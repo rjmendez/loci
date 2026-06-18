@@ -32,7 +32,7 @@ services:
     volumes:
       - hermes-mcp-data:/data
     ports:
-      - "8000:8000"
+      - "0.0.0.0:8000:8000"
     restart: unless-stopped
 
   hermes-a2a:
@@ -53,7 +53,7 @@ services:
     volumes:
       - hermes-a2a-data:/data
     ports:
-      - "8201:8201"
+      - "0.0.0.0:8201:8201"
     restart: unless-stopped
 
 volumes:
