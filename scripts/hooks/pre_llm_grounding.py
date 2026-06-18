@@ -126,6 +126,7 @@ PHERO_EPSILON      = float(os.environ.get("HOOK_PHERO_EPSILON",     "0.05"))  # 
 _EXTRA_FIELD_MAP: dict[str, tuple] = {
     "ecc_skills":        ("content_preview", None, True),
     "agent_core_chunks": ("text",            None, False),
+    "dama_gotchi_code":  ("text",            None, True),
 }
 _DEFAULT_EXTRA_FIELDS = ("text", None, True)
 
