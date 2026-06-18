@@ -1,0 +1,66 @@
+# hermes_memory — local development override
+#
+# Adds Qdrant and Ollama sidecars so you can run everything locally.
+# This is for development and smoke-testing only — NOT a production topology.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# First run: pull the embedding model (required before hermes-mcp will embed):
+#   docker exec -it hermes-memory-ollama-1 ollama pull nomic-embed-text
+#
+# Qdrant UI: http://localhost:6333/dashboard
+# Ollama:    http://localhost:11434
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    volumes:
+      - qdrant-dev-data:/qdrant/storage
+    ports:
+      - "6333:6333"   # REST + dashboard
+      - "6334:6334"   # gRPC
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-dev-data:/root/.ollama
+    ports:
+      - "11434:11434"
+    # GPU: uncomment if you have NVIDIA drivers + nvidia-container-toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+  # Override service env to use the local sidecars
+  hermes-mcp:
+    depends_on:
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_started
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      OLLAMA_BASE_URL: http://ollama:11434
+
+  hermes-a2a:
+    depends_on:
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_started
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MNEMOSYNE_EMBEDDING_API_URL: http://ollama:11434/v1
+
+volumes:
+  qdrant-dev-data:
+    driver: local
+  ollama-dev-data:
+    driver: local

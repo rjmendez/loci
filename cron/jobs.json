@@ -1,0 +1,196 @@
+{
+  "jobs": [
+    {
+      "id": "5872853d8b28",
+      "name": "mnemosyne-consolidation",
+      "prompt": "You are a background memory consolidation agent. No user is present.\n\nGATE: If the script output above is empty or blank — output nothing and stop immediately. Idle = silent, zero tokens.\n\nIf script output contains \"working_memory grew\", run consolidation on both memory banks by calling mnemosyne_sleep for bank=\"default\" and bank=\"my-project\".\n\nAfter both complete, output a single line: \"consolidated: default=N episodic, my-project=M episodic\" where N/M are the new episodic counts. Nothing else.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "mnemosyne_activity_check.py",
+      "no_agent": false,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 20,
+        "display": "every 20m"
+      },
+      "schedule_display": "every 20m",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": [
+        "mcp"
+      ],
+      "workdir": null,
+      "profile": null
+    },
+    {
+      "id": "65355f0c518f",
+      "name": "mnemosyne-session-summarizer",
+      "prompt": "You are a background memory archivist for Hermes agent sessions. No user is present.\n\nGATE: If the script output above is empty or blank — do NOTHING. Return immediately. Idle = silent.\n\nIf the script output shows working_memory grew, execute ALL of the following steps using every available Mnemosyne feature to maximize context preservation:\n\n=== STEP 1: SCRATCHPAD — read current scratchpad ===\nCall mnemosyne_scratchpad_read (bank=\"default\") and mnemosyne_scratchpad_read (bank=\"my-project\").\nNote what's there — it's the running session context.\n\n=== STEP 2: RECALL — what do we already know? ===\nCall mnemosyne_recall with query=\"recent decisions architecture changes\" (bank=\"my-project\", top_k=5).\nThis prevents writing duplicate memories.\n\n=== STEP 3: NARRATIVE MEMORIES — store structured session facts ===\nFor each significant thing that happened in this session window, call mnemosyne_remember with:\n- bank=\"my-project\"\n- source=\"session-summary\"\n- importance=0.8-0.95 (higher for decisions/architecture, lower for status updates)\n- extract_entities=True (populate entity graph)\n- extract=True (LLM fact extraction into memoria_facts)\n- metadata with {\"session_date\": \"<today>\", \"topic\": \"<topic>\"}\n\nCategories to cover (skip any with no new info):\n  A. DECISIONS made (architecture choices, tradeoffs accepted, things rejected and why)\n  B. DISCOVERIES (bugs found, behavior confirmed, data shapes, facts)\n  C. ACTIVE STATE (what's running, what's in-progress, what's blocked)\n  D. KEY FACTS (service names, file paths, endpoints — NOT actual secrets)\n\n=== STEP 4: KNOWLEDGE TRIPLES — store relationships ===\nUse mnemosyne_triple_add for factual relationships that benefit from graph traversal. Examples:\n- subject=\"my-service\", predicate=\"writes_to\", object=\"my-storage-bucket\"\n- subject=\"my-consolidation-cron\", predicate=\"runs_every\", object=\"20_minutes\"\nUse bank=\"my-project\", source=\"session-summary\", confidence=0.9\n\n=== STEP 5: ANNOTATIONS — tag key memories with temporal anchors ===\nFor any memory you stored in step 3, add annotations:\n- predicate=\"occurred_on\", object=\"<today YYYY-MM-DD>\"\n- predicate=\"has_source\", object=\"hermes-session\"\n- predicate=\"mentions\" for key entities\n\n=== STEP 6: SCRATCHPAD UPDATE — write running session state ===\nCall mnemosyne_scratchpad_write (bank=\"my-project\") with a compact running-state block:\n```\n## Session State [<timestamp>]\n### Active Jobs\n- <list active work>\n\n### Recent Decisions\n<bullet list of decisions from this window>\n\n### Blocked / Needs Attention\n<bullet list>\n\n### Key Numbers\n<row counts, checkpoint counts, sizes>\n```\n\n=== STEP 7: CONSOLIDATION ===\nCall mnemosyne_sleep (bank=\"default\") then mnemosyne_sleep (bank=\"my-project\").\n\n=== OUTPUT ===\nPrint one compact summary line per bank: \"archived: N memories, M triples, scratchpad updated\"\nNothing else. No chat filler.",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "mnemosyne_activity_check.py",
+      "no_agent": false,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 20,
+        "display": "every 20m"
+      },
+      "schedule_display": "every 20m",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": [
+        "mcp"
+      ],
+      "workdir": null,
+      "profile": null
+    },
+    {
+      "id": "b40ae8101c2a",
+      "name": "mnemosyne-sleep-cli",
+      "prompt": "unused",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "mnemosyne_sleep_all.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 30,
+        "display": "every 30m"
+      },
+      "schedule_display": "every 30m",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": null,
+      "workdir": null,
+      "profile": null
+    },
+    {
+      "id": "c857cd706f67",
+      "name": "mnemosyne-qdrant-sync",
+      "prompt": "",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "mnemosyne_qdrant_sync.py",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 30,
+        "display": "every 30m"
+      },
+      "schedule_display": "every 30m",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": null,
+      "workdir": null
+    },
+    {
+      "id": "a9fc1ea0886a",
+      "name": "state-db-qdrant-sync",
+      "prompt": "",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "state_db_qdrant_sync.py",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 5,
+        "display": "every 5m"
+      },
+      "schedule_display": "every 5m",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": true,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": null,
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": null,
+      "workdir": null
+    }
+  ]
+}

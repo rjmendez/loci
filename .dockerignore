@@ -1,0 +1,32 @@
+# Secrets
+.env
+auth.json
+auth.lock
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Venvs
+.venv/
+venv/
+env/
+
+# Data / caches (mounted as volumes at runtime)
+*.db
+*.db-shm
+*.db-wal
+mnemosyne/
+cache/
+sessions/
+cron/output/
+
+# Dev / editor
+.git/
+*.md.bak
+.DS_Store

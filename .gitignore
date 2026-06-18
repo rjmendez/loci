@@ -1,0 +1,57 @@
+# Secrets / credentials
+.env
+auth.json
+auth.lock
+*.lock
+pairing/
+
+# Large binaries / DBs / caches
+state.db*
+mnemosyne/
+bin/
+lsp/
+cache/
+plugins/
+migration/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak*
+models_dev_cache.json
+provider_models_cache.json
+ollama_cloud_models_cache.json
+.skills_prompt_snapshot.json
+
+# Runtime / generated
+cron/output/
+skills/
+plugin-data/
+channel_directory.json
+shell-hooks-allowlist.json
+logs/
+sessions/
+audio_cache/
+image_cache/
+images/
+pastes/
+sandboxes/
+gateway.lock
+gateway.pid
+gateway_state.json
+processes.json
+interrupt_debug.log
+.hermes_history
+.update_check
+.session_sync_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Backups
+*.bak*
+config.yaml.bak*
+config.yaml
+
+memories/
+plans/
+*.log

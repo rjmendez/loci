@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loci-mcp"
+version = "0.2.0"
+description = "Loci — persistent memory and knowledge MCP server for AI agent meshes"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "python-dotenv>=1.0.0",
+    "qdrant-client>=1.17.0,<1.19.0",
+    "fastembed>=0.7.0",
+    "sentence-transformers>=3.0.0",
+    "requests>=2.31.0",
+    "iocextract>=1.16.1",
+]
+
+[project.optional-dependencies]
+# mnemosyne is an optional substrate for shared memory across sessions.
+# Install from PyPI ("mnemosyne-memory") or build from source.
+# Omit for Qdrant-only operation — all MCP tools degrade gracefully without it.
+mnemosyne = [
+    "mnemosyne-memory[mcp]",
+]
+
+[project.scripts]
+loci-mcp = "server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memcheck*"]

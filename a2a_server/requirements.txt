@@ -1,0 +1,44 @@
+# Loci A2A Server — direct runtime dependencies
+# Python 3.11 (venv: ~/.hermes/hermes-agent/venv/bin/python3)
+# Pinned to versions confirmed present in the hermes venv on 2026-06-13.
+#
+# Install into the hermes venv:
+#   pip install -r requirements.txt --target ~/.hermes/hermes-agent/venv/lib/python3.11/site-packages
+#
+# Note: pip binary is absent from this venv; use:
+#   python3 -m pip install ...  OR  pip3 install --target <site-packages>
+
+# ── HTTP server ────────────────────────────────────────────────────────────────
+fastapi==0.133.1          # JSON-RPC 2.0 routes, dependency injection (Bearer/TOTP)
+uvicorn==0.41.0           # ASGI server; uvloop extra recommended for production
+starlette==1.0.1          # fastapi dep — Request, JSONResponse, HTTPException
+pydantic==2.13.4          # fastapi dep — request/response validation
+
+# ── Async HTTP client (Qdrant + Ollama embed calls) ───────────────────────────
+aiohttp==3.13.4           # async POST to Qdrant /collections/.../points/search
+                          # async POST to Ollama /v1/embeddings
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+pyotp==2.9.0              # TOTP (RFC 6238) — X-TOTP header verification
+                          # installed via: pip3 install pyotp --target <site-packages>
+                          # (no pip in hermes venv — see NOTE above)
+
+# ── stdlib only (no pip install needed) ───────────────────────────────────────
+# os, uuid, json, sqlite3, logging, datetime, asyncio, sys
+# sqlite3 talks to: ~/.hermes/mnemosyne/data/mnemosyne.db
+#   tables used: memories, working_memory, episodic_memory, fts_working, fts_episodes
+
+# ── External services (not pip-installed; configured via .env) ─────────────────
+# Qdrant        http://localhost:6333   api-key: QDRANT_API_KEY
+#   collections: mnemosyne (198 pts/768d), hermes_sessions (151 pts/768d),
+#                hermes_memory (89 pts/768d)
+#   vector name: "dense" (named-vector format — required in search payload)
+#
+# Ollama        http://localhost:11434/v1
+#   model:       nomic-embed-text  (768-dim, Cosine)
+#   endpoint:    POST /v1/embeddings  {"model": "nomic-embed-text", "input": "<text>"}
+#   response:    data.data[0].embedding  OR  data.embedding  (both shapes handled)
+#
+# Mnemosyne dashboard (optional — for memory_sleep skill)
+#   http://127.0.0.1:8765/api/sleep  POST {"dry_run": bool}
+#   If not running, memory_sleep returns status="deferred" (non-fatal)

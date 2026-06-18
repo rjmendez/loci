@@ -1,0 +1,37 @@
+[Unit]
+Description=Loci A2A Server (port 8201)
+Documentation=https://github.com/rjmendez/loci
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust WorkingDirectory and ExecStart to your checkout / venv paths.
+# This file is a template — copy to ~/.config/systemd/user/ before enabling.
+WorkingDirectory=%h/.hermes/loci/a2a_server
+
+# Load .env file (leading '-' makes it non-fatal if missing)
+EnvironmentFile=-%h/.hermes/loci/.env
+
+# Required — server exits at startup if unset.
+# Environment=HERMES_A2A_TOKEN=<generate with: python3 -c "import secrets;print(secrets.token_hex(32))">
+Environment=HERMES_A2A_PORT=8201
+Environment=HERMES_A2A_HOST=0.0.0.0
+
+ExecStart=%h/.hermes/loci/venv/bin/python3 \
+    %h/.hermes/loci/a2a_server/server.py
+
+Restart=on-failure
+RestartSec=5
+# Allow up to 15 s for in-flight requests to drain before SIGKILL
+TimeoutStopSec=15
+# Cap RSS to prevent unbounded growth from the task cache
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=loci-a2a
+
+# [Install]
+# Install scope: USER only — use `systemctl --user enable loci-a2a`
+# Do NOT install system-wide; paths use %h (user home) which only resolves in user scope.
+WantedBy=default.target

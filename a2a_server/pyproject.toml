@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "loci-a2a"
+version = "0.1.0"
+description = "Loci A2A server — persistent memory node for AI agent meshes"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.133.1",
+    "uvicorn[standard]==0.41.0",
+    "starlette==1.0.1",
+    "pydantic==2.13.4",
+    "aiohttp==3.13.4",
+    "pyotp==2.9.0",
+]
+
+[project.scripts]
+hermes-a2a = "server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["server*", "client*"]

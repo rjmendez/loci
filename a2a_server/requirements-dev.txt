@@ -1,0 +1,8 @@
+# Loci A2A Server — dev/test dependencies
+# Install alongside requirements.txt for running smoke tests.
+#
+# These are already present in the hermes venv; listed here for documentation.
+
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-timeout==2.4.0

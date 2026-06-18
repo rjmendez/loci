@@ -1,0 +1,63 @@
+# hermes_memory — production compose
+#
+# Runs only the custom-built services (MCP server + A2A server).
+# Qdrant and the embedding API are EXTERNAL — configure via .env or environment.
+#
+# Required env (see .env.example):
+#   QDRANT_URL              Your Qdrant instance (cloud or self-hosted)
+#   QDRANT_API_KEY          API key if your Qdrant requires one
+#   OLLAMA_BASE_URL         Any OpenAI-compatible /v1/embeddings endpoint
+#   EMBED_MODEL             Must match the model used to build your collections
+#   LOCI_A2A_TOKEN          Bearer token for A2A server (required, no default)
+#
+# For local development with Qdrant + Ollama sidecars:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  hermes-mcp:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HERMES_MCP_TRANSPORT: ${HERMES_MCP_TRANSPORT:-sse}
+      HERMES_MCP_HOST: "0.0.0.0"
+      HERMES_MCP_PORT: "8000"
+      QDRANT_URL: ${QDRANT_URL:-http://localhost:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://localhost:11434}
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+    volumes:
+      - hermes-mcp-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  hermes-a2a:
+    build:
+      context: ./a2a_server
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LOCI_A2A_TOKEN: ${LOCI_A2A_TOKEN:?LOCI_A2A_TOKEN is required}
+      LOCI_A2A_URL: ${LOCI_A2A_URL:-http://localhost:8201}
+      HERMES_AGENT_ID: ${HERMES_AGENT_ID:-loci}
+      QDRANT_URL: ${QDRANT_URL:-http://localhost:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      MNEMOSYNE_EMBEDDING_API_URL: ${OLLAMA_BASE_URL:-http://localhost:11434}/v1
+      MNEMOSYNE_EMBEDDING_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+    volumes:
+      - hermes-a2a-data:/data
+    ports:
+      - "8201:8201"
+    restart: unless-stopped
+
+volumes:
+  hermes-mcp-data:
+    driver: local
+  hermes-a2a-data:
+    driver: local
