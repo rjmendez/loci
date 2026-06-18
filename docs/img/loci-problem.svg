@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 300" width="820" height="300">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    </style>
+    <marker id="arr-red" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#F87171"/>
+    </marker>
+    <marker id="arr-green" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#34D399"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="820" height="300" fill="#F9FAFB" rx="12"/>
+
+  <!-- ── LEFT PANEL: Without Loci ── -->
+  <rect x="10" y="10" width="385" height="280" rx="10" fill="white" stroke="#FCA5A5" stroke-width="1.5"/>
+  <rect x="10" y="10" width="385" height="44" rx="10" fill="#FEF2F2"/>
+  <rect x="10" y="44" width="385" height="10" fill="#FEF2F2"/>
+  <text x="202" y="37" text-anchor="middle" fill="#DC2626" font-size="14" font-weight="700">Without Loci — Every session starts blank</text>
+
+  <!-- Session boxes (left) -->
+  <!-- Session 1 -->
+  <rect x="34" y="75" width="140" height="54" rx="8" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+  <text x="104" y="97" text-anchor="middle" fill="#991B1B" font-size="12" font-weight="600">Session 1</text>
+  <text x="104" y="114" text-anchor="middle" fill="#6B7280" font-size="10">"We discussed X last week"</text>
+
+  <!-- Session 2 -->
+  <rect x="34" y="150" width="140" height="54" rx="8" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+  <text x="104" y="172" text-anchor="middle" fill="#991B1B" font-size="12" font-weight="600">Session 2</text>
+  <text x="104" y="189" text-anchor="middle" fill="#6B7280" font-size="10">"What did we discuss?"</text>
+
+  <!-- Session 3 -->
+  <rect x="34" y="225" width="140" height="54" rx="8" fill="#FEF2F2" stroke="#FECACA" stroke-width="1.5"/>
+  <text x="104" y="247" text-anchor="middle" fill="#991B1B" font-size="12" font-weight="600">Session 3</text>
+  <text x="104" y="264" text-anchor="middle" fill="#6B7280" font-size="10">"Who are you again?"</text>
+
+  <!-- Broken link symbols -->
+  <line x1="180" y1="102" x2="335" y2="102" stroke="#F87171" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="260" y="99" text-anchor="middle" fill="#DC2626" font-size="16" font-weight="700">✕</text>
+
+  <line x1="180" y1="177" x2="335" y2="177" stroke="#F87171" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="260" y="174" text-anchor="middle" fill="#DC2626" font-size="16" font-weight="700">✕</text>
+
+  <line x1="180" y1="252" x2="335" y2="252" stroke="#F87171" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <text x="260" y="249" text-anchor="middle" fill="#DC2626" font-size="16" font-weight="700">✕</text>
+
+  <!-- "Forgotten" cloud placeholders -->
+  <rect x="210" y="75" width="160" height="54" rx="8" fill="#FFF1F2" stroke="#FECACA" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="290" y="98" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">memory</text>
+  <text x="290" y="114" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">evaporates</text>
+
+  <rect x="210" y="150" width="160" height="54" rx="8" fill="#FFF1F2" stroke="#FECACA" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="290" y="173" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">memory</text>
+  <text x="290" y="189" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">evaporates</text>
+
+  <rect x="210" y="225" width="160" height="54" rx="8" fill="#FFF1F2" stroke="#FECACA" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="290" y="248" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">memory</text>
+  <text x="290" y="264" text-anchor="middle" fill="#9CA3AF" font-size="11" font-style="italic">evaporates</text>
+
+  <!-- ── RIGHT PANEL: With Loci ── -->
+  <rect x="425" y="10" width="385" height="280" rx="10" fill="white" stroke="#6EE7B7" stroke-width="1.5"/>
+  <rect x="425" y="10" width="385" height="44" rx="10" fill="#ECFDF5"/>
+  <rect x="425" y="44" width="385" height="10" fill="#ECFDF5"/>
+  <text x="617" y="37" text-anchor="middle" fill="#065F46" font-size="14" font-weight="700">With Loci — Memory grows across sessions</text>
+
+  <!-- Session boxes (right) -->
+  <rect x="445" y="75" width="140" height="54" rx="8" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <text x="515" y="97" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="600">Session 1</text>
+  <text x="515" y="114" text-anchor="middle" fill="#6B7280" font-size="10">saves findings → Loci</text>
+
+  <rect x="445" y="150" width="140" height="54" rx="8" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <text x="515" y="172" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="600">Session 2</text>
+  <text x="515" y="189" text-anchor="middle" fill="#6B7280" font-size="10">recalls Session 1 context</text>
+
+  <rect x="445" y="225" width="140" height="54" rx="8" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <text x="515" y="247" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="600">Session 3</text>
+  <text x="515" y="264" text-anchor="middle" fill="#6B7280" font-size="10">knows the full history</text>
+
+  <!-- Central Loci memory store (cylinder) -->
+  <ellipse cx="740" cy="164" rx="48" ry="14" fill="#D1FAE5" stroke="#34D399" stroke-width="1.5"/>
+  <rect x="692" y="164" width="96" height="60" fill="#ECFDF5" stroke="#34D399" stroke-width="1.5"/>
+  <ellipse cx="740" cy="224" rx="48" ry="14" fill="#D1FAE5" stroke="#34D399" stroke-width="1.5"/>
+  <text x="740" y="189" text-anchor="middle" fill="#065F46" font-size="12" font-weight="700">LOCI</text>
+  <text x="740" y="207" text-anchor="middle" fill="#065F46" font-size="10">persistent</text>
+  <text x="740" y="220" text-anchor="middle" fill="#065F46" font-size="10">memory</text>
+
+  <!-- Arrows: sessions ↔ Loci -->
+  <path d="M 585 102 C 630 102 670 160 692 169" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+  <path d="M 692 176 C 670 177 630 177 585 177" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+
+  <path d="M 585 177 L 692 180" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+  <path d="M 692 183 L 585 183" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+
+  <path d="M 585 252 C 630 252 670 218 692 212" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+  <path d="M 692 218 C 670 225 630 255 585 257" stroke="#34D399" stroke-width="2" fill="none" marker-end="url(#arr-green)"/>
+</svg>

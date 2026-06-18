@@ -1,98 +1,86 @@
-# Loci — Persistent Memory for AI Agent Meshes
+# Loci — Persistent Memory for AI Agents
 
-Persistent memory and knowledge layer for AI agent meshes. Provides grounding,
-consolidation, self-improvement, and longitudinal evaluation for Claude Code and
-other agent sessions.
+**Loci gives AI agents like Claude a long-term memory that survives across sessions.**
 
-## Quick orientation
+Without it, every conversation starts from zero — no history, no accumulated knowledge,
+no memory of what you tried and why. With Loci, sessions build on each other. Decisions,
+findings, and context persist in a searchable memory store that Claude can read and write
+like a set of notes.
 
-| What you want | Where to look |
-|---|---|
-| How the system works | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
-| What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
-| How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
-| How to deploy (Docker / systemd) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+![The memory problem Loci solves](docs/img/loci-problem.svg)
 
-## Feature highlights
+---
 
-- **Qdrant vector store** — hybrid dense (768-dim nomic-embed-text) + sparse BM25 search
-  with cross-encoder reranking over investigation findings
-- **Mnemosyne SQLite substrate** — FTS5 full-text search, cross-session shared memory,
-  bank-scoped storage for multi-agent meshes
-- **MCP server (25 tools)** — investigation sessions, RAG retrieval, claim validation,
-  entity lookup, provenance tracing, audit log, reflection loop, context search,
-  memory consolidation, confidence estimation, and routing query
-- **A2A server** — JSON-RPC 2.0 over HTTP; exposes 14 memory skills to peer agents
-  without requiring the MCP stack
-- **Bio-inspired memory** — slow-wave/REM consolidation, stigmergic recall scoring,
-  glymphatic sweep (TTL purge), metamemory confidence tracking
+## What it unlocks
 
-## Repo layout
+- **Continuity** — Session 7 knows what happened in Sessions 1–6, without you re-explaining
+- **Grounded answers** — Claude checks stored history before answering, reducing hallucinations
+- **Claim validation** — Verify a proposed answer against stored evidence before asserting it
+- **Accumulated knowledge** — Your project context grows richer with every session
+- **Multi-agent memory** — Multiple AI agents can share a common memory pool via the A2A server
+- **Supply chain security** — Every tool call is scanned for injection attacks and malicious patterns
 
-```
-hermes_memory/
-├── mcp/                   MCP server — 25 tools: investigation memory, RAG, claim validation
-│   ├── server.py          FastMCP server entry point
-│   ├── memcheck/          Standalone claim-validation + code-hallucination module
-│   ├── pyproject.toml     Package definition (pip install -e .)
-│   └── README.md          MCP setup and tool reference
-├── docs/                  Architecture, theory, component reference, ops guide
-├── scripts/               Python scripts (run standalone or via cron)
-│   └── hooks/             Claude Code / agent hook adapters
-├── eval/                  Longitudinal grounding quality evaluation harness
-├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
-├── rules/                 Agent behavioral rules (loaded at session start)
-├── cron/jobs.json         (reference copy — live file in ~/.hermes/cron/)
-└── .env.example           Full environment variable reference for all components
-```
+---
 
-## Infrastructure
+## How it works
 
-| Resource | Default | Env var(s) |
-|---|---|---|
-| Qdrant | `http://localhost:6333` | `QDRANT_URL`, `QDRANT_API_KEY` |
-| Ollama (MCP server) | `http://localhost:11434` | `OLLAMA_BASE_URL` |
-| Ollama (A2A server) | `http://localhost:11434/v1` | `MNEMOSYNE_EMBEDDING_API_URL` |
-| Embedding model (MCP) | `nomic-embed-text` | `EMBED_MODEL` |
-| Embedding model (A2A) | `nomic-embed-text` | `MNEMOSYNE_EMBEDDING_MODEL` |
-| Embedding dimensions | `768` | `MNEMOSYNE_EMBEDDING_DIM` |
-| Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
-| Memory session dir (MCP) | `~/.hermes/memory-sessions` | `HERMES_MEMORY_DIR` |
-| Qdrant collection prefix | `hermes_memory` | `QDRANT_COLLECTION_PREFIX` |
-| Hook state | `~/.claude/hook-state/` | — |
+![Loci architecture](docs/img/loci-overview.svg)
 
-The MCP server reads `OLLAMA_BASE_URL` for its embedding calls. The A2A server reads
-`MNEMOSYNE_EMBEDDING_API_URL` (an OpenAI-compatible endpoint, typically
-`OLLAMA_BASE_URL + /v1`). The two variables serve different components — set both
-when running the full stack.
+Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
+something, it calls one of Loci's 25 tools — the same way it calls any other tool. Your
+data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
-Two `.env.example` files are provided:
+> **New to terms like "vector search", "RAG", or "MCP"?**
+> Start with **[docs/CONCEPTS.md](docs/CONCEPTS.md)** — a plain-English guide that explains
+> everything from scratch with no assumed knowledge.
 
-- **`.env.example`** (repo root) — complete reference covering all components (MCP
-  server, A2A server, hooks, cron scripts).
-- **`mcp/.env.example`** — minimal file for deployments that run only the MCP server.
-
-Override any default with env vars — see [docs/OPERATIONS.md](docs/OPERATIONS.md).
+---
 
 ## Quick start
 
 ```bash
 git clone https://github.com/rjmendez/loci
-cd hermes_memory/mcp
-python3 -m venv .venv
-# Base install (Qdrant-only mode):
-.venv/bin/pip install -e "."
-# With Mnemosyne SQLite substrate (optional):
-.venv/bin/pip install -e ".[mnemosyne]"
-cp .env.example .env   # fill in QDRANT_URL, QDRANT_API_KEY, OLLAMA_BASE_URL
+cd loci/mcp
+python3 -m venv .venv && .venv/bin/pip install -e "."
+cp ../.env.example .env   # fill in QDRANT_URL and OLLAMA_BASE_URL at minimum
 .venv/bin/python server.py
 ```
 
-See [mcp/README.md](mcp/README.md) for full tool reference and Claude Code wiring.
-See [a2a_server/README.md](a2a_server/README.md) for the A2A mesh endpoint.
+Wire into Claude Code (`~/.claude/settings.json`):
+
+```json
+"loci": {
+  "type": "stdio",
+  "command": "/path/to/.venv/bin/python3",
+  "args": ["/path/to/loci/mcp/server.py"],
+  "env": {
+    "QDRANT_URL": "http://localhost:6333",
+    "OLLAMA_BASE_URL": "http://localhost:11434"
+  }
+}
+```
+
+See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide.
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
+
+---
+
+## Quick orientation
+
+| What you want | Where to look |
+|---|---|
+| New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
+| How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
+| What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
+| How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+| How to deploy (Docker / systemd) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+
+---
 
 ## MCP tools (25)
+
+![Tool groups](docs/img/loci-tools.svg)
 
 | Tool | Purpose |
 |---|---|
@@ -122,13 +110,15 @@ See [a2a_server/README.md](a2a_server/README.md) for the A2A mesh endpoint.
 | `dama_routing_query` | Query domain routing decisions from the configured collection |
 | `memory_confidence` | Estimate confidence in a memory-derived claim before asserting it |
 
+---
+
 ## A2A skills (14)
 
-The A2A server exposes 14 skills via `_SKILL_MAP`. Thirteen are advertised in the
-agent card; `memory_prime` is callable but not listed in the agent card discovery
-response.
+The A2A server exposes 14 skills via JSON-RPC 2.0 over HTTP, letting peer agents share
+memory without requiring the MCP stack. Thirteen are advertised in the agent card;
+`memory_prime` is callable but not listed in discovery.
 
-| Skill | Advertised in agent card |
+| Skill | Advertised |
 |---|---|
 | `memory_recall` | Yes |
 | `memory_remember` | Yes |
@@ -144,6 +134,34 @@ response.
 | `ua_search` | Yes |
 | `dama_telemetry` | Yes |
 | `memory_prime` | No |
+
+---
+
+## Infrastructure
+
+| Resource | Default | Env var(s) |
+|---|---|---|
+| Qdrant | `http://localhost:6333` | `QDRANT_URL`, `QDRANT_API_KEY` |
+| Ollama (MCP server) | `http://localhost:11434` | `OLLAMA_BASE_URL` |
+| Ollama (standalone scripts) | `http://localhost:11434` | `OLLAMA_URL` |
+| Ollama (A2A server) | `http://localhost:11434/v1` | `MNEMOSYNE_EMBEDDING_API_URL` |
+| Embedding model (MCP) | `nomic-embed-text` | `EMBED_MODEL` |
+| Embedding model (A2A) | `nomic-embed-text` | `MNEMOSYNE_EMBEDDING_MODEL` |
+| Embedding dimensions | `768` | `MNEMOSYNE_EMBEDDING_DIM` |
+| Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
+| Memory session dir (MCP) | `~/.hermes/memory-sessions` | `HERMES_MEMORY_DIR` |
+| Qdrant collection prefix | `hermes_memory` | `QDRANT_COLLECTION_PREFIX` |
+| Hook state | `~/.claude/hook-state/` | — |
+
+`OLLAMA_BASE_URL` and `OLLAMA_URL` serve different components — set both when running
+the full stack. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full env var reference.
+
+Two `.env.example` files are provided:
+
+- **`.env.example`** (repo root) — complete reference covering all components
+- **`mcp/.env.example`** — minimal file for MCP-server-only deployments
+
+---
 
 ## Key env vars
 
@@ -181,6 +199,8 @@ response.
 | `PEER_A2A_URLS` | `""` | Comma-separated peer A2A endpoints for context broadcast |
 | `DAMA_TELEMETRY_COLLECTION` | `""` | Qdrant collection for `dama_telemetry` skill |
 
+---
+
 ## Qdrant collections
 
 | Collection | Purpose |
@@ -189,6 +209,8 @@ response.
 | `hermes_sessions` | Session history embeddings |
 | `hermes_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
 | `mnemosyne` | Synced Mnemosyne SQLite vectors |
+
+---
 
 ## MCP transport modes
 
@@ -199,4 +221,27 @@ For Docker or remote deployments set `HERMES_MCP_TRANSPORT=sse` (or
 ```bash
 HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
   .venv/bin/python server.py
+```
+
+---
+
+## Repo layout
+
+```
+loci/
+├── mcp/                   MCP server — 25 tools: investigation memory, RAG, claim validation
+│   ├── server.py          FastMCP server entry point
+│   ├── memcheck/          Standalone claim-validation + code-hallucination module
+│   ├── pyproject.toml     Package definition (pip install -e .)
+│   └── README.md          MCP setup and tool reference
+├── docs/                  Architecture, theory, component reference, ops guide
+│   ├── CONCEPTS.md        Plain-English guide for beginners
+│   └── img/               SVG diagrams
+├── scripts/               Python scripts (run standalone or via cron)
+│   └── hooks/             Claude Code / agent hook adapters
+├── eval/                  Longitudinal grounding quality evaluation harness
+├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
+├── rules/                 Agent behavioral rules (loaded at session start)
+├── cron/jobs.json         (reference copy — live file in ~/.hermes/cron/)
+└── .env.example           Full environment variable reference for all components
 ```

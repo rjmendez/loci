@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 420" width="840" height="420">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="840" height="420" fill="#F9FAFB" rx="12"/>
+  <text x="420" y="30" text-anchor="middle" fill="#1F2937" font-size="15" font-weight="700">Loci's 25 MCP Tools — organised by purpose</text>
+
+  <!-- ── GROUP 1: Investigation (blue) — col 1 ── -->
+  <rect x="20" y="50" width="240" height="340" rx="10" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <rect x="20" y="50" width="240" height="38" rx="10" fill="#DBEAFE"/>
+  <rect x="20" y="78" width="240" height="10" fill="#DBEAFE"/>
+  <text x="140" y="74" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="700">🔬 Investigation (12)</text>
+  <text x="140" y="99" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Track multi-step research like a detective case file</text>
+
+  <text x="35" y="120" fill="#1D4ED8" font-size="11">investigation_start</text>
+  <text x="35" y="136" fill="#6B7280" font-size="9">   Open a new research session</text>
+  <text x="35" y="155" fill="#1D4ED8" font-size="11">investigation_store</text>
+  <text x="35" y="171" fill="#6B7280" font-size="9">   Save a finding to the session</text>
+  <text x="35" y="190" fill="#1D4ED8" font-size="11">investigation_search</text>
+  <text x="35" y="206" fill="#6B7280" font-size="9">   Search within a session</text>
+  <text x="35" y="225" fill="#1D4ED8" font-size="11">investigation_pre_answer_check</text>
+  <text x="35" y="241" fill="#6B7280" font-size="9">   Validate a claim before asserting it</text>
+  <text x="35" y="260" fill="#1D4ED8" font-size="11">investigation_entity_lookup</text>
+  <text x="35" y="276" fill="#6B7280" font-size="9">   Find what's known about a name/topic</text>
+  <text x="35" y="295" fill="#1D4ED8" font-size="11">investigation_related_cases</text>
+  <text x="35" y="311" fill="#6B7280" font-size="9">   Find similar past investigations</text>
+  <text x="35" y="330" fill="#6B7280" font-size="9.5">+ load · note · reflect · evidence_precheck</text>
+  <text x="35" y="346" fill="#6B7280" font-size="9.5">  finding_provenance · list</text>
+
+  <!-- ── GROUP 2: Memory (green) — col 2 top ── -->
+  <rect x="280" y="50" width="270" height="185" rx="10" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1.5"/>
+  <rect x="280" y="50" width="270" height="38" rx="10" fill="#D1FAE5"/>
+  <rect x="280" y="78" width="270" height="10" fill="#D1FAE5"/>
+  <text x="415" y="74" text-anchor="middle" fill="#065F46" font-size="12" font-weight="700">🧠 Memory Management (5)</text>
+  <text x="415" y="99" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Keep stored knowledge accurate and healthy</text>
+
+  <text x="295" y="120" fill="#065F46" font-size="11">memory_self_check</text>
+  <text x="295" y="136" fill="#6B7280" font-size="9">   Scan for contradictions in stored memory</text>
+  <text x="295" y="155" fill="#065F46" font-size="11">memory_retract</text>
+  <text x="295" y="171" fill="#6B7280" font-size="9">   Mark a memory as wrong/outdated</text>
+  <text x="295" y="190" fill="#065F46" font-size="11">memory_restore</text>
+  <text x="295" y="206" fill="#6B7280" font-size="9">   Bring back a retracted memory</text>
+  <text x="295" y="225" fill="#065F46" font-size="11">memory_health / memory_consolidate</text>
+  <text x="295" y="241" fill="#6B7280" font-size="9">   System status · deduplicate &amp; merge</text>
+
+  <!-- ── GROUP 3: RAG Search (purple) — col 2 bottom ── -->
+  <rect x="280" y="250" width="270" height="140" rx="10" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.5"/>
+  <rect x="280" y="250" width="270" height="38" rx="10" fill="#EDE9FE"/>
+  <rect x="280" y="278" width="270" height="10" fill="#EDE9FE"/>
+  <text x="415" y="274" text-anchor="middle" fill="#5B21B6" font-size="12" font-weight="700">🔍 Search &amp; Retrieval (3)</text>
+  <text x="415" y="299" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Pull relevant context before answering</text>
+
+  <text x="295" y="320" fill="#5B21B6" font-size="11">rag_context_search</text>
+  <text x="295" y="336" fill="#6B7280" font-size="9">   Semantic search across all memory collections</text>
+  <text x="295" y="355" fill="#5B21B6" font-size="11">code_memory_correlate</text>
+  <text x="295" y="371" fill="#6B7280" font-size="9">   Link a code change to stored context</text>
+  <text x="295" y="388" fill="#5B21B6" font-size="11">dama_routing_query</text>
+  <text x="295" y="404" fill="#6B7280" font-size="9">   Query from a custom routing collection</text>
+
+  <!-- ── GROUP 4: Reflection (orange) — col 3 top ── -->
+  <rect x="570" y="50" width="250" height="185" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1.5"/>
+  <rect x="570" y="50" width="250" height="38" rx="10" fill="#FEF3C7"/>
+  <rect x="570" y="78" width="250" height="10" fill="#FEF3C7"/>
+  <text x="695" y="74" text-anchor="middle" fill="#78350F" font-size="12" font-weight="700">🔄 Reflection Loop (3)</text>
+  <text x="695" y="99" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Self-improvement: review and refine over time</text>
+
+  <text x="585" y="120" fill="#92400E" font-size="11">reflection_loop_seed</text>
+  <text x="585" y="136" fill="#6B7280" font-size="9">   Queue material for background review</text>
+  <text x="585" y="155" fill="#92400E" font-size="11">reflection_loop_tick</text>
+  <text x="585" y="171" fill="#6B7280" font-size="9">   Process one item from the review queue</text>
+  <text x="585" y="190" fill="#92400E" font-size="11">reflection_loop_status</text>
+  <text x="585" y="206" fill="#6B7280" font-size="9">   Check what's queued for review</text>
+
+  <!-- ── GROUP 5: Audit &amp; Meta (gray) — col 3 bottom ── -->
+  <rect x="570" y="250" width="250" height="140" rx="10" fill="#F3F4F6" stroke="#D1D5DB" stroke-width="1.5"/>
+  <rect x="570" y="250" width="250" height="38" rx="10" fill="#E5E7EB"/>
+  <rect x="570" y="278" width="250" height="10" fill="#E5E7EB"/>
+  <text x="695" y="274" text-anchor="middle" fill="#374151" font-size="12" font-weight="700">📋 Audit &amp; Trust (2)</text>
+  <text x="695" y="299" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Verify and record every claim made</text>
+
+  <text x="585" y="320" fill="#374151" font-size="11">audit_log</text>
+  <text x="585" y="336" fill="#6B7280" font-size="9">   Append to the immutable audit trail</text>
+  <text x="585" y="355" fill="#374151" font-size="11">memory_confidence</text>
+  <text x="585" y="371" fill="#6B7280" font-size="9">   Score how trustworthy a memory claim is</text>
+</svg>
