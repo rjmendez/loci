@@ -249,8 +249,6 @@ $HERMES_MEMORY_DIR/
 |------|---------|
 | `rag_context_search(query, limit?, collections?, budget_chars?, exclude_types?)` | Hybrid Qdrant RAG with cross-encoder reranking. Searches `hermes_memory` and any code-chunks collection by default. Returns prompt-ready context with `[SOURCE N]` citations. Requires Qdrant — no keyword fallback. |
 | `memory_confidence(query, top_k?)` | Metamemory: 5-cue calibrated confidence score (fluency, accessibility, source_diversity, corroboration, trust). Use before asserting a memory-derived claim. |
-| `dama_routing_query(device_id?, action?, reason_label?, min_confidence?, limit?)` | Query routing decisions by structured payload filters. Requires `ROUTING_DECISIONS_COLLECTION` env var. Returns matching decisions sorted by timestamp. |
-
 #### Memory Maintenance
 
 | Tool | Purpose |
@@ -326,9 +324,8 @@ The daemon must be running for the fast path. See Section 4.
    - hermes_sessions    — past conversation history
    - hermes_memory      — investigation notes, findings (written by loci-mcp)
    - ecc_skills         — skill library
-   - agent_core_chunks  — great-library KB (DAMA, infra, code)
-   - dama_gotchi_code   — DAMA codebase
-   - prometheus_dama_code — prometheus codebase
+   - agent_core_chunks  — knowledge base (infra, code, research)
+   - (any extra collections configured via GROUNDING_EXTRA_COLLECTIONS)
 4. Score fusion: Qdrant cosine_score × importance_weight (where available)
 5. Filter: score ≥ 0.55, importance ≥ 0.2, deduplicate
 6. Take top 5 results, truncate each to 200 chars
@@ -616,9 +613,8 @@ them as orders of magnitude.
 | `hermes_memory` | tens–hundreds | Investigation notes, findings (dense+sparse, INT8 quant) | loci-mcp via investigation_store, audit_log, reflection_loop_tick |
 | `hermes_verdicts` | varies | Claim check verdict history (pre_answer_check results) | loci-mcp via investigation_pre_answer_check |
 | `ecc_skills` | hundreds | Skill library knowledge | ECC skill indexing pipeline |
-| `agent_core_chunks` | hundreds of thousands | Knowledge base: DAMA, infra, code, telemetry | ingestion pipeline |
-| `dama_gotchi_code` | tens of thousands | DAMA codebase (source indexed) | CocoIndex / ccc |
-| `prometheus_dama_code` | thousands | Prometheus DAMA source | CocoIndex / ccc |
+| `agent_core_chunks` | hundreds of thousands | Knowledge base: infra, code, research, telemetry | ingestion pipeline |
+| _(your collections)_ | varies | Any extra collections wired via `GROUNDING_EXTRA_COLLECTIONS` | your indexing pipeline |
 
 **Check live collection sizes:**
 ```bash
@@ -985,7 +981,6 @@ collections — cosine similarity breaks.
 | `QDRANT_API_KEY` | Qdrant API key | unset |
 | `HERMES_MNEMO_BANK` | Mnemosyne bank for mirroring | `default` |
 | `CODE_CHUNKS_COLLECTION` | Qdrant collection for code-chunk correlation | unset |
-| `ROUTING_DECISIONS_COLLECTION` | Qdrant collection for `dama_routing_query` | unset |
 | `HERMES_AGENT_ID` | Agent identity stamp on Qdrant points | unset |
 | `LOCI_NAMESPACE` | Namespace stamp on Qdrant points | unset |
 | `FASTEMBED_MODEL` | Fallback local embedder (used if Ollama is unavailable) | `BAAI/bge-small-en-v1.5` |
@@ -1024,7 +1019,6 @@ mismatch. Either set `EMBED_DIM=384` when using fastembed, or restore Ollama.
 | `memory_confidence` | Metamemory: 5-cue calibrated confidence score (fluency, accessibility, source_diversity, corroboration, trust). |
 | `code_memory_correlate` | Link a code hallucination to contaminated memories. Advisory and read-only. |
 | `rag_context_search` | Hybrid Qdrant RAG with cross-encoder reranking. Returns prompt-ready context with `[SOURCE N]` citations. Requires Qdrant. |
-| `dama_routing_query` | Query DAMA routing decisions by structured payload filters. Requires `ROUTING_DECISIONS_COLLECTION` env var. |
 | `reflection_loop_seed` | Enqueue Copilot artifacts (session events, process logs, temp_ingest) into the reflection queue. |
 | `reflection_loop_tick` | Process a small queue batch. Deterministic parsing only — no LLM pass. Writes findings via `investigation_store`. |
 | `reflection_loop_status` | Inspect reflection queue size, processed count, and aggregate stats. |

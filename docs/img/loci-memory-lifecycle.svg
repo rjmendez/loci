@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 360" width="840" height="360">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    </style>
+    <marker id="arr-lc" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#6B7280"/>
+    </marker>
+    <marker id="arr-lc-r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#EF4444"/>
+    </marker>
+    <marker id="arr-lc-g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#10B981"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="840" height="360" fill="#F9FAFB" rx="12"/>
+  <text x="420" y="28" text-anchor="middle" fill="#1F2937" font-size="14" font-weight="700">Memory lifecycle — how Loci keeps memory healthy over time</text>
+
+  <!-- ── PHASE 1: Write ── -->
+  <rect x="20" y="55" width="160" height="185" rx="10" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
+  <text x="100" y="82" text-anchor="middle" fill="#1E40AF" font-size="12" font-weight="700">📥 Write</text>
+  <line x1="30" y1="90" x2="170" y2="90" stroke="#BFDBFE" stroke-width="1"/>
+  <text x="100" y="112" text-anchor="middle" fill="#4B5563" font-size="10">Claude stores a finding</text>
+  <text x="100" y="128" text-anchor="middle" fill="#4B5563" font-size="10">via investigation_store</text>
+  <text x="100" y="152" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Text → embedding →</text>
+  <text x="100" y="166" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">vector stored in Qdrant</text>
+  <text x="100" y="186" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">+ row written to</text>
+  <text x="100" y="200" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Mnemosyne SQLite</text>
+  <text x="100" y="226" text-anchor="middle" fill="#3B82F6" font-size="9" font-weight="600">importance scored 1–10</text>
+
+  <!-- Arrow 1→2 -->
+  <path d="M 180 148 L 210 148" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr-lc)"/>
+
+  <!-- ── PHASE 2: Decay ── -->
+  <rect x="210" y="55" width="160" height="185" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="290" y="82" text-anchor="middle" fill="#78350F" font-size="12" font-weight="700">📉 Decay</text>
+  <line x1="220" y1="90" x2="360" y2="90" stroke="#FCD34D" stroke-width="1"/>
+  <text x="290" y="112" text-anchor="middle" fill="#4B5563" font-size="10">Confidence decays</text>
+  <text x="290" y="128" text-anchor="middle" fill="#4B5563" font-size="10">if not reinforced</text>
+  <text x="290" y="152" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Ebbinghaus forgetting</text>
+  <text x="290" y="166" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">curve applied daily</text>
+  <text x="290" y="186" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Memories recalled</text>
+  <text x="290" y="200" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">often decay slower</text>
+  <text x="290" y="226" text-anchor="middle" fill="#D97706" font-size="9" font-weight="600">FSRS spaced repetition</text>
+
+  <!-- Arrow 2→3 -->
+  <path d="M 370 148 L 400 148" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr-lc)"/>
+
+  <!-- ── PHASE 3: Consolidate ── -->
+  <rect x="400" y="55" width="165" height="185" rx="10" fill="#F0FDF4" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="482" y="82" text-anchor="middle" fill="#14532D" font-size="12" font-weight="700">🔀 Consolidate</text>
+  <line x1="410" y1="90" x2="555" y2="90" stroke="#86EFAC" stroke-width="1"/>
+  <text x="482" y="112" text-anchor="middle" fill="#4B5563" font-size="10">Background cron</text>
+  <text x="482" y="128" text-anchor="middle" fill="#4B5563" font-size="10">deduplicates &amp; merges</text>
+  <text x="482" y="152" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Duplicates merged;</text>
+  <text x="482" y="166" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">contradictions flagged</text>
+  <text x="482" y="186" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">memory_self_check</text>
+  <text x="482" y="200" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">runs automatically</text>
+  <text x="482" y="226" text-anchor="middle" fill="#16A34A" font-size="9" font-weight="600">memory_consolidate tool</text>
+
+  <!-- Arrow 3→4 -->
+  <path d="M 565 148 L 595 148" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr-lc)"/>
+
+  <!-- ── PHASE 4: Prune ── -->
+  <rect x="595" y="55" width="225" height="185" rx="10" fill="#FFF1F2" stroke="#FDA4AF" stroke-width="1.5"/>
+  <text x="707" y="82" text-anchor="middle" fill="#9F1239" font-size="12" font-weight="700">🧹 Prune or Reinforce</text>
+  <line x1="605" y1="90" x2="810" y2="90" stroke="#FDA4AF" stroke-width="1"/>
+  <text x="707" y="112" text-anchor="middle" fill="#4B5563" font-size="10">Low-confidence memories</text>
+  <text x="707" y="128" text-anchor="middle" fill="#4B5563" font-size="10">are purged (glymphatic sweep)</text>
+  <text x="707" y="152" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">Important memories</text>
+  <text x="707" y="166" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">reinforced and promoted</text>
+  <text x="707" y="186" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">You can manually correct</text>
+  <text x="707" y="200" text-anchor="middle" fill="#6B7280" font-size="9" font-style="italic">with memory_retract</text>
+  <text x="707" y="226" text-anchor="middle" fill="#BE123C" font-size="9" font-weight="600">TTL-based auto-purge</text>
+
+  <!-- ── BOTTOM LEGEND: cron schedule ── -->
+  <rect x="20" y="265" width="800" height="78" rx="10" fill="white" stroke="#E5E7EB" stroke-width="1"/>
+  <text x="40" y="288" fill="#1F2937" font-size="11" font-weight="600">Automated schedule (cron)</text>
+  <text x="40" y="308" fill="#6B7280" font-size="10">• Ebbinghaus decay scoring — runs nightly</text>
+  <text x="40" y="324" fill="#6B7280" font-size="10">• Glymphatic sweep (TTL purge) — runs nightly</text>
+  <text x="300" y="308" fill="#6B7280" font-size="10">• Qdrant ↔ SQLite sync — runs hourly</text>
+  <text x="300" y="324" fill="#6B7280" font-size="10">• FSRS review queue update — runs nightly</text>
+  <text x="570" y="308" fill="#6B7280" font-size="10">• A-MEM associative consolidation — nightly</text>
+  <text x="570" y="324" fill="#6B7280" font-size="10">• Reflection loop tick — on demand or scheduled</text>
+  <text x="40" y="336" fill="#9CA3AF" font-size="9" font-style="italic">You don't have to think about any of this — it runs in the background automatically.</text>
+</svg>

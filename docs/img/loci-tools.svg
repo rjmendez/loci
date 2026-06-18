@@ -7,7 +7,7 @@
 
   <!-- Background -->
   <rect width="840" height="420" fill="#F9FAFB" rx="12"/>
-  <text x="420" y="30" text-anchor="middle" fill="#1F2937" font-size="15" font-weight="700">Loci's 25 MCP Tools — organised by purpose</text>
+  <text x="420" y="30" text-anchor="middle" fill="#1F2937" font-size="15" font-weight="700">Loci's 24 MCP Tools — organised by purpose</text>
 
   <!-- ── GROUP 1: Investigation (blue) — col 1 ── -->
   <rect x="20" y="50" width="240" height="340" rx="10" fill="#EFF6FF" stroke="#BFDBFE" stroke-width="1.5"/>
@@ -51,15 +51,13 @@
   <rect x="280" y="250" width="270" height="140" rx="10" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.5"/>
   <rect x="280" y="250" width="270" height="38" rx="10" fill="#EDE9FE"/>
   <rect x="280" y="278" width="270" height="10" fill="#EDE9FE"/>
-  <text x="415" y="274" text-anchor="middle" fill="#5B21B6" font-size="12" font-weight="700">🔍 Search &amp; Retrieval (3)</text>
+  <text x="415" y="274" text-anchor="middle" fill="#5B21B6" font-size="12" font-weight="700">🔍 Search &amp; Retrieval (2)</text>
   <text x="415" y="299" text-anchor="middle" fill="#4B5563" font-size="10" font-style="italic">Pull relevant context before answering</text>
 
-  <text x="295" y="320" fill="#5B21B6" font-size="11">rag_context_search</text>
-  <text x="295" y="336" fill="#6B7280" font-size="9">   Semantic search across all memory collections</text>
-  <text x="295" y="355" fill="#5B21B6" font-size="11">code_memory_correlate</text>
-  <text x="295" y="371" fill="#6B7280" font-size="9">   Link a code change to stored context</text>
-  <text x="295" y="388" fill="#5B21B6" font-size="11">dama_routing_query</text>
-  <text x="295" y="404" fill="#6B7280" font-size="9">   Query from a custom routing collection</text>
+  <text x="295" y="325" fill="#5B21B6" font-size="11">rag_context_search</text>
+  <text x="295" y="341" fill="#6B7280" font-size="9">   Semantic search across all memory collections</text>
+  <text x="295" y="363" fill="#5B21B6" font-size="11">code_memory_correlate</text>
+  <text x="295" y="379" fill="#6B7280" font-size="9">   Link a code change to stored memory context</text>
 
   <!-- ── GROUP 4: Reflection (orange) — col 3 top ── -->
   <rect x="570" y="50" width="250" height="185" rx="10" fill="#FFFBEB" stroke="#FCD34D" stroke-width="1.5"/>

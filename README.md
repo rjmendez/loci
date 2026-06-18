@@ -38,6 +38,8 @@ data stays on your own infrastructure: Qdrant and Ollama run locally or on your 
 
 ## Quick start
 
+![Three-step setup](docs/img/loci-quickstart.svg)
+
 ```bash
 git clone https://github.com/rjmendez/loci
 cd loci/mcp
@@ -78,7 +80,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
 ---
 
-## MCP tools (25)
+## MCP tools (24)
 
 ![Tool groups](docs/img/loci-tools.svg)
 
@@ -107,15 +109,14 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 | `reflection_loop_status` | Report reflection loop queue status |
 | `rag_context_search` | Fan-out semantic search across all configured Qdrant collections |
 | `memory_consolidate` | Trigger memory consolidation (dedup + merge) |
-| `dama_routing_query` | Query domain routing decisions from the configured collection |
 | `memory_confidence` | Estimate confidence in a memory-derived claim before asserting it |
 
 ---
 
-## A2A skills (14)
+## A2A skills (13)
 
-The A2A server exposes 14 skills via JSON-RPC 2.0 over HTTP, letting peer agents share
-memory without requiring the MCP stack. Thirteen are advertised in the agent card;
+The A2A server exposes 13 skills via JSON-RPC 2.0 over HTTP, letting peer agents share
+memory without requiring the MCP stack. Twelve are advertised in the agent card;
 `memory_prime` is callable but not listed in discovery.
 
 | Skill | Advertised |
@@ -132,7 +133,6 @@ memory without requiring the MCP stack. Thirteen are advertised in the agent car
 | `gpu_inference` | Yes |
 | `docker_status` | Yes |
 | `ua_search` | Yes |
-| `dama_telemetry` | Yes |
 | `memory_prime` | No |
 
 ---
@@ -179,7 +179,6 @@ Two `.env.example` files are provided:
 | `HERMES_MEMORY_DIR` | `~/.hermes/memory-sessions` | Investigation session storage root |
 | `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension — must match your model |
 | `CODE_CHUNKS_COLLECTION` | _(unset)_ | Qdrant collection for `code_memory_correlate` |
-| `ROUTING_DECISIONS_COLLECTION` | _(unset)_ | Qdrant collection for `dama_routing_query` |
 | `HERMES_MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable-http` |
 | `HERMES_MCP_HOST` | `0.0.0.0` | Bind host for SSE/HTTP transport |
 | `HERMES_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
@@ -197,7 +196,6 @@ Two `.env.example` files are provided:
 | `HERMES_AGENT_ID` | `hermes-agent` | Agent identity stamped on all writes |
 | `EXTRA_RAG_COLLECTIONS` | `""` | Comma-separated extra Qdrant collections for fan-out RAG |
 | `PEER_A2A_URLS` | `""` | Comma-separated peer A2A endpoints for context broadcast |
-| `DAMA_TELEMETRY_COLLECTION` | `""` | Qdrant collection for `dama_telemetry` skill |
 
 ---
 

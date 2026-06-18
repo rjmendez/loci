@@ -77,7 +77,7 @@ are completely different.
 MCP stands for **Model Context Protocol** — a standard that lets AI tools like Claude Code
 call external functions. Think of it like browser extensions, but for AI agents.
 
-Loci ships 25 MCP tools that Claude can call. They fall into five groups:
+Loci ships 24 MCP tools that Claude can call. They fall into five groups:
 
 ![Tool map](img/loci-tools.svg)
 
@@ -137,6 +137,9 @@ etc.) and block or audit them before they execute.
 
 ### Bio-inspired memory lifecycle
 Loci runs background consolidation processes inspired by how human memory works:
+
+![Memory lifecycle](img/loci-memory-lifecycle.svg)
+
 - **Slow-wave consolidation** — important memories are strengthened periodically
 - **Glymphatic sweep** — old, low-importance memories are pruned to keep the store clean
 - **FSRS spaced repetition** — memories due for review surface at the right time
@@ -161,6 +164,8 @@ Everything except Claude Code runs locally on your machine or your own server.
 ---
 
 ## Minimal setup (5 minutes)
+
+![Setup steps](img/loci-quickstart.svg)
 
 ```bash
 # 1. Clone and install

@@ -549,8 +549,6 @@ def _embed_auth_headers() -> dict:
 # to the name of a Qdrant collection that holds code embeddings).
 _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 
-# Optional collection for routing/decision records (set ROUTING_DECISIONS_COLLECTION).
-_ROUTING_DECISIONS_COLLECTION = os.environ.get("ROUTING_DECISIONS_COLLECTION", "")
 
 
 def _embed(text: str) -> list[float] | None:
@@ -4890,110 +4888,6 @@ def memory_consolidate(dry_run: bool = False) -> str:
         })
     except Exception as e:
         return _json.dumps({"status": "error", "error": str(e)})
-
-@mcp.tool()
-def dama_routing_query(
-    device_id: str = "",
-    action: str = "",
-    reason_label: str = "",
-    min_confidence: float = 0.0,
-    limit: int = 20,
-) -> str:
-    """
-    Query routing decisions stored in the configured ROUTING_DECISIONS_COLLECTION.
-    Returns matching decisions filtered by device, action, reason label, and confidence.
-
-    Args:
-        device_id: Filter by device ID (partial match). Empty = all devices.
-        action: Filter by action type. Empty = all.
-        reason_label: Filter by reason label. Empty = all.
-        min_confidence: Minimum confidence threshold (0.0-1.0). Default 0.0 = no filter.
-        limit: Max results to return (default 20, max 100).
-
-    Returns JSON with matching decisions sorted by timestamp descending.
-    """
-    import json
-    from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
-
-    if not _ROUTING_DECISIONS_COLLECTION:
-        return json.dumps({
-            "mode": "not_configured",
-            "error": "ROUTING_DECISIONS_COLLECTION env var not set",
-            "hint": "Set ROUTING_DECISIONS_COLLECTION=<your-collection-name> to enable this tool",
-            "results": [],
-        })
-
-    client, _col = _get_qdrant()
-    if client is None:
-        return json.dumps({"mode": "qdrant_unavailable", "error": "Qdrant not configured", "results": []})
-
-    must_conditions = []
-
-    if device_id:
-        must_conditions.append(
-            FieldCondition(key="device_id", match=MatchValue(value=device_id))
-        )
-    if action:
-        must_conditions.append(
-            FieldCondition(key="action", match=MatchValue(value=action))
-        )
-    if reason_label:
-        must_conditions.append(
-            FieldCondition(key="reason_label", match=MatchValue(value=reason_label))
-        )
-    if min_confidence > 0.0:
-        must_conditions.append(
-            FieldCondition(key="confidence", range=Range(gte=min_confidence))
-        )
-
-    scroll_filter = Filter(must=must_conditions) if must_conditions else None
-
-    try:
-        results, _ = client.scroll(
-            collection_name=_ROUTING_DECISIONS_COLLECTION,
-            scroll_filter=scroll_filter,
-            limit=min(limit, 100),
-            with_payload=True,
-            with_vectors=False,
-        )
-    except Exception as e:
-        return json.dumps({"mode": "error", "error": str(e), "results": []})
-
-    decisions = []
-    for pt in results:
-        pay = pt.payload or {}
-        decisions.append({
-            "decision_id": pay.get("decision_id"),
-            "device_id": pay.get("device_id"),
-            "ant_id": pay.get("ant_id"),
-            "timestamp": pay.get("timestamp"),
-            "action": pay.get("action"),
-            "confidence": pay.get("confidence"),
-            "risk_score": pay.get("risk_score"),
-            "reason_label": pay.get("reason_label"),
-            "inference_mode": pay.get("inference_mode"),
-            "decision_summary": pay.get("decision_summary"),
-            "feature_attribution_summary": pay.get("feature_attribution_summary"),
-            "top_sensor_domain": pay.get("top_sensor_domain"),
-            "transition_label": pay.get("transition_label"),
-        })
-
-    # Sort by timestamp descending if available
-    decisions.sort(key=lambda d: d.get("timestamp") or "", reverse=True)
-
-    return json.dumps({
-        "mode": "payload_filtered",
-        "collection": _ROUTING_DECISIONS_COLLECTION,
-        "result_count": len(decisions),
-        "filters_applied": {
-            "device_id": device_id or None,
-            "action": action or None,
-            "reason_label": reason_label or None,
-            "min_confidence": min_confidence if min_confidence > 0 else None,
-        },
-        "decisions": decisions,
-    })
-
 
 # ---------------------------------------------------------------------------
 # Metamemory

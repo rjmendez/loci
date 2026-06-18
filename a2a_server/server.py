@@ -138,8 +138,8 @@ JSON-RPC CALL SHAPE
     "method": "tasks/send",
     "params": {
       "skill_id": "memory_recall",
-      "message":  "DAMA ant colony",
-      "input":    {"query": "DAMA ant colony", "top_k": 5},
+      "message":  "recent authentication decisions",
+      "input":    {"query": "recent authentication decisions", "top_k": 5},
       "sender":   "hermes-agent"
     }
   }
@@ -216,8 +216,6 @@ _EXTRA_RAG_COLLECTIONS = [
 
 # Optional named collection for domain-specific skills. Skill returns "not configured"
 # if the env var is unset, so the server works without the backing collection.
-_DAMA_TELEMETRY_COLLECTION = os.environ.get('DAMA_TELEMETRY_COLLECTION', '')
-
 _LOG_AGENT_ID = os.environ.get('HERMES_AGENT_ID', 'hermes-agent')
 logging.basicConfig(level=logging.INFO,
                     format=f'%(asctime)s [{_LOG_AGENT_ID}] %(message)s')
@@ -326,15 +324,6 @@ AGENT_CARD = {
             'description': (
                 'Semantic search over understand-anything knowledge graphs in Qdrant. '
                 'Input: {query: str, repo?: str, type?: str, layer?: str, limit?: int=10}'
-            )
-        },
-        {
-            'id': 'dama_telemetry',
-            'name': 'DAMA Telemetry Query',
-            'description': (
-                'Query domain telemetry from the configured Qdrant collection. '
-                'Requires DAMA_TELEMETRY_COLLECTION to be set. '
-                'Input: {query?: str, device?: str, limit?: int=5}'
             )
         },
         {
@@ -1084,61 +1073,6 @@ async def skill_ua_search(task: dict) -> dict:
         return {'error': str(e), 'query': query}
 
 
-async def skill_dama_telemetry(task: dict) -> dict:
-    """
-    Query a telemetry Qdrant collection by semantic similarity.
-    Requires DAMA_TELEMETRY_COLLECTION env var to be set.
-    Input: {query?: str, device?: str, limit?: int=5}
-    """
-    if not _DAMA_TELEMETRY_COLLECTION:
-        return {
-            'error': 'DAMA_TELEMETRY_COLLECTION env var not configured',
-            'hint': 'Set DAMA_TELEMETRY_COLLECTION=<your-collection-name> to enable this skill',
-        }
-
-    inp    = task.get('input', {})
-    query  = inp.get('query', 'telemetry')
-    device = inp.get('device')
-    limit  = int(inp.get('limit', 5))
-
-    must = []
-    if device:
-        must.append({'key': 'device_id', 'match': {'value': device}})
-
-    payload = {'vector': None, 'limit': limit, 'with_payload': True}
-    if must:
-        payload['filter'] = {'must': must}
-
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{OLLAMA_BASE.rstrip('/v1')}/api/embed",
-                json={'model': EMBED_MODEL, 'input': query},
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                d = await r.json()
-                vec = d['embeddings'][0]
-
-        payload['vector'] = vec
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{QDRANT_URL}/collections/{_DAMA_TELEMETRY_COLLECTION}/points/search",
-                headers={'api-key': QDRANT_KEY, 'Content-Type': 'application/json'},
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                d = await r.json()
-                hits = d.get('result', [])
-                return {
-                    'results': [{'score': h['score'], 'payload': h['payload']} for h in hits],
-                    'count': len(hits),
-                    'query': query,
-                    'collection': _DAMA_TELEMETRY_COLLECTION,
-                }
-    except Exception as e:
-        return {'error': str(e)}
-
-
 # ── skill dispatcher ─────────────────────────────────────────────────────────────
 async def skill_memory_prime(task: dict) -> dict:
     """
@@ -1262,7 +1196,6 @@ _SKILL_MAP: dict[str, Any] = {
     'gpu_inference':           skill_gpu_inference,
     'docker_status':           skill_docker_status,
     'ua_search':               skill_ua_search,
-    'dama_telemetry':          skill_dama_telemetry,
 }
 
 async def _dispatch(skill_id: str, task: dict) -> Any:
