@@ -1,4 +1,4 @@
-# hermes_memory — Persistent Memory for AI Agent Meshes
+# Loci — Persistent Memory for AI Agent Meshes
 
 Persistent memory and knowledge layer for AI agent meshes. Provides grounding,
 consolidation, self-improvement, and longitudinal evaluation for Claude Code and
@@ -78,7 +78,7 @@ Override any default with env vars — see [docs/OPERATIONS.md](docs/OPERATIONS.
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-org>/hermes_memory
+git clone https://github.com/rjmendez/loci
 cd hermes_memory/mcp
 python3 -m venv .venv
 # Base install (Qdrant-only mode):
@@ -92,7 +92,7 @@ cp .env.example .env   # fill in QDRANT_URL, QDRANT_API_KEY, OLLAMA_BASE_URL
 See [mcp/README.md](mcp/README.md) for full tool reference and Claude Code wiring.
 See [a2a_server/README.md](a2a_server/README.md) for the A2A mesh endpoint.
 
-## MCP tools (26)
+## MCP tools (25)
 
 | Tool | Purpose |
 |---|---|

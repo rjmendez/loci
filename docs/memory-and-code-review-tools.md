@@ -101,7 +101,7 @@ prompt on every single turn. No query needed — always present.
 **MEMORY.md** — notes about the environment, tools, and codebase.
   - Stack facts: Qdrant host/port, Ollama host, setup details
   - Tool quirks and workarounds
-  - hermes_memory repo layout, session sync config
+  - Loci repo layout, session sync config
   - Stable conventions that would otherwise need re-explaining every session
 
 **USER.md** — facts about the user.
@@ -956,7 +956,7 @@ SOUL.md                        — profile identity/persona definition
 
 **MCP servers wired (from config.yaml):**
 ```
-hermes_memory (loci): stdio via mcp/server.py              (this repo)
+loci:                 stdio via mcp/server.py              (this repo)
   env: QDRANT_URL, OLLAMA_BASE_URL, QDRANT_API_KEY, HERMES_AGENT_ID, LOCI_NAMESPACE
 deep_think:           http://127.0.0.1:30852/mcp           (systemd --user)
 mnemosyne:            stdio via mnemosyne mcp               (local venv)
