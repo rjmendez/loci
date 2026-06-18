@@ -5,8 +5,10 @@ Qdrant/Ollama/SQLite. Skills that make network calls are not tested here —
 only the JSON-RPC dispatch layer, auth enforcement, and error responses.
 """
 
+import importlib.util
 import json
 import os
+import pathlib
 import sys
 import unittest
 
@@ -16,10 +18,14 @@ os.environ.setdefault("HERMES_A2A_URL", "http://localhost:8201")
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("MNEMOSYNE_EMBEDDING_API_URL", "http://localhost:11434/v1")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Load server.py by absolute path so pytest sessions that also collect mcp/tests/
+# (which imports a different 'server' module) don't collide in sys.modules.
+_server_path = pathlib.Path(__file__).parent.parent / "server.py"
+_spec = importlib.util.spec_from_file_location("a2a_server_impl", _server_path)
+a2a_server = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(a2a_server)
 
 from fastapi.testclient import TestClient
-import server as a2a_server
 
 client = TestClient(a2a_server.app, raise_server_exceptions=False)
 

@@ -561,7 +561,7 @@ async def skill_memory_remember(task: dict) -> dict:
         return {'error': 'content is required'}
 
     mem_id = str(uuid.uuid4())
-    now    = datetime.datetime.utcnow().isoformat()
+    now    = datetime.datetime.now(datetime.timezone.utc).isoformat()
     meta   = json.dumps({'author_id': sender, 'via': 'a2a', 'stored_by': AGENT_ID})
 
     try:
@@ -883,7 +883,7 @@ async def skill_mnemosyne_triple_add(task: dict) -> dict:
     subject    = (inp.get('subject') or '').strip()
     predicate  = (inp.get('predicate') or '').strip()
     obj        = (inp.get('object') or '').strip()
-    valid_from = inp.get('valid_from') or datetime.datetime.utcnow().strftime('%Y-%m-%d')
+    valid_from = inp.get('valid_from') or datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
     valid_until = inp.get('valid_until')
     source     = inp.get('source', 'a2a')
     confidence = float(inp.get('confidence', 1.0))
@@ -1331,7 +1331,7 @@ async def a2a_endpoint(request: Request):
         })
 
 
-@app.get('/a2a/tasks/{task_id}', dependencies=[Depends(_verify_bearer)])
+@app.get('/a2a/tasks/{task_id}', dependencies=[Depends(_verify_bearer), Depends(_verify_totp)])
 async def get_task(task_id: str):
     if task_id not in _tasks:
         raise HTTPException(status_code=404, detail='Task not found')
@@ -1351,7 +1351,7 @@ async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
         'input':      params.get('input', {}),
         'sender':     sender,
         'status':     'working',
-        'created_at': datetime.datetime.utcnow().isoformat(),
+        'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'result':     None
     }
     _store_task(task_id, task)

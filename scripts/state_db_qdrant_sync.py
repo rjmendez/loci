@@ -206,7 +206,7 @@ def main():
                     "agent_id":   AGENT_ID,
                     "profile":    PROFILE,
                     "msg_count":  s.get("msg_count", 0),
-                    "last_synced": datetime.datetime.utcnow().isoformat() + "Z",
+                    "last_synced": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                     "content_preview": s["text"][:500],
                 }
             })

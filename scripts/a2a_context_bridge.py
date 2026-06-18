@@ -180,7 +180,7 @@ async def run(dry_run: bool, verbose: bool):
     else:
         # First run: look back LOOKBACK_MIN minutes
         since = (
-            datetime.datetime.utcnow() - datetime.timedelta(minutes=LOOKBACK_MIN)
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=LOOKBACK_MIN)
         ).isoformat()
         log.info("First run — looking back %d min (since %s)", LOOKBACK_MIN, since)
 
@@ -190,7 +190,7 @@ async def run(dry_run: bool, verbose: bool):
     if not mems:
         log.info("Nothing to bridge.")
         if not dry_run:
-            state["last_run"] = datetime.datetime.utcnow().isoformat()
+            state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             _save_state(state)
         return
 
@@ -212,7 +212,7 @@ async def run(dry_run: bool, verbose: bool):
     log.info("Bridge complete — ok=%d fail=%d dry_run=%s", ok, fail, dry_run)
 
     if not dry_run:
-        state["last_run"] = datetime.datetime.utcnow().isoformat()
+        state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         state["last_ok"]  = ok
         state["last_fail"]= fail
         _save_state(state)

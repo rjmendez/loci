@@ -4800,6 +4800,9 @@ def rag_context_search(
         JSON with {query, context, sources, total_chars, truncated, result_count, mode,
                    collections_searched, qdrant_available}
     """
+    if not query or not query.strip():
+        return json.dumps({"error": "query must not be empty", "results": [], "query": query})
+
     if exclude_types is None:
         exclude_types = ["gps_trajectory"]
 

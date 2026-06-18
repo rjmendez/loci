@@ -34,7 +34,7 @@ def read_recent_failures():
         print(f"[exif] WARNING: mnemosyne db not found at {MNEMOSYNE_DB}", file=sys.stderr)
         return []
 
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
+    cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=7)).isoformat()
     query = """
         SELECT content, importance
         FROM memories
@@ -204,7 +204,7 @@ def phase_validator(suggestion: dict, candidate_dir: str) -> None:
     confidence = suggestion.get("confidence", 0.0)
 
     record = {
-        "ts": datetime.datetime.utcnow().isoformat(),
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "skill_name": skill_name,
         "confidence": confidence,
         "path": candidate_dir,

@@ -291,7 +291,7 @@ def write_manifest(n_neg: int, n_pos: int, n_corr: int) -> None:
         "n_neg": n_neg,
         "n_pos": n_pos,
         "n_corr": n_corr,
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "ready_for_sft": n_corr >= 10,
     }
     path = os.path.join(OUTPUT_DIR, "manifest.json")
