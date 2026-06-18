@@ -4897,14 +4897,13 @@ def dama_routing_query(
     limit: int = 20,
 ) -> str:
     """
-    Query DAMA routing decisions by structured filters.
-    Searches the routing_decisions Qdrant collection (279k pts, 32-dim ant-state vectors).
-    Returns matching decisions with action, confidence, risk scores, sensor attribution.
+    Query routing decisions stored in the configured ROUTING_DECISIONS_COLLECTION.
+    Returns matching decisions filtered by device, action, reason label, and confidence.
 
     Args:
-        device_id: Filter by device ID (partial match, e.g. 'pixel_6a'). Empty = all devices.
-        action: Filter by action type ('escalate', 'local_observe', 'remote_infer', etc.). Empty = all.
-        reason_label: Filter by reason label (e.g. 'threat_detected', 'burst_opportunity'). Empty = all.
+        device_id: Filter by device ID (partial match). Empty = all devices.
+        action: Filter by action type. Empty = all.
+        reason_label: Filter by reason label. Empty = all.
         min_confidence: Minimum confidence threshold (0.0-1.0). Default 0.0 = no filter.
         limit: Max results to return (default 20, max 100).
 

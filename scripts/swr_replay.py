@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 
 QDRANT_URL            = os.environ.get("QDRANT_URL")
 QDRANT_KEY            = os.environ.get("QDRANT_API_KEY",   "")
-OLLAMA_URL            = os.environ.get("OLLAMA_BASE_URL")
+OLLAMA_URL            = os.environ.get("OLLAMA_URL")
 EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")

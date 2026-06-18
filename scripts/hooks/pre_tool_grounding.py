@@ -52,7 +52,12 @@ GROUNDING_TOOLS: frozenset[str] = frozenset({
     "mcp_serena_get_diagnostics_for_file",
     "mcp_serena_list_dir",
     "mcp_serena_get_overview",
-    # Hermes read tools — not mutations, suppress audit noise
+    # Claude Code read-only tools — suppress audit noise
+    "Read",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    # Hermes/legacy read tools
     "read_file",
     "search_files",
     "skill_view",
@@ -70,6 +75,11 @@ GROUNDING_TOOLS: frozenset[str] = frozenset({
 
 # ---- File-mutation tools — intercepted when BLOCK_MODE is on ------------------
 MUTATION_TOOLS: frozenset[str] = frozenset({
+    # Claude Code mutation tools
+    "Edit",
+    "Write",
+    "MultiEdit",
+    # Hermes/legacy mutation tools
     "write_file",
     "patch",
     "mcp_serena_create_text_file",
@@ -459,8 +469,8 @@ def main() -> None:
         _audit(tool_name, tool_input, session_id, "ALLOW(mutation)")
         sys.exit(0)
 
-    # Tier 3 — terminal: supply chain IOCs + dangerous patterns
-    if tool_name == "terminal":
+    # Tier 3 — terminal/Bash: supply chain IOCs + dangerous patterns
+    if tool_name in ("terminal", "Bash"):
         # 3a — Supply chain IOC (Hades/Miasma) — always audited, blocked in BLOCK_MODE
         sc_terminal = _check_supply_chain_terminal(tool_input)
         if sc_terminal:

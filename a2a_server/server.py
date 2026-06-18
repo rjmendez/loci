@@ -620,9 +620,7 @@ async def skill_memory_stats(task: dict) -> dict:
     return {
         'sqlite': sqlite_stats,
         'qdrant': qdrant_stats,
-        'db_path': MNEMOSYNE_DB,
         'agent_id': AGENT_ID,
-        'qdrant_url': QDRANT_URL
     }
 
 
@@ -641,7 +639,6 @@ async def skill_session_search(task: dict) -> dict:
         return {
             'error': 'embedding failed — Ollama may be unreachable',
             'sessions': [],
-            'ollama_url': OLLAMA_BASE
         }
 
     qdrant_filter = None
