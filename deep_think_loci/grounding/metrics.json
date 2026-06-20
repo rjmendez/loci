@@ -1,0 +1,10 @@
+{
+ "trained_task": "rag_bleed / topical-grounding",
+ "cv_auc": 0.957,
+ "cv_acc": 0.847,
+ "cosine_baseline_acc": 0.858,
+ "n_topical": 450,
+ "n_lineage": 68,
+ "n_hallucination": 1,
+ "total": 519
+}

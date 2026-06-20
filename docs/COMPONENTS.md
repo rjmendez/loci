@@ -288,6 +288,42 @@ Bridges Hermes event stream to the A2A broadcast server for mesh-wide context sh
 
 ---
 
+## Deep-think-loci reasoning engine
+
+Lives in `deep_think_loci/` (not `scripts/`). A multi-tier reasoning engine that runs
+as a Claude Code **Workflow** over a Loci investigation — the supported replacement for
+the `deep_think` MCP server's reasoning surface. See `deep_think_loci/README.md` for the
+full reference and `deep_think_loci/CHANGELOG.md` for the v1→v3.2 evolution.
+
+**Not to be confused with the Grounding pipeline above.** That pipeline grounds *every
+user turn* (pre-LLM/pre-tool hooks). This engine grounds *its own multi-agent reasoning*:
+tiered models (haiku ideation → opus synthesis) fan out, persist findings to the
+investigation with lineage (`derived_from`), and an opus tier produces a grounded answer.
+
+### `deep_think_loci/workflows/deep-think-loci.js`
+**Purpose:** the engine. init → 5 haiku ideation generators (RAG-grounded) → dedicated
+writer (persists all findings) → verify → 2 opus half-syntheses → opus final (red-team +
+integrity check). All-Claude as of v3.2 (external uncensored tier removed).
+**Run:** `Workflow({ scriptPath: "deep_think_loci/workflows/deep-think-loci.js" })`.
+**Key args:** `run_id`, `targets[]`, `rag_collections`, `ground_threshold` (default 0.59).
+
+### `deep_think_loci/grounding/ground_gate.py`
+**Purpose:** cosine RAG-bleed gate — embeds query + candidates (nomic) and keeps only
+those clearing a per-target threshold (0.59), dropping cross-target bleed before any model
+reasons. Local, ~$0. `--model grounding_bleed_clf.joblib` swaps in the trained classifier.
+**Key env:** nomic-embed endpoint (Ollama `/v1/embeddings`).
+
+### `deep_think_loci/grounding/build_grounding_dataset.py`
+**Purpose:** reproducible — harvest labeled (claim, evidence) pairs from a Loci corpus,
+train + eval the bleed-detector, write `grounding_dataset.jsonl` / `grounding_bleed_clf.joblib`
+/ `metrics.json`. Re-run as the corpus grows (each engine run mints more labeled pairs).
+
+### `deep_think_loci/install.sh`
+**Purpose:** deploy the workflow + gate from the repo to the `~/.hermes` runtime locations
+the workflow defaults to. Idempotent.
+
+---
+
 ## Cron schedule summary
 
 | Script | Job name | Interval |

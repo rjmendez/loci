@@ -238,6 +238,7 @@ loci/
 ├── scripts/               Python scripts (run standalone or via cron)
 │   └── hooks/             Claude Code / agent hook adapters
 ├── eval/                  Longitudinal grounding quality evaluation harness
+├── deep_think_loci/       Multi-tier reasoning engine — Workflow over the Loci corpus (beta)
 ├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
 ├── rules/                 Agent behavioral rules (loaded at session start)
 ├── cron/jobs.json         (reference copy — live file in ~/.hermes/cron/)
