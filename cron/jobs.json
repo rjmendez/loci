@@ -119,6 +119,44 @@
       "profile": null
     },
     {
+      "id": "d731a8c5e012",
+      "name": "deep-think-loci-harvest",
+      "prompt": "unused",
+      "skills": [],
+      "skill": null,
+      "model": null,
+      "provider": null,
+      "base_url": null,
+      "script": "dtl_harvest.sh",
+      "no_agent": true,
+      "context_from": null,
+      "schedule": {
+        "kind": "interval",
+        "minutes": 10080,
+        "display": "every 7d"
+      },
+      "schedule_display": "every 7d",
+      "repeat": {
+        "times": null,
+        "completed": 0
+      },
+      "enabled": false,
+      "state": "scheduled",
+      "paused_at": null,
+      "paused_reason": "disabled by default — retrains a model from the corpus; enable deliberately",
+      "created_at": null,
+      "next_run_at": null,
+      "last_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "deliver": "local",
+      "origin": null,
+      "enabled_toolsets": null,
+      "workdir": null,
+      "profile": null
+    },
+    {
       "id": "c857cd706f67",
       "name": "mnemosyne-qdrant-sync",
       "prompt": "",
