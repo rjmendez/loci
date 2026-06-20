@@ -6,3 +6,4 @@ EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 "$HERMES_PY" "$EVAL_DIR/harness.py" "$@"
 "$HERMES_PY" "$EVAL_DIR/grounding_gate_eval.py" "$@"
+"$HERMES_PY" "$EVAL_DIR/grounding_gate_qf_eval.py" "$@"

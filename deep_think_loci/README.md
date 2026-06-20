@@ -25,9 +25,9 @@ Every tier reasons **only over grounding-gated evidence** (see below). The opus 
 
 1. **Dedicated-writer persistence.** Workflow subagents unreliably execute an `investigation_store` MCP call when it's one step in a multi-step task (RAG → generate → store) — they silently skip it or *fabricate* a confirmation. Fix: generation agents return schema-validated output **only**; a single-purpose **writer** agent does all the stores and returns the real `finding_id`s. Took persistence from ~40% to 100%.
 
-2. **Cosine grounding gate (`grounding/ground_gate.py`).** RAG retrieval bleeds cross-target findings at cosine 0.35–0.59 — moderately similar, plausibly relevant, but *wrong topic* — and a non-verifying model will hallucinate over them. The gate embeds the query + each candidate (nomic, local) and keeps only those clearing a per-target threshold (**0.59**), dropping the bleed before any model reasons. Local, ~$0 marginal.
+2. **Grounding gate (`grounding/ground_gate.py`).** RAG retrieval bleeds cross-target findings at cosine 0.35–0.59 — moderately similar, plausibly relevant, but *wrong topic* — and a non-verifying model will hallucinate over them. The gate embeds the query + each candidate (nomic, local) and keeps only on-topic findings, dropping the bleed before any model reasons. Local, ~$0 marginal.
    - **Query per-target, never blended** — a blended multi-target query dilutes cosines and false-drops whole genuine targets (the v3 bug).
-   - Drop-in upgrade: a trained classifier (`grounding/grounding_bleed_clf.joblib`) once it beats the cosine threshold on a larger corpus.
+   - **Default = the trained classifier** (`grounding/grounding_bleed_clf.joblib`), now that `eval/grounding_gate_qf_eval.py` validated it beats the cosine threshold on the gate's real query→finding task (F1 0.94 vs 0.82, rejects all bleed at a small recall cost). Auto-loads when present + loadable; **falls back to the cosine threshold (0.59)** on any error or with `--no-model`.
 
 ## Usage
 
@@ -81,10 +81,10 @@ A full run ≈ **$5–8**, dominated by **cached context** (cache read/write), n
 | `grounding_bleed_clf.joblib` | trained bleed-detector (LR on nomic pair-features) |
 | `metrics.json` | latest CV AUC 0.994 / acc 0.965 vs tuned-cosine 0.910 (the finding-pair task) |
 
-Each run mints more labeled pairs as a byproduct; run `harvest.sh` to fold them back in (rebuild + retrain + eval). `eval/grounding_gate_eval.py` tracks separation quality longitudinally.
+Each run mints more labeled pairs as a byproduct; run `harvest.sh` to fold them back in (rebuild + retrain + eval). `eval/grounding_gate_eval.py` (pair task) and `eval/grounding_gate_qf_eval.py` (query→finding, cosine vs model) track quality longitudinally.
 
 ## Known limits
 
-- `mnemo_mirror` is down in Loci's venv → findings persist to qdrant `hermes_memory` (RAG works) but don't mirror to mnemosyne; `pip install mnemosyne-memory` into Loci's venv to enable.
-- The trained classifier now beats a tuned cosine threshold on the **finding-pair** task (CV acc 0.965 vs 0.910), but that's the classifier's *training* task — the live gate operates *query→finding*, so the cosine threshold remains the shipped default until a query→finding eval validates the swap.
+- `mnemo_mirror` is **active** — findings persist to both qdrant `hermes_memory` (RAG) and mnemosyne (3.4.0 in Loci's MCP venv).
+- The trained classifier is the gate **default**: it beats the cosine threshold on both the finding-pair task (CV acc 0.965 vs 0.910) and the gate's real **query→finding** task (F1 0.94 vs 0.82, rejects all bleed). Trade-off: it drops ~11% of genuine on-topic findings (recall 0.89 vs cosine 0.99) to reject *all* bleed; the opus load-gate backstops residual. The query→finding eval is currently **in-sample** (the model trained on these runs' findings), so the longitudinal harness eval is what guards future out-of-sample drift; use `--no-model` to force cosine.
 - Entailment-grounding (lineage/hallucination signals) is too sparse to train — accumulate deliberately.
