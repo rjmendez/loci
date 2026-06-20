@@ -36,10 +36,45 @@ def embed(texts):
     return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
 
 
+def gate(query, cands, threshold=0.59, model=None):
+    """Filter candidate findings against a query. Returns the result dict.
+
+    cands: list of {"id","text"} dicts (or bare strings). Pure logic + embed();
+    patch embed() to unit-test without a network call.
+    """
+    cands = [c if isinstance(c, dict) else {"text": str(c)} for c in cands]
+    if not cands:
+        return {"kept": [], "dropped": [], "threshold": threshold, "mode": "empty",
+                "n_in": 0, "n_kept": 0, "n_dropped": 0}
+
+    qv = embed([query])[0]
+    cv = embed([c.get("text", "") for c in cands])
+    cos = (cv @ qv).tolist()
+
+    if model:
+        import joblib
+        clf = joblib.load(model)
+        feats = np.array([np.concatenate([np.abs(cv[i] - qv), cv[i] * qv, [cos[i]]]) for i in range(len(cands))])
+        score = clf.predict_proba(feats)[:, 1].tolist()
+        keep = [s >= 0.5 for s in score]
+        mode = "model:" + model.split("/")[-1]
+    else:
+        score = cos
+        keep = [c >= threshold for c in cos]
+        mode = f"cosine>={threshold}"
+
+    kept, dropped = [], []
+    for c, cs, sc, k in zip(cands, cos, score, keep):
+        rec = {**c, "cos": round(float(cs), 3), "score": round(float(sc), 3)}
+        (kept if k else dropped).append(rec)
+    return {"kept": kept, "dropped": dropped, "threshold": threshold, "mode": mode,
+            "n_in": len(cands), "n_kept": len(kept), "n_dropped": len(dropped)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", required=True)
-    ap.add_argument("--threshold", type=float, default=0.65)
+    ap.add_argument("--threshold", type=float, default=0.59)
     ap.add_argument("--model", default=None, help="optional joblib pair-feature classifier (drop-in upgrade)")
     ap.add_argument("--in", dest="infile", default=None)
     ap.add_argument("--out", default=None)
@@ -47,33 +82,7 @@ def main():
 
     raw = json.load(open(a.infile)) if a.infile else json.load(sys.stdin)
     cands = raw.get("findings", raw) if isinstance(raw, dict) else raw
-    cands = [c if isinstance(c, dict) else {"text": str(c)} for c in cands]
-    if not cands:
-        print(json.dumps({"kept": [], "dropped": [], "threshold": a.threshold, "mode": "empty"}))
-        return
-
-    qv = embed([a.query])[0]
-    cv = embed([c.get("text", "") for c in cands])
-    cos = (cv @ qv).tolist()
-
-    if a.model:
-        import joblib
-        clf = joblib.load(a.model)
-        feats = np.array([np.concatenate([np.abs(cv[i] - qv), cv[i] * qv, [cos[i]]]) for i in range(len(cands))])
-        score = clf.predict_proba(feats)[:, 1].tolist()
-        keep = [s >= 0.5 for s in score]
-        mode = "model:" + a.model.split("/")[-1]
-    else:
-        score = cos
-        keep = [c >= a.threshold for c in cos]
-        mode = f"cosine>={a.threshold}"
-
-    kept, dropped = [], []
-    for c, cs, sc, k in zip(cands, cos, score, keep):
-        rec = {**c, "cos": round(float(cs), 3), "score": round(float(sc), 3)}
-        (kept if k else dropped).append(rec)
-    result = {"kept": kept, "dropped": dropped, "threshold": a.threshold, "mode": mode,
-              "n_in": len(cands), "n_kept": len(kept), "n_dropped": len(dropped)}
+    result = gate(a.query, cands, a.threshold, a.model)
     out = json.dumps(result, indent=1)
     (open(a.out, "w").write(out + "\n")) if a.out else print(out)
 
