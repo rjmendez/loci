@@ -76,14 +76,15 @@ A full run ≈ **$5–8**, dominated by **cached context** (cache read/write), n
 |---|---|
 | `ground_gate.py` | the cosine grounding gate (v0) + `--model` hook for the trained classifier |
 | `build_grounding_dataset.py` | reproducible: harvest labeled pairs from a Loci corpus → train + eval |
-| `grounding_dataset.jsonl` | 519 labeled examples (450 topical, 68 lineage, 1 hallucination) |
+| `harvest.sh` | rebuild dataset + retrain from ALL accumulated runs, then report the swap-in signal |
+| `grounding_dataset.jsonl` | labeled examples harvested from the corpus (currently 5 runs / 143 findings → 5,418 pairs) |
 | `grounding_bleed_clf.joblib` | trained bleed-detector (LR on nomic pair-features) |
-| `metrics.json` | CV AUC 0.957 / acc 0.847 (vs tuned-cosine 0.858 — data-starved; harvest-as-you-run) |
+| `metrics.json` | latest CV AUC 0.994 / acc 0.965 vs tuned-cosine 0.910 (the finding-pair task) |
 
-Each run mints more labeled pairs as a byproduct; rebuild with `build_grounding_dataset.py` as the corpus grows.
+Each run mints more labeled pairs as a byproduct; run `harvest.sh` to fold them back in (rebuild + retrain + eval). `eval/grounding_gate_eval.py` tracks separation quality longitudinally.
 
 ## Known limits
 
 - `mnemo_mirror` is down in Loci's venv → findings persist to qdrant `hermes_memory` (RAG works) but don't mirror to mnemosyne; `pip install mnemosyne-memory` into Loci's venv to enable.
-- The trained classifier doesn't yet beat a tuned cosine threshold (small corpus); the cosine gate is the shipped default.
+- The trained classifier now beats a tuned cosine threshold on the **finding-pair** task (CV acc 0.965 vs 0.910), but that's the classifier's *training* task — the live gate operates *query→finding*, so the cosine threshold remains the shipped default until a query→finding eval validates the swap.
 - Entailment-grounding (lineage/hallucination signals) is too sparse to train — accumulate deliberately.
