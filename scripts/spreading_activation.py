@@ -21,11 +21,9 @@ Environment variables (all optional):
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 import sys
-from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Config — all overridable via environment
