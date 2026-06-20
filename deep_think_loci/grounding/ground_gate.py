@@ -24,9 +24,10 @@ import numpy as np
 _BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://100.73.200.19:11434").rstrip("/")
 OLLAMA = _BASE + "/v1/embeddings"
 EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-# The trained bleed-detector, co-located. Validated to beat cosine on the gate's
-# query->finding operation (eval/grounding_gate_qf_eval.py: f1 0.94 vs 0.82), so it
-# is the default when present + loadable; falls back to the cosine threshold otherwise.
+# The trained bleed-detector, co-located. Beats cosine IN-SAMPLE (qf-eval f1 0.94
+# vs 0.82) but OVERFITS — out-of-sample (eval/grounding_gate_oos_eval.py) it does
+# NOT generalize yet (leave-one-run-out mean f1 0.79 vs cosine 0.81). So cosine is
+# the default; enable the model explicitly with --model once OOS validation favors it.
 DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grounding_bleed_clf.joblib")
 
 
@@ -79,16 +80,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", required=True)
     ap.add_argument("--threshold", type=float, default=0.59)
-    ap.add_argument("--model", default=None, help="joblib pair-feature classifier (defaults to the co-located one)")
-    ap.add_argument("--no-model", action="store_true", help="force the cosine threshold even if the model is present")
+    ap.add_argument("--model", default=None,
+                    help="opt-in joblib classifier (default is cosine — the model overfits out-of-sample; see eval/grounding_gate_oos_eval.py)")
     ap.add_argument("--in", dest="infile", default=None)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
     raw = json.load(open(a.infile)) if a.infile else json.load(sys.stdin)
     cands = raw.get("findings", raw) if isinstance(raw, dict) else raw
-    # Default to the trained model when present + loadable; fall back to cosine on any error.
-    model = None if a.no_model else (a.model or (DEFAULT_MODEL if os.path.exists(DEFAULT_MODEL) else None))
+    # Cosine threshold is the default; the model is opt-in via --model until OOS validation favors it.
+    model = a.model
     try:
         result = gate(a.query, cands, a.threshold, model)
     except Exception as exc:

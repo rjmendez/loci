@@ -27,7 +27,7 @@ Every tier reasons **only over grounding-gated evidence** (see below). The opus 
 
 2. **Grounding gate (`grounding/ground_gate.py`).** RAG retrieval bleeds cross-target findings at cosine 0.35–0.59 — moderately similar, plausibly relevant, but *wrong topic* — and a non-verifying model will hallucinate over them. The gate embeds the query + each candidate (nomic, local) and keeps only on-topic findings, dropping the bleed before any model reasons. Local, ~$0 marginal.
    - **Query per-target, never blended** — a blended multi-target query dilutes cosines and false-drops whole genuine targets (the v3 bug).
-   - **Default = the trained classifier** (`grounding/grounding_bleed_clf.joblib`), now that `eval/grounding_gate_qf_eval.py` validated it beats the cosine threshold on the gate's real query→finding task (F1 0.94 vs 0.82, rejects all bleed at a small recall cost). Auto-loads when present + loadable; **falls back to the cosine threshold (0.59)** on any error or with `--no-model`.
+   - **Default = cosine threshold (0.59).** The trained classifier (`grounding/grounding_bleed_clf.joblib`) beats cosine *in-sample* (qf-eval F1 0.94 vs 0.82) but **overfits**: leave-one-run-out (`eval/grounding_gate_oos_eval.py`) gives model F1 0.79 vs cosine 0.81. So cosine stays the default; enable the model with `--model` once OOS validation favors it.
 
 ## Usage
 
@@ -86,5 +86,5 @@ Each run mints more labeled pairs as a byproduct; run `harvest.sh` to fold them 
 ## Known limits
 
 - `mnemo_mirror` is **active** — findings persist to both qdrant `hermes_memory` (RAG) and mnemosyne (3.4.0 in Loci's MCP venv).
-- The trained classifier is the gate **default**: it beats the cosine threshold on both the finding-pair task (CV acc 0.965 vs 0.910) and the gate's real **query→finding** task (F1 0.94 vs 0.82, rejects all bleed). Trade-off: it drops ~11% of genuine on-topic findings (recall 0.89 vs cosine 0.99) to reject *all* bleed; the opus load-gate backstops residual. The query→finding eval is currently **in-sample** (the model trained on these runs' findings), so the longitudinal harness eval is what guards future out-of-sample drift; use `--no-model` to force cosine.
+- The grounding gate **defaults to the cosine threshold (0.59)**. The trained classifier wins *in-sample* (pair CV acc 0.965; qf F1 0.94 vs 0.82) but **does not generalize yet**: leave-one-run-out validation (`eval/grounding_gate_oos_eval.py`) gives model F1 0.79 vs cosine 0.81 — it overfits on small/varied held-out runs (the in-sample numbers were the mirage the OOS eval exists to catch). The model is opt-in (`--model`); re-check OOS as the corpus grows and swap only when it actually generalizes.
 - Entailment-grounding (lineage/hallucination signals) is too sparse to train — accumulate deliberately.
