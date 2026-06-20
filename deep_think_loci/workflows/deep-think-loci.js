@@ -11,13 +11,15 @@ export const meta = {
 }
 
 // ── parameters ──
-const RUN = (args && args.run_id) || 'dt-loci-005'
-const TITLE = (args && args.title) || 'deep-think-loci v3 run'
-const CODE_COLLS = JSON.stringify((args && args.rag_collections) || ['dama_gotchi_code'])
-const N_IDEAS = (args && args.ideas_per_agent) || 10
-const GATE = (args && args.ground_gate) || '/home/rjmendez/.hermes/specialists/grounding/ground_gate.py'
-const THRESH = (args && args.ground_threshold) || 0.59
-const TARGETS = (args && args.targets) || [
+// The Workflow tool delivers `args` as a JSON STRING, not a parsed object — normalize it.
+const A = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
+const RUN = A.run_id || 'dt-loci-005'
+const TITLE = A.title || 'deep-think-loci v3 run'
+const CODE_COLLS = JSON.stringify(A.rag_collections || ['dama_gotchi_code'])
+const N_IDEAS = A.ideas_per_agent || 10
+const GATE = A.ground_gate || '/home/rjmendez/.hermes/specialists/grounding/ground_gate.py'
+const THRESH = A.ground_threshold || 0.59
+const TARGETS = A.targets || [
   { name: 'rooted-canary', focus: 'training/rooted_canary_e2e.py rooted-device telemetry canary + DGC-26 gate' },
   { name: 'governance-gate', focus: 'training/governance_gate.py DGC checks, shadow-eval, fail-closed logic' },
   { name: 'telemetry-ingest', focus: 'realtime ingest + gotchi_mqtt_bridge.py telemetry path and schema' },
