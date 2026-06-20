@@ -1,0 +1,8 @@
+# deep-think-loci grounding specialist deps.
+# The workflow itself needs no Python deps (it runs via the Claude Code Workflow tool
+# and calls Loci MCP). These are for ground_gate.py (trained-model mode) and the
+# dataset builder. Embedding endpoint is read from $OLLAMA_BASE_URL / $EMBED_MODEL
+# (Loci .env conventions); falls back to a sane default.
+numpy
+scikit-learn
+joblib
