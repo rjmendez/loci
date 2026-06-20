@@ -17,11 +17,13 @@ Usage:
   # also reads candidates from stdin if --in is omitted.
 Exit: prints JSON {kept:[...], dropped:[...], threshold, mode} to --out or stdout.
 """
-import argparse, json, sys, urllib.request
+import argparse, json, os, sys, urllib.request
 import numpy as np
 
-OLLAMA = "http://100.73.200.19:11434/v1/embeddings"
-EMB_MODEL = "nomic-embed-text"
+# Loci convention: OLLAMA_BASE_URL has no /v1 suffix; EMBED_MODEL names the embedder.
+_BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://100.73.200.19:11434").rstrip("/")
+OLLAMA = _BASE + "/v1/embeddings"
+EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 
 
 def embed(texts):

@@ -62,7 +62,9 @@ The repo is the source of truth; `install.sh` deploys the workflow + gate to the
 deep_think_loci/install.sh
 ```
 
-Requires: a reachable nomic-embed endpoint (Ollama `/v1/embeddings`), the Loci MCP server, and `numpy`/`scikit-learn` for the gate's optional trained-model mode.
+Requires: the Loci MCP server, a reachable embeddings endpoint, and (for the gate's trained-model mode + the dataset builder) `pip install -r deep_think_loci/requirements.txt`.
+
+**Config** follows Loci's `.env` conventions — `ground_gate.py` and `build_grounding_dataset.py` read the embeddings endpoint from `OLLAMA_BASE_URL` (no `/v1` suffix; `/v1/embeddings` is appended) and the model from `EMBED_MODEL` (default `nomic-embed-text`), falling back to a built-in default. No new env vars are introduced.
 
 ## Cost (measured, API-rate equivalent; runs are subscription-metered)
 

@@ -18,11 +18,12 @@ Usage:
     --findings ~/.hermes/memory-sessions/dt-loci-*/findings.jsonl \
     --out . [--ollama http://100.73.200.19:11434/v1/embeddings]
 """
-import argparse, glob, itertools, json, random, re, urllib.request
+import argparse, glob, itertools, json, os, random, re, urllib.request
 from collections import Counter
 import numpy as np
 
-EMB_MODEL = "nomic-embed-text"
+EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://100.73.200.19:11434").rstrip("/") + "/v1/embeddings"
 
 
 def topic_of(rec):
@@ -52,7 +53,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--findings", nargs="+", required=True, help="findings.jsonl glob(s)")
     ap.add_argument("--out", default=".")
-    ap.add_argument("--ollama", default="http://100.73.200.19:11434/v1/embeddings")
+    ap.add_argument("--ollama", default=DEFAULT_OLLAMA, help="embeddings endpoint (default: $OLLAMA_BASE_URL/v1/embeddings)")
     ap.add_argument("--neg-ratio", type=int, default=2)
     a = ap.parse_args()
     random.seed(0); np.random.seed(0)
