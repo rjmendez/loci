@@ -447,9 +447,6 @@ def _get_qdrant():
             from qdrant_client.models import (
                 Distance, VectorParams, SparseVectorParams,
                 SparseIndexParams, Modifier,
-                KeywordIndexParams, KeywordIndexType,
-                IntegerIndexParams, IntegerIndexType,
-                PayloadSchemaType,
                 HnswConfigDiff,
                 ScalarQuantization, ScalarQuantizationConfig, ScalarType,
             )
@@ -648,7 +645,7 @@ def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
     if _namespace and "namespace" not in payload:
         payload = {**payload, "namespace": _namespace}
     try:
-        from qdrant_client.models import PointStruct, SparseVector
+        from qdrant_client.models import PointStruct
         vector_dict: dict = {"dense": dense_vec}
         if sparse_vec is not None:
             vector_dict["sparse"] = sparse_vec
@@ -719,7 +716,6 @@ def _record_claim_verdicts(
             cr.update({"verdict_type": None, "prior_occurrences": 0, "verdict_conflict": False})
         return {"recorded": 0, "qdrant": "unavailable"}
 
-    import asyncio
     from memcheck.verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
     _VERDICT_MAP = {

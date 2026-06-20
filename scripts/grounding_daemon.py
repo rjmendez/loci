@@ -22,7 +22,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import contextlib
-import json
 import os
 import signal
 import socket

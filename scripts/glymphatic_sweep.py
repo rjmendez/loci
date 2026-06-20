@@ -36,8 +36,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
 # ── config ────────────────────────────────────────────────────────────────────
 
