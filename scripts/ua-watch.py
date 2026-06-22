@@ -18,7 +18,6 @@ import sys
 import os
 import json
 import subprocess
-import glob
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,11 +79,10 @@ def run_ingest(project_root):
     if result.returncode == 0:
         print(result.stdout)
         return True
-    else:
-        print(f"ERROR ingesting {project_root}:")
-        print(result.stdout[-2000:])
-        print(result.stderr[-500:])
-        return False
+    print(f"ERROR ingesting {project_root}:")
+    print(result.stdout[-2000:])
+    print(result.stderr[-500:])
+    return False
 
 
 def main():

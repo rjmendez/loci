@@ -16,7 +16,6 @@ Or from CLI:
 """
 
 import os, sys, json, asyncio, uuid
-from typing import Optional
 
 # Load .env
 _ENV = os.path.expanduser('~/.hermes/.env')
@@ -85,16 +84,15 @@ class LociClient:
         }
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
-        ) as sess:
-            async with sess.post(
-                f'{self.endpoint}/a2a',
-                json=payload,
-                headers=self._headers()
-            ) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    return {'error': f'HTTP {resp.status}', 'detail': data}
-                return data.get('result', {}).get('output', data)
+        ) as sess, sess.post(
+            f'{self.endpoint}/a2a',
+            json=payload,
+            headers=self._headers()
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                return {'error': f'HTTP {resp.status}', 'detail': data}
+            return data.get('result', {}).get('output', data)
 
     async def memory_recall(
         self, query: str, top_k: int = 5, semantic: bool = True
@@ -137,9 +135,8 @@ class LociClient:
     async def health(self) -> dict:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=5)
-        ) as sess:
-            async with sess.get(f'{self.endpoint}/health') as r:
-                return await r.json()
+        ) as sess, sess.get(f'{self.endpoint}/health') as r:
+            return await r.json()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────────

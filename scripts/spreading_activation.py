@@ -21,11 +21,9 @@ Environment variables (all optional):
 
 import argparse
 import json
-import math
 import os
 import sqlite3
 import sys
-from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Config — all overridable via environment
@@ -203,7 +201,6 @@ def run_spreading_activation(
                     newly_activated.append(target)
 
             # Next frontier: targets that were not already in the frontier set
-            activated_so_far = set(activation.keys())
             frontier = [
                 t for (_, t, _) in edges
                 if t not in seed_set
