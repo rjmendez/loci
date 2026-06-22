@@ -551,6 +551,8 @@ _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 def _embed(text: str) -> list[float] | None:
     """Single-text embed via OpenAI-compat /v1/embeddings.
     Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
+    if not _OLLAMA_BASE:
+        return None
     try:
         import requests as _req
         r = _req.post(
