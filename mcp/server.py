@@ -4820,12 +4820,45 @@ def memory_retract(
             "scope_semantic": scope_semantic,
         })
 
+    # Record a quarantine verdict to the store (fail-open) for recall.
+    try:
+        seed_text = str(seeds[0].get("text", "") or "")
+        quarantine_verdict = new_verdict(
+            subject_kind="memory",
+            subject_signature=make_signature("memory", seed_anchor),
+            subject_excerpt=redact_excerpt(seed_text),
+            verdict_type="retracted",
+            decision="quarantine",
+            confidence=0.9,
+            rationale=reason or "hallucination retracted with contaminated lineage",
+            source="human",
+            refs=list(contaminated_ids),
+        )
+        quarantine_recorded = _record_verdicts([quarantine_verdict])
+    except Exception as exc:  # fail-open
+        logger.debug("quarantine verdict record failed, degrading: %r", exc)
+        quarantine_recorded = False
+
+    _append_jsonl(audit_path, {
+        "action": "retract",
+        "ts": ts,
+        "target": target,
+        "seed_ids": seed_ids,
+        "reason": reason or "hallucination retraction",
+        "retracted_finding_ids": list(contaminated_ids),
+        "count": len(contaminated_ids),
+        "verdicts_forgotten": verdicts_forgotten,
+        "scope_semantic": scope_semantic,
+    })
+
+
     return json.dumps({
         "seed_ids": seed_ids,
         "retracted": retracted_records,
         "count": len(retracted_records),
         "verdicts_forgotten": verdicts_forgotten,
         "applied": True,
+        "quarantine_verdict_recorded": quarantine_recorded,
         "reversible": "findings.jsonl is untouched (append-only); reverse with memory_restore",
     }, indent=2)
 
