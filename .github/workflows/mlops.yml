@@ -1,0 +1,140 @@
+name: MLOps Loop
+
+on:
+  schedule:
+    # Nightly at 03:00 UTC — runs on self-hosted if available, falls back to hosted
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Skip new-data thresholds and retrain unconditionally"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Plan only — no model writes, no Ollama model creates"
+        type: boolean
+        default: false
+      findings_glob:
+        description: "Override findings glob (default: ~/.hermes/memory-sessions/dt-loci-*/findings.jsonl)"
+        type: string
+        default: ""
+
+concurrency:
+  group: mlops-loop
+  cancel-in-progress: false
+
+jobs:
+  # ── Validation: always runs on GitHub-hosted runners ──────────────────────
+  validate:
+    name: Validate MLOps scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal deps
+        run: pip install numpy scikit-learn joblib
+
+      - name: Syntax check all mlops scripts
+        run: |
+          for f in mlops/loop.py \
+                   mlops/grounding/train.py \
+                   mlops/grounding/canary.py \
+                   mlops/finetune/collect.py \
+                   mlops/finetune/format_sft.py \
+                   mlops/finetune/train_lora.py \
+                   mlops/embedding/contrastive.py; do
+            python3 -m py_compile "$f" && echo "OK $f"
+          done
+
+      - name: Dry-run dataset stats
+        run: |
+          python3 mlops/grounding/train.py \
+            --dataset deep_think_loci/grounding/grounding_dataset.jsonl \
+            --out /tmp/train_metrics.json \
+            --dry-run
+
+  # ── Full loop: only runs on self-hosted (has Ollama + findings data) ──────
+  loop:
+    name: MLOps self-closing loop
+    runs-on: [self-hosted, loci]
+    timeout-minutes: 120
+    needs: validate
+    # Only fire on self-hosted. On GitHub-hosted runners (no Ollama, no
+    # findings data) the validate job above is the full CI contribution.
+    # Remove the `if` condition when a self-hosted runner is registered.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+
+    env:
+      OLLAMA_BASE_URL: ${{ vars.OLLAMA_BASE_URL || 'http://localhost:11434' }}
+      MNEMOSYNE_DB: ${{ vars.MNEMOSYNE_DB || '~/.hermes/mnemosyne/data/mnemosyne.db' }}
+      EMBED_MODEL: ${{ vars.EMBED_MODEL || 'nomic-embed-text' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install numpy scikit-learn joblib scipy
+
+      - name: Probe Ollama
+        id: ollama
+        run: |
+          if curl -sf "$OLLAMA_BASE_URL/api/tags" > /dev/null 2>&1; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "Ollama reachable at $OLLAMA_BASE_URL"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "Ollama not reachable — loop will run in validate-only mode"
+          fi
+
+      - name: Run MLOps loop
+        run: |
+          ARGS=""
+          [ "${{ inputs.force }}" = "true" ] && ARGS="$ARGS --force"
+          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          [ -n "${{ inputs.findings_glob }}" ] && ARGS="$ARGS --findings '${{ inputs.findings_glob }}'"
+
+          python3 mlops/loop.py \
+            --ollama "$OLLAMA_BASE_URL" \
+            $ARGS
+
+      - name: Upload loop artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlops-loop-${{ github.run_id }}
+          path: |
+            mlops/loop_state.json
+            mlops/loop_history.jsonl
+            mlops/grounding/train_metrics.json
+            mlops/grounding/canary_history.jsonl
+            mlops/grounding/promotions.jsonl
+          retention-days: 90
+
+      - name: Commit promoted model if changed
+        if: steps.ollama.outputs.available == 'true' && inputs.dry_run != 'true'
+        run: |
+          git config user.name "loci-mlops[bot]"
+          git config user.email "mlops@loci.local"
+          git add deep_think_loci/grounding/grounding_bleed_clf.joblib \
+                  mlops/grounding/train_metrics.json \
+                  mlops/loop_state.json \
+                  mlops/grounding/promotions.jsonl || true
+          if git diff --cached --quiet; then
+            echo "No model changes to commit"
+          else
+            git commit -m "mlops: auto-promote grounding_bleed_clf [skip ci]"
+            git push
+          fi
