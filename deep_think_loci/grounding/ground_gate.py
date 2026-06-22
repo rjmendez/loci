@@ -86,7 +86,11 @@ def main():
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
-    raw = json.load(open(a.infile)) if a.infile else json.load(sys.stdin)
+    if a.infile:
+        with open(a.infile) as fh:
+            raw = json.load(fh)
+    else:
+        raw = json.load(sys.stdin)
     cands = raw.get("findings", raw) if isinstance(raw, dict) else raw
     # Cosine threshold is the default; the model is opt-in via --model until OOS validation favors it.
     model = a.model
@@ -98,7 +102,11 @@ def main():
         print(f"[ground_gate] model path failed ({exc}); falling back to cosine", file=sys.stderr)
         result = gate(a.query, cands, a.threshold, None)
     out = json.dumps(result, indent=1)
-    (open(a.out, "w").write(out + "\n")) if a.out else print(out)
+    if a.out:
+        with open(a.out, "w") as fh:
+            fh.write(out + "\n")
+    else:
+        print(out)
 
 
 if __name__ == "__main__":

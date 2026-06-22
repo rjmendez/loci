@@ -67,6 +67,9 @@ def _hdrs() -> dict:
 
 def _scroll_all(collection: str, with_vectors: bool = False) -> list[dict]:
     """Scroll all points in a collection. Returns list of {id, payload, vector?}."""
+    if not QDRANT_URL:
+        print("[glym] QDRANT_URL is not set — skipping Qdrant operations")
+        return []
     url  = f"{QDRANT_URL}/collections/{collection}/points/scroll"
     pts  = []
     offset = None
@@ -91,6 +94,8 @@ def _scroll_all(collection: str, with_vectors: bool = False) -> list[dict]:
 
 def _delete_points(collection: str, ids: list, dry_run: bool) -> int:
     if not ids:
+        return 0
+    if not QDRANT_URL:
         return 0
     if dry_run:
         print(f"[glym] DRY-RUN would delete {len(ids)} pts from {collection}")
@@ -166,8 +171,8 @@ def sweep_orphans(dry_run: bool) -> int:
     cur  = conn.cursor()
 
     try:
-        cur.execute("SELECT DISTINCT source_id FROM graph_edges")
-        has_edges = {str(row["source_id"]) for row in cur.fetchall()}
+        cur.execute("SELECT DISTINCT source FROM graph_edges")
+        has_edges = {str(row["source"]) for row in cur.fetchall()}
     except sqlite3.OperationalError:
         has_edges = set()
 
@@ -209,7 +214,7 @@ def sweep_orphans(dry_run: bool) -> int:
 # ── step 3: dangling graph edges ──────────────────────────────────────────────
 
 def sweep_edges(dry_run: bool) -> int:
-    """Remove graph_edges where source_id or target_id no longer exists."""
+    """Remove graph_edges where source or target no longer exists in working_memory."""
     if not os.path.exists(DB_PATH):
         print(f"[glym/edges] DB not found: {DB_PATH}")
         return 0
@@ -227,7 +232,7 @@ def sweep_edges(dry_run: bool) -> int:
         return 0
 
     try:
-        cur.execute("SELECT rowid, source_id, target_id FROM graph_edges")
+        cur.execute("SELECT rowid, source, target FROM graph_edges")
         edges = cur.fetchall()
     except sqlite3.OperationalError:
         conn.close()
@@ -236,7 +241,7 @@ def sweep_edges(dry_run: bool) -> int:
 
     dangling_rowids = [
         row["rowid"] for row in edges
-        if str(row["source_id"]) not in existing or str(row["target_id"]) not in existing
+        if str(row["source"]) not in existing or str(row["target"]) not in existing
     ]
 
     if dangling_rowids and not dry_run:

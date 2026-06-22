@@ -22,7 +22,7 @@ DB_PATH = os.environ.get(
     "MNEMOSYNE_DB",
     os.path.expanduser("~/.hermes/mnemosyne/data/mnemosyne.db"),
 )
-OLLAMA_URL = os.environ.get("OLLAMA_URL")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 AMEM_LINK_THRESHOLD = float(os.environ.get("AMEM_LINK_THRESHOLD", "0.88"))
 AMEM_CONFLICT_THRESHOLD = float(os.environ.get("AMEM_CONFLICT_THRESHOLD", "0.96"))
