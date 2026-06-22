@@ -266,8 +266,8 @@ def _extract_write_targets(tool_name: str, tool_input: dict) -> list[str]:
     paths: list[str] = []
     if not tool_input:
         return paths
-    # Hermes write_file / patch
-    for key in ("path",):
+    # Hermes write_file / patch; Claude Code Edit/Write tools use file_path
+    for key in ("path", "file_path"):
         v = tool_input.get(key)
         if v and isinstance(v, str):
             paths.append(v)
