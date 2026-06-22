@@ -326,11 +326,18 @@ def main() -> None:
     write_manifest(len(negatives), len(all_positives), len(corrections))
 
     # Embed corrections and upsert to Qdrant
+    embed_failures = 0
+    upserted_corrections = 0
     if corrections:
         ensure_score_traces_collection(api_key)
         for corr in corrections:
             vec = embed_text(corr["failed_content"])
             if vec is None:
+                embed_failures += 1
+                print(
+                    f"[score] WARNING: embed_text returned None for session={corr['session_id']!r} "
+                    f"trace_type={corr['trace_type']!r}; skipping upsert"
+                )
                 continue
             point_id = stable_id(corr["session_id"] + corr["failed_content"])
             payload = {
@@ -340,6 +347,16 @@ def main() -> None:
                 "session_id": corr["session_id"],
             }
             upsert_to_qdrant(point_id, vec, payload, api_key)
+            upserted_corrections += 1
+
+    if embed_failures:
+        # Rewrite manifest with the actual count of successfully upserted corrections
+        # so dataset/manifest counts stay consistent.
+        write_manifest(len(negatives), len(all_positives), upserted_corrections)
+        print(
+            f"[score] WARNING: {embed_failures} embedding failure(s) reduced upserted corrections "
+            f"from {len(corrections)} to {upserted_corrections}; manifest updated."
+        )
 
     sft_ready = len(corrections) >= 10
     print(
