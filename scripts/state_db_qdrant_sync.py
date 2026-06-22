@@ -114,8 +114,10 @@ def get_synced_ids(key):
             break
     return synced
 
+VECTOR_DIM = 768
+
 def embed_batch(chunks, key):
-    """Embed via worker, return {chunk_id: vector} for successfully embedded chunks."""
+    """Embed via worker, return ({chunk_id: vector}, dropped_count) for successfully embedded chunks."""
     r = subprocess.run(
         ["curl", "-s", "-X", "POST", f"{EMBED_WORKER}/embed",
          "-H", "Content-Type: application/json",
@@ -123,17 +125,17 @@ def embed_batch(chunks, key):
         capture_output=True, text=True, timeout=90
     )
     if not r.stdout.strip():
-        return {}
+        return {}, 0
     try:
         edata = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return {}
+        return {}, 0
     if edata.get("status") != "ok":
         print(f"  [embed] error: {edata}", file=sys.stderr)
-        return {}
+        return {}, 0
     vectors_map = edata.get("vectors", {})   # {chunk_id: qdrant_uuid in agent_core_chunks}
     if not vectors_map:
-        return {}
+        return {}, 0
     # Fetch vectors back from agent_core_chunks
     uuids = list(vectors_map.values())
     fr = curl_json("POST", f"{QDRANT}/collections/{SRC_COLL}/points",
@@ -141,16 +143,31 @@ def embed_batch(chunks, key):
     uuid_to_vec = {p["id"]: p.get("vector")
                    for p in fr.get("result", []) if p.get("vector")}
     id_to_vec = {}
+    dropped = 0
     for chunk_id, uuid in vectors_map.items():
         vec = uuid_to_vec.get(uuid)
         if vec is None:
+            print(f"  [embed] dropped chunk_id={chunk_id}: no vector returned", file=sys.stderr)
+            dropped += 1
             continue
         # Handle both unnamed (list) and named (dict) vector shapes
         if isinstance(vec, list):
-            id_to_vec[chunk_id] = vec
+            resolved = vec
         elif isinstance(vec, dict):
-            id_to_vec[chunk_id] = vec.get("dense") or next(iter(vec.values()), None)
-    return id_to_vec
+            resolved = vec.get("dense") or next(iter(vec.values()), None)
+        else:
+            resolved = None
+        if not isinstance(resolved, list) or len(resolved) != VECTOR_DIM:
+            print(
+                f"  [embed] dropped chunk_id={chunk_id}: malformed vector "
+                f"(type={type(resolved).__name__}, "
+                f"dim={len(resolved) if isinstance(resolved, list) else 'n/a'})",
+                file=sys.stderr,
+            )
+            dropped += 1
+            continue
+        id_to_vec[chunk_id] = resolved
+    return id_to_vec, dropped
 
 def upsert_points(points, key):
     """Upsert a batch of points into hermes_sessions."""
@@ -185,7 +202,8 @@ def main():
     for i in range(0, len(to_sync), BATCH_SIZE):
         batch = to_sync[i : i + BATCH_SIZE]
         chunks = [{"id": s["session_id"], "text": s["text"]} for s in batch]
-        id_to_vec = embed_batch(chunks, key)
+        id_to_vec, dropped = embed_batch(chunks, key)
+        err += dropped
 
         points = []
         for s in batch:
