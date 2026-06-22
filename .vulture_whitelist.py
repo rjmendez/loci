@@ -31,6 +31,7 @@ _ = memory_promote
 _ = memory_retract
 _ = memory_restore
 _ = memory_confidence
+_ = memory_route
 _ = memory_surface
 _ = procedure_attempt
 _ = procedure_search
