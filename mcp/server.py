@@ -1953,13 +1953,21 @@ def _tag_finding_ids(findings: list[dict], investigation_id: str) -> list[dict]:
     return tagged
 
 
-def _compute_self_check(investigation_id: str) -> dict:
+def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict:
     """Run provenance + contradiction inline over an investigation's JSONL.
 
     Pure over the JSONL — does NOT require qdrant. Returns the raw verdict lists
     keyed by check, plus a derived ``hallucination_candidates`` list. Already-
     retracted findings are excluded so a cleaned-up hallucination stops being
     re-surfaced. Fail-open: a check error degrades to an empty list.
+
+    When ``llm_verify`` is set (the deep_think -> loci merge path), the lexical
+    contradiction verdicts are run through an embedding subject gate + LLM
+    polarity judge (``contradiction_llm.verify_and_merge``): same-subject pairs
+    are confirmed by a model that ignores wording, which drops the bag-of-words
+    false positives and adds the semantic negations token overlap misses. Stays
+    fail-open — if embeddings/LLM are unreachable the lexical verdicts pass
+    through unchanged.
     """
     raw_findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
     retracted = _load_retracted_ids(investigation_id)
@@ -1988,6 +1996,14 @@ def _compute_self_check(investigation_id: str) -> dict:
     except Exception as exc:  # fail-open
         logger.debug("contradiction check failed, degrading to none: %r", exc)
         contradictions = []
+
+    if llm_verify:
+        try:
+            from memcheck.checks.contradiction_llm import verify_and_merge
+
+            contradictions = verify_and_merge(findings, contradictions)
+        except Exception as exc:  # fail-open — keep lexical verdicts on any error
+            logger.debug("llm contradiction verify failed, keeping lexical: %r", exc)
 
     try:
         candidates = _hallucination_candidates(
@@ -2256,6 +2272,10 @@ def investigation_store(
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
+        existing_ids = {f["id"] for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl") if "id" in f}
+        unknown = [pid for pid in derived if pid not in existing_ids]
+        if unknown:
+            return json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     finding["entities"] = _extract_entities(text)
 
@@ -3636,6 +3656,7 @@ def memory_self_check(
     investigation_id: Optional[str] = None,
     checks: str = "provenance,contradiction",
     record: bool = True,
+    llm_verify: bool = False,
 ) -> str:
     """
     Run the server's advisory memory self-check over stored findings.
@@ -3661,10 +3682,19 @@ def memory_self_check(
         investigation_id: Investigation to check, or omit to check all.
         checks: Comma-separated subset of: provenance, contradiction.
         record: When true and qdrant is reachable, record verdicts for recall.
+        llm_verify: Opt into the deep_think -> loci semantic contradiction path —
+            an embedding subject gate + LLM polarity judge that supersedes the
+            lexical token-overlap heuristic (drops its false positives, catches
+            the semantic negations it misses). Default False keeps the check
+            pure/offline. Also enabled by env MEMCHECK_LLM_CONTRADICTION=1.
+            Fail-open: lexical verdicts pass through if embeddings/LLM are down.
 
     Returns:
         JSON with per-investigation counts and the advisory verdicts.
     """
+    llm_verify = llm_verify or os.environ.get(
+        "MEMCHECK_LLM_CONTRADICTION", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
     requested = {c.strip().lower() for c in (checks or "").split(",") if c.strip()}
     if not requested:
         requested = {"provenance", "contradiction"}
@@ -3689,7 +3719,7 @@ def memory_self_check(
     per_investigation: list[dict] = []
 
     for inv_id in targets:
-        computed = _compute_self_check(inv_id)
+        computed = _compute_self_check(inv_id, llm_verify=llm_verify)
         inv_verdicts: list = []
         if "provenance" in requested:
             inv_verdicts.extend(computed["unsupported_observed"])
@@ -5048,6 +5078,167 @@ def memory_confidence(
         },
         "top_hit_preview": top_text,
         "recommendation": recommendation,
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Tool: investigation_reason  (deep_think -> loci in-server reasoning surface)
+# ---------------------------------------------------------------------------
+
+# General-purpose adversarial mandates (ported from deep_think PERSPECTIVE_MANDATES).
+# Width clips from the front, so the first N are the most load-bearing.
+_REASON_MANDATES: list[tuple[str, str]] = [
+    ("primary", "Provide a thorough, balanced analysis from first principles. Cover the major angles."),
+    ("adversarial", "Challenge the primary framing. Find every assumption, logical gap, and place the obvious conclusion is overstated or wrong."),
+    ("alternative", "Propose different interpretations and underexplored angles a standard analysis would miss."),
+    ("risk", "Identify failure modes and second-order consequences. What happens if the key assumptions are wrong?"),
+    ("devils_advocate", "Steelman the strongest case AGAINST the likely conclusion."),
+]
+
+_REASON_SYNTHESIS_PROMPT = """You are the synthesis analyst integrating {n} independent perspective analyses of the question below.
+
+QUESTION:
+{question}
+
+PERSPECTIVES:
+{perspectives}
+
+Identify where perspectives independently converged (high confidence) and where they explicitly conflict (contested). Respond with ONLY this JSON, no other text:
+{{"confidence_score": <integer 0-100>, "converged_claims": ["..."], "contested_areas": ["..."], "final_answer": "<integrated answer: lead with convergence, mark contested areas, note gaps>"}}"""
+
+
+@mcp.tool()
+def investigation_reason(
+    investigation_id: str,
+    question: str,
+    perspectives: int = 3,
+    ground_threshold: float = 0.59,
+    persist: bool = False,
+) -> str:
+    """Reason over an investigation's findings with grounded, multi-perspective analysis.
+
+    The in-server complement to the deep_think_loci Workflow: it fuses the merge's
+    two pieces of tech in-process — the **grounding gate** (embed the question +
+    each finding, keep only on-topic findings, dropping cross-target RAG-bleed)
+    and **deep_think fan-out** (N adversarial perspectives + a synthesis that
+    extracts converged vs contested claims). Runs N+1 LLM calls inline; intended
+    as an explicit, user-invoked "reason now" call, not a hot path.
+
+    Requires an LLM endpoint (Ollama by default; anthropic/copilot if a key is
+    set). Fail-soft: returns an ``error`` field if the LLM is unreachable rather
+    than raising.
+
+    Args:
+        investigation_id: Investigation whose findings ground the reasoning.
+        question:         The question/problem to reason about.
+        perspectives:     Number of adversarial perspectives (1-5). Default 3.
+        ground_threshold: Per-finding cosine keep threshold for the grounding
+                          gate (deep_think_loci convention: 0.59). Findings below
+                          it are dropped as off-topic before any model reasons.
+        persist:          If True, store each converged claim as an ``inferred``
+                          finding (source=investigation_reason). Default False.
+
+    Returns:
+        JSON: {investigation_id, question, perspectives_used, grounded_findings,
+               gate_applied, confidence_score, converged_claims, contested_areas,
+               final_answer, persisted_finding_ids}.
+    """
+    from memcheck import llm as _llm
+    from memcheck.checks.contradiction_llm import _extract_json
+
+    if not (investigation_id and (MEMORY_DIR / investigation_id).exists()):
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+    if not (question or "").strip():
+        return json.dumps({"error": "question is required."})
+    if not _llm.llm_available():
+        return json.dumps({"error": "No LLM endpoint available. Set OLLAMA_BASE_URL "
+                                    "or a provider key (ANTHROPIC_API_KEY / GITHUB_COPILOT_OAUTH_TOKEN)."})
+
+    n = max(1, min(int(perspectives or 3), len(_REASON_MANDATES)))
+
+    # Load active (non-retracted) findings.
+    raw = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    retracted = _load_retracted_ids(investigation_id)
+    findings = [f for f in raw if isinstance(f, dict) and str(f.get("id", "")) not in retracted
+                and str(f.get("text", "") or "").strip()]
+
+    # Grounding gate: keep only findings on-topic to the question (fail-open).
+    gate_applied = False
+    gated = findings
+    if findings:
+        try:
+            vecs = _llm.embed_texts([question] + [str(f["text"]) for f in findings])
+        except Exception:
+            vecs = []
+        if vecs and len(vecs) == len(findings) + 1:
+            qv = vecs[0]
+            scored = [(_llm.cosine(qv, vecs[i + 1]), f) for i, f in enumerate(findings)]
+            kept = [f for c, f in scored if c >= ground_threshold]
+            gated = sorted(kept, key=lambda f: 0)[:12] if kept else []
+            gate_applied = True
+
+    evidence = "\n".join(
+        f"- [{f.get('type', f.get('record_type', '?'))}] {str(f['text'])[:300]}"
+        for f in gated[:12]
+    ) or "(no on-topic findings in this investigation — reason from the question alone)"
+
+    # Fan out N perspectives.
+    perspective_outputs: list[dict] = []
+    for name, mandate in _REASON_MANDATES[:n]:
+        prompt = (
+            f"You are the {name} analyst.\n{mandate}\n\n"
+            f"QUESTION:\n{question}\n\n"
+            f"GROUNDED EVIDENCE (investigation {investigation_id}):\n{evidence}\n\n"
+            "Give your analysis in <=200 words. Ground every claim in the evidence; "
+            "if the evidence is insufficient, say so rather than inventing facts."
+        )
+        out = _llm.call_llm(prompt, timeout=90.0)
+        if out:
+            perspective_outputs.append({"name": name, "analysis": out})
+
+    if not perspective_outputs:
+        return json.dumps({"error": "All perspective LLM calls failed (endpoint unreachable or timed out)."})
+
+    # Synthesize.
+    persp_text = "\n\n".join(f"=== {p['name'].upper()} ===\n{p['analysis']}" for p in perspective_outputs)
+    synth_raw = _llm.call_llm(
+        _REASON_SYNTHESIS_PROMPT.format(n=len(perspective_outputs), question=question, perspectives=persp_text),
+        json_mode=True, timeout=120.0,
+    )
+    synth = _extract_json(synth_raw or "") or {}
+    converged = [str(c) for c in (synth.get("converged_claims") or []) if str(c).strip()]
+    contested = [str(c) for c in (synth.get("contested_areas") or []) if str(c).strip()]
+    final_answer = str(synth.get("final_answer") or synth_raw or "").strip()
+
+    # Optionally persist converged claims as inferred findings.
+    persisted: list[str] = []
+    if persist and converged:
+        for claim in converged:
+            try:
+                res = json.loads(investigation_store(
+                    investigation_id=investigation_id,
+                    finding_type="inferred",
+                    text=f"[reasoned] {claim}",
+                    source="investigation_reason",
+                    confidence="medium",
+                    tags="reasoned,investigation_reason",
+                ))
+                if res.get("finding_id"):
+                    persisted.append(res["finding_id"])
+            except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+                logger.debug("investigation_reason persist failed: %r", exc)
+
+    return json.dumps({
+        "investigation_id": investigation_id,
+        "question": question,
+        "perspectives_used": [p["name"] for p in perspective_outputs],
+        "grounded_findings": len(gated),
+        "gate_applied": gate_applied,
+        "confidence_score": synth.get("confidence_score"),
+        "converged_claims": converged,
+        "contested_areas": contested,
+        "final_answer": final_answer,
+        "persisted_finding_ids": persisted,
     }, indent=2)
 
 
