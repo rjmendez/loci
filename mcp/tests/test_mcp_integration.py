@@ -1306,3 +1306,122 @@ class TestConflictTools(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInvestigationExportImport(unittest.TestCase):
+    """Tests for investigation_export and investigation_import tools."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_investigation_export_returns_bundle(self):
+        """Export produces a valid bundle with schema_version, manifest, and findings."""
+        inv_id = _new_id("export")
+        server.investigation_start(investigation_id=inv_id, title="Export test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Connection to 10.0.0.1 on port 443 observed.",
+            source="test:netlog",
+            confidence="high",
+        )
+
+        result = _json(server.investigation_export(investigation_id=inv_id))
+
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertTrue(result.get("exported"))
+        self.assertEqual(result.get("investigation_id"), inv_id)
+        self.assertGreater(result.get("finding_count", 0), 0)
+        self.assertGreater(result.get("size_bytes", 0), 0)
+
+        bundle = result.get("bundle", {})
+        self.assertEqual(bundle.get("schema_version"), "1.0")
+        self.assertIn("exported_at", bundle)
+        self.assertIn("manifest", bundle)
+        self.assertIn("findings", bundle)
+        self.assertIsInstance(bundle["findings"], list)
+        self.assertGreater(len(bundle["findings"]), 0)
+        texts = [f.get("text", "") for f in bundle["findings"]]
+        self.assertTrue(any("443" in t for t in texts))
+
+    def test_investigation_export_missing_investigation(self):
+        """Export of a non-existent investigation returns an error."""
+        result = _json(server.investigation_export(investigation_id="no-such-inv-xyz"))
+        self.assertIn("error", result)
+
+    def test_investigation_import_creates_new_investigation(self):
+        """Import a bundle and verify a new investigation is created with findings."""
+        inv_id = _new_id("import-src")
+        server.investigation_start(investigation_id=inv_id, title="Source investigation")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Suspicious login from 192.168.1.100 at 03:15 UTC.",
+            source="test:auth",
+            confidence="high",
+        )
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="Account may have been compromised.",
+            source="test:analysis",
+            confidence="medium",
+        )
+
+        # Export the investigation.
+        export_result = _json(server.investigation_export(investigation_id=inv_id))
+        self.assertNotIn("error", export_result)
+        bundle = export_result["bundle"]
+
+        # Import as a new investigation with a custom title.
+        import json as _json_mod
+        bundle_json = _json_mod.dumps(bundle)
+        import_result = _json(server.investigation_import(
+            bundle_json=bundle_json,
+            new_title="Imported: Source investigation",
+        ))
+
+        self.assertNotIn("error", import_result, f"Unexpected import error: {import_result}")
+        self.assertTrue(import_result.get("imported"))
+        self.assertEqual(import_result.get("original_investigation_id"), inv_id)
+        self.assertEqual(import_result.get("findings_imported"), 2)
+
+        new_id = import_result.get("new_investigation_id")
+        self.assertIsNotNone(new_id)
+        self.assertNotEqual(new_id, inv_id)
+
+        # Load the new investigation and verify findings are there.
+        loaded = _json(server.investigation_load(investigation_id=new_id))
+        self.assertNotIn("error", loaded, f"Could not load imported investigation: {loaded}")
+        self.assertEqual(loaded["manifest"]["title"], "Imported: Source investigation")
+        self.assertEqual(loaded["manifest"].get("imported_from"), inv_id)
+        texts = [f.get("text", "") for f in loaded.get("recent_findings", [])]
+        self.assertTrue(any("192.168.1.100" in t for t in texts))
+
+    def test_investigation_import_invalid_json(self):
+        """Import with malformed JSON returns an error."""
+        result = _json(server.investigation_import(bundle_json="not-valid-json"))
+        self.assertIn("error", result)
+
+    def test_investigation_import_wrong_schema_version(self):
+        """Import with unsupported schema_version returns an error."""
+        import json as _json_mod
+        bad_bundle = _json_mod.dumps({"schema_version": "2.0", "manifest": {}, "findings": []})
+        result = _json(server.investigation_import(bundle_json=bad_bundle))
+        self.assertIn("error", result)
+
+    def test_investigation_import_bundle_too_large(self):
+        """Import a bundle exceeding 10 MB returns an error."""
+        big_bundle = "x" * (10 * 1024 * 1024 + 1)
+        result = _json(server.investigation_import(bundle_json=big_bundle))
+        self.assertIn("error", result)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
