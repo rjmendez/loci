@@ -156,7 +156,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, uuid, json, sqlite3, logging, datetime
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime
 from typing import Optional, Any
 
 # ── load .env before anything else ─────────────────────────────────────────────
