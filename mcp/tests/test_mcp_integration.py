@@ -178,6 +178,119 @@ class TestInvestigationLifecycle(unittest.TestCase):
         finding_ids = [f.get("id") for f in loaded.get("recent_findings", [])]
         self.assertIn(finding_id, finding_ids)
 
+    def test_investigation_store_accepts_valid_from(self):
+        """investigation_store should persist valid_from/valid_until in the finding."""
+        inv_id = _new_id("bitemporal-store")
+        server.investigation_start(investigation_id=inv_id, title="Bi-temporal store test")
+
+        past_ts = "2020-01-01T00:00:00+00:00"
+        future_ts = "2099-12-31T23:59:59+00:00"
+
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Auth service was returning HTTP 401 on all requests in Jan 2020.",
+            source="test:history",
+            confidence="high",
+            valid_from=past_ts,
+            valid_until=future_ts,
+        ))
+        self.assertNotIn("error", stored, f"Unexpected error: {stored}")
+        self.assertTrue(stored.get("stored"))
+
+        # Verify fields were persisted in the JSONL
+        loaded = _json(server.investigation_load(investigation_id=inv_id))
+        findings = loaded.get("recent_findings", [])
+        self.assertTrue(findings, "No findings returned from load")
+        finding = findings[0]
+        self.assertEqual(finding.get("valid_from"), past_ts,
+                         "valid_from not persisted correctly")
+        self.assertEqual(finding.get("valid_until"), future_ts,
+                         "valid_until not persisted correctly")
+
+    def test_investigation_as_of_returns_findings(self):
+        """investigation_as_of should return only findings valid at the given timestamp.
+
+        Strategy:
+        - Use a near-future checkpoint (2028) so all findings stored right now
+          have created_at_ts <= as_of_epoch.
+        - Distinguish findings via valid_until: finding A has no valid_until
+          (still believed), finding B has valid_until in 2023 (expired before checkpoint).
+        - A far-future query (2099) should include A but still exclude B.
+        - A past query (2000) should exclude all findings (created after 2000).
+        """
+        inv_id = _new_id("bitemporal-as-of")
+        server.investigation_start(investigation_id=inv_id, title="Bi-temporal as-of test")
+
+        # Near-future checkpoint: both findings are stored before this moment
+        checkpoint_ts = "2028-01-01T00:00:00+00:00"
+
+        # Finding A: no valid_until — currently believed, should appear at checkpoint
+        stored_a = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Finding A — no valid_until, currently believed, should appear at checkpoint.",
+            source="test:a",
+            confidence="high",
+        ))
+        self.assertNotIn("error", stored_a)
+        fid_a = stored_a["finding_id"]
+
+        # Finding B: valid_until in the past (2023) — expired before checkpoint
+        stored_b = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="Finding B — valid_until=2023, expired before checkpoint, should be excluded.",
+            source="test:b",
+            confidence="medium",
+            valid_until="2023-01-01T00:00:00+00:00",
+        ))
+        self.assertNotIn("error", stored_b)
+        fid_b = stored_b["finding_id"]
+
+        # Query as-of checkpoint (2028): should include A, exclude B (B expired 2023)
+        result = _json(server.investigation_as_of(
+            investigation_id=inv_id,
+            as_of_timestamp=checkpoint_ts,
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(result["investigation_id"], inv_id)
+        self.assertEqual(result["as_of"], checkpoint_ts)
+        self.assertIsInstance(result["findings"], list)
+
+        returned_ids = {f.get("id") for f in result["findings"]}
+        self.assertIn(fid_a, returned_ids, "Finding A (no valid_until) should appear at checkpoint")
+        self.assertNotIn(fid_b, returned_ids,
+                         "Finding B (valid_until=2023) should NOT appear at 2028 checkpoint")
+
+        # Far-future query (2099): A still included (no valid_until), B still excluded
+        future_ts = "2099-01-01T00:00:00+00:00"
+        result_future = _json(server.investigation_as_of(
+            investigation_id=inv_id,
+            as_of_timestamp=future_ts,
+        ))
+        self.assertNotIn("error", result_future)
+        future_ids = {f.get("id") for f in result_future["findings"]}
+        self.assertIn(fid_a, future_ids, "A should still appear with no valid_until in 2099")
+        self.assertNotIn(fid_b, future_ids, "B (expired 2023) should not appear in 2099 query")
+
+        # Past query (2000): no findings existed yet (created_at_ts > 2000 epoch)
+        past_ts = "2000-01-01T00:00:00+00:00"
+        result_past = _json(server.investigation_as_of(
+            investigation_id=inv_id,
+            as_of_timestamp=past_ts,
+        ))
+        self.assertNotIn("error", result_past)
+        self.assertEqual(result_past["count"], 0,
+                         "No findings should appear for a query set in year 2000")
+
+        # Error path: invalid investigation ID
+        err = _json(server.investigation_as_of(
+            investigation_id="no-such-investigation-xyz",
+            as_of_timestamp=checkpoint_ts,
+        ))
+        self.assertIn("error", err)
+
 
 class TestMemoryHealth(unittest.TestCase):
     """memory_health should always return valid JSON."""

@@ -1496,6 +1496,50 @@ def _read_jsonl(path: Path) -> list[dict]:
     return out
 
 
+def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> int:
+    """
+    Atomically rewrite a JSONL file, setting ``field`` = ``value`` on every
+    entry whose "id" is in ``target_ids``.
+
+    Returns the count of entries that were modified.  Fails open — if any I/O
+    or JSON error occurs the original file is left untouched.
+    """
+    if not path.exists():
+        return 0
+    try:
+        lines = path.read_text().splitlines()
+        new_lines = []
+        modified = 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                new_lines.append(line)
+                continue
+            try:
+                entry = json.loads(stripped)
+            except Exception:
+                new_lines.append(line)
+                continue
+            if str(entry.get("id", "")) in target_ids:
+                entry[field] = value
+                new_lines.append(json.dumps(entry))
+                modified += 1
+            else:
+                new_lines.append(line)
+        # Atomic replace via temp file in the same directory
+        dir_ = path.parent
+        with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
+            tf.write("\n".join(new_lines))
+            if new_lines:
+                tf.write("\n")
+            tmp_path = Path(tf.name)
+        tmp_path.replace(path)
+        return modified
+    except Exception as exc:
+        logger.debug("_rewrite_jsonl_set_field failed (fail-open): %r", exc)
+        return 0
+
+
 _REFLECTION_ERROR_RE = re.compile(r"\b(error|exception|traceback|failed|failure|timeout|conflict)\b", re.I)
 _REFLECTION_WARN_RE = re.compile(r"\b(warn|warning|degraded|fallback|retry)\b", re.I)
 _REFLECTION_HEX_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.I)
@@ -2358,6 +2402,8 @@ def investigation_store(
     procedure_preconditions: Optional[str] = None,
     procedure_steps: Optional[str] = None,
     procedure_postconditions: Optional[str] = None,
+    valid_from: Optional[str] = None,
+    valid_until: Optional[str] = None,
 ) -> str:
     """
     Record a finding in the investigation.
@@ -2390,6 +2436,12 @@ def investigation_store(
                                  preconditions that must be true before running the procedure.
         procedure_steps: (procedure only) Numbered steps as a string.
         procedure_postconditions: (procedure only) Expected outcomes after the procedure.
+        valid_from: ISO8601 timestamp from which this finding is valid. Defaults
+                    to the current time when the finding is stored. Use to record
+                    a finding that was true at an earlier point in time.
+        valid_until: ISO8601 timestamp at which this finding ceased to be valid,
+                     or null (default) meaning it is currently believed to be true.
+                     Set when a finding has a known expiry or is superseded.
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2419,10 +2471,11 @@ def investigation_store(
         except (TypeError, ValueError):
             resolved_numeric_confidence = _confidence_to_numeric.get(confidence, 0.6)
 
+    _ts_now = _now()
     finding = {
         "id": str(uuid.uuid4()),
         "investigation_id": investigation_id,
-        "ts": _now(),
+        "ts": _ts_now,
         "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
         "record_type": finding_type,   # "observed" | "inferred" | "assumed" | "gap"
         "type": finding_type,          # kept for backwards compat with existing JSONL
@@ -2433,6 +2486,8 @@ def investigation_store(
         "tags": [t.strip() for t in (
             ",".join(tags) if isinstance(tags, list) else (tags or "")
         ).split(",") if t.strip()],
+        "valid_from": valid_from if valid_from is not None else _ts_now,
+        "valid_until": valid_until,
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
@@ -2695,6 +2750,90 @@ def procedure_search(
     except Exception as exc:
         logger.warning("procedure_search: unexpected error: %s", exc)
         return json.dumps({"error": str(exc), "procedures": [], "count": 0})
+
+
+# ---- Tool: investigation_as_of ----
+
+@mcp.tool()
+def investigation_as_of(
+    investigation_id: str,
+    as_of_timestamp: str,
+) -> str:
+    """
+    Return findings from an investigation as they were believed at a specific point in time.
+
+    A finding is included when BOTH of the following hold:
+      - created_at_ts <= as_of_epoch  (the finding existed by that moment)
+      - valid_until is null OR valid_until >= as_of_timestamp  (it was still believed valid)
+
+    This supports bi-temporal analysis: you can reconstruct the investigation's
+    knowledge state at any historical moment, even after findings have been
+    superseded or retracted.
+
+    Args:
+        investigation_id: Investigation identifier.
+        as_of_timestamp: ISO8601 timestamp (e.g. "2024-01-15T10:30:00+00:00").
+                         Findings created after this moment are excluded, and
+                         findings whose valid_until is before this moment are
+                         also excluded.
+
+    Returns:
+        JSON: {
+          "investigation_id": "<id>",
+          "as_of": "<as_of_timestamp>",
+          "findings": [...],
+          "count": <int>
+        }
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        try:
+            as_of_dt = datetime.fromisoformat(as_of_timestamp)
+            # Make timezone-aware if naive (assume UTC)
+            if as_of_dt.tzinfo is None:
+                as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
+            as_of_epoch = int(as_of_dt.timestamp())
+        except (ValueError, TypeError) as exc:
+            return json.dumps({"error": f"Invalid as_of_timestamp: {exc}"})
+
+        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+        all_findings = _read_jsonl(findings_path)
+
+        result_findings = []
+        for f in all_findings:
+            created_at_ts = f.get("created_at_ts")
+            if created_at_ts is None:
+                # Older findings without created_at_ts: include them (fail-open)
+                pass
+            elif int(created_at_ts) > as_of_epoch:
+                continue
+
+            valid_until = f.get("valid_until")
+            if valid_until is not None:
+                try:
+                    vu_dt = datetime.fromisoformat(str(valid_until))
+                    if vu_dt.tzinfo is None:
+                        vu_dt = vu_dt.replace(tzinfo=timezone.utc)
+                    if vu_dt < as_of_dt:
+                        continue
+                except (ValueError, TypeError):
+                    pass  # fail-open: include if valid_until can't be parsed
+
+            result_findings.append(f)
+
+        return json.dumps({
+            "investigation_id": investigation_id,
+            "as_of": as_of_timestamp,
+            "findings": result_findings,
+            "count": len(result_findings),
+        }, indent=2)
+    except Exception as exc:
+        logger.exception("investigation_as_of failed")
+        return json.dumps({"error": f"investigation_as_of failed: {exc}"})
 
 
 # ---- Tool: investigation_note ----
@@ -5203,6 +5342,19 @@ def memory_retract(
                 "finding_id": fid,
                 "reasons": reasons.get(fid, []),
             })
+
+        # Bi-temporal hook: stamp valid_until on retracted findings so that
+        # investigation_as_of queries exclude them from any future as-of view.
+        try:
+            findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+            _rewrite_jsonl_set_field(
+                findings_path,
+                set(contaminated_ids),
+                "valid_until",
+                ts,
+            )
+        except Exception as exc:  # fail-open
+            logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
 
         # Record a quarantine verdict to the store (fail-open) for recall.
         try:
