@@ -1649,6 +1649,44 @@ def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
                     str(event.get("tool_complete_result_content") or ""),
                 ])
                 _scan_line(joined)
+    elif kind == "claude_code_event":
+        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for raw in fh:
+                if lines_scanned >= max_lines:
+                    break
+                lines_scanned += 1
+                bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    _scan_line(line)
+                    continue
+                # Claude Code event schema: {"type": "...", "message": {...}, "attachments": [...]}
+                event_type = str(event.get("type") or "unknown")
+                event_counts[event_type] += 1
+                # Tool names appear in attachments list as {"toolName": "..."} entries
+                for attachment in (event.get("attachments") or []):
+                    if isinstance(attachment, dict):
+                        tool_name = attachment.get("toolName") or attachment.get("tool_name")
+                        if tool_name:
+                            tool_counts[str(tool_name)] += 1
+                # Message content is nested under "message" with role/content structure
+                message = event.get("message") or {}
+                if isinstance(message, dict):
+                    content = message.get("content") or ""
+                    if isinstance(content, list):
+                        # content may be a list of blocks: [{"type": "text", "text": "..."}]
+                        content = " ".join(
+                            str(block.get("text") or "") for block in content
+                            if isinstance(block, dict)
+                        )
+                    joined = str(content)
+                else:
+                    joined = str(message)
+                _scan_line(joined)
     elif kind == "process_log":
         file_bytes = int(file_path.stat().st_size)
         if file_bytes > REFLECTION_LOG_TAIL_MIN_FILE_BYTES:
@@ -2518,7 +2556,8 @@ def reflection_loop_seed(
         title="Copilot self-reflection loop",
         context=(
             "Continuous bounded mining of ~/.copilot/temp_ingest, "
-            "~/.copilot/session-state/*/events.jsonl, and ~/.copilot/logs/process-*.log"
+            "~/.copilot/session-state/*/events.jsonl, ~/.copilot/logs/process-*.log, "
+            "and ~/.claude/projects/**/*.jsonl (Claude Code)"
         ),
     )
 
@@ -2554,6 +2593,15 @@ def reflection_loop_seed(
         reverse=True,
     )[:process_logs_limit]
     candidates.extend({"kind": "process_log", "path": str(p)} for p in process_logs)
+
+    # Claude Code source paths: ~/.claude/projects/**/*.jsonl
+    claude_code_files = sorted(
+        (Path.home() / ".claude" / "projects").glob("**/*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:session_events_limit]
+    candidates.extend({"kind": "claude_code_event", "path": str(p)} for p in claude_code_files)
+
     candidates.sort(key=lambda item: _reflection_queue_priority(item.get("kind")))
 
     added = 0
@@ -2575,6 +2623,7 @@ def reflection_loop_seed(
             "temp_ingest": int(temp_ingest.exists()),
             "session_events_candidates": len(session_files),
             "process_logs_candidates": len(process_logs),
+            "claude_code_events_candidates": len(claude_code_files),
         },
         "state_file": str(REFLECTION_STATE_FILE),
     }, indent=2)
