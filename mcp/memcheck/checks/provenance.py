@@ -142,7 +142,11 @@ def run_provenance(
                 # token with the receipt's names.
                 name_ok = False
                 if f_source and r_names:
-                    if f_source in r_names or any(f_source in n or n in f_source for n in r_names):
+                    f_tokens_name = set(re.split(r"[\W_]+", f_source))
+                    if f_source in r_names or any(
+                        n == f_source or bool(f_tokens_name & set(re.split(r"[\W_]+", n)))
+                        for n in r_names
+                    ):
                         name_ok = True
                 # Token overlap clears the lexical bar.
                 lex_ok = score(f_tokens, r_tokens) >= min_overlap
