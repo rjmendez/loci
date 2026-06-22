@@ -240,6 +240,8 @@ def main():
     ap.add_argument("--findings-glob", default=None)
     ap.add_argument("--ollama", default=(os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434"))
     ap.add_argument("--dry-run", action="store_true", help="Eval only; never write the joblib")
+    ap.add_argument("--candidate-out", default=None,
+                    help="Write winning candidate model here instead of live path (used by loop.py)")
     args = ap.parse_args()
 
     from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -355,9 +357,11 @@ def main():
     thresholds = np.linspace(0.2, 0.9, 71)
     best_thresh = float(max(thresholds, key=lambda t: f1_score(labels, (all_proba > t).astype(int), zero_division=0)))
 
+    write_path = args.candidate_out if args.candidate_out else CLF_PATH
     if not args.dry_run and decision == "PROMOTE":
-        joblib.dump(best_clf, CLF_PATH)
-        print(f"Model written to {CLF_PATH}")
+        os.makedirs(os.path.dirname(os.path.abspath(write_path)), exist_ok=True)
+        joblib.dump(best_clf, write_path)
+        print(f"Model written to {write_path}")
     elif args.dry_run:
         print("--dry-run: skipping joblib write")
     else:
