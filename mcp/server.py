@@ -2637,6 +2637,7 @@ def reflection_loop_tick(
     batch_warning_signatures: Counter[str] = Counter()
     item_reports: list[dict] = []
     low_signal_session_events: list[dict[str, Any]] = []
+    dropped_items: list[dict] = []
 
     for _ in range(min(max_items, len(queue))):
         next_index = min(
@@ -2649,6 +2650,7 @@ def reflection_loop_tick(
         summary = _process_reflection_item(kind, path, max_lines=max_lines_per_file)
         item_reports.append(summary)
         if summary.get("status") != "processed":
+            dropped_items.append(item)
             continue
 
         key = f"{kind}|{path}"
@@ -2788,6 +2790,27 @@ def reflection_loop_tick(
     ]
     stats["error_signature_observations"] = _prune_signature_observations(error_observations)
     stats["warning_signature_observations"] = _prune_signature_observations(warning_observations)
+
+    for dropped in dropped_items:
+        queue.append(dropped)
+        if store_item_findings:
+            d_kind = str(dropped.get("kind") or "")
+            d_path = str(dropped.get("path") or "")
+            gap_text = (
+                f"reflection_loop_tick could not process item kind={d_kind} path={d_path}; "
+                "item re-queued for future processing."
+            )
+            gap_res = json.loads(investigation_store(
+                investigation_id=investigation_id,
+                finding_type="gap",
+                text=gap_text,
+                source="reflection_loop_tick",
+                confidence="low",
+                tags="self-reflection,loop-tick,dropped-item,re-queued",
+            ))
+            if bool(gap_res.get("stored")):
+                findings_written += 1
+
     state["stats"] = stats
     state["processed"] = processed
     state["queue"] = queue
