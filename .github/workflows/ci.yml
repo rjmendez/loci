@@ -91,3 +91,114 @@ jobs:
                      scripts/ \
                      --select E9,F401,F811,F821,F841 \
                      --ignore E402
+
+  type-check:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: mcp/requirements.txt
+
+      - name: Install mypy and stubs
+        run: |
+          pip install mypy
+          pip install -r mcp/requirements.txt || true
+
+      - name: Run mypy on mcp/server.py
+        working-directory: mcp
+        run: |
+          mypy server.py \
+            --config-file ../mypy.ini \
+            --no-error-summary \
+            || true
+
+      - name: Run mypy on scripts
+        run: |
+          mypy scripts/ \
+            --config-file mypy.ini \
+            --no-error-summary \
+            || true
+
+      - name: Run mypy on a2a_server
+        working-directory: a2a_server
+        run: |
+          pip install -r requirements.txt || true
+          mypy server.py \
+            --config-file ../mypy.ini \
+            --no-error-summary \
+            || true
+
+  schema-consistency:
+    name: Schema consistency test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run schema consistency tests
+        run: pytest tests/test_schema_consistency.py -v --tb=short
+
+  test-mcp-integration:
+    name: MCP tool integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: mcp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            mcp/requirements.txt
+            mcp/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e "."
+          pip install pytest pytest-asyncio pytest-timeout
+
+      - name: Run MCP integration tests
+        run: pytest tests/test_mcp_integration.py -v --tb=short --timeout=60
+
+  dead-code:
+    name: Dead code (vulture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install vulture
+        run: pip install vulture
+
+      - name: Run vulture
+        run: |
+          vulture mcp/server.py \
+                  mcp/memcheck/ \
+                  scripts/ \
+                  a2a_server/server.py \
+                  .vulture_whitelist.py \
+                  --min-confidence 80 \
+                  || true
