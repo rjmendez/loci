@@ -5,13 +5,19 @@ The deployed gate operates query->finding (a target's focus query vs each
 candidate finding), NOT finding<->finding (which is the classifier's training
 task, measured by grounding_gate_eval.py). This measures the gate's ACTUAL
 operation on the corpus and compares the cosine threshold against the trained
-classifier — the eval that decides whether to swap the trained model in as the
-gate default.
+classifier.
+
+IN-SAMPLE DIAGNOSTIC ONLY: the trained model is fit on this same corpus, so its
+metrics here are optimistic (AUC can read ~1.0 purely from memorization). This
+does NOT decide the gate default — that is governed by the out-of-sample
+grounding_gate_oos_eval.py (leave-one-run-out), which is the eval that catches the
+in-sample mirage and reverts the swap when the model fails to generalize.
 
 For every (target focus query, finding) pair: cosine = sim(embed(focus),
 embed(finding)); label = 1 if the finding belongs to that target else 0 (bleed).
-Reports recall / bleed_rejection / f1 / accuracy / auc for the cosine threshold
-and (if present) the trained model, plus a swap verdict.
+Reports recall / bleed_rejection / f1 / accuracy / auc for cosine and (if present)
+the trained model, each at a fixed AND best-F1 threshold (so the F1 comparison is
+fair), plus an in-sample-only note that defers the swap decision to the OOS eval.
 
 Live-only (needs embeddings). Requires OLLAMA_URL. Persists scores
 dtl.gate_qf.{cosine,model}.{metric} unless HARNESS_DRY_RUN=1.
@@ -100,10 +106,30 @@ def run():
 
     print(f"[gate-qf-eval] run_date={run_date} targets={len(targets)} findings={len(findings)} "
           f"pairs={len(labels)} (pos={sum(labels)}) thr={THRESHOLD} dry_run={harness.DRY_RUN}")
-    cos_m = _metrics(labels, cosv, THRESHOLD)
-    print("  COSINE @%.2f :" % THRESHOLD, {k: round(v, 3) for k, v in cos_m.items()})
+    # Report each scorer at a FIXED threshold AND at its own best-F1 operating
+    # point, so the model-vs-cosine F1 gap isn't just a threshold artifact
+    # (cosine@0.59 vs model@0.5 is not a fair head-to-head). AUC is threshold-free.
+    def _best_f1(scores):
+        pos_tot = sum(labels) or 1
+        best_thr, best_f1 = THRESHOLD, -1.0
+        for t in sorted(set(scores)):
+            tp = sum(1 for l, s in zip(labels, scores) if l == 1 and s >= t)
+            fp = sum(1 for l, s in zip(labels, scores) if l == 0 and s >= t)
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec = tp / pos_tot
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+            if f1 > best_f1:
+                best_f1, best_thr = f1, t
+        m = _metrics(labels, scores, best_thr)
+        m["thr"] = best_thr
+        return m
 
-    mdl_m = None
+    cos_m = _metrics(labels, cosv, THRESHOLD)
+    cos_best = _best_f1(cosv)
+    print("  COSINE @%.2f   :" % THRESHOLD, {k: round(v, 3) for k, v in cos_m.items()})
+    print("  COSINE @best=%.3f:" % cos_best["thr"], {k: round(v, 3) for k, v in cos_best.items() if k != "thr"})
+
+    mdl_best = None
     if MODEL.exists():
         try:
             import joblib
@@ -113,15 +139,22 @@ def run():
                           for q, cv, cos in feats])
             proba = clf.predict_proba(X)[:, 1].tolist()
             mdl_m = _metrics(labels, proba, 0.5)
-            print("  MODEL  @0.5 :", {k: round(v, 3) for k, v in mdl_m.items()})
+            mdl_best = _best_f1(proba)
+            print("  MODEL  @0.50  :", {k: round(v, 3) for k, v in mdl_m.items()})
+            print("  MODEL  @best=%.3f:" % mdl_best["thr"], {k: round(v, 3) for k, v in mdl_best.items() if k != "thr"})
         except Exception as e:
             print("  [model skipped]", e)
 
-    if mdl_m:
-        better = mdl_m["f1"] > cos_m["f1"] and mdl_m["accuracy"] >= cos_m["accuracy"]
-        print(f"  VERDICT: trained model {'BEATS' if better else 'does NOT beat'} cosine on query->finding "
-              f"(f1 {mdl_m['f1']:.3f} vs {cos_m['f1']:.3f}, acc {mdl_m['accuracy']:.3f} vs {cos_m['accuracy']:.3f})"
-              f" -> {'SWAP IN the trained model' if better else 'keep cosine default'}")
+    if mdl_best:
+        # Compare at each scorer's best F1 threshold, judged on F1 + AUC. Accuracy
+        # is omitted from the criterion: pairs are ~4:1 bleed-imbalanced, so it is
+        # inflated (predict-all-bleed already scores high).
+        better = mdl_best["f1"] > cos_best["f1"] and mdl_best["auc"] >= cos_best["auc"]
+        print(f"  IN-SAMPLE: model {'>' if better else '<='} cosine at best-F1 "
+              f"(f1 {mdl_best['f1']:.3f} vs {cos_best['f1']:.3f}; auc {mdl_best['auc']:.3f} vs {cos_best['auc']:.3f})")
+        print("  NOTE: in-sample only — the model is fit on THIS corpus, so these are optimistic and "
+              "NOT a swap decision. The gate default is governed by the out-of-sample "
+              "grounding_gate_oos_eval.py (leave-one-run-out).")
 
     if not harness.DRY_RUN:
         vec = harness.embed("deep_think_loci grounding gate query->finding eval")

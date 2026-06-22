@@ -22,7 +22,6 @@ from __future__ import annotations
 import importlib.util
 import io
 import contextlib
-import json
 import os
 import signal
 import socket
@@ -79,8 +78,6 @@ def _handle(conn: socket.socket, mod) -> None:
         log.warning("recv error: %s", e)
         conn.close()
         return
-
-    payload_str = data.decode("utf-8", errors="replace")
 
     buf = io.StringIO()
     old_stdin = sys.stdin
