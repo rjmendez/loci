@@ -2355,17 +2355,21 @@ def investigation_store(
     tags: Optional[str] = None,
     derived_from: str | list[str] | None = None,
     numeric_confidence: float | None = None,
+    procedure_preconditions: Optional[str] = None,
+    procedure_steps: Optional[str] = None,
+    procedure_postconditions: Optional[str] = None,
 ) -> str:
     """
     Record a finding in the investigation.
 
     Args:
         investigation_id: Investigation identifier.
-        finding_type: One of: observed, inferred, assumed, gap.
+        finding_type: One of: observed, inferred, assumed, gap, procedure.
                       observed  — from a direct tool response; cite source and key values.
                       inferred  — reasoned from observations but not directly stated.
                       assumed   — working hypothesis with no current evidence.
                       gap       — something that should be checked but hasn't been.
+                      procedure — a reusable step-by-step procedure (runbook/playbook entry).
         text: The finding. For observed, include enough detail to reproduce the
               query (table name, time range, key field values).
         source: Tool or data source this came from (e.g. sentinel__run_kql_query).
@@ -2382,6 +2386,10 @@ def investigation_store(
         numeric_confidence: Optional float in [0.0, 1.0]. When omitted, auto-derived
                             from string confidence: high→0.9, medium→0.6, low→0.3.
                             Values outside [0,1] are clamped.
+        procedure_preconditions: (procedure only) Comma-separated or natural-language
+                                 preconditions that must be true before running the procedure.
+        procedure_steps: (procedure only) Numbered steps as a string.
+        procedure_postconditions: (procedure only) Expected outcomes after the procedure.
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2396,8 +2404,8 @@ def investigation_store(
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
-    if finding_type not in {"observed", "inferred", "assumed", "gap"}:
-        return json.dumps({"error": "finding_type must be one of: observed, inferred, assumed, gap"})
+    if finding_type not in {"observed", "inferred", "assumed", "gap", "procedure"}:
+        return json.dumps({"error": "finding_type must be one of: observed, inferred, assumed, gap, procedure"})
     if confidence not in {"high", "medium", "low"}:
         return json.dumps({"error": "confidence must be one of: high, medium, low"})
 
@@ -2434,6 +2442,15 @@ def investigation_store(
             return json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     finding["entities"] = _extract_entities(text)
+
+    if finding_type == "procedure":
+        finding["procedure_meta"] = {
+            "preconditions": procedure_preconditions or "",
+            "steps": procedure_steps or "",
+            "postconditions": procedure_postconditions or "",
+            "success_count": 0,
+            "attempt_count": 0,
+        }
 
     _lock_path = _inv_dir(investigation_id) / ".lock"
     with open(_lock_path, "w") as _lock_fh:
@@ -2473,6 +2490,211 @@ def investigation_store(
         "type": finding_type,
         "mnemo_stored": mnemo_stored,
     }, indent=2)
+
+
+# ---- Tool: procedure_attempt ----
+
+@mcp.tool()
+def procedure_attempt(
+    investigation_id: str,
+    finding_id: str,
+    success: bool,
+) -> str:
+    """
+    Record an attempt (pass or fail) against a procedure-type finding.
+
+    Increments attempt_count on the finding's procedure_meta, and if success is
+    True also increments success_count.  The findings.jsonl file is rewritten
+    atomically (write to a temp file then rename) so no data is lost on crash.
+
+    Args:
+        investigation_id: Investigation that owns the finding.
+        finding_id: ID of the procedure finding to update.
+        success: True if the procedure succeeded on this attempt, False otherwise.
+
+    Returns:
+        JSON: {"finding_id": "<id>", "success_count": int, "attempt_count": int,
+               "success_rate": float}
+        On error: {"error": "<message>"}
+    """
+    try:
+        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+        if not findings_path.exists():
+            return json.dumps({"error": f"No findings file for investigation '{investigation_id}'."})
+
+        findings = _read_jsonl(findings_path)
+        target = None
+        for f in findings:
+            if f.get("id") == finding_id:
+                target = f
+                break
+
+        if target is None:
+            return json.dumps({"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
+
+        if target.get("record_type") != "procedure" and target.get("type") != "procedure":
+            return json.dumps({"error": f"Finding '{finding_id}' is not a procedure-type finding."})
+
+        if "procedure_meta" not in target:
+            target["procedure_meta"] = {
+                "preconditions": "",
+                "steps": "",
+                "postconditions": "",
+                "success_count": 0,
+                "attempt_count": 0,
+            }
+
+        target["procedure_meta"]["attempt_count"] = target["procedure_meta"].get("attempt_count", 0) + 1
+        if success:
+            target["procedure_meta"]["success_count"] = target["procedure_meta"].get("success_count", 0) + 1
+
+        attempt_count = target["procedure_meta"]["attempt_count"]
+        success_count = target["procedure_meta"]["success_count"]
+        success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+
+        # Atomic rewrite: write to temp file then rename
+        import tempfile as _tempfile
+        tmp_fd, tmp_path = _tempfile.mkstemp(dir=str(findings_path.parent), suffix=".jsonl.tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as tmp_fh:
+                for f in findings:
+                    tmp_fh.write(json.dumps(f) + "\n")
+            os.replace(tmp_path, str(findings_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+
+        # Update Qdrant payload for the finding
+        try:
+            _qdrant_upsert(finding_id, target.get("text", ""), target)
+        except Exception as exc:
+            logger.debug("procedure_attempt: qdrant upsert failed: %s", exc)
+
+        return json.dumps({
+            "finding_id": finding_id,
+            "success_count": success_count,
+            "attempt_count": attempt_count,
+            "success_rate": success_rate,
+        }, indent=2)
+
+    except Exception as exc:
+        logger.warning("procedure_attempt: unexpected error: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
+# ---- Tool: procedure_search ----
+
+@mcp.tool()
+def procedure_search(
+    query: str,
+    investigation_id: Optional[str] = None,
+    limit: int = 5,
+) -> str:
+    """
+    Search for procedure-type findings matching a query.
+
+    Searches Qdrant for findings with record_type == "procedure".  When
+    investigation_id is provided, results are filtered to that investigation.
+    Falls back to a keyword scan of local JSONL files when Qdrant is unavailable.
+
+    Args:
+        query: Natural language query describing the procedure you need.
+        investigation_id: Optional — limit search to a single investigation.
+        limit: Max number of results to return (default 5).
+
+    Returns:
+        JSON: {"procedures": [{"finding_id", "text", "source", "success_rate",
+               "procedure_meta", "investigation_id", "score"}], "count": int}
+        On error: {"error": "<message>", "procedures": [], "count": 0}
+    """
+    try:
+        client, _col = _get_qdrant()
+        procedures = []
+
+        if client is not None:
+            try:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                must_conditions = [
+                    FieldCondition(key="record_type", match=MatchValue(value="procedure")),
+                ]
+                if investigation_id:
+                    must_conditions.append(
+                        FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))
+                    )
+                qfilter = Filter(must=must_conditions)
+                hits = _qdrant_search_collection(
+                    query,
+                    collection_name=QDRANT_COLLECTION_PREFIX,
+                    limit=limit,
+                    query_filter=qfilter,
+                )
+                for h in hits:
+                    pm = h.get("procedure_meta", {})
+                    attempt_count = pm.get("attempt_count", 0) if pm else 0
+                    success_count = pm.get("success_count", 0) if pm else 0
+                    success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+                    procedures.append({
+                        "finding_id": h.get("id", ""),
+                        "text": h.get("text", ""),
+                        "source": h.get("source", ""),
+                        "investigation_id": h.get("investigation_id", ""),
+                        "success_rate": success_rate,
+                        "procedure_meta": pm,
+                        "score": h.get("score", 0.0),
+                    })
+            except Exception as exc:
+                logger.warning("procedure_search: qdrant search failed, falling back to JSONL scan: %s", exc)
+                client = None  # trigger fallback below
+
+        if client is None:
+            # Fallback: scan JSONL files directly
+            query_lower = query.lower()
+            inv_dirs = []
+            if investigation_id:
+                d = MEMORY_DIR / investigation_id
+                if d.is_dir():
+                    inv_dirs = [d]
+            else:
+                try:
+                    inv_dirs = [d for d in MEMORY_DIR.iterdir() if d.is_dir()]
+                except Exception:
+                    inv_dirs = []
+
+            candidates = []
+            for inv_dir_path in inv_dirs:
+                findings_path = inv_dir_path / "findings.jsonl"
+                if not findings_path.exists():
+                    continue
+                try:
+                    for f in _read_jsonl(findings_path):
+                        if f.get("record_type") == "procedure" or f.get("type") == "procedure":
+                            text = f.get("text", "")
+                            if query_lower in text.lower():
+                                pm = f.get("procedure_meta", {})
+                                attempt_count = pm.get("attempt_count", 0) if pm else 0
+                                success_count = pm.get("success_count", 0) if pm else 0
+                                success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+                                candidates.append({
+                                    "finding_id": f.get("id", ""),
+                                    "text": text,
+                                    "source": f.get("source", ""),
+                                    "investigation_id": f.get("investigation_id", ""),
+                                    "success_rate": success_rate,
+                                    "procedure_meta": pm,
+                                    "score": 0.0,
+                                })
+                except Exception as exc:
+                    logger.debug("procedure_search: error reading %s: %s", findings_path, exc)
+            procedures = candidates[:limit]
+
+        return json.dumps({"procedures": procedures, "count": len(procedures)}, indent=2)
+
+    except Exception as exc:
+        logger.warning("procedure_search: unexpected error: %s", exc)
+        return json.dumps({"error": str(exc), "procedures": [], "count": 0})
 
 
 # ---- Tool: investigation_note ----

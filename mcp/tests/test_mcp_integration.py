@@ -514,3 +514,166 @@ class TestNumericConfidence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestProceduralMemory(unittest.TestCase):
+    """Tests for procedure finding type, procedure_attempt, and procedure_search."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_investigation_store_accepts_procedure_type(self):
+        inv_id = _new_id("proc-store")
+        server.investigation_start(investigation_id=inv_id, title="Procedure store test")
+        result = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="procedure",
+            text="Rotate expired TLS certificates on the web tier.",
+            source="runbook:tls-rotation",
+            confidence="high",
+            procedure_preconditions="cert-manager installed, kubectl access available",
+            procedure_steps="1. List expired certs\n2. Rotate with cert-manager\n3. Verify pod restarts",
+            procedure_postconditions="All pods serving valid certs, no 502 errors",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertTrue(result.get("stored"), "stored should be True")
+        self.assertIn("finding_id", result)
+        self.assertEqual(result.get("type"), "procedure")
+
+        # Verify that procedure_meta was written to the JSONL
+        loaded = _json(server.investigation_load(investigation_id=inv_id))
+        proc_findings = [
+            f for f in loaded.get("recent_findings", [])
+            if f.get("record_type") == "procedure" or f.get("type") == "procedure"
+        ]
+        self.assertEqual(len(proc_findings), 1, "Expected exactly one procedure finding")
+        pm = proc_findings[0].get("procedure_meta", {})
+        self.assertIsInstance(pm, dict, "procedure_meta should be a dict")
+        self.assertEqual(pm.get("success_count"), 0)
+        self.assertEqual(pm.get("attempt_count"), 0)
+        self.assertIn("steps", pm)
+
+    def test_procedure_attempt_updates_success_rate(self):
+        inv_id = _new_id("proc-attempt")
+        server.investigation_start(investigation_id=inv_id, title="Procedure attempt test")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="procedure",
+            text="Check disk space on all nodes.",
+            source="runbook:disk-check",
+            confidence="medium",
+            procedure_steps="1. ssh to node\n2. df -h\n3. alert if >80%",
+        ))
+        finding_id = stored.get("finding_id")
+        self.assertIsNotNone(finding_id, "Should have a finding_id")
+
+        # First attempt: failure
+        r1 = _json(server.procedure_attempt(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            success=False,
+        ))
+        self.assertNotIn("error", r1, f"Unexpected error: {r1}")
+        self.assertEqual(r1.get("attempt_count"), 1)
+        self.assertEqual(r1.get("success_count"), 0)
+        self.assertEqual(r1.get("success_rate"), 0.0)
+
+        # Second attempt: success
+        r2 = _json(server.procedure_attempt(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            success=True,
+        ))
+        self.assertNotIn("error", r2, f"Unexpected error: {r2}")
+        self.assertEqual(r2.get("attempt_count"), 2)
+        self.assertEqual(r2.get("success_count"), 1)
+        self.assertAlmostEqual(r2.get("success_rate"), 0.5, places=3)
+
+        # Third attempt: success
+        r3 = _json(server.procedure_attempt(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            success=True,
+        ))
+        self.assertEqual(r3.get("attempt_count"), 3)
+        self.assertEqual(r3.get("success_count"), 2)
+        self.assertAlmostEqual(r3.get("success_rate"), 2 / 3, places=3)
+
+    def test_procedure_attempt_rejects_nonexistent_finding(self):
+        inv_id = _new_id("proc-miss")
+        server.investigation_start(investigation_id=inv_id, title="Proc miss test")
+        result = _json(server.procedure_attempt(
+            investigation_id=inv_id,
+            finding_id="does-not-exist-uuid",
+            success=True,
+        ))
+        self.assertIn("error", result)
+
+    def test_procedure_attempt_rejects_non_procedure_finding(self):
+        inv_id = _new_id("proc-wrong-type")
+        server.investigation_start(investigation_id=inv_id, title="Wrong type test")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Some observation.",
+            source="test",
+        ))
+        finding_id = stored.get("finding_id")
+        result = _json(server.procedure_attempt(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            success=True,
+        ))
+        self.assertIn("error", result)
+
+    def test_procedure_search_returns_procedures(self):
+        inv_id = _new_id("proc-search")
+        server.investigation_start(investigation_id=inv_id, title="Procedure search test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="procedure",
+            text="Restart the nginx service after config change.",
+            source="runbook:nginx",
+            confidence="high",
+            procedure_steps="1. nginx -t\n2. systemctl reload nginx",
+        )
+        # Qdrant is unavailable in tests; fallback JSONL scan must find the result
+        result = _json(server.procedure_search(
+            query="nginx",
+            investigation_id=inv_id,
+            limit=5,
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("procedures", result)
+        self.assertIn("count", result)
+        procs = result["procedures"]
+        self.assertGreaterEqual(len(procs), 1, "Should find at least one procedure")
+        self.assertIn("nginx", procs[0]["text"])
+
+    def test_procedure_search_returns_empty_for_unmatched_query(self):
+        inv_id = _new_id("proc-search-empty")
+        server.investigation_start(investigation_id=inv_id, title="Procedure search empty test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="procedure",
+            text="Restart the nginx service after config change.",
+            source="runbook:nginx",
+            confidence="high",
+        )
+        result = _json(server.procedure_search(
+            query="zxqyabc_totally_nonexistent_zzz",
+            investigation_id=inv_id,
+            limit=5,
+        ))
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("count"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
