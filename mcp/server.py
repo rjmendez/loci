@@ -2456,6 +2456,125 @@ def investigation_load(
     }, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Conflict detection helpers
+# ---------------------------------------------------------------------------
+
+_NEGATION_MARKERS = frozenset(["not ", "no ", "never", "false"])
+
+
+def _has_negation(text: str) -> bool:
+    """Return True if text contains any negation marker (case-insensitive)."""
+    lower = text.lower()
+    return any(marker in lower for marker in _NEGATION_MARKERS)
+
+
+def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
+    """
+    Search Qdrant for near-neighbors of new_finding (same investigation, cosine
+    > 0.82, excluding the new finding itself) and apply simple conflict heuristics.
+
+    Returns a list of conflict dicts (may be empty). Fail-open — any exception
+    returns an empty list so investigation_store is never blocked.
+    """
+    try:
+        client, col = _get_qdrant()
+        if client is None:
+            return []
+
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+        except ImportError:
+            return []
+
+        dense_vec = _embed(new_finding.get("text", ""))
+        if dense_vec is None:
+            return []
+
+        search_filter = Filter(must=[
+            FieldCondition(
+                key="investigation_id",
+                match=MatchValue(value=investigation_id),
+            )
+        ])
+
+        try:
+            from qdrant_client.models import SearchParams, QuantizationSearchParams
+            _sp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
+            result = client.search(
+                collection_name=col,
+                query_vector=dense_vec,
+                query_filter=search_filter,
+                limit=10,
+                score_threshold=0.82,
+                with_payload=True,
+                search_params=_sp,
+            )
+        except Exception:
+            # Some collection configurations use named vectors; fall back gracefully.
+            return []
+
+        new_id = new_finding.get("id", "")
+        new_type = new_finding.get("record_type", "")
+        new_text = new_finding.get("text", "")
+        new_neg = _has_negation(new_text)
+
+        conflicts = []
+        for hit in result:
+            payload = dict(hit.payload or {})
+            neighbor_id = str(payload.get("id", hit.id))
+            # Skip the finding itself (shouldn't appear since it may not yet be
+            # in the index, but guard anyway).
+            if neighbor_id == new_id:
+                continue
+
+            neighbor_type = payload.get("record_type") or payload.get("type", "")
+            neighbor_text = str(payload.get("text", ""))
+            neighbor_neg = _has_negation(neighbor_text)
+
+            is_conflict = False
+
+            # Heuristic 1: gap now filled by an observed finding
+            if neighbor_type == "gap" and new_type == "observed":
+                is_conflict = True
+
+            # Heuristic 2: assumption overridden by a non-assumed finding
+            elif neighbor_type == "assumed" and new_type != "assumed":
+                is_conflict = True
+
+            # Heuristic 3: opposing negation markers
+            elif new_neg != neighbor_neg:
+                is_conflict = True
+
+            if is_conflict:
+                conflicts.append({
+                    "neighbor_id": neighbor_id,
+                    "neighbor_type": neighbor_type,
+                    "score": round(float(hit.score), 4),
+                })
+
+        return conflicts
+    except Exception as exc:
+        logger.debug("_detect_conflicts: fail-open on exception: %s", exc)
+        return []
+
+
+def _write_conflict(investigation_id: str, finding_id_a: str, neighbor_id: str) -> str:
+    """Append a conflict record to conflicts.jsonl and return its id."""
+    conflict = {
+        "id": str(uuid.uuid4()),
+        "investigation_id": investigation_id,
+        "finding_id_a": finding_id_a,
+        "finding_id_b": neighbor_id,
+        "detected_at": _now(),
+        "status": "open",
+        "resolution": None,
+    }
+    path = _inv_dir(investigation_id) / "conflicts.jsonl"
+    _append_jsonl(path, conflict)
+    return conflict["id"]
+
+
 # ---- Tool: investigation_store ----
 
 @mcp.tool()
@@ -2612,12 +2731,32 @@ def investigation_store(
         "confidence": confidence,
     })
 
-    return json.dumps({
+    # Conflict detection — fail-open; never blocks a successful store.
+    conflict_detected = False
+    conflicting_finding_id = None
+    conflict_id = None
+    try:
+        conflicts = _detect_conflicts(investigation_id, finding)
+        if conflicts:
+            first = conflicts[0]
+            conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"])
+            conflict_detected = True
+            conflicting_finding_id = first["neighbor_id"]
+    except Exception as _cd_exc:
+        logger.debug("investigation_store: conflict detection failed (fail-open): %s", _cd_exc)
+
+    result = {
         "stored": True,
         "finding_id": finding["id"],
         "type": finding_type,
         "mnemo_stored": mnemo_stored,
-    }, indent=2)
+        "conflict_detected": conflict_detected,
+    }
+    if conflict_detected:
+        result["conflicting_finding_id"] = conflicting_finding_id
+        result["conflict_id"] = conflict_id
+
+    return json.dumps(result, indent=2)
 
 
 # ---- Tool: procedure_attempt ----
@@ -6379,6 +6518,116 @@ def investigation_reason(
         "final_answer": final_answer,
         "persisted_finding_ids": persisted,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Conflict management tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def conflict_list(investigation_id: str) -> str:
+    """
+    List all detected conflicts for an investigation.
+
+    Conflicts are recorded automatically by investigation_store when a new
+    finding appears to contradict an existing one (e.g. an observed finding
+    that contradicts an assumed or gap finding, or opposing negation markers).
+
+    Args:
+        investigation_id: Investigation identifier.
+
+    Returns:
+        JSON: {"conflicts": [{id, finding_id_a, finding_id_b, detected_at,
+               status, resolution}], "count": <int>}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        path = _inv_dir(investigation_id) / "conflicts.jsonl"
+        raw_conflicts = _read_jsonl(path)
+
+        conflicts = [
+            {
+                "id": c.get("id"),
+                "finding_id_a": c.get("finding_id_a"),
+                "finding_id_b": c.get("finding_id_b"),
+                "detected_at": c.get("detected_at"),
+                "status": c.get("status", "open"),
+                "resolution": c.get("resolution"),
+            }
+            for c in raw_conflicts
+        ]
+
+        return json.dumps({"conflicts": conflicts, "count": len(conflicts)}, indent=2)
+    except Exception as exc:
+        logger.exception("conflict_list failed: %s", exc)
+        return json.dumps({"error": str(exc)})
+
+
+_VALID_VERDICTS = frozenset(["a_wins", "b_wins", "both_valid", "false_positive"])
+
+
+@mcp.tool()
+def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> str:
+    """
+    Resolve a detected conflict by recording a verdict.
+
+    Args:
+        investigation_id: Investigation identifier.
+        conflict_id: The conflict id to resolve (from conflict_list or
+                     conflict_detected in investigation_store response).
+        verdict: One of: a_wins | b_wins | both_valid | false_positive
+                 a_wins        — finding_id_a (the newer finding) is correct.
+                 b_wins        — finding_id_b (the older finding) is correct.
+                 both_valid    — both findings are valid in different contexts.
+                 false_positive — the conflict detector was wrong; no real conflict.
+
+    Returns:
+        JSON: {"resolved": true, "conflict_id": "...", "verdict": "..."}
+        On error: {"error": "<message>"}
+    """
+    try:
+        if verdict not in _VALID_VERDICTS:
+            return json.dumps({
+                "error": f"verdict must be one of: {', '.join(sorted(_VALID_VERDICTS))}"
+            })
+
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        path = _inv_dir(investigation_id) / "conflicts.jsonl"
+        conflicts = _read_jsonl(path)
+
+        updated = False
+        new_rows = []
+        for c in conflicts:
+            if c.get("id") == conflict_id:
+                c = dict(c)
+                c["status"] = "resolved"
+                c["resolution"] = verdict
+                updated = True
+            new_rows.append(c)
+
+        if not updated:
+            return json.dumps({"error": f"Conflict '{conflict_id}' not found in investigation '{investigation_id}'."})
+
+        # Atomic rewrite using a temp file
+        import tempfile as _tmpmod
+        dir_ = _inv_dir(investigation_id)
+        with _tmpmod.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
+            for row in new_rows:
+                tf.write(json.dumps(row) + "\n")
+            tmp_path = Path(tf.name)
+        tmp_path.replace(path)
+
+        return json.dumps({"resolved": True, "conflict_id": conflict_id, "verdict": verdict}, indent=2)
+    except Exception as exc:
+        logger.exception("conflict_resolve failed: %s", exc)
+        return json.dumps({"error": str(exc)})
 
 
 # ---------------------------------------------------------------------------

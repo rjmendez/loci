@@ -34,6 +34,8 @@ _ = rag_context_search
 _ = reflection_loop_seed
 _ = reflection_loop_tick
 _ = reflection_loop_status
+_ = conflict_list
+_ = conflict_resolve
 
 # ── Public API exported by memcheck modules
 _ = run_contradiction
