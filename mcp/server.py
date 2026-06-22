@@ -2593,6 +2593,7 @@ def investigation_store(
     valid_from: Optional[str] = None,
     valid_until: Optional[str] = None,
     authored_by: Optional[str] = None,
+    tier: str = "warm",
 ) -> str:
     """
     Record a finding in the investigation.
@@ -2633,10 +2634,14 @@ def investigation_store(
                      Set when a finding has a known expiry or is superseded.
         authored_by: Optional agent_id of the agent storing this finding.
                      Used with investigation ACL to filter findings per agent.
+        tier: Memory tier — "hot", "warm", or "cold". Default "warm".
+              hot  — indexed in Qdrant AND summarized in manifest notes (instantly in-context).
+              warm — indexed in Qdrant only (default, searchable).
+              cold — stored in JSONL only, NOT indexed in Qdrant (archived).
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
-               "mnemo_stored": true|false}
+               "mnemo_stored": true|false, "tier": "<tier>"}
         On error: {"error": "<message>"}
 
     Note on arg name: the second positional parameter is ``finding_type``, NOT
@@ -2651,6 +2656,8 @@ def investigation_store(
         return json.dumps({"error": "finding_type must be one of: observed, inferred, assumed, gap, procedure"})
     if confidence not in {"high", "medium", "low"}:
         return json.dumps({"error": "confidence must be one of: high, medium, low"})
+    if tier not in {"hot", "warm", "cold"}:
+        return json.dumps({"error": "tier must be one of: hot, warm, cold"})
 
     # Resolve numeric_confidence: caller-supplied (clamped) or derived from string confidence.
     _confidence_to_numeric = {"high": 0.9, "medium": 0.6, "low": 0.3}
@@ -2680,6 +2687,7 @@ def investigation_store(
         "valid_from": valid_from if valid_from is not None else _ts_now,
         "valid_until": valid_until,
         "authored_by": authored_by or "",
+        "tier": tier,
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
@@ -2705,6 +2713,11 @@ def investigation_store(
         try:
             _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
             manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
+            # Update hot-tier manifest notes
+            if tier == "hot":
+                snippet = text[:200]
+                notes = manifest.get("notes") or ""
+                manifest["notes"] = (notes + "; " + snippet) if notes else snippet
             _save_manifest(manifest)
         finally:
             fcntl.flock(_lock_fh, fcntl.LOCK_UN)
@@ -2722,13 +2735,16 @@ def investigation_store(
         },
     )
 
-    _qdrant_upsert(finding["id"], text, finding)
+    # cold tier: skip Qdrant indexing; hot and warm: index normally
+    if tier != "cold":
+        _qdrant_upsert(finding["id"], text, finding)
     _event_log_append({
         "op": "store",
         "investigation_id": investigation_id,
         "finding_id": finding["id"],
         "finding_type": finding_type,
         "confidence": confidence,
+        "tier": tier,
     })
 
     # Conflict detection — fail-open; never blocks a successful store.
@@ -2751,6 +2767,7 @@ def investigation_store(
         "type": finding_type,
         "mnemo_stored": mnemo_stored,
         "conflict_detected": conflict_detected,
+        "tier": tier,
     }
     if conflict_detected:
         result["conflicting_finding_id"] = conflicting_finding_id
@@ -4385,6 +4402,18 @@ def investigation_list() -> str:
         manifest = _load_manifest(d.name)
         if manifest:
             acl = manifest.get("acl") or []
+            # Scan findings.jsonl to build tier counts
+            tier_counts = {"hot": 0, "warm": 0, "cold": 0}
+            try:
+                findings_path = d / "findings.jsonl"
+                for f in _read_jsonl(findings_path):
+                    t = f.get("tier", "warm")
+                    if t in tier_counts:
+                        tier_counts[t] += 1
+                    else:
+                        tier_counts["warm"] += 1  # default for legacy findings
+            except Exception:
+                pass  # fail-open
             investigations.append({
                 "id": manifest["id"],
                 "title": manifest["title"],
@@ -4395,6 +4424,7 @@ def investigation_list() -> str:
                 "open_questions_count": len(manifest["open_questions"]),
                 "hypothesis": manifest["hypothesis"],
                 "visibility": "shared" if acl else "private",
+                "tier_counts": tier_counts,
             })
 
     return json.dumps({"investigations": investigations}, indent=2)
@@ -6357,6 +6387,163 @@ def memory_confidence(
         "top_hit_preview": top_text,
         "recommendation": recommendation,
     }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Memory tier management helpers
+# ---------------------------------------------------------------------------
+
+def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) -> dict:
+    """
+    Core logic for memory_promote / memory_demote.
+
+    Rewrites findings.jsonl atomically, updating the tier field of the target
+    finding. Returns a dict with {finding_id, old_tier, new_tier, ok} or {error}.
+    All Qdrant operations are fail-open.
+    """
+    if new_tier not in {"hot", "warm", "cold"}:
+        return {"error": "tier must be one of: hot, warm, cold"}
+
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return {"error": f"Investigation '{investigation_id}' not found."}
+
+    findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+    findings = _read_jsonl(findings_path)
+
+    target = None
+    for f in findings:
+        if str(f.get("id", "")) == finding_id:
+            target = f
+            break
+    if target is None:
+        return {"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."}
+
+    old_tier = target.get("tier", "warm")
+    if old_tier == new_tier:
+        return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+
+    # Update the finding in-memory
+    for f in findings:
+        if str(f.get("id", "")) == finding_id:
+            f["tier"] = new_tier
+
+    # Atomically rewrite the JSONL file
+    _lock_path = _inv_dir(investigation_id) / ".lock"
+    try:
+        with open(_lock_path, "w") as _lock_fh:
+            fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+            try:
+                dir_ = findings_path.parent
+                with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
+                    for f in findings:
+                        tf.write(json.dumps(f) + "\n")
+                    tmp_path = Path(tf.name)
+                tmp_path.replace(findings_path)
+            finally:
+                fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+    except Exception as exc:
+        return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
+
+    text = str(target.get("text", "") or "")
+
+    # Handle Qdrant changes based on tier transition
+    try:
+        if new_tier == "cold":
+            # Remove from Qdrant vector index
+            client, col = _get_qdrant()
+            if client is not None:
+                try:
+                    from qdrant_client.models import PointIdsList
+                    client.delete(col, points_selector=PointIdsList(points=[finding_id]))
+                except Exception as exc:
+                    logger.warning("Qdrant delete failed (demote to cold) — JSONL updated: %s", exc)
+        elif new_tier in ("warm", "hot") and old_tier == "cold":
+            # Re-index in Qdrant (was cold, now searchable)
+            _qdrant_upsert(finding_id, text, target)
+        elif new_tier == "hot" and old_tier == "warm":
+            # Already in Qdrant; just ensure it stays indexed (upsert is idempotent)
+            _qdrant_upsert(finding_id, text, target)
+    except Exception as exc:
+        logger.warning("Qdrant tier-change operation failed (fail-open): %s", exc)
+
+    # If promoting to hot: append text snippet to manifest notes
+    if new_tier == "hot":
+        try:
+            snippet = text[:200]
+            notes = manifest.get("notes") or ""
+            manifest["notes"] = (notes + "; " + snippet) if notes else snippet
+            _save_manifest(manifest)
+        except Exception as exc:
+            logger.warning("manifest notes update failed (fail-open): %s", exc)
+
+    return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tool: memory_promote
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
+    """
+    Promote a finding to a higher memory tier.
+
+    Memory tiers:
+      hot  — text snippet added to manifest notes (instantly in-context) + Qdrant indexed.
+      warm — Qdrant indexed (default searchable tier).
+      cold — JSONL only; NOT in Qdrant (archived, not vector-searchable).
+
+    Typical promotions: cold → warm, warm → hot.
+
+    Args:
+        investigation_id: Investigation identifier.
+        finding_id: UUID of the finding to promote.
+        tier: Target tier — "hot", "warm", or "cold".
+
+    Returns:
+        JSON: {finding_id, old_tier, new_tier, ok: true}
+        On error: {error: "<message>"}
+    """
+    try:
+        result = _change_finding_tier(investigation_id, finding_id, tier)
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Tool: memory_demote
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
+    """
+    Demote a finding to a lower memory tier.
+
+    Memory tiers:
+      hot  — text snippet added to manifest notes (instantly in-context) + Qdrant indexed.
+      warm — Qdrant indexed (default searchable tier).
+      cold — JSONL only; NOT in Qdrant (archived, not vector-searchable).
+
+    Typical demotions: hot → warm, warm → cold.
+    Demoting to cold removes the vector from Qdrant so it no longer appears in
+    semantic searches.
+
+    Args:
+        investigation_id: Investigation identifier.
+        finding_id: UUID of the finding to demote.
+        tier: Target tier — "hot", "warm", or "cold".
+
+    Returns:
+        JSON: {finding_id, old_tier, new_tier, ok: true}
+        On error: {error: "<message>"}
+    """
+    try:
+        result = _change_finding_tier(investigation_id, finding_id, tier)
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
 # ---------------------------------------------------------------------------
