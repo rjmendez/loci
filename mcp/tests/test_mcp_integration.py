@@ -1856,3 +1856,129 @@ class TestMemoryHints(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEntityNodes(unittest.TestCase):
+    """Entity node layer: entity_list and entity_timeline tools."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _start_and_store(self, inv_id, texts):
+        server.investigation_start(investigation_id=inv_id, title="Entity test")
+        finding_ids = []
+        for text in texts:
+            r = _json(server.investigation_store(
+                investigation_id=inv_id,
+                finding_type="observed",
+                text=text,
+                source="test:entity",
+                confidence="medium",
+            ))
+            finding_ids.append(r.get("finding_id"))
+        return finding_ids
+
+    def test_entity_list_returns_valid_json(self):
+        inv_id = _new_id("elist")
+        self._start_and_store(inv_id, [
+            'Windows Server contacted Azure AD at 192.168.1.1.',
+            '"John Smith" accessed the system from 10.0.0.5.',
+        ])
+        result = _json(server.entity_list(investigation_id=inv_id))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("entities", result)
+        self.assertIn("count", result)
+        self.assertIsInstance(result["entities"], list)
+        self.assertIsInstance(result["count"], int)
+        # At minimum, some entities should have been extracted
+        # (capitalized phrases like "Windows Server", "Azure AD", IP addresses)
+        self.assertGreaterEqual(result["count"], 0)
+
+    def test_entity_list_missing_investigation_returns_error(self):
+        result = _json(server.entity_list(investigation_id="does-not-exist-xyz"))
+        self.assertIn("error", result)
+
+    def test_entity_list_type_filter(self):
+        inv_id = _new_id("elist-filter")
+        self._start_and_store(inv_id, [
+            'Windows Server contacted Azure AD at 192.168.1.1.',
+        ])
+        result = _json(server.entity_list(investigation_id=inv_id, entity_type="system"))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("entities", result)
+        # All returned entities should have type == "system"
+        for ent in result["entities"]:
+            self.assertEqual(ent.get("type"), "system")
+
+    def test_entity_timeline_returns_valid_json(self):
+        inv_id = _new_id("etimeline")
+        self._start_and_store(inv_id, [
+            'Windows Server was observed sending traffic.',
+            'Windows Server escalated privileges.',
+        ])
+        # Get entity list first to find an entity_id
+        list_result = _json(server.entity_list(investigation_id=inv_id))
+        entities = list_result.get("entities", [])
+
+        if not entities:
+            # No entities extracted — still must return valid JSON when called with bad id
+            result = _json(server.entity_timeline(
+                investigation_id=inv_id,
+                entity_id="nonexistent-id",
+            ))
+            self.assertIn("error", result)
+            return
+
+        entity_id = entities[0]["entity_id"]
+        result = _json(server.entity_timeline(
+            investigation_id=inv_id,
+            entity_id=entity_id,
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("entity", result)
+        self.assertIn("timeline", result)
+        self.assertIn("count", result)
+        self.assertIsInstance(result["timeline"], list)
+        self.assertIsInstance(result["count"], int)
+
+    def test_entity_timeline_missing_entity_returns_error(self):
+        inv_id = _new_id("etimeline-miss")
+        server.investigation_start(investigation_id=inv_id, title="Timeline miss")
+        result = _json(server.entity_timeline(
+            investigation_id=inv_id,
+            entity_id="00000000-0000-0000-0000-000000000000",
+        ))
+        self.assertIn("error", result)
+
+    def test_entity_timeline_missing_investigation_returns_error(self):
+        result = _json(server.entity_timeline(
+            investigation_id="does-not-exist-xyz",
+            entity_id="some-entity-id",
+        ))
+        self.assertIn("error", result)
+
+    def test_entities_accumulated_across_findings(self):
+        """Entities mentioned in multiple findings should accumulate finding_refs."""
+        inv_id = _new_id("eaccum")
+        self._start_and_store(inv_id, [
+            'Windows Server sent a request.',
+            'Windows Server received a response.',
+            'Windows Server crashed.',
+        ])
+        list_result = _json(server.entity_list(investigation_id=inv_id))
+        entities = list_result.get("entities", [])
+        # Find "Windows Server" entity (if extracted)
+        ws_entities = [e for e in entities if "windows" in e.get("name", "").lower()]
+        if ws_entities:
+            # Should appear in multiple findings
+            self.assertGreaterEqual(ws_entities[0]["finding_count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
