@@ -19,6 +19,7 @@ basename when no root is given).
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 
@@ -165,11 +166,13 @@ def run_code_checks(
     try:
         vendored_issues = check_file(p)
     except Exception:  # noqa: BLE001 — checker errors must not break the hook
+        logging.exception("vendored checker failed for %s", p)
         vendored_issues = []
 
     try:
         extended_issues = run_extended_checks(p)
     except Exception:  # noqa: BLE001 — extended layer is fail-safe too
+        logging.exception("extended checker failed for %s", p)
         extended_issues = []
 
     verdicts: list[Verdict] = []
@@ -178,6 +181,7 @@ def run_code_checks(
         try:
             verdict = _issue_to_verdict(issue, relpath)
         except Exception:  # noqa: BLE001 — skip a bad issue, never raise
+            logging.exception("_issue_to_verdict failed for issue %r in %s", issue, p)
             continue
         if verdict.subject_signature in seen_signatures:
             continue
