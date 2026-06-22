@@ -156,7 +156,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, uuid, json, sqlite3, logging, datetime
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime
 from typing import Optional, Any
 
 # ── load .env before anything else ─────────────────────────────────────────────
@@ -831,16 +831,14 @@ async def skill_context_broadcast(task: dict) -> dict:
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
-            ) as sess:
-                async with sess.post(peer_url, json=payload, headers=headers) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return {'peer': peer_url, 'status': 'ok',
-                                'output': data.get('result', {}).get('output', {})}
-                    else:
-                        body = await r.text()
-                        return {'peer': peer_url, 'status': f'http_{r.status}',
-                                'error': body[:200]}
+            ) as sess, sess.post(peer_url, json=payload, headers=headers) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return {'peer': peer_url, 'status': 'ok',
+                            'output': data.get('result', {}).get('output', {})}
+                body = await r.text()
+                return {'peer': peer_url, 'status': f'http_{r.status}',
+                        'error': body[:200]}
         except Exception as e:
             return {'peer': peer_url, 'status': 'error', 'error': str(e)}
 
@@ -977,15 +975,14 @@ async def skill_gpu_inference(task: dict) -> dict:
     messages.append({'role': 'user', 'content': prompt})
 
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(
-                f"{OLLAMA_BASE.rstrip('/v1')}/v1/chat/completions",
-                json={'model': model, 'messages': messages, 'max_tokens': max_t},
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as r:
-                d = await r.json()
-                content = d['choices'][0]['message']['content']
-                return {'response': content, 'model': model, 'status': 'ok'}
+        async with aiohttp.ClientSession() as sess, sess.post(
+            f"{OLLAMA_BASE.rstrip('/v1')}/v1/chat/completions",
+            json={'model': model, 'messages': messages, 'max_tokens': max_t},
+            timeout=aiohttp.ClientTimeout(total=120)
+        ) as r:
+            d = await r.json()
+            content = d['choices'][0]['message']['content']
+            return {'response': content, 'model': model, 'status': 'ok'}
     except Exception as e:
         return {'error': str(e), 'status': 'error'}
 
@@ -1250,18 +1247,17 @@ async def a2a_endpoint(request: Request):
 
     if method == 'tasks/send':
         return await _handle_task_send(rpc_id, params)
-    elif method == 'tasks/get':
+    if method == 'tasks/get':
         return await _handle_task_get(rpc_id, params)
-    elif method == 'tasks/list':
+    if method == 'tasks/list':
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
             'result': {'tasks': list(_tasks.values())}
         })
-    else:
-        return JSONResponse({
-            'jsonrpc': '2.0', 'id': rpc_id,
-            'error': {'code': -32601, 'message': f"Method not found: '{method}'"}
-        })
+    return JSONResponse({
+        'jsonrpc': '2.0', 'id': rpc_id,
+        'error': {'code': -32601, 'message': f"Method not found: '{method}'"}
+    })
 
 
 @app.get('/a2a/tasks/{task_id}', dependencies=[Depends(_verify_bearer), Depends(_verify_totp)])

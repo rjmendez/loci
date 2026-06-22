@@ -50,7 +50,7 @@ def make_signature(subject_kind: str, text: str) -> str:
     same qdrant point id downstream).
     """
     normalized = _normalize(text)
-    digest = hashlib.sha256(f"{subject_kind}:{normalized}".encode("utf-8"))
+    digest = hashlib.sha256(f"{subject_kind}:{normalized}".encode())
     return digest.hexdigest()
 
 

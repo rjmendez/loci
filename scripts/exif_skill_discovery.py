@@ -51,7 +51,7 @@ def read_recent_failures():
             return [row[0] for row in rows]
         finally:
             conn.close()
-    except sqlite3.OperationalError as exc:
+    except sqlite3.OperationalError:
         # Table or column may differ; try a fallback without bank filter
         try:
             conn = sqlite3.connect(MNEMOSYNE_DB)
@@ -84,7 +84,7 @@ def read_existing_skill_names():
         if not os.path.exists(skill_md):
             continue
         try:
-            with open(skill_md, "r", encoding="utf-8") as fh:
+            with open(skill_md, encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if line.startswith("name:"):
