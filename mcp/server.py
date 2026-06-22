@@ -359,13 +359,25 @@ def _get_cross_encoder():
 
 def _embed_sparse(text: str):
     """Returns a SparseVector or None."""
+    cached = _embed_sparse_cache.get(text)
+    if cached is not None:
+        try:
+            from qdrant_client.models import SparseVector
+            return SparseVector(indices=list(cached[0]), values=list(cached[1]))
+        except Exception:
+            pass
     model = _get_sparse_embedder()
     if model is None:
         return None
     try:
         from qdrant_client.models import SparseVector
         result = list(model.embed([text]))[0]
-        return SparseVector(indices=result.indices.tolist(), values=result.values.tolist())
+        indices = result.indices.tolist()
+        values = result.values.tolist()
+        if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
+            _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
+        _embed_sparse_cache[text] = (tuple(indices), tuple(values))
+        return SparseVector(indices=indices, values=values)
     except Exception as exc:
         logger.debug("sparse embed failed: %s", exc)
         return None
@@ -543,6 +555,9 @@ _EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
 _EMBED_BATCH_SIZE = 32  # Ollama stalls on >32
+_EMBED_CACHE_MAXSIZE = 512
+_embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
+_embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
 
 # Startup validation — warn clearly when required backends are not configured.
 # Server runs in degraded mode (keyword-only) rather than refusing to start.
@@ -576,6 +591,9 @@ _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 def _embed(text: str) -> list[float] | None:
     """Single-text embed via OpenAI-compat /v1/embeddings.
     Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
+    cached = _embed_cache.get(text)
+    if cached is not None:
+        return cached
     if not _OLLAMA_BASE:
         return None
     try:
@@ -588,7 +606,12 @@ def _embed(text: str) -> list[float] | None:
         )
         r.raise_for_status()
         data = r.json().get("data", [])
-        return list(data[0]["embedding"]) if data else None
+        result = list(data[0]["embedding"]) if data else None
+        if result is not None:
+            if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
+                _embed_cache.pop(next(iter(_embed_cache)))
+            _embed_cache[text] = result
+        return result
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
         return None
@@ -1425,11 +1448,19 @@ def _inv_dir(investigation_id: str) -> Path:
     return d
 
 
+_manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
+
+
 def _load_manifest(investigation_id: str) -> dict | None:
+    raw = _manifest_cache.get(investigation_id)
+    if raw is not None:
+        return json.loads(raw)
     p = MEMORY_DIR / investigation_id / "manifest.json"
     if not p.exists():
         return None
-    return json.loads(p.read_text())
+    raw = p.read_text()
+    _manifest_cache[investigation_id] = raw
+    return json.loads(raw)
 
 
 def _save_manifest(manifest: dict) -> None:
@@ -1441,6 +1472,7 @@ def _save_manifest(manifest: dict) -> None:
         tf.write(data)
         tmp_path = Path(tf.name)
     tmp_path.replace(p)
+    _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
