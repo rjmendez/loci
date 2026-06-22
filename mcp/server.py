@@ -44,6 +44,7 @@ Tools:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -2280,10 +2281,15 @@ def investigation_store(
         finding["derived_from"] = derived
     finding["entities"] = _extract_entities(text)
 
-    _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
-
-    manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
-    _save_manifest(manifest)
+    _lock_path = _inv_dir(investigation_id) / ".lock"
+    with open(_lock_path, "w") as _lock_fh:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+        try:
+            _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
+            manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
+            _save_manifest(manifest)
+        finally:
+            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
 
     mnemo_stored = _mnemo_remember(
         text,
