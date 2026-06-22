@@ -2255,6 +2255,10 @@ def investigation_store(
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
+        existing_ids = {f["id"] for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl") if "id" in f}
+        unknown = [pid for pid in derived if pid not in existing_ids]
+        if unknown:
+            return json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     finding["entities"] = _extract_entities(text)
 
