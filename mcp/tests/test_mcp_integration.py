@@ -257,6 +257,61 @@ class TestAuditLog(unittest.TestCase):
         self.assertNotIn("error", result)
 
 
+class TestMemorySurface(unittest.TestCase):
+    """memory_surface returns valid JSON in all cases, including when Qdrant is unavailable."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_memory_surface_returns_valid_json(self):
+        """Without Qdrant, memory_surface must return valid JSON with error key."""
+        result = _json(server.memory_surface(context="Working on authentication token expiry bug"))
+        self.assertIsInstance(result, dict)
+        # Either surfaced results (if Qdrant available) or a graceful error
+        self.assertTrue(
+            "surfaced" in result or "error" in result,
+            f"memory_surface missing 'surfaced' or 'error' key: {result}",
+        )
+
+    def test_memory_surface_no_qdrant_has_surfaced_list(self):
+        """When Qdrant is unavailable, surfaced must be an empty list, not missing."""
+        result = _json(server.memory_surface(context="Investigating retry logic in sync service"))
+        self.assertIn("surfaced", result)
+        self.assertIsInstance(result["surfaced"], list)
+
+    def test_memory_surface_empty_context_returns_error(self):
+        """Empty context string should return an error dict, not raise."""
+        result = _json(server.memory_surface(context=""))
+        self.assertIn("error", result)
+        self.assertIn("surfaced", result)
+        self.assertEqual(result["surfaced"], [])
+
+    def test_memory_surface_has_required_output_keys(self):
+        """Output must always include context_used and count keys."""
+        result = _json(server.memory_surface(
+            context="Debugging database connection pool exhaustion",
+            top_k=3,
+        ))
+        self.assertIn("surfaced", result)
+        self.assertIn("count", result)
+        self.assertIn("context_used", result)
+
+    def test_memory_surface_with_investigation_id(self):
+        """Passing an investigation_id should not raise, must return valid JSON."""
+        result = _json(server.memory_surface(
+            context="Reviewing the auth service login flow",
+            investigation_id="test-inv-does-not-exist",
+        ))
+        self.assertIsInstance(result, dict)
+        self.assertIn("surfaced", result)
+
+
 class TestToolsSmokeReturnValidJSON(unittest.TestCase):
     """Smoke test: key tools return parseable JSON without raising."""
 
