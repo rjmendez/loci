@@ -100,11 +100,25 @@ const triageResults = (await parallel(loadedIssues.map(iss => () =>
   )
 ))).filter(Boolean)
 
-const fixable = triageResults.filter(t => t.fixable)
-const deferred = triageResults.filter(t => !t.fixable)
+// ── Dedup check: skip issues that already have an open PR from someone else ──
+const dedupResults = (await parallel(triageResults.filter(t => t.fixable).map(t => () =>
+  agent(
+    `Check if issue #${t.number} in ${GITHUB_REPO} already has an open PR from another contributor.\n\nRun: gh pr list --repo ${GITHUB_REPO} --search "#${t.number}" --state open --json number,title,author --limit 5\n\nAlso try: gh pr list --repo ${GITHUB_REPO} --state open --json number,title,body --limit 30 | grep -i "issue.${t.number}\\|closes.${t.number}\\|fixes.${t.number}"\n\nIf any open PR already references issue #${t.number} and was NOT authored by a bot or CI automation, return has_pr=true and pr_info="PR #<N> by <author>".\nOtherwise return has_pr=false, pr_info="".`,
+    {
+      label: `dedup:#${t.number}`, phase: 'Triage', model: 'haiku',
+      schema: { type: 'object', required: ['number','has_pr','pr_info'], properties: {
+        number: { type: 'integer' }, has_pr: { type: 'boolean' }, pr_info: { type: 'string' } } },
+    }
+  ).then(r => ({ ...t, has_pr: r?.has_pr || false, pr_info: r?.pr_info || '' }))
+))).filter(Boolean)
 
-log(`Triage: ${fixable.length} fixable, ${deferred.length} deferred`)
-if (deferred.length) log(`Deferred: ${deferred.map(d => `#${d.number} (${d.reason.slice(0,40)})`).join('; ')}`)
+const fixable = dedupResults.filter(t => !t.has_pr)
+const existingPR = dedupResults.filter(t => t.has_pr)
+const deferred = [...triageResults.filter(t => !t.fixable), ...existingPR.map(t => ({ ...t, reason: `existing PR: ${t.pr_info}` }))]
+
+log(`Triage: ${fixable.length} fixable, ${existingPR.length} skipped (existing PR), ${deferred.length} deferred total`)
+if (existingPR.length) log(`Skipped (existing PRs): ${existingPR.map(t => `#${t.number} → ${t.pr_info}`).join('; ')}`)
+if (deferred.length) log(`Deferred: ${deferred.filter(d => !d.has_pr).map(d => `#${d.number} (${d.reason.slice(0,40)})`).join('; ')}`)
 
 if (!fixable.length) {
   log('No fixable issues. Exiting.')
