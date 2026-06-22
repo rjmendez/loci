@@ -5002,6 +5002,12 @@ def memory_confidence(
     """
     import math as _math
 
+    if not query:
+        return json.dumps({
+            "confidence": 0.0, "basis": "empty_query",
+            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
+        })
+
     client, col = _get_qdrant()
     if client is None:
         return json.dumps({
