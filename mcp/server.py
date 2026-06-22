@@ -94,8 +94,7 @@ try:
 except ImportError:
     pass
 
-import re as _re
-_EMAIL_RE = _re.compile(r'\b[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}\b', _re.I)
+_EMAIL_RE = re.compile(r'\b[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}\b', re.I)
 
 # ── Immutable event log (fail-open) ───────────────────────────────────────────
 # Appends a record before every memory mutation so the full operation history
@@ -111,12 +110,19 @@ def _event_log_append(event: dict) -> None:
         _el_append(event)
     except Exception:
         pass  # Never let event log failures block memory operations
-_HOST_RE = _re.compile(
+_HOST_RE = re.compile(
     r'\b[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?'
     r'(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)*'
-    r'(?:\.(?:local|corp|internal|lan|dev|test|net|com|io|org))\b', _re.I
+    r'(?:\.(?:local|corp|internal|lan|dev|test|net|com|io|org))\b', re.I
 )
-_URL_RE = _re.compile(r'https?://[^\s"\' <>;]+', _re.I)
+_URL_RE = re.compile(r'https?://[^\s"\' <>;]+', re.I)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _extract_entities(text: str) -> dict:
@@ -1983,13 +1989,6 @@ def _lexical_match_score(claim_tokens: set[str], evidence_tokens: set[str]) -> f
         return 0.0
     overlap = claim_tokens.intersection(evidence_tokens)
     return len(overlap) / max(1, len(claim_tokens))
-
-
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _make_ref(record: dict, match_type: str, score: float | None = None) -> dict:
@@ -5347,7 +5346,7 @@ def investigation_reason(
                final_answer, persisted_finding_ids}.
     """
     from memcheck import llm as _llm
-    from memcheck.checks.contradiction_llm import _extract_json
+    from memcheck.checks.contradiction_llm import extract_json as _extract_json
 
     if not (investigation_id and (MEMORY_DIR / investigation_id).exists()):
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})

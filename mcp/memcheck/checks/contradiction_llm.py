@@ -85,7 +85,7 @@ def _wire(embed_fn, llm_fn, cosine_fn):
     return embed_fn, llm_fn, cosine_fn
 
 
-def _extract_json(text: str) -> dict | None:
+def extract_json(text: str) -> dict | None:
     """Tolerant JSON extraction from a model reply (handles ``` fences)."""
     if not text:
         return None
@@ -173,7 +173,7 @@ def _gate_and_judge(
         except Exception as exc:  # noqa: BLE001 - fail-open per pair
             _log.debug("llm judge failed for pair (%s,%s): %r", id_a, id_b, exc)
             continue
-        parsed = _extract_json(reply or "")
+        parsed = extract_json(reply or "")
         if not parsed or not bool(parsed.get("contradict")):
             continue
 

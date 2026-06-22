@@ -1164,7 +1164,6 @@ async def skill_memory_prime(task: dict) -> dict:
         peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
 
         import uuid as _uuid
-        import aiohttp
 
         async def _prime_peer(peer_url: str):
             base  = peer_url.rstrip('/a2a').rstrip('/')
