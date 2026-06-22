@@ -169,6 +169,8 @@ _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 _sparse_model = None
 _cross_encoder = None          # sentence_transformers.CrossEncoder | False (permanent failure)
 _cross_encoder_lock = threading.Lock()   # guards lazy init against concurrent first-callers
+_investigation_locks: dict[str, threading.Lock] = {}  # per-investigation lock for atomic JSONL appends
+_investigation_locks_lock = threading.Lock()          # guards _investigation_locks dict itself
 _qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
 _qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
 _QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
@@ -552,6 +554,8 @@ _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 def _embed(text: str) -> list[float] | None:
     """Single-text embed via OpenAI-compat /v1/embeddings.
     Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
+    if not _OLLAMA_BASE:
+        return None
     try:
         import requests as _req
         r = _req.post(
@@ -1483,9 +1487,20 @@ def _load_reflection_state() -> dict:
 
 
 def _save_reflection_state(state: dict) -> None:
+    import tempfile
     REFLECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = _now()
-    REFLECTION_STATE_FILE.write_text(json.dumps(state, indent=2))
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=REFLECTION_STATE_DIR, prefix=".reflection_tmp_")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(json.dumps(state, indent=2))
+        os.replace(tmp_path, REFLECTION_STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def _canonicalize_reflection_signature(text: str) -> str:
@@ -4694,53 +4709,61 @@ def memory_retract(
     retracted_records: list[dict] = []
     verdicts_forgotten = 0
 
-    for fid in contaminated_ids:
-        retraction_id = str(uuid.uuid4())
-        entry = {
-            "retraction_id": retraction_id,
-            "finding_id": fid,
-            "seed_id": seed_anchor,
-            "reason": reason or "hallucination retraction",
+    # Acquire a per-investigation lock so that the retractions.jsonl appends
+    # and the matching retraction_audit.jsonl append are observed atomically
+    # by concurrent readers (no window where a retraction exists without its
+    # audit record).
+    with _investigation_locks_lock:
+        inv_lock = _investigation_locks.setdefault(investigation_id, threading.Lock())
+
+    with inv_lock:
+        for fid in contaminated_ids:
+            retraction_id = str(uuid.uuid4())
+            entry = {
+                "retraction_id": retraction_id,
+                "finding_id": fid,
+                "seed_id": seed_anchor,
+                "reason": reason or "hallucination retraction",
+                "ts": ts,
+                "active": True,
+            }
+            _append_jsonl(retractions_path, entry)
+            verdicts_forgotten += _forget_finding_verdicts(by_id.get(fid, {}))
+            retracted_records.append({
+                "retraction_id": retraction_id,
+                "finding_id": fid,
+                "reasons": reasons.get(fid, []),
+            })
+
+        # Record a quarantine verdict to the store (fail-open) for recall.
+        try:
+            seed_text = str(seeds[0].get("text", "") or "")
+            quarantine_verdict = new_verdict(
+                subject_kind="memory",
+                subject_signature=make_signature("memory", seed_anchor),
+                subject_excerpt=redact_excerpt(seed_text),
+                verdict_type="retracted",
+                decision="quarantine",
+                confidence=0.9,
+                rationale=reason or "hallucination retracted with contaminated lineage",
+                source="human",
+                refs=list(contaminated_ids),
+            )
+            _record_verdicts([quarantine_verdict])
+        except Exception as exc:  # fail-open
+            logger.debug("quarantine verdict record failed, degrading: %r", exc)
+
+        _append_jsonl(audit_path, {
+            "action": "retract",
             "ts": ts,
-            "active": True,
-        }
-        _append_jsonl(retractions_path, entry)
-        verdicts_forgotten += _forget_finding_verdicts(by_id.get(fid, {}))
-        retracted_records.append({
-            "retraction_id": retraction_id,
-            "finding_id": fid,
-            "reasons": reasons.get(fid, []),
+            "target": target,
+            "seed_ids": seed_ids,
+            "reason": reason or "hallucination retraction",
+            "retracted_finding_ids": list(contaminated_ids),
+            "count": len(contaminated_ids),
+            "verdicts_forgotten": verdicts_forgotten,
+            "scope_semantic": scope_semantic,
         })
-
-    # Record a quarantine verdict to the store (fail-open) for recall.
-    try:
-        seed_text = str(seeds[0].get("text", "") or "")
-        quarantine_verdict = new_verdict(
-            subject_kind="memory",
-            subject_signature=make_signature("memory", seed_anchor),
-            subject_excerpt=redact_excerpt(seed_text),
-            verdict_type="retracted",
-            decision="quarantine",
-            confidence=0.9,
-            rationale=reason or "hallucination retracted with contaminated lineage",
-            source="human",
-            refs=list(contaminated_ids),
-        )
-        _record_verdicts([quarantine_verdict])
-    except Exception as exc:  # fail-open
-        logger.debug("quarantine verdict record failed, degrading: %r", exc)
-
-    _append_jsonl(audit_path, {
-        "action": "retract",
-        "ts": ts,
-        "target": target,
-        "seed_ids": seed_ids,
-        "reason": reason or "hallucination retraction",
-        "retracted_finding_ids": list(contaminated_ids),
-        "count": len(contaminated_ids),
-        "verdicts_forgotten": verdicts_forgotten,
-        "scope_semantic": scope_semantic,
-    })
 
     return json.dumps({
         "seed_ids": seed_ids,
@@ -4978,6 +5001,12 @@ def memory_confidence(
         JSON with {confidence, basis, cues, top_hit_preview, recommendation}.
     """
     import math as _math
+
+    if not query:
+        return json.dumps({
+            "confidence": 0.0, "basis": "empty_query",
+            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
+        })
 
     client, col = _get_qdrant()
     if client is None:
