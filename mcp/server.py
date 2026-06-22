@@ -1482,9 +1482,20 @@ def _load_reflection_state() -> dict:
 
 
 def _save_reflection_state(state: dict) -> None:
+    import tempfile
     REFLECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = _now()
-    REFLECTION_STATE_FILE.write_text(json.dumps(state, indent=2))
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=REFLECTION_STATE_DIR, prefix=".reflection_tmp_")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(json.dumps(state, indent=2))
+        os.replace(tmp_path, REFLECTION_STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def _canonicalize_reflection_signature(text: str) -> str:
