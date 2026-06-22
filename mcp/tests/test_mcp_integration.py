@@ -1425,3 +1425,168 @@ class TestInvestigationExportImport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestMemoryTiers(unittest.TestCase):
+    """Tests for memory tier management: memory_promote, memory_demote, and tier field in store."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _start_and_store(self, prefix="tier", tier="warm"):
+        inv_id = _new_id(prefix)
+        server.investigation_start(investigation_id=inv_id, title=f"Tier test {prefix}")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Auth service returns HTTP 401 on expired tokens.",
+            source="test:manual",
+            confidence="high",
+            tier=tier,
+        ))
+        return inv_id, stored
+
+    def test_investigation_store_accepts_tier_warm(self):
+        inv_id, result = self._start_and_store(prefix="warm", tier="warm")
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("tier"), "warm")
+        self.assertIn("finding_id", result)
+
+    def test_investigation_store_accepts_tier_cold(self):
+        inv_id, result = self._start_and_store(prefix="cold", tier="cold")
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("tier"), "cold")
+
+    def test_investigation_store_accepts_tier_hot(self):
+        inv_id, result = self._start_and_store(prefix="hot", tier="hot")
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("tier"), "hot")
+
+    def test_investigation_store_rejects_invalid_tier(self):
+        inv_id = _new_id("badtier")
+        server.investigation_start(investigation_id=inv_id, title="Bad tier test")
+        result = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="some text",
+            source="test",
+            tier="invalid",
+        ))
+        self.assertIn("error", result)
+
+    def test_investigation_list_includes_tier_counts(self):
+        inv_id = _new_id("listier")
+        server.investigation_start(investigation_id=inv_id, title="Tier counts test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="finding one warm",
+            source="test",
+            tier="warm",
+        )
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="finding two cold",
+            source="test",
+            tier="cold",
+        )
+        result = _json(server.investigation_list())
+        inv_summary = next((i for i in result["investigations"] if i["id"] == inv_id), None)
+        self.assertIsNotNone(inv_summary, "Investigation not found in list")
+        self.assertIn("tier_counts", inv_summary)
+        tc = inv_summary["tier_counts"]
+        self.assertEqual(tc.get("warm"), 1)
+        self.assertEqual(tc.get("cold"), 1)
+        self.assertEqual(tc.get("hot"), 0)
+
+    def test_memory_promote_returns_valid_json(self):
+        inv_id, stored = self._start_and_store(prefix="promote", tier="cold")
+        finding_id = stored.get("finding_id")
+        self.assertIsNotNone(finding_id)
+
+        result = _json(server.memory_promote(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            tier="warm",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(result.get("finding_id"), finding_id)
+        self.assertEqual(result.get("old_tier"), "cold")
+        self.assertEqual(result.get("new_tier"), "warm")
+        self.assertTrue(result.get("ok"))
+
+    def test_memory_demote_returns_valid_json(self):
+        inv_id, stored = self._start_and_store(prefix="demote", tier="warm")
+        finding_id = stored.get("finding_id")
+        self.assertIsNotNone(finding_id)
+
+        result = _json(server.memory_demote(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            tier="cold",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(result.get("finding_id"), finding_id)
+        self.assertEqual(result.get("old_tier"), "warm")
+        self.assertEqual(result.get("new_tier"), "cold")
+        self.assertTrue(result.get("ok"))
+
+    def test_memory_promote_missing_finding(self):
+        inv_id = _new_id("promote-missing")
+        server.investigation_start(investigation_id=inv_id, title="Promote missing")
+        result = _json(server.memory_promote(
+            investigation_id=inv_id,
+            finding_id="no-such-finding-id",
+            tier="warm",
+        ))
+        self.assertIn("error", result)
+
+    def test_memory_demote_missing_investigation(self):
+        result = _json(server.memory_demote(
+            investigation_id="does-not-exist",
+            finding_id="no-such-id",
+            tier="cold",
+        ))
+        self.assertIn("error", result)
+
+    def test_memory_promote_invalid_tier(self):
+        inv_id, stored = self._start_and_store(prefix="promote-bad-tier", tier="warm")
+        finding_id = stored.get("finding_id")
+        result = _json(server.memory_promote(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            tier="ultra",
+        ))
+        self.assertIn("error", result)
+
+    def test_tier_persisted_in_jsonl(self):
+        """Tier field should be stored in findings.jsonl and readable back."""
+        inv_id, stored = self._start_and_store(prefix="persist", tier="cold")
+        finding_id = stored.get("finding_id")
+        findings_path = Path(self._tmp.name) / inv_id / "findings.jsonl"
+        findings = [json.loads(line) for line in findings_path.read_text().splitlines() if line.strip()]
+        match = next((f for f in findings if f.get("id") == finding_id), None)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.get("tier"), "cold")
+
+    def test_memory_promote_updates_tier_in_jsonl(self):
+        """After promoting, tier field in JSONL should reflect the new tier."""
+        inv_id, stored = self._start_and_store(prefix="update-tier", tier="cold")
+        finding_id = stored.get("finding_id")
+        server.memory_promote(investigation_id=inv_id, finding_id=finding_id, tier="warm")
+        findings_path = Path(self._tmp.name) / inv_id / "findings.jsonl"
+        findings = [json.loads(line) for line in findings_path.read_text().splitlines() if line.strip()]
+        match = next((f for f in findings if f.get("id") == finding_id), None)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.get("tier"), "warm")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
