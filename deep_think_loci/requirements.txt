@@ -4,5 +4,8 @@
 # dataset builder. Embedding endpoint is read from $OLLAMA_BASE_URL / $EMBED_MODEL
 # (Loci .env conventions); falls back to a sane default.
 numpy
-scikit-learn
+# Pinned: the committed grounding_bleed_clf.joblib is pickled with scikit-learn
+# 1.8.0; loading it under a different minor warns (InconsistentVersionWarning) and
+# may give invalid results. Bump this only together with a model retrain (harvest).
+scikit-learn==1.8.0
 joblib

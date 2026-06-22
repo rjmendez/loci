@@ -27,7 +27,7 @@ LEARNED_CONSTRAINTS_RE = re.compile(
 def load_jsonl(path):
     records = []
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             for lineno, raw in enumerate(fh, 1):
                 raw = raw.strip()
                 if not raw:
@@ -59,7 +59,7 @@ def find_skill_md(skills_dir, tool_name):
     pattern = os.path.join(skills_dir, "*", "SKILL.md")
     for skill_path in sorted(glob.glob(pattern)):
         try:
-            with open(skill_path, "r", encoding="utf-8") as fh:
+            with open(skill_path, encoding="utf-8") as fh:
                 content = fh.read()
         except OSError:
             continue
