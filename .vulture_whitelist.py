@@ -4,6 +4,7 @@
 # Keep entries alphabetical within each section.
 
 # ── MCP tool functions (registered via @mcp.tool() decorator, called by the framework)
+_ = causal_edges_list
 _ = investigation_start
 _ = investigation_store
 _ = investigation_note

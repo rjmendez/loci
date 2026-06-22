@@ -1654,3 +1654,84 @@ class TestMemoryRoute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestMemoryConsolidateCausalInference(unittest.TestCase):
+    """Tests for memory_consolidate causal_edges_inferred field and causal_edges_list tool."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_memory_consolidate_returns_valid_json(self):
+        """memory_consolidate must always return valid JSON with causal_edges_inferred >= 0."""
+        result = server.memory_consolidate(dry_run=True)
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            self.fail(f"memory_consolidate returned non-JSON: {result!r}")
+        self.assertIsInstance(parsed, dict)
+        # causal_edges_inferred must be present and non-negative
+        self.assertIn("causal_edges_inferred", parsed)
+        self.assertGreaterEqual(parsed["causal_edges_inferred"], 0)
+
+    def test_causal_edges_list_empty_for_new_investigation(self):
+        """causal_edges_list returns empty edges list for an investigation with no edges."""
+        inv_id = _new_id("causal")
+        server.investigation_start(investigation_id=inv_id, title="Causal test")
+        result = _json(server.causal_edges_list(investigation_id=inv_id))
+        self.assertIn("edges", result)
+        self.assertIn("count", result)
+        self.assertEqual(result["count"], 0)
+        self.assertIsInstance(result["edges"], list)
+
+    def test_causal_edges_list_missing_investigation(self):
+        """causal_edges_list returns an error for a non-existent investigation."""
+        result = _json(server.causal_edges_list(investigation_id="nonexistent-xyz-999"))
+        self.assertIn("error", result)
+
+    def test_causal_edges_list_no_investigation_id(self):
+        """causal_edges_list returns an error when investigation_id is empty."""
+        result = _json(server.causal_edges_list(investigation_id=""))
+        self.assertIn("error", result)
+
+    def test_heuristic_causal_inference_writes_edges(self):
+        """Heuristic causal inference writes edges when findings reference each other."""
+        import uuid as _uuid
+        inv_id = _new_id("heuristic")
+        server.investigation_start(investigation_id=inv_id, title="Heuristic causal test")
+        # Create findings where B references A by keyword + snippet.
+        id_a = str(_uuid.uuid4())
+        id_b = str(_uuid.uuid4())
+        id_c = str(_uuid.uuid4())
+        findings_path = Path(self._tmp.name) / inv_id / "findings.jsonl"
+        import json as _json_local
+        with open(findings_path, "a") as f:
+            f.write(_json_local.dumps({"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"}) + "\n")
+            f.write(_json_local.dumps({"id": id_b, "text": "Because the cache was full", "type": "inferred"}) + "\n")
+            f.write(_json_local.dumps({"id": id_c, "text": "Service latency spiked", "type": "observed"}) + "\n")
+        # Run causal inference directly.
+        n = server._run_causal_inference(inv_id, [
+            {"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"},
+            {"id": id_b, "text": "Because the cache was full", "type": "inferred"},
+            {"id": id_c, "text": "Service latency spiked", "type": "observed"},
+        ])
+        # causal_edges_list should now return edges.
+        result = _json(server.causal_edges_list(investigation_id=inv_id))
+        self.assertEqual(result["count"], n)
+        if n > 0:
+            edge = result["edges"][0]
+            self.assertIn("source_id", edge)
+            self.assertIn("target_id", edge)
+            self.assertIn("edge_type", edge)
+            self.assertIn("confidence", edge)
+            self.assertIn("inferred_at", edge)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

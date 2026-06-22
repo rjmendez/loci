@@ -6196,6 +6196,168 @@ def memory_surface(
 # Mnemosyne sleep / consolidation
 # ---------------------------------------------------------------------------
 
+def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, None]:
+    """Find the most recently updated investigation and its last 10 findings.
+
+    Returns (investigation_id, findings) or (None, None) on any error.
+    Fail-open — never raises.
+    """
+    try:
+        if not MEMORY_DIR.exists():
+            return None, None
+        best_id = None
+        best_ts = ""
+        for d in MEMORY_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            manifest = _load_manifest(d.name)
+            if manifest is None:
+                continue
+            ts = str(manifest.get("updated_at") or "")
+            if ts > best_ts:
+                best_ts = ts
+                best_id = d.name
+        if best_id is None:
+            return None, None
+        findings_path = MEMORY_DIR / best_id / "findings.jsonl"
+        findings = _read_jsonl(findings_path)
+        return best_id, findings[-10:] if len(findings) > 10 else findings
+    except Exception:
+        return None, None
+
+
+def _heuristic_causal_edges(findings: list[dict]) -> list[dict]:
+    """Infer causal edges heuristically from finding texts.
+
+    If finding B's text references finding A's id or contains causal keywords
+    alongside A's text snippet, emit a caused_by edge with confidence 0.5.
+    Returns a (possibly empty) list of edge dicts.
+    """
+    _CAUSAL_KEYWORDS = re.compile(
+        r"\b(because|caused|led to|resulted in|after|following|due to|triggered)\b",
+        re.I,
+    )
+    edges = []
+    for i, b in enumerate(findings):
+        b_text = str(b.get("text") or "")
+        b_id = str(b.get("id") or "")
+        if not b_text:
+            continue
+        for j, a in enumerate(findings):
+            if j >= i:
+                break
+            a_id = str(a.get("id") or "")
+            a_text = str(a.get("text") or "")
+            if not a_id or not a_text:
+                continue
+            # Cross-reference: B mentions A's id, or B contains causal phrasing
+            # and A's text appears as a substring in B's text.
+            id_ref = a_id in b_text
+            snippet = a_text[:60].strip().lower()
+            snippet_ref = len(snippet) > 10 and snippet in b_text.lower()
+            keyword_match = bool(_CAUSAL_KEYWORDS.search(b_text))
+            if id_ref or (snippet_ref and keyword_match):
+                edges.append({
+                    "id": str(uuid.uuid4()),
+                    "source_id": a_id,
+                    "target_id": b_id,
+                    "edge_type": "caused_by",
+                    "confidence": 0.5,
+                    "inferred_at": _now(),
+                    "method": "heuristic",
+                })
+    return edges
+
+
+def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
+    """Run causal inference on the last findings of an investigation.
+
+    Attempts an LLM slow path first; falls back to heuristic if LLM unavailable.
+    Writes inferred edges to {MEMORY_DIR}/{investigation_id}/causal_edges.jsonl.
+    Returns the number of edges written.  Fail-open — never raises.
+    """
+    if not findings:
+        return 0
+    edges: list[dict] = []
+    try:
+        from memcheck import llm as _llm  # type: ignore
+        if _llm.llm_available():
+            numbered = "\n".join(
+                f"{idx + 1}. [{f.get('id', '?')}] {str(f.get('text', ''))[:300]}"
+                for idx, f in enumerate(findings)
+            )
+            prompt = (
+                "Given these investigation findings in chronological order:\n"
+                f"{numbered}\n\n"
+                "Identify causal relationships. For each pair where A caused or "
+                "enabled B, output a JSON line: "
+                '{"source_id": "<id of A>", "target_id": "<id of B>", '
+                '"edge_type": "<caused_by|enabled_by|correlates_with>", '
+                '"confidence": <0.0-1.0>}. '
+                "edge_type must be 'caused_by', 'enabled_by', or 'correlates_with'. "
+                "Only output confident relationships (confidence >= 0.6). "
+                "If none, output empty list []."
+            )
+            raw = _llm.call_llm(prompt, timeout=60.0)
+            if raw:
+                # Parse JSON lines or a JSON array from the response.
+                valid_types = {"caused_by", "enabled_by", "correlates_with"}
+                for line in raw.splitlines():
+                    line = line.strip().lstrip("- ")
+                    if not line:
+                        continue
+                    # strip trailing comma for array-style output
+                    line = line.rstrip(",")
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        # try to find an embedded JSON object
+                        m = re.search(r'\{[^}]+\}', line)
+                        if m:
+                            try:
+                                obj = json.loads(m.group(0))
+                            except Exception:
+                                continue
+                        else:
+                            continue
+                    if not isinstance(obj, dict):
+                        continue
+                    src = str(obj.get("source_id") or "")
+                    tgt = str(obj.get("target_id") or "")
+                    etype = str(obj.get("edge_type") or "")
+                    conf = float(obj.get("confidence") or 0.0)
+                    if src and tgt and etype in valid_types and conf >= 0.6:
+                        edges.append({
+                            "id": str(uuid.uuid4()),
+                            "source_id": src,
+                            "target_id": tgt,
+                            "edge_type": etype,
+                            "confidence": conf,
+                            "inferred_at": _now(),
+                            "method": "llm_slow_path",
+                        })
+    except Exception:
+        pass  # LLM path failed; fall through to heuristic
+
+    if not edges:
+        try:
+            edges = _heuristic_causal_edges(findings)
+        except Exception:
+            edges = []
+
+    if not edges:
+        return 0
+
+    try:
+        edges_path = MEMORY_DIR / investigation_id / "causal_edges.jsonl"
+        for edge in edges:
+            _append_jsonl(edges_path, edge)
+    except Exception:
+        return 0
+
+    return len(edges)
+
+
 @mcp.tool()
 def memory_consolidate(dry_run: bool = False) -> str:
     """
@@ -6203,25 +6365,85 @@ def memory_consolidate(dry_run: bool = False) -> str:
     Merges old working_memory entries into episodic memory, reducing DB size.
     Safe to run periodically (daily or after large investigation sessions).
 
+    After the Mnemosyne pass, runs a causal inference slow path on the most
+    recently active investigation (if it has ≥3 findings), writing inferred
+    edges to causal_edges.jsonl.  The causal step is fail-open and never
+    blocks the consolidation result.
+
     Args:
         dry_run: If True, preview consolidation without executing.
 
-    Returns JSON with consolidation stats.
+    Returns JSON with consolidation stats and causal_edges_inferred count.
     """
     import json as _json
+    causal_edges_inferred = 0
     try:
         from mnemosyne.core.memory import Mnemosyne
         m = Mnemosyne()
         result = m.sleep_all_sessions(dry_run=dry_run)
         _event_log_append({"op": "consolidate", "dry_run": dry_run,
                            "result_summary": str(result)[:200] if result else ""})
+
+        # Causal inference slow path (fail-open).
+        try:
+            if not dry_run:
+                inv_id, findings = _find_most_recent_investigation()
+                if inv_id and findings and len(findings) >= 3:
+                    causal_edges_inferred = _run_causal_inference(inv_id, findings)
+        except Exception:
+            causal_edges_inferred = 0
+
         return _json.dumps({
             "status": "ok",
             "dry_run": dry_run,
             "result": result if isinstance(result, dict) else str(result),
+            "causal_edges_inferred": causal_edges_inferred,
         })
     except Exception as e:
-        return _json.dumps({"status": "error", "error": str(e)})
+        return _json.dumps({
+            "status": "error",
+            "error": str(e),
+            "causal_edges_inferred": causal_edges_inferred,
+        })
+
+
+@mcp.tool()
+def causal_edges_list(investigation_id: str) -> str:
+    """
+    List causal edges inferred for an investigation.
+
+    Edges are written by the causal inference slow path in memory_consolidate.
+    Each edge describes a directional relationship between two findings.
+
+    Args:
+        investigation_id: The investigation whose causal_edges.jsonl to read.
+
+    Returns JSON with {edges: [{id, source_id, target_id, edge_type,
+                                confidence, inferred_at}], count}.
+    """
+    if not investigation_id:
+        return json.dumps({"error": "investigation_id is required"})
+    inv_path = MEMORY_DIR / investigation_id
+    if not inv_path.exists():
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found"})
+    try:
+        edges_path = inv_path / "causal_edges.jsonl"
+        raw = _read_jsonl(edges_path)
+        edges = [
+            {
+                "id": str(e.get("id") or ""),
+                "source_id": str(e.get("source_id") or ""),
+                "target_id": str(e.get("target_id") or ""),
+                "edge_type": str(e.get("edge_type") or ""),
+                "confidence": float(e.get("confidence") or 0.0),
+                "inferred_at": str(e.get("inferred_at") or ""),
+            }
+            for e in raw
+            if isinstance(e, dict)
+        ]
+        return json.dumps({"edges": edges, "count": len(edges)})
+    except Exception as exc:
+        return json.dumps({"error": str(exc), "edges": [], "count": 0})
 
 # ---------------------------------------------------------------------------
 # Metamemory
