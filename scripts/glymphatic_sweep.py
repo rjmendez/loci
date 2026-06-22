@@ -52,6 +52,9 @@ MUTEX_FLAG   = os.environ.get("GLYMPHATIC_MUTEX",
 ORPHAN_TTL_DAYS         = float(os.environ.get("GLYMPHATIC_ORPHAN_TTL_DAYS",   "7"))
 DUPLICATE_COS_THRESHOLD = float(os.environ.get("GLYMPHATIC_DUP_COS_THRESH",    "0.98"))
 SCROLL_BATCH            = int(os.environ.get("GLYMPHATIC_SCROLL_BATCH",         "500"))
+SHIFT_SNAPSHOT_FILE     = os.environ.get("GLYMPHATIC_SHIFT_SNAPSHOT",
+    os.path.expanduser("~/.hermes/glymphatic_centroid_snapshot.json"))
+SHIFT_THRESHOLD         = float(os.environ.get("GLYMPHATIC_SHIFT_THRESHOLD",   "0.05"))  # centroid drift > 5% triggers
 
 _LN2 = math.log(2)
 
@@ -301,6 +304,96 @@ def sweep_duplicates(dry_run: bool) -> int:
     return deleted
 
 
+# ── step 5: content-shift detection (GAM pattern) ────────────────────────────
+
+def _embed_text(text: str, ollama_url: str) -> list[float] | None:
+    """Embed a single text via Ollama. Returns None on failure."""
+    try:
+        payload = json.dumps({"model": "nomic-embed-text", "input": text[:2000]}).encode()
+        req = urllib.request.Request(
+            f"{ollama_url.rstrip('/')}/v1/embeddings",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+        return body["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+def _cosine_vecs(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(x * x for x in b)) or 1.0
+    return dot / (na * nb)
+
+
+def check_content_shift(ollama_url: str | None = None, sample_n: int = 50) -> dict:
+    """Compute centroid drift between current working_memory and last snapshot.
+
+    Returns {"drift_score": float, "should_sweep": bool, "n_sampled": int}.
+    If Ollama is unreachable, returns {"drift_score": None, "should_sweep": False}.
+
+    On the first run (no snapshot), saves a baseline and returns should_sweep=False.
+    """
+    _ollama = ollama_url or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
+    if not os.path.exists(DB_PATH):
+        return {"drift_score": None, "should_sweep": False, "reason": "db_not_found"}
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT content FROM working_memory ORDER BY created_at DESC LIMIT ?",
+            (sample_n,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"drift_score": None, "should_sweep": False, "reason": "table_not_found"}
+    finally:
+        conn.close()
+
+    if len(rows) < 5:
+        return {"drift_score": None, "should_sweep": False, "reason": "too_few_rows"}
+
+    # Embed a sample and compute centroid
+    vecs = []
+    for row in rows[:sample_n]:
+        v = _embed_text(row["content"], _ollama)
+        if v:
+            vecs.append(v)
+    if not vecs:
+        return {"drift_score": None, "should_sweep": False, "reason": "embed_failed"}
+
+    dim = len(vecs[0])
+    centroid = [sum(v[i] for v in vecs) / len(vecs) for i in range(dim)]
+    norm = math.sqrt(sum(x * x for x in centroid)) or 1.0
+    centroid = [x / norm for x in centroid]
+
+    # Load snapshot
+    if os.path.exists(SHIFT_SNAPSHOT_FILE):
+        with open(SHIFT_SNAPSHOT_FILE) as fh:
+            snapshot = json.load(fh)
+        prev_centroid = snapshot.get("centroid", [])
+        if prev_centroid and len(prev_centroid) == dim:
+            drift = 1.0 - _cosine_vecs(centroid, prev_centroid)
+            should_sweep = drift >= SHIFT_THRESHOLD
+            # Update snapshot
+            with open(SHIFT_SNAPSHOT_FILE, "w") as fh:
+                json.dump({"centroid": centroid, "n_sampled": len(vecs), "updated_at": time.time()}, fh)
+            print(f"[glym/shift] centroid drift={drift:.4f} threshold={SHIFT_THRESHOLD} "
+                  f"should_sweep={should_sweep}")
+            return {"drift_score": drift, "should_sweep": should_sweep, "n_sampled": len(vecs)}
+
+    # First run — save baseline
+    with open(SHIFT_SNAPSHOT_FILE, "w") as fh:
+        json.dump({"centroid": centroid, "n_sampled": len(vecs), "updated_at": time.time()}, fh)
+    print(f"[glym/shift] baseline snapshot saved (n={len(vecs)})")
+    return {"drift_score": 0.0, "should_sweep": False, "n_sampled": len(vecs), "reason": "baseline_saved"}
+
+
 # ── mutex ──────────────────────────────────────────────────────────────────────
 
 class _Mutex:
@@ -348,9 +441,27 @@ class _Mutex:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def main(dry_run: bool = False, skip: set | None = None) -> None:
+def main(
+    dry_run: bool = False,
+    skip: set | None = None,
+    check_shift: bool = False,
+    shift_only: bool = False,
+    ollama_url: str | None = None,
+) -> None:
     skip = skip or set()
     t0 = time.time()
+
+    if check_shift or shift_only:
+        shift_result = check_content_shift(ollama_url=ollama_url)
+        if shift_only:
+            print(f"[glym] shift check: {shift_result}")
+            return
+        if not shift_result.get("should_sweep", True):
+            print(f"[glym] content shift below threshold ({shift_result.get('drift_score'):.4f}) "
+                  "— skipping sweep")
+            return
+        print(f"[glym] content shift triggered sweep (drift={shift_result.get('drift_score'):.4f})")
+
     print(f"[glym] starting  dry_run={dry_run}  skip={skip or 'none'}")
 
     with _Mutex(MUTEX_FLAG):
@@ -378,6 +489,18 @@ if __name__ == "__main__":
                         help="Report what would be removed without deleting")
     parser.add_argument("--skip", default="",
                         help="Comma-separated steps to skip: verdicts,orphans,edges,duplicates")
+    parser.add_argument("--check-shift", action="store_true",
+                        help="Run content-shift detection before sweep; skip if below threshold")
+    parser.add_argument("--shift-only", action="store_true",
+                        help="Only run content-shift detection and exit (no sweep)")
+    parser.add_argument("--ollama", default=None,
+                        help="Ollama base URL for content-shift embeddings")
     args   = parser.parse_args()
     skip   = {s.strip() for s in args.skip.split(",") if s.strip()}
-    main(dry_run=args.dry_run, skip=skip)
+    main(
+        dry_run=args.dry_run,
+        skip=skip,
+        check_shift=args.check_shift,
+        shift_only=args.shift_only,
+        ollama_url=args.ollama,
+    )

@@ -96,6 +96,21 @@ except ImportError:
 
 import re as _re
 _EMAIL_RE = _re.compile(r'\b[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}\b', _re.I)
+
+# ── Immutable event log (fail-open) ───────────────────────────────────────────
+# Appends a record before every memory mutation so the full operation history
+# is preserved independent of the live SQLite/Qdrant store (SSGM + AgentCore pattern).
+def _event_log_append(event: dict) -> None:
+    """Write one event to the immutable append-only event log. Fail-open."""
+    try:
+        import sys as _sys
+        _scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts not in _sys.path:
+            _sys.path.insert(0, _scripts)
+        from event_log import append as _el_append
+        _el_append(event)
+    except Exception:
+        pass  # Never let event log failures block memory operations
 _HOST_RE = _re.compile(
     r'\b[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?'
     r'(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)*'
@@ -2362,6 +2377,13 @@ def investigation_store(
     )
 
     _qdrant_upsert(finding["id"], text, finding)
+    _event_log_append({
+        "op": "store",
+        "investigation_id": investigation_id,
+        "finding_id": finding["id"],
+        "finding_type": finding_type,
+        "confidence": confidence,
+    })
 
     return json.dumps({
         "stored": True,
@@ -2432,6 +2454,11 @@ def investigation_note(
         })
 
     _save_manifest(manifest)
+    _event_log_append({
+        "op": "note",
+        "investigation_id": investigation_id,
+        "field": field,
+    })
     return json.dumps({"updated": field, "manifest": manifest}, indent=2)
 
 
@@ -4877,16 +4904,12 @@ def memory_retract(
         logger.debug("quarantine verdict record failed, degrading: %r", exc)
         quarantine_recorded = False
 
-    _append_jsonl(audit_path, {
-        "action": "retract",
-        "ts": ts,
-        "target": target,
+    _event_log_append({
+        "op": "retract",
+        "investigation_id": investigation_id,
         "seed_ids": seed_ids,
+        "count": len(retracted_records),
         "reason": reason or "hallucination retraction",
-        "retracted_finding_ids": list(contaminated_ids),
-        "count": len(contaminated_ids),
-        "verdicts_forgotten": verdicts_forgotten,
-        "scope_semantic": scope_semantic,
     })
 
 
@@ -5085,6 +5108,8 @@ def memory_consolidate(dry_run: bool = False) -> str:
         from mnemosyne.core.memory import Mnemosyne
         m = Mnemosyne()
         result = m.sleep_all_sessions(dry_run=dry_run)
+        _event_log_append({"op": "consolidate", "dry_run": dry_run,
+                           "result_summary": str(result)[:200] if result else ""})
         return _json.dumps({
             "status": "ok",
             "dry_run": dry_run,

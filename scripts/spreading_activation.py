@@ -55,19 +55,47 @@ def _placeholders(n: int) -> str:
     return ",".join("?" * n)
 
 
-def _fetch_edges(conn: sqlite3.Connection, node_ids: list[str], edge_floor: float) -> list[tuple]:
-    """
-    Load graph_edges where source is in node_ids and weight >= edge_floor.
-    Returns list of (source, target, weight).
+# Causal edge types get a weight boost so they propagate more strongly.
+# contradicts edges are excluded from standard traversal (traversed separately).
+_CAUSAL_BOOST = {
+    "caused_by": 1.3,
+    "updated_by": 1.2,
+    "semantic_link": 1.0,
+    "contradicts": 0.0,  # excluded from standard activation path
+}
+
+
+def _fetch_edges(
+    conn: sqlite3.Connection,
+    node_ids: list[str],
+    edge_floor: float,
+    edge_types: list[str] | None = None,
+) -> list[tuple]:
+    """Load graph_edges where source is in node_ids and weight >= edge_floor.
+
+    Returns list of (source, target, weight, edge_type).
+    edge_types: if provided, only return edges with those types; default excludes
+    'contradicts' edges (which are traversed separately for conflict detection).
     """
     if not node_ids:
         return []
+
+    if edge_types is None:
+        # Default: all except contradicts (no negative activation in standard pass)
+        type_clause = "AND (edge_type IS NULL OR edge_type != 'contradicts')"
+        params = node_ids + [edge_floor]
+    else:
+        phs = _placeholders(len(edge_types))
+        type_clause = f"AND edge_type IN ({phs})"
+        params = node_ids + [edge_floor] + edge_types
+
     sql = (
-        "SELECT source, target, weight FROM graph_edges "
+        "SELECT source, target, weight, COALESCE(edge_type, 'semantic_link') AS edge_type "
+        "FROM graph_edges "
         f"WHERE source IN ({_placeholders(len(node_ids))}) "
-        "AND weight >= ?"
+        "AND weight >= ? "
+        f"{type_clause}"
     )
-    params = node_ids + [edge_floor]
     try:
         cursor = conn.execute(sql, params)
         return cursor.fetchall()
@@ -178,12 +206,14 @@ def run_spreading_activation(
 
             # Compute out-degree per source (number of qualifying edges per node)
             out_degree: dict[str, int] = {}
-            for source, _target, _weight in edges:
+            for source, _target, _weight, _etype in edges:
                 out_degree[source] = out_degree.get(source, 0) + 1
 
-            for source, target, weight in edges:
-                # Rescale weight relative to the floor
+            for source, target, weight, edge_type in edges:
+                # Rescale weight relative to the floor; apply causal boost
                 w_prime = (weight - SA_EDGE_FLOOR) / (1.0 - SA_EDGE_FLOOR)
+                causal_boost = _CAUSAL_BOOST.get(edge_type, 1.0)
+                w_prime = min(1.0, w_prime * causal_boost)
 
                 src_activation = activation.get(source, 0.0)
                 if SA_FAN_EFFECT:
