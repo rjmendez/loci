@@ -111,7 +111,7 @@ class Verdict:
             subject_excerpt=payload.get("subject_excerpt", ""),
             verdict_type=payload["verdict_type"],
             decision=payload["decision"],
-            confidence=float(payload.get("confidence", 0.0)),
+            confidence=max(0.0, min(1.0, float(payload.get("confidence", 0.0)))),
             rationale=payload.get("rationale", ""),
             source=payload.get("source", "rule"),
             refs=list(payload.get("refs", []) or []),
