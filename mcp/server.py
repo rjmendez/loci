@@ -6630,6 +6630,211 @@ def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> s
         return json.dumps({"error": str(exc)})
 
 
+# Tool: investigation_export
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def investigation_export(
+    investigation_id: str,
+    include_embeddings: bool = False,
+) -> str:
+    """
+    Export an investigation as a portable JSON bundle suitable for archival or
+    transfer to another Loci instance.
+
+    Bundles the manifest, all findings, conflicts, and entities into a single
+    JSON string.  The ``include_embeddings`` parameter is accepted for forward
+    compatibility but embeddings are not yet included in the bundle (future work).
+
+    Args:
+        investigation_id: Investigation identifier to export.
+        include_embeddings: Reserved for future use — embeddings are not yet
+                            included.  Pass ``True`` to opt-in once supported.
+
+    Returns:
+        JSON: {"exported": true, "investigation_id": str, "bundle": {...},
+               "finding_count": int, "size_bytes": int}
+        On error: {"error": str}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        inv_dir = _inv_dir(investigation_id)
+
+        findings = _read_jsonl(inv_dir / "findings.jsonl")
+        conflicts = _read_jsonl(inv_dir / "conflicts.jsonl")
+        entities = _read_jsonl(inv_dir / "entities.jsonl")
+
+        bundle = {
+            "schema_version": "1.0",
+            "exported_at": _now(),
+            "manifest": manifest,
+            "findings": findings,
+            "conflicts": conflicts,
+            "entities": entities,
+        }
+
+        bundle_str = json.dumps(bundle)
+        size_bytes = len(bundle_str.encode("utf-8"))
+
+        return json.dumps({
+            "exported": True,
+            "investigation_id": investigation_id,
+            "bundle": bundle,
+            "finding_count": len(findings),
+            "size_bytes": size_bytes,
+        })
+    except Exception as exc:
+        logger.warning("investigation_export failed: %s", exc)
+        return json.dumps({"error": f"Export failed: {exc}"})
+
+
+# ---------------------------------------------------------------------------
+# Tool: investigation_import
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def investigation_import(
+    bundle_json: str,
+    new_title: Optional[str] = None,
+) -> str:
+    """
+    Import an investigation bundle (produced by ``investigation_export``) into
+    this Loci instance under a brand-new investigation ID.
+
+    A fresh UUID is always assigned — the original investigation ID is preserved
+    in the manifest as ``imported_from``.  Findings are re-indexed into Qdrant
+    on a best-effort basis (fail-open: Qdrant may be unavailable).
+
+    Args:
+        bundle_json: The JSON string produced by ``investigation_export`` (the
+                     value of the ``bundle`` key, or the whole export response).
+        new_title: Optional override for the investigation title.  When omitted
+                   the original title from the bundle is used.
+
+    Returns:
+        JSON: {"imported": true, "new_investigation_id": str,
+               "original_investigation_id": str, "findings_imported": int,
+               "qdrant_indexed": int}
+        On error: {"error": str}
+    """
+    _MAX_BUNDLE_BYTES = 10 * 1024 * 1024  # 10 MB
+    try:
+        raw_bytes = bundle_json.encode("utf-8") if isinstance(bundle_json, str) else bundle_json
+        if len(raw_bytes) > _MAX_BUNDLE_BYTES:
+            return json.dumps({"error": "bundle too large"})
+
+        try:
+            data = json.loads(bundle_json)
+        except Exception as exc:
+            return json.dumps({"error": f"Invalid JSON in bundle_json: {exc}"})
+
+        # Support two calling conventions:
+        #   1. The raw bundle dict (schema_version at top level)
+        #   2. The full export response dict (bundle nested under "bundle" key)
+        if "bundle" in data and isinstance(data.get("bundle"), dict):
+            data = data["bundle"]
+
+        # Validate required keys.
+        schema_version = data.get("schema_version")
+        if schema_version != "1.0":
+            return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
+
+        required_keys = {"manifest", "findings"}
+        missing = required_keys - set(data.keys())
+        if missing:
+            return json.dumps({"error": f"Bundle is missing required keys: {sorted(missing)}"})
+
+        src_manifest = data["manifest"]
+        if not isinstance(src_manifest, dict):
+            return json.dumps({"error": "Bundle manifest is not a dict."})
+
+        original_id = src_manifest.get("id", "unknown")
+
+        # Generate a new investigation ID.
+        new_id = str(uuid.uuid4())
+
+        # Build a new manifest.
+        now = _now()
+        new_manifest = dict(src_manifest)
+        new_manifest["id"] = new_id
+        new_manifest["created_at"] = now
+        new_manifest["updated_at"] = now
+        new_manifest["imported_from"] = original_id
+        if new_title:
+            new_manifest["title"] = new_title
+
+        # Create the investigation directory and write the manifest.
+        inv_dir = _inv_dir(new_id)
+        _save_manifest(new_manifest)
+
+        # Write findings.jsonl with updated investigation_id.
+        findings = data.get("findings") or []
+        if not isinstance(findings, list):
+            findings = []
+
+        findings_path = inv_dir / "findings.jsonl"
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            f = dict(finding)
+            f["investigation_id"] = new_id
+            _append_jsonl(findings_path, f)
+
+        # Write conflicts.jsonl if present.
+        conflicts = data.get("conflicts")
+        if conflicts and isinstance(conflicts, list):
+            conflicts_path = inv_dir / "conflicts.jsonl"
+            for entry in conflicts:
+                if isinstance(entry, dict):
+                    _append_jsonl(conflicts_path, entry)
+
+        # Write entities.jsonl if present.
+        entities = data.get("entities")
+        if entities and isinstance(entities, list):
+            entities_path = inv_dir / "entities.jsonl"
+            for entry in entities:
+                if isinstance(entry, dict):
+                    _append_jsonl(entities_path, entry)
+
+        # Re-index findings into Qdrant (fail-open).
+        qdrant_indexed = 0
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            text = str(finding.get("text") or "").strip()
+            finding_id = str(finding.get("id") or "")
+            if not text or not finding_id:
+                continue
+            try:
+                payload = {
+                    "investigation_id": new_id,
+                    "type": finding.get("type") or finding.get("record_type") or "observed",
+                    "source": finding.get("source") or "",
+                    "confidence": finding.get("confidence") or "medium",
+                    "tags": finding.get("tags") or [],
+                }
+                _qdrant_upsert(finding_id, text, payload)
+                qdrant_indexed += 1
+            except Exception as exc:
+                logger.debug("investigation_import: qdrant upsert skipped for %s: %s", finding_id, exc)
+
+        return json.dumps({
+            "imported": True,
+            "new_investigation_id": new_id,
+            "original_investigation_id": original_id,
+            "findings_imported": len(findings),
+            "qdrant_indexed": qdrant_indexed,
+        })
+    except Exception as exc:
+        logger.warning("investigation_import failed: %s", exc)
+        return json.dumps({"error": f"Import failed: {exc}"})
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
