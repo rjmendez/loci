@@ -2333,6 +2333,8 @@ def investigation_start(
         "closed_summary": None,
         "owner": "",
         "acl": [],
+        "summary_l1": [],
+        "summary_l2": "",
     }
     _save_manifest(manifest)
     logger.info("Created investigation %s", investigation_id)
@@ -2347,6 +2349,7 @@ def investigation_load(
     last_n_findings: int = 20,
     include_retracted: bool = False,
     requesting_agent_id: Optional[str] = None,
+    fidelity: str = "full",
 ) -> str:
     """
     Retrieve manifest and recent findings for an investigation.
@@ -2367,10 +2370,19 @@ def investigation_load(
                              provided and the investigation has a non-empty ACL,
                              findings are filtered to those authored by agents
                              in the ACL or by the requesting agent itself.
+        fidelity: Controls how much detail is returned. One of:
+                  "full"    — existing behavior: returns manifest + all recent findings.
+                  "summary" — returns manifest + summary_l1 (bullets) + summary_l2
+                              (paragraph) instead of full findings list. Useful when
+                              context window is constrained.
+                  "brief"   — returns manifest + summary_l2 only (single paragraph).
+                              Most compact form; good for quick orientation.
 
     Returns:
         JSON with manifest, total finding count, recent findings, and
         ``excluded_retracted`` (count of findings filtered out).
+        When fidelity is "summary" or "brief", the ``recent_findings`` key is
+        omitted and replaced with ``summary_l1`` and/or ``summary_l2``.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -2378,6 +2390,39 @@ def investigation_load(
             "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
         })
 
+    # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
+    summary_l1 = manifest.get("summary_l1") or []
+    summary_l2 = manifest.get("summary_l2") or ""
+
+    if fidelity == "brief":
+        return json.dumps({
+            "manifest": manifest,
+            "fidelity": "brief",
+            "summary_l2": summary_l2,
+        }, indent=2)
+
+    if fidelity == "summary":
+        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+        all_retracted = _load_retracted_ids(investigation_id)
+        total_retracted = len(all_retracted)
+        retracted = set() if include_retracted else all_retracted
+        excluded_retracted = 0
+        if retracted:
+            kept = [f for f in findings if str(f.get("id", "")) not in retracted]
+            excluded_retracted = len(findings) - len(kept)
+            findings = kept
+        return json.dumps({
+            "manifest": manifest,
+            "fidelity": "summary",
+            "total_findings": len(findings),
+            "summary_l1": summary_l1,
+            "summary_l2": summary_l2,
+            "excluded_retracted": excluded_retracted,
+            "total_retracted": total_retracted,
+            "include_retracted": include_retracted,
+        }, indent=2)
+
+    # Default: fidelity == "full"
     findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
     all_retracted = _load_retracted_ids(investigation_id)
     total_retracted = len(all_retracted)
@@ -2402,6 +2447,7 @@ def investigation_load(
 
     return json.dumps({
         "manifest": manifest,
+        "fidelity": "full",
         "total_findings": len(findings),
         "recent_findings": recent,
         "excluded_retracted": excluded_retracted,
@@ -3012,6 +3058,76 @@ def investigation_reflect(investigation_id: str) -> str:
         if freq
     }
 
+    # Progressive summary ladder — compute L1 (bullets) and L2 (paragraph) and
+    # persist them to the manifest so investigation_load can serve them without
+    # re-reading all findings. Fail-open: any failure falls back to a deterministic
+    # non-LLM summary and never blocks the rest of the reflect response.
+    summary_l1: list[str] = []
+    summary_l2: str = ""
+    try:
+        last_20 = findings[-20:]
+        _llm_summary_attempted = False
+        try:
+            from memcheck import llm as _llm
+            if _llm.llm_available() and last_20:
+                _llm_summary_attempted = True
+                context_bullets = "\n".join(
+                    f"- [{f.get('type', '?')}] {str(f.get('text', ''))[:300]}"
+                    for f in last_20
+                )
+                l1_prompt = (
+                    f"Investigation: {manifest['title']}\n"
+                    f"Recent findings (up to 20):\n{context_bullets}\n\n"
+                    "Produce exactly 5-7 concise key-point bullet strings that capture "
+                    "the most important things known so far. Each bullet should be a "
+                    "single sentence under 120 characters. Reply with ONLY a JSON array "
+                    "of strings, no other text. Example: [\"First point.\", \"Second point.\"]"
+                )
+                l1_raw = _llm.call_llm(l1_prompt, json_mode=True, timeout=60.0)
+                if l1_raw:
+                    try:
+                        parsed = json.loads(l1_raw)
+                        if isinstance(parsed, list):
+                            summary_l1 = [str(b) for b in parsed if str(b).strip()][:7]
+                    except Exception:
+                        pass
+
+                if summary_l1:
+                    l2_prompt = (
+                        f"Investigation: {manifest['title']}\n"
+                        f"Key points:\n" + "\n".join(f"- {b}" for b in summary_l1) + "\n\n"
+                        "Write a 2-3 sentence 'state of knowledge' paragraph summarising "
+                        "what is established, what is uncertain, and what remains to check. "
+                        "Be direct and concise. Reply with only the paragraph text."
+                    )
+                    l2_raw = _llm.call_llm(l2_prompt, timeout=60.0)
+                    if l2_raw:
+                        summary_l2 = l2_raw.strip()
+        except Exception:
+            _llm_summary_attempted = False
+
+        # Deterministic fallback when LLM is unavailable or failed to produce output
+        if not summary_l1:
+            summary_l1 = [
+                str(f.get("text", ""))[:100]
+                for f in findings[-5:]
+                if str(f.get("text", "")).strip()
+            ]
+        if not summary_l2:
+            n = len(findings)
+            latest_text = str(findings[-1].get("text", "")) if findings else ""
+            summary_l2 = (
+                f"Investigation with {n} finding{'s' if n != 1 else ''}."
+                + (f" Latest: {latest_text[:200]}" if latest_text else "")
+            )
+
+        # Persist to manifest (write-through cache via _save_manifest)
+        manifest["summary_l1"] = summary_l1
+        manifest["summary_l2"] = summary_l2
+        _save_manifest(manifest)
+    except Exception:
+        pass  # fail-open: summary generation never breaks reflect
+
     return json.dumps({
         "investigation_id": investigation_id,
         "title": manifest["title"],
@@ -3026,6 +3142,8 @@ def investigation_reflect(investigation_id: str) -> str:
         "key_entities": key_entities,
         "excluded_retracted": excluded_retracted,
         "self_check": self_check,
+        "summary_l1": summary_l1,
+        "summary_l2": summary_l2,
     }, indent=2)
 
 
