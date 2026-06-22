@@ -35,7 +35,6 @@ import json
 import uuid
 import hashlib
 import subprocess
-import time
 from datetime import datetime, timezone
 
 # ── Config from env or defaults ────────────────────────────────────────────

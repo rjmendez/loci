@@ -10,7 +10,6 @@ import json
 import math
 import os
 import sqlite3
-import sys
 import urllib.request
 from datetime import datetime, timezone
 
