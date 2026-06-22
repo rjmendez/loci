@@ -50,6 +50,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -1413,7 +1414,12 @@ def _load_manifest(investigation_id: str) -> dict | None:
 def _save_manifest(manifest: dict) -> None:
     manifest["updated_at"] = _now()
     p = _inv_dir(manifest["id"]) / "manifest.json"
-    p.write_text(json.dumps(manifest, indent=2))
+    data = json.dumps(manifest, indent=2)
+    dir_ = p.parent
+    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
+        tf.write(data)
+        tmp_path = Path(tf.name)
+    tmp_path.replace(p)
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
