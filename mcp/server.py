@@ -4929,15 +4929,8 @@ def memory_confidence(
             "cues": {}, "top_hit_preview": "", "recommendation": "verify",
         })
 
-    embed_fn = _get_embed_fn()
-    if embed_fn is None:
-        return json.dumps({
-            "confidence": 0.0, "basis": "embed_unavailable",
-            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
-        })
-
     try:
-        emb = embed_fn(query)
+        emb = _embed(query)
     except Exception:
         emb = None
     if not emb:
