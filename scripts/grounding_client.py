@@ -14,7 +14,6 @@ import os
 import socket
 import subprocess
 import sys
-import time
 
 SOCK_PATH  = os.environ.get("GROUNDING_SOCK", "/tmp/hermes-grounding-{}.sock".format(os.environ.get("HERMES_AGENT_ID", "hermes")))
 HOOK_PATH  = os.path.join(os.path.dirname(__file__), "hooks", "pre_llm_grounding.py")
