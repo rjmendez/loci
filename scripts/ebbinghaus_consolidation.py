@@ -75,7 +75,11 @@ def now_iso() -> str:
 
 
 def days_since(ts_str: str) -> float:
-    """Return fractional days between ts_str (ISO-8601 or SQLite datetime) and now."""
+    """Return fractional days between ts_str (ISO-8601 or SQLite datetime) and now.
+
+    Returns -1.0 as a sentinel when the timestamp cannot be parsed, so callers
+    can distinguish a genuine zero-age item from a parse failure.
+    """
     if not ts_str:
         return 0.0
     ts_str = ts_str.strip()
@@ -90,7 +94,7 @@ def days_since(ts_str: str) -> float:
         except ValueError:
             continue
     print(f"[warn] unrecognised timestamp format: {ts_str!r}")
-    return 0.0
+    return -1.0
 
 
 def _init_difficulty(importance: float) -> float:
@@ -132,8 +136,17 @@ def _grade_from_retention(r: float) -> float:
 
 def retention(recall_count: int, last_recalled: str, created_at: str,
               fsrs_stability: float | None = None) -> float:
-    """R = exp(-t / S) where S comes from FSRS stability if available, else computed."""
+    """R = exp(-t / S) where S comes from FSRS stability if available, else computed.
+
+    If days_since returns the sentinel -1.0 (parse failure), treat the item as
+    having a very large age so retention approaches 0, ensuring it is eligible
+    for consolidation.
+    """
     t = days_since(last_recalled) if last_recalled else days_since(created_at)
+    if t < 0:
+        # Sentinel: timestamp was unparseable — force low retention so the item
+        # is eligible for consolidation rather than being silently suppressed.
+        return 0.0
     if fsrs_stability and fsrs_stability > 0:
         s = fsrs_stability
     else:
