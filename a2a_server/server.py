@@ -516,6 +516,8 @@ async def skill_memory_recall(task: dict) -> dict:
             for h in hits:
                 pl = h.get('payload', {})
                 mid = pl.get('memory_id', str(h.get('id', '')))
+                if float(h.get('score', 0)) < 0.59:
+                    continue
                 if mid not in seen_ids:
                     results.append({
                         'id': mid, 'content': pl.get('content', ''),
