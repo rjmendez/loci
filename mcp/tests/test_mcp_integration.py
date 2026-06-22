@@ -332,3 +332,130 @@ class TestRagContextSearchDecayParam(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNumericConfidence(unittest.TestCase):
+    """Tests for numeric_confidence field in investigation_store and
+    aggregate_confidence in investigation_finding_provenance."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_investigation_store_stores_numeric_confidence(self):
+        """investigation_store persists numeric_confidence in the JSONL and
+        auto-derives it from the string confidence when not supplied."""
+        inv_id = _new_id("nc")
+        server.investigation_start(investigation_id=inv_id, title="Numeric confidence test")
+
+        # Supply explicit numeric_confidence — should be stored as-is.
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Auth service returned HTTP 401 for expired token.",
+            source="test:manual",
+            confidence="high",
+            numeric_confidence=0.75,
+        ))
+        self.assertNotIn("error", stored, f"Unexpected error: {stored}")
+        self.assertEqual(stored.get("stored"), True)
+        finding_id = stored["finding_id"]
+
+        # Verify the JSONL file actually has numeric_confidence=0.75.
+        findings_path = server.MEMORY_DIR / inv_id / "findings.jsonl"
+        findings = [json.loads(line) for line in findings_path.read_text().splitlines() if line.strip()]
+        match = next((f for f in findings if f.get("id") == finding_id), None)
+        self.assertIsNotNone(match, "Stored finding not found in JSONL")
+        self.assertAlmostEqual(match.get("numeric_confidence"), 0.75, places=5)
+
+        # Store another finding without numeric_confidence — should auto-derive from "low" → 0.3.
+        stored2 = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="Rate limiter not engaged during auth failure burst.",
+            source="test:inference",
+            confidence="low",
+        ))
+        self.assertNotIn("error", stored2)
+        finding_id2 = stored2["finding_id"]
+
+        findings2 = [json.loads(line) for line in findings_path.read_text().splitlines() if line.strip()]
+        match2 = next((f for f in findings2 if f.get("id") == finding_id2), None)
+        self.assertIsNotNone(match2, "Second finding not found in JSONL")
+        self.assertAlmostEqual(match2.get("numeric_confidence"), 0.3, places=5,
+                               msg="low confidence should auto-derive to 0.3")
+
+        # Clamping: value > 1.0 should be clamped to 1.0.
+        stored3 = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Token expiry field missing in JWT payload.",
+            source="test:manual",
+            confidence="medium",
+            numeric_confidence=2.5,
+        ))
+        self.assertNotIn("error", stored3)
+        finding_id3 = stored3["finding_id"]
+        findings3 = [json.loads(line) for line in findings_path.read_text().splitlines() if line.strip()]
+        match3 = next((f for f in findings3 if f.get("id") == finding_id3), None)
+        self.assertIsNotNone(match3)
+        self.assertAlmostEqual(match3.get("numeric_confidence"), 1.0, places=5,
+                               msg="numeric_confidence > 1.0 should be clamped to 1.0")
+
+    def test_investigation_finding_provenance_returns_aggregate_confidence(self):
+        """investigation_finding_provenance returns aggregate_confidence as the
+        product of numeric_confidence values along the derived_from chain."""
+        inv_id = _new_id("prov")
+        server.investigation_start(investigation_id=inv_id, title="Provenance confidence test")
+
+        # Root observed finding with numeric_confidence 0.9.
+        root = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Login audit log shows 50 failed attempts from 198.51.100.5.",
+            source="test:audit",
+            confidence="high",
+            numeric_confidence=0.9,
+        ))
+        self.assertNotIn("error", root)
+        root_id = root["finding_id"]
+
+        # Inferred finding derived from root, with numeric_confidence 0.8.
+        child = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="Brute-force attack likely originating from 198.51.100.5.",
+            source="test:inference",
+            confidence="high",
+            numeric_confidence=0.8,
+            derived_from=root_id,
+        ))
+        self.assertNotIn("error", child)
+        child_id = child["finding_id"]
+
+        # Trace provenance from the inferred child.
+        prov = _json(server.investigation_finding_provenance(
+            finding_id=child_id,
+            investigation_id=inv_id,
+        ))
+        self.assertNotIn("error", prov)
+        self.assertIn("aggregate_confidence", prov,
+                      "Response must include aggregate_confidence")
+        # Expected: 0.8 (child) * 0.9 (root) = 0.72
+        self.assertAlmostEqual(prov["aggregate_confidence"], 0.72, places=4,
+                               msg="aggregate_confidence should be product of chain nc values")
+        self.assertEqual(prov["chain_length"], 2)
+        # Each chain node should carry numeric_confidence.
+        for node in prov["chain"]:
+            if "error" not in node:
+                self.assertIn("numeric_confidence", node,
+                              f"Chain node missing numeric_confidence: {node}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
