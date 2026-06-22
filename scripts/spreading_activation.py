@@ -181,8 +181,6 @@ def run_spreading_activation(
             for source, _target, _weight in edges:
                 out_degree[source] = out_degree.get(source, 0) + 1
 
-            newly_activated: list[str] = []
-
             for source, target, weight in edges:
                 # Rescale weight relative to the floor
                 w_prime = (weight - SA_EDGE_FLOOR) / (1.0 - SA_EDGE_FLOOR)
@@ -196,9 +194,6 @@ def run_spreading_activation(
 
                 prior = activation.get(target, 0.0)
                 activation[target] = min(1.0, prior + contribution)
-
-                if target not in activation or prior == 0.0:
-                    newly_activated.append(target)
 
             # Next frontier: targets that were not already in the frontier set
             frontier = [

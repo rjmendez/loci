@@ -201,7 +201,7 @@ QDRANT_URL = os.environ.get('QDRANT_URL')
 QDRANT_KEY = os.environ.get('QDRANT_API_KEY', '')
 
 # Ollama embedding (same config as hooks/pre_llm_grounding.py + session_end_sync.py)
-OLLAMA_BASE           = os.environ.get('MNEMOSYNE_EMBEDDING_API_URL')
+OLLAMA_BASE           = os.environ.get('MNEMOSYNE_EMBEDDING_API_URL', 'http://localhost:11434/v1')
 EMBED_MODEL           = os.environ.get('MNEMOSYNE_EMBEDDING_MODEL',   'nomic-embed-text')
 EMBED_DIM             = int(os.environ.get('MNEMOSYNE_EMBEDDING_DIM', '768'))
 _EMBED_API_KEY        = os.environ.get('EMBED_API_KEY', '')
@@ -377,11 +377,21 @@ def _verify_totp(x_totp: Optional[str] = Header(default=None)):
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
-def _db() -> sqlite3.Connection:
-    """Open Mnemosyne SQLite with row_factory."""
+from contextlib import contextmanager
+
+@contextmanager
+def _db():
+    """Open Mnemosyne SQLite with row_factory, commit on success, always close."""
     conn = sqlite3.connect(MNEMOSYNE_DB, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _embed_auth_headers() -> dict:
@@ -396,7 +406,7 @@ def _embed_auth_headers() -> dict:
 
 async def _embed(text: str) -> Optional[list]:
     """Embed via OpenAI-compat /v1/embeddings. Works with Ollama and cloud providers."""
-    url = OLLAMA_BASE.rstrip('/') + '/embeddings'
+    url = OLLAMA_BASE.rstrip('/').removesuffix('/v1') + '/v1/embeddings'
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
             async with sess.post(url, json={'model': EMBED_MODEL, 'input': text[:2000]},
@@ -978,7 +988,7 @@ async def skill_gpu_inference(task: dict) -> dict:
 
     try:
         async with aiohttp.ClientSession() as sess, sess.post(
-            f"{OLLAMA_BASE.rstrip('/v1')}/v1/chat/completions",
+            f"{OLLAMA_BASE.rstrip('/').removesuffix('/v1')}/v1/chat/completions",
             json={'model': model, 'messages': messages, 'max_tokens': max_t},
             timeout=aiohttp.ClientTimeout(total=120)
         ) as r:

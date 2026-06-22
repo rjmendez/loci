@@ -40,7 +40,7 @@ __all__ = [
 
 _log = logging.getLogger("memcheck.llm")
 
-_DEFAULT_OLLAMA = "http://100.73.200.19:11434"  # loci convention (matches ground_gate.py)
+_DEFAULT_OLLAMA = "http://localhost:11434"
 
 
 def _ollama_base() -> str:

@@ -3146,16 +3146,16 @@ def investigation_pre_answer_check(
         claim_support_refs: list[dict] = []
         claim_contradiction_refs: list[dict] = []
 
-        for record in evidence_pool:
-            score = _lexical_match_score(claim_tokens, record.get("tokens", set()))
+        for evid in evidence_pool:
+            score = _lexical_match_score(claim_tokens, evid.get("tokens", set()))
             if score < 0.45:
                 continue
-            evidence_negated = bool(_NEGATION_RE.search(str(record.get("text", ""))))
+            evidence_negated = bool(_NEGATION_RE.search(str(evid.get("text", ""))))
             if claim_negated != evidence_negated and score >= 0.5:
-                ref = _make_ref(record, "contradiction", score=score)
+                ref = _make_ref(evid, "contradiction", score=score)
                 claim_contradiction_refs.append(ref)
             else:
-                ref = _make_ref(record, "support", score=score)
+                ref = _make_ref(evid, "support", score=score)
                 claim_support_refs.append(ref)
 
         qdrant_refs, qdrant_status = _search_qdrant_claim_evidence(claim, investigation_id, limit=5)
@@ -3737,7 +3737,25 @@ def _record_verdicts(verdicts: list) -> bool:
                 # vector is stored rather than the backend's fallback.
                 await engine.record(v, _embed(v.subject_excerpt))
 
-        asyncio.run(_record_all())
+        # FastMCP dispatches sync tools inline on a running event loop — asyncio.run()
+        # raises RuntimeError in that context. Delegate to a daemon thread when needed.
+        try:
+            asyncio.get_running_loop()
+            _exc: list[Exception] = []
+
+            def _run_thread() -> None:
+                try:
+                    asyncio.run(_record_all())
+                except Exception as e:
+                    _exc.append(e)
+
+            t = threading.Thread(target=_run_thread, daemon=True)
+            t.start()
+            t.join()
+            if _exc:
+                raise _exc[0]
+        except RuntimeError:
+            asyncio.run(_record_all())
         return True
     except Exception as exc:  # fail-open — recording must not fail the tool
         logger.debug("memcheck verdict recording failed, degrading: %r", exc)
@@ -4656,7 +4674,27 @@ def _forget_finding_verdicts(finding: dict) -> int:
             removed += await engine.forget(redact_excerpt(text), "memory")
             return removed
 
-        return asyncio.run(_forget_all())
+        # Same loop-detection guard as _record_claim_verdicts — asyncio.run() raises
+        # RuntimeError when FastMCP is dispatching inline on a running event loop.
+        try:
+            asyncio.get_running_loop()
+            _result: list[int] = []
+            _exc2: list[Exception] = []
+
+            def _run_forget() -> None:
+                try:
+                    _result.append(asyncio.run(_forget_all()))
+                except Exception as e:
+                    _exc2.append(e)
+
+            t2 = threading.Thread(target=_run_forget, daemon=True)
+            t2.start()
+            t2.join()
+            if _exc2:
+                raise _exc2[0]
+            return _result[0] if _result else 0
+        except RuntimeError:
+            return asyncio.run(_forget_all())
     except Exception as exc:  # fail-open — verdict cleanup is best-effort
         logger.debug("verdict forget failed, degrading to 0: %r", exc)
         return 0
@@ -5313,8 +5351,8 @@ def investigation_reason(
         if vecs and len(vecs) == len(findings) + 1:
             qv = vecs[0]
             scored = [(_llm.cosine(qv, vecs[i + 1]), f) for i, f in enumerate(findings)]
-            kept = [f for c, f in scored if c >= ground_threshold]
-            gated = sorted(kept, key=lambda f: 0)[:12] if kept else []
+            kept = [(c, f) for c, f in scored if c >= ground_threshold]
+            gated = [f for _, f in sorted(kept, key=lambda x: x[0], reverse=True)[:12]]
             gate_applied = True
 
     evidence = "\n".join(
