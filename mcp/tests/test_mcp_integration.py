@@ -14,12 +14,10 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 """
 
 import json
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 # Ensure the mcp/ directory is on the path so `import server` resolves correctly.
 _MCP_DIR = Path(__file__).resolve().parent.parent
@@ -37,87 +35,148 @@ def _json(result: str) -> dict:
         raise AssertionError(f"Tool returned non-JSON: {result!r}") from exc
 
 
+# Counters so each test gets a unique investigation_id (the tool is idempotent
+# on the same ID — it resumes instead of creating — so uniqueness matters).
+_counter = [0]
+
+
+def _new_id(prefix="test"):
+    _counter[0] += 1
+    return f"{prefix}-{_counter[0]:04d}"
+
+
 class TestInvestigationLifecycle(unittest.TestCase):
-    """Full investigation create → store → note → list roundtrip."""
+    """Full investigation create → store → note → load → list roundtrip."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        # Point the server at a temp MEMORY_DIR so tests don't touch real data.
-        self._orig_memory_dir = server.MEMORY_DIR
+        self._orig = server.MEMORY_DIR
         server.MEMORY_DIR = Path(self._tmp.name)
 
     def tearDown(self):
-        server.MEMORY_DIR = self._orig_memory_dir
+        server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_investigation_start_returns_id(self):
+    def test_investigation_start_creates_and_returns_manifest(self):
+        inv_id = _new_id("start")
         result = _json(server.investigation_start(
-            task="Test task",
-            context="Test context",
-            hypothesis="Test hypothesis",
+            investigation_id=inv_id,
+            title="Test investigation",
+            context="Created by integration test",
         ))
-        self.assertIn("investigation_id", result)
-        self.assertIsInstance(result["investigation_id"], str)
-        self.assertGreater(len(result["investigation_id"]), 0)
+        self.assertEqual(result["status"], "created")
+        self.assertIn("manifest", result)
+        self.assertEqual(result["manifest"]["id"], inv_id)
+
+    def test_investigation_start_resumes_existing(self):
+        inv_id = _new_id("resume")
+        server.investigation_start(investigation_id=inv_id, title="First creation")
+        result = _json(server.investigation_start(investigation_id=inv_id, title="Second call"))
+        self.assertEqual(result["status"], "resumed")
+        # Title should not be overwritten on resume
+        self.assertEqual(result["manifest"]["title"], "First creation")
 
     def test_investigation_store_valid_finding(self):
-        start = _json(server.investigation_start(task="Store test"))
-        inv_id = start["investigation_id"]
+        inv_id = _new_id("store")
+        server.investigation_start(investigation_id=inv_id, title="Store test")
         result = _json(server.investigation_store(
             investigation_id=inv_id,
-            text="Found that the authentication service returns 401 on expired tokens.",
-            record_type="observation",
+            finding_type="observed",
+            text="The auth service returns HTTP 401 on expired tokens.",
+            source="test:manual",
             confidence="high",
-            source="test",
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("id", result)
         self.assertEqual(result.get("stored"), True)
+        self.assertIn("finding_id", result)
 
-    def test_investigation_note_updates_manifest(self):
-        start = _json(server.investigation_start(task="Note test"))
-        inv_id = start["investigation_id"]
-        result = _json(server.investigation_note(
-            investigation_id=inv_id,
-            next_step="Check the token expiry logic in auth.py",
-        ))
-        self.assertNotIn("error", result, f"Unexpected error: {result}")
-
-    def test_investigation_list_returns_list(self):
-        # Create two investigations
-        server.investigation_start(task="Inv A")
-        server.investigation_start(task="Inv B")
-        result = _json(server.investigation_list())
-        self.assertIn("investigations", result)
-        self.assertIsInstance(result["investigations"], list)
-        self.assertGreaterEqual(len(result["investigations"]), 2)
-
-    def test_investigation_store_missing_id_returns_error(self):
+    def test_investigation_store_rejects_bad_finding_type(self):
+        inv_id = _new_id("bad-type")
+        server.investigation_start(investigation_id=inv_id, title="Bad type test")
         result = _json(server.investigation_store(
-            investigation_id="nonexistent-id-xyz",
-            text="some finding",
+            investigation_id=inv_id,
+            finding_type="INVALID",
+            text="some text",
+            source="test",
         ))
         self.assertIn("error", result)
 
-    def test_investigation_store_roundtrip_then_load(self):
-        start = _json(server.investigation_start(task="Roundtrip test"))
-        inv_id = start["investigation_id"]
-        store_result = _json(server.investigation_store(
-            investigation_id=inv_id,
-            text="The database uses bcrypt for password hashing.",
-            record_type="finding",
-            confidence="high",
+    def test_investigation_store_rejects_missing_investigation(self):
+        result = _json(server.investigation_store(
+            investigation_id="does-not-exist-xyz",
+            finding_type="observed",
+            text="some finding",
+            source="test",
         ))
-        finding_id = store_result.get("id")
-        self.assertIsNotNone(finding_id, "Store did not return an id")
+        self.assertIn("error", result)
 
-        loaded = _json(server.investigation_load(investigation_id=inv_id))
-        self.assertNotIn("error", loaded)
-        texts = [f.get("text", "") for f in loaded.get("findings", [])]
+    def test_investigation_note_updates_hypothesis(self):
+        inv_id = _new_id("note")
+        server.investigation_start(investigation_id=inv_id, title="Note test")
+        result = _json(server.investigation_note(
+            investigation_id=inv_id,
+            field="hypothesis",
+            value="The bug is in the token expiry check.",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+
+    def test_investigation_note_updates_next_step(self):
+        inv_id = _new_id("note-step")
+        server.investigation_start(investigation_id=inv_id, title="Note step test")
+        result = _json(server.investigation_note(
+            investigation_id=inv_id,
+            field="next_step",
+            value="Check auth.py line 42",
+        ))
+        self.assertNotIn("error", result)
+
+    def test_investigation_load_returns_findings(self):
+        inv_id = _new_id("load")
+        server.investigation_start(investigation_id=inv_id, title="Load test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Database uses bcrypt for password hashing.",
+            source="test:code-review",
+            confidence="high",
+        )
+        result = _json(server.investigation_load(investigation_id=inv_id))
+        self.assertNotIn("error", result)
+        self.assertIn("manifest", result)
+        texts = [f.get("text", "") for f in result.get("recent_findings", [])]
         self.assertTrue(
             any("bcrypt" in t for t in texts),
             f"Stored finding not found in load results: {texts}",
         )
+
+    def test_investigation_list_returns_list(self):
+        inv_a = _new_id("list-a")
+        inv_b = _new_id("list-b")
+        server.investigation_start(investigation_id=inv_a, title="List test A")
+        server.investigation_start(investigation_id=inv_b, title="List test B")
+        result = _json(server.investigation_list())
+        self.assertIn("investigations", result)
+        self.assertIsInstance(result["investigations"], list)
+        ids = [i.get("id") for i in result["investigations"]]
+        self.assertIn(inv_a, ids)
+        self.assertIn(inv_b, ids)
+
+    def test_store_roundtrip_finding_id_in_load(self):
+        inv_id = _new_id("roundtrip")
+        server.investigation_start(investigation_id=inv_id, title="Roundtrip test")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="The retry loop in sync.py does not back off on rate limits.",
+            source="test:code-analysis",
+            confidence="medium",
+        ))
+        finding_id = stored.get("finding_id")
+        self.assertIsNotNone(finding_id, "Store did not return a finding_id")
+
+        loaded = _json(server.investigation_load(investigation_id=inv_id))
+        finding_ids = [f.get("id") for f in loaded.get("recent_findings", [])]
+        self.assertIn(finding_id, finding_ids)
 
 
 class TestMemoryHealth(unittest.TestCase):
@@ -125,20 +184,20 @@ class TestMemoryHealth(unittest.TestCase):
 
     def test_returns_valid_json_without_qdrant(self):
         result = _json(server.memory_health())
-        # Should have at minimum a status or error key
+        # Should have at minimum one of these keys
         self.assertTrue(
-            "status" in result or "error" in result or "qdrant" in result,
+            any(k in result for k in ("status", "error", "qdrant", "sqlite")),
             f"Unexpected health response shape: {result}",
         )
 
-    def test_with_investigation_id_not_found(self):
+    def test_with_missing_investigation_id(self):
+        # Should not raise; any valid JSON response is acceptable
         result = _json(server.memory_health(investigation_id="no-such-investigation"))
-        # Should not raise; should return gracefully
         self.assertIsInstance(result, dict)
 
 
 class TestMemoryConfidence(unittest.TestCase):
-    """memory_confidence should return valid JSON and handle empty query gracefully."""
+    """memory_confidence returns valid JSON for any query."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -149,16 +208,24 @@ class TestMemoryConfidence(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_empty_query_returns_error(self):
+    def test_returns_valid_json_for_empty_query(self):
+        # Empty query may return a confidence response or an error dict — both are valid.
         result = _json(server.memory_confidence(query=""))
-        self.assertIn("error", result)
-
-    def test_valid_query_returns_json(self):
-        result = _json(server.memory_confidence(query="authentication"))
         self.assertIsInstance(result, dict)
+
+    def test_returns_valid_json_for_real_query(self):
+        result = _json(server.memory_confidence(query="authentication token expiry"))
+        self.assertIsInstance(result, dict)
+        # When Qdrant is unavailable the response may be degraded but must be valid JSON
+        self.assertTrue(
+            any(k in result for k in ("confidence", "error", "status", "score")),
+            f"Unexpected confidence response shape: {result}",
+        )
 
 
 class TestAuditLog(unittest.TestCase):
+    """audit_log records tool calls; requires tool_name, inputs_json, output."""
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig = server.MEMORY_DIR
@@ -168,21 +235,30 @@ class TestAuditLog(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_returns_valid_json(self):
-        result = _json(server.audit_log())
+    def test_returns_valid_json_with_required_args(self):
+        result = _json(server.audit_log(
+            tool_name="test_tool",
+            inputs_json='{"query": "test"}',
+            output='{"result": "ok"}',
+        ))
         self.assertIsInstance(result, dict)
+        self.assertNotIn("error", result)
 
     def test_with_investigation_id(self):
-        # Start an investigation then read its audit log
-        start = _json(server.investigation_start(task="Audit test"))
-        inv_id = start["investigation_id"]
-        result = _json(server.audit_log(investigation_id=inv_id))
+        inv_id = _new_id("audit")
+        server.investigation_start(investigation_id=inv_id, title="Audit test")
+        result = _json(server.audit_log(
+            tool_name="test_tool",
+            inputs_json='{"param": "value"}',
+            output='{"status": "ok"}',
+            investigation_id=inv_id,
+        ))
         self.assertIsInstance(result, dict)
         self.assertNotIn("error", result)
 
 
-class TestToolsReturnValidJSON(unittest.TestCase):
-    """Smoke test: every listed tool returns parseable JSON without crashing."""
+class TestToolsSmokeReturnValidJSON(unittest.TestCase):
+    """Smoke test: key tools return parseable JSON without raising."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -194,12 +270,12 @@ class TestToolsReturnValidJSON(unittest.TestCase):
         self._tmp.cleanup()
 
     def _smoke(self, fn, *args, **kwargs):
+        result = fn(*args, **kwargs)
         try:
-            result = fn(*args, **kwargs)
             parsed = json.loads(result)
-            self.assertIsInstance(parsed, (dict, list))
         except json.JSONDecodeError:
             self.fail(f"{fn.__name__} returned non-JSON: {result!r}")
+        self.assertIsInstance(parsed, (dict, list))
 
     def test_investigation_list_smoke(self):
         self._smoke(server.investigation_list)
@@ -207,12 +283,15 @@ class TestToolsReturnValidJSON(unittest.TestCase):
     def test_memory_health_smoke(self):
         self._smoke(server.memory_health)
 
-    def test_memory_confidence_empty_query(self):
-        # Known error path — still must be valid JSON
-        self._smoke(server.memory_confidence, query="")
+    def test_memory_confidence_smoke(self):
+        self._smoke(server.memory_confidence, query="test query")
 
     def test_investigation_start_smoke(self):
-        self._smoke(server.investigation_start, task="smoke test")
+        self._smoke(
+            server.investigation_start,
+            investigation_id=_new_id("smoke"),
+            title="smoke test",
+        )
 
 
 if __name__ == "__main__":

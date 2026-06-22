@@ -68,3 +68,10 @@ _ = compact
 
 # ── spreading activation public interface
 _ = run_spreading_activation
+
+# ── Signal handler parameters (received by OS convention, not read in body)
+_ = signum   # signal number param in _sigterm(signum, frame)
+_ = frame    # stack frame param in _sigterm(signum, frame)
+
+# ── Server socket variables assigned for binding but not read after bind
+_ = client_address  # assigned in TCPServer.__init__ or similar; used by framework
