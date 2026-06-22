@@ -35,9 +35,16 @@ HISTORY_FILE = MLOPS / "loop_history.jsonl"
 CANDIDATE_MODEL = MLOPS / "grounding" / "candidate.joblib"
 LIVE_MODEL = GROUNDING_DIR / "grounding_bleed_clf.joblib"
 DATASET = GROUNDING_DIR / "grounding_dataset.jsonl"
+ACTIVE_CANDIDATES = MLOPS / "grounding" / "active_candidates.jsonl"
 
 DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
 DEFAULT_FINDINGS = os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findings.jsonl")
+DEFAULT_DB = os.path.expanduser(
+    os.environ.get("MNEMOSYNE_DB", "~/.hermes/mnemosyne/data/mnemosyne.db")
+)
+DEFAULT_HOOK_STATE = os.path.expanduser(
+    os.environ.get("CLAUDE_HOOK_STATE", "~/.claude/hook-state")
+)
 
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
@@ -184,7 +191,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         [sys.executable, str(MLOPS / "finetune" / "collect.py"),
          "--out", str(collect_out), "--ollama", ollama],
         [sys.executable, str(MLOPS / "finetune" / "format_sft.py"),
-         "--traces", str(traces), "--out", str(sft)],
+         "--traces", str(traces), "--out", str(sft), "--mode", "both"],
     ]:
         r = subprocess.run(cmd, capture_output=True, text=True)
         print(r.stdout[-500:])
@@ -205,6 +212,113 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         print(r.stdout[-500:])
         return r.returncode == 0
     return True
+
+
+# ── Weibull memory decay ──────────────────────────────────────────────────────
+
+def _run_decay(db_path: str, dry_run: bool) -> dict:
+    try:
+        sys.path.insert(0, str(MLOPS))
+        from memory.decay import apply_decay
+        stats = apply_decay(db_path=db_path, dry_run=dry_run)
+        print(f"[loop] decay: n_rows={stats.get('n_rows')} n_decayed={stats.get('n_decayed')} "
+              f"mean_retention={stats.get('mean_retention', 0):.3f}")
+        return stats
+    except Exception as exc:
+        print(f"[loop] decay step failed: {exc}")
+        return {}
+
+
+# ── Live-Evo memory adaptation ────────────────────────────────────────────────
+
+def _run_live_evo(db_path: str, hook_state: str, dry_run: bool) -> dict:
+    try:
+        from memory.live_evo import adapt
+        stats = adapt(db_path=db_path, hook_state_dir=hook_state, dry_run=dry_run)
+        print(f"[loop] live_evo: failures={stats.get('n_failures')} "
+              f"correlated={stats.get('n_correlated')} penalized={stats.get('n_penalized')}")
+        return stats
+    except Exception as exc:
+        print(f"[loop] live_evo step failed: {exc}")
+        return {}
+
+
+# ── Post-promotion monitoring ─────────────────────────────────────────────────
+
+def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
+    if not LIVE_MODEL.exists():
+        print("[loop] monitor skipped — no live model yet")
+        return {}
+    try:
+        sys.path.insert(0, str(MLOPS / "grounding"))
+        from mlops.grounding.canary import monitor_live
+        result = monitor_live(
+            live_model_path=str(LIVE_MODEL),
+            findings_glob=findings_glob,
+            ollama_url=ollama,
+            dry_run=dry_run,
+        )
+        print(f"[loop] monitor: drift={result.get('drift')} "
+              f"rollback_recommended={result.get('rollback_recommended')}")
+        if result.get("rollback_recommended"):
+            print("[loop] ALERT: rollback recommended — check monitor_history.jsonl")
+        return result
+    except Exception as exc:
+        print(f"[loop] monitor step failed: {exc}")
+        return {}
+
+
+# ── Embedding drift detection ─────────────────────────────────────────────────
+
+def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
+    anchor = MLOPS / "embedding" / "anchor.npz"
+    drift_script = MLOPS / "embedding" / "drift.py"
+    if not drift_script.exists():
+        return {}
+    if not anchor.exists():
+        print("[loop] embedding drift: no anchor — building anchor set ...")
+        cmd = [sys.executable, str(drift_script),
+               "--dataset", str(DATASET), "--ollama", ollama,
+               "--anchor", str(anchor), "--build-anchor"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print(result.stdout[-300:])
+        return {"built_anchor": True}
+    out_path = MLOPS / "embedding" / "drift_result.json"
+    cmd = [sys.executable, str(drift_script),
+           "--dataset", str(DATASET), "--ollama", ollama,
+           "--anchor", str(anchor), "--out", str(out_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout[-300:])
+    if result.returncode == 1:
+        print("[loop] ALERT: embedding drift detected — scheduling embedding fine-tune")
+        if not dry_run:
+            _emit_embedding_trigger()
+    if out_path.exists():
+        try:
+            return json.loads(out_path.read_text())
+        except Exception:
+            pass
+    return {"exit_code": result.returncode}
+
+
+# ── Active learning ───────────────────────────────────────────────────────────
+
+def _run_active_learn(ollama: str) -> dict:
+    if not LIVE_MODEL.exists() or not DATASET.exists():
+        return {}
+    script = MLOPS / "grounding" / "active_learn.py"
+    if not script.exists():
+        return {}
+    result = subprocess.run(
+        [sys.executable, str(script),
+         "--model", str(LIVE_MODEL),
+         "--dataset", str(DATASET),
+         "--out", str(ACTIVE_CANDIDATES),
+         "--ollama", ollama],
+        capture_output=True, text=True,
+    )
+    print(result.stdout[-300:])
+    return {"exit_code": result.returncode}
 
 
 # ── Embedding tune trigger ────────────────────────────────────────────────────
@@ -247,6 +361,13 @@ def main() -> None:
                     help="Plan only — no model writes, no Ollama model creates")
     ap.add_argument("--force", action="store_true",
                     help="Skip new-data thresholds and retrain unconditionally")
+    ap.add_argument("--db", default=DEFAULT_DB, help="Path to Mnemosyne SQLite database")
+    ap.add_argument("--hook-state", default=DEFAULT_HOOK_STATE,
+                    help="Directory containing guard_bash_*.log files for Live-Evo")
+    ap.add_argument("--decay-every", type=int, default=1,
+                    help="Apply Weibull decay every N loop runs (default: every run)")
+    ap.add_argument("--active-learn-every", type=int, default=7,
+                    help="Generate active learning candidates every N days (default: 7)")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
@@ -306,6 +427,23 @@ def main() -> None:
         state["last_dataset_size"] = new_size
         state["runs_seen"] = state["runs_seen"] + new_runs
 
+    # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
+    loop_count = state.get("total_loop_runs", 0) + 1
+    if loop_count % args.decay_every == 0:
+        _run_decay(args.db, args.dry_run)
+    else:
+        print(f"[loop] decay skipped (run {loop_count}, cadence={args.decay_every})")
+
+    # ── 7b. Live-Evo memory adaptation ───────────────────────────────────────
+    _run_live_evo(args.db, args.hook_state, args.dry_run)
+
+    # ── 7c. Post-promotion online monitoring ──────────────────────────────────
+    _run_monitor(args.findings, args.ollama, args.dry_run)
+
+    # ── 7d. Embedding drift detection ─────────────────────────────────────────
+    if ollama_ok:
+        _run_embedding_drift(args.ollama, args.dry_run)
+
     # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
     last_sft = state.get("last_sft_bake")
     sft_days_ago = (
@@ -332,8 +470,20 @@ def main() -> None:
     else:
         print(f"[loop] embedding trigger skipped ({emb_days_ago}d ago, cadence={args.embedding_every}d)")
 
+    # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
+    last_al = state.get("last_active_learn")
+    al_days_ago = (now - datetime.fromisoformat(last_al)).days if last_al else 999
+    if ollama_ok and al_days_ago >= args.active_learn_every:
+        print(f"[loop] active_learn (last was {al_days_ago}d ago)")
+        al_result = _run_active_learn(args.ollama)
+        if al_result.get("exit_code", 1) == 0 and not args.dry_run:
+            state["last_active_learn"] = now_iso
+    else:
+        print(f"[loop] active_learn skipped ({al_days_ago}d ago, cadence={args.active_learn_every}d)")
+
     # ── 9. Persist state + history ────────────────────────────────────────────
     state["last_run"] = now_iso
+    state["total_loop_runs"] = loop_count
     if not args.dry_run:
         _save_state(state)
 

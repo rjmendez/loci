@@ -32,6 +32,8 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _HISTORY_PATH = Path(__file__).resolve().parent / "canary_history.jsonl"
 _PROMOTIONS_PATH = Path(__file__).resolve().parent / "promotions.jsonl"
+_MONITOR_PATH = Path(__file__).resolve().parent / "monitor_history.jsonl"
+MONITOR_ROLLBACK_WINDOW = 2  # consecutive drift events before rollback alert
 
 EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 DEFAULT_FINDINGS_GLOB = os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findings.jsonl")
@@ -317,6 +319,86 @@ def _append_history(record):
 
 
 # ---------------------------------------------------------------------------
+# Post-promotion online monitoring (EDDOps pattern)
+# ---------------------------------------------------------------------------
+
+def monitor_live(
+    live_model_path,
+    findings_glob=DEFAULT_FINDINGS_GLOB,
+    threshold=DEFAULT_THRESHOLD,
+    ollama_url=DEFAULT_OLLAMA,
+    dry_run=False,
+):
+    """Evaluate the LIVE (already promoted) model against recent findings.
+
+    Runs the same drift check as the pre-promotion canary but writes to
+    monitor_history.jsonl. If MONITOR_ROLLBACK_WINDOW consecutive monitor
+    runs show drift, emits a rollback recommendation.
+    """
+    import joblib
+
+    clf = joblib.load(live_model_path) if os.path.exists(str(live_model_path)) else None
+    if clf is None:
+        return {"drift": False, "rollback_recommended": False, "reason": "no live model found"}
+
+    runs = _load_runs(findings_glob)
+    if not runs:
+        return {"drift": False, "rollback_recommended": False, "reason": "no findings to evaluate"}
+
+    cos_f1s, model_f1s = [], []
+    for _, findings in sorted(runs.items()):
+        result = _eval_run(findings, threshold, clf, ollama_url)
+        if result is None:
+            continue
+        cos_f1s.append(result["cosine"]["f1"])
+        if result["model"]:
+            model_f1s.append(result["model"]["f1"])
+
+    cos_f1 = float(np.mean(cos_f1s)) if cos_f1s else float("nan")
+    model_f1 = float(np.mean(model_f1s)) if model_f1s else float("nan")
+
+    drift_result = zscore_drift_check(
+        {"cosine_f1": cos_f1, "model_f1": model_f1},
+        history_path=_MONITOR_PATH,
+    )
+
+    record = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "monitor_live",
+        "n_runs": len(runs),
+        "cosine_f1": cos_f1,
+        "model_f1": model_f1,
+        "drift": drift_result["drift"],
+        "reason": drift_result["reason"],
+    }
+
+    rollback_recommended = False
+    if not dry_run:
+        with open(_MONITOR_PATH, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+        if drift_result["drift"]:
+            history = []
+            if _MONITOR_PATH.exists():
+                with open(_MONITOR_PATH) as fh:
+                    for line in fh:
+                        try:
+                            history.append(json.loads(line.strip()))
+                        except Exception:
+                            continue
+            recent_drift = [r.get("drift", False) for r in history[-MONITOR_ROLLBACK_WINDOW:]]
+            if len(recent_drift) >= MONITOR_ROLLBACK_WINDOW and all(recent_drift):
+                rollback_recommended = True
+
+    return {
+        "drift": drift_result["drift"],
+        "rollback_recommended": rollback_recommended,
+        "cosine_f1": cos_f1,
+        "model_f1": model_f1,
+        "reason": drift_result["reason"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -324,9 +406,11 @@ def main():
     ap = argparse.ArgumentParser(
         description="Grounding gate canary: evaluate candidate model vs cosine baseline and optionally promote."
     )
-    ap.add_argument("--candidate", required=True, help="Path to candidate.joblib")
-    ap.add_argument("--target", required=True,
-                    help="Path to the live joblib (promote target)")
+    ap.add_argument("--mode", choices=["pre-promote", "monitor"], default="pre-promote",
+                    help="pre-promote: gate before promotion; monitor: eval live model post-promotion")
+    ap.add_argument("--candidate", default=None, help="Path to candidate.joblib (pre-promote mode)")
+    ap.add_argument("--target", default=None,
+                    help="Path to the live joblib (promote target / monitor source)")
     ap.add_argument("--findings", default=DEFAULT_FINDINGS_GLOB,
                     help="Glob for findings.jsonl files")
     ap.add_argument("--ollama", default=DEFAULT_OLLAMA,
@@ -338,6 +422,30 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="Evaluate and report but do not promote or write history")
     a = ap.parse_args()
+
+    if a.mode == "monitor":
+        if not a.target:
+            ap.error("--target is required for monitor mode")
+        print(f"[canary] monitor_live target={a.target} findings={a.findings}")
+        mon = monitor_live(
+            live_model_path=a.target,
+            findings_glob=a.findings,
+            threshold=a.threshold,
+            ollama_url=a.ollama,
+            dry_run=a.dry_run,
+        )
+        print(f"[canary] monitor cosine_f1={mon['cosine_f1']:.4f} model_f1={mon['model_f1']:.4f} "
+              f"drift={mon['drift']} rollback_recommended={mon['rollback_recommended']}")
+        if mon["rollback_recommended"]:
+            print(f"[canary] ROLLBACK RECOMMENDED: {mon['reason']}", file=sys.stderr)
+            sys.exit(2)
+        if mon["drift"]:
+            print(f"[canary] ALERT: drift detected — {mon['reason']}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    if not a.candidate:
+        ap.error("--candidate is required for pre-promote mode")
 
     print(f"[canary] evaluating candidate={a.candidate} findings={a.findings}")
     result = evaluate_gate(
