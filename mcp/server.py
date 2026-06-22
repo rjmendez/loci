@@ -2403,12 +2403,12 @@ def investigation_note(
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
-    if field == "context":
-        manifest["context"] = value
-    elif field == "hypothesis":
-        manifest["hypothesis"] = value
-    elif field == "next_step":
-        manifest["next_step"] = value
+    if field in ("context", "hypothesis", "next_step"):
+        stripped = value.strip() if value else ""
+        if not stripped:
+            return json.dumps({"error": f"Field '{field}' must not be empty or whitespace-only."})
+        manifest[field] = stripped
+        manifest[f"{field}_ts"] = _now()
     elif field == "open_question_add":
         if value not in manifest["open_questions"]:
             manifest["open_questions"].append(value)
