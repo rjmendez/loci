@@ -2594,6 +2594,163 @@ def _write_conflict(investigation_id: str, finding_id_a: str, neighbor_id: str) 
     path = _inv_dir(investigation_id) / "conflicts.jsonl"
     _append_jsonl(path, conflict)
     return conflict["id"]
+# Entity node helpers (object permanence across findings)
+# ---------------------------------------------------------------------------
+
+# Regex patterns for named-entity extraction from finding text
+_CAPITALIZED_PHRASE_RE = re.compile(r'\b([A-Z][a-zA-Z0-9]*(?:[ \t][A-Z][a-zA-Z0-9]*)+)\b')
+_QUOTED_PHRASE_RE = re.compile(r'"([^"]{2,80})"')
+_IP_ADDR_RE = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
+_HOSTNAME_ENTITY_RE = re.compile(
+    r'\b[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?'
+    r'(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)*'
+    r'(?:\.(?:local|corp|internal|lan|dev|test|net|com|io|org))\b', re.I
+)
+_URL_ENTITY_RE = re.compile(r'https?://[^\s"\'<>;]+', re.I)
+
+_ENTITY_STOP_WORDS = frozenset({
+    "The", "This", "That", "These", "Those", "There", "They", "Then",
+    "When", "What", "With", "From", "Into", "True", "False", "None",
+    "HTTP", "JSON", "SQL", "API", "URL", "ID",
+})
+
+
+def _classify_named_entity(name: str) -> str:
+    """Heuristic type classifier for a named entity string."""
+    if _IP_ADDR_RE.match(name):
+        return "location"
+    if _URL_ENTITY_RE.match(name):
+        return "system"
+    low = name.lower()
+    if any(kw in low for kw in ("server", "service", "system", "db", "database",
+                                 "cluster", "host", "node", "api", "gateway",
+                                 "azure", "aws", "gcp", "cloud")):
+        return "system"
+    # Two-word capitalized names that look like people
+    parts = name.split()
+    if len(parts) == 2 and all(p[0].isupper() and p[1:].islower() for p in parts):
+        return "person"
+    return "concept"
+
+
+def _extract_named_entities(text: str) -> list:
+    """
+    Heuristic extraction of named entities from finding text.
+    Returns list of {name, type} dicts.  No LLM call — fail-open.
+    """
+    try:
+        candidates = []
+
+        # Capitalized multi-word phrases
+        for m in _CAPITALIZED_PHRASE_RE.finditer(text):
+            phrase = m.group(1).strip()
+            if phrase and phrase not in _ENTITY_STOP_WORDS and len(phrase) >= 3:
+                candidates.append(phrase)
+
+        # Things in double quotes
+        for m in _QUOTED_PHRASE_RE.finditer(text):
+            phrase = m.group(1).strip()
+            if phrase and len(phrase) >= 2:
+                candidates.append(phrase)
+
+        # IP addresses
+        for ip in _IP_ADDR_RE.findall(text):
+            candidates.append(ip)
+
+        # Hostnames / FQDNs
+        for host in _HOSTNAME_ENTITY_RE.findall(text):
+            candidates.append(host)
+
+        # URLs
+        for url in _URL_ENTITY_RE.findall(text):
+            candidates.append(url)
+
+        # Deduplicate preserving order
+        seen = set()
+        result = []
+        for name in candidates:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append({"name": name, "type": _classify_named_entity(name)})
+        return result
+    except Exception:
+        return []
+
+
+def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) -> None:
+    """
+    Merge extracted named entities into entities.jsonl for the investigation.
+    Creates new entity records or updates existing ones (fuzzy name match).
+    Fail-open — all exceptions are silently swallowed.
+    """
+    try:
+        inv_path = MEMORY_DIR / investigation_id
+        if not inv_path.exists():
+            return
+
+        entities_path = inv_path / "entities.jsonl"
+        extracted = _extract_named_entities(text)
+        if not extracted:
+            return
+
+        now = _now()
+
+        # Read existing entities
+        existing = _read_jsonl(entities_path)
+
+        # Build a lookup: lowercase name → index in existing list
+        name_index = {}
+        for i, ent in enumerate(existing):
+            name_index[ent.get("name", "").lower()] = i
+
+        changed = False
+        for item in extracted:
+            name = item["name"]
+            etype = item["type"]
+            name_lower = name.lower()
+
+            # Fuzzy match: substring in either direction
+            match_idx = None
+            if name_lower in name_index:
+                match_idx = name_index[name_lower]
+            else:
+                for existing_name_lower, idx in name_index.items():
+                    if name_lower in existing_name_lower or existing_name_lower in name_lower:
+                        match_idx = idx
+                        break
+
+            if match_idx is not None:
+                ent = existing[match_idx]
+                if finding_id not in ent.get("finding_refs", []):
+                    ent.setdefault("finding_refs", []).append(finding_id)
+                    ent["last_seen"] = now
+                    changed = True
+            else:
+                new_ent = {
+                    "entity_id": str(uuid.uuid4()),
+                    "name": name,
+                    "type": etype,
+                    "aliases": [],
+                    "first_seen": now,
+                    "last_seen": now,
+                    "finding_refs": [finding_id],
+                }
+                existing.append(new_ent)
+                name_index[name_lower] = len(existing) - 1
+                changed = True
+
+        if not changed:
+            return
+
+        # Atomic rewrite: temp file + rename
+        tmp_path = entities_path.with_suffix(".tmp")
+        with open(tmp_path, "w") as f:
+            for ent in existing:
+                f.write(json.dumps(ent) + "\n")
+        tmp_path.replace(entities_path)
+    except Exception:
+        pass  # fail-open — never crash investigation_store
 
 
 # ---- Tool: investigation_store ----
@@ -2792,6 +2949,9 @@ def investigation_store(
         "ts": finding["ts"],
         "created_at_ts": finding["created_at_ts"],
     })
+
+        # Background entity extraction — fail-open, never blocks the response
+    _update_entities_jsonl(investigation_id, finding["id"], text)
 
     result = {
         "stored": True,
@@ -4144,6 +4304,136 @@ def investigation_entity_lookup(
         "retrieval": method,
         "by_investigation": by_inv,
     }, indent=2, default=str)
+
+
+# ---- Tool: entity_list ----
+
+@mcp.tool()
+def entity_list(
+    investigation_id: str,
+    entity_type: Optional[str] = None,
+) -> str:
+    """
+    List all named entities extracted from findings in an investigation.
+
+    Entities are extracted automatically during investigation_store from
+    capitalized phrases, quoted strings, IP addresses, hostnames, and URLs.
+    This gives a quick overview of all actors, systems, and concepts that
+    have appeared across findings.
+
+    Args:
+        investigation_id: The investigation to list entities for.
+        entity_type: Optional filter — one of "person", "system", "concept",
+                     "location", "other". Omit to return all types.
+
+    Returns:
+        JSON: {"entities": [{entity_id, name, type, finding_count}], "count": int}
+        On error: {"error": "<message>"}
+    """
+    try:
+        inv_path = MEMORY_DIR / investigation_id
+        if not inv_path.exists():
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        entities_path = inv_path / "entities.jsonl"
+        raw_entities = _read_jsonl(entities_path)
+
+        results = []
+        for ent in raw_entities:
+            if entity_type and ent.get("type") != entity_type:
+                continue
+            results.append({
+                "entity_id": ent.get("entity_id"),
+                "name": ent.get("name"),
+                "type": ent.get("type"),
+                "finding_count": len(ent.get("finding_refs", [])),
+            })
+
+        # Sort by finding_count descending for relevance
+        results.sort(key=lambda e: e["finding_count"], reverse=True)
+
+        return json.dumps({"entities": results, "count": len(results)}, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---- Tool: entity_timeline ----
+
+@mcp.tool()
+def entity_timeline(
+    investigation_id: str,
+    entity_id: str,
+) -> str:
+    """
+    Show a chronological timeline of all findings that mention a specific entity.
+
+    Use this to reconstruct the narrative arc of how an actor, system, or
+    concept evolved across the investigation — from first mention through
+    latest observation.
+
+    Args:
+        investigation_id: The investigation containing the entity.
+        entity_id: The entity_id returned by entity_list.
+
+    Returns:
+        JSON: {
+            "entity": {entity_id, name, type, aliases, first_seen, last_seen},
+            "timeline": [{finding_id, ts, text, record_type}],
+            "count": int
+        }
+        On error: {"error": "<message>"}
+    """
+    try:
+        inv_path = MEMORY_DIR / investigation_id
+        if not inv_path.exists():
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        entities_path = inv_path / "entities.jsonl"
+        raw_entities = _read_jsonl(entities_path)
+
+        target_entity = None
+        for ent in raw_entities:
+            if ent.get("entity_id") == entity_id:
+                target_entity = ent
+                break
+
+        if target_entity is None:
+            return json.dumps({"error": f"Entity '{entity_id}' not found in investigation '{investigation_id}'."})
+
+        finding_refs = set(target_entity.get("finding_refs", []))
+
+        findings_path = inv_path / "findings.jsonl"
+        all_findings = _read_jsonl(findings_path)
+
+        timeline = []
+        for f in all_findings:
+            if f.get("id") in finding_refs:
+                timeline.append({
+                    "finding_id": f.get("id"),
+                    "ts": f.get("ts"),
+                    "text": f.get("text", ""),
+                    "record_type": f.get("record_type") or f.get("type"),
+                })
+
+        # Sort chronologically by ts
+        timeline.sort(key=lambda x: x.get("ts") or "")
+
+        entity_summary = {
+            "entity_id": target_entity.get("entity_id"),
+            "name": target_entity.get("name"),
+            "type": target_entity.get("type"),
+            "aliases": target_entity.get("aliases", []),
+            "first_seen": target_entity.get("first_seen"),
+            "last_seen": target_entity.get("last_seen"),
+        }
+
+        return json.dumps({
+            "entity": entity_summary,
+            "timeline": timeline,
+            "count": len(timeline),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
 # ---- Tool: investigation_related_cases ----
