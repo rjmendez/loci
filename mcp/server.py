@@ -2040,6 +2040,40 @@ def _make_ref(record: dict, match_type: str, score: float | None = None) -> dict
     return ref
 
 
+def _compute_aggregate_confidence(
+    finding_id: str,
+    findings_by_id: dict,
+    max_depth: int = 5,
+) -> float:
+    """Walk the derived_from chain for a finding and return the product of
+    numeric_confidence values along the chain (up to max_depth nodes).
+
+    Findings without numeric_confidence are treated as 1.0 (backward compat).
+    Returns 1.0 if the finding_id is not found or the chain is empty.
+    """
+    try:
+        product = 1.0
+        visited: set[str] = set()
+        current_id = finding_id
+        depth = 0
+        while current_id and current_id not in visited and depth < max_depth:
+            visited.add(current_id)
+            node = findings_by_id.get(current_id)
+            if not node:
+                break
+            nc = node.get("numeric_confidence", 1.0)
+            try:
+                product *= float(nc)
+            except (TypeError, ValueError):
+                pass
+            parents = node.get("derived_from") or []
+            current_id = str(parents[0]) if parents else None
+            depth += 1
+        return round(product, 6)
+    except Exception:
+        return 1.0
+
+
 # ---------------------------------------------------------------------------
 # Memory self-check helpers (advisory-only; never mutate/delete findings)
 # ---------------------------------------------------------------------------
@@ -2320,6 +2354,7 @@ def investigation_store(
     confidence: str = "medium",
     tags: Optional[str] = None,
     derived_from: str | list[str] | None = None,
+    numeric_confidence: float | None = None,
 ) -> str:
     """
     Record a finding in the investigation.
@@ -2344,6 +2379,9 @@ def investigation_store(
                       (memory_retract) can follow the lineage and clean up
                       everything built on a false fact. Omit when the finding
                       stands alone.
+        numeric_confidence: Optional float in [0.0, 1.0]. When omitted, auto-derived
+                            from string confidence: high→0.9, medium→0.6, low→0.3.
+                            Values outside [0,1] are clamped.
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2363,6 +2401,16 @@ def investigation_store(
     if confidence not in {"high", "medium", "low"}:
         return json.dumps({"error": "confidence must be one of: high, medium, low"})
 
+    # Resolve numeric_confidence: caller-supplied (clamped) or derived from string confidence.
+    _confidence_to_numeric = {"high": 0.9, "medium": 0.6, "low": 0.3}
+    if numeric_confidence is None:
+        resolved_numeric_confidence = _confidence_to_numeric.get(confidence, 0.6)
+    else:
+        try:
+            resolved_numeric_confidence = max(0.0, min(1.0, float(numeric_confidence)))
+        except (TypeError, ValueError):
+            resolved_numeric_confidence = _confidence_to_numeric.get(confidence, 0.6)
+
     finding = {
         "id": str(uuid.uuid4()),
         "investigation_id": investigation_id,
@@ -2373,6 +2421,7 @@ def investigation_store(
         "text": text,
         "source": source,
         "confidence": confidence,
+        "numeric_confidence": resolved_numeric_confidence,
         "tags": [t.strip() for t in (
             ",".join(tags) if isinstance(tags, list) else (tags or "")
         ).split(",") if t.strip()],
@@ -3280,6 +3329,31 @@ def investigation_pre_answer_check(
 
     verdict_summary = _record_claim_verdicts(investigation_id, claim_results, record=record)
 
+    # Compute min_chain_confidence and confidence_summary from supporting findings.
+    min_chain_confidence = None
+    confidence_summary = None
+    try:
+        findings_by_id_for_conf: dict[str, dict] = {
+            str(f.get("id", "")): f
+            for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+            if f.get("id")
+        }
+        chain_confidences: list[float] = []
+        for ev_id in matched_ids:
+            if ev_id and ev_id in findings_by_id_for_conf:
+                agg = _compute_aggregate_confidence(ev_id, findings_by_id_for_conf)
+                chain_confidences.append(agg)
+        if chain_confidences:
+            min_chain_confidence = round(min(chain_confidences), 6)
+            if min_chain_confidence >= 0.8:
+                confidence_summary = "high (≥0.8)"
+            elif min_chain_confidence >= 0.5:
+                confidence_summary = "medium (0.5-0.8)"
+            else:
+                confidence_summary = "low (<0.5)"
+    except Exception:
+        pass
+
     response = {
         "investigation_id": investigation_id,
         "checked_at": _now(),
@@ -3291,6 +3365,8 @@ def investigation_pre_answer_check(
         "matched_evidence": matched_refs[:50],
         "claim_results": claim_results,
         "verdict_recording": verdict_summary,
+        "min_chain_confidence": min_chain_confidence,
+        "confidence_summary": confidence_summary,
         "qdrant_status": {
             "enabled": qdrant_enabled,
             "available": qdrant_available,
@@ -3498,8 +3574,9 @@ def investigation_finding_provenance(
     chain: list[dict] = []
     visited: set[str] = set()
     current_id = finding_id
+    _MAX_CHAIN_DEPTH = 5
 
-    while current_id and current_id not in visited:
+    while current_id and current_id not in visited and len(chain) < _MAX_CHAIN_DEPTH:
         visited.add(current_id)
         node = findings_by_id.get(current_id)
         if not node:
@@ -3510,6 +3587,7 @@ def investigation_finding_provenance(
             "ts": node.get("ts"),
             "record_type": node.get("record_type") or node.get("type"),
             "confidence": node.get("confidence"),
+            "numeric_confidence": node.get("numeric_confidence", 1.0),
             "source": node.get("source"),
             "text": str(node.get("text", ""))[:400],
             "derived_from": node.get("derived_from", []),
@@ -3526,6 +3604,21 @@ def investigation_finding_provenance(
     root_type = root.get("record_type") if root else None
     grounded = root_type == "observed"
 
+    # Compute aggregate_confidence: product of numeric_confidence values along the chain.
+    # Findings without numeric_confidence are treated as 1.0 (backward compat).
+    try:
+        aggregate_confidence = 1.0
+        for node_entry in chain:
+            if "error" not in node_entry:
+                nc = node_entry.get("numeric_confidence", 1.0)
+                try:
+                    aggregate_confidence *= float(nc)
+                except (TypeError, ValueError):
+                    pass
+        aggregate_confidence = round(aggregate_confidence, 6)
+    except Exception:
+        aggregate_confidence = None
+
     return json.dumps({
         "investigation_id": investigation_id,
         "chain_length": len(chain),
@@ -3534,6 +3627,7 @@ def investigation_finding_provenance(
             "fully grounded" if grounded
             else f"chain terminates in '{root_type}' — not directly observed evidence"
         ),
+        "aggregate_confidence": aggregate_confidence,
         "chain": chain,
     }, indent=2, default=str)
 
