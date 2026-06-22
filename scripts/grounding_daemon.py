@@ -79,8 +79,6 @@ def _handle(conn: socket.socket, mod) -> None:
         conn.close()
         return
 
-    payload_str = data.decode("utf-8", errors="replace")
-
     buf = io.StringIO()
     old_stdin = sys.stdin
     sys.stdin = io.TextIOWrapper(io.BytesIO(data))
