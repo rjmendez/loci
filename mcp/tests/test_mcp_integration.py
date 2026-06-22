@@ -1735,3 +1735,124 @@ class TestMemoryConsolidateCausalInference(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestMemoryHints(unittest.TestCase):
+    """memory_hints returns valid JSON with expected shape and respects the limit."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_dir = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+        # Clear the in-process session hints ring buffer between tests so
+        # findings stored in one test do not bleed into another.
+        server._session_hints.clear()
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig_dir
+        server._session_hints.clear()
+        self._tmp.cleanup()
+
+    def _create_and_store(self, inv_id, n_findings=3):
+        server.investigation_start(investigation_id=inv_id, title=f"Hints test {inv_id}")
+        finding_ids = []
+        for i in range(n_findings):
+            res = json.loads(server.investigation_store(
+                investigation_id=inv_id,
+                finding_type="observed",
+                text=f"Finding number {i}: something interesting happened here.",
+                source=f"test:source-{i}",
+                confidence="medium",
+            ))
+            finding_ids.append(res.get("finding_id"))
+        return finding_ids
+
+    def test_memory_hints_returns_valid_json(self):
+        inv_id = _new_id("hints-json")
+        self._create_and_store(inv_id, n_findings=2)
+        result_str = server.memory_hints(investigation_id=inv_id)
+        result = _json(result_str)
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("hints", result, f"Missing 'hints' key: {result}")
+        self.assertIn("investigation_id", result)
+        self.assertIn("count", result)
+        self.assertIn("as_of", result)
+        self.assertIsInstance(result["hints"], list)
+        self.assertEqual(result["investigation_id"], inv_id)
+        # Each hint must have the expected fields
+        for hint in result["hints"]:
+            self.assertIn("finding_id", hint)
+            self.assertIn("text", hint)
+            self.assertIn("source", hint)
+            self.assertIn("record_type", hint)
+            self.assertIn("recency_score", hint)
+            self.assertIn("ts", hint)
+            self.assertIsInstance(hint["recency_score"], float)
+            self.assertGreaterEqual(hint["recency_score"], 0.0)
+            self.assertLessEqual(hint["recency_score"], 1.0)
+
+    def test_memory_hints_respects_limit(self):
+        inv_id = _new_id("hints-limit")
+        n = 5
+        self._create_and_store(inv_id, n_findings=n)
+
+        limit = 2
+        result = _json(server.memory_hints(investigation_id=inv_id, limit=limit))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertLessEqual(len(result["hints"]), limit,
+                             f"Got {len(result['hints'])} hints; expected ≤ {limit}")
+        self.assertEqual(result["count"], len(result["hints"]))
+
+    def test_memory_hints_missing_investigation_returns_error(self):
+        result = _json(server.memory_hints(investigation_id="no-such-inv-xyz"))
+        self.assertIn("error", result)
+
+    def test_memory_hints_since_ts_filters_older(self):
+        """since_ts should exclude findings stored before that timestamp."""
+        import time as _time
+        inv_id = _new_id("hints-since")
+        server.investigation_start(investigation_id=inv_id, title="since_ts test")
+        # Store one finding, capture a timestamp, then store another.
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="First finding — should be filtered out.",
+            source="test",
+            confidence="low",
+        )
+        # Snapshot time between the two stores.
+        _time.sleep(0.01)
+        from datetime import datetime, timezone as tz
+        cutoff = datetime.now(tz.utc).isoformat()
+        _time.sleep(0.01)
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="Second finding — should pass the since_ts filter.",
+            source="test",
+            confidence="high",
+        )
+        result = _json(server.memory_hints(
+            investigation_id=inv_id,
+            limit=10,
+            since_ts=cutoff,
+        ))
+        self.assertNotIn("error", result)
+        for hint in result["hints"]:
+            self.assertGreater(hint["ts"], cutoff,
+                               f"Hint ts {hint['ts']!r} should be > cutoff {cutoff!r}")
+
+    def test_memory_hints_cold_path_from_jsonl(self):
+        """Hints should still work when the session ring buffer is empty (JSONL cold path)."""
+        inv_id = _new_id("hints-cold")
+        self._create_and_store(inv_id, n_findings=2)
+        # Clear the ring buffer to force the JSONL cold path.
+        server._session_hints.pop(inv_id, None)
+        result = _json(server.memory_hints(investigation_id=inv_id, limit=5))
+        self.assertNotIn("error", result)
+        self.assertGreater(result["count"], 0,
+                           "Cold-path JSONL read returned no hints for an investigation with stored findings")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
