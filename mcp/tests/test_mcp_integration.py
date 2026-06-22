@@ -1134,3 +1134,175 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestConflictTools(unittest.TestCase):
+    """Tests for conflict_list and conflict_resolve tools."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_conflict_list_returns_valid_json(self):
+        """conflict_list returns valid JSON with conflicts list for an investigation."""
+        inv_id = _new_id("clist")
+        server.investigation_start(investigation_id=inv_id, title="Conflict list test")
+
+        # Store a finding so the investigation dir exists with the right structure
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Auth service returns 200 on valid tokens.",
+            source="test:manual",
+            confidence="high",
+        )
+
+        result = _json(server.conflict_list(investigation_id=inv_id))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("conflicts", result)
+        self.assertIn("count", result)
+        self.assertIsInstance(result["conflicts"], list)
+        self.assertEqual(result["count"], len(result["conflicts"]))
+
+    def test_conflict_list_missing_investigation_returns_error(self):
+        """conflict_list returns an error dict for a non-existent investigation."""
+        result = _json(server.conflict_list(investigation_id="does-not-exist-xyz"))
+        self.assertIn("error", result)
+
+    def test_conflict_list_reflects_manually_written_conflict(self):
+        """conflict_list reads conflicts.jsonl correctly when a conflict entry exists."""
+        import json as _json_mod
+        from pathlib import Path as _Path
+
+        inv_id = _new_id("clist-manual")
+        server.investigation_start(investigation_id=inv_id, title="Manual conflict test")
+        # Create the investigation directory by storing a finding
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="gap",
+            text="We don't know if the token check is enforced.",
+            source="test",
+            confidence="low",
+        )
+
+        # Write a conflict record directly to conflicts.jsonl
+        conflict_entry = {
+            "id": "test-conflict-abc123",
+            "investigation_id": inv_id,
+            "finding_id_a": "finding-new",
+            "finding_id_b": "finding-old",
+            "detected_at": "2026-01-01T00:00:00+00:00",
+            "status": "open",
+            "resolution": None,
+        }
+        conflicts_path = _Path(self._tmp.name) / inv_id / "conflicts.jsonl"
+        with open(conflicts_path, "a") as fh:
+            fh.write(_json_mod.dumps(conflict_entry) + "\n")
+
+        result = _json(server.conflict_list(investigation_id=inv_id))
+        self.assertNotIn("error", result)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["conflicts"][0]["id"], "test-conflict-abc123")
+        self.assertEqual(result["conflicts"][0]["status"], "open")
+
+    def test_conflict_resolve_valid_verdicts(self):
+        """conflict_resolve accepts all four valid verdicts."""
+        import json as _json_mod
+        from pathlib import Path as _Path
+
+        for verdict in ("a_wins", "b_wins", "both_valid", "false_positive"):
+            with self.subTest(verdict=verdict):
+                inv_id = _new_id(f"cresolve-{verdict[:3]}")
+                server.investigation_start(investigation_id=inv_id, title=f"Resolve test {verdict}")
+                server.investigation_store(
+                    investigation_id=inv_id,
+                    finding_type="gap",
+                    text="Gap placeholder for conflict resolve test.",
+                    source="test",
+                    confidence="low",
+                )
+
+                conflict_id = f"conflict-{verdict}-abc"
+                conflict_entry = {
+                    "id": conflict_id,
+                    "investigation_id": inv_id,
+                    "finding_id_a": "fa",
+                    "finding_id_b": "fb",
+                    "detected_at": "2026-01-01T00:00:00+00:00",
+                    "status": "open",
+                    "resolution": None,
+                }
+                conflicts_path = _Path(self._tmp.name) / inv_id / "conflicts.jsonl"
+                with open(conflicts_path, "a") as fh:
+                    fh.write(_json_mod.dumps(conflict_entry) + "\n")
+
+                result = _json(server.conflict_resolve(
+                    investigation_id=inv_id,
+                    conflict_id=conflict_id,
+                    verdict=verdict,
+                ))
+                self.assertNotIn("error", result, f"Unexpected error for verdict {verdict!r}: {result}")
+                self.assertTrue(result.get("resolved"), f"resolved!=True for verdict {verdict!r}")
+                self.assertEqual(result.get("verdict"), verdict)
+                self.assertEqual(result.get("conflict_id"), conflict_id)
+
+                # Verify the file was updated
+                updated = _Path(self._tmp.name) / inv_id / "conflicts.jsonl"
+                rows = [_json_mod.loads(line) for line in updated.read_text().splitlines() if line.strip()]
+                row = next(r for r in rows if r["id"] == conflict_id)
+                self.assertEqual(row["status"], "resolved")
+                self.assertEqual(row["resolution"], verdict)
+
+    def test_conflict_resolve_rejects_invalid_verdict(self):
+        """conflict_resolve returns an error for unknown verdicts."""
+        inv_id = _new_id("cresolve-bad")
+        server.investigation_start(investigation_id=inv_id, title="Bad verdict test")
+        result = _json(server.conflict_resolve(
+            investigation_id=inv_id,
+            conflict_id="any-id",
+            verdict="WRONG_VERDICT",
+        ))
+        self.assertIn("error", result)
+
+    def test_conflict_resolve_unknown_conflict_id_returns_error(self):
+        """conflict_resolve returns error when conflict_id not found."""
+        inv_id = _new_id("cresolve-miss")
+        server.investigation_start(investigation_id=inv_id, title="Missing conflict test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="gap",
+            text="placeholder",
+            source="test",
+            confidence="low",
+        )
+        result = _json(server.conflict_resolve(
+            investigation_id=inv_id,
+            conflict_id="no-such-conflict",
+            verdict="false_positive",
+        ))
+        self.assertIn("error", result)
+
+    def test_investigation_store_includes_conflict_detected_field(self):
+        """investigation_store response always includes conflict_detected field."""
+        inv_id = _new_id("store-conflict-field")
+        server.investigation_start(investigation_id=inv_id, title="Conflict field test")
+        result = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Token validation uses RS256 algorithm.",
+            source="test:code-review",
+            confidence="medium",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("conflict_detected", result)
+        # Without Qdrant, conflict detection is skipped → always False in tests
+        self.assertFalse(result["conflict_detected"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
