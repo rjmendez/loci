@@ -790,3 +790,212 @@ class TestProceduralMemory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInvestigationACL(unittest.TestCase):
+    """Tests for investigation sharing / ACL (bipartite access control)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_investigation_share_adds_to_acl(self):
+        inv_id = _new_id("share")
+        server.investigation_start(investigation_id=inv_id, title="Share ACL test")
+
+        result = _json(server.investigation_share(
+            investigation_id=inv_id,
+            agent_ids=["agent-alpha", "agent-beta"],
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(set(result["shared_with"]), {"agent-alpha", "agent-beta"})
+        self.assertEqual(result["total_acl"], 2)
+
+        # Verify manifest was persisted
+        manifest = server._load_manifest(inv_id)
+        self.assertIn("agent-alpha", manifest["acl"])
+        self.assertIn("agent-beta", manifest["acl"])
+
+    def test_investigation_share_is_idempotent(self):
+        inv_id = _new_id("share-idem")
+        server.investigation_start(investigation_id=inv_id, title="Share idempotent test")
+
+        server.investigation_share(investigation_id=inv_id, agent_ids=["agent-x"])
+        result = _json(server.investigation_share(
+            investigation_id=inv_id,
+            agent_ids=["agent-x", "agent-y"],
+        ))
+        # agent-x already present, only agent-y should appear in shared_with
+        self.assertEqual(result["shared_with"], ["agent-y"])
+        self.assertEqual(result["total_acl"], 2)
+
+    def test_investigation_unshare_removes_from_acl(self):
+        inv_id = _new_id("unshare")
+        server.investigation_start(investigation_id=inv_id, title="Unshare ACL test")
+        server.investigation_share(
+            investigation_id=inv_id,
+            agent_ids=["agent-one", "agent-two", "agent-three"],
+        )
+
+        result = _json(server.investigation_unshare(
+            investigation_id=inv_id,
+            agent_ids=["agent-one", "agent-two"],
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(set(result["removed"]), {"agent-one", "agent-two"})
+        self.assertEqual(result["total_acl"], 1)
+
+        # Verify manifest was persisted
+        manifest = server._load_manifest(inv_id)
+        self.assertNotIn("agent-one", manifest["acl"])
+        self.assertNotIn("agent-two", manifest["acl"])
+        self.assertIn("agent-three", manifest["acl"])
+
+    def test_investigation_unshare_is_idempotent(self):
+        inv_id = _new_id("unshare-idem")
+        server.investigation_start(investigation_id=inv_id, title="Unshare idempotent")
+        server.investigation_share(investigation_id=inv_id, agent_ids=["agent-z"])
+
+        # Removing an agent that doesn't exist should not error
+        result = _json(server.investigation_unshare(
+            investigation_id=inv_id,
+            agent_ids=["agent-not-there"],
+        ))
+        self.assertNotIn("error", result)
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["total_acl"], 1)
+
+    def test_investigation_share_error_on_missing_investigation(self):
+        result = _json(server.investigation_share(
+            investigation_id="does-not-exist-acl",
+            agent_ids=["agent-x"],
+        ))
+        self.assertIn("error", result)
+
+    def test_investigation_unshare_error_on_missing_investigation(self):
+        result = _json(server.investigation_unshare(
+            investigation_id="does-not-exist-acl",
+            agent_ids=["agent-x"],
+        ))
+        self.assertIn("error", result)
+
+    def test_investigation_list_includes_visibility(self):
+        inv_private = _new_id("vis-priv")
+        inv_shared = _new_id("vis-shared")
+        server.investigation_start(investigation_id=inv_private, title="Private investigation")
+        server.investigation_start(investigation_id=inv_shared, title="Shared investigation")
+        server.investigation_share(investigation_id=inv_shared, agent_ids=["agent-a"])
+
+        result = _json(server.investigation_list())
+        by_id = {i["id"]: i for i in result["investigations"]}
+        self.assertIn("visibility", by_id[inv_private])
+        self.assertEqual(by_id[inv_private]["visibility"], "private")
+        self.assertEqual(by_id[inv_shared]["visibility"], "shared")
+
+    def test_investigation_store_authored_by_field(self):
+        inv_id = _new_id("authored")
+        server.investigation_start(investigation_id=inv_id, title="Authored-by test")
+        result = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="A finding authored by agent-bob",
+            source="test:manual",
+            confidence="high",
+            authored_by="agent-bob",
+        ))
+        self.assertNotIn("error", result)
+        self.assertTrue(result.get("stored"))
+
+        # Verify authored_by was written to JSONL
+        loaded = _json(server.investigation_load(investigation_id=inv_id))
+        findings = loaded.get("recent_findings", [])
+        authored = [f for f in findings if f.get("authored_by") == "agent-bob"]
+        self.assertTrue(len(authored) > 0, "authored_by not persisted in finding")
+
+    def test_investigation_load_acl_filtering(self):
+        inv_id = _new_id("acl-filter")
+        server.investigation_start(investigation_id=inv_id, title="ACL filtering test")
+
+        # Set up ACL with agent-alice only; agent-bob is NOT in ACL
+        server.investigation_share(investigation_id=inv_id, agent_ids=["agent-alice"])
+
+        # Store finding by agent-alice (in ACL)
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Finding by alice",
+            source="test",
+            confidence="high",
+            authored_by="agent-alice",
+        )
+        # Store finding by agent-bob (not in ACL)
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Finding by bob",
+            source="test",
+            confidence="high",
+            authored_by="agent-bob",
+        )
+        # Store finding with no author
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Finding by nobody",
+            source="test",
+            confidence="low",
+        )
+
+        # Without requesting_agent_id, all findings returned (backward compat)
+        all_loaded = _json(server.investigation_load(investigation_id=inv_id))
+        self.assertEqual(all_loaded["total_findings"], 3)
+
+        # Requesting as agent-bob: sees own findings (authored_by == requesting_agent_id)
+        # AND ACL members' findings (alice is in ACL).
+        # "Finding by nobody" has authored_by="" which is neither bob nor in ACL, so filtered.
+        bob_loaded = _json(server.investigation_load(
+            investigation_id=inv_id,
+            requesting_agent_id="agent-bob",
+        ))
+        texts = [f.get("text", "") for f in bob_loaded.get("recent_findings", [])]
+        self.assertIn("Finding by bob", texts)
+        self.assertIn("Finding by alice", texts)   # alice is in ACL
+        self.assertNotIn("Finding by nobody", texts)  # no author, not in ACL
+
+        # Requesting as agent-alice: sees own findings + bob (not in ACL → filtered)
+        alice_loaded = _json(server.investigation_load(
+            investigation_id=inv_id,
+            requesting_agent_id="agent-alice",
+        ))
+        texts = [f.get("text", "") for f in alice_loaded.get("recent_findings", [])]
+        self.assertIn("Finding by alice", texts)   # alice == requesting_agent_id
+        self.assertNotIn("Finding by bob", texts)  # bob not in ACL
+        self.assertNotIn("Finding by nobody", texts)
+
+    def test_backward_compat_old_manifest_no_acl_key(self):
+        """Manifests without acl/owner keys should be loaded with safe defaults."""
+        inv_id = _new_id("backcompat")
+        server.investigation_start(investigation_id=inv_id, title="Backward compat test")
+
+        # Manually write a manifest without acl/owner fields
+        import json as _json_mod
+        manifest_path = server.MEMORY_DIR / inv_id / "manifest.json"
+        raw = _json_mod.loads(manifest_path.read_text())
+        raw.pop("acl", None)
+        raw.pop("owner", None)
+        manifest_path.write_text(_json_mod.dumps(raw))
+
+        # Loading should not raise and should inject defaults
+        loaded_manifest = server._load_manifest(inv_id)
+        self.assertIsNotNone(loaded_manifest)
+        self.assertEqual(loaded_manifest.get("acl"), [])
+        self.assertEqual(loaded_manifest.get("owner"), "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
