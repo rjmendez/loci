@@ -306,7 +306,30 @@ class _Mutex:
         if os.path.exists(self._path):
             with open(self._path) as f:
                 info = f.read().strip()
-            raise RuntimeError(f"Another sweep is running (lock: {info}). Aborting.")
+            # Parse PID from lock file contents (e.g. "pid=1234 ts=...")
+            pid = None
+            for part in info.split():
+                if part.startswith("pid="):
+                    try:
+                        pid = int(part[4:])
+                    except ValueError:
+                        pass
+                    break
+            # Check if the owning process is still alive
+            pid_alive = False
+            if pid is not None:
+                try:
+                    import psutil
+                    pid_alive = psutil.pid_exists(pid)
+                except ImportError:
+                    pid_alive = os.path.exists(f"/proc/{pid}")
+            if pid_alive:
+                raise RuntimeError(f"Another sweep is running (lock: {info}). Aborting.")
+            # Stale lock — owning process is gone; remove it and continue
+            try:
+                os.remove(self._path)
+            except OSError:
+                pass
         with open(self._path, "w") as f:
             f.write(f"pid={os.getpid()} ts={int(time.time())}")
         return self
