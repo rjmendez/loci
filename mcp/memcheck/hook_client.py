@@ -88,7 +88,7 @@ def run(stdin_bytes):
             try:
                 while sock.recv(65536):
                     pass
-            except (OSError, socket.timeout):
+            except (TimeoutError, OSError):
                 pass
         finally:
             sock.close()
