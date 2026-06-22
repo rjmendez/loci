@@ -26,6 +26,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 AMEM_LINK_THRESHOLD = float(os.environ.get("AMEM_LINK_THRESHOLD", "0.88"))
 AMEM_CONFLICT_THRESHOLD = float(os.environ.get("AMEM_CONFLICT_THRESHOLD", "0.96"))
+AMEM_UPDATE_THRESHOLD = float(os.environ.get("AMEM_UPDATE_THRESHOLD", "0.92"))  # near-copy with temporal ordering → updated_by
 MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "100"))
 
 # Keyword pairs whose co-presence signals a potential conflict.
@@ -82,6 +83,25 @@ def has_contradiction(content_a: str, content_b: str) -> bool:
     return False
 
 
+# Phrases that signal one entry supersedes or follows from another.
+_UPDATE_SIGNALS = [
+    "updated", "revised", "corrected", "supersedes", "replaces", "now", "actually",
+    "new finding", "correction:", "update:", "revision:",
+]
+
+def _has_update_signal(content: str) -> bool:
+    lower = content.lower()
+    return any(sig in lower for sig in _UPDATE_SIGNALS)
+
+
+def _has_causal_signal(content_b: str, id_a: str) -> bool:
+    """Return True if content_b references entry A by id or common causal phrasing."""
+    causal_phrases = ["because", "caused by", "due to", "as a result", "triggered by",
+                      "led to", "resulting from", "following", "after"]
+    lower = content_b.lower()
+    return id_a[:8] in content_b or any(p in lower for p in causal_phrases)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -132,7 +152,7 @@ def main() -> None:
     # Load recent entries
     # ------------------------------------------------------------------
     cur.execute(
-        "SELECT id, content FROM working_memory ORDER BY created_at DESC LIMIT ?",
+        "SELECT id, content, created_at FROM working_memory ORDER BY created_at DESC LIMIT ?",
         (MAX_PER_RUN,),
     )
     rows = cur.fetchall()
@@ -145,10 +165,10 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Phase 1 — Embed all entries
     # ------------------------------------------------------------------
-    entries: list[tuple[str, str, list[float]]] = []
+    entries: list[tuple[str, str, list[float], str]] = []
     for row in rows:
         vec = embed(row["content"])
-        entries.append((row["id"], row["content"], vec))
+        entries.append((row["id"], row["content"], vec, row["created_at"] or ""))
 
     # ------------------------------------------------------------------
     # Phase 1 — Pairwise cosine → cross-links
@@ -157,10 +177,13 @@ def main() -> None:
     flagged_conflicts = 0
 
     n = len(entries)
+    causal_links = 0
+    update_links = 0
+
     for i in range(n):
-        id_a, content_a, vec_a = entries[i]
+        id_a, content_a, vec_a, ts_a = entries[i]
         for j in range(i + 1, n):
-            id_b, content_b, vec_b = entries[j]
+            id_b, content_b, vec_b, ts_b = entries[j]
 
             sim = cosine(vec_a, vec_b)
 
@@ -190,12 +213,65 @@ def main() -> None:
                     )
                     if cur.rowcount:
                         flagged_conflicts += 1
+                    # Also add contradicts edge for causal traversal
+                    cur.execute(
+                        """
+                        INSERT OR IGNORE INTO graph_edges
+                            (source, target, edge_type, weight, timestamp, created_at)
+                        VALUES (?, ?, 'contradicts', ?, ?, ?)
+                        """,
+                        (id_a, id_b, sim, now, now),
+                    )
+
+                # ------------------------------------------------------
+                # Phase 3 — Causal edge detection (ActMem/GAM pattern)
+                # updated_by: high similarity + B is newer + B has update signal
+                # caused_by: B explicitly references A or uses causal phrasing
+                # ------------------------------------------------------
+                if sim >= AMEM_UPDATE_THRESHOLD:
+                    newer, older = (id_b, id_a) if ts_b > ts_a else (id_a, id_b)
+                    newer_content = content_b if ts_b > ts_a else content_a
+                    if _has_update_signal(newer_content):
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO graph_edges
+                                (source, target, edge_type, weight, timestamp, created_at)
+                            VALUES (?, ?, 'updated_by', ?, ?, ?)
+                            """,
+                            (older, newer, sim, now, now),
+                        )
+                        if cur.rowcount:
+                            update_links += 1
+
+                if _has_causal_signal(content_b, id_a):
+                    cur.execute(
+                        """
+                        INSERT OR IGNORE INTO graph_edges
+                            (source, target, edge_type, weight, timestamp, created_at)
+                        VALUES (?, ?, 'caused_by', ?, ?, ?)
+                        """,
+                        (id_b, id_a, sim, now, now),
+                    )
+                    if cur.rowcount:
+                        causal_links += 1
+                elif _has_causal_signal(content_a, id_b):
+                    cur.execute(
+                        """
+                        INSERT OR IGNORE INTO graph_edges
+                            (source, target, edge_type, weight, timestamp, created_at)
+                        VALUES (?, ?, 'caused_by', ?, ?, ?)
+                        """,
+                        (id_a, id_b, sim, now, now),
+                    )
+                    if cur.rowcount:
+                        causal_links += 1
 
     conn.commit()
     conn.close()
 
     print(f"[amem] {new_links} new cross-links created")
     print(f"[amem] {flagged_conflicts} conflicts flagged")
+    print(f"[amem] {update_links} updated_by edges | {causal_links} caused_by edges")
 
     # Reset quorum accumulator now that we ran (so next quorum cycle starts fresh).
     if gate is not None:
