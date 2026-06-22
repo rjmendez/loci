@@ -7022,6 +7022,161 @@ def investigation_import(
         return json.dumps({"error": f"Import failed: {exc}"})
 
 
+# Memory-as-a-Service: cross-investigation routing
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def memory_route(
+    query: str,
+    agent_id: Optional[str] = None,
+    top_k: int = 10,
+    deduplicate: bool = True,
+) -> str:
+    """
+    Agent-mesh-aware search across ALL investigations — no investigation_id filter.
+
+    Searches the main Qdrant collection and returns findings with full provenance,
+    optionally filtered by agent_id and deduplicated by content similarity.
+
+    Args:
+        query:       Natural language query to search across all investigations.
+        agent_id:    If provided, filter to findings authored by this agent or in
+                     investigations whose ACL includes this agent_id.
+        top_k:       Maximum results to return after deduplication (default 10).
+        deduplicate: If True, remove near-duplicate findings (>80% word overlap).
+                     Default True.
+
+    Returns JSON with:
+        {routed: [{finding_id, investigation_id, investigation_title, text, source,
+                   authored_by, score, tier}],
+         query, agent_id, total_before_dedup, total_after_dedup, count}
+    """
+    if not query or not query.strip():
+        return json.dumps({
+            "error": "query must not be empty",
+            "routed": [],
+            "query": query,
+        })
+
+    try:
+        client, _col = _get_qdrant()
+        if client is None:
+            return json.dumps({
+                "error": "memory_route requires Qdrant",
+                "routed": [],
+            })
+
+        # Step 1+2: Search across the whole collection (no investigation_id filter)
+        try:
+            raw_hits = _qdrant_search_collection(
+                query,
+                collection_name=QDRANT_COLLECTION_PREFIX,
+                limit=top_k * 3,
+            )
+        except RuntimeError as exc:
+            return json.dumps({
+                "error": f"memory_route requires Qdrant: {exc}",
+                "routed": [],
+            })
+        except Exception as exc:
+            logger.warning("memory_route: Qdrant search failed: %s", exc)
+            return json.dumps({
+                "error": f"memory_route search failed: {exc}",
+                "routed": [],
+            })
+
+        total_before_dedup = len(raw_hits)
+
+        # Step 3: Filter by agent_id if provided
+        if agent_id:
+            filtered = []
+            for hit in raw_hits:
+                authored_by = hit.get("authored_by", "")
+                if authored_by == agent_id:
+                    filtered.append(hit)
+                    continue
+                # Check if the investigation ACL includes this agent
+                inv_id = hit.get("investigation_id", "")
+                if inv_id:
+                    try:
+                        manifest = _load_manifest(inv_id)
+                        if manifest:
+                            acl = manifest.get("acl", [])
+                            if isinstance(acl, list) and agent_id in acl:
+                                filtered.append(hit)
+                                continue
+                    except Exception:
+                        pass  # graceful skip
+            raw_hits = filtered
+
+        # Step 4: Deduplicate by word-overlap (>80% overlap → keep highest score)
+        if deduplicate and len(raw_hits) > 1:
+            kept = []
+            suppressed = set()
+            for i, hit_a in enumerate(raw_hits):
+                if i in suppressed:
+                    continue
+                words_a = set(str(hit_a.get("text", "")).lower().split())
+                for j, hit_b in enumerate(raw_hits):
+                    if j <= i or j in suppressed:
+                        continue
+                    words_b = set(str(hit_b.get("text", "")).lower().split())
+                    union = words_a | words_b
+                    if not union:
+                        continue
+                    overlap = len(words_a & words_b) / max(len(union), 1)
+                    if overlap > 0.80:
+                        # Suppress the lower-scoring one (raw_hits already sorted by score)
+                        suppressed.add(j)
+                kept.append(hit_a)
+            raw_hits = kept
+
+        # Step 5: Trim to top_k
+        raw_hits = raw_hits[:top_k]
+        total_after_dedup = len(raw_hits)
+
+        # Step 6: Build response with provenance
+        routed = []
+        for hit in raw_hits:
+            inv_id = hit.get("investigation_id", "")
+            inv_title = ""
+            if inv_id:
+                try:
+                    manifest = _load_manifest(inv_id)
+                    if manifest:
+                        inv_title = manifest.get("title", "")
+                except Exception:
+                    pass
+
+            routed.append({
+                "finding_id": hit.get("finding_id") or hit.get("id", ""),
+                "investigation_id": inv_id,
+                "investigation_title": inv_title,
+                "text": hit.get("text", ""),
+                "source": hit.get("source", ""),
+                "authored_by": hit.get("authored_by", ""),
+                "score": hit.get("score", 0.0),
+                "tier": hit.get("tier") or hit.get("record_type", "finding"),
+            })
+
+        return json.dumps({
+            "routed": routed,
+            "query": query,
+            "agent_id": agent_id,
+            "total_before_dedup": total_before_dedup,
+            "total_after_dedup": total_after_dedup,
+            "count": len(routed),
+        }, indent=2)
+
+    except Exception as exc:
+        logger.exception("memory_route: unexpected error: %s", exc)
+        return json.dumps({
+            "error": f"memory_route failed: {exc}",
+            "routed": [],
+        })
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

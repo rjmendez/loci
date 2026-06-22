@@ -1590,3 +1590,67 @@ class TestMemoryTiers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestMemoryRoute(unittest.TestCase):
+    """memory_route should always return valid JSON, even when Qdrant is unavailable."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_memory_route_returns_valid_json(self):
+        """memory_route returns parseable JSON whether Qdrant is available or not."""
+        result = server.memory_route(query="authentication failure patterns")
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            self.fail(f"memory_route returned non-JSON: {result!r}")
+        self.assertIsInstance(parsed, dict)
+
+    def test_memory_route_qdrant_unavailable_returns_error_json(self):
+        """When Qdrant is unavailable, memory_route returns an error dict with 'routed' key."""
+        # Temporarily override _get_qdrant to simulate unavailability
+        _orig_get_qdrant = server._get_qdrant
+
+        def _no_qdrant():
+            return None, None
+
+        server._get_qdrant = _no_qdrant
+        try:
+            result = server.memory_route(query="auth bypass investigation")
+            parsed = json.loads(result)
+            self.assertIn("error", parsed)
+            self.assertIn("routed", parsed)
+            self.assertIsInstance(parsed["routed"], list)
+            self.assertEqual(len(parsed["routed"]), 0)
+        finally:
+            server._get_qdrant = _orig_get_qdrant
+
+    def test_memory_route_empty_query_returns_error(self):
+        """Empty query returns an error dict without raising."""
+        result = server.memory_route(query="")
+        parsed = json.loads(result)
+        self.assertIn("error", parsed)
+        self.assertIn("routed", parsed)
+
+    def test_memory_route_response_shape_on_success_or_unavailable(self):
+        """Response always has 'routed', 'query', 'count' or 'error' keys."""
+        result = server.memory_route(query="cross-investigation routing test", top_k=5)
+        parsed = json.loads(result)
+        self.assertIsInstance(parsed, dict)
+        # Either a successful result or a graceful error — never a bare exception
+        if "error" not in parsed:
+            self.assertIn("routed", parsed)
+            self.assertIn("query", parsed)
+            self.assertIn("count", parsed)
+            self.assertIsInstance(parsed["routed"], list)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
