@@ -156,7 +156,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, sys, asyncio, uuid, json, sqlite3, logging, datetime
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections
 from typing import Optional, Any
 
 # ── load .env before anything else ─────────────────────────────────────────────
@@ -364,14 +364,28 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
-    if not creds or creds.credentials != A2A_TOKEN:
+    if not creds or not hmac.compare_digest(creds.credentials, A2A_TOKEN):
         raise HTTPException(status_code=401, detail='Unauthorized — invalid or missing bearer token')
 
 
-def _verify_totp(x_totp: Optional[str] = Header(default=None)):
+# TOTP rate limiter: max 5 attempts per 60 seconds per client IP
+_TOTP_WINDOW = 60
+_TOTP_MAX_ATTEMPTS = 5
+_totp_attempts: dict = collections.defaultdict(list)
+
+
+def _verify_totp(request: Request, x_totp: Optional[str] = Header(default=None)):
     if TOTP_SEED:
         if x_totp is None:
             raise HTTPException(status_code=401, detail='X-TOTP header required (TOTP is enabled)')
+        client_ip = request.client.host if request.client else 'unknown'
+        now = time.monotonic()
+        attempts = _totp_attempts[client_ip]
+        # Evict timestamps older than the window
+        _totp_attempts[client_ip] = [t for t in attempts if now - t < _TOTP_WINDOW]
+        if len(_totp_attempts[client_ip]) >= _TOTP_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
+        _totp_attempts[client_ip].append(now)
         if not pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1):
             raise HTTPException(status_code=401, detail='Invalid TOTP code')
 
