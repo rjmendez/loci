@@ -1545,6 +1545,27 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Session hints — module-level ring buffer updated by investigation_store so
+# that memory_hints (and the MCP resource) can surface "what changed recently"
+# without re-scanning JSONL.  Each key is an investigation_id; the value is a
+# list of hint dicts (most-recent-last) capped at _SESSION_HINTS_MAX_PER_INV.
+# ---------------------------------------------------------------------------
+_session_hints: dict[str, list[dict]] = {}
+_SESSION_HINTS_MAX_PER_INV = 20  # ring-buffer cap per investigation
+
+
+def _session_hints_push(investigation_id: str, hint: dict) -> None:
+    """Append a hint to the in-process ring buffer (fail-open)."""
+    try:
+        buf = _session_hints.setdefault(investigation_id, [])
+        buf.append(hint)
+        if len(buf) > _SESSION_HINTS_MAX_PER_INV:
+            del buf[0]
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _REFLECTION_ERROR_RE = re.compile(r"\b(error|exception|traceback|failed|failure|timeout|conflict)\b", re.I)
 _REFLECTION_WARN_RE = re.compile(r"\b(warn|warning|degraded|fallback|retry)\b", re.I)
 _REFLECTION_HEX_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.I)
@@ -2760,6 +2781,17 @@ def investigation_store(
             conflicting_finding_id = first["neighbor_id"]
     except Exception as _cd_exc:
         logger.debug("investigation_store: conflict detection failed (fail-open): %s", _cd_exc)
+
+    # Update the in-process session hints ring buffer so memory_hints can
+    # surface this finding immediately without re-scanning JSONL.
+    _session_hints_push(investigation_id, {
+        "finding_id": finding["id"],
+        "text": text,
+        "source": source,
+        "record_type": finding_type,
+        "ts": finding["ts"],
+        "created_at_ts": finding["created_at_ts"],
+    })
 
     result = {
         "stored": True,
@@ -7036,6 +7068,162 @@ def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> s
         return json.dumps({"resolved": True, "conflict_id": conflict_id, "verdict": verdict}, indent=2)
     except Exception as exc:
         logger.exception("conflict_resolve failed: %s", exc)
+
+
+# Memory hints — polling tool + MCP resource
+# ---------------------------------------------------------------------------
+
+
+def _compute_hints(investigation_id: str, limit: int, since_ts: Optional[str]) -> dict:
+    """
+    Core logic for memory_hints — shared by the tool and the MCP resource.
+
+    Strategy:
+      1. If _session_hints has entries for this investigation, use those
+         (fast path — no disk I/O).
+      2. Otherwise fall back to reading the tail of findings.jsonl.
+
+    Returns the hints payload dict (not yet JSON-serialised).
+    """
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    def _recency(created_at_ts) -> float:
+        try:
+            age_hours = max(0.0, (now_ts - int(created_at_ts)) / 3600.0)
+            return round(1.0 / (1.0 + age_hours), 6)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    # --- source: session ring buffer (fast path) ---
+    buf = _session_hints.get(investigation_id, [])
+    if buf:
+        candidates = list(buf)  # copy; most-recent-last already
+    else:
+        # --- source: JSONL tail (cold path) ---
+        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+        raw = _read_jsonl(findings_path)
+        candidates = [
+            {
+                "finding_id": f.get("id", ""),
+                "text": f.get("text", ""),
+                "source": f.get("source", ""),
+                "record_type": f.get("record_type", f.get("type", "observed")),
+                "ts": f.get("ts", ""),
+                "created_at_ts": f.get("created_at_ts", 0),
+            }
+            for f in raw
+            if isinstance(f, dict)
+        ]
+
+    # Apply since_ts filter if requested
+    if since_ts:
+        candidates = [h for h in candidates if str(h.get("ts", "")) > since_ts]
+
+    # Take the most recent `limit` entries (tail of the list)
+    recent = candidates[-limit:] if len(candidates) > limit else candidates
+
+    # Attach recency score
+    hints = []
+    for h in reversed(recent):  # most-recent first in output
+        hints.append({
+            "finding_id": h.get("finding_id", ""),
+            "text": h.get("text", ""),
+            "source": h.get("source", ""),
+            "record_type": h.get("record_type", "observed"),
+            "recency_score": _recency(h.get("created_at_ts", 0)),
+            "ts": h.get("ts", ""),
+        })
+
+    return {
+        "investigation_id": investigation_id,
+        "hints": hints,
+        "count": len(hints),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@mcp.tool()
+def memory_hints(
+    investigation_id: str,
+    limit: int = 3,
+    since_ts: Optional[str] = None,
+) -> str:
+    """
+    Return the most recent findings for an investigation as lightweight hints.
+
+    Suitable for polling after investigation_store to surface "what changed
+    recently" without loading the full investigation context.  Assigns a
+    recency_score (1.0 / (1 + age_hours)) to each hint so callers can rank
+    them by freshness.
+
+    The in-process session ring buffer (populated by investigation_store) is
+    preferred for speed; the tool falls back to reading findings.jsonl when
+    the ring buffer is empty (e.g. after a server restart).
+
+    Args:
+        investigation_id: Investigation identifier.
+        limit: Maximum number of hints to return (default 3, max 20).
+        since_ts: Optional ISO-8601 timestamp.  When provided, only findings
+                  with ts > since_ts are returned.  Use the ``as_of`` field
+                  from the previous response as the next ``since_ts`` to poll
+                  for changes incrementally.
+
+    Returns:
+        JSON: {investigation_id, hints: [{finding_id, text, source,
+               record_type, recency_score, ts}], count, as_of}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        limit = max(1, min(int(limit or 3), 20))
+        payload = _compute_hints(investigation_id, limit, since_ts)
+        return json.dumps(payload, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("memory_hints error: %r", exc)
+        return json.dumps({"error": str(exc)})
+
+
+# ---- MCP resource: memory://hints/{investigation_id} ----
+# FastMCP supports @mcp.resource() with URI template parameters.
+# The resource exposes the same hint payload as the polling tool so MCP
+# clients that support resource subscriptions can receive proactive push
+# updates when the resource changes.
+#
+# Note: FastMCP resource subscriptions (real-time push) require the client to
+# support MCP resource change notifications over SSE/streamable-http transport.
+# The resource is readable over all transports; push is transport-dependent.
+
+@mcp.resource(
+    "memory://hints/{investigation_id}",
+    name="memory_hints_resource",
+    title="Investigation Memory Hints",
+    description=(
+        "Top recent findings for the given investigation, ranked by recency. "
+        "Poll or subscribe to surface what changed since the last context load."
+    ),
+    mime_type="application/json",
+)
+def memory_hints_resource(investigation_id: str) -> str:
+    """
+    MCP resource handler for memory://hints/{investigation_id}.
+
+    Returns the same JSON payload as the memory_hints tool.  FastMCP registers
+    this as a URI-template resource so clients can request it as:
+        memory://hints/<investigation_id>
+
+    Fail-open: returns a JSON error payload on any exception rather than
+    raising, so resource reads never crash the server.
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        payload = _compute_hints(investigation_id, limit=3, since_ts=None)
+        return json.dumps(payload, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("memory_hints_resource error: %r", exc)
         return json.dumps({"error": str(exc)})
 
 
