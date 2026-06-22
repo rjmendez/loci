@@ -5271,6 +5271,152 @@ def rag_context_search(
 
 
 # ---------------------------------------------------------------------------
+# Tool: memory_surface — proactive context surfacing
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def memory_surface(
+    context: str,
+    investigation_id: Optional[str] = None,
+    top_k: int = 5,
+) -> str:
+    """
+    Proactively surface prior findings most relevant to the agent's current working context.
+
+    Unlike rag_context_search (which requires a precise query), memory_surface accepts
+    a free-form paragraph describing what the agent is doing and returns the most
+    tangentially-relevant prior findings using a lower similarity threshold (0.25 vs 0.5+).
+    This is designed for passive context injection — call it at the start of a task to
+    surface related memory without knowing exactly what to search for.
+
+    Args:
+        context:          A paragraph describing the agent's current working context.
+        investigation_id: Optional — if provided, restrict results to this investigation.
+        top_k:            How many surfaced results to return (default 5).
+
+    Returns:
+        JSON with {surfaced: [{finding_id, text, source, relevance_note, score,
+                               investigation_id}], context_used, count}
+    """
+    import math as _math
+
+    if not context or not context.strip():
+        return json.dumps({
+            "error": "context must not be empty",
+            "surfaced": [],
+            "context_used": context,
+            "count": 0,
+        })
+
+    try:
+        client, _col = _get_qdrant()
+        if client is None:
+            return json.dumps({
+                "error": "memory_surface requires Qdrant",
+                "surfaced": [],
+                "context_used": context,
+                "count": 0,
+            })
+
+        # Build investigation filter if requested
+        query_filter = None
+        if investigation_id:
+            try:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                query_filter = Filter(
+                    must=[FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))]
+                )
+            except Exception:
+                pass
+
+        # Fetch top_k * 3 candidates with a lower threshold via _qdrant_search_collection
+        fetch_limit = top_k * 3
+        try:
+            candidates = _qdrant_search_collection(
+                context,
+                collection_name=QDRANT_COLLECTION_PREFIX,
+                limit=fetch_limit,
+                query_filter=query_filter,
+            )
+        except RuntimeError as _rte:
+            _rte_msg = str(_rte)
+            if "qdrant_unavailable" in _rte_msg or "embedding_unavailable" in _rte_msg:
+                return json.dumps({
+                    "error": "memory_surface requires Qdrant",
+                    "surfaced": [],
+                    "context_used": context,
+                    "count": 0,
+                })
+            raise
+        except Exception as _exc:
+            return json.dumps({
+                "error": f"memory_surface search failed: {_exc}",
+                "surfaced": [],
+                "context_used": context,
+                "count": 0,
+            })
+
+        # Apply lower score threshold (0.25) to allow tangentially relevant findings
+        _SURFACE_SCORE_THRESHOLD = 0.25
+        filtered = [r for r in candidates if float(r.get("score") or 0.0) >= _SURFACE_SCORE_THRESHOLD]
+
+        # Apply Ebbinghaus decay if _MEMORY_DECAY_LAMBDA is defined on this module
+        _decay_lambda = globals().get("_MEMORY_DECAY_LAMBDA")
+        now_ts = time.time()
+        if _decay_lambda is not None:
+            try:
+                for r in filtered:
+                    created_ts = float(r.get("created_at_ts") or now_ts)
+                    age_days = (now_ts - created_ts) / 86400.0
+                    decay = _math.exp(-float(_decay_lambda) * age_days)
+                    r["score"] = round(float(r.get("score") or 0.0) * decay, 4)
+            except Exception:
+                pass  # decay is optional enhancement; never break the tool
+
+        # Re-sort after possible decay adjustment, then take top_k
+        filtered.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        top_results = filtered[:top_k]
+
+        # Build short context prefix for relevance note fallback
+        _ctx_words = context.strip().split()
+        _ctx_prefix = " ".join(_ctx_words[:8])
+
+        surfaced = []
+        for r in top_results:
+            finding_id = r.get("id") or r.get("finding_id") or ""
+            text = str(r.get("text") or r.get("content") or "")
+            source = str(r.get("source") or r.get("origin") or "")
+            inv_id = r.get("investigation_id") or investigation_id or ""
+            score = round(float(r.get("score") or 0.0), 4)
+
+            # Generate relevance_note: simple label based on context prefix
+            relevance_note = f"Related to: {_ctx_prefix}"
+
+            surfaced.append({
+                "finding_id": finding_id,
+                "text": text[:300] if len(text) > 300 else text,
+                "source": source,
+                "relevance_note": relevance_note,
+                "score": score,
+                "investigation_id": inv_id,
+            })
+
+        return json.dumps({
+            "surfaced": surfaced,
+            "context_used": context[:200] if len(context) > 200 else context,
+            "count": len(surfaced),
+        }, indent=2)
+
+    except Exception as _top_exc:
+        return json.dumps({
+            "error": f"memory_surface error: {_top_exc}",
+            "surfaced": [],
+            "context_used": context[:200] if len(context) > 200 else context,
+            "count": 0,
+        })
+
+
+# ---------------------------------------------------------------------------
 # Mnemosyne sleep / consolidation
 # ---------------------------------------------------------------------------
 

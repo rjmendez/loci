@@ -25,6 +25,7 @@ _ = memory_consolidate
 _ = memory_retract
 _ = memory_restore
 _ = memory_confidence
+_ = memory_surface
 _ = rag_context_search
 _ = reflection_loop_seed
 _ = reflection_loop_tick
