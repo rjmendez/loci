@@ -999,3 +999,138 @@ class TestInvestigationACL(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestProgressiveSummaryFidelity(unittest.TestCase):
+    """Tests for the L0/L1/L2 progressive summary ladder (investigation_load fidelity param)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _setup_investigation_with_findings(self, inv_id):
+        """Create an investigation, add findings, then call reflect to populate summaries."""
+        server.investigation_start(investigation_id=inv_id, title="Fidelity test investigation")
+        for i in range(3):
+            server.investigation_store(
+                investigation_id=inv_id,
+                finding_type="observed",
+                text=f"Finding number {i + 1}: something important was observed here.",
+                source="test:manual",
+                confidence="high",
+            )
+        # Call reflect to compute and persist L1/L2 summaries
+        server.investigation_reflect(investigation_id=inv_id)
+
+    def test_investigation_load_fidelity_full_returns_recent_findings(self):
+        """fidelity='full' (default) returns recent_findings and manifest."""
+        inv_id = _new_id("fid-full")
+        self._setup_investigation_with_findings(inv_id)
+
+        result = _json(server.investigation_load(investigation_id=inv_id, fidelity="full"))
+        self.assertNotIn("error", result)
+        self.assertIn("manifest", result)
+        self.assertIn("recent_findings", result)
+        self.assertIsInstance(result["recent_findings"], list)
+        self.assertGreater(len(result["recent_findings"]), 0)
+
+    def test_investigation_load_fidelity_summary(self):
+        """fidelity='summary' returns summary_l1 bullets + summary_l2 paragraph, not full findings."""
+        inv_id = _new_id("fid-sum")
+        self._setup_investigation_with_findings(inv_id)
+
+        result = _json(server.investigation_load(investigation_id=inv_id, fidelity="summary"))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("manifest", result)
+        self.assertEqual(result.get("fidelity"), "summary")
+        self.assertIn("summary_l1", result)
+        self.assertIn("summary_l2", result)
+        self.assertIsInstance(result["summary_l1"], list)
+        self.assertIsInstance(result["summary_l2"], str)
+        # Must NOT contain full findings list
+        self.assertNotIn("recent_findings", result)
+        # summary_l1 should have at least one bullet (fallback always populates it)
+        self.assertGreater(len(result["summary_l1"]), 0)
+        # summary_l2 should be a non-empty string
+        self.assertTrue(result["summary_l2"].strip())
+
+    def test_investigation_load_fidelity_brief(self):
+        """fidelity='brief' returns only manifest + summary_l2 paragraph."""
+        inv_id = _new_id("fid-brief")
+        self._setup_investigation_with_findings(inv_id)
+
+        result = _json(server.investigation_load(investigation_id=inv_id, fidelity="brief"))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertIn("manifest", result)
+        self.assertEqual(result.get("fidelity"), "brief")
+        self.assertIn("summary_l2", result)
+        self.assertIsInstance(result["summary_l2"], str)
+        # Must NOT contain full findings or L1 bullets
+        self.assertNotIn("recent_findings", result)
+        self.assertNotIn("summary_l1", result)
+
+    def test_investigation_reflect_populates_manifest_summaries(self):
+        """investigation_reflect persists summary_l1 and summary_l2 to the manifest."""
+        inv_id = _new_id("ref-sum")
+        server.investigation_start(investigation_id=inv_id, title="Reflect summary test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="The database connection pool is exhausted under load.",
+            source="test:perf",
+            confidence="high",
+        )
+
+        reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+        self.assertNotIn("error", reflect_result)
+        self.assertIn("summary_l1", reflect_result)
+        self.assertIn("summary_l2", reflect_result)
+        self.assertIsInstance(reflect_result["summary_l1"], list)
+        self.assertIsInstance(reflect_result["summary_l2"], str)
+
+        # Verify the summaries were persisted to the manifest
+        load_result = _json(server.investigation_load(investigation_id=inv_id))
+        manifest = load_result["manifest"]
+        self.assertIn("summary_l1", manifest)
+        self.assertIn("summary_l2", manifest)
+
+    def test_investigation_start_includes_summary_fields(self):
+        """Newly created investigations have summary_l1 and summary_l2 initialized."""
+        inv_id = _new_id("start-sum")
+        result = _json(server.investigation_start(investigation_id=inv_id, title="Summary init test"))
+        self.assertEqual(result["status"], "created")
+        manifest = result["manifest"]
+        self.assertIn("summary_l1", manifest)
+        self.assertIn("summary_l2", manifest)
+        self.assertEqual(manifest["summary_l1"], [])
+        self.assertEqual(manifest["summary_l2"], "")
+
+    def test_investigation_load_fidelity_summary_empty_investigation(self):
+        """fidelity='summary' on a fresh investigation with no findings does not error."""
+        inv_id = _new_id("fid-sum-empty")
+        server.investigation_start(investigation_id=inv_id, title="Empty summary test")
+
+        result = _json(server.investigation_load(investigation_id=inv_id, fidelity="summary"))
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("fidelity"), "summary")
+        self.assertIn("summary_l1", result)
+        self.assertIn("summary_l2", result)
+
+    def test_investigation_load_fidelity_brief_empty_investigation(self):
+        """fidelity='brief' on a fresh investigation with no findings does not error."""
+        inv_id = _new_id("fid-brief-empty")
+        server.investigation_start(investigation_id=inv_id, title="Empty brief test")
+
+        result = _json(server.investigation_load(investigation_id=inv_id, fidelity="brief"))
+        self.assertNotIn("error", result)
+        self.assertEqual(result.get("fidelity"), "brief")
+        self.assertIn("summary_l2", result)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
