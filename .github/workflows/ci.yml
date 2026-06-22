@@ -147,6 +147,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install pytest
+        run: pip install pytest
+
       - name: Run schema consistency tests
         run: pytest tests/test_schema_consistency.py -v --tb=short
 
