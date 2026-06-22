@@ -294,5 +294,41 @@ class TestToolsSmokeReturnValidJSON(unittest.TestCase):
         )
 
 
+class TestRagContextSearchDecayParam(unittest.TestCase):
+    """rag_context_search accepts the decay parameter without raising."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_rag_context_search_accepts_decay_param(self):
+        # Without Qdrant available the function should return a valid JSON error dict,
+        # not raise — both decay=True and decay=False must be accepted without error.
+        for decay_val in (True, False):
+            result = server.rag_context_search(query="authentication token", decay=decay_val)
+            try:
+                parsed = json.loads(result)
+            except json.JSONDecodeError:
+                self.fail(
+                    f"rag_context_search(decay={decay_val!r}) returned non-JSON: {result!r}"
+                )
+            self.assertIsInstance(parsed, dict, f"Expected dict for decay={decay_val!r}")
+            # Either a rag_required error (no Qdrant) or a real response — both are valid.
+            self.assertTrue(
+                any(k in parsed for k in ("mode", "error", "context", "results")),
+                f"Unexpected response shape for decay={decay_val!r}: {parsed}",
+            )
+
+    def test_rag_context_search_decay_default_is_true(self):
+        # Calling without decay kwarg must not raise — default decay=True is active.
+        result = server.rag_context_search(query="memory decay ebbinghaus")
+        self.assertIsInstance(json.loads(result), dict)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

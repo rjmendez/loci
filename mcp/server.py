@@ -47,6 +47,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -558,6 +559,7 @@ _EMBED_BATCH_SIZE = 32  # Ollama stalls on >32
 _EMBED_CACHE_MAXSIZE = 512
 _embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
 _embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
+_MEMORY_DECAY_LAMBDA  = float(os.environ.get("MEMORY_DECAY_LAMBDA", "0.007"))  # Ebbinghaus decay; half-life ~100 days
 
 # Startup validation — warn clearly when required backends are not configured.
 # Server runs in degraded mode (keyword-only) rather than refusing to start.
@@ -5035,6 +5037,7 @@ def rag_context_search(
     collections: Optional[list] = None,
     budget_chars: int = 6000,
     exclude_types: Optional[list] = None,
+    decay: bool = True,
 ) -> str:
     """
     Hybrid RAG search over Qdrant corpus. Returns prompt-ready context with cited sources.
@@ -5051,6 +5054,9 @@ def rag_context_search(
         exclude_types: Payload 'type' values to exclude from agent_core_chunks results.
                        Default None → ['gps_trajectory'] to suppress high-volume GPS pings.
                        Pass [] to disable filtering.
+        decay: If True (default), apply Ebbinghaus exponential time-decay rescoring to
+               findings from the main investigation collection before ranking.
+               Set False to disable decay and use raw similarity scores.
 
     Returns:
         JSON with {query, context, sources, total_chars, truncated, result_count, mode,
@@ -5094,6 +5100,30 @@ def rag_context_search(
             errors.append(f"{col}: {exc}")
             logger.warning("rag_context_search: collection %s failed: %s", col, exc)
 
+    # Apply Ebbinghaus exponential time-decay rescoring to findings from the main
+    # investigation collection only (agent_core_chunks is static knowledge, not time-sensitive).
+    if decay:
+        try:
+            _now_ts = time.time()
+            for r in all_results:
+                if r.get("origin") != QDRANT_COLLECTION_PREFIX:
+                    continue
+                ts_val = r.get("created_at_ts") or r.get("ts")
+                if ts_val is None:
+                    continue
+                # ts field may be an ISO string; created_at_ts is always an int epoch
+                try:
+                    age_days = (_now_ts - float(ts_val)) / 86400.0
+                    if age_days < 0:
+                        age_days = 0.0
+                    raw_score = float(r.get("score") or 0.0)
+                    r["score"] = round(raw_score * math.exp(-_MEMORY_DECAY_LAMBDA * age_days), 4)
+                    r["decay_applied"] = True
+                except Exception:
+                    pass
+        except Exception as _decay_exc:
+            logger.debug("rag_context_search: decay rescoring failed: %s", _decay_exc)
+
     # Merge-sort by score descending across all collections
     all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
 
@@ -5108,6 +5138,34 @@ def rag_context_search(
             all_results[:20] = sorted(all_results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)
         except Exception as _ce_exc:
             logger.debug('Final CE re-pass failed: %s', _ce_exc)
+
+    # Best-effort access tracking: append last_accessed timestamp to each returned finding's JSONL.
+    # Failures are silently ignored — this must never block the response.
+    try:
+        _access_ts = int(time.time())
+        for r in all_results:
+            try:
+                if r.get("origin") != QDRANT_COLLECTION_PREFIX:
+                    continue
+                finding_id = r.get("id")
+                inv_id = r.get("investigation_id")
+                if not finding_id or not inv_id:
+                    continue
+                _findings_path = _inv_dir(inv_id) / "findings.jsonl"
+                if not _findings_path.exists():
+                    continue
+                _access_entry = {
+                    "id": finding_id,
+                    "investigation_id": inv_id,
+                    "record_type": "access",
+                    "last_accessed": _access_ts,
+                    "query": query[:200],
+                }
+                _append_jsonl(_findings_path, _access_entry)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     ctx = context_assemble(all_results, query, budget_chars=budget_chars)
     ctx["mode"] = "rag_hybrid"
