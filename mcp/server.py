@@ -1455,14 +1455,19 @@ _manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (wr
 
 def _load_manifest(investigation_id: str) -> dict | None:
     raw = _manifest_cache.get(investigation_id)
-    if raw is not None:
-        return json.loads(raw)
-    p = MEMORY_DIR / investigation_id / "manifest.json"
-    if not p.exists():
-        return None
-    raw = p.read_text()
-    _manifest_cache[investigation_id] = raw
-    return json.loads(raw)
+    if raw is None:
+        p = MEMORY_DIR / investigation_id / "manifest.json"
+        if not p.exists():
+            return None
+        raw = p.read_text()
+        _manifest_cache[investigation_id] = raw
+    manifest = json.loads(raw)
+    # Backward compat: initialize ACL fields if missing (old investigations)
+    if "owner" not in manifest:
+        manifest["owner"] = ""
+    if "acl" not in manifest:
+        manifest["acl"] = []
+    return manifest
 
 
 def _save_manifest(manifest: dict) -> None:
@@ -2326,6 +2331,8 @@ def investigation_start(
         "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
         "closed_at": None,
         "closed_summary": None,
+        "owner": "",
+        "acl": [],
     }
     _save_manifest(manifest)
     logger.info("Created investigation %s", investigation_id)
@@ -2339,6 +2346,7 @@ def investigation_load(
     investigation_id: str,
     last_n_findings: int = 20,
     include_retracted: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Retrieve manifest and recent findings for an investigation.
@@ -2355,6 +2363,10 @@ def investigation_load(
         investigation_id: Investigation identifier.
         last_n_findings: How many recent findings to include (default 20).
         include_retracted: Include soft-retracted findings (default False).
+        requesting_agent_id: Optional agent_id of the requesting agent. When
+                             provided and the investigation has a non-empty ACL,
+                             findings are filtered to those authored by agents
+                             in the ACL or by the requesting agent itself.
 
     Returns:
         JSON with manifest, total finding count, recent findings, and
@@ -2375,6 +2387,17 @@ def investigation_load(
         kept = [f for f in findings if str(f.get("id", "")) not in retracted]
         excluded_retracted = len(findings) - len(kept)
         findings = kept
+
+    # ACL filtering: only apply when requesting_agent_id is given AND acl is non-empty
+    acl = manifest.get("acl") or []
+    if requesting_agent_id and acl:
+        acl_set = set(acl)
+        findings = [
+            f for f in findings
+            if f.get("authored_by", "") == requesting_agent_id
+            or f.get("authored_by", "") in acl_set
+        ]
+
     recent = findings[-last_n_findings:]
 
     return json.dumps({
@@ -2404,6 +2427,7 @@ def investigation_store(
     procedure_postconditions: Optional[str] = None,
     valid_from: Optional[str] = None,
     valid_until: Optional[str] = None,
+    authored_by: Optional[str] = None,
 ) -> str:
     """
     Record a finding in the investigation.
@@ -2442,6 +2466,8 @@ def investigation_store(
         valid_until: ISO8601 timestamp at which this finding ceased to be valid,
                      or null (default) meaning it is currently believed to be true.
                      Set when a finding has a known expiry or is superseded.
+        authored_by: Optional agent_id of the agent storing this finding.
+                     Used with investigation ACL to filter findings per agent.
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2488,6 +2514,7 @@ def investigation_store(
         ).split(",") if t.strip()],
         "valid_from": valid_from if valid_from is not None else _ts_now,
         "valid_until": valid_until,
+        "authored_by": authored_by or "",
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
@@ -4100,6 +4127,7 @@ def investigation_list() -> str:
             continue
         manifest = _load_manifest(d.name)
         if manifest:
+            acl = manifest.get("acl") or []
             investigations.append({
                 "id": manifest["id"],
                 "title": manifest["title"],
@@ -4109,9 +4137,96 @@ def investigation_list() -> str:
                 "finding_counts": manifest["finding_counts"],
                 "open_questions_count": len(manifest["open_questions"]),
                 "hypothesis": manifest["hypothesis"],
+                "visibility": "shared" if acl else "private",
             })
 
     return json.dumps({"investigations": investigations}, indent=2)
+
+
+# ---- Tool: investigation_share ----
+
+@mcp.tool()
+def investigation_share(
+    investigation_id: str,
+    agent_ids: list,
+) -> str:
+    """
+    Grant read/write access to an investigation for one or more agents.
+    Adds the given agent_ids to the investigation's ACL (access control list).
+    Idempotent — adding an agent already in the ACL has no effect.
+
+    Args:
+        investigation_id: Investigation identifier.
+        agent_ids: List of agent_id strings to add to the ACL.
+
+    Returns:
+        JSON: {"shared_with": [...], "total_acl": N}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        current_acl = list(manifest.get("acl") or [])
+        current_set = set(current_acl)
+        added = []
+        for agent_id in (agent_ids or []):
+            if agent_id and agent_id not in current_set:
+                current_acl.append(agent_id)
+                current_set.add(agent_id)
+                added.append(agent_id)
+
+        manifest["acl"] = current_acl
+        _save_manifest(manifest)
+
+        return json.dumps({
+            "shared_with": added,
+            "total_acl": len(current_acl),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+# ---- Tool: investigation_unshare ----
+
+@mcp.tool()
+def investigation_unshare(
+    investigation_id: str,
+    agent_ids: list,
+) -> str:
+    """
+    Revoke access to an investigation for one or more agents.
+    Removes the given agent_ids from the investigation's ACL.
+    Idempotent — removing an agent not in the ACL has no effect.
+
+    Args:
+        investigation_id: Investigation identifier.
+        agent_ids: List of agent_id strings to remove from the ACL.
+
+    Returns:
+        JSON: {"removed": [...], "total_acl": N}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        current_acl = list(manifest.get("acl") or [])
+        remove_set = set(agent_ids or [])
+        removed = [a for a in current_acl if a in remove_set]
+        current_acl = [a for a in current_acl if a not in remove_set]
+
+        manifest["acl"] = current_acl
+        _save_manifest(manifest)
+
+        return json.dumps({
+            "removed": removed,
+            "total_acl": len(current_acl),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
 # ---- Tool: audit_log ----
