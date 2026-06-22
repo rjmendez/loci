@@ -36,8 +36,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
 # ── config ────────────────────────────────────────────────────────────────────
 
@@ -165,13 +164,6 @@ def sweep_orphans(dry_run: bool) -> int:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur  = conn.cursor()
-
-    # Find nodes with zero outgoing edges.
-    try:
-        cur.execute("SELECT id FROM working_memory WHERE recall_count = 0 OR recall_count IS NULL")
-        zero_recall_ids = {str(row["id"]) for row in cur.fetchall()}
-    except sqlite3.OperationalError:
-        zero_recall_ids = set()
 
     try:
         cur.execute("SELECT DISTINCT source_id FROM graph_edges")

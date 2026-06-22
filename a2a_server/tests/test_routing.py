@@ -6,10 +6,8 @@ only the JSON-RPC dispatch layer, auth enforcement, and error responses.
 """
 
 import importlib.util
-import json
 import os
 import pathlib
-import sys
 import unittest
 
 # Set required env vars before importing server (server exits at load if unset)

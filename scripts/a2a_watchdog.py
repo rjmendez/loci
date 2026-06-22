@@ -18,11 +18,9 @@ Env vars:
   HERMES_PORTPROXY_PS1   Output path for the portproxy script (default: /mnt/c/tmp/hermes-a2a-portproxy.ps1)
 """
 import subprocess
-import sys
 import json
 import urllib.request
 import urllib.error
-import socket
 import os
 import re
 from pathlib import Path
