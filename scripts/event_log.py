@@ -194,7 +194,7 @@ def main() -> None:
     cp = sub.add_parser("compact", help="Archive old events")
     cp.add_argument("--before-days", type=float, default=90)
 
-    sp = sub.add_parser("stats", help="Print log statistics")
+    sub.add_parser("stats", help="Print log statistics")
 
     a = ap.parse_args()
 
