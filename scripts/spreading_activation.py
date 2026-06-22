@@ -199,7 +199,7 @@ def run_spreading_activation(
                 prior = activation.get(target, 0.0)
                 activation[target] = min(1.0, prior + contribution)
 
-                if target not in activation or prior == 0.0:
+                if prior == 0.0:
                     newly_activated.append(target)
 
             # Next frontier: targets that were not already in the frontier set
