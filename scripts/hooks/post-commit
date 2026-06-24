@@ -23,8 +23,7 @@ fi
 
 env -u ANTHROPIC_API_KEY \
   claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
-  >> /tmp/loci-post-commit-ingest.log 2>&1 \
-  || echo "[post-commit] Warning: ingest workflow exited with an error (commit not blocked)." >&2
+  >> /tmp/loci-post-commit-ingest.log 2>&1 &
 
 # Run contract extraction for any .py/.ts/.go/.rs/.java change (non-blocking)
 "$REPO_ROOT/scripts/hooks/post-commit-contract-extract.sh" || true
