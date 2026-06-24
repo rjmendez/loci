@@ -34,10 +34,11 @@ if [ ! -f "$WORKFLOW" ]; then
   exit 0
 fi
 
-# Run contract-sync in the background (fire-and-forget, non-blocking)
-claude --workflow "$WORKFLOW" \
-       --args "{\"root\": \"$REPO_ROOT\", \"loci_investigation\": \"$INV\", \"since_commit\": \"HEAD~1\"}" \
-       --dangerously-skip-permissions \
+# Run contract-sync in the background (fire-and-forget, non-blocking).
+# /contract-sync is the named workflow; args are passed as a trailing JSON blob
+# which the workflow reads via its `args` global.
+claude -p --dangerously-skip-permissions \
+       "/contract-sync {\"root\": \"$REPO_ROOT\", \"loci_investigation\": \"$INV\", \"since_commit\": \"HEAD~1\"}" \
   >> "${TMPDIR:-/tmp}/loci-contract-extract.log" 2>&1 &
 
 exit 0

@@ -187,6 +187,8 @@ def _embed_headers() -> dict:
 def _embed(text: str) -> Optional[list[float]]:
     """Get embedding vector via OpenAI-compat /v1/embeddings endpoint.
     Works with Ollama (no auth) and cloud providers (set EMBED_API_KEY)."""
+    if not OLLAMA_URL:
+        return None
     url = f"{OLLAMA_URL.rstrip('/')}/embeddings"
     body = json.dumps({"model": EMBED_MODEL, "input": [text]}).encode()
     req = urllib.request.Request(url, data=body, headers=_embed_headers(), method="POST")
