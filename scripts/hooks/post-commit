@@ -21,7 +21,8 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 0
 fi
 
-claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
+env -u ANTHROPIC_API_KEY \
+  claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
   >> /tmp/loci-post-commit-ingest.log 2>&1 \
   || echo "[post-commit] Warning: ingest workflow exited with an error (commit not blocked)." >&2
 
