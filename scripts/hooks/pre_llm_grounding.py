@@ -512,7 +512,10 @@ def main() -> None:
     except (json.JSONDecodeError, OSError):
         sys.exit(0)
 
-    if payload.get("hook_event_name", "") != "pre_llm_call":
+    if payload.get("hook_event_name", "") not in (
+        "pre_llm_call", "PreLlmCall",       # legacy Hermes names
+        "UserPromptSubmit", "SubagentStart", # Claude Code native names
+    ):
         sys.exit(0)
 
     extra = payload.get("extra") or {}
