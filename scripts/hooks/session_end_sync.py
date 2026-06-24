@@ -29,6 +29,7 @@ MAX_CHARS   = 4000   # chars of session content to embed
 CACHE_DIR   = os.path.expanduser(os.environ.get("HERMES_SYNC_CACHE", "~/.hermes/.session_sync_cache"))
 AGENT_ID    = os.environ.get("HERMES_AGENT_ID", "")
 PROFILE     = os.environ.get("HERMES_PROFILE", "")
+ACTIVE_INV  = os.environ.get("HERMES_ACTIVE_INVESTIGATION", "")
 # ───────────────────────────────────────────────────────────────────────────
 
 def ensure_collection():
@@ -209,6 +210,49 @@ def qdrant_upsert(point_id: int, vector: list, payload: dict):
         result = json.loads(resp.read())
     return result.get("status") == "ok"
 
+def _check_wiring_obligations(investigation_id: str, payload: dict) -> str:
+    """Query Loci for unresolved wiring obligations and append to upsert payload.
+
+    Uses the MCP HTTP API if QDRANT-side Loci is available; otherwise reads
+    the investigation findings.jsonl directly for the wiring_obligation tag.
+    Non-fatal: returns empty string on any error.
+    """
+    loci_dir = os.path.expanduser(
+        os.environ.get("LOCI_INVESTIGATIONS_DIR", "~/.loci/investigations")
+    )
+    findings_file = os.path.join(loci_dir, investigation_id, "findings.jsonl")
+    if not os.path.exists(findings_file):
+        return ""
+
+    unresolved = []
+    seen_ids: set = set()
+    try:
+        with open(findings_file) as f:
+            lines = f.readlines()
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line.strip())
+            except Exception:
+                continue
+            fid = rec.get("id", "")
+            if fid in seen_ids:
+                continue
+            seen_ids.add(fid)
+            tags = rec.get("tags", [])
+            if "wiring_obligation" in tags and rec.get("record_type") == "gap":
+                unresolved.append(rec.get("text", fid)[:120])
+    except Exception:
+        return ""
+
+    count = len(unresolved)
+    if count == 0:
+        return ""
+
+    payload["unresolved_wiring_obligations"] = count
+    payload["unresolved_wiring_obligation_samples"] = unresolved[:3]
+    return f" | ⚠ UNRESOLVED WIRING OBLIGATIONS: {count}"
+
+
 def main():
     t0 = time.monotonic()
     session_id = read_stdin_session_id()
@@ -261,7 +305,16 @@ def main():
     if ok:
         write_cache(session_id, sess["msg_count"])
         elapsed = time.monotonic() - t0
-        print(f"[session_end_sync] synced {session_id[:20]} ({sess['msg_count']} msgs) in {elapsed:.2f}s")
+
+        # Check for unresolved wiring obligations via Loci MCP (best-effort)
+        unresolved_note = ""
+        if ACTIVE_INV:
+            try:
+                unresolved_note = _check_wiring_obligations(ACTIVE_INV, payload)
+            except Exception:
+                pass
+
+        print(f"[session_end_sync] synced {session_id[:20]} ({sess['msg_count']} msgs) in {elapsed:.2f}s{unresolved_note}")
 
 if __name__ == "__main__":
     main()

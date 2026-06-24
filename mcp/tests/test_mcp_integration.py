@@ -1980,5 +1980,188 @@ class TestEntityNodes(unittest.TestCase):
             self.assertGreaterEqual(ws_entities[0]["finding_count"], 1)
 
 
+class TestContractDeclarationStore(unittest.TestCase):
+    """Integration tests for contract_declare / contract_query / contract_check."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+        self.inv_id = _new_id("contract")
+        server.investigation_start(investigation_id=self.inv_id, title="Contract test")
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_contract_declare_and_query(self):
+        result = _json(server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="UserSerializer",
+            role="producer",
+            fields='{"user_id": "int", "created_at": "ISO8601"}',
+            protocol="JSON-HTTP",
+        ))
+        self.assertTrue(result.get("stored"))
+        self.assertIn("finding_id", result)
+        self.assertEqual(result["entity"], "UserSerializer")
+        self.assertEqual(result["role"], "producer")
+
+        query = _json(server.contract_query(
+            investigation_id=self.inv_id,
+            entity="UserSerializer",
+        ))
+        self.assertEqual(query["count"], 1)
+        self.assertEqual(len(query["contracts"]), 1)
+        self.assertIn("contract_declaration", query["contracts"][0].get("tags", []))
+
+    def test_contract_query_role_filter(self):
+        server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="EventStream",
+            role="producer",
+            fields='{"event_id": "str"}',
+        )
+        server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="EventStream",
+            role="consumer",
+            fields='{"event_id": "str"}',
+        )
+        producers = _json(server.contract_query(
+            investigation_id=self.inv_id, entity="EventStream", role="producer"
+        ))
+        self.assertEqual(producers["count"], 1)
+
+    def test_contract_check_detects_drift(self):
+        server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="Payload",
+            role="producer",
+            fields='{"threat_score": "float", "confidence": "float"}',
+        )
+        result = _json(server.contract_check(
+            investigation_id=self.inv_id,
+            field_name="score",
+            entity="Payload",
+        ))
+        self.assertFalse(result["consistent"])
+        self.assertGreater(len(result["conflicts"]), 0)
+        self.assertEqual(result["conflicts"][0]["declared_field"], "threat_score")
+
+    def test_contract_check_no_conflict_on_exact_match(self):
+        server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="Payload",
+            role="producer",
+            fields='{"user_id": "int"}',
+        )
+        result = _json(server.contract_check(
+            investigation_id=self.inv_id,
+            field_name="user_id",
+        ))
+        self.assertTrue(result["consistent"])
+        self.assertEqual(len(result["conflicts"]), 0)
+
+    def test_contract_declare_invalid_role(self):
+        result = _json(server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="X",
+            role="observer",
+            fields='{}',
+        ))
+        self.assertIn("error", result)
+
+    def test_contract_declare_invalid_fields_json(self):
+        result = _json(server.contract_declare(
+            investigation_id=self.inv_id,
+            entity="X",
+            role="producer",
+            fields="not-json",
+        ))
+        self.assertIn("error", result)
+
+
+class TestWiringObligationTracker(unittest.TestCase):
+    """Integration tests for wiring_obligation_declare / _list / _resolve."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+        self.inv_id = _new_id("wiring")
+        server.investigation_start(investigation_id=self.inv_id, title="Wiring test")
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_declare_list_resolve_lifecycle(self):
+        decl = _json(server.wiring_obligation_declare(
+            investigation_id=self.inv_id,
+            class_name="AlertNotifier",
+            method_name="send",
+            expected_effect="POST to the webhook URL with the alert payload",
+        ))
+        self.assertTrue(decl.get("stored"))
+        fid = decl["finding_id"]
+        self.assertIn("AlertNotifier", decl["obligation"]["class"])
+
+        listed = _json(server.wiring_obligation_list(investigation_id=self.inv_id))
+        self.assertEqual(listed["unresolved_count"], 1)
+        self.assertEqual(len(listed["obligations"]), 1)
+
+        resolved = _json(server.wiring_obligation_resolve(
+            investigation_id=self.inv_id,
+            finding_id=fid,
+            evidence="Confirmed at alerting/notifier.py:47 — requests.post(self.webhook_url, json=payload)",
+        ))
+        self.assertTrue(resolved["resolved"])
+
+        listed_after = _json(server.wiring_obligation_list(investigation_id=self.inv_id))
+        self.assertEqual(listed_after["unresolved_count"], 0)
+
+    def test_list_resolved_includes_all(self):
+        decl = _json(server.wiring_obligation_declare(
+            investigation_id=self.inv_id,
+            class_name="MetricsSender",
+            method_name="push",
+            expected_effect="push metrics to Prometheus pushgateway",
+        ))
+        fid = decl["finding_id"]
+        server.wiring_obligation_resolve(
+            investigation_id=self.inv_id,
+            finding_id=fid,
+            evidence="metrics/sender.py:22 calls pushgateway_client.push()",
+        )
+        all_obls = _json(server.wiring_obligation_list(
+            investigation_id=self.inv_id, resolved=True
+        ))
+        self.assertGreaterEqual(len(all_obls["obligations"]), 1)
+
+    def test_resolve_unknown_finding(self):
+        result = _json(server.wiring_obligation_resolve(
+            investigation_id=self.inv_id,
+            finding_id="nonexistent-id",
+            evidence="nothing",
+        ))
+        self.assertIn("error", result)
+
+    def test_resolve_non_obligation_finding(self):
+        stored = _json(server.investigation_store(
+            investigation_id=self.inv_id,
+            finding_type="observed",
+            text="Regular finding",
+            source="test",
+        ))
+        fid = stored["finding_id"]
+        result = _json(server.wiring_obligation_resolve(
+            investigation_id=self.inv_id,
+            finding_id=fid,
+            evidence="should fail",
+        ))
+        self.assertIn("error", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -6222,6 +6222,400 @@ def memory_restore(
     }, indent=2)
 
 
+# ── Contract Declaration Store ─────────────────────────────────────────────────
+
+
+@mcp.tool()
+def contract_declare(
+    investigation_id: str,
+    entity: str,
+    role: str,
+    fields: str,
+    protocol: str = "",
+) -> str:
+    """Store a cross-boundary contract declaration for an entity.
+
+    Records what a producer outputs or what a consumer expects at a serialization
+    boundary (HTTP API, message queue, DB schema, file format). Stored as a gap
+    finding (unverified integration) tagged ``contract_declaration``. Surfaces in
+    grounding so future agents can query before generating consumer code.
+
+    Args:
+        investigation_id: Investigation to store the contract in.
+        entity: The entity this contract describes, e.g. ``"UserSerializer"``,
+            ``"POST /api/users"``, ``"sensor/+/data topic"``.
+        role: Either ``"producer"`` (what it outputs) or ``"consumer"``
+            (what it expects as input).
+        fields: JSON object mapping field names to type descriptions,
+            e.g. ``'{"user_id": "int", "created_at": "ISO8601 string"}'``.
+        protocol: Optional wire protocol, e.g. ``"JSON-HTTP"``, ``"MQTT"``,
+            ``"gRPC"``, ``"Parquet"``. Stored for reference.
+
+    Returns:
+        JSON with ``{"stored": true, "finding_id": "<uuid>", "entity": ..., "role": ...}``
+    """
+    if role not in ("producer", "consumer"):
+        return json.dumps({"error": "role must be 'producer' or 'consumer'"})
+    try:
+        json.loads(fields)
+    except (json.JSONDecodeError, TypeError):
+        return json.dumps({"error": "fields must be a valid JSON object string"})
+
+    inv_dir = _inv_dir(investigation_id)
+    manifest = _load_manifest(investigation_id)
+    if manifest is None:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    protocol_note = f" protocol={protocol}" if protocol else ""
+    text = (
+        f"Contract {entity!r} as {role}: fields={fields}{protocol_note}"
+    )
+    tags = ["contract_declaration", f"entity:{entity}", f"role:{role}"]
+    if protocol:
+        tags.append(f"protocol:{protocol}")
+
+    fid = str(uuid.uuid4())
+    finding: dict = {
+        "id": fid,
+        "investigation_id": investigation_id,
+        "ts": _now(),
+        "created_at_ts": int(__import__("time").time()),
+        "record_type": "gap",
+        "type": "gap",
+        "text": text,
+        "source": "contract_declare",
+        "confidence": "medium",
+        "tags": tags,
+        "derived_from": [],
+        "entities": {},
+    }
+    _append_jsonl(inv_dir / "findings.jsonl", finding)
+    manifest.setdefault("finding_counts", {})
+    manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
+    _save_manifest(manifest)
+
+    _mnemo_remember(
+        f"Contract declaration — {entity} ({role}): {fields}",
+        importance=0.8,
+        metadata={"investigation_id": investigation_id, "finding_id": fid, "entity": entity, "role": role},
+    )
+    _qdrant_upsert(fid, text, {**finding, "tags": ",".join(tags)})
+
+    _event_log_append({
+        "event": "contract_declare", "investigation_id": investigation_id,
+        "finding_id": fid, "entity": entity, "role": role,
+    })
+    return json.dumps({"stored": True, "finding_id": fid, "entity": entity, "role": role}, indent=2)
+
+
+@mcp.tool()
+def contract_query(
+    investigation_id: str,
+    entity: str,
+    role: str = "",
+) -> str:
+    """Query stored contract declarations for an entity.
+
+    Searches the investigation's findings for ``contract_declaration`` findings
+    matching ``entity``. Optionally filters by role (``"producer"`` or
+    ``"consumer"``). Falls back to Qdrant semantic search if local JSONL is empty.
+
+    Args:
+        investigation_id: Investigation to search.
+        entity: Entity name to look up (exact match on the ``entity:<name>`` tag).
+        role: Optional filter — ``"producer"``, ``"consumer"``, or ``""`` for both.
+
+    Returns:
+        JSON with ``{"contracts": [...findings], "count": N}``.
+    """
+    inv_dir = _inv_dir(investigation_id)
+    jsonl_path = inv_dir / "findings.jsonl"
+    findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
+
+    entity_tag = f"entity:{entity}"
+    results = []
+    for f in findings:
+        tags = f.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",")]
+        if "contract_declaration" not in tags:
+            continue
+        if entity_tag not in tags:
+            continue
+        if role and f"role:{role}" not in tags:
+            continue
+        results.append(f)
+
+    if not results:
+        hits = _qdrant_similarity_search(
+            f"Contract {entity} {role}".strip(), limit=5, investigation_id=investigation_id
+        )
+        results = [
+            h.get("payload", {}) for h in (hits or [])
+            if "contract_declaration" in str(h.get("payload", {}).get("tags", ""))
+            and f"entity:{entity}" in str(h.get("payload", {}).get("tags", ""))
+        ]
+
+    return json.dumps({"contracts": results, "count": len(results)}, indent=2)
+
+
+@mcp.tool()
+def contract_check(
+    investigation_id: str,
+    field_name: str,
+    entity: str = "",
+) -> str:
+    """Check whether a field name conflicts with stored contract declarations.
+
+    Loads contract declarations from the investigation and checks whether
+    ``field_name`` appears as a near-miss for a declared field on the same entity
+    (suggesting rename drift across a boundary). Uses the same prefix-overlap
+    heuristic as the ``contract_contradiction`` memcheck rule.
+
+    Args:
+        investigation_id: Investigation to search.
+        field_name: Field name to check (the name used in the new code).
+        entity: Optional — scope the check to a specific entity's contracts.
+
+    Returns:
+        JSON with ``{"conflicts": [...], "consistent": bool}``.
+    """
+    inv_dir = _inv_dir(investigation_id)
+    jsonl_path = inv_dir / "findings.jsonl"
+    findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
+
+    contracts = []
+    entity_filter = f"entity:{entity}" if entity else None
+    for f in findings:
+        tags = f.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",")]
+        if "contract_declaration" not in tags:
+            continue
+        if entity_filter and entity_filter not in tags:
+            continue
+        contracts.append(f)
+
+    if not contracts:
+        return json.dumps({"conflicts": [], "consistent": True, "note": "no contracts stored"})
+
+    new_tok = field_name.lower()
+    conflicts = []
+    for contract in contracts:
+        text = str(contract.get("text", ""))
+        import re as _re
+        m = _re.search(r"fields=(\{[^}]+\})", text)
+        if not m:
+            continue
+        try:
+            declared = json.loads(m.group(1))
+        except Exception:
+            continue
+        for stored_field, stored_type in declared.items():
+            sf = stored_field.lower()
+            if sf == new_tok:
+                continue
+            shorter, longer = sorted([new_tok, sf], key=len)
+            if not longer:
+                continue
+            is_suffix = longer.endswith(shorter) or longer.startswith(shorter)
+            if is_suffix and len(shorter) >= 4:
+                contracts_entity = next(
+                    (t[len("entity:"):] for t in (contract.get("tags") or []) if str(t).startswith("entity:")),
+                    "unknown"
+                )
+                conflicts.append({
+                    "entity": contracts_entity,
+                    "your_field": field_name,
+                    "declared_field": stored_field,
+                    "declared_type": stored_type,
+                    "finding_id": contract.get("id", ""),
+                })
+
+    return json.dumps({"conflicts": conflicts, "consistent": len(conflicts) == 0}, indent=2)
+
+
+# ── Wiring Obligation Tracker ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+def wiring_obligation_declare(
+    investigation_id: str,
+    class_name: str,
+    method_name: str,
+    expected_effect: str,
+) -> str:
+    """Declare a wiring obligation — a method that SHOULD perform an integration but is unverified.
+
+    Stores a ``gap`` finding tagged ``wiring_obligation``. The obligation is open
+    until ``wiring_obligation_resolve`` is called with evidence of fulfillment.
+
+    Use this when generating a class that is named for an integration
+    (Publisher, Sender, Exporter, Notifier) — declare the obligation immediately
+    so it can be tracked across sessions and verified before shipping.
+
+    Args:
+        investigation_id: Investigation to store the obligation in.
+        class_name: Class that bears the integration responsibility.
+        method_name: Method that should perform the integration effect.
+        expected_effect: What the method SHOULD do (the integration promise).
+
+    Returns:
+        JSON with ``{"stored": true, "finding_id": "<uuid>", "obligation": {...}}``.
+    """
+    inv_dir = _inv_dir(investigation_id)
+    manifest = _load_manifest(investigation_id)
+    if manifest is None:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    text = (
+        f"Wiring obligation: {class_name}.{method_name}() must {expected_effect} "
+        f"[UNVERIFIED — call wiring_obligation_resolve with evidence when confirmed]"
+    )
+    tags = [
+        "wiring_obligation",
+        f"class:{class_name}",
+        f"method:{method_name}",
+    ]
+    fid = str(uuid.uuid4())
+    finding: dict = {
+        "id": fid,
+        "investigation_id": investigation_id,
+        "ts": _now(),
+        "created_at_ts": int(__import__("time").time()),
+        "record_type": "gap",
+        "type": "gap",
+        "text": text,
+        "source": "wiring_obligation_declare",
+        "confidence": "medium",
+        "tags": tags,
+        "derived_from": [],
+        "entities": {},
+    }
+    _append_jsonl(inv_dir / "findings.jsonl", finding)
+    manifest.setdefault("finding_counts", {})
+    manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
+    _save_manifest(manifest)
+    _event_log_append({
+        "event": "wiring_obligation_declare", "investigation_id": investigation_id,
+        "finding_id": fid, "class": class_name, "method": method_name,
+    })
+    return json.dumps({
+        "stored": True,
+        "finding_id": fid,
+        "obligation": {"class": class_name, "method": method_name, "expected_effect": expected_effect},
+    }, indent=2)
+
+
+@mcp.tool()
+def wiring_obligation_list(
+    investigation_id: str,
+    resolved: bool = False,
+) -> str:
+    """List wiring obligations for an investigation.
+
+    By default returns only unresolved obligations (``gap`` findings tagged
+    ``wiring_obligation``). Pass ``resolved=True`` to include all obligations
+    including those resolved via ``wiring_obligation_resolve``.
+
+    Args:
+        investigation_id: Investigation to query.
+        resolved: When ``True``, include obligations that have already been resolved.
+
+    Returns:
+        JSON with ``{"obligations": [...], "unresolved_count": N}``.
+    """
+    inv_dir = _inv_dir(investigation_id)
+    jsonl_path = inv_dir / "findings.jsonl"
+    findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
+
+    obligations = []
+    unresolved = 0
+    seen_ids: set = set()
+    for f in reversed(findings):
+        fid = f.get("id", "")
+        if fid in seen_ids:
+            continue
+        seen_ids.add(fid)
+        tags = f.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",")]
+        if "wiring_obligation" not in tags:
+            continue
+        is_gap = f.get("record_type", f.get("type", "")) == "gap"
+        if not resolved and not is_gap:
+            continue
+        obligations.append(f)
+        if is_gap:
+            unresolved += 1
+
+    obligations.reverse()
+    return json.dumps({"obligations": obligations, "unresolved_count": unresolved}, indent=2)
+
+
+@mcp.tool()
+def wiring_obligation_resolve(
+    investigation_id: str,
+    finding_id: str,
+    evidence: str,
+) -> str:
+    """Resolve a wiring obligation by providing evidence of fulfillment.
+
+    Changes the obligation from a ``gap`` finding to an ``observed`` finding,
+    appends the evidence to the text, and sets confidence to ``"high"``.
+
+    Args:
+        investigation_id: Investigation containing the obligation.
+        finding_id: ID of the ``wiring_obligation`` gap finding to resolve.
+        evidence: What was verified — cite the file and line where the integration
+            call was confirmed to exist.
+
+    Returns:
+        JSON with ``{"resolved": true, "finding_id": "<uuid>"}``.
+    """
+    inv_dir = _inv_dir(investigation_id)
+    manifest = _load_manifest(investigation_id)
+    if manifest is None:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    jsonl_path = inv_dir / "findings.jsonl"
+    findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
+
+    target = next((f for f in reversed(findings) if f.get("id") == finding_id), None)
+    if target is None:
+        return json.dumps({"error": f"Finding '{finding_id}' not found in '{investigation_id}'."})
+
+    tags = target.get("tags") or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")]
+    if "wiring_obligation" not in tags:
+        return json.dumps({"error": f"Finding '{finding_id}' is not a wiring_obligation."})
+    if target.get("record_type", "gap") != "gap":
+        return json.dumps({"error": f"Finding '{finding_id}' is already resolved."})
+
+    resolved_finding = {
+        **target,
+        "record_type": "observed",
+        "type": "observed",
+        "text": target["text"] + f" | RESOLVED: {evidence}",
+        "confidence": "high",
+        "ts": _now(),
+        "tags": [t for t in tags if t != "wiring_obligation"] + ["wiring_obligation", "wiring_obligation_resolved"],
+    }
+    _append_jsonl(jsonl_path, resolved_finding)
+
+    counts = manifest.setdefault("finding_counts", {})
+    counts["gap"] = max(0, counts.get("gap", 1) - 1)
+    counts["observed"] = counts.get("observed", 0) + 1
+    _save_manifest(manifest)
+
+    _event_log_append({
+        "event": "wiring_obligation_resolve", "investigation_id": investigation_id,
+        "finding_id": finding_id, "evidence": evidence[:200],
+    })
+    return json.dumps({"resolved": True, "finding_id": finding_id}, indent=2)
+
+
 @mcp.tool()
 def rag_context_search(
     query: str,
