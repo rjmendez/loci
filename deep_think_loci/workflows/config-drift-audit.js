@@ -10,11 +10,12 @@ export const meta = {
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
-const ROOT = args && args.root
+const A    = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
+const ROOT = A.root
 if (!ROOT) { log('args.root is required.'); return { error: 'root_required' } }
 
-const LANGS = (args && args.language_stack) || []
-const INV   = (args && args.loci_investigation) || null
+const LANGS = A.language_stack || []
+const INV   = A.loci_investigation || null
 
 const LANG_NOTE = LANGS.length
   ? `The codebase uses: ${LANGS.join(', ')}. Adapt grep extensions and patterns accordingly.`

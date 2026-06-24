@@ -10,13 +10,14 @@ export const meta = {
 }
 
 // ── Parameters ────────────────────────────────────────────────────────────────
-const ROOT  = args && args.root
-const INV   = args && args.loci_investigation
+const A     = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
+const ROOT  = A.root
+const INV   = A.loci_investigation
 if (!ROOT)  { log('args.root is required.'); return { error: 'root_required' } }
 if (!INV)   { log('args.loci_investigation is required.'); return { error: 'investigation_required' } }
 
-const SINCE = (args && args.since_commit) || 'HEAD~1'
-const LANGS = (args && args.language_stack) || []
+const SINCE = A.since_commit || 'HEAD~1'
+const LANGS = A.language_stack || []
 const LANG_NOTE = LANGS.length
   ? `The codebase uses: ${LANGS.join(', ')}.`
   : 'Detect languages from file extensions.'
