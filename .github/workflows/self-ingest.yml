@@ -1,0 +1,40 @@
+name: Self-ingest codebase
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.py"
+  workflow_dispatch:
+
+concurrency:
+  group: self-ingest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ingest:
+    name: Re-ingest loci-codebase
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run loci-codebase ingest workflow
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude --workflow .claude/workflows/loci-codebase-ingest.js \
+                 --dangerously-skip-permissions
