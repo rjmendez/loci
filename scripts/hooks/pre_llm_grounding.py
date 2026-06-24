@@ -31,6 +31,11 @@ v3 changes vs v2:
   - Rules index injection preserved from v2
   - Subagent skip, min-length guard preserved from v2
 """
+# v4 hardening:
+#   - Subagent skip replaced with lightweight single-collection path (hermes_memory only)
+#   - Slash-command skip narrowed to navigation-only commands; code-affecting commands grounded
+#   - Short-message length guard removed entirely
+#   - Ollama + BeamMemory dual failure now injects explicit WARNING instead of silently proceeding
 from __future__ import annotations
 
 import json
@@ -155,6 +160,14 @@ GROUNDING_DIRECTIVE = os.environ.get("GROUNDING_DIRECTIVE") or (
     "4. SESSION SEARCH: for 'what did we do about X' questions\n"
     "Skip recall only when the answer comes directly from tool output in this turn."
 )
+
+# Slash commands that are pure navigation — no code or memory work involved.
+# Every other slash command (including /fix, /review, /code-review, /remember,
+# /ultrareview, /schedule) gets full grounding because it may touch code.
+NAVIGATION_SLASH_COMMANDS: frozenset[str] = frozenset({
+    "/help", "/clear", "/compact", "/cost", "/status",
+    "/history", "/ide", "/doctor", "/login", "/logout",
+})
 
 
 # ── embedding ─────────────────────────────────────────────────────────────────
@@ -504,24 +517,69 @@ def main() -> None:
 
     extra = payload.get("extra") or {}
 
-    # Skip subagents
+    # Detect subagent context — triggers lightweight path, NOT a skip.
+    # Previous behaviour (sys.exit) left all workflow subagents ungrounded;
+    # that is where cross-file mistakes (wrong import names, renamed fields) occur.
     task_id = extra.get("task_id") or payload.get("session_id") or ""
-    if "subagent" in task_id.lower() or os.environ.get("HERMES_SUBAGENT"):
-        sys.exit(0)
+    is_subagent = "subagent" in task_id.lower() or bool(os.environ.get("HERMES_SUBAGENT"))
 
     user_message = extra.get("user_message") or ""
     if not isinstance(user_message, str):
         user_message = ""
     msg_stripped = user_message.strip()
 
-    if not msg_stripped or msg_stripped.startswith("/"):
+    # Skip only for truly empty messages.
+    if not msg_stripped:
         sys.exit(0)
-    if len(msg_stripped) < MIN_PROMPT_LEN:
-        sys.exit(0)
+
+    # Narrow slash-command skip: navigation-only commands need no grounding.
+    # Code-affecting commands (/fix, /review, /remember, /code-review, etc.) get grounded.
+    if msg_stripped.startswith("/"):
+        cmd = msg_stripped.split()[0].lower()
+        if cmd in NAVIGATION_SLASH_COMMANDS:
+            sys.exit(0)
+        # Fall through: non-navigation slash command → continue to grounding.
+
+    # Short-message length guard removed: "fix the bug" is 13 chars but needs grounding.
 
     intent = _extract_intent(msg_stripped)
 
-    # ── v3: embed → parallel Qdrant fan-out ──────────────────────────────────
+    # ── Lightweight subagent path ─────────────────────────────────────────────
+    # Skips the 7-collection fan-out, session history, SA enrichment.
+    # Still grounds on hermes_memory (investigation findings) — the collection
+    # most relevant to code-generation tasks in an active investigation.
+    if is_subagent:
+        sub_hits: list[dict] = []
+        if QDRANT_URL:
+            sub_vec = _embed(intent)
+            if sub_vec is not None:
+                sub_hits = _search_collection(
+                    "hermes_memory", sub_vec, "text", "confidence", True,
+                    top_k=min(RECALL_TOP_K, 2),
+                )
+                sub_hits = [h for h in sub_hits if h["importance"] >= MIN_IMPORTANCE]
+                _sub_ts = time.time()
+                for h in sub_hits:
+                    h["_ms_score"] = _multi_signal_score(h, _sub_ts)
+                sub_hits = sorted(sub_hits, key=lambda h: h["_ms_score"], reverse=True)[:2]
+            else:
+                sub_hits = _beam_fallback(intent)
+
+        if sub_hits:
+            recall_block = _format_results(sub_hits, intent, False)
+        else:
+            recall_block = (
+                "[WARNING: memory grounding unavailable in subagent context — "
+                "Qdrant unreachable. Verify cross-file references by reading "
+                "the actual files before using any name, field, or import path.]\n\n"
+                + GROUNDING_DIRECTIVE
+            )
+        rules_summary = _load_rules_summary()
+        context = (recall_block + "\n\n" + rules_summary) if rules_summary else recall_block
+        print(json.dumps({"context": context}))
+        return
+
+    # ── v3: embed → parallel Qdrant fan-out (main session) ───────────────────
     vector = _embed(intent)
     used_fallback = False
 
@@ -529,6 +587,20 @@ def main() -> None:
         # Ollama unavailable — fall back to BeamMemory (v2 path)
         hits = _beam_fallback(intent)
         used_fallback = True
+        if not hits:
+            # Both Ollama and BeamMemory failed — memory is dark this turn.
+            # Inject a visible warning rather than silently proceeding.
+            warning = (
+                "[WARNING: memory grounding UNAVAILABLE this turn — Ollama unreachable "
+                "and BeamMemory fallback also failed. Do NOT rely on parametric memory "
+                "for cross-file references, API names, field names, or import paths. "
+                "Read the relevant files before using any name.]\n\n"
+                + GROUNDING_DIRECTIVE
+            )
+            rules_summary = _load_rules_summary()
+            context = (warning + "\n\n" + rules_summary) if rules_summary else warning
+            print(json.dumps({"context": context}))
+            return
     else:
         all_hits: list[dict] = []
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
