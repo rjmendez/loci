@@ -55,3 +55,8 @@ config.yaml
 memories/
 plans/
 *.log
+
+# Python venv + build artifacts
+mcp/.venv/
+mcp/loci_mcp.egg-info/
+**/__pycache__/

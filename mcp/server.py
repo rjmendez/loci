@@ -176,6 +176,169 @@ _mnemo_recall_fn = None
 _verdict_backend = None                # QdrantBackend for hermes_verdicts (pre_answer_check)
 _verdict_backend_failed = False        # permanent-failure sentinel — don't retry
 
+# ---------------------------------------------------------------------------
+# Kuzu graph store (primary relationship/graph backend) — fail-open like Qdrant.
+# Mirrors findings/entities/derivation into an embedded graph and backs the
+# entity-lookup / related-cases / contamination / code-symbol paths. If kuzu or
+# the module is unavailable, every consumer degrades to the pre-existing path.
+# ---------------------------------------------------------------------------
+_kuzu_store = None                     # KuzuStore singleton once initialized
+_kuzu_failed = False                   # permanent-failure sentinel — don't retry
+_kuzu_lock = threading.Lock()
+
+
+def _get_kuzu():
+    """Lazy, fail-open KuzuStore singleton. Returns None if unavailable."""
+    global _kuzu_store, _kuzu_failed
+    if _kuzu_store is not None:
+        return _kuzu_store
+    if _kuzu_failed:
+        return None
+    with _kuzu_lock:
+        if _kuzu_store is not None:
+            return _kuzu_store
+        if _kuzu_failed:
+            return None
+        try:
+            from graph.kuzu_store import KuzuStore
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # kuzu won't create parents
+            ks = KuzuStore(str(MEMORY_DIR / "graph.kuzu"))
+            if not ks.available():
+                _kuzu_failed = True
+                logger.warning("Kuzu graph store unavailable — graph features disabled.")
+                return None
+            _kuzu_store = ks
+        except Exception as exc:  # fail-open — never break the server on graph init
+            _kuzu_failed = True
+            logger.warning("Kuzu graph init failed (%r) — graph features disabled.", exc)
+            return None
+    # One-time backfill of pre-existing findings, guarded by an empty-graph check.
+    try:
+        _kuzu_backfill_if_empty(_kuzu_store)
+    except Exception as exc:
+        logger.debug("Kuzu backfill skipped (fail-open): %r", exc)
+    return _kuzu_store
+
+
+def _kuzu_upsert_investigation(investigation_id: str, title: str = "") -> None:
+    ks = _get_kuzu()
+    if not ks:
+        return
+    try:
+        ks.upsert_investigation(str(investigation_id), str(title or ""))
+    except Exception as exc:
+        logger.debug("Kuzu investigation upsert failed (fail-open): %r", exc)
+
+
+def _coerce_ts(v) -> int:
+    """Coerce a finding timestamp (int, epoch-string, or ISO-8601) to an int epoch. 0 on failure."""
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str) and v.strip():
+        s = v.strip()
+        if s.isdigit():
+            return int(s)
+        try:
+            from datetime import datetime
+            return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            return 0
+    return 0
+
+
+def _mirror_finding_to_kuzu(finding: dict, investigation_id: str, ks=None) -> None:
+    """Mirror one finding (node + MENTIONS + DERIVED_FROM) into the graph. Fail-open."""
+    ks = ks or _get_kuzu()
+    if not ks or not isinstance(finding, dict):
+        return
+    fid = finding.get("id")
+    if not fid:
+        return
+    try:
+        ks.upsert_finding({
+            "id": fid,
+            "investigation": investigation_id or finding.get("investigation_id") or "",
+            "type": (finding.get("finding_type") or finding.get("type")
+                     or finding.get("ftype") or ""),
+            "text": finding.get("text", "") or "",
+            "confidence": finding.get("confidence", "") or "",
+            "source": finding.get("source", "") or "",
+            "ts": _coerce_ts(finding.get("ts") or finding.get("created_at") or finding.get("timestamp")),
+        })
+        ents = finding.get("entities")
+        if isinstance(ents, dict):
+            distinctive = _distinctive_entity_set(ents)
+            triples = []
+            for etype, vals in ents.items():
+                for v in vals or []:
+                    name = str(v).strip()
+                    if name:
+                        triples.append((name, str(etype), name.lower() in distinctive))
+            if triples:
+                ks.link_mentions(fid, triples)
+        df = finding.get("derived_from")
+        if df:
+            ks.link_derived_from(fid, list(df) if isinstance(df, (list, tuple, set)) else [df])
+    except Exception as exc:
+        logger.debug("Kuzu finding mirror failed (fail-open): %r", exc)
+
+
+def _kuzu_backfill_if_empty(ks) -> None:
+    """Backfill existing on-disk findings into a freshly-created graph (once)."""
+    try:
+        rows = ks.code_query("MATCH (f:Finding) RETURN count(f)")
+        existing = int(rows[0][0]) if rows and rows[0] else 0
+    except Exception:
+        existing = 0
+    if existing > 0:
+        return
+    count = 0
+    try:
+        for inv_dir in sorted(MEMORY_DIR.iterdir()):
+            if not inv_dir.is_dir() or inv_dir.name.startswith("_"):
+                continue
+            fjsonl = inv_dir / "findings.jsonl"
+            if not fjsonl.exists():
+                continue
+            ks.upsert_investigation(inv_dir.name, "")
+            for f in _read_jsonl(fjsonl):
+                _mirror_finding_to_kuzu(f, str(f.get("investigation_id") or inv_dir.name), ks=ks)
+                count += 1
+    except Exception as exc:
+        logger.debug("Kuzu backfill partial (fail-open): %r", exc)
+    if count:
+        logger.info("Kuzu backfill: mirrored %d pre-existing findings into the graph.", count)
+
+
+def _entity_lookup_kuzu(entity: str, investigation_id, limit: int) -> list[dict]:
+    """Graph-primary entity lookup. Normalizes to the finding shape the tools use."""
+    ks = _get_kuzu()
+    if not ks:
+        return []
+    try:
+        rows = ks.entity_findings(entity, limit=max(limit * 2, limit))
+    except Exception as exc:
+        logger.debug("Kuzu entity_findings failed (fail-open): %r", exc)
+        return []
+    out: list[dict] = []
+    for r in rows or []:
+        inv = r.get("investigation") or ""
+        if investigation_id and inv != investigation_id:
+            continue
+        out.append({
+            "id": r.get("id"),
+            "investigation_id": inv,
+            "finding_type": r.get("ftype", "") or "",
+            "text": r.get("text", "") or "",
+            "confidence": r.get("confidence", "") or "",
+            "source": r.get("source", "") or "",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
 
 def _mnemo_bank() -> str:
     return os.environ.get("HERMES_MNEMO_BANK", "default")
@@ -1096,12 +1259,14 @@ def _qdrant_search_collection(
         col_info = client.get_collection(collection_name)
         vectors_config = col_info.config.params.vectors
         has_named_vectors = isinstance(vectors_config, dict)
+        has_sparse_index = has_named_vectors and "sparse" in (vectors_config or {})
     except Exception:
         has_named_vectors = False
+        has_sparse_index = False
 
     _qsp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
 
-    if has_named_vectors and sparse_vec is not None:
+    if has_named_vectors and has_sparse_index and sparse_vec is not None:
         result = client.query_points(
             collection_name=collection_name,
             prefetch=[
@@ -2108,6 +2273,7 @@ def investigation_start(
     """
     existing = _load_manifest(investigation_id)
     if existing:
+        _kuzu_upsert_investigation(investigation_id, existing.get("title", ""))
         return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
 
     manifest = {
@@ -2126,6 +2292,7 @@ def investigation_start(
         "closed_summary": None,
     }
     _save_manifest(manifest)
+    _kuzu_upsert_investigation(investigation_id, title)
     logger.info("Created investigation %s", investigation_id)
     return json.dumps({"status": "created", "manifest": manifest}, indent=2)
 
@@ -2277,6 +2444,7 @@ def investigation_store(
     )
 
     _qdrant_upsert(finding["id"], text, finding)
+    _mirror_finding_to_kuzu(finding, investigation_id)
 
     return json.dumps({
         "stored": True,
@@ -3173,9 +3341,12 @@ def investigation_entity_lookup(
             "error": f"entity_type must be one of: {', '.join(_ENTITY_FIELD_MAP)} or 'auto'"
         })
 
-    # Prefer Qdrant (indexed, fast); fall back to JSONL scan.
-    findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
-    method = "qdrant"
+    # Prefer the Kuzu graph (primary), then Qdrant (indexed), then JSONL scan.
+    findings = _entity_lookup_kuzu(entity, investigation_id, limit)
+    method = "kuzu"
+    if not findings:
+        findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
+        method = "qdrant"
     if not findings:
         findings = _entity_lookup_jsonl(entity, entity_type, investigation_id, limit)
         method = "jsonl_fallback"
@@ -3235,12 +3406,14 @@ def investigation_related_cases(
     results: list[dict] = []
     for entity in entities[:10]:  # cap total entities to avoid runaway queries
         etype = entity_type if entity_type != "auto" else _detect_entity_type(entity)
-        findings = _entity_lookup_qdrant(entity, etype, None, limit_per_entity * 4)
+        findings = _entity_lookup_kuzu(entity, None, limit_per_entity * 4)
+        method = "kuzu"
+        if not findings:
+            findings = _entity_lookup_qdrant(entity, etype, None, limit_per_entity * 4)
+            method = "qdrant"
         if not findings:
             findings = _entity_lookup_jsonl(entity, etype, None, limit_per_entity * 4)
             method = "jsonl_fallback"
-        else:
-            method = "qdrant"
 
         # Group by investigation, exclude findings with no investigation context
         by_inv: dict[str, list[dict]] = {}
@@ -3850,17 +4023,33 @@ def _correlate_memories(
         logger.debug("semantic neighbor lookup failed in correlate, skipping: %r", exc)
         semantic_ids = []
 
-    try:
-        cluster = find_contamination(
-            seed_ids,
-            findings,
-            entities_of=_extract_entities,
-            semantic_neighbor_ids=semantic_ids,
-            min_shared_entities=1,
-        )
-    except Exception as exc:  # fail-open — degrade to seeds only
-        logger.debug("find_contamination failed in correlate, degrading to seeds: %r", exc)
-        cluster = {"contaminated_ids": list(seed_ids), "reasons": {sid: ["seed"] for sid in seed_ids}}
+    # Primary: the Kuzu graph traversal (semantics identical to find_contamination).
+    # Fallback: the in-memory traversal if the graph is unavailable or errors.
+    cluster = None
+    ks = _get_kuzu()
+    if ks:
+        try:
+            graph_cluster = ks.contamination(
+                list(seed_ids),
+                min_shared_entities=1,
+                semantic_neighbor_ids=semantic_ids,
+            )
+            if isinstance(graph_cluster, dict) and "contaminated_ids" in graph_cluster:
+                cluster = graph_cluster
+        except Exception as exc:
+            logger.debug("Kuzu contamination failed, falling back to in-memory: %r", exc)
+    if cluster is None:
+        try:
+            cluster = find_contamination(
+                seed_ids,
+                findings,
+                entities_of=_extract_entities,
+                semantic_neighbor_ids=semantic_ids,
+                min_shared_entities=1,
+            )
+        except Exception as exc:  # fail-open — degrade to seeds only
+            logger.debug("find_contamination failed in correlate, degrading to seeds: %r", exc)
+            cluster = {"contaminated_ids": list(seed_ids), "reasons": {sid: ["seed"] for sid in seed_ids}}
 
     return {
         "contaminated_ids": cluster.get("contaminated_ids", []),
@@ -3951,6 +4140,18 @@ def code_memory_correlate(
                 code_note = f"target_file {tf!r} could not be read — skipped"
             if content or code_note is None:
                 suspected |= _suspected_entities_from_text(content)
+                # tree-sitter: ingest the file's AST into the code graph (fail-open) so
+                # its symbols/calls are queryable via code_graph_query and linkable to
+                # the memory graph. Targeted symbol suspicion still comes from the code
+                # checker's flagged identifiers (_verdict_symbols) below, not every symbol.
+                try:
+                    from graph.code_parse import parse_source, detect_lang
+                    _lang = detect_lang(tf)
+                    _ks = _get_kuzu()
+                    if _lang and _ks:
+                        _ks.ingest_code([parse_source(tf, content.encode("utf-8", "replace"), _lang)])
+                except Exception as exc:
+                    logger.debug("AST ingest for %s failed (fail-open): %r", tf, exc)
                 try:
                     verdicts = run_code_checks(p)
                 except Exception as exc:  # fail-open — checker errors are advisory
@@ -5055,6 +5256,91 @@ def memory_confidence(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def code_graph_ingest(path: str, max_files: Optional[int] = None) -> str:
+    """
+    Parse a source file or directory with tree-sitter and ingest its symbol graph
+    into the Kuzu code graph (CodeFile / CodeSymbol nodes; DEFINES / CALLS / IMPORTS
+    edges). Enables ``code_graph_query`` and the AST-backed code<->memory linkage.
+
+    Supports python, java, kotlin, rust, javascript, typescript/tsx, go (c/c++
+    parse but currently yield file-level nodes only). Binary/oversized files and
+    common vendor dirs (.git, node_modules, .venv, build, dist, target) are skipped.
+
+    Args:
+        path: A source file or a directory root to walk.
+        max_files: Optional cap on files parsed (directory mode).
+
+    Returns:
+        JSON with per-run counts {files, symbols, defines, calls, imports} or an error.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable — cannot ingest code graph."})
+    try:
+        from graph.code_parse import parse_path, parse_source, detect_lang
+        p = Path(path).expanduser()
+        if not p.exists():
+            return json.dumps({"error": f"Path not found: {path}"})
+        if p.is_file():
+            lang = detect_lang(str(p))
+            if not lang:
+                return json.dumps({"error": f"Unsupported/undetected language for file: {path}"})
+            try:
+                src = p.read_bytes()
+            except Exception as exc:
+                return json.dumps({"error": f"Could not read {path}: {exc!r}"})
+            parsed = [parse_source(str(p), src, lang)]
+        else:
+            parsed = parse_path(str(p), max_files=max_files)
+        counts = ks.ingest_code(parsed)
+        return json.dumps({"path": str(p), "parsed_files": len(parsed), "ingested": counts}, indent=2)
+    except Exception as exc:
+        logger.debug("code_graph_ingest failed: %r", exc)
+        return json.dumps({"error": f"code_graph_ingest failed: {exc!r}"})
+
+
+@mcp.tool()
+def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
+    """
+    Run a READ-ONLY Cypher query against the Kuzu graph (code symbols + findings +
+    entities + investigations) and return the rows.
+
+    Write-shaped queries (CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER) are rejected —
+    this tool never mutates the graph. Use it for impact analysis and traversal, e.g.
+    finding callers of a symbol, symbols a file defines, or findings that reference a
+    given CodeSymbol.
+
+    Node tables: CodeFile(path,lang), CodeSymbol(id,name,kind,file,line,lang),
+      Finding(id,investigation,ftype,text,confidence,source,ts), Entity(name,etype,distinctive),
+      Investigation(id,title).
+    Rel tables: DEFINES(CodeFile->CodeSymbol), CALLS(CodeSymbol->CodeSymbol),
+      IMPORTS(CodeFile->CodeFile), REFERENCES(Finding->CodeSymbol), MENTIONS(Finding->Entity),
+      DERIVED_FROM(Finding->Finding), IN_INVESTIGATION(Finding->Investigation),
+      RELATED(Investigation->Investigation).
+
+    Example: MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol {name:'helper'}) RETURN c.id, c.file
+
+    Args:
+        cypher: A read-only Cypher query.
+        params: Optional parameter dict for ``$name`` placeholders.
+
+    Returns:
+        JSON with {rows: [...], row_count} or an error (including a write-guard rejection).
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        rows = ks.code_query(cypher, params or None)
+        return json.dumps({"row_count": len(rows), "rows": rows}, indent=2, default=str)
+    except ValueError as exc:  # write-guard rejection
+        return json.dumps({"error": f"rejected (read-only tool): {exc}"})
+    except Exception as exc:
+        logger.debug("code_graph_query failed: %r", exc)
+        return json.dumps({"error": f"code_graph_query failed: {exc!r}"})
 
 
 def main() -> None:
