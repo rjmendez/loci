@@ -264,3 +264,62 @@ def related_investigations_via_code(ks: Any, investigation_id: str, limit: int =
         sample = list(names)[:6] if isinstance(names, list) else []
         out.append({"investigation": iid, "shared_symbols": int(shared), "sample_symbols": sample})
     return out
+
+
+# Decorators that mark a symbol as called externally (framework entry point) or
+# accessed specially (property) — such symbols are NOT dead even with zero callers.
+_ENTRYPOINT_DECORATORS = frozenset({
+    "mcp.tool", "tool", "mcp.resource", "resource", "mcp.prompt", "prompt",
+    "app.route", "route", "fixture", "pytest.fixture", "task", "command",
+    "staticmethod", "classmethod", "property", "abstractmethod", "cached_property",
+    "Override", "Test", "Before", "After", "Bean", "EventHandler",
+})
+_ENTRYPOINT_PREFIXES = ("mcp.", "app.", "cli.", "click.", "router.", "bp.", "celery.", "pytest.")
+# Names that are entry points by convention (module __main__ dispatch etc.) — no
+# in-graph caller even when live.
+_ENTRYPOINT_NAMES = frozenset({"main", "__main__"})
+
+
+def _is_entrypoint(decorators: str) -> bool:
+    for d in (decorators or "").split(","):
+        d = d.strip()
+        if not d:
+            continue
+        if d in _ENTRYPOINT_DECORATORS or any(d.lower().startswith(p) for p in _ENTRYPOINT_PREFIXES):
+            return True
+    return False
+
+
+def dead_code_candidates(ks: Any, *, lang: str | None = None, limit: int = 50) -> dict:
+    """Functions/methods with NO code caller and NO finding reference — with entry
+    points (decorated), private (_), tests, and dunders excluded — i.e. a *reliable*
+    dead-code list rather than the naive "0 callers" one.
+
+    Shape: ``{candidates:[{name,kind,file,line,decorators}], count, note}``. Fail-open.
+    NOTE: call-graph recall varies by language (Python is sparser) — treat as candidates
+    to verify, strongest for statically-typed code.
+    """
+    empty = {"candidates": [], "count": 0, "note": "graph unavailable"}
+    if not _ok(ks):
+        return empty
+    rows = _q(ks,
+        "MATCH (s:CodeSymbol) WHERE s.kind IN ['function','method'] "
+        "AND NOT EXISTS { MATCH (:CodeSymbol)-[:CALLS]->(s) } "
+        "AND NOT EXISTS { MATCH (:Finding)-[:REFERENCES]->(s) } "
+        "RETURN s.name, s.kind, s.file, s.line, s.decorators, s.lang")
+    out = []
+    for name, kind, file, line, decorators, l in rows:
+        if lang and l != lang:
+            continue
+        n = name or ""
+        if n.startswith("_") or n.startswith("test_") or n in _ENTRYPOINT_NAMES:
+            continue
+        if _is_entrypoint(decorators or ""):
+            continue
+        out.append({"name": n, "kind": kind, "file": file, "line": line,
+                    "decorators": decorators or ""})
+        if len(out) >= int(limit):
+            break
+    return {"candidates": out, "count": len(out),
+            "note": "no code-caller and no finding-reference; entry points/private/tests excluded. "
+                    "Call-graph recall varies by language (Python sparser) — verify before deleting."}

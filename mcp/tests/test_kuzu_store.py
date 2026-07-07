@@ -238,6 +238,44 @@ def test_ingest_code_module_qualified_call(tmp_path):
     assert [c["id"] for c in store.callers_of("helper")] == ["pkg/caller.py::use"]
 
 
+def test_ingest_code_python_duck_typing(tmp_path):
+    """Python Any-typed receiver: `ks.code_query()` resolves by globally-unique method
+    name; stdlib-name calls (`ks.get()`) and Java untyped receivers do NOT (precision)."""
+    store = KuzuStore(str(tmp_path / "duckdb"))
+    parsed = [{
+        "file": "m.py", "lang": "python", "import_map": {},
+        "symbols": [
+            {"id": "m.py::code_query", "name": "code_query", "kind": "function",
+             "line": 1, "lang": "python", "file": "m.py"},
+            {"id": "m.py::get", "name": "get", "kind": "function",
+             "line": 2, "lang": "python", "file": "m.py"},
+            {"id": "m.py::use", "name": "use", "kind": "function",
+             "line": 3, "lang": "python", "file": "m.py"},
+        ],
+        "edges": [
+            {"src": "m.py::use", "dst": "code_query", "type": "CALLS",
+             "receiver": "ks", "recv_kind": "name"},   # Any-typed -> unique name -> resolve
+            {"src": "m.py::use", "dst": "get", "type": "CALLS",
+             "receiver": "d", "recv_kind": "name"},     # stdlib name -> DROP
+        ], "imports": [],
+    }, {
+        "file": "J.java", "lang": "java", "import_map": {},
+        "symbols": [
+            {"id": "J.java::J", "name": "J", "kind": "class", "line": 1, "lang": "java", "file": "J.java"},
+            {"id": "J.java::J.uniqueThing", "name": "uniqueThing", "kind": "method",
+             "line": 2, "lang": "java", "file": "J.java"},
+            {"id": "J.java::J.run", "name": "run", "kind": "method", "line": 3, "lang": "java", "file": "J.java"},
+        ],
+        "edges": [{"src": "J.java::J.run", "dst": "uniqueThing", "type": "CALLS",
+                   "receiver": "x", "recv_kind": "name"}],  # java untyped -> DROP (not python)
+        "imports": [],
+    }]
+    store.ingest_code(parsed)
+    assert [c["id"] for c in store.callers_of("code_query")] == ["m.py::use"]   # resolved
+    assert store.callers_of("get") == []                                       # stopword -> dropped
+    assert store.callers_of("uniqueThing") == []                               # java untyped -> dropped
+
+
 def test_ingest_code_drops_untyped_and_expr_receivers(tmp_path):
     """Untyped variable receivers and complex-expression receivers are dropped
     in v1 (no global by-name fallback)."""

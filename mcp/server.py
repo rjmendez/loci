@@ -8910,6 +8910,35 @@ def related_investigations_via_code(investigation_id: str, limit: int = 15) -> s
         return json.dumps({"error": f"related_investigations_via_code failed: {exc!r}"})
 
 
+@mcp.tool()
+def dead_code_candidates(lang: Optional[str] = None, limit: int = 50) -> str:
+    """
+    Functions/methods with no code caller and no finding reference — a reliable
+    dead-code list with framework entry points (@mcp.tool, @app.route, @property…),
+    private (_), test, and dunder symbols excluded.
+
+    Requires an ingested code graph (code_graph_ingest). Call-graph recall varies by
+    language (Python is sparser than Java/Kotlin), so treat results as candidates to
+    verify. Composes graph.analytics.dead_code_candidates.
+
+    Args:
+        lang: Optional filter — "python" / "java" / "kotlin" / etc.
+        limit: Max candidates (default 50).
+
+    Returns:
+        JSON {candidates:[{name,kind,file,line,decorators}], count, note}.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import dead_code_candidates as _dead
+        return json.dumps(_dead(ks, lang=lang, limit=limit), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("dead_code_candidates failed: %r", exc)
+        return json.dumps({"error": f"dead_code_candidates failed: {exc!r}"})
+
+
 def main() -> None:
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
