@@ -156,7 +156,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, uuid, json, sqlite3, logging, datetime
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections
 from typing import Optional, Any
 
 # ── load .env before anything else ─────────────────────────────────────────────
@@ -201,7 +201,7 @@ QDRANT_URL = os.environ.get('QDRANT_URL')
 QDRANT_KEY = os.environ.get('QDRANT_API_KEY', '')
 
 # Ollama embedding (same config as hooks/pre_llm_grounding.py + session_end_sync.py)
-OLLAMA_BASE           = os.environ.get('MNEMOSYNE_EMBEDDING_API_URL')
+OLLAMA_BASE           = os.environ.get('MNEMOSYNE_EMBEDDING_API_URL', 'http://localhost:11434/v1')
 EMBED_MODEL           = os.environ.get('MNEMOSYNE_EMBEDDING_MODEL',   'nomic-embed-text')
 EMBED_DIM             = int(os.environ.get('MNEMOSYNE_EMBEDDING_DIM', '768'))
 _EMBED_API_KEY        = os.environ.get('EMBED_API_KEY', '')
@@ -364,24 +364,48 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
-    if not creds or creds.credentials != A2A_TOKEN:
+    if not creds or not hmac.compare_digest(creds.credentials, A2A_TOKEN):
         raise HTTPException(status_code=401, detail='Unauthorized — invalid or missing bearer token')
 
 
-def _verify_totp(x_totp: Optional[str] = Header(default=None)):
+# TOTP rate limiter: max 5 attempts per 60 seconds per client IP
+_TOTP_WINDOW = 60
+_TOTP_MAX_ATTEMPTS = 5
+_totp_attempts: dict = collections.defaultdict(list)
+
+
+def _verify_totp(request: Request, x_totp: Optional[str] = Header(default=None)):
     if TOTP_SEED:
         if x_totp is None:
             raise HTTPException(status_code=401, detail='X-TOTP header required (TOTP is enabled)')
+        client_ip = request.client.host if request.client else 'unknown'
+        now = time.monotonic()
+        attempts = _totp_attempts[client_ip]
+        # Evict timestamps older than the window
+        _totp_attempts[client_ip] = [t for t in attempts if now - t < _TOTP_WINDOW]
+        if len(_totp_attempts[client_ip]) >= _TOTP_MAX_ATTEMPTS:
+            raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
+        _totp_attempts[client_ip].append(now)
         if not pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1):
             raise HTTPException(status_code=401, detail='Invalid TOTP code')
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
-def _db() -> sqlite3.Connection:
-    """Open Mnemosyne SQLite with row_factory."""
+from contextlib import contextmanager
+
+@contextmanager
+def _db():
+    """Open Mnemosyne SQLite with row_factory, commit on success, always close."""
     conn = sqlite3.connect(MNEMOSYNE_DB, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _embed_auth_headers() -> dict:
@@ -396,7 +420,7 @@ def _embed_auth_headers() -> dict:
 
 async def _embed(text: str) -> Optional[list]:
     """Embed via OpenAI-compat /v1/embeddings. Works with Ollama and cloud providers."""
-    url = OLLAMA_BASE.rstrip('/') + '/embeddings'
+    url = OLLAMA_BASE.rstrip('/').removesuffix('/v1') + '/v1/embeddings'
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
             async with sess.post(url, json={'model': EMBED_MODEL, 'input': text[:2000]},
@@ -516,6 +540,8 @@ async def skill_memory_recall(task: dict) -> dict:
             for h in hits:
                 pl = h.get('payload', {})
                 mid = pl.get('memory_id', str(h.get('id', '')))
+                if float(h.get('score', 0)) < 0.59:
+                    continue
                 if mid not in seen_ids:
                     results.append({
                         'id': mid, 'content': pl.get('content', ''),
@@ -976,7 +1002,7 @@ async def skill_gpu_inference(task: dict) -> dict:
 
     try:
         async with aiohttp.ClientSession() as sess, sess.post(
-            f"{OLLAMA_BASE.rstrip('/v1')}/v1/chat/completions",
+            f"{OLLAMA_BASE.rstrip('/').removesuffix('/v1')}/v1/chat/completions",
             json={'model': model, 'messages': messages, 'max_tokens': max_t},
             timeout=aiohttp.ClientTimeout(total=120)
         ) as r:
@@ -1138,7 +1164,6 @@ async def skill_memory_prime(task: dict) -> dict:
         peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
 
         import uuid as _uuid
-        import aiohttp
 
         async def _prime_peer(peer_url: str):
             base  = peer_url.rstrip('/a2a').rstrip('/')

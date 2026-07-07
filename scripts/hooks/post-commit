@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# post-commit: re-ingest loci-codebase when Python files change.
+# Hook failures never block commits — all exit paths end with || true.
+
+set -uo pipefail
+
+# Check whether any .py files were touched in the most recent commit.
+if ! git diff-tree --no-commit-id -r --name-only HEAD 2>/dev/null \
+     | grep -q '\.py$'; then
+  exit 0
+fi
+
+echo "[post-commit] Python files changed — triggering loci-codebase re-ingest..."
+
+# Locate the repo root so the workflow path is always absolute.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Bail gracefully if the claude CLI is not available.
+if ! command -v claude >/dev/null 2>&1; then
+  echo "[post-commit] Warning: 'claude' CLI not found; skipping ingest." >&2
+  exit 0
+fi
+
+env -u ANTHROPIC_API_KEY \
+  claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
+  >> /tmp/loci-post-commit-ingest.log 2>&1 &
+
+# Run contract extraction for any .py/.ts/.go/.rs/.java change (non-blocking)
+"$REPO_ROOT/scripts/hooks/post-commit-contract-extract.sh" || true
+
+exit 0
