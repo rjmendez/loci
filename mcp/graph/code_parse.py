@@ -513,13 +513,17 @@ def _import_map_entries(node, lang: str):
                         al = c.child_by_field_name("alias")
                         base = _text(nm) if nm is not None else ""
                         key = _text(al) if al is not None else base.split(".")[-1]
-                        fqn = f"{mod_txt}.{base}" if mod_txt else base
+                        # Relative imports ("from . import queries") bind the module
+                        # by its simple name — don't prefix the dotted package path.
+                        fqn = base if (not mod_txt or set(mod_txt) <= {"."}) else f"{mod_txt}.{base}"
                         if key:
                             out.append((key, fqn))
                     elif c.type in ("dotted_name", "identifier"):
                         base = _text(c)
                         key = base.split(".")[-1]
-                        fqn = f"{mod_txt}.{base}" if mod_txt else base
+                        # Relative imports ("from . import queries") bind the module
+                        # by its simple name — don't prefix the dotted package path.
+                        fqn = base if (not mod_txt or set(mod_txt) <= {"."}) else f"{mod_txt}.{base}"
                         if key:
                             out.append((key, fqn))
             else:  # import_statement

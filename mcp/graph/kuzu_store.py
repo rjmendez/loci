@@ -392,7 +392,7 @@ class KuzuStore:
         """
         counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0,
                   "calls_dropped_external": 0, "calls_dropped_unresolved": 0,
-                  "calls_resolved_by_type": 0}
+                  "calls_resolved_by_type": 0, "calls_resolved_by_module": 0}
         if not self.ok or not parsed_files:
             return counts
         # Collect everything first, then insert in a few UNWIND batches.
@@ -537,6 +537,12 @@ class KuzuStore:
             by_name_unique: dict[str, str] = {
                 nm: name_first[nm] for nm, c in name_count.items() if c == 1
             }
+            # module simple-name (file stem) -> file path, for resolving module-
+            # qualified calls (Python "from . import queries as Q; Q.func()").
+            module_files: dict[str, str] = {}
+            for _fp in files:
+                _stem = _fp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                module_files.setdefault(_stem, _fp)
 
             def _find_named(ids: Optional[list], name: str) -> Optional[str]:
                 for mid in (ids or []):
@@ -548,6 +554,7 @@ class KuzuStore:
             n_external = 0
             n_unresolved = 0
             n_by_type = 0
+            n_by_module = 0
             for edge in call_edges:
                 src = edge["src"]
                 if src not in symbols:
@@ -585,6 +592,16 @@ class KuzuStore:
                             tgt = _find_named(class_methods.get(fqn_cls), callee)
                             if tgt:
                                 call_rows.append({"a": src, "b": tgt})
+                            else:
+                                n_unresolved += 1
+                        elif fqn_cls in module_files:
+                            # Import points at a repo MODULE (Python module-qualified
+                            # call, e.g. "Q.finding_symbols()") -> resolve the callee
+                            # within that module's file. Unambiguous, so precision-safe.
+                            tgt = _find_named(file_methods.get(module_files[fqn_cls]), callee)
+                            if tgt:
+                                call_rows.append({"a": src, "b": tgt})
+                                n_by_module += 1
                             else:
                                 n_unresolved += 1
                         else:
@@ -626,6 +643,7 @@ class KuzuStore:
             counts["calls_dropped_external"] = n_external
             counts["calls_dropped_unresolved"] = n_unresolved
             counts["calls_resolved_by_type"] = n_by_type
+            counts["calls_resolved_by_module"] = n_by_module
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)

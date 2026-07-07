@@ -210,6 +210,34 @@ def test_ingest_code_type_aware_calls(tmp_path):
         assert [c["id"] for c in store.callers_of(name)] == ["app/A.java::AppClass.caller"], name
 
 
+def test_ingest_code_module_qualified_call(tmp_path):
+    """Python module-qualified call: `from . import querymod as Q; Q.helper()`
+    resolves to querymod's helper (repo module import), NOT dropped as external."""
+    store = KuzuStore(str(tmp_path / "moddb"))
+    assert store.available()
+    parsed = [
+        {
+            "file": "pkg/querymod.py", "lang": "python", "import_map": {},
+            "symbols": [{"id": "pkg/querymod.py::helper", "name": "helper", "kind": "function",
+                         "line": 1, "lang": "python", "file": "pkg/querymod.py"}],
+            "edges": [], "imports": [],
+        },
+        {
+            "file": "pkg/caller.py", "lang": "python",
+            "import_map": {"Q": "querymod"},          # from . import querymod as Q
+            "symbols": [{"id": "pkg/caller.py::use", "name": "use", "kind": "function",
+                         "line": 1, "lang": "python", "file": "pkg/caller.py"}],
+            "edges": [{"src": "pkg/caller.py::use", "dst": "helper",
+                       "type": "CALLS", "receiver": "Q", "recv_kind": "name"}],
+            "imports": ["querymod"],
+        },
+    ]
+    counts = store.ingest_code(parsed)
+    assert counts["calls_resolved_by_module"] == 1
+    assert counts["calls_dropped_external"] == 0
+    assert [c["id"] for c in store.callers_of("helper")] == ["pkg/caller.py::use"]
+
+
 def test_ingest_code_drops_untyped_and_expr_receivers(tmp_path):
     """Untyped variable receivers and complex-expression receivers are dropped
     in v1 (no global by-name fallback)."""
