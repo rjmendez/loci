@@ -390,7 +390,8 @@ class KuzuStore:
         "edges":[{src,dst,type}], "imports":[module_str,...]}``.
         Returns ingestion counts.
         """
-        counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0}
+        counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0,
+                  "calls_dropped_external": 0, "calls_dropped_unresolved": 0}
         if not self.ok or not parsed_files:
             return counts
         # Collect everything first, then insert in a few UNWIND batches.
@@ -398,7 +399,10 @@ class KuzuStore:
         symbols: dict[str, dict] = {}       # id -> row
         defines: list[dict] = []
         imports: list[dict] = []
-        call_edges: list[tuple] = []
+        # Each call edge keeps the type-aware fields the resolver needs.
+        call_edges: list[dict] = []
+        # file path -> {simple imported name -> best-effort FQN}
+        file_import_map: dict[str, dict] = {}
         for pf in parsed_files:
             if not isinstance(pf, dict):
                 continue
@@ -407,6 +411,12 @@ class KuzuStore:
                 continue
             fpath = str(fpath)
             files.setdefault(fpath, str(pf.get("lang") or ""))
+            imap = pf.get("import_map")
+            if isinstance(imap, dict) and imap:
+                dst = file_import_map.setdefault(fpath, {})
+                for k, v in imap.items():
+                    if k and v:
+                        dst.setdefault(str(k), str(v))
             for sym in (pf.get("symbols") or []):
                 if not isinstance(sym, dict) or not sym.get("id"):
                     continue
@@ -426,7 +436,15 @@ class KuzuStore:
                     continue
                 src, dst = edge.get("src"), edge.get("dst")
                 if src and dst and "call" in str(edge.get("type") or "").lower():
-                    call_edges.append((str(src), str(dst)))
+                    rk = str(edge.get("recv_kind") or "none").lower()
+                    if rk not in ("self", "name", "expr", "none"):
+                        rk = "none"
+                    recv = edge.get("receiver")
+                    call_edges.append({
+                        "src": str(src), "callee": str(dst),
+                        "receiver": (str(recv) if recv else None),
+                        "recv_kind": rk, "file": fpath,
+                    })
             for imp in (pf.get("imports") or []):
                 if imp:
                     imports.append({"a": fpath, "b": str(imp)})
@@ -460,27 +478,102 @@ class KuzuStore:
                     {"rows": chunk},
                 )
             counts["imports"] = len(imports)
-            # CALLS — resolve dst by id, then by name within the batch, then one
-            # batched DB lookup for names defined by an earlier ingest.
-            by_name: dict[str, str] = {}
+            # CALLS — type-aware resolution over the parsed batch. We NEVER
+            # resolve a call that has an explicit receiver by bare global name;
+            # only bare/self calls use name scoping (class > file > unique).
+            #
+            # Precompute the lookup tables the resolver needs.
+            def _enclosing_class(sym_id: str) -> Optional[str]:
+                # id is "file::Qual"; enclosing simple class = segment before the
+                # method name (e.g. "A.B.m" -> "B"). Top-level func -> None.
+                qual = sym_id.split("::", 1)[1] if "::" in sym_id else sym_id
+                segs = qual.split(".")
+                return segs[-2] if len(segs) >= 2 else None
+
+            _TYPE_KINDS = {"class", "interface", "enum", "struct", "trait"}
+            app_type_names: set[str] = {
+                row["name"] for row in symbols.values()
+                if row["kind"].lower() in _TYPE_KINDS and row["name"]
+            }
+            # simpleClassName -> list of member (method) symbol ids.
+            class_methods: dict[str, list] = {}
+            # file path -> list of symbol ids defined in that file.
+            file_methods: dict[str, list] = {}
+            # method simple-name -> count, and -> a representative id.
+            name_count: dict[str, int] = {}
+            name_first: dict[str, str] = {}
             for sid, row in symbols.items():
-                by_name.setdefault(row["name"], sid)
-            unresolved = sorted({dst for src, dst in call_edges
-                                 if src in symbols and dst not in symbols and dst not in by_name})
-            db_name_map: dict[str, str] = {}
-            for chunk in self._chunks(unresolved):
-                for r in self._rows(
-                    "UNWIND $names AS n MATCH (s:CodeSymbol {name:n}) RETURN n, s.id",
-                    {"names": chunk},
-                ):
-                    db_name_map.setdefault(r[0], r[1])
-            call_rows = []
-            for src, dst in call_edges:
+                cls = _enclosing_class(sid)
+                if cls:
+                    class_methods.setdefault(cls, []).append(sid)
+                file_methods.setdefault(row["file"], []).append(sid)
+                nm = row["name"]
+                if nm:
+                    name_count[nm] = name_count.get(nm, 0) + 1
+                    name_first.setdefault(nm, sid)
+            by_name_unique: dict[str, str] = {
+                nm: name_first[nm] for nm, c in name_count.items() if c == 1
+            }
+
+            def _find_named(ids: Optional[list], name: str) -> Optional[str]:
+                for mid in (ids or []):
+                    if symbols[mid]["name"] == name:
+                        return mid
+                return None
+
+            call_rows: list[dict] = []
+            n_external = 0
+            n_unresolved = 0
+            for edge in call_edges:
+                src = edge["src"]
                 if src not in symbols:
+                    continue  # caller not in this batch
+                callee = edge["callee"]
+                # An explicit dst id in the batch is authoritative.
+                if callee in symbols:
+                    call_rows.append({"a": src, "b": callee})
                     continue
-                tgt = dst if dst in symbols else by_name.get(dst) or db_name_map.get(dst)
-                if tgt:
-                    call_rows.append({"a": src, "b": tgt})
+                rk = edge["recv_kind"]
+                recv = edge["receiver"]
+                tgt: Optional[str] = None
+                if rk in ("none", "self"):
+                    caller_cls = _enclosing_class(src)
+                    tgt = _find_named(class_methods.get(caller_cls), callee) \
+                        or _find_named(file_methods.get(edge["file"]), callee) \
+                        or by_name_unique.get(callee)
+                    if tgt:
+                        call_rows.append({"a": src, "b": tgt})
+                    else:
+                        n_unresolved += 1
+                elif rk == "name" and recv:
+                    if recv in app_type_names:
+                        # Static / typed call on a repo-defined type.
+                        tgt = _find_named(class_methods.get(recv), callee)
+                        if tgt:
+                            call_rows.append({"a": src, "b": tgt})
+                        else:
+                            n_unresolved += 1
+                    elif recv in file_import_map.get(edge["file"], {}):
+                        fqn = file_import_map[edge["file"]][recv]
+                        fqn_cls = fqn.split(".")[-1]
+                        if fqn_cls in app_type_names:
+                            # Import points at a repo type -> resolve as app call.
+                            tgt = _find_named(class_methods.get(fqn_cls), callee)
+                            if tgt:
+                                call_rows.append({"a": src, "b": tgt})
+                            else:
+                                n_unresolved += 1
+                        else:
+                            # Import points outside the repo (Log, Collections…).
+                            n_external += 1
+                    else:
+                        # Unknown / untyped variable receiver. v1: drop, do NOT
+                        # fall back to global by-name (that was the noise bug).
+                        n_unresolved += 1
+                else:
+                    # rk == "expr" (complex receiver) or a receiver'd call with no
+                    # receiver text. v1: drop.
+                    n_unresolved += 1
             for chunk in self._chunks(call_rows):
                 self._exec(
                     "UNWIND $rows AS r MATCH (a:CodeSymbol {id:r.a}), (b:CodeSymbol {id:r.b}) "
@@ -488,6 +581,8 @@ class KuzuStore:
                     {"rows": chunk},
                 )
             counts["calls"] = len(call_rows)
+            counts["calls_dropped_external"] = n_external
+            counts["calls_dropped_unresolved"] = n_unresolved
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)

@@ -272,6 +272,67 @@ def _rightmost_name(node) -> Optional[str]:
     return found[0]
 
 
+def _call_receiver(call_node, lang: str):
+    """Return ``(receiver_text_or_None, recv_kind)`` for a call/invocation node.
+
+    recv_kind is one of:
+      "self" -> receiver is this/self
+      "name" -> receiver is a plain identifier ("Log", "obj")
+      "expr" -> receiver is a complex expression (e.g. ``a.b().c``)
+      "none" -> bare call with no receiver (``foo()``)
+    """
+    try:
+        if lang == "java":
+            obj = call_node.child_by_field_name("object")
+            if obj is None:
+                return (None, "none")
+            if obj.type == "this":
+                return ("this", "self")
+            if obj.child_count == 0 and obj.type in _NAME_LEAVES:
+                return (_text(obj), "name")
+            return (_text(obj), "expr")
+
+        if lang == "python":
+            fn = call_node.child_by_field_name("function")
+            if fn is None:
+                return (None, "none")
+            if fn.type == "attribute":
+                obj = fn.child_by_field_name("object")
+                if obj is None:
+                    return (None, "expr")
+                if obj.type == "identifier" and obj.child_count == 0:
+                    txt = _text(obj)
+                    return (txt, "self" if txt == "self" else "name")
+                return (_text(obj), "expr")
+            return (None, "none")
+
+        if lang == "kotlin":
+            callee = None
+            for c in call_node.named_children:
+                if c.type not in _ARG_NODES:
+                    callee = c
+                    break
+            if callee is None:
+                return (None, "none")
+            if callee.type == "navigation_expression":
+                recv = None
+                for c in callee.named_children:
+                    if c.type == "navigation_suffix":
+                        break
+                    recv = c
+                if recv is None:
+                    return (None, "none")
+                if recv.type in ("this_expression", "this"):
+                    return ("this", "self")
+                if recv.type in _NAME_LEAVES:
+                    return (_text(recv), "name")
+                return (_text(recv), "expr")
+            return (None, "none")
+    except Exception:
+        return (None, "none")
+    return (None, "none")
+
+
 def _callee_name(call_node) -> Optional[str]:
     """Best-effort callee NAME (string) from a call/invocation node."""
     try:
@@ -351,6 +412,89 @@ def _import_modules(node, lang: str) -> List[str]:
     return [m for m in out if m]
 
 
+def _import_map_entries(node, lang: str):
+    """Best-effort ``(simple_name, fqn)`` pairs from an import-capture node.
+
+    java  ``import android.util.Log;``      -> ("Log", "android.util.Log")
+    kotlin ``import a.b.C`` / ``... as D``   -> ("C", "a.b.C") / ("D", "a.b.C")
+    python ``import os``                     -> ("os", "os")
+           ``import numpy as np``            -> ("np", "numpy")
+           ``from a.b import C``             -> ("C", "a.b.C")
+           ``from a.b import c as d``        -> ("d", "a.b.c")
+    """
+    out = []
+    try:
+        if lang == "java":
+            fqn = None
+            for c in node.named_children:
+                if c.type in ("scoped_identifier", "identifier"):
+                    fqn = _text(c)
+                    break
+            if fqn:
+                simple = fqn.split(".")[-1]
+                if simple and simple != "*":
+                    out.append((simple, fqn))
+
+        elif lang == "kotlin":
+            fqn = None
+            alias = None
+            for c in node.named_children:
+                if c.type == "identifier":
+                    fqn = _text(c)
+                elif c.type == "import_alias":
+                    an = c.child_by_field_name("name")
+                    if an is None:
+                        for gc in c.named_children:
+                            if gc.type in _NAME_LEAVES:
+                                an = gc
+                                break
+                    alias = _text(an) if an is not None else None
+            if fqn:
+                simple = alias or fqn.split(".")[-1]
+                if simple and simple != "*":
+                    out.append((simple, fqn))
+
+        elif lang == "python":
+            if node.type == "import_from_statement":
+                mod = node.child_by_field_name("module_name")
+                mod_txt = _text(mod) if mod is not None else ""
+                mod_span = (mod.start_byte, mod.end_byte) if mod is not None else None
+                for c in node.named_children:
+                    if mod_span is not None and (c.start_byte, c.end_byte) == mod_span:
+                        continue
+                    if c.type == "aliased_import":
+                        nm = c.child_by_field_name("name")
+                        al = c.child_by_field_name("alias")
+                        base = _text(nm) if nm is not None else ""
+                        key = _text(al) if al is not None else base.split(".")[-1]
+                        fqn = f"{mod_txt}.{base}" if mod_txt else base
+                        if key:
+                            out.append((key, fqn))
+                    elif c.type in ("dotted_name", "identifier"):
+                        base = _text(c)
+                        key = base.split(".")[-1]
+                        fqn = f"{mod_txt}.{base}" if mod_txt else base
+                        if key:
+                            out.append((key, fqn))
+            else:  # import_statement
+                for c in node.named_children:
+                    if c.type == "aliased_import":
+                        nm = c.child_by_field_name("name")
+                        al = c.child_by_field_name("alias")
+                        base = _text(nm) if nm is not None else ""
+                        key = _text(al) if al is not None else base.split(".")[0]
+                        if key:
+                            out.append((key, base))
+                    elif c.type == "dotted_name":
+                        base = _text(c)
+                        key = base.split(".")[0]  # ``import a.b`` binds ``a``
+                        if key:
+                            out.append((key, base))
+    except Exception:
+        return out
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Query capture normalisation
 # --------------------------------------------------------------------------- #
@@ -395,7 +539,14 @@ def _run_query(lang_obj, query_str: str, root) -> Dict[str, List[Any]]:
 # Core per-file parse
 # --------------------------------------------------------------------------- #
 def _empty(file: str, lang: Optional[str]) -> Dict[str, Any]:
-    return {"file": file, "lang": lang, "symbols": [], "edges": [], "imports": []}
+    return {
+        "file": file,
+        "lang": lang,
+        "symbols": [],
+        "edges": [],
+        "imports": [],
+        "import_map": {},
+    }
 
 
 def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[str, Any]:
@@ -459,17 +610,20 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
         symbols: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
         imports: List[str] = []
+        import_map: Dict[str, str] = {}
         seen_syms: set = set()
         seen_edges: set = set()
 
-        def add_edge(src, dst, etype):
+        def add_edge(src, dst, etype, **extra):
             if not dst:
                 return
-            key = (src, dst, etype)
+            key = (src, dst, etype, extra.get("receiver"), extra.get("recv_kind"))
             if key in seen_edges:
                 return
             seen_edges.add(key)
-            edges.append({"src": src, "dst": dst, "type": etype})
+            edge = {"src": src, "dst": dst, "type": etype}
+            edge.update(extra)
+            edges.append(edge)
 
         # ---- definitions (symbols + DEFINES) ----
         for cap_name, nodes in caps.items():
@@ -511,17 +665,22 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
             if not callee:
                 continue
             src = enclosing_symbol_src(node)
-            add_edge(src, callee, "CALLS")
+            recv, recv_kind = _call_receiver(node, lang)
+            add_edge(src, callee, "CALLS", receiver=recv, recv_kind=recv_kind)
 
-        # ---- imports (IMPORTS) ----
+        # ---- imports (IMPORTS + import_map) ----
         for node in caps.get("import", []):
             for mod in _import_modules(node, lang):
                 imports.append(mod)
                 add_edge(file, mod, "IMPORTS")
+            for simple, fqn in _import_map_entries(node, lang):
+                if simple and simple not in import_map:
+                    import_map[simple] = fqn
 
         result["symbols"] = symbols
         result["edges"] = edges
         result["imports"] = imports
+        result["import_map"] = import_map
         return result
     except Exception:
         return _empty(file, lang)

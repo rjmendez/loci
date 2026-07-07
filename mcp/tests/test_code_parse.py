@@ -28,11 +28,13 @@ class ClassA:
 
 JAVA_SNIPPET = b'''
 import java.util.List;
+import android.util.Log;
 
 class Foo {
     void bar() {
         baz();
         this.qux();
+        Log.w(x);
     }
 }
 '''
@@ -91,6 +93,62 @@ def test_java_symbols():
 
     calls = {e["dst"] for e in res["edges"] if e["type"] == "CALLS"}
     assert "baz" in calls
+
+
+def _calls(result):
+    return [e for e in result["edges"] if e["type"] == "CALLS"]
+
+
+def test_java_call_receivers():
+    res = parse_source("Foo.java", JAVA_SNIPPET)
+    by_dst = {e["dst"]: e for e in _calls(res)}
+
+    # Log.w(x) -> receiver "Log", recv_kind "name"
+    assert by_dst["w"]["receiver"] == "Log"
+    assert by_dst["w"]["recv_kind"] == "name"
+
+    # this.qux() -> recv_kind "self"
+    assert by_dst["qux"]["recv_kind"] == "self"
+    assert by_dst["qux"]["receiver"] == "this"
+
+    # bare baz() -> recv_kind "none", receiver None
+    assert by_dst["baz"]["recv_kind"] == "none"
+    assert by_dst["baz"]["receiver"] is None
+
+    # every CALLS edge carries both keys
+    for e in _calls(res):
+        assert "receiver" in e
+        assert "recv_kind" in e
+
+
+def test_java_import_map():
+    res = parse_source("Foo.java", JAVA_SNIPPET)
+    imap = res["import_map"]
+    assert imap["Log"] == "android.util.Log"
+    assert imap["List"] == "java.util.List"
+
+
+def test_python_call_receivers_and_import_map():
+    res = parse_source("snippet.py", PY_SNIPPET)
+    by_dst = {e["dst"]: e for e in _calls(res)}
+
+    # bare helper() -> none
+    assert by_dst["helper"]["recv_kind"] == "none"
+    assert by_dst["helper"]["receiver"] is None
+
+    # os.getpid() -> receiver "os", recv_kind "name"
+    assert by_dst["getpid"]["receiver"] == "os"
+    assert by_dst["getpid"]["recv_kind"] == "name"
+
+    imap = res["import_map"]
+    assert imap["os"] == "os"
+    assert imap["c"] == "a.b.c"
+
+
+def test_import_map_present_and_fail_open():
+    # always a dict, even on garbage / unknown lang
+    assert parse_source("weird.py", b"\x00 def (((").get("import_map") == {}
+    assert parse_source("data.unknownext", b"x")["import_map"] == {}
 
 
 def test_fail_open_garbage_bytes():

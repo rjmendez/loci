@@ -160,6 +160,91 @@ def test_ingest_code_and_reads(tmp_path):
     assert [f["id"] for f in store.symbol_findings("helper")] == ["cf1"]
 
 
+def test_ingest_code_type_aware_calls(tmp_path):
+    """Type-aware CALLS resolution: receiver'd calls are never resolved by bare
+    global name; external-import receivers (Log.w) are dropped entirely."""
+    store = KuzuStore(str(tmp_path / "typedb"))
+    assert store.available()
+
+    parsed = [
+        {
+            "file": "app/A.java", "lang": "java",
+            "import_map": {"Log": "android.util.Log"},
+            "symbols": [
+                {"id": "app/A.java::AppClass", "name": "AppClass", "kind": "class",
+                 "line": 1, "lang": "java", "file": "app/A.java"},
+                {"id": "app/A.java::AppClass.caller", "name": "caller", "kind": "method",
+                 "line": 5, "lang": "java", "file": "app/A.java"},
+                {"id": "app/A.java::AppClass.foo", "name": "foo", "kind": "method",
+                 "line": 10, "lang": "java", "file": "app/A.java"},
+                {"id": "app/A.java::AppClass.bar", "name": "bar", "kind": "method",
+                 "line": 15, "lang": "java", "file": "app/A.java"},
+                {"id": "app/A.java::AppClass.helper", "name": "helper", "kind": "method",
+                 "line": 20, "lang": "java", "file": "app/A.java"},
+            ],
+            "edges": [
+                # External import receiver -> DROP (no edge).
+                {"src": "app/A.java::AppClass.caller", "dst": "w",
+                 "type": "CALLS", "receiver": "Log", "recv_kind": "name"},
+                # this.foo() -> same class's foo.
+                {"src": "app/A.java::AppClass.caller", "dst": "foo",
+                 "type": "CALLS", "receiver": "this", "recv_kind": "self"},
+                # AppClass.bar() -> app-type static call resolves to AppClass.bar.
+                {"src": "app/A.java::AppClass.caller", "dst": "bar",
+                 "type": "CALLS", "receiver": "AppClass", "recv_kind": "name"},
+                # bare helper() -> enclosing class method.
+                {"src": "app/A.java::AppClass.caller", "dst": "helper",
+                 "type": "CALLS", "receiver": None, "recv_kind": "none"},
+            ],
+            "imports": ["android.util.Log"],
+        },
+    ]
+    counts = store.ingest_code(parsed)
+    assert counts["calls"] == 3
+    assert counts["calls_dropped_external"] == 1
+
+    # Log.w produced NO edge.
+    assert store.callers_of("w") == []
+    # this.foo / AppClass.bar / bare helper all resolve to the caller.
+    for name in ("foo", "bar", "helper"):
+        assert [c["id"] for c in store.callers_of(name)] == ["app/A.java::AppClass.caller"], name
+
+
+def test_ingest_code_drops_untyped_and_expr_receivers(tmp_path):
+    """Untyped variable receivers and complex-expression receivers are dropped
+    in v1 (no global by-name fallback)."""
+    store = KuzuStore(str(tmp_path / "untypeddb"))
+    assert store.available()
+
+    parsed = [
+        {
+            "file": "app/B.java", "lang": "java", "import_map": {},
+            "symbols": [
+                {"id": "app/B.java::C", "name": "C", "kind": "class",
+                 "line": 1, "lang": "java", "file": "app/B.java"},
+                {"id": "app/B.java::C.run", "name": "run", "kind": "method",
+                 "line": 5, "lang": "java", "file": "app/B.java"},
+                # A globally-unique 'target' that a receiver'd call must NOT reach.
+                {"id": "app/B.java::C.target", "name": "target", "kind": "method",
+                 "line": 9, "lang": "java", "file": "app/B.java"},
+            ],
+            "edges": [
+                # Unknown variable receiver -> DROP (no by-name fallback).
+                {"src": "app/B.java::C.run", "dst": "target",
+                 "type": "CALLS", "receiver": "obj", "recv_kind": "name"},
+                # Complex expression receiver -> DROP.
+                {"src": "app/B.java::C.run", "dst": "target",
+                 "type": "CALLS", "receiver": "a.b().c", "recv_kind": "expr"},
+            ],
+            "imports": [],
+        },
+    ]
+    counts = store.ingest_code(parsed)
+    assert counts["calls"] == 0
+    assert counts["calls_dropped_unresolved"] == 2
+    assert store.callers_of("target") == []
+
+
 def test_code_query_write_guard(tmp_path):
     store = KuzuStore(str(tmp_path / "guarddb"))
     assert store.available()
