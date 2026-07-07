@@ -150,6 +150,49 @@ def finding_code_context(ks: Any, finding_id: str, neighbours: int = 6) -> dict:
     return {"finding_id": finding_id, "text": (text or "")[:400], "symbols": out}
 
 
+def investigation_code_briefing(ks: Any, investigation_id: str, top: int = 3) -> dict:
+    """Capstone: the code story of an investigation, composed from the OTHER analytics.
+
+    Layers investigation_footprint (what it touches) + impact_report over its top
+    hotspot symbols (their blast radius + which other investigations share them) +
+    related_investigations_via_code (code-neighbouring cases). A tool built from tools.
+
+    Shape: ``{investigation, finding_count, symbols_touched, files_touched,
+    top_symbols:[{symbol, in_investigation_findings, transitive_callers,
+    total_referencing_findings, other_investigations:[...]}], related_investigations}``.
+    """
+    empty = {"investigation": investigation_id, "finding_count": 0, "symbols_touched": 0,
+             "files_touched": 0, "top_symbols": [], "related_investigations": []}
+    if not _ok(ks) or not investigation_id:
+        return empty
+    fp = Q.investigation_footprint(ks, investigation_id)
+    hotspots = _q(ks,
+        "MATCH (f:Finding)-[:IN_INVESTIGATION]->(i:Investigation {id:$id}) "
+        "MATCH (f)-[:REFERENCES]->(s:CodeSymbol) "
+        "RETURN s.name, count(DISTINCT f) AS c ORDER BY c DESC LIMIT $t",
+        {"id": investigation_id, "t": max(1, int(top))})
+    top_symbols = []
+    for name, cnt in hotspots:
+        rep = impact_report(ks, name, hops=2)
+        others = [i["id"] for i in rep["investigations"]
+                  if i["id"] not in (investigation_id, "(none)")]
+        top_symbols.append({
+            "symbol": name,
+            "in_investigation_findings": int(cnt),
+            "transitive_callers": rep["transitive_caller_count"],
+            "total_referencing_findings": rep["referencing_finding_count"],
+            "other_investigations": others[:5],
+        })
+    return {
+        "investigation": investigation_id,
+        "finding_count": fp.get("finding_count", 0),
+        "symbols_touched": len(fp.get("symbols", [])),
+        "files_touched": len(fp.get("files", [])),
+        "top_symbols": top_symbols,
+        "related_investigations": related_investigations_via_code(ks, investigation_id, limit=8),
+    }
+
+
 def subsystem_report(ks: Any, anchor: str, limit: int = 15) -> dict:
     """Full picture of a subsystem = the CodeSymbols under a file or path prefix.
 

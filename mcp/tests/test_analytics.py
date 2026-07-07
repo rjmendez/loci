@@ -77,6 +77,17 @@ def test_subsystem_report_prefix(ks):
     assert A.subsystem_report(ks, "nonexistent/")["files"] == []
 
 
+def test_investigation_code_briefing(ks):
+    b = A.investigation_code_briefing(ks, "inv1", top=2)
+    assert b["finding_count"] == 1
+    assert b["symbols_touched"] == 1  # inv1's finding references foo
+    top = {t["symbol"]: t for t in b["top_symbols"]}
+    assert "foo" in top
+    # foo is also referenced by inv2 -> shows up as a related/other investigation
+    assert "inv2" in top["foo"]["other_investigations"]
+    assert any(r["investigation"] == "inv2" for r in b["related_investigations"])
+
+
 def test_fail_open():
     class Dead:
         def available(self):

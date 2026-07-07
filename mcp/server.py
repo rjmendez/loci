@@ -5603,6 +5603,36 @@ def finding_code_context(finding_id: str) -> str:
 
 
 @mcp.tool()
+def investigation_code_briefing(investigation_id: str, top: int = 3) -> str:
+    """
+    The code story of an investigation: what code it touches, the blast radius of its
+    most-analysed symbols, and which other investigations share that code.
+
+    A one-call briefing composed from investigation_footprint + impact_report (over the
+    investigation's hotspot symbols) + related_investigations_via_code. Use it to onboard
+    onto a case or see how it connects to the codebase and to other cases.
+
+    Args:
+        investigation_id: The investigation to brief.
+        top: How many hotspot symbols to expand impact for (default 3).
+
+    Returns:
+        JSON {investigation, finding_count, symbols_touched, files_touched,
+        top_symbols:[{symbol, in_investigation_findings, transitive_callers,
+        total_referencing_findings, other_investigations}], related_investigations}.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import investigation_code_briefing as _brief
+        return json.dumps(_brief(ks, investigation_id, top=top), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("investigation_code_briefing failed: %r", exc)
+        return json.dumps({"error": f"investigation_code_briefing failed: {exc!r}"})
+
+
+@mcp.tool()
 def subsystem_report(anchor: str, limit: int = 15) -> str:
     """
     Full picture of a subsystem: the code under a file path or path/package prefix,
