@@ -5545,6 +5545,91 @@ def symbol_impact(symbol: str, hops: int = 3) -> str:
         return json.dumps({"error": f"symbol_impact failed: {exc!r}"})
 
 
+@mcp.tool()
+def impact_report(symbol: str, hops: int = 3) -> str:
+    """
+    Change blast radius for a code symbol or class: who calls it (transitively) and
+    which findings / investigations reference it or its callers.
+
+    Answers "if I change this, what code and what prior analysis is affected?".
+    For a class name it also folds in the class's own methods. Composes the
+    graph.analytics.impact_report primitive over the code<->memory graph.
+
+    Args:
+        symbol: A CodeSymbol name (method or class), e.g. "EskfFusion" or "updateGps".
+        hops: Transitive CALLS depth for callers (default 3, max 6).
+
+    Returns:
+        JSON with resolved symbols, direct + transitive caller counts, the count of
+        referencing findings, affected investigations (by finding count, with samples),
+        and the symbols most co-referenced with it. Empty structure if unavailable.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import impact_report as _impact
+        return json.dumps(_impact(ks, symbol, hops=hops), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("impact_report failed: %r", exc)
+        return json.dumps({"error": f"impact_report failed: {exc!r}"})
+
+
+@mcp.tool()
+def finding_code_context(finding_id: str) -> str:
+    """
+    The code a finding references, each symbol wrapped with its callers/callees.
+
+    Attach concrete code context when reviewing a finding — the CodeSymbols it
+    mentions plus each one's immediate call neighbourhood — so you can judge the
+    claim against the actual code. Composes graph.analytics.finding_code_context.
+
+    Args:
+        finding_id: The Finding id to contextualize.
+
+    Returns:
+        JSON {finding_id, text, symbols:[{id,name,kind,file,line,callers,callees}]}.
+        Empty symbols if the finding references no code (or is unavailable).
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import finding_code_context as _ctx
+        return json.dumps(_ctx(ks, finding_id), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("finding_code_context failed: %r", exc)
+        return json.dumps({"error": f"finding_code_context failed: {exc!r}"})
+
+
+@mcp.tool()
+def related_investigations_via_code(investigation_id: str, limit: int = 15) -> str:
+    """
+    Other investigations that reference the SAME code symbols as this one.
+
+    Code-mediated case linkage: surfaces prior investigations that touched the same
+    subsystem (shared CodeSymbols), ranked by overlap — even when they share no
+    entities or text. Composes graph.analytics.related_investigations_via_code.
+
+    Args:
+        investigation_id: The investigation to find code-neighbours for.
+        limit: Max related investigations (default 15).
+
+    Returns:
+        JSON list of {investigation, shared_symbols, sample_symbols}, ranked desc.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import related_investigations_via_code as _rel
+        return json.dumps({"investigation_id": investigation_id,
+                           "related": _rel(ks, investigation_id, limit=limit)}, indent=2, default=str)
+    except Exception as exc:
+        logger.debug("related_investigations_via_code failed: %r", exc)
+        return json.dumps({"error": f"related_investigations_via_code failed: {exc!r}"})
+
+
 def main() -> None:
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
