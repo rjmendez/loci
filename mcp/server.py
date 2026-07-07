@@ -294,7 +294,10 @@ def _kuzu_backfill_if_empty(ks) -> None:
         existing = 0
     if existing > 0:
         return
-    count = 0
+    finding_rows: list[dict] = []
+    mention_rows: list[dict] = []
+    derived_rows: list[dict] = []
+    invs: list[str] = []
     try:
         for inv_dir in sorted(MEMORY_DIR.iterdir()):
             if not inv_dir.is_dir() or inv_dir.name.startswith("_"):
@@ -302,14 +305,47 @@ def _kuzu_backfill_if_empty(ks) -> None:
             fjsonl = inv_dir / "findings.jsonl"
             if not fjsonl.exists():
                 continue
-            ks.upsert_investigation(inv_dir.name, "")
+            invs.append(inv_dir.name)
             for f in _read_jsonl(fjsonl):
-                _mirror_finding_to_kuzu(f, str(f.get("investigation_id") or inv_dir.name), ks=ks)
-                count += 1
+                fid = f.get("id")
+                if not fid:
+                    continue
+                inv = str(f.get("investigation_id") or inv_dir.name)
+                finding_rows.append({
+                    "id": fid, "investigation": inv,
+                    "type": f.get("finding_type") or f.get("type") or f.get("ftype") or "",
+                    "text": f.get("text", "") or "", "confidence": f.get("confidence", "") or "",
+                    "source": f.get("source", "") or "",
+                    "ts": _coerce_ts(f.get("ts") or f.get("created_at") or f.get("timestamp")),
+                })
+                ents = f.get("entities")
+                if isinstance(ents, dict):
+                    distinctive = _distinctive_entity_set(ents)
+                    for etype, vals in ents.items():
+                        for v in vals or []:
+                            name = str(v).strip()
+                            if name:
+                                mention_rows.append({"f": fid, "name": name, "etype": str(etype),
+                                                     "distinctive": name.lower() in distinctive})
+                df = f.get("derived_from")
+                if df:
+                    for p in (df if isinstance(df, (list, tuple, set)) else [df]):
+                        if p:
+                            derived_rows.append({"f": fid, "p": str(p)})
     except Exception as exc:
-        logger.debug("Kuzu backfill partial (fail-open): %r", exc)
-    if count:
-        logger.info("Kuzu backfill: mirrored %d pre-existing findings into the graph.", count)
+        logger.debug("Kuzu backfill scan failed (fail-open): %r", exc)
+    if not finding_rows:
+        return
+    try:
+        for iv in invs:
+            ks.upsert_investigation(iv, "")
+        n = ks.upsert_findings_batch(finding_rows)
+        ks.link_mentions_batch(mention_rows)
+        ks.link_derived_from_batch(derived_rows)
+        logger.info("Kuzu backfill: mirrored %d findings, %d mentions, %d derivations (batched).",
+                    n, len(mention_rows), len(derived_rows))
+    except Exception as exc:
+        logger.debug("Kuzu backfill batch failed (fail-open): %r", exc)
 
 
 def _entity_lookup_kuzu(entity: str, investigation_id, limit: int) -> list[dict]:

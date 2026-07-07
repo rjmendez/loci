@@ -265,6 +265,124 @@ class KuzuStore:
             logger.debug("link_related failed: %s", exc)
             return False
 
+    # ------------------------------------------------------------------ #
+    # Batched writes (UNWIND $rows) — ~orders of magnitude faster than the
+    # per-item MERGE loop for backfill / whole-repo code ingest. Fail-open.
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _chunks(seq, n=4000):
+        for i in range(0, len(seq), n):
+            yield seq[i:i + n]
+
+    def upsert_findings_batch(self, rows: list) -> int:
+        """Batch upsert findings (+ Investigation nodes + IN_INVESTIGATION).
+
+        ``rows``: dicts with id, investigation/inv, type/ftype, text, confidence,
+        source, ts. Returns the number of findings written.
+        """
+        if not self.ok or not rows:
+            return 0
+        norm: list[dict] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            fid = r.get("id") or r.get("finding_id")
+            if not fid:
+                continue
+            try:
+                ts = int(r.get("ts") or 0)
+            except Exception:
+                ts = 0
+            norm.append({
+                "id": str(fid),
+                "inv": str(r.get("investigation") or r.get("investigation_id") or ""),
+                "ftype": str(r.get("ftype") or r.get("type") or ""),
+                "text": str(r.get("text") or ""),
+                "conf": str(r.get("confidence") or ""),
+                "src": str(r.get("source") or ""),
+                "ts": ts,
+            })
+        if not norm:
+            return 0
+        try:
+            for chunk in self._chunks(norm):
+                self._exec(
+                    "UNWIND $rows AS r MERGE (f:Finding {id:r.id}) "
+                    "SET f.investigation=r.inv, f.ftype=r.ftype, f.text=r.text, "
+                    "f.confidence=r.conf, f.source=r.src, f.ts=r.ts",
+                    {"rows": chunk},
+                )
+            invs = sorted({r["inv"] for r in norm if r["inv"]})
+            if invs:
+                for chunk in self._chunks([{"id": i} for i in invs]):
+                    self._exec("UNWIND $rows AS r MERGE (i:Investigation {id:r.id})", {"rows": chunk})
+                pairs = [{"f": r["id"], "i": r["inv"]} for r in norm if r["inv"]]
+                for chunk in self._chunks(pairs):
+                    self._exec(
+                        "UNWIND $rows AS r MATCH (f:Finding {id:r.f}), (i:Investigation {id:r.i}) "
+                        "MERGE (f)-[:IN_INVESTIGATION]->(i)",
+                        {"rows": chunk},
+                    )
+            return len(norm)
+        except Exception as exc:
+            logger.debug("upsert_findings_batch failed: %s", exc)
+            return 0
+
+    def link_mentions_batch(self, rows: list) -> int:
+        """Batch link findings->entities. ``rows``: dicts {f, name, etype, distinctive}."""
+        if not self.ok or not rows:
+            return 0
+        norm = [
+            {"f": str(r.get("f") or ""), "name": str(r.get("name") or ""),
+             "etype": str(r.get("etype") or ""), "dist": bool(r.get("distinctive"))}
+            for r in rows if isinstance(r, dict) and r.get("f") and r.get("name")
+        ]
+        if not norm:
+            return 0
+        try:
+            ents: dict[str, dict] = {}
+            for r in norm:
+                ents.setdefault(r["name"], {"name": r["name"], "etype": r["etype"], "dist": r["dist"]})
+            for chunk in self._chunks(list(ents.values())):
+                self._exec(
+                    "UNWIND $rows AS r MERGE (e:Entity {name:r.name}) "
+                    "SET e.etype=r.etype, e.distinctive=r.dist",
+                    {"rows": chunk},
+                )
+            for chunk in self._chunks(norm):
+                self._exec(
+                    "UNWIND $rows AS r MATCH (f:Finding {id:r.f}), (e:Entity {name:r.name}) "
+                    "MERGE (f)-[:MENTIONS]->(e)",
+                    {"rows": chunk},
+                )
+            return len(norm)
+        except Exception as exc:
+            logger.debug("link_mentions_batch failed: %s", exc)
+            return 0
+
+    def link_derived_from_batch(self, rows: list) -> int:
+        """Batch link findings->parents. ``rows``: dicts {f, p} (child id, parent id)."""
+        if not self.ok or not rows:
+            return 0
+        norm = [{"f": str(r.get("f") or ""), "p": str(r.get("p") or "")}
+                for r in rows if isinstance(r, dict) and r.get("f") and r.get("p")]
+        if not norm:
+            return 0
+        try:
+            nodes = sorted({r["f"] for r in norm} | {r["p"] for r in norm})
+            for chunk in self._chunks([{"id": n} for n in nodes]):
+                self._exec("UNWIND $rows AS r MERGE (f:Finding {id:r.id})", {"rows": chunk})
+            for chunk in self._chunks(norm):
+                self._exec(
+                    "UNWIND $rows AS r MATCH (f:Finding {id:r.f}), (p:Finding {id:r.p}) "
+                    "MERGE (f)-[:DERIVED_FROM]->(p)",
+                    {"rows": chunk},
+                )
+            return len(norm)
+        except Exception as exc:
+            logger.debug("link_derived_from_batch failed: %s", exc)
+            return 0
+
     def ingest_code(self, parsed_files: list) -> dict:
         """Ingest ``code_parse`` per-file dicts into the code graph.
 
@@ -275,81 +393,101 @@ class KuzuStore:
         counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0}
         if not self.ok or not parsed_files:
             return counts
+        # Collect everything first, then insert in a few UNWIND batches.
+        files: dict[str, str] = {}          # path -> lang
+        symbols: dict[str, dict] = {}       # id -> row
+        defines: list[dict] = []
+        imports: list[dict] = []
+        call_edges: list[tuple] = []
+        for pf in parsed_files:
+            if not isinstance(pf, dict):
+                continue
+            fpath = pf.get("file")
+            if not fpath:
+                continue
+            fpath = str(fpath)
+            files.setdefault(fpath, str(pf.get("lang") or ""))
+            for sym in (pf.get("symbols") or []):
+                if not isinstance(sym, dict) or not sym.get("id"):
+                    continue
+                try:
+                    line = int(sym.get("line") or 0)
+                except Exception:
+                    line = 0
+                symbols[str(sym["id"])] = {
+                    "id": str(sym["id"]), "name": str(sym.get("name") or ""),
+                    "kind": str(sym.get("kind") or ""),
+                    "file": str(sym.get("file") or fpath), "line": line,
+                    "lang": str(sym.get("lang") or files[fpath]),
+                }
+                defines.append({"p": fpath, "s": str(sym["id"])})
+            for edge in (pf.get("edges") or []):
+                if not isinstance(edge, dict):
+                    continue
+                src, dst = edge.get("src"), edge.get("dst")
+                if src and dst and "call" in str(edge.get("type") or "").lower():
+                    call_edges.append((str(src), str(dst)))
+            for imp in (pf.get("imports") or []):
+                if imp:
+                    imports.append({"a": fpath, "b": str(imp)})
         try:
-            for pf in parsed_files:
-                if not isinstance(pf, dict):
-                    continue
-                fpath = pf.get("file")
-                if not fpath:
-                    continue
-                flang = str(pf.get("lang") or "")
+            # Files (source files + placeholder nodes for imported modules).
+            file_rows = [{"p": p, "l": l} for p, l in files.items()]
+            file_rows += [{"p": t, "l": ""} for t in ({r["b"] for r in imports} - set(files))]
+            for chunk in self._chunks(file_rows):
+                self._exec("UNWIND $rows AS r MERGE (c:CodeFile {path:r.p}) SET c.lang=r.l", {"rows": chunk})
+            counts["files"] = len(files)
+            # Symbols + DEFINES.
+            for chunk in self._chunks(list(symbols.values())):
                 self._exec(
-                    "MERGE (c:CodeFile {path:$p}) SET c.lang=$l",
-                    {"p": str(fpath), "l": flang},
+                    "UNWIND $rows AS r MERGE (s:CodeSymbol {id:r.id}) "
+                    "SET s.name=r.name, s.kind=r.kind, s.file=r.file, s.line=r.line, s.lang=r.lang",
+                    {"rows": chunk},
                 )
-                counts["files"] += 1
-
-                for sym in (pf.get("symbols") or []):
-                    if not isinstance(sym, dict):
-                        continue
-                    sid = sym.get("id")
-                    if not sid:
-                        continue
-                    try:
-                        line = int(sym.get("line") or 0)
-                    except Exception:
-                        line = 0
-                    self._exec(
-                        "MERGE (s:CodeSymbol {id:$id}) SET s.name=$name, s.kind=$kind, "
-                        "s.file=$file, s.line=$line, s.lang=$lang",
-                        {"id": str(sid), "name": str(sym.get("name") or ""),
-                         "kind": str(sym.get("kind") or ""),
-                         "file": str(sym.get("file") or fpath),
-                         "line": line, "lang": str(sym.get("lang") or flang)},
-                    )
-                    counts["symbols"] += 1
-                    self._exec(
-                        "MATCH (c:CodeFile {path:$p}), (s:CodeSymbol {id:$s}) "
-                        "MERGE (c)-[:DEFINES]->(s)",
-                        {"p": str(fpath), "s": str(sid)},
-                    )
-                    counts["defines"] += 1
-
-                for edge in (pf.get("edges") or []):
-                    if not isinstance(edge, dict):
-                        continue
-                    src, dst = edge.get("src"), edge.get("dst")
-                    etype = str(edge.get("type") or "").lower()
-                    if not src or not dst:
-                        continue
-                    if "call" not in etype:
-                        continue
-                    resolved = self._resolve_symbol(str(dst))
-                    if resolved is None:
-                        continue
-                    try:
-                        self._exec(
-                            "MATCH (a:CodeSymbol {id:$a}), (b:CodeSymbol {id:$b}) "
-                            "MERGE (a)-[:CALLS]->(b)",
-                            {"a": str(src), "b": resolved},
-                        )
-                        counts["calls"] += 1
-                    except Exception:
-                        continue
-
-                for imp in (pf.get("imports") or []):
-                    if not imp:
-                        continue
-                    self._exec(
-                        "MERGE (c:CodeFile {path:$p}) SET c.lang=coalesce(c.lang,'')",
-                        {"p": str(imp)},
-                    )
-                    self._exec(
-                        "MATCH (a:CodeFile {path:$a}), (b:CodeFile {path:$b}) "
-                        "MERGE (a)-[:IMPORTS]->(b)",
-                        {"a": str(fpath), "b": str(imp)},
-                    )
-                    counts["imports"] += 1
+            counts["symbols"] = len(symbols)
+            for chunk in self._chunks(defines):
+                self._exec(
+                    "UNWIND $rows AS r MATCH (c:CodeFile {path:r.p}), (s:CodeSymbol {id:r.s}) "
+                    "MERGE (c)-[:DEFINES]->(s)",
+                    {"rows": chunk},
+                )
+            counts["defines"] = len(defines)
+            # IMPORTS.
+            for chunk in self._chunks(imports):
+                self._exec(
+                    "UNWIND $rows AS r MATCH (a:CodeFile {path:r.a}), (b:CodeFile {path:r.b}) "
+                    "MERGE (a)-[:IMPORTS]->(b)",
+                    {"rows": chunk},
+                )
+            counts["imports"] = len(imports)
+            # CALLS — resolve dst by id, then by name within the batch, then one
+            # batched DB lookup for names defined by an earlier ingest.
+            by_name: dict[str, str] = {}
+            for sid, row in symbols.items():
+                by_name.setdefault(row["name"], sid)
+            unresolved = sorted({dst for src, dst in call_edges
+                                 if src in symbols and dst not in symbols and dst not in by_name})
+            db_name_map: dict[str, str] = {}
+            for chunk in self._chunks(unresolved):
+                for r in self._rows(
+                    "UNWIND $names AS n MATCH (s:CodeSymbol {name:n}) RETURN n, s.id",
+                    {"names": chunk},
+                ):
+                    db_name_map.setdefault(r[0], r[1])
+            call_rows = []
+            for src, dst in call_edges:
+                if src not in symbols:
+                    continue
+                tgt = dst if dst in symbols else by_name.get(dst) or db_name_map.get(dst)
+                if tgt:
+                    call_rows.append({"a": src, "b": tgt})
+            for chunk in self._chunks(call_rows):
+                self._exec(
+                    "UNWIND $rows AS r MATCH (a:CodeSymbol {id:r.a}), (b:CodeSymbol {id:r.b}) "
+                    "MERGE (a)-[:CALLS]->(b)",
+                    {"rows": chunk},
+                )
+            counts["calls"] = len(call_rows)
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)
