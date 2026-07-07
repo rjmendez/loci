@@ -245,6 +245,68 @@ def test_ingest_code_drops_untyped_and_expr_receivers(tmp_path):
     assert store.callers_of("target") == []
 
 
+def test_ingest_code_receiver_type_inference(tmp_path):
+    """Receiver-type inference (step 2.5): a receiver variable whose declared type
+    is an APP type resolves to that type's method; a receiver typed to an imported
+    non-app class is dropped external; unknown/import-only receivers still drop."""
+    store = KuzuStore(str(tmp_path / "recvtypedb"))
+    assert store.available()
+
+    parsed = [
+        {
+            "file": "app/A.java", "lang": "java",
+            "import_map": {"Log": "android.util.Log",
+                           "OutputStream": "java.io.OutputStream"},
+            "symbols": [
+                {"id": "app/A.java::A", "name": "A", "kind": "class",
+                 "line": 1, "lang": "java", "file": "app/A.java"},
+                {"id": "app/A.java::A.run", "name": "run", "kind": "method",
+                 "line": 5, "lang": "java", "file": "app/A.java"},
+                # The app type whose method we expect the receiver call to reach.
+                {"id": "app/FooService.java::FooService", "name": "FooService",
+                 "kind": "class", "line": 1, "lang": "java",
+                 "file": "app/FooService.java"},
+                {"id": "app/FooService.java::FooService.doThing", "name": "doThing",
+                 "kind": "method", "line": 4, "lang": "java",
+                 "file": "app/FooService.java"},
+            ],
+            # svc is a field of class A typed to the app type FooService;
+            # ext is a local of A.run typed to an imported non-app class.
+            "decls": [
+                {"name": "svc", "type": "FooService", "scope": "app/A.java::A",
+                 "scope_kind": "field"},
+                {"name": "ext", "type": "OutputStream",
+                 "scope": "app/A.java::A.run", "scope_kind": "local"},
+            ],
+            "edges": [
+                # svc.doThing() -> resolves via field type inference to FooService.
+                {"src": "app/A.java::A.run", "dst": "doThing",
+                 "type": "CALLS", "receiver": "svc", "recv_kind": "name"},
+                # ext.close() -> ext typed to imported non-app class -> DROP.
+                {"src": "app/A.java::A.run", "dst": "close",
+                 "type": "CALLS", "receiver": "ext", "recv_kind": "name"},
+                # Log.w(...) -> external import receiver -> DROP.
+                {"src": "app/A.java::A.run", "dst": "w",
+                 "type": "CALLS", "receiver": "Log", "recv_kind": "name"},
+            ],
+            "imports": ["android.util.Log", "java.io.OutputStream"],
+        },
+        {"file": "app/FooService.java", "lang": "java", "symbols": [], "edges": [],
+         "imports": []},
+    ]
+    counts = store.ingest_code(parsed)
+    assert counts["calls"] == 1
+    assert counts["calls_resolved_by_type"] == 1
+    assert counts["calls_dropped_external"] == 1      # Log.w
+    assert counts["calls_dropped_unresolved"] == 1    # ext.close (external type)
+
+    # svc.doThing resolved to FooService.doThing.
+    assert [c["id"] for c in store.callers_of("doThing")] == ["app/A.java::A.run"]
+    # ext.close and Log.w produced NO edges.
+    assert store.callers_of("close") == []
+    assert store.callers_of("w") == []
+
+
 def test_code_query_write_guard(tmp_path):
     store = KuzuStore(str(tmp_path / "guarddb"))
     assert store.available()

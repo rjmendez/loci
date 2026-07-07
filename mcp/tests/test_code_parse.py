@@ -176,6 +176,71 @@ def test_detect_lang_and_ext_map():
     assert LANG_BY_EXT[".rs"] == "rust"
 
 
+DECL_JAVA = b'''
+class Foo {
+    private FooService svc;
+    private List<Bar> items;
+    void handle(BarClient c) {
+        Baz b = new Baz();
+    }
+}
+'''
+
+
+def test_java_decls_field_param_local():
+    res = parse_source("Foo.java", DECL_JAVA)
+    decls = res["decls"]
+    class_id = next(s["id"] for s in res["symbols"] if s["name"] == "Foo")
+    method_id = next(s["id"] for s in res["symbols"] if s["name"] == "handle")
+
+    # every decl has the required shape
+    for d in decls:
+        assert set(d) == {"name", "type", "scope", "scope_kind"}, d
+        assert d["scope_kind"] in ("field", "local", "param")
+
+    by_name = {d["name"]: d for d in decls}
+
+    # field: private FooService svc; -> scoped to the CLASS id
+    svc = by_name["svc"]
+    assert svc == {
+        "name": "svc",
+        "type": "FooService",
+        "scope": class_id,
+        "scope_kind": "field",
+    }
+
+    # generics stripped: List<Bar> -> "List"
+    assert by_name["items"]["type"] == "List"
+    assert by_name["items"]["scope_kind"] == "field"
+
+    # param: void handle(BarClient c) -> type "BarClient", scoped to the METHOD id
+    c = by_name["c"]
+    assert c["type"] == "BarClient"
+    assert c["scope"] == method_id
+    assert c["scope_kind"] == "param"
+
+    # local: Baz b = new Baz(); -> type "Baz", scoped to the METHOD id
+    b = by_name["b"]
+    assert b["type"] == "Baz"
+    assert b["scope"] == method_id
+    assert b["scope_kind"] == "local"
+
+
+def test_java_var_local_infers_ctor_type():
+    src = b"class C { void m() { var x = new Widget(); } }"
+    res = parse_source("C.java", src)
+    x = next(d for d in res["decls"] if d["name"] == "x")
+    assert x["type"] == "Widget"
+    assert x["scope_kind"] == "local"
+
+
+def test_decls_present_and_fail_open():
+    # always a list, even on garbage / unknown lang
+    assert parse_source("weird.py", b"\x00 def (((").get("decls") == []
+    assert parse_source("data.unknownext", b"x")["decls"] == []
+    assert isinstance(parse_source("snippet.py", PY_SNIPPET)["decls"], list)
+
+
 def test_parse_path_walks_dir(tmp_path):
     (tmp_path / "a.py").write_bytes(PY_SNIPPET)
     (tmp_path / "Foo.java").write_bytes(JAVA_SNIPPET)

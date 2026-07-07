@@ -356,6 +356,52 @@ def _callee_name(call_node) -> Optional[str]:
         return None
 
 
+def _norm_type(s: Optional[str]) -> Optional[str]:
+    """Normalise a raw type string to a simple (rightmost) type name.
+
+    Strips generics (``List<Foo>`` -> ``List``), arrays (``Foo[]`` -> ``Foo``),
+    trailing nullability ``?``, and package/scope qualifiers. Returns None when
+    nothing usable remains.
+    """
+    if not s:
+        return None
+    try:
+        s = s.strip()
+        if "<" in s:  # strip generic args
+            s = s.split("<", 1)[0]
+        s = s.replace("[]", "")  # array dims
+        s = s.replace("[", "").replace("]", "")
+        s = s.strip().rstrip("?").strip()
+        # rightmost of dotted / scoped names
+        for sep in ("::", "."):
+            if sep in s:
+                s = s.split(sep)[-1]
+        s = s.strip()
+        if not s or not any(ch.isalnum() or ch == "_" for ch in s):
+            return None
+        return s
+    except Exception:
+        return None
+
+
+def _infer_java_ctor_type(value_node):
+    """Infer a type name from a java initializer (``new Foo()`` -> ``Foo``)."""
+    try:
+        stack = [value_node]
+        while stack:
+            n = stack.pop()
+            if n is None:
+                continue
+            if n.type == "object_creation_expression":
+                t = n.child_by_field_name("type")
+                if t is not None:
+                    return _norm_type(_text(t))
+            stack.extend(n.children)
+    except Exception:
+        return None
+    return None
+
+
 def _strip_quotes(s: str) -> str:
     s = s.strip()
     if len(s) >= 2 and s[0] in "\"'`" and s[-1] == s[0]:
@@ -536,6 +582,157 @@ def _run_query(lang_obj, query_str: str, root) -> Dict[str, List[Any]]:
 
 
 # --------------------------------------------------------------------------- #
+# Declaration capture (fields / params / locals) for receiver-type inference
+# --------------------------------------------------------------------------- #
+def _first_child_type(node, types):
+    """First direct named child whose type is in ``types`` (or None)."""
+    try:
+        for c in node.named_children:
+            if c.type in types:
+                return c
+    except Exception:
+        return None
+    return None
+
+
+def _kotlin_property_name_type(prop_node):
+    """(name, type_str_or_None) for a kotlin property/local declaration node."""
+    name = None
+    type_ = None
+    vd = _first_child_type(prop_node, {"variable_declaration"})
+    if vd is not None:
+        for c in vd.named_children:
+            if c.type == "simple_identifier" and name is None:
+                name = _text(c)
+            elif c.type == "user_type" and type_ is None:
+                ut = _first_child_type(c, {"type_identifier"})
+                type_ = _norm_type(_text(ut)) if ut is not None else _norm_type(_text(c))
+    if type_ is None:  # infer from ``val x = Foo()`` constructor call
+        call = _first_child_type(prop_node, {"call_expression"})
+        if call is not None:
+            type_ = _norm_type(_callee_name(call))
+    return name, type_
+
+
+def _collect_decls(root, lang, def_types, enclosing_symbol_src, in_method, add_decl):
+    """Walk the whole tree once, emitting field/param/local declarations.
+
+    FAIL-OPEN: individual node handling is wrapped; nothing raises out.
+    """
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        try:
+            t = node.type
+
+            if lang == "java":
+                if t == "field_declaration":
+                    tnode = node.child_by_field_name("type")
+                    type_ = _norm_type(_text(tnode)) if tnode is not None else None
+                    scope = enclosing_symbol_src(node)
+                    for c in node.named_children:
+                        if c.type == "variable_declarator":
+                            nm = c.child_by_field_name("name")
+                            if nm is not None:
+                                add_decl(_text(nm), type_, scope, "field")
+                elif t == "formal_parameter":
+                    tnode = node.child_by_field_name("type")
+                    nm = node.child_by_field_name("name")
+                    if nm is not None:
+                        type_ = _norm_type(_text(tnode)) if tnode is not None else None
+                        add_decl(_text(nm), type_, enclosing_symbol_src(node), "param")
+                elif t == "local_variable_declaration":
+                    tnode = node.child_by_field_name("type")
+                    type_ = _norm_type(_text(tnode)) if tnode is not None else None
+                    scope = enclosing_symbol_src(node)
+                    for c in node.named_children:
+                        if c.type == "variable_declarator":
+                            nm = c.child_by_field_name("name")
+                            if nm is None:
+                                continue
+                            dtype = type_
+                            if dtype == "var" or dtype is None:
+                                val = c.child_by_field_name("value")
+                                inferred = _infer_java_ctor_type(val) if val is not None else None
+                                dtype = inferred if inferred else (None if dtype == "var" else dtype)
+                            add_decl(_text(nm), dtype, scope, "local")
+
+            elif lang == "kotlin":
+                if t == "property_declaration":
+                    name, type_ = _kotlin_property_name_type(node)
+                    if name is not None:
+                        kind = "local" if in_method(node) else "field"
+                        add_decl(name, type_, enclosing_symbol_src(node), kind)
+                elif t in ("parameter", "class_parameter"):
+                    nm = _first_child_type(node, {"simple_identifier"})
+                    ut = _first_child_type(node, {"user_type"})
+                    type_ = None
+                    if ut is not None:
+                        ti = _first_child_type(ut, {"type_identifier"})
+                        type_ = _norm_type(_text(ti)) if ti is not None else _norm_type(_text(ut))
+                    if nm is not None:
+                        add_decl(_text(nm), type_, enclosing_symbol_src(node), "param")
+
+            elif lang == "python":
+                if t == "assignment":
+                    left = node.child_by_field_name("left")
+                    if left is not None and left.type == "identifier":
+                        edn_method = in_method(node)
+                        # only class-body (field) or function-body (local) assigns
+                        if edn_method or _python_is_class_field(node, def_types):
+                            tnode = node.child_by_field_name("type")
+                            type_ = None
+                            if tnode is not None:
+                                ti = _first_child_type(tnode, _NAME_LEAVES) or tnode
+                                type_ = _norm_type(_text(ti))
+                            if type_ is None:
+                                val = node.child_by_field_name("right")
+                                if val is not None and val.type == "call":
+                                    type_ = _norm_type(_callee_name(val))
+                            kind = "local" if edn_method else "field"
+                            add_decl(_text(left), type_, enclosing_symbol_src(node), kind)
+                elif t in ("typed_parameter", "typed_default_parameter"):
+                    nm = _first_child_type(node, {"identifier"})
+                    tnode = node.child_by_field_name("type")
+                    type_ = None
+                    if tnode is not None:
+                        ti = _first_child_type(tnode, _NAME_LEAVES) or tnode
+                        type_ = _norm_type(_text(ti))
+                    if nm is not None:
+                        add_decl(_text(nm), type_, enclosing_symbol_src(node), "param")
+                elif t == "parameters":
+                    for c in node.named_children:
+                        if c.type == "identifier":
+                            add_decl(_text(c), None, enclosing_symbol_src(node), "param")
+                        elif c.type == "default_parameter":
+                            nm = c.child_by_field_name("name")
+                            if nm is None:
+                                nm = _first_child_type(c, {"identifier"})
+                            if nm is not None:
+                                add_decl(_text(nm), None, enclosing_symbol_src(node), "param")
+        except Exception:
+            pass
+
+        try:
+            stack.extend(node.children)
+        except Exception:
+            pass
+
+
+def _python_is_class_field(assign_node, def_types) -> bool:
+    """True when the nearest enclosing definition of a python assignment is a class."""
+    try:
+        cur = assign_node.parent
+        while cur is not None:
+            if cur.type in def_types:
+                return cur.type == "class_definition"
+            cur = cur.parent
+    except Exception:
+        return False
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Core per-file parse
 # --------------------------------------------------------------------------- #
 def _empty(file: str, lang: Optional[str]) -> Dict[str, Any]:
@@ -546,6 +743,7 @@ def _empty(file: str, lang: Optional[str]) -> Dict[str, Any]:
         "edges": [],
         "imports": [],
         "import_map": {},
+        "decls": [],
     }
 
 
@@ -677,10 +875,52 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
                 if simple and simple not in import_map:
                     import_map[simple] = fqn
 
+        # ---- declarations (fields / params / locals) ----
+        method_kinds = {"method", "function"}
+
+        def enclosing_def_node(node):
+            cur = node.parent
+            while cur is not None:
+                if cur.type in def_types:
+                    return cur
+                cur = cur.parent
+            return None
+
+        decls: List[Dict[str, Any]] = []
+        seen_decls: set = set()
+
+        def add_decl(name, type_, scope, scope_kind):
+            if not name or not scope_kind:
+                return
+            key = (name, type_, scope, scope_kind)
+            if key in seen_decls:
+                return
+            seen_decls.add(key)
+            decls.append(
+                {
+                    "name": name,
+                    "type": type_,
+                    "scope": scope,
+                    "scope_kind": scope_kind,
+                }
+            )
+
+        def _in_method(node) -> bool:
+            edn = enclosing_def_node(node)
+            return edn is not None and def_types.get(edn.type) in method_kinds
+
+        try:
+            _collect_decls(
+                root, lang, def_types, enclosing_symbol_src, _in_method, add_decl
+            )
+        except Exception:
+            pass
+
         result["symbols"] = symbols
         result["edges"] = edges
         result["imports"] = imports
         result["import_map"] = import_map
+        result["decls"] = decls
         return result
     except Exception:
         return _empty(file, lang)

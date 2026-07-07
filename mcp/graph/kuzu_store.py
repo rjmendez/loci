@@ -391,7 +391,8 @@ class KuzuStore:
         Returns ingestion counts.
         """
         counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0,
-                  "calls_dropped_external": 0, "calls_dropped_unresolved": 0}
+                  "calls_dropped_external": 0, "calls_dropped_unresolved": 0,
+                  "calls_resolved_by_type": 0}
         if not self.ok or not parsed_files:
             return counts
         # Collect everything first, then insert in a few UNWIND batches.
@@ -403,6 +404,9 @@ class KuzuStore:
         call_edges: list[dict] = []
         # file path -> {simple imported name -> best-effort FQN}
         file_import_map: dict[str, dict] = {}
+        # scope symbol id -> {declared var/field/param name -> declared type simple}
+        # (last decl wins; null types skipped). Powers receiver-type inference.
+        decls_by_scope: dict[str, dict] = {}
         for pf in parsed_files:
             if not isinstance(pf, dict):
                 continue
@@ -448,6 +452,15 @@ class KuzuStore:
             for imp in (pf.get("imports") or []):
                 if imp:
                     imports.append({"a": fpath, "b": str(imp)})
+            for dec in (pf.get("decls") or []):
+                if not isinstance(dec, dict):
+                    continue
+                dname = dec.get("name")
+                dtype = dec.get("type")
+                dscope = dec.get("scope")
+                if not dname or not dtype or not dscope:
+                    continue  # null/unknown type or no scope -> nothing to infer
+                decls_by_scope.setdefault(str(dscope), {})[str(dname)] = str(dtype)
         try:
             # Files (source files + placeholder nodes for imported modules).
             file_rows = [{"p": p, "l": l} for p, l in files.items()]
@@ -490,6 +503,16 @@ class KuzuStore:
                 segs = qual.split(".")
                 return segs[-2] if len(segs) >= 2 else None
 
+            def _enclosing_class_id(sym_id: str) -> Optional[str]:
+                # "file::A.m" -> enclosing class SYMBOL ID "file::A" (fields are
+                # scoped by class id). Top-level func -> None.
+                if "::" not in sym_id:
+                    return None
+                fpref, qual = sym_id.split("::", 1)
+                if "." not in qual:
+                    return None
+                return f"{fpref}::{qual.rsplit('.', 1)[0]}"
+
             _TYPE_KINDS = {"class", "interface", "enum", "struct", "trait"}
             app_type_names: set[str] = {
                 row["name"] for row in symbols.values()
@@ -524,6 +547,7 @@ class KuzuStore:
             call_rows: list[dict] = []
             n_external = 0
             n_unresolved = 0
+            n_by_type = 0
             for edge in call_edges:
                 src = edge["src"]
                 if src not in symbols:
@@ -567,9 +591,27 @@ class KuzuStore:
                             # Import points outside the repo (Log, Collections…).
                             n_external += 1
                     else:
-                        # Unknown / untyped variable receiver. v1: drop, do NOT
-                        # fall back to global by-name (that was the noise bug).
-                        n_unresolved += 1
+                        # 2.5: receiver-type inference from captured declarations.
+                        # Look up R as a local/param of the calling method first,
+                        # then as a field of the enclosing class. Only resolve when
+                        # the inferred type is an APP type; external/unknown -> DROP
+                        # (never fall back to global by-name).
+                        t = decls_by_scope.get(src, {}).get(recv)
+                        if not t:
+                            encl_id = _enclosing_class_id(src)
+                            if encl_id:
+                                t = decls_by_scope.get(encl_id, {}).get(recv)
+                        if t and t in app_type_names:
+                            tgt = _find_named(class_methods.get(t), callee)
+                            if tgt:
+                                call_rows.append({"a": src, "b": tgt})
+                                n_by_type += 1
+                            else:
+                                n_unresolved += 1
+                        else:
+                            # Unknown / untyped / external variable receiver. v1:
+                            # drop, do NOT fall back to global by-name.
+                            n_unresolved += 1
                 else:
                     # rk == "expr" (complex receiver) or a receiver'd call with no
                     # receiver text. v1: drop.
@@ -583,6 +625,7 @@ class KuzuStore:
             counts["calls"] = len(call_rows)
             counts["calls_dropped_external"] = n_external
             counts["calls_dropped_unresolved"] = n_unresolved
+            counts["calls_resolved_by_type"] = n_by_type
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)
