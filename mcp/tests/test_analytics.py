@@ -60,6 +60,23 @@ def test_related_investigations_via_code(ks):
     assert rel[0]["shared_symbols"] >= 1
 
 
+def test_subsystem_report(ks):
+    r = A.subsystem_report(ks, "a.java")
+    assert r["files"] == ["a.java"]
+    assert r["symbol_count"] == 3
+    assert r["kinds"] == {"class": 1, "method": 2}
+    assert {h["name"]: h["findings"] for h in r["hotspot_symbols"]}.get("foo") == 2
+    assert {i["id"] for i in r["investigations"]} == {"inv1", "inv2"}
+    # all calls are internal to a.java -> no boundary crossings
+    assert r["inbound_callers"] == [] and r["outbound_callees"] == []
+
+
+def test_subsystem_report_prefix(ks):
+    # a path prefix should match the file too
+    assert A.subsystem_report(ks, "a.")["symbol_count"] == 3
+    assert A.subsystem_report(ks, "nonexistent/")["files"] == []
+
+
 def test_fail_open():
     class Dead:
         def available(self):
@@ -68,3 +85,4 @@ def test_fail_open():
     assert A.impact_report(Dead(), "x")["resolved"] == []
     assert A.finding_code_context(Dead(), "x")["symbols"] == []
     assert A.related_investigations_via_code(Dead(), "x") == []
+    assert A.subsystem_report(Dead(), "x")["files"] == []

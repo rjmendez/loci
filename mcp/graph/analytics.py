@@ -150,6 +150,57 @@ def finding_code_context(ks: Any, finding_id: str, neighbours: int = 6) -> dict:
     return {"finding_id": finding_id, "text": (text or "")[:400], "symbols": out}
 
 
+def subsystem_report(ks: Any, anchor: str, limit: int = 15) -> dict:
+    """Full picture of a subsystem = the CodeSymbols under a file or path prefix.
+
+    ``anchor`` matches a CodeFile whose path equals it OR starts with it (a single
+    file, a directory, or a package path). Unions the code boundary (who calls in /
+    what it calls out) with the memory footprint (hotspot symbols, investigations
+    analysing it) — the composed answer to "tell me everything about this subsystem".
+
+    Shape: ``{anchor, files:[...], symbol_count, kinds:{kind:n},
+    inbound_callers:[{name,file}], outbound_callees:[{name,file}],
+    hotspot_symbols:[{name,findings}], investigations:[{id,finding_count}]}``.
+    """
+    empty = {"anchor": anchor, "files": [], "symbol_count": 0, "kinds": {},
+             "inbound_callers": [], "outbound_callees": [], "hotspot_symbols": [],
+             "investigations": []}
+    if not _ok(ks) or not anchor:
+        return empty
+
+    # Resolve the subsystem's files (exact path or path-prefix) in Python — robust
+    # across Kuzu string-fn differences.
+    all_files = [r[0] for r in _q(ks, "MATCH (c:CodeFile) RETURN c.path")]
+    files = [f for f in all_files if f == anchor or f.startswith(anchor)]
+    if not files:
+        return empty
+
+    kinds: dict[str, int] = {}
+    symbol_count = 0
+    for name, cnt in _q(ks, "MATCH (s:CodeSymbol) WHERE s.file IN $f RETURN s.kind, count(*) AS c",
+                        {"f": files}):
+        kinds[name] = int(cnt)
+        symbol_count += int(cnt)
+
+    inbound = [{"name": r[0], "file": r[1]} for r in _q(ks,
+        "MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol) WHERE t.file IN $f AND NOT c.file IN $f "
+        "RETURN DISTINCT c.name, c.file LIMIT $lim", {"f": files, "lim": int(limit)})]
+    outbound = [{"name": r[0], "file": r[1]} for r in _q(ks,
+        "MATCH (s:CodeSymbol)-[:CALLS]->(o:CodeSymbol) WHERE s.file IN $f AND NOT o.file IN $f "
+        "RETURN DISTINCT o.name, o.file LIMIT $lim", {"f": files, "lim": int(limit)})]
+    hotspots = [{"name": r[0], "findings": int(r[1])} for r in _q(ks,
+        "MATCH (fd:Finding)-[:REFERENCES]->(s:CodeSymbol) WHERE s.file IN $f "
+        "RETURN s.name, count(DISTINCT fd) AS c ORDER BY c DESC LIMIT $lim", {"f": files, "lim": int(limit)})]
+    invs = [{"id": r[0], "finding_count": int(r[1])} for r in _q(ks,
+        "MATCH (fd:Finding)-[:REFERENCES]->(s:CodeSymbol) WHERE s.file IN $f "
+        "MATCH (fd)-[:IN_INVESTIGATION]->(i:Investigation) "
+        "RETURN i.id, count(DISTINCT fd) AS c ORDER BY c DESC LIMIT $lim", {"f": files, "lim": int(limit)})]
+
+    return {"anchor": anchor, "files": files, "symbol_count": symbol_count, "kinds": kinds,
+            "inbound_callers": inbound, "outbound_callees": outbound,
+            "hotspot_symbols": hotspots, "investigations": invs}
+
+
 def related_investigations_via_code(ks: Any, investigation_id: str, limit: int = 15) -> list:
     """Other investigations whose findings reference the SAME CodeSymbols as this one.
 

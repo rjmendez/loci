@@ -5603,6 +5603,35 @@ def finding_code_context(finding_id: str) -> str:
 
 
 @mcp.tool()
+def subsystem_report(anchor: str, limit: int = 15) -> str:
+    """
+    Full picture of a subsystem: the code under a file path or path/package prefix,
+    its call boundary (who calls in / what it calls out), the symbols most analysed
+    in memory, and which investigations touch it.
+
+    Give a file (".../EskfFusion.java"), a directory, or a package prefix. Composes
+    graph.analytics.subsystem_report over the code<->memory graph.
+
+    Args:
+        anchor: A CodeFile path, or a path/package prefix matching several files.
+        limit: Max rows per section (default 15).
+
+    Returns:
+        JSON {anchor, files, symbol_count, kinds, inbound_callers, outbound_callees,
+        hotspot_symbols, investigations}.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph.analytics import subsystem_report as _sub
+        return json.dumps(_sub(ks, anchor, limit=limit), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("subsystem_report failed: %r", exc)
+        return json.dumps({"error": f"subsystem_report failed: {exc!r}"})
+
+
+@mcp.tool()
 def related_investigations_via_code(investigation_id: str, limit: int = 15) -> str:
     """
     Other investigations that reference the SAME code symbols as this one.
