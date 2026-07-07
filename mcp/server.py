@@ -285,6 +285,58 @@ def _mirror_finding_to_kuzu(finding: dict, investigation_id: str, ks=None) -> No
         logger.debug("Kuzu finding mirror failed (fail-open): %r", exc)
 
 
+# --- Finding -> CodeSymbol auto-linker (REFERENCES) --------------------------
+# A tiny cache so the per-write auto-link doesn't rebuild the symbol index on
+# every finding. Invalidated when the CodeSymbol count changes (e.g. after a new
+# code_graph_ingest / code_memory_relink). Fail-open throughout.
+_symbol_index_cache = None             # built graph.linker index
+_symbol_index_count = -1               # CodeSymbol count the cache was built at
+
+
+def _get_symbol_index(ks):
+    """Return a cached graph.linker symbol index, rebuilding it when the graph's
+    CodeSymbol count changes. Returns None (fail-open) if unavailable/empty."""
+    global _symbol_index_cache, _symbol_index_count
+    if not ks:
+        return None
+    try:
+        rows = ks.code_query("MATCH (s:CodeSymbol) RETURN count(s)")
+        count = int(rows[0][0]) if rows and rows[0] else 0
+        if count == 0:
+            _symbol_index_cache, _symbol_index_count = None, 0
+            return None
+        if _symbol_index_cache is None or count != _symbol_index_count:
+            from graph import linker
+            srows = ks._rows("MATCH (s:CodeSymbol) RETURN s.id, s.name, s.kind, s.file")
+            symbols = [{"id": r[0], "name": r[1], "kind": r[2], "file": r[3]} for r in srows]
+            _symbol_index_cache = linker.build_symbol_index(symbols)
+            _symbol_index_count = count
+        return _symbol_index_cache
+    except Exception as exc:
+        logger.debug("symbol index build failed (fail-open): %r", exc)
+        return None
+
+
+def _autolink_finding_to_kuzu(finding: dict, ks=None) -> None:
+    """Auto-create REFERENCES edges from one just-mirrored finding to CodeSymbols.
+    Cheap single-finding link over a cached index. Fail-open — never raises."""
+    ks = ks or _get_kuzu()
+    if not ks or not isinstance(finding, dict):
+        return
+    fid = finding.get("id")
+    text = finding.get("text")
+    if not fid or not text:
+        return
+    try:
+        index = _get_symbol_index(ks)
+        if not index:
+            return  # no code graph ingested yet — nothing to link against
+        from graph import linker
+        linker.link_findings(ks, [{"id": fid, "text": text}], index)
+    except Exception as exc:
+        logger.debug("Kuzu finding auto-link failed (fail-open): %r", exc)
+
+
 def _kuzu_backfill_if_empty(ks) -> None:
     """Backfill existing on-disk findings into a freshly-created graph (once)."""
     try:
@@ -2481,6 +2533,7 @@ def investigation_store(
 
     _qdrant_upsert(finding["id"], text, finding)
     _mirror_finding_to_kuzu(finding, investigation_id)
+    _autolink_finding_to_kuzu(finding)
 
     return json.dumps({
         "stored": True,
@@ -5377,6 +5430,119 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     except Exception as exc:
         logger.debug("code_graph_query failed: %r", exc)
         return json.dumps({"error": f"code_graph_query failed: {exc!r}"})
+
+
+@mcp.tool()
+def code_memory_relink() -> str:
+    """
+    (Re)build all Finding -> CodeSymbol REFERENCES edges across the whole graph.
+
+    Scans every Finding's text and links it to the CodeSymbols it distinctively
+    names (precision-focused: distinctive types / explicit ``symbol:`` markers /
+    ``File.ext`` mentions / unique long identifiers — never bare common words).
+    Idempotent (MERGE). Run this after ingesting code with ``code_graph_ingest``
+    so already-stored findings get connected; new findings auto-link on write.
+
+    Returns:
+        JSON ``{"findings_scanned": int, "links_created": int}`` (zeros if the
+        graph store is unavailable).
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph import linker
+        result = linker.relink_all(ks)
+        # A relink can change the symbol set relationship; drop the cached index
+        # so subsequent auto-links rebuild against the current graph.
+        global _symbol_index_cache, _symbol_index_count
+        _symbol_index_cache, _symbol_index_count = None, -1
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.debug("code_memory_relink failed: %r", exc)
+        return json.dumps({"error": f"code_memory_relink failed: {exc!r}"})
+
+
+@mcp.tool()
+def code_memory_map(anchor: str, anchor_type: str = "auto", hops: int = 1) -> str:
+    """
+    Map the code<->memory neighbourhood around an anchor node as a subgraph.
+
+    Walks up to ``hops`` steps from the anchor over all edge types (CALLS,
+    DEFINES, REFERENCES, IN_INVESTIGATION, MENTIONS, ...) and returns the nodes
+    and edges around it — the concrete bridge between a code symbol and the
+    findings/investigations that touch it (and vice-versa).
+
+    Args:
+        anchor: The anchor's key — a CodeSymbol name, Finding id, Investigation
+            id, or CodeFile path, depending on ``anchor_type``.
+        anchor_type: One of ``CodeSymbol`` / ``Finding`` / ``Investigation`` /
+            ``CodeFile``, or ``auto`` (default) to try each in that order and use
+            the first that exists in the graph.
+        hops: BFS radius (default 1).
+
+    Returns:
+        JSON ``{"matched": {"label", "key"} | None, "nodes": [...],
+        "edges": [...]}``. ``matched`` reports which anchor label resolved.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph import queries
+        candidates = (
+            [anchor_type] if anchor_type and anchor_type != "auto"
+            else ["CodeSymbol", "Finding", "Investigation", "CodeFile"]
+        )
+        for label in candidates:
+            key = anchor
+            if label == "CodeSymbol":
+                # CodeSymbol's primary key is its id ("file::Qual"); callers usually
+                # pass a bare NAME. If the anchor isn't a direct id, resolve name->id.
+                if not ks.code_query("MATCH (s:CodeSymbol {id:$k}) RETURN s.id LIMIT 1", {"k": anchor}):
+                    rows = ks.code_query("MATCH (s:CodeSymbol {name:$n}) RETURN s.id LIMIT 1", {"n": anchor})
+                    if rows:
+                        key = rows[0][0]
+            sub = queries.subgraph(ks, label, key, hops=hops)
+            # A resolved anchor yields at least the anchor node itself.
+            if sub.get("nodes"):
+                return json.dumps(
+                    {"matched": {"label": label, "key": key}, **sub},
+                    indent=2, default=str,
+                )
+        return json.dumps({"matched": None, "nodes": [], "edges": []}, indent=2)
+    except Exception as exc:
+        logger.debug("code_memory_map failed: %r", exc)
+        return json.dumps({"error": f"code_memory_map failed: {exc!r}"})
+
+
+@mcp.tool()
+def symbol_impact(symbol: str, hops: int = 3) -> str:
+    """
+    Blast radius of a code symbol across code and memory.
+
+    Combines the transitive CALLS callers that reach ``symbol`` (up to ``hops``)
+    with the Findings — and their Investigations — that REFERENCE the symbol or
+    any of those callers. Answers "if this symbol is broken, which prior
+    findings/investigations are implicated, and what calls into it?"
+
+    Args:
+        symbol: A CodeSymbol id (``file::Qualname``) or a bare symbol name.
+        hops: Max transitive CALLS depth (default 3).
+
+    Returns:
+        JSON ``{"callers": [...symbols...], "findings": [...],
+        "investigations": [...]}``.
+    """
+    ks = _get_kuzu()
+    if not ks:
+        return json.dumps({"error": "Kuzu graph store unavailable."})
+    try:
+        from graph import queries
+        return json.dumps(queries.symbol_impact(ks, symbol, hops=hops), indent=2, default=str)
+    except Exception as exc:
+        logger.debug("symbol_impact failed: %r", exc)
+        return json.dumps({"error": f"symbol_impact failed: {exc!r}"})
 
 
 def main() -> None:
