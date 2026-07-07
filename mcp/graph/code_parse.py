@@ -618,6 +618,36 @@ def _kotlin_property_name_type(prop_node):
     return name, type_
 
 
+def _decorators(node, lang: str) -> List[str]:
+    """Decorator / annotation names on a definition node (best-effort, fail-open).
+
+    Python: ``@mcp.tool()`` -> ``"mcp.tool"``. Java/Kotlin: ``@Override`` -> ``"Override"``.
+    Used to identify framework entry points (so dead-code detection can exclude them).
+    """
+    out: List[str] = []
+    try:
+        if lang == "python":
+            parent = node.parent
+            if parent is not None and parent.type == "decorated_definition":
+                for c in parent.children:
+                    if c.type == "decorator":
+                        t = _text(c).lstrip("@").strip().split("(")[0].strip()
+                        if t:
+                            out.append(t)
+        elif lang in ("java", "kotlin"):
+            for c in node.children:
+                if c.type in ("modifiers", "annotation"):
+                    for m in ([c] if c.type == "annotation" else c.children):
+                        if m.type in ("annotation", "marker_annotation"):
+                            nm = m.child_by_field_name("name")
+                            t = _text(nm) if nm is not None else _text(m).lstrip("@").split("(")[0]
+                            if t:
+                                out.append(t.strip())
+    except Exception:
+        return out
+    return out
+
+
 def _collect_decls(root, lang, def_types, enclosing_symbol_src, in_method, add_decl):
     """Walk the whole tree once, emitting field/param/local declarations.
 
@@ -857,6 +887,7 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
                         "line": node.start_point[0] + 1,
                         "lang": lang,
                         "file": file,
+                        "decorators": _decorators(node, lang),
                     }
                 )
                 add_edge(file, sid, "DEFINES")

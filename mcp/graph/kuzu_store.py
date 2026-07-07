@@ -48,6 +48,21 @@ _WRITE_GUARD_RE = re.compile(
     r"\b(CREATE|DELETE|SET|DROP|COPY|ALTER|MERGE)\b", re.IGNORECASE
 )
 
+# Common stdlib/builtin protocol method names. The Python duck-typing call fallback
+# (resolve by globally-unique app-method name) must NOT fire on these — an app method
+# that merely shares a name with dict.get/list.append/str.split is almost always a
+# stdlib call, not a call to that app method. Keeps the fallback precise.
+_DUCK_STOPWORDS = frozenset({
+    "get", "keys", "values", "items", "setdefault", "update", "copy", "clear", "pop",
+    "append", "extend", "insert", "remove", "add", "discard", "index", "count",
+    "sort", "reverse", "join", "split", "rsplit", "splitlines", "strip", "lstrip",
+    "rstrip", "replace", "startswith", "endswith", "find", "rfind", "format",
+    "format_map", "encode", "decode", "lower", "upper", "title", "capitalize",
+    "read", "readline", "readlines", "write", "writelines", "close", "seek", "tell",
+    "flush", "group", "groups", "groupdict", "match", "search", "finditer", "findall",
+    "sub", "send", "throw", "next", "name", "value", "isdigit", "isalpha", "isspace",
+})
+
 
 class KuzuStore:
     """Embedded Kuzu graph store. All public methods are fail-open."""
@@ -80,7 +95,7 @@ class KuzuStore:
     _SCHEMA = (
         "CREATE NODE TABLE IF NOT EXISTS CodeFile(path STRING PRIMARY KEY, lang STRING)",
         "CREATE NODE TABLE IF NOT EXISTS CodeSymbol(id STRING PRIMARY KEY, name STRING, "
-        "kind STRING, file STRING, line INT64, lang STRING)",
+        "kind STRING, file STRING, line INT64, lang STRING, decorators STRING)",
         "CREATE NODE TABLE IF NOT EXISTS Finding(id STRING PRIMARY KEY, investigation STRING, "
         "ftype STRING, text STRING, confidence STRING, source STRING, ts INT64)",
         "CREATE NODE TABLE IF NOT EXISTS Entity(name STRING PRIMARY KEY, etype STRING, distinctive BOOL)",
@@ -98,6 +113,13 @@ class KuzuStore:
     def _init_schema(self) -> None:
         for ddl in self._SCHEMA:
             self._conn.execute(ddl)
+        # Additive migrations for graphs created before a column existed. ALTER ADD
+        # errors harmlessly if the column is already present -> ignore.
+        for alt in ("ALTER TABLE CodeSymbol ADD decorators STRING DEFAULT ''",):
+            try:
+                self._conn.execute(alt)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -392,7 +414,8 @@ class KuzuStore:
         """
         counts = {"files": 0, "symbols": 0, "defines": 0, "calls": 0, "imports": 0,
                   "calls_dropped_external": 0, "calls_dropped_unresolved": 0,
-                  "calls_resolved_by_type": 0, "calls_resolved_by_module": 0}
+                  "calls_resolved_by_type": 0, "calls_resolved_by_module": 0,
+                  "calls_resolved_by_duck": 0}
         if not self.ok or not parsed_files:
             return counts
         # Collect everything first, then insert in a few UNWIND batches.
@@ -433,6 +456,7 @@ class KuzuStore:
                     "kind": str(sym.get("kind") or ""),
                     "file": str(sym.get("file") or fpath), "line": line,
                     "lang": str(sym.get("lang") or files[fpath]),
+                    "decorators": ",".join(sym.get("decorators") or []),
                 }
                 defines.append({"p": fpath, "s": str(sym["id"])})
             for edge in (pf.get("edges") or []):
@@ -472,7 +496,8 @@ class KuzuStore:
             for chunk in self._chunks(list(symbols.values())):
                 self._exec(
                     "UNWIND $rows AS r MERGE (s:CodeSymbol {id:r.id}) "
-                    "SET s.name=r.name, s.kind=r.kind, s.file=r.file, s.line=r.line, s.lang=r.lang",
+                    "SET s.name=r.name, s.kind=r.kind, s.file=r.file, s.line=r.line, "
+                    "s.lang=r.lang, s.decorators=r.decorators",
                     {"rows": chunk},
                 )
             counts["symbols"] = len(symbols)
@@ -554,6 +579,7 @@ class KuzuStore:
             n_external = 0
             n_unresolved = 0
             n_by_type = 0
+            n_by_duck = 0
             n_by_module = 0
             for edge in call_edges:
                 src = edge["src"]
@@ -626,9 +652,20 @@ class KuzuStore:
                             else:
                                 n_unresolved += 1
                         else:
-                            # Unknown / untyped / external variable receiver. v1:
-                            # drop, do NOT fall back to global by-name.
-                            n_unresolved += 1
+                            # Unknown / Any-typed receiver. The duck-typing fallback (resolve
+                            # by globally-UNIQUE method name) is sound only for dynamically
+                            # typed Python, where such a receiver is an app object
+                            # (`ks.code_query()` where ks: Any). In statically-typed langs an
+                            # untyped receiver calling a method that merely happens to be
+                            # unique in the repo (someList.isEmpty()) is usually a STDLIB call
+                            # -> we must NOT guess there. Ambiguous names stay dropped anyway.
+                            if symbols[src]["lang"] == "python" and callee not in _DUCK_STOPWORDS:
+                                tgt = by_name_unique.get(callee)
+                            if tgt:
+                                call_rows.append({"a": src, "b": tgt})
+                                n_by_duck += 1
+                            else:
+                                n_unresolved += 1
                 else:
                     # rk == "expr" (complex receiver) or a receiver'd call with no
                     # receiver text. v1: drop.
@@ -644,6 +681,7 @@ class KuzuStore:
             counts["calls_dropped_unresolved"] = n_unresolved
             counts["calls_resolved_by_type"] = n_by_type
             counts["calls_resolved_by_module"] = n_by_module
+            counts["calls_resolved_by_duck"] = n_by_duck
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)
