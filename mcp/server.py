@@ -1840,17 +1840,21 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
 # Finding lifecycle: append-only updates log + staleness (code-ref hashing).
 #
 # findings.jsonl stays pure (only real finding records) so every existing reader
-# is untouched. In-place resolution and verify-all verdicts are recorded as
-# APPEND-ONLY update records in a sibling ``finding_updates.jsonl`` and folded in
-# last-write-wins by the read path. Both features are additive + fail-open.
+# is untouched. In-place resolutions are recorded as APPEND-ONLY update records in
+# a sibling ``finding_updates.jsonl`` and folded in last-write-wins by the read
+# path. verify-all verdicts are written to a SEPARATE ``finding_verifications.jsonl``
+# (round-3 scaling fix) so the resolution read path never scans the high-churn
+# verification log. Both features are additive + fail-open.
 # ---------------------------------------------------------------------------
 
 # Injectable generation fn for investigation_verify_all — None means "use the
 # shipped verify.py default" (lazy llm_local). Tests set this to a stub.
 _verify_gen_fn = None
 
-# Update-record types recorded in finding_updates.jsonl.
-_LIFECYCLE_UPDATE_TYPES: frozenset = frozenset({"resolution", "verification"})
+# Update-record types recorded in finding_updates.jsonl. Only 'resolution' records
+# land here; verify-all verdicts are written to the separate finding_verifications.jsonl
+# (see _finding_verifications_path) and are NOT part of this constant.
+_LIFECYCLE_UPDATE_TYPES: frozenset = frozenset({"resolution"})
 
 # Known source/config/doc file extensions a code ref may end in. Requiring the
 # extension to be from THIS set (not merely "some letters after a dot") is what
