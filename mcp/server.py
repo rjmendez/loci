@@ -5090,14 +5090,35 @@ def investigation_list(
 
     Args:
         limit: Max investigations to return (default 30). Use 0 or a negative
-            value for no limit (return all).
+            value for no limit (return all remaining). Note: offset is still
+            honored when limit<=0, so this returns everything *starting at*
+            offset, not the entire list.
         offset: Number of investigations to skip from the front (default 0).
+            Always applied, including when limit<=0.
         summary: If True (default), return only compact fields; if False,
             return the full record including tier counts.
 
     Returns:
         JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
     """
+    # Coerce limit/offset once up front, BEFORE any early return, so both the
+    # empty-MEMORY_DIR path and the normal path echo normalized ints. String
+    # JSON tool args must not leak through inconsistently (early return echoing
+    # raw strings while the non-empty path echoes coerced ints).
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    # A string limit (e.g. via JSON tool args) would otherwise raise TypeError
+    # in the `limit <= 0` comparison and `offset + limit` slice below,
+    # contradicting the documented "limit<=0 returns everything" behavior.
+    # None stays None (explicit no-limit); garbage falls back to the default.
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 30
+
     if not MEMORY_DIR.exists():
         return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
 
@@ -5115,20 +5136,6 @@ def investigation_list(
 
     total = len(entries)
 
-    try:
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        offset = 0
-    # Coerce limit the same way offset is coerced: a string limit (e.g. via
-    # JSON tool args) would otherwise raise TypeError in the `limit <= 0`
-    # comparison and `offset + limit` slice below, contradicting the
-    # documented "limit<=0 returns everything" behavior. None stays None
-    # (explicit no-limit); garbage falls back to the documented default.
-    if limit is not None:
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 30
     if limit is None or limit <= 0:
         page = entries[offset:]
     else:

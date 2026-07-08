@@ -242,6 +242,28 @@ class TestInvestigationLifecycle(unittest.TestCase):
         self.assertEqual(result["investigations"], [])
         self.assertEqual(result["total"], 0)
 
+    def test_investigation_list_missing_dir_echoes_coerced_ints(self):
+        """MEMORY_DIR-does-not-exist early return must echo normalized ints.
+
+        Regression guard: string JSON tool args (limit="2", offset="1") must
+        be coerced up front so the empty-dir early return echoes the same
+        int types as the non-empty path — not the raw strings.
+        """
+        missing = Path(self._tmp.name) / "does_not_exist"
+        self.assertFalse(missing.exists())
+        orig = server.MEMORY_DIR
+        server.MEMORY_DIR = missing
+        try:
+            result = _json(server.investigation_list(limit="2", offset="1"))
+        finally:
+            server.MEMORY_DIR = orig
+        self.assertEqual(result["investigations"], [])
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["limit"], 2)
+        self.assertEqual(result["offset"], 1)
+        self.assertIsInstance(result["limit"], int)
+        self.assertIsInstance(result["offset"], int)
+
     def test_store_roundtrip_finding_id_in_load(self):
         inv_id = _new_id("roundtrip")
         server.investigation_start(investigation_id=inv_id, title="Roundtrip test")
