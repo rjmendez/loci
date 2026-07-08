@@ -38,6 +38,10 @@ def _default_memory_dir() -> str:
 
 _MEMORY_DIR_DEFAULT = _default_memory_dir()
 
+# Finding resolution states that count as "handled" — the exclusion lane surfaces these
+# as a "do NOT re-report" block so re-audits skip already-fixed/accepted items.
+_RESOLVED_STATES = frozenset({"fixed", "intentional", "wontfix"})
+
 # Sources/types whose text is a raw conversation dump — never inject these.
 _DUMP_MARKERS = ("pre_compress", "session_end", "session_dump", "conversation", "transcript", "turn")
 _ROLE_RE = re.compile(r'\b(user|assistant|system)\b\s*[:"]', re.IGNORECASE)
@@ -203,6 +207,39 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                         add(f"case:{cid}:finding", str(f.get("text", "")), 0.08)
         except Exception:
             continue
+
+    # 2. Exclusion lane: findings already resolved (fixed/intentional/wontfix) for the
+    # grounded cases -> a compact "do NOT re-report" block so a re-audit auto-skips items
+    # already handled (the manual known-state step, automated). Budget-bounded, noise-
+    # filtered, fail-open: a missing/empty resolution set simply omits the block. Uses a
+    # separate load (large last_n) so the case lane above stays byte-for-byte unchanged.
+    resolved_known: list[str] = []
+    _seen_known: set = set()
+    for cid in (task.get("caseIds") or [])[:3]:
+        if not S:
+            break
+        try:
+            data = _jload(S.investigation_load(cid, last_n_findings=200))
+            if not isinstance(data, dict) or data.get("error"):
+                continue
+            for f in (data.get("recent_findings") or []):
+                if not isinstance(f, dict):
+                    continue
+                res = str(f.get("resolution", "open") or "open").lower()
+                if res not in _RESOLVED_STATES:
+                    continue
+                txt = str(f.get("text", "")).strip()
+                if not txt:
+                    continue
+                h = re.sub(r"\s+", " ", txt.lower())[:120]
+                if h in _seen_known:
+                    continue
+                _seen_known.add(h)
+                resolved_known.append(f"[{res}] {txt[:180]}")
+        except Exception:
+            continue
+    if resolved_known:
+        add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15)
 
     # 3. Exact entities -> entity_lookup (O(1), no embedding). Fail-open per entity.
     for ent in (task.get("entities") or [])[:5]:

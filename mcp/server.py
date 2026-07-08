@@ -185,6 +185,12 @@ REFLECTION_SIGNATURE_MAP_LIMIT = 500
 # Defined once here to avoid the same dict appearing inline in multiple functions.
 _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
+# Finding lifecycle/resolution states. "open" is the default and the implied value for
+# any finding record stored before this field existed (absent -> "open"). The three
+# resolved states are what exclusion-aware grounding treats as "handled — do not re-report".
+_RESOLUTION_STATES: frozenset = frozenset({"open", "fixed", "intentional", "wontfix", "superseded"})
+_RESOLVED_STATES: frozenset = frozenset({"fixed", "intentional", "wontfix"})
+
 # ---------------------------------------------------------------------------
 # Optional Qdrant + fastembed
 # ---------------------------------------------------------------------------
@@ -2752,6 +2758,11 @@ def investigation_load(
         ]
 
     recent = findings[-last_n_findings:]
+    # Surface the lifecycle/resolution state; findings stored before this field
+    # existed read as "open" (additive, backwards-compatible).
+    for _f in recent:
+        if isinstance(_f, dict) and not _f.get("resolution"):
+            _f["resolution"] = "open"
 
     return json.dumps({
         "manifest": manifest,
@@ -3059,6 +3070,7 @@ def investigation_store(
     valid_until: Optional[str] = None,
     authored_by: Optional[str] = None,
     tier: str = "warm",
+    resolution: str = "open",
 ) -> str:
     """
     Record a finding in the investigation.
@@ -3103,6 +3115,15 @@ def investigation_store(
               hot  — indexed in Qdrant AND summarized in manifest notes (instantly in-context).
               warm — indexed in Qdrant only (default, searchable).
               cold — stored in JSONL only, NOT indexed in Qdrant (archived).
+        resolution: Lifecycle state of the finding. One of:
+              open (default) — active/unresolved; the normal state for a new finding.
+              fixed          — the issue has been addressed/remediated.
+              intentional    — reviewed and deemed acceptable/by-design.
+              wontfix        — acknowledged but will not be actioned.
+              superseded     — replaced by a newer finding.
+              The three resolved states (fixed/intentional/wontfix) let
+              exclusion-aware grounding auto-skip handled items on re-audit.
+              Findings stored before this field existed read as "open".
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -3123,6 +3144,9 @@ def investigation_store(
         return json.dumps({"error": "confidence must be one of: high, medium, low"})
     if tier not in {"hot", "warm", "cold"}:
         return json.dumps({"error": "tier must be one of: hot, warm, cold"})
+    resolution = str(resolution or "open").lower()
+    if resolution not in _RESOLUTION_STATES:
+        return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
 
     # Resolve numeric_confidence: caller-supplied (clamped) or derived from string confidence.
     _confidence_to_numeric = {"high": 0.9, "medium": 0.6, "low": 0.3}
@@ -3153,6 +3177,7 @@ def investigation_store(
         "valid_until": valid_until,
         "authored_by": authored_by or "",
         "tier": tier,
+        "resolution": resolution,
     }
     derived = _normalize_derived_from(derived_from)
     if derived:
@@ -4165,6 +4190,7 @@ def investigation_search(
     limit: int = 10,
     include_retracted: bool = False,
     min_confidence: str = "low",
+    resolution: Optional[str] = None,
 ) -> str:
     """
     Search findings by similarity.
@@ -4181,10 +4207,23 @@ def investigation_search(
         investigation_id: Limit to one investigation, or omit to search all.
         limit: Maximum results to return (default 10).
         include_retracted: Include soft-retracted findings (default False).
+        resolution: Optional lifecycle filter. When set to one of
+                    open/fixed/intentional/wontfix/superseded, only findings in that
+                    resolution state are returned. Omit (default) to return all.
+                    Each result row surfaces its ``resolution`` (absent -> "open").
 
     Returns:
         JSON list of matching findings with investigation context.
     """
+    # Normalise resolution filter (fail-open: an unknown value disables the filter).
+    resolution = str(resolution).lower() if resolution else None
+    if resolution is not None and resolution not in _RESOLUTION_STATES:
+        logger.warning(
+            "investigation_search: unknown resolution %r — ignoring filter; valid "
+            "values: %s", resolution, ", ".join(sorted(_RESOLUTION_STATES))
+        )
+        resolution = None
+
     # Normalise confidence floor so callers passing "High" or "MEDIUM" are not
     # silently ignored by the lowercase dict lookup downstream.
     min_confidence = str(min_confidence or "low").lower()
@@ -4301,6 +4340,36 @@ def investigation_search(
             if _CONFIDENCE_RANK.get(str(r.get("confidence", "low")).lower(), 0) >= floor
         ]
 
+    # Surface each row's resolution and optionally filter by it. Rows sourced from
+    # mnemosyne carry no resolution, so we build an authoritative finding_id ->
+    # resolution map from JSONL — scoped to only the investigations that actually
+    # produced rows, so cost is bounded regardless of how many investigations exist.
+    # Absent record -> "open". Fail-open (a failed map build just falls back to the
+    # per-row payload value, defaulting to "open").
+    _resolution_map: dict[str, str] = {}
+    try:
+        _invs_in_results = {str(r.get("investigation_id", "")) for r in deduped}
+        _invs_in_results.discard("")
+        for _inv in _invs_in_results:
+            for _f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
+                _fid = str(_f.get("id", ""))
+                if _fid:
+                    _resolution_map[_fid] = str(_f.get("resolution") or "open").lower()
+    except Exception as exc:  # fail-open — never block search on the map build
+        logger.debug("resolution map build failed, using per-row values: %r", exc)
+        _resolution_map = {}
+
+    def _row_resolution(row: dict) -> str:
+        fid = str(row.get("finding_id") or row.get("id") or "")
+        if fid and fid in _resolution_map:
+            return _resolution_map[fid]
+        return str(row.get("resolution") or "open").lower()
+
+    for r in deduped:
+        r["resolution"] = _row_resolution(r)
+    if resolution is not None:
+        deduped = [r for r in deduped if r.get("resolution") == resolution]
+
     if not deduped:
         qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
         # Only use rag_required mode when Qdrant itself is unavailable.
@@ -4334,6 +4403,7 @@ def investigation_search(
         "results": deduped[: max(1, min(limit, 200))],
         "excluded_retracted": _excluded_retracted["n"],
         "include_retracted": include_retracted,
+        "resolution_filter": resolution,
         "mnemo_status": {
             "enabled": mnemo_enabled,
             "bank": _mnemo_bank() if mnemo_enabled else None,

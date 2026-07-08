@@ -101,6 +101,51 @@ def test_ground_fail_open_no_server(monkeypatch):
     assert isinstance(r["sources"], list)
 
 
+def test_ground_emits_exclusion_block_for_resolved_findings(monkeypatch):
+    # Findings marked fixed/intentional/wontfix on a grounded case must surface as a
+    # compact "do NOT re-report" block so re-audits auto-exclude handled items.
+    import types
+    fake = types.ModuleType("server")
+    fake.investigation_load = lambda cid, **k: {
+        "manifest": {"hypothesis": "h", "next_step": "n"},
+        "recent_findings": [
+            {"text": "null-deref in parse()", "resolution": "fixed"},
+            {"text": "wide CORS is by design", "resolution": "intentional"},
+            {"text": "still an open bug in retry loop", "resolution": "open"},
+            {"text": "legacy flag, leave it", "resolution": "wontfix"},
+        ],
+    }
+    monkeypatch.setitem(sys.modules, "server", fake)
+    r = G.ground({"title": "re-audit", "caseIds": ["c1"]},
+                 {"budgetChars": 4000, "memoryDir": "/nonexistent"})
+    assert "known — do NOT re-report" in r["block"]
+    # Isolate the exclusion-block line and assert it lists the resolved findings only.
+    known_line = next(ln for ln in r["block"].splitlines() if "known — do NOT re-report" in ln)
+    assert "null-deref in parse()" in known_line
+    assert "wide CORS is by design" in known_line
+    assert "legacy flag, leave it" in known_line
+    # An open finding must NOT be excluded (it stays re-reportable).
+    assert "still an open bug" not in known_line
+
+
+def test_ground_omits_exclusion_block_when_nothing_resolved(monkeypatch):
+    # No resolved findings (all open / absent field) -> the block is omitted entirely.
+    import types
+    fake = types.ModuleType("server")
+    fake.investigation_load = lambda cid, **k: {
+        "manifest": {"hypothesis": "h"},
+        "recent_findings": [
+            {"text": "an open finding"},                       # no resolution -> open
+            {"text": "another active item", "resolution": "open"},
+        ],
+    }
+    monkeypatch.setitem(sys.modules, "server", fake)
+    r = G.ground({"title": "re-audit", "caseIds": ["c1"]},
+                 {"budgetChars": 4000, "memoryDir": "/nonexistent"})
+    assert "known — do NOT re-report" not in r["block"]
+    assert set(r) == {"block", "sources", "chars", "degraded"}
+
+
 def test_ground_budget_respected(tmp_path, monkeypatch):
     (tmp_path / "MEMORY.md").write_text(
         "- [a](a.md) — dispatch referenced flag dead-code registry rules detection\n")

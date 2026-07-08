@@ -2163,5 +2163,127 @@ class TestWiringObligationTracker(unittest.TestCase):
         self.assertIn("error", result)
 
 
+class TestFindingResolution(unittest.TestCase):
+    """resolution lifecycle field: store persists it, load surfaces it (absent -> open),
+    and investigation_search can optionally filter by it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_store_persists_resolution(self):
+        inv_id = _new_id("res-store")
+        server.investigation_start(investigation_id=inv_id, title="Resolution store test")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Null-deref in parse() was patched.",
+            source="test",
+            resolution="fixed",
+        ))
+        self.assertTrue(stored.get("stored"))
+        # Persisted in the JSONL
+        findings = server._read_jsonl(server.MEMORY_DIR / inv_id / "findings.jsonl")
+        self.assertEqual(findings[0].get("resolution"), "fixed")
+
+    def test_store_rejects_bad_resolution(self):
+        inv_id = _new_id("res-bad")
+        server.investigation_start(investigation_id=inv_id, title="Bad resolution test")
+        result = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="x",
+            source="test",
+            resolution="banana",
+        ))
+        self.assertIn("error", result)
+
+    def test_store_defaults_resolution_open(self):
+        inv_id = _new_id("res-default")
+        server.investigation_start(investigation_id=inv_id, title="Default resolution test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="A normal finding with no resolution given.",
+            source="test",
+        )
+        findings = server._read_jsonl(server.MEMORY_DIR / inv_id / "findings.jsonl")
+        self.assertEqual(findings[0].get("resolution"), "open")
+
+    def test_load_surfaces_resolution_and_legacy_reads_open(self):
+        inv_id = _new_id("res-load")
+        server.investigation_start(investigation_id=inv_id, title="Load resolution test")
+        server.investigation_store(
+            investigation_id=inv_id, finding_type="observed",
+            text="Fixed thing.", source="test", resolution="fixed",
+        )
+        # Simulate a legacy record with NO resolution field by appending raw JSONL.
+        legacy = {
+            "id": "legacy-1", "investigation_id": inv_id, "record_type": "observed",
+            "type": "observed", "text": "Legacy finding without resolution.",
+            "source": "test", "confidence": "medium", "tags": [],
+        }
+        server._append_jsonl(server.MEMORY_DIR / inv_id / "findings.jsonl", legacy)
+
+        loaded = _json(server.investigation_load(investigation_id=inv_id))
+        by_text = {f["text"]: f for f in loaded["recent_findings"]}
+        self.assertEqual(by_text["Fixed thing."]["resolution"], "fixed")
+        # A record stored before the field existed must read as "open".
+        self.assertEqual(by_text["Legacy finding without resolution."]["resolution"], "open")
+
+    def test_search_filters_by_resolution(self):
+        inv_id = _new_id("res-search")
+        server.investigation_start(investigation_id=inv_id, title="Search resolution test")
+        open_stored = _json(server.investigation_store(
+            investigation_id=inv_id, finding_type="observed",
+            text="Open bug in the retry loop.", source="test", resolution="open",
+        ))
+        fixed_stored = _json(server.investigation_store(
+            investigation_id=inv_id, finding_type="observed",
+            text="Fixed the CORS misconfig.", source="test", resolution="fixed",
+        ))
+
+        # This test env has no Qdrant/mnemosyne backend, so drive the recall lane with a
+        # synthetic stub that returns rows referencing the two real findings. The
+        # resolution surfacing/filter reads the authoritative state from JSONL.
+        rows = [
+            {"investigation_id": inv_id, "finding_id": open_stored["finding_id"],
+             "record_type": "observed", "source": "test", "text": "Open bug in the retry loop.",
+             "score": 0.9},
+            {"investigation_id": inv_id, "finding_id": fixed_stored["finding_id"],
+             "record_type": "observed", "source": "test", "text": "Fixed the CORS misconfig.",
+             "score": 0.8},
+        ]
+        orig_recall = server._mnemo_recall
+        server._mnemo_recall = lambda *a, **k: [dict(r) for r in rows]
+        try:
+            # Default (no filter): both returned, each with resolution surfaced.
+            res_all = _json(server.investigation_search("bug", investigation_id=inv_id))
+            res_by_text = {r["text"]: r for r in res_all["results"]}
+            self.assertEqual(res_by_text["Open bug in the retry loop."]["resolution"], "open")
+            self.assertEqual(res_by_text["Fixed the CORS misconfig."]["resolution"], "fixed")
+
+            # Filter open -> only the open finding.
+            res_open = _json(server.investigation_search(
+                "bug", investigation_id=inv_id, resolution="open"))
+            texts_open = [r["text"] for r in res_open["results"]]
+            self.assertIn("Open bug in the retry loop.", texts_open)
+            self.assertNotIn("Fixed the CORS misconfig.", texts_open)
+
+            # Filter fixed -> only the fixed finding.
+            res_fixed = _json(server.investigation_search(
+                "bug", investigation_id=inv_id, resolution="fixed"))
+            texts_fixed = [r["text"] for r in res_fixed["results"]]
+            self.assertIn("Fixed the CORS misconfig.", texts_fixed)
+            self.assertNotIn("Open bug in the retry loop.", texts_fixed)
+        finally:
+            server._mnemo_recall = orig_recall
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
