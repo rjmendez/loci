@@ -69,6 +69,45 @@ def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
     assert _EXPECTED_KEYS <= set(out.keys())
 
 
+def test_code_version_first_compute_is_thread_safe(monkeypatch):
+    # Concurrent callers before the cache is filled must spawn `git rev-parse`
+    # exactly ONCE (double-checked locking), and all agree on the result.
+    import subprocess as _sp
+
+    monkeypatch.setattr(server, "_code_version_cache", None)
+    calls = []
+    barrier = threading.Barrier(8)
+
+    class _Result:
+        returncode = 0
+        stdout = "deadbeef\n"
+
+    def fake_run(*a, **k):
+        calls.append(1)
+        # Slow enough that racers pile up on the lock before the cache is set.
+        import time as _t
+        _t.sleep(0.05)
+        return _Result()
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    results = []
+
+    def worker():
+        barrier.wait()
+        results.append(server._code_version())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1  # subprocess forked once despite 8 concurrent callers
+    assert results == ["deadbeef"] * 8
+    assert server._code_version_cache == "deadbeef"
+
+
 def _reset_warm():
     with embed_ops._warm_lock:
         embed_ops._warm_started = False

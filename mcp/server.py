@@ -296,29 +296,36 @@ def _kuzu_health_state() -> str:
 
 
 _code_version_cache: Optional[str] = None  # computed once per process (incl. '' failure)
+_code_version_lock = threading.Lock()
 
 
 def _code_version() -> str:
     """Best-effort short git SHA of the running code. '' when not a git checkout / on
     any error. Never raises. Cached for the process lifetime (incl. the failure/empty
-    result) so the polled health tool never re-forks git on every call."""
+    result) so the polled health tool never re-forks git on every call.
+
+    First compute is guarded by a lock with double-checked locking so concurrent
+    callers before the cache is filled do not each spawn a `git rev-parse`."""
     global _code_version_cache
-    if _code_version_cache is not None:
+    if _code_version_cache is not None:  # fast path: no lock once cached
         return _code_version_cache
-    result = ""
-    try:
-        import subprocess
-        out = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent),
-            capture_output=True, text=True, timeout=2,
-        )
-        if out.returncode == 0:
-            result = out.stdout.strip()
-    except Exception:
+    with _code_version_lock:
+        if _code_version_cache is not None:  # re-check under the lock
+            return _code_version_cache
         result = ""
-    _code_version_cache = result
-    return result
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                result = out.stdout.strip()
+        except Exception:
+            result = ""
+        _code_version_cache = result
+        return result
 
 
 def _kuzu_upsert_investigation(investigation_id: str, title: str = "") -> None:
