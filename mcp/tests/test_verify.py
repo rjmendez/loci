@@ -207,6 +207,44 @@ def test_unreadable_ref_fails_open_and_still_verifies():
     assert r["verdict"] == "confirmed"
 
 
+def _capture_fetch(refs, reader):
+    """Exercise _fetch_code directly (bypasses ref-parsing) so we can assert the block."""
+    return V._fetch_code(refs, reader)
+
+
+def test_zero_line_ref_normalizes_to_line_one():
+    # A ref like file.py:0 must not yield an empty block; it clamps to line 1 and the
+    # header reflects the ACTUAL displayed line, not the raw 0.
+    def _reader(path):
+        return "alpha\nbeta\ngamma\n"
+
+    block = _capture_fetch([("m.py", 0, 0)], _reader)
+    assert block, "0-line ref should still emit a non-empty block"
+    assert "--- m.py:1 ---" in block          # header from actual span, not ':0'
+    assert "1: alpha" in block
+    assert ":0" not in block                   # raw 0 never surfaces
+
+
+def test_truncated_ref_header_reflects_displayed_span():
+    # An oversized end (past EOF and past _MAX_LINES_PER_REF) must show the real s..e span
+    # in the header, not the requested 1-999.
+    body = "".join(f"line{i}\n" for i in range(1, 201))   # 200 lines
+    block = _capture_fetch([("big.py", 1, 999)], lambda p: body)
+    cap = V._MAX_LINES_PER_REF
+    assert f"--- big.py:1-{cap} ---" in block            # clamped to the cap, not 1-999
+    assert "1-999" not in block
+    # Exactly _MAX_LINES_PER_REF numbered lines are present.
+    assert f"{cap}: line{cap}" in block
+    assert f"{cap + 1}: line{cap + 1}" not in block
+
+
+def test_ref_clamped_to_eof_header_reflects_last_line():
+    # end past EOF (but within the line cap) clamps the header to the last real line.
+    block = _capture_fetch([("m.py", 2, 50)], lambda p: "a\nb\nc\n")   # only 3 lines
+    assert "--- m.py:2-3 ---" in block
+    assert "3: c" in block
+
+
 def test_reasoning_field_is_surfaced():
     r = V.verify_finding("f() returns 1", gen_fn=_ok(_CONFIRMED_REASONING))
     assert r["verdict"] == "confirmed"

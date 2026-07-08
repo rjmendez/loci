@@ -212,14 +212,22 @@ def _fetch_code(refs, reader: ReaderFn) -> str:
             continue
         lines = text.splitlines()
         n = len(lines)
+        if n == 0:
+            continue
+        # Clamp the START into the file (a ref like file.py:0 becomes line 1).
         s = max(1, start)
         if s > n:
             continue
-        e = min(n, end if end >= start else start)
+        # Clamp the END to the ACTUAL last displayable line: at least `s`, no past EOF,
+        # and no more than _MAX_LINES_PER_REF lines. The header is then formatted from the
+        # real s..e span so a 0/oversized/truncated ref never shows a misleading range or
+        # an empty block.
+        e = end if end >= start else start
+        e = min(n, max(s, e))
         if e - s + 1 > _MAX_LINES_PER_REF:
             e = s + _MAX_LINES_PER_REF - 1
         numbered = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
-        header = f"--- {path}:{start}" + (f"-{end}" if end != start else "") + " ---"
+        header = f"--- {path}:{s}" + (f"-{e}" if e != s else "") + " ---"
         blocks.append(header + "\n" + numbered)
     return "\n\n".join(blocks)
 
