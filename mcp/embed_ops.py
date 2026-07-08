@@ -103,19 +103,22 @@ def warm(embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None) ->
     with _warm_lock:
         if _warm_started:
             return False
-        _warm_started = True
-    ef = embed_fn or embed_texts
+        ef = embed_fn or embed_texts
 
-    def _run() -> None:
+        def _run() -> None:
+            try:
+                ef(["warm"])
+            except Exception:
+                pass
+
         try:
-            ef(["warm"])
+            threading.Thread(target=_run, name="embed-warm", daemon=True).start()
         except Exception:
-            pass
-
-    try:
-        threading.Thread(target=_run, name="embed-warm", daemon=True).start()
-    except Exception:
-        pass
+            # Thread creation/start failed: do NOT latch _warm_started, so a later
+            # call can retry and warmed() doesn't report a warm that never fired.
+            return False
+        # Latch only after the thread has actually started.
+        _warm_started = True
     return True
 
 

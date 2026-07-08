@@ -26,7 +26,8 @@ _EXPECTED_KEYS = {
 def test_loci_health_returns_expected_keys():
     out = json.loads(server.loci_health())
     assert isinstance(out, dict)
-    assert set(out.keys()) == _EXPECTED_KEYS
+    # Subset (not ==) so additive fields don't break this contract.
+    assert _EXPECTED_KEYS <= set(out.keys())
     # kuzu is one of the documented states
     assert out["kuzu"] in ("available", "unavailable", "latched", "backoff")
     # booleans for reachability, strings for model names / version
@@ -55,16 +56,17 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
     assert out["ollama_reachable"] is False   # swallowed -> default
     assert out["vllm_reachable"] is True
     assert out["qdrant_reachable"] is False
-    assert set(out.keys()) == _EXPECTED_KEYS
+    assert _EXPECTED_KEYS <= set(out.keys())
 
 
-def test_loci_health_never_raises_when_backends_import_missing(monkeypatch):
-    # Even if the whole backends module resolution blows up, the tool returns a dict.
+def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
+    # Even if every backend endpoint resolver raises, the tool still returns a dict
+    # with the full key set (each probe is independent + fail-open).
     monkeypatch.setattr(backends, "ollama_url", lambda: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "vllm_url", lambda: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "qdrant", lambda: (_ for _ in ()).throw(RuntimeError("x")))
     out = json.loads(server.loci_health())
-    assert set(out.keys()) == _EXPECTED_KEYS
+    assert _EXPECTED_KEYS <= set(out.keys())
 
 
 def _reset_warm():
@@ -96,4 +98,27 @@ def test_warm_is_best_effort_never_raises_when_endpoint_down():
     # the daemon thread actually ran and swallowed the exception (no crash).
     assert ran.wait(timeout=5) is True
     # warmed() reflects the fired state regardless of the underlying failure.
+    assert embed_ops.warmed() is True
+
+
+def test_warm_does_not_latch_when_thread_start_fails(monkeypatch):
+    # If the daemon thread cannot be created/started, warm() must NOT latch
+    # _warm_started, so warmed() stays False and a later call can retry.
+    _reset_warm()
+
+    class _BoomThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot spawn thread")
+
+    monkeypatch.setattr(embed_ops.threading, "Thread", _BoomThread)
+    assert embed_ops.warm(embed_fn=lambda t: []) is False
+    assert embed_ops.warmed() is False
+
+    # With threading restored, a subsequent call succeeds and latches.
+    monkeypatch.undo()
+    _reset_warm()
+    assert embed_ops.warm(embed_fn=lambda t: []) is True
     assert embed_ops.warmed() is True

@@ -295,9 +295,17 @@ def _kuzu_health_state() -> str:
         return "unavailable"
 
 
+_code_version_cache: Optional[str] = None  # computed once per process (incl. '' failure)
+
+
 def _code_version() -> str:
     """Best-effort short git SHA of the running code. '' when not a git checkout / on
-    any error. Never raises."""
+    any error. Never raises. Cached for the process lifetime (incl. the failure/empty
+    result) so the polled health tool never re-forks git on every call."""
+    global _code_version_cache
+    if _code_version_cache is not None:
+        return _code_version_cache
+    result = ""
     try:
         import subprocess
         out = subprocess.run(
@@ -306,10 +314,11 @@ def _code_version() -> str:
             capture_output=True, text=True, timeout=2,
         )
         if out.returncode == 0:
-            return out.stdout.strip()
+            result = out.stdout.strip()
     except Exception:
-        pass
-    return ""
+        result = ""
+    _code_version_cache = result
+    return result
 
 
 def _kuzu_upsert_investigation(investigation_id: str, title: str = "") -> None:
