@@ -60,3 +60,7 @@ plans/
 mcp/.venv/
 mcp/loci_mcp.egg-info/
 **/__pycache__/
+
+# Loci machine-specific backend config (keep out of the public repo)
+backends.toml
+.loci/

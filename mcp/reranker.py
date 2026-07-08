@@ -63,8 +63,16 @@ _model_name: Optional[str] = None
 
 
 def _model_id() -> str:
-    """The configured backend, read from env each call so it can be overridden at runtime."""
-    return os.environ.get("RERANK_MODEL") or _DEFAULT_MODEL
+    """The configured backend, read from env each call so it can be overridden at runtime;
+    else via backends (gitignored config), else the MiniLM default."""
+    v = os.environ.get("RERANK_MODEL")
+    if v:
+        return v
+    try:
+        import backends
+        return backends.rerank_model()
+    except Exception:
+        return _DEFAULT_MODEL
 
 
 def _get_model():

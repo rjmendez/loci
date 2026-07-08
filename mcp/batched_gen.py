@@ -42,13 +42,26 @@ from typing import Callable, Optional
 # server sees multiple concurrent requests, so we dispatch the batch across a thread pool.
 _MAX_CONCURRENCY = int(os.environ.get("VLLM_MAX_CONCURRENCY", "16"))
 
-# [hardware] The batched server's OpenAI-compatible base URL, e.g. http://100.73.200.19:8000
-# Unset -> we never touch the network for the primary path and degrade to Ollama immediately.
+# The batched server's OpenAI-compatible base URL, e.g. http://<host>:8000. Env wins; when
+# unset, _resolve_vllm() falls back to backends (local :8000 probe -> gitignored config).
 _VLLM = os.environ.get("VLLM_BASE_URL") or ""
+_DEFAULT_MODEL = os.environ.get("VLLM_MODEL", "")   # empty -> resolved via backends at call time
 
-# Model the batched server serves. Grounding is silent on the exact tag; default matches the
-# small instruct model recommended in scripts/vllm_serve.md. Override via VLLM_MODEL or arg.
-_DEFAULT_MODEL = os.environ.get("VLLM_MODEL", "Qwen2.5-3B-Instruct")
+
+def _resolve_vllm() -> str:
+    try:
+        import backends
+        return backends.vllm_url()
+    except Exception:
+        return ""
+
+
+def _resolve_vllm_model() -> str:
+    try:
+        import backends
+        return backends.vllm_model()
+    except Exception:
+        return "Qwen2.5-3B-Instruct"
 
 # Generous timeout: a batched server may queue many concurrent requests behind continuous
 # batching. Grounding is silent on an exact value; 120s mirrors llm_local's cold-load budget.
@@ -158,8 +171,9 @@ def generate_batch(prompts: list[str],
     # Normalize to strings so a stray non-str prompt can't blow up json serialization.
     prompts = [p if isinstance(p, str) else str(p) for p in prompts]
 
-    # No batched server configured -> straight to the sequential Ollama fallback [gen].
-    if not _VLLM:
+    # Batched server: env wins; else backends (local :8000 probe -> config). None -> Ollama fallback.
+    vllm = _VLLM or _resolve_vllm()
+    if not vllm:
         return _via_ollama(prompts, model, max_tokens, fmt)
 
     # Resolve the HTTP client lazily/injectably. If even that fails, degrade to Ollama.
@@ -172,7 +186,7 @@ def generate_batch(prompts: list[str],
     except Exception:
         return _via_ollama(prompts, model, max_tokens, fmt)
 
-    served_model = model or _DEFAULT_MODEL
+    served_model = model or _DEFAULT_MODEL or _resolve_vllm_model()
 
     # Dispatch the batch CONCURRENTLY so the batched server has multiple in-flight requests
     # to interleave — a plain blocking loop would serialize and never engage continuous
@@ -182,7 +196,7 @@ def generate_batch(prompts: list[str],
 
     def _one(i: int, p: str):
         try:
-            return i, _post_completions(client, _VLLM, served_model, p, max_tokens, fmt), False
+            return i, _post_completions(client, vllm, served_model, p, max_tokens, fmt), False
         except Exception:
             # Per-prompt isolation on the batched path too [pattern:fail-open].
             return i, {"text": "", "ok": False}, True

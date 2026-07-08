@@ -68,7 +68,7 @@ def test_batched_happy_path(monkeypatch):
     # Hit the OpenAI-compatible completions endpoint, once per prompt.
     assert all(c["url"].endswith("/v1/completions") for c in client.calls)
     assert len(client.calls) == 3
-    assert client.calls[0]["json"]["model"] == B._DEFAULT_MODEL
+    assert client.calls[0]["json"]["model"] == (B._DEFAULT_MODEL or B._resolve_vllm_model())
 
 
 def test_batched_respects_model_and_max_tokens(monkeypatch):

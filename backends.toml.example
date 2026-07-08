@@ -1,0 +1,25 @@
+# Loci backend config — copy to ~/.loci/backends.toml (or point $LOCI_CONFIG at it) and edit.
+# This file holds MACHINE-SPECIFIC endpoints/keys so they never live in the public repo.
+# Resolution order per backend: env var > local probe (localhost) > this file > safe default.
+# So on a laptop with its own Ollama you can leave everything blank (the probe finds it);
+# on a headless box, point these at shared infra (e.g. an oxalis endpoint over tailscale).
+
+[ollama]
+# url = "http://100.73.200.19:11434"   # remote Ollama over tailscale (omit to use local :11434)
+
+[embed]
+# model = "nomic-embed-text"
+
+[vllm]
+# url = "http://100.73.200.19:8000"    # batched OpenAI-compatible server (omit -> Ollama fallback)
+# model = "Qwen/Qwen2.5-3B-Instruct"
+
+[rerank]
+# model = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # or "BAAI/bge-reranker-v2-m3"
+
+[qdrant]
+# url = "http://172.21.171.198:30633"
+# api_key = "..."
+
+[memory]
+# dir = "/absolute/path/to/curated/MEMORY.md/dir"

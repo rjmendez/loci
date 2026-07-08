@@ -26,10 +26,17 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-_MEMORY_DIR_DEFAULT = os.environ.get(
-    "LOCI_MEMORY_MD_DIR",
-    str(Path.home() / ".claude" / "projects" / "-home-rjmendez" / "memory"),
-)
+def _default_memory_dir() -> str:
+    """Curated MEMORY.md dir via backends (env -> gitignored config -> HERMES_MEMORY_DIR).
+    No machine/user-specific default — if nothing is configured the memory lane just no-ops."""
+    try:
+        import backends
+        return backends.memory_dir()
+    except Exception:
+        return os.environ.get("LOCI_MEMORY_MD_DIR") or os.environ.get("HERMES_MEMORY_DIR", "")
+
+
+_MEMORY_DIR_DEFAULT = _default_memory_dir()
 
 # Sources/types whose text is a raw conversation dump — never inject these.
 _DUMP_MARKERS = ("pre_compress", "session_end", "session_dump", "conversation", "transcript", "turn")

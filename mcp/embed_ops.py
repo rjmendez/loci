@@ -21,18 +21,30 @@ import os
 from typing import Callable, Optional
 
 _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
-_EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+_EMBED_MODEL = os.environ.get("EMBED_MODEL", "")   # empty -> resolved via backends at call time
+
+
+def _resolve() -> tuple[str, str]:
+    """(ollama_url, embed_model): env wins; else backends (local probe -> config -> default)."""
+    if _OLLAMA and _EMBED_MODEL:
+        return _OLLAMA, _EMBED_MODEL
+    try:
+        import backends
+        return (_OLLAMA or backends.ollama_url()), (_EMBED_MODEL or backends.embed_model())
+    except Exception:
+        return _OLLAMA, (_EMBED_MODEL or "nomic-embed-text")
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """Batch-embed via Ollama /api/embed. Returns [] on any failure (fail-open)."""
     texts = [t if isinstance(t, str) else str(t) for t in texts]
-    if not texts or not _OLLAMA:
+    base, model = _resolve()
+    if not texts or not base:
         return []
     try:
         import requests
-        r = requests.post(f"{_OLLAMA}/api/embed",
-                          json={"model": _EMBED_MODEL, "input": texts}, timeout=60)
+        r = requests.post(f"{base}/api/embed",
+                          json={"model": model, "input": texts}, timeout=60)
         r.raise_for_status()
         embs = r.json().get("embeddings") or []
         return embs if len(embs) == len(texts) else []
