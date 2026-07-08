@@ -277,6 +277,57 @@ def _get_kuzu():
     return _kuzu_store
 
 
+def _kuzu_health_state() -> str:
+    """Read-only view of the Kuzu store state for loci_health, WITHOUT grabbing the
+    single-writer lock (so a health probe never contends with a real writer):
+    'available' (open) | 'latched' (permanent failure, won't retry) |
+    'backoff' (transient failure, retrying after the window) | 'unavailable' (not yet
+    initialized / unknown). Never raises."""
+    try:
+        if _kuzu_store is not None:
+            return "available"
+        if _kuzu_failed:
+            return "latched"
+        if _kuzu_last_attempt and (time.monotonic() - _kuzu_last_attempt) < _KUZU_RETRY_SECONDS:
+            return "backoff"
+        return "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+_code_version_cache: Optional[str] = None  # computed once per process (incl. '' failure)
+_code_version_lock = threading.Lock()
+
+
+def _code_version() -> str:
+    """Best-effort short git SHA of the running code. '' when not a git checkout / on
+    any error. Never raises. Cached for the process lifetime (incl. the failure/empty
+    result) so the polled health tool never re-forks git on every call.
+
+    First compute is guarded by a lock with double-checked locking so concurrent
+    callers before the cache is filled do not each spawn a `git rev-parse`."""
+    global _code_version_cache
+    if _code_version_cache is not None:  # fast path: no lock once cached
+        return _code_version_cache
+    with _code_version_lock:
+        if _code_version_cache is not None:  # re-check under the lock
+            return _code_version_cache
+        result = ""
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                result = out.stdout.strip()
+        except Exception:
+            result = ""
+        _code_version_cache = result
+        return result
+
+
 def _kuzu_upsert_investigation(investigation_id: str, title: str = "") -> None:
     ks = _get_kuzu()
     if not ks:
@@ -7135,6 +7186,80 @@ def semantic_relevance(texts: list, topic: str) -> str:
 
 
 @mcp.tool()
+def loci_health() -> str:
+    """
+    Read-only self-diagnosis of the Loci MCP server. Returns a JSON snapshot of the
+    running code version, the graph-store state, and per-backend reachability so a
+    'reconnect needed / backend down / graph lock held' condition is self-evident
+    instead of hand-diagnosed. Every probe is independent, cheap (short timeout), and
+    fail-open — a dead backend reports False/unavailable, never an exception.
+
+    Returns JSON:
+      code_version:      short git SHA of the running code ('' if not a git checkout)
+      kuzu:              'available' | 'unavailable' | 'latched' | 'backoff' — reflects
+                         the graph store state WITHOUT grabbing the single-writer lock
+      ollama_reachable:  TCP reachability of the resolved Ollama endpoint
+      vllm_reachable:    TCP reachability of the resolved vLLM endpoint
+      qdrant_reachable:  TCP reachability of the resolved Qdrant endpoint
+      embed_model:       configured embedding model
+      rerank_model:      configured cross-encoder rerank model
+      warm:              whether the embed warm-ping has been fired this process
+    """
+    out: dict = {
+        "code_version": "",
+        "kuzu": "unavailable",
+        "ollama_reachable": False,
+        "vllm_reachable": False,
+        "qdrant_reachable": False,
+        "embed_model": "",
+        "rerank_model": "",
+        "warm": False,
+    }
+    try:
+        out["code_version"] = _code_version()
+    except Exception:
+        pass
+    try:
+        out["kuzu"] = _kuzu_health_state()
+    except Exception:
+        pass
+    try:
+        import backends
+        # Bounded, fast even on the FIRST call with backends down: resolve each
+        # endpoint URL ONCE (the resolvers are memoized) and pass a SHORT probe
+        # timeout so the resolvers' own internal local probe cannot block for the
+        # 1.0s default. Then run loci_health's own reachability check with the same
+        # short timeout. Each probe is independent + fail-open: one raising /
+        # unreachable backend must not mask the others.
+        _PROBE_T = 0.5
+        for key, resolver in (
+            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
+            ("vllm_reachable", lambda: backends.vllm_url(_PROBE_T)),
+            ("qdrant_reachable", lambda: backends.qdrant()[0]),
+        ):
+            try:
+                out[key] = bool(backends._alive(resolver(), timeout=_PROBE_T))
+            except Exception:
+                pass
+        try:
+            out["embed_model"] = backends.embed_model()
+        except Exception:
+            pass
+        try:
+            out["rerank_model"] = backends.rerank_model()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        import embed_ops
+        out["warm"] = embed_ops.warmed()
+    except Exception:
+        pass
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
 def ground(
     title: str,
     focus: str = "",
@@ -8909,6 +9034,14 @@ from graph_tools import (  # noqa: E402,F401
 
 
 def main() -> None:
+    # Fire-and-forget embed warm-ping so the FIRST real RAG/dedup call doesn't eat the
+    # ~9s nomic cold-load. Non-blocking (daemon thread) and fail-open — never blocks or
+    # breaks startup.
+    try:
+        import embed_ops
+        embed_ops.warm()
+    except Exception:
+        pass
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
         host = os.environ.get("HERMES_MCP_HOST", "0.0.0.0")
