@@ -76,3 +76,49 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     B._reset_cache()
     assert B.embed_model() == "nomic-embed-text"      # falls to default, never raises
     assert B.ollama_url() == ""
+
+
+# --- Fresh-install end-to-end: no env overrides, no local Ollama/vLLM, config resolved from
+# a file (or absent). The in-process equivalent of the env -i simulation, exercising ALL
+# backends together so the resolution chain + the bge default flip are guarded as one unit. ---
+
+_ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "EMBED_MODEL",
+                    "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
+                    "LOCI_MEMORY_MD_DIR", "HERMES_MEMORY_DIR")
+
+
+def _fresh_install(mp, config_path):
+    """Clean machine: no backend env overrides, no local service listening, config at path."""
+    for k in _ALL_BACKEND_ENV:
+        mp.delenv(k, raising=False)
+    mp.setattr(B, "_alive", lambda url, timeout=1.0: False)   # no local GPU services
+    mp.setattr(B, "_CONFIG_PATH", str(config_path))
+    B._reset_cache()
+
+
+def test_fresh_install_full_config_resolves_all_backends(tmp_path, monkeypatch):
+    cfg = tmp_path / "backends.toml"
+    cfg.write_text('[ollama]\nurl = "http://cfg-gpu:11434"\n'
+                   '[embed]\nmodel = "cfg-embed"\n'
+                   '[vllm]\nurl = "http://cfg-gpu:8000"\nmodel = "cfg-vllm"\n'
+                   '[rerank]\nmodel = "cfg-rerank"\n'
+                   '[qdrant]\nurl = "http://cfg-qdrant:6333"\napi_key = "cfg-key"\n'
+                   '[memory]\ndir = "/cfg/mem"\n')
+    _fresh_install(monkeypatch, cfg)
+    assert B.ollama_url() == "http://cfg-gpu:11434"
+    assert B.vllm_url() == "http://cfg-gpu:8000"
+    assert B.embed_model() == "cfg-embed"
+    assert B.vllm_model() == "cfg-vllm"
+    assert B.rerank_model() == "cfg-rerank"
+    assert B.qdrant() == ("http://cfg-qdrant:6333", "cfg-key")
+    assert B.memory_dir() == "/cfg/mem"
+
+
+def test_fresh_install_bare_defaults(monkeypatch):
+    _fresh_install(monkeypatch, "/nonexistent/no.toml")
+    assert B.ollama_url() == "" and B.vllm_url() == ""        # urls empty -> tiers fail-open
+    assert B.embed_model() == "nomic-embed-text"
+    assert B.vllm_model() == "Qwen2.5-3B-Instruct"
+    assert B.rerank_model() == "BAAI/bge-reranker-v2-m3"      # bge is the flipped fresh default
+    assert B.qdrant() == ("", "")
+    assert B.memory_dir() == ""
