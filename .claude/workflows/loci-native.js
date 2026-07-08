@@ -11,10 +11,14 @@ export const meta = {
 // -----------------------------------------------------------------------------
 // CONTRACT
 //   Workflow scripts cannot import local files or call MCP tools directly, so the
-//   grounding block is produced ONCE in the main loop and passed in via args:
+//   grounding block is produced ONCE in the main loop and passed in via args. Produce it
+//   with the warm `ground` MCP tool (keeps the cross-encoder loaded, so the RAG lane is
+//   reliable) — or the scripts/ground.py CLI when no server is running (cold-start may
+//   drop the RAG lane; fail-open, the case lanes still carry it):
 //
-//     block=$(python scripts/ground.py '{"title":"...","focus":"...","caseIds":[...]}')
-//     Workflow({ name: 'loci-native', args: { ground: block, tasks: [...] } })
+//     block = mcp__loci__ground({title, focus, case_ids:[...]}).block   // preferred (warm)
+//     block = $(python scripts/ground.py '{"title":"...","caseIds":[...]}')  // fallback
+//     Workflow({ scriptPath: '.../loci-native.js', args: { ground: block, tasks: [...] } })
 //
 //   args = {
 //     ground:  string   // grounding.ground().block — injected verbatim into every prompt
