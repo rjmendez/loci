@@ -6921,6 +6921,41 @@ def wiring_obligation_resolve(
 
 
 @mcp.tool()
+def semantic_dedup(items: list, threshold: float = 0.88, text_key: Optional[str] = None) -> str:
+    """
+    Cluster near-duplicate items by embedding cosine similarity on the local-GPU path —
+    no generation model, ~zero token cost. Use in a fan-out's synthesis step so an N-way
+    search doesn't triple-report the same finding: pass the aggregated items, feed the
+    returned `kept` (one representative per cluster) downstream.
+
+    items: list of strings OR dicts (text pulled from text_key, else text/content/summary/title).
+    threshold: cosine >= this counts as a duplicate (default 0.88; raise to be stricter).
+    Fail-open: if embeddings are unavailable, nothing is dropped and degraded=True.
+
+    Returns JSON {clusters:[{rep_index, member_indices, text}], kept:[...], dropped:int, degraded}.
+    """
+    import embed_ops
+    return json.dumps(embed_ops.dedup(items or [], threshold=threshold, key=text_key), indent=2)
+
+
+@mcp.tool()
+def semantic_relevance(texts: list, topic: str) -> str:
+    """
+    Cosine relevance of each text to `topic` on the local-GPU embedding path — a cheap
+    gate/router (keep texts above a score) that trims what reaches Claude, replacing a
+    classifier agent. No generation model.
+
+    Returns JSON {scores:[float|None], degraded}; scores align with `texts` (None when
+    embeddings are unavailable, degraded=True).
+    """
+    if not topic or not str(topic).strip():
+        return json.dumps({"scores": [None] * len(texts or []), "degraded": True,
+                           "error": "topic must not be empty"})
+    import embed_ops
+    return json.dumps(embed_ops.relevance(list(texts or []), topic), indent=2)
+
+
+@mcp.tool()
 def ground(
     title: str,
     focus: str = "",
