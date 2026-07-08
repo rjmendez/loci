@@ -6921,6 +6921,58 @@ def wiring_obligation_resolve(
 
 
 @mcp.tool()
+def llm_local(prompt: str, model: str = "qwen2.5:3b", fmt: Optional[str] = None,
+              max_tokens: int = 256, temperature: float = 0.2, keep_alive: str = "30m") -> str:
+    """
+    Generate with a LOCAL model on the GPU (Ollama) — the generation tier of the offload
+    hierarchy, for cheap high-volume ops (classify/expand/compress) that shouldn't spend
+    Claude tokens. Verified-good model: qwen2.5:3b (sub-second warm, ~111 tok/s).
+
+    keep_alive pins the model resident (default '30m') to avoid the ~70s cold load — keep it
+    long for hot paths. Set fmt='json' to constrain + validate JSON output. Fail-open: on any
+    error/timeout, or invalid JSON when fmt='json', returns ok=False (the caller should then
+    fall back to a Claude model). Returns JSON {text, ok, model}.
+    """
+    import llm_local as _llm
+    return json.dumps(_llm.generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens,
+                                    temperature=temperature, keep_alive=keep_alive), indent=2)
+
+
+@mcp.tool()
+def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
+    """
+    Expand a search query (HyDE-lite) using the LOCAL model — alternative phrasings + domain
+    keywords to improve retrieval recall before an embedding search. Runs on the GPU, ~zero
+    Claude tokens. Fail-open: if the local model is down, returns the original query with
+    degraded=True. Returns JSON {queries, keywords, degraded}.
+    """
+    import query_expand as _qe
+    return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
+
+
+@mcp.tool()
+def classify_text(text: str, labels: list) -> str:
+    """
+    Pick the single best label from `labels` for `text` using the LOCAL model — a cheap
+    gate/router that replaces a classifier agent. Fail-open: label=None + degraded=True if the
+    model is down or returns an out-of-set label. Returns JSON {label, degraded}.
+    """
+    import text_ops as _to
+    return json.dumps(_to.classify(text, list(labels or [])), indent=2)
+
+
+@mcp.tool()
+def compress_text(text: str, max_chars: int = 600) -> str:
+    """
+    Semantically condense `text` to <= max_chars using the LOCAL model — e.g. shrink a long
+    agent output before a Claude synthesis stage (saves Claude input tokens). Fail-open:
+    returns a char-truncation + degraded=True if the model is down. Returns JSON {text, degraded}.
+    """
+    import text_ops as _to
+    return json.dumps(_to.compress(text, max_chars=max_chars), indent=2)
+
+
+@mcp.tool()
 def semantic_dedup(items: list, threshold: float = 0.88, text_key: Optional[str] = None) -> str:
     """
     Cluster near-duplicate items by embedding cosine similarity on the local-GPU path —
