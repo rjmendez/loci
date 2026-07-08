@@ -258,6 +258,25 @@ def test_reasoning_falls_back_to_raw_text_when_absent():
     assert '"verdict": "confirmed"' in r["reasoning"]
 
 
+def test_degraded_coerces_nonstring_text_to_string():
+    # A not-ok result whose "text" is None must not leak None into reasoning:
+    # _degraded is the single normalization point and keeps the all-strings return shape.
+    def _not_ok_none_text(prompt, *, fmt=None, max_tokens=256):
+        return {"ok": False, "text": None}
+
+    r = V.verify_finding("some claim", gen_fn=_not_ok_none_text)
+    assert r["verdict"] == "uncertain"
+    assert r["degraded"] is True
+    assert isinstance(r["reasoning"], str) and r["reasoning"] == ""
+    assert isinstance(r["refutation"], str)
+
+
+def test_degraded_direct_nonstring_args_coerced():
+    d = V._degraded(refutation=None, reasoning=123)
+    assert d["refutation"] == "" and d["reasoning"] == "123"
+    assert isinstance(d["refutation"], str) and isinstance(d["reasoning"], str)
+
+
 def test_claim_only_still_works_without_refs():
     # No code_refs, no file:line anywhere -> reader must never be consulted; behavior unchanged.
     def _reader(path):
@@ -299,6 +318,19 @@ def test_default_reader_size_cap(monkeypatch):
     monkeypatch.setattr(V, "_MAX_FILE_BYTES", 16)
     text = V._lazy_read_file("mcp/verify.py")
     assert 0 < len(text) <= 16
+
+
+def test_default_reader_size_cap_is_byte_accurate(monkeypatch, tmp_path):
+    # The cap is BYTES, not characters: a multibyte file must not read past the byte cap.
+    # Under the old text-mode f.read(n) this capped characters and could return more bytes.
+    p = tmp_path / "multibyte.txt"
+    p.write_text("é" * 100, encoding="utf-8")  # each 'é' is 2 UTF-8 bytes
+    monkeypatch.setattr(V, "_MAX_FILE_BYTES", 10)
+    monkeypatch.setattr(V, "_safe_resolve", lambda path: str(p))
+    text = V._lazy_read_file("multibyte.txt")
+    # Never decode more than the byte cap allowed (10 bytes -> at most 5 'é' chars).
+    assert len(text.encode("utf-8")) <= 10
+    assert 0 < len(text) <= 5
 
 
 def test_absolute_code_ref_reads_nothing_end_to_end():

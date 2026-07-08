@@ -162,8 +162,11 @@ def _lazy_read_file(path: str) -> str:
         full = _safe_resolve(path)
         if not full or not os.path.isfile(full):
             return ""
-        with open(full, "r", encoding="utf-8", errors="replace") as f:
-            return f.read(_MAX_FILE_BYTES)
+        # Read raw BYTES so the cap is byte-accurate (text-mode f.read(n) caps CHARACTERS and
+        # can pull in more bytes for multibyte text). Read exactly the cap, then decode.
+        with open(full, "rb") as f:
+            raw = f.read(_MAX_FILE_BYTES)
+        return raw.decode("utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -316,8 +319,13 @@ def _degraded(refutation: str = "", reasoning: str = "") -> dict:
     """Well-formed skeptical fallback: uncertain, low confidence, degraded=True.
 
     `reasoning` carries any raw model text we did manage to get, so a caller can still judge.
+    Callers may pass through non-string values (e.g. ``res.get('text')`` is None), so coerce
+    both text fields to a stripped str here — the single normalization point — to keep the
+    documented all-strings return shape.
     """
-    return {"verdict": "uncertain", "refutation": refutation, "reasoning": reasoning,
+    ref = refutation if isinstance(refutation, str) else ("" if refutation is None else str(refutation))
+    rea = reasoning if isinstance(reasoning, str) else ("" if reasoning is None else str(reasoning))
+    return {"verdict": "uncertain", "refutation": ref.strip(), "reasoning": rea.strip(),
             "confidence": 0.0, "degraded": True}
 
 
