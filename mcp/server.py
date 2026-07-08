@@ -3588,6 +3588,8 @@ def finding_resolve(
         return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
 
     # Confirm the finding exists so we don't record an orphan resolution.
+    # Uses the codebase-wide _read_jsonl (whole-file read, tolerant of a
+    # partial last line) — same semantics as every other findings.jsonl reader.
     findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
     if not any(isinstance(f, dict) and str(f.get("id", "")) == str(finding_id) for f in findings):
         return json.dumps({"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
@@ -7458,18 +7460,25 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             return overrides[fid]
         return str(f.get("resolution") or "open").lower()
 
-    open_findings = [
-        f for f in findings
-        if isinstance(f, dict)
-        and _effective_res(f) == "open"
-        and str(f.get("id", "")) not in retracted
-        and str(f.get("text") or "").strip()
-    ]
     try:
         _limit = max(0, int(limit))
     except (TypeError, ValueError):
         _limit = 20
-    open_findings = open_findings[:_limit]
+
+    # Apply the limit WHILE iterating so we stop after collecting `_limit` open
+    # findings instead of materializing every open finding and then slicing
+    # (Copilot round 7): cheaper on large findings sets.
+    open_findings = []
+    for f in findings:
+        if len(open_findings) >= _limit:
+            break
+        if (
+            isinstance(f, dict)
+            and _effective_res(f) == "open"
+            and str(f.get("id", "")) not in retracted
+            and str(f.get("text") or "").strip()
+        ):
+            open_findings.append(f)
 
     results = []
     for f in open_findings:
