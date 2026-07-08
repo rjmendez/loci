@@ -190,8 +190,6 @@ _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 # ---------------------------------------------------------------------------
 
 _sparse_model = None
-_cross_encoder = None          # sentence_transformers.CrossEncoder | False (permanent failure)
-_cross_encoder_lock = threading.Lock()   # guards lazy init against concurrent first-callers
 _investigation_locks: dict[str, threading.Lock] = {}  # per-investigation lock for atomic JSONL appends
 _investigation_locks_lock = threading.Lock()          # guards _investigation_locks dict itself
 _qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
@@ -585,28 +583,23 @@ def _get_sparse_embedder():
 
 
 def _get_cross_encoder():
-    """Lazy-init a sentence-transformers CrossEncoder for two-stage reranking.
+    """The two-stage reranker's CrossEncoder, or None when unavailable (fail-open).
 
-    Uses ms-marco-MiniLM-L-6-v2 — a 22 M-param model trained on passage
-    ranking, CPU-capable at <100 ms per batch of 50. Gracefully disabled when
-    sentence-transformers is not installed so the rest of retrieval keeps
-    working with bi-encoder scores alone.
+    Delegates to reranker.get_model() so the backend is env-pluggable via RERANK_MODEL:
+    default 'cross-encoder/ms-marco-MiniLM-L-6-v2' reproduces the historical behavior; opt-in
+    'BAAI/bge-reranker-v2-m3' is a stronger reranker. Lazy-init, globally cached, loaded on
+    cuda:0 (the 4070 Ti) when available. Call sites keep calling `.predict(pairs)` unchanged.
+
+    NOTE: flipping RERANK_MODEL to bge is a retrieval-QUALITY change — shadow-eval / A-B it on
+    a held-out query set before making it the default (mirrors the DAMA shadow-eval + canary
+    gate; see scripts/gpu_placement.md and dama-gotchi/training/GPU_PACKING_POLICY.md).
     """
-    global _cross_encoder
-    if _cross_encoder is None:                        # fast path — no lock needed post-init
-        with _cross_encoder_lock:                     # slow path — guard concurrent first callers
-            if _cross_encoder is None:                # re-check after acquiring the lock
-                try:
-                    from sentence_transformers import CrossEncoder as _CE
-                    _cross_encoder = _CE("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
-                    logger.info("Cross-encoder reranking enabled (ms-marco-MiniLM-L-6-v2)")
-                except ImportError:
-                    logger.debug("sentence-transformers not installed — reranking disabled")
-                    _cross_encoder = False
-                except Exception as exc:
-                    logger.warning("Cross-encoder init failed — reranking disabled: %s", exc)
-                    _cross_encoder = False
-    return _cross_encoder if _cross_encoder is not False else None
+    try:
+        import reranker
+        return reranker.get_model()
+    except Exception as exc:
+        logger.warning("Reranker unavailable — reranking disabled: %s", exc)
+        return None
 
 
 def _embed_sparse(text: str):
@@ -6936,6 +6929,21 @@ def llm_local(prompt: str, model: str = "qwen2.5:3b", fmt: Optional[str] = None,
     import llm_local as _llm
     return json.dumps(_llm.generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens,
                                     temperature=temperature, keep_alive=keep_alive), indent=2)
+
+
+@mcp.tool()
+def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int = 256,
+                   fmt: Optional[str] = None) -> str:
+    """
+    Generate for MANY prompts at once — for high-concurrency fan-out (per-item classify/expand
+    gates, map stages). Uses a batched OpenAI-compatible server (vLLM/TGI at VLLM_BASE_URL,
+    dispatched concurrently so continuous batching engages) when configured, else fails open to
+    the sequential Ollama tier (llm_local). Returns JSON: a list of {text, ok} aligned 1:1 to
+    `prompts` (a failed prompt is {text:'', ok:False}; never raises).
+    """
+    import batched_gen
+    return json.dumps(batched_gen.generate_batch(list(prompts or []), model=model,
+                                                 max_tokens=max_tokens, fmt=fmt), indent=2)
 
 
 @mcp.tool()
