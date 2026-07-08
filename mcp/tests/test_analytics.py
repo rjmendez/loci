@@ -92,20 +92,20 @@ def test_dead_code_candidates(tmp_path):
     from graph.kuzu_store import KuzuStore
     s = KuzuStore(str(tmp_path / "dc.kuzu"))
     e = s._exec
-    def sym(sid, name, kind="function", decs=""):
+    # `referenced` is the usage signal now (name occurs more than it's defined).
+    def sym(sid, name, kind="function", decs="", referenced=False):
         e("MERGE (x:CodeSymbol {id:$i}) SET x.name=$n, x.kind=$k, x.file='m.py', x.line=1, "
-          "x.lang='python', x.decorators=$d", {"i": sid, "n": name, "k": kind, "d": decs})
-    sym("m.py::genuine_dead", "genuine_dead")   # -> candidate
-    sym("m.py::tool_fn", "tool_fn", decs="mcp.tool")  # entry point -> excluded
-    sym("m.py::_private", "_private")            # private -> excluded
-    sym("m.py::main", "main")                    # convention entry point -> excluded
-    sym("m.py::called_fn", "called_fn")          # has a caller -> excluded
-    sym("m.py::caller", "caller")
-    e("MATCH (a:CodeSymbol {id:'m.py::caller'}),(b:CodeSymbol {id:'m.py::called_fn'}) "
-      "MERGE (a)-[:CALLS]->(b)")
+          "x.lang='python', x.decorators=$d, x.referenced=$r",
+          {"i": sid, "n": name, "k": kind, "d": decs, "r": referenced})
+    sym("m.py::genuine_dead", "genuine_dead")               # not referenced -> candidate
+    sym("m.py::tool_fn", "tool_fn", decs="mcp.tool")         # entry point -> excluded
+    sym("m.py::_private", "_private")                        # private -> excluded
+    sym("m.py::main", "main")                                # convention entry point -> excluded
+    sym("m.py::setUp", "setUp", kind="method")               # unittest hook -> excluded
+    sym("m.py::used_fn", "used_fn", referenced=True)         # referenced -> excluded
     names = {c["name"] for c in A.dead_code_candidates(s)["candidates"]}
     assert "genuine_dead" in names
-    assert names.isdisjoint({"tool_fn", "_private", "main", "called_fn"})
+    assert names.isdisjoint({"tool_fn", "_private", "main", "setUp", "used_fn"})
 
 
 def test_fail_open():

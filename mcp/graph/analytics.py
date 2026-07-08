@@ -277,7 +277,8 @@ _ENTRYPOINT_DECORATORS = frozenset({
 _ENTRYPOINT_PREFIXES = ("mcp.", "app.", "cli.", "click.", "router.", "bp.", "celery.", "pytest.")
 # Names that are entry points by convention (module __main__ dispatch etc.) — no
 # in-graph caller even when live.
-_ENTRYPOINT_NAMES = frozenset({"main", "__main__"})
+_ENTRYPOINT_NAMES = frozenset({"main", "__main__", "setUp", "tearDown",
+                               "setUpClass", "tearDownClass", "setup_method", "teardown_method"})
 
 
 def _is_entrypoint(decorators: str) -> bool:
@@ -302,9 +303,13 @@ def dead_code_candidates(ks: Any, *, lang: str | None = None, limit: int = 50) -
     empty = {"candidates": [], "count": 0, "note": "graph unavailable"}
     if not _ok(ks):
         return empty
+    # `referenced` = the name occurs more as an identifier than it is defined, i.e.
+    # used somewhere (call / registry list / callback / polymorphic dispatch). It is
+    # recall-independent, so it catches uses the sparse call graph misses (dispatch
+    # tables, duck-typed interface methods). Dead = not referenced AND not finding-linked.
     rows = _q(ks,
         "MATCH (s:CodeSymbol) WHERE s.kind IN ['function','method'] "
-        "AND NOT EXISTS { MATCH (:CodeSymbol)-[:CALLS]->(s) } "
+        "AND (s.referenced = false OR s.referenced IS NULL) "
         "AND NOT EXISTS { MATCH (:Finding)-[:REFERENCES]->(s) } "
         "RETURN s.name, s.kind, s.file, s.line, s.decorators, s.lang")
     out = []
