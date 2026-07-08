@@ -1736,8 +1736,20 @@ def _save_manifest(manifest: dict) -> None:
 
 
 def _append_jsonl(path: Path, entry: dict) -> None:
+    # Exclusive advisory lock around the append so concurrent writers (e.g. parallel
+    # workflow agents recording to the same investigation) can't interleave a >PIPE_BUF
+    # line and corrupt the file. flock is POSIX-only; degrade to a bare append elsewhere.
+    line = json.dumps(entry) + "\n"
     with open(path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.write(line)
+            f.flush()
+        finally:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
 
 
 def _read_jsonl(path: Path) -> list[dict]:
