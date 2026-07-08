@@ -110,6 +110,37 @@ def evaluate(query_set: Sequence[dict],
     }
 
 
+def score_configs(rankings_by_config: dict, relevant: set, k: int) -> dict:
+    """Per-query: score each config's ranking against a JUDGE-supplied relevant set — the
+    real-relevance path that replaces the same-investigation proxy. rankings_by_config maps a
+    config name to its ranked [doc_id, ...]. Returns {config -> {recall, mrr, ndcg}} (raw)."""
+    out = {}
+    for cfg, ranked in (rankings_by_config or {}).items():
+        rel = set(relevant or ())
+        out[cfg] = {"recall": recall_at_k(ranked, rel, k), "mrr": mrr(ranked, rel),
+                    "ndcg": ndcg_at_k(ranked, rel, k)}
+    return out
+
+
+def aggregate(per_query_scores: list, k: int) -> dict:
+    """Mean each config's metrics across queries. Input is the list of score_configs() dicts.
+    Returns {config -> {recall@k, mrr, ndcg@k, n, k}} — the shape compare() consumes. Queries
+    with an empty judge-relevant set contribute 0s (a config can't recall what has no relevant)."""
+    agg, counts = {}, {}
+    for pq in per_query_scores or ():
+        for cfg, m in (pq or {}).items():
+            a = agg.setdefault(cfg, {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0})
+            for kk in ("recall", "mrr", "ndcg"):
+                a[kk] += m.get(kk, 0.0)
+            counts[cfg] = counts.get(cfg, 0) + 1
+    out = {}
+    for cfg, a in agg.items():
+        n = counts[cfg] or 1
+        out[cfg] = {f"recall@{k}": round(a["recall"] / n, 4), "mrr": round(a["mrr"] / n, 4),
+                    f"ndcg@{k}": round(a["ndcg"] / n, 4), "n": counts[cfg], "k": k}
+    return out
+
+
 def compare(baseline_name: str, baseline: dict, candidate_name: str, candidate: dict,
             primary: str = "ndcg", min_rel_gain: float = 0.02) -> dict:
     """Compare two eval results and recommend whether to flip to the candidate.
