@@ -217,6 +217,14 @@ class TestInvestigationLifecycle(unittest.TestCase):
         str_two = _json(server.investigation_list(limit="2", offset=0))
         self.assertEqual([i["id"] for i in str_two["investigations"]], ids[:2])
 
+        # limit=None (explicit no-limit) must normalize to the limit<=0 case:
+        # returns everything AND echoes an int, matching the `limit: int`
+        # signature/docstring — never a null in the response.
+        none_limit = _json(server.investigation_list(limit=None))
+        self.assertEqual([i["id"] for i in none_limit["investigations"]], ids)
+        self.assertIsInstance(none_limit["limit"], int)
+        self.assertEqual(none_limit["limit"], 0)
+
     def test_investigation_list_summary_omits_verbose_fields(self):
         inv_id = _new_id("summary")
         server.investigation_start(investigation_id=inv_id, title="Summary test")

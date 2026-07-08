@@ -5112,8 +5112,12 @@ def investigation_list(
     # A string limit (e.g. via JSON tool args) would otherwise raise TypeError
     # in the `limit <= 0` comparison and `offset + limit` slice below,
     # contradicting the documented "limit<=0 returns everything" behavior.
-    # None stays None (explicit no-limit); garbage falls back to the default.
-    if limit is not None:
+    # Normalize None to 0 so it collapses into the documented limit<=0 no-limit
+    # case; the echoed `limit` is then always an int, matching the signature
+    # (limit: int) and docstring. Garbage falls back to the default.
+    if limit is None:
+        limit = 0
+    else:
         try:
             limit = int(limit)
         except (TypeError, ValueError):
@@ -5136,14 +5140,13 @@ def investigation_list(
 
     total = len(entries)
 
-    if limit is None or limit <= 0:
+    if limit <= 0:
         page = entries[offset:]
     else:
         page = entries[offset:offset + limit]
 
     investigations = []
     for d, manifest in page:
-        acl = manifest.get("acl") or []
         record = {
             "id": manifest["id"],
             "title": manifest["title"],
@@ -5164,6 +5167,9 @@ def investigation_list(
                         tier_counts["warm"] += 1  # default for legacy findings
             except Exception:
                 pass  # fail-open
+            # acl is only needed to derive visibility, which is a full-mode-only
+            # field — skip the lookup entirely on the default summary path.
+            acl = manifest.get("acl") or []
             record.update({
                 "created_at": manifest["created_at"],
                 "open_questions_count": len(manifest["open_questions"]),
