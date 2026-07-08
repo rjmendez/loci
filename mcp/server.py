@@ -6921,6 +6921,61 @@ def wiring_obligation_resolve(
 
 
 @mcp.tool()
+def ground(
+    title: str,
+    focus: str = "",
+    case_ids: Optional[list] = None,
+    entities: Optional[list] = None,
+    code_refs: Optional[list] = None,
+    budget_chars: int = 4000,
+    allow_keyword: bool = False,
+    graph_available: bool = False,
+) -> str:
+    """
+    Assemble a compact, provenance-tagged, char-budgeted GROUNDING block for a task —
+    run ONCE in an orchestrator before a fan-out and inject the block into every agent
+    prompt, so agents start with relevant prior context instead of each re-querying Loci
+    (the cost win). Structured-first, embedding-independent retrieval order: named cases
+    (investigation_load) -> exact entities (investigation_entity_lookup) -> code graph
+    (when graph_available) -> semantic RAG -> curated MEMORY.md -> keyword FTS (opt-in).
+    Every lane is fail-open: a dead source sets degraded=True rather than aborting.
+
+    Prefer this over calling the individual investigation_*/rag tools when preparing a
+    workflow — one warm call here beats N cold ones (and keeps the cross-encoder loaded,
+    which the ground.py CLI cannot). The block is tagged read-only reference, NOT ground
+    truth: consumers must verify against live code/data and cite the [tag] they rely on.
+
+    Args:
+        title: Short task title (drives retrieval).
+        focus: Optional longer task description.
+        case_ids: Named investigation IDs to load.
+        entities: Exact entity IDs to look up (O(1), no embedding).
+        code_refs: Symbol names for code-graph grounding (used only if graph_available).
+        budget_chars: Max characters of the assembled block (default 4000).
+        allow_keyword: Enable the noisy keyword/FTS fallback lane (default off).
+        graph_available: Enable the code-graph lane (default off; needs the Kuzu graph).
+
+    Returns:
+        JSON with {block, sources, chars, degraded}.
+    """
+    if not title or not title.strip():
+        return json.dumps({"error": "title must not be empty",
+                           "block": "", "sources": [], "chars": 0, "degraded": True})
+    import grounding
+    task = {
+        "title": title, "focus": focus or "",
+        "caseIds": case_ids or [], "entities": entities or [],
+        "codeRefs": code_refs or [],
+    }
+    opts = {
+        "budgetChars": budget_chars,
+        "allowKeyword": allow_keyword,
+        "graphAvailable": graph_available,
+    }
+    return json.dumps(grounding.ground(task, opts), indent=2)
+
+
+@mcp.tool()
 def rag_context_search(
     query: str,
     limit: int = 10,
