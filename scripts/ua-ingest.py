@@ -62,15 +62,24 @@ def qdrant(method, path, **kwargs):
     return r.json()
 
 
+_fastembed_model = None
+
 def embed_batch(texts):
-    """Embed a list of texts via Ollama /api/embed (batch). Returns list of vectors."""
-    r = requests.post(
-        f"{OLLAMA_URL}/api/embed",
-        json={"model": EMBED_MODEL, "input": texts},
-        timeout=120
-    )
-    r.raise_for_status()
-    return r.json()["embeddings"]
+    """Embed texts via Ollama /api/embed, or fastembed if OLLAMA_URL is unset."""
+    global _fastembed_model
+    if OLLAMA_URL:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": EMBED_MODEL, "input": texts},
+            timeout=120
+        )
+        r.raise_for_status()
+        return r.json()["embeddings"]
+    # Fallback: fastembed TextEmbedding (CPU, same nomic-embed-text model)
+    if _fastembed_model is None:
+        from fastembed import TextEmbedding
+        _fastembed_model = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+    return [v.tolist() for v in _fastembed_model.embed(texts)]
 
 
 def node_text(node):
