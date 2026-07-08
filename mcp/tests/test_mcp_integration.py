@@ -189,6 +189,34 @@ class TestInvestigationLifecycle(unittest.TestCase):
         self.assertEqual(second["total"], 5)
         self.assertEqual([i["id"] for i in second["investigations"]], ids[2:4])
 
+    def test_investigation_list_nonpositive_limit_returns_everything(self):
+        """Documented contract: limit<=0 (and a string form of it) returns all.
+
+        Also guards the coercion: a string limit must not raise TypeError in
+        the `limit <= 0` / `offset + limit` paths — it is coerced like offset.
+        """
+        ids = [_new_id("nolimit") for _ in range(5)]
+        for inv_id in ids:
+            server.investigation_start(investigation_id=inv_id, title=f"NoLimit {inv_id}")
+        self._set_updated_order(ids)
+
+        # limit=0 -> everything
+        zero = _json(server.investigation_list(limit=0))
+        self.assertEqual(zero["total"], 5)
+        self.assertEqual([i["id"] for i in zero["investigations"]], ids)
+
+        # negative limit -> everything
+        neg = _json(server.investigation_list(limit=-1))
+        self.assertEqual([i["id"] for i in neg["investigations"]], ids)
+
+        # string "0" must coerce, not raise, and behave like 0 (everything)
+        str_zero = _json(server.investigation_list(limit="0"))
+        self.assertEqual([i["id"] for i in str_zero["investigations"]], ids)
+
+        # string positive limit must coerce and paginate, not raise
+        str_two = _json(server.investigation_list(limit="2", offset=0))
+        self.assertEqual([i["id"] for i in str_two["investigations"]], ids[:2])
+
     def test_investigation_list_summary_omits_verbose_fields(self):
         inv_id = _new_id("summary")
         server.investigation_start(investigation_id=inv_id, title="Summary test")

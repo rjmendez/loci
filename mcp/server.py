@@ -5119,6 +5119,16 @@ def investigation_list(
         offset = max(0, int(offset))
     except (TypeError, ValueError):
         offset = 0
+    # Coerce limit the same way offset is coerced: a string limit (e.g. via
+    # JSON tool args) would otherwise raise TypeError in the `limit <= 0`
+    # comparison and `offset + limit` slice below, contradicting the
+    # documented "limit<=0 returns everything" behavior. None stays None
+    # (explicit no-limit); garbage falls back to the documented default.
+    if limit is not None:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 30
     if limit is None or limit <= 0:
         page = entries[offset:]
     else:
