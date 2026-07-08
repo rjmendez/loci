@@ -97,7 +97,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 | `investigation_entity_lookup` | Look up an entity by name across stored findings |
 | `investigation_related_cases` | Find related prior investigations |
 | `investigation_finding_provenance` | Trace source provenance for a finding |
-| `investigation_list` | List all investigations |
+| `investigation_list` | List investigations, most-recent first. Paginated (`limit=30`, `offset=0`) and compact by default (`summary=True`); pass `summary=False` for full records and `limit=0` (or any value `<=0`) for all — note `offset` still applies in no-limit mode, returning all *remaining* records starting at `offset`. Response includes `total`/`limit`/`offset`. |
 | `audit_log` | Append to the audit trail |
 | `memory_self_check` | Cross-check stored memories for consistency |
 | `code_memory_correlate` | Correlate a code change with stored memory context |

@@ -14,6 +14,7 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 """
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -160,6 +161,181 @@ class TestInvestigationLifecycle(unittest.TestCase):
         ids = [i.get("id") for i in result["investigations"]]
         self.assertIn(inv_a, ids)
         self.assertIn(inv_b, ids)
+
+    def _set_updated_order(self, inv_ids):
+        """Force directory mtimes so inv_ids[0] is the most-recently updated.
+
+        The list is sorted by directory st_mtime; creating investigations in
+        fast succession can tie, so pin distinct mtimes for deterministic order.
+        """
+        base = 1_000_000
+        for i, inv_id in enumerate(inv_ids):
+            d = server.MEMORY_DIR / inv_id
+            ts = base + (len(inv_ids) - i) * 10  # earlier in list => newer
+            os.utime(d, (ts, ts))
+
+    def test_investigation_list_respects_limit_and_offset(self):
+        ids = [_new_id("page") for _ in range(5)]
+        for inv_id in ids:
+            server.investigation_start(investigation_id=inv_id, title=f"Page {inv_id}")
+        # ids[0] newest ... ids[4] oldest
+        self._set_updated_order(ids)
+
+        first = _json(server.investigation_list(limit=2, offset=0))
+        self.assertEqual(first["total"], 5)
+        self.assertEqual([i["id"] for i in first["investigations"]], ids[:2])
+
+        second = _json(server.investigation_list(limit=2, offset=2))
+        self.assertEqual(second["total"], 5)
+        self.assertEqual([i["id"] for i in second["investigations"]], ids[2:4])
+
+    def test_investigation_list_nonpositive_limit_returns_everything(self):
+        """Documented contract: limit<=0 (and a string form of it) returns all.
+
+        Also guards the coercion: a string limit must not raise TypeError in
+        the `limit <= 0` / `offset + limit` paths — it is coerced like offset.
+        """
+        ids = [_new_id("nolimit") for _ in range(5)]
+        for inv_id in ids:
+            server.investigation_start(investigation_id=inv_id, title=f"NoLimit {inv_id}")
+        self._set_updated_order(ids)
+
+        # limit=0 -> everything
+        zero = _json(server.investigation_list(limit=0))
+        self.assertEqual(zero["total"], 5)
+        self.assertEqual([i["id"] for i in zero["investigations"]], ids)
+
+        # negative limit -> everything
+        neg = _json(server.investigation_list(limit=-1))
+        self.assertEqual([i["id"] for i in neg["investigations"]], ids)
+
+        # string "0" must coerce, not raise, and behave like 0 (everything)
+        str_zero = _json(server.investigation_list(limit="0"))
+        self.assertEqual([i["id"] for i in str_zero["investigations"]], ids)
+
+        # string positive limit must coerce and paginate, not raise
+        str_two = _json(server.investigation_list(limit="2", offset=0))
+        self.assertEqual([i["id"] for i in str_two["investigations"]], ids[:2])
+
+        # limit=None (explicit no-limit) must normalize to the limit<=0 case:
+        # returns everything AND echoes an int, matching the `limit: int`
+        # signature/docstring — never a null in the response.
+        none_limit = _json(server.investigation_list(limit=None))
+        self.assertEqual([i["id"] for i in none_limit["investigations"]], ids)
+        self.assertIsInstance(none_limit["limit"], int)
+        self.assertEqual(none_limit["limit"], 0)
+
+    def test_investigation_list_summary_omits_verbose_fields(self):
+        inv_id = _new_id("summary")
+        server.investigation_start(investigation_id=inv_id, title="Summary test")
+        result = _json(server.investigation_list(summary=True))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        for key in ("id", "title", "status", "finding_counts", "updated_at"):
+            self.assertIn(key, rec)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec)
+
+    def test_investigation_list_full_includes_verbose_fields(self):
+        inv_id = _new_id("full")
+        server.investigation_start(investigation_id=inv_id, title="Full test")
+        result = _json(server.investigation_list(summary=False))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertIn(key, rec)
+
+    def test_investigation_list_summary_false_string_returns_full(self):
+        """String summary='false' must coerce to full mode, not summary mode.
+
+        Mirrors the limit/offset string-coercion guards: a stringly-typed
+        client (JSON tool args) passing the truthy string 'false' must not be
+        treated as truthy True and wrongly select the compact summary record.
+        """
+        inv_id = _new_id("summary-false-str")
+        server.investigation_start(investigation_id=inv_id, title="Summary false string test")
+        result = _json(server.investigation_list(summary="false"))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        # Full-mode fields must be present (summary='false' == full records).
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertIn(key, rec)
+
+        # The truthy string 'true' still selects summary mode.
+        summ = _json(server.investigation_list(summary="true"))
+        rec2 = next(i for i in summ["investigations"] if i["id"] == inv_id)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec2)
+
+    def test_investigation_list_summary_none_preserves_default(self):
+        """summary=None (JSON null) must preserve the default (summary mode).
+
+        bool(None) is False, which would force FULL-mode records and reintroduce
+        the large-output/token-overflow this pagination path exists to prevent.
+        Since summary defaults to True, an explicit null must behave like the
+        default — compact records with the verbose fields absent — not full mode.
+        """
+        inv_id = _new_id("summary-none")
+        server.investigation_start(investigation_id=inv_id, title="Summary none test")
+        result = _json(server.investigation_list(summary=None))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        # Compact fields present.
+        for key in ("id", "title", "status", "finding_counts", "updated_at"):
+            self.assertIn(key, rec)
+        # Verbose full-mode fields MUST be absent (None preserved summary mode).
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec)
+
+    def test_investigation_list_summary_empty_string_preserves_default(self):
+        """summary='' (empty / whitespace-only string) must preserve the default.
+
+        An empty string for an optional arg is far more likely UNSET than an
+        intentional falsey value; treating it as falsey would force FULL-mode
+        records and reintroduce the token-overflow this path prevents. So ''
+        (and whitespace-only) must behave like the default summary=True —
+        compact records — while only 'false'/'0'/'no' select full mode.
+        """
+        inv_id = _new_id("summary-empty-str")
+        server.investigation_start(investigation_id=inv_id, title="Summary empty string test")
+        for empty in ("", "   "):
+            result = _json(server.investigation_list(summary=empty))
+            rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+            # Compact fields present.
+            for key in ("id", "title", "status", "finding_counts", "updated_at"):
+                self.assertIn(key, rec)
+            # Verbose full-mode fields MUST be absent ('' preserved summary mode).
+            for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                        "open_questions_count"):
+                self.assertNotIn(key, rec)
+
+    def test_investigation_list_empty(self):
+        result = _json(server.investigation_list())
+        self.assertEqual(result["investigations"], [])
+        self.assertEqual(result["total"], 0)
+
+    def test_investigation_list_missing_dir_echoes_coerced_ints(self):
+        """MEMORY_DIR-does-not-exist early return must echo normalized ints.
+
+        Regression guard: string JSON tool args (limit="2", offset="1") must
+        be coerced up front so the empty-dir early return echoes the same
+        int types as the non-empty path — not the raw strings.
+        """
+        missing = Path(self._tmp.name) / "does_not_exist"
+        self.assertFalse(missing.exists())
+        orig = server.MEMORY_DIR
+        server.MEMORY_DIR = missing
+        try:
+            result = _json(server.investigation_list(limit="2", offset="1"))
+        finally:
+            server.MEMORY_DIR = orig
+        self.assertEqual(result["investigations"], [])
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["limit"], 2)
+        self.assertEqual(result["offset"], 1)
+        self.assertIsInstance(result["limit"], int)
+        self.assertIsInstance(result["offset"], int)
 
     def test_store_roundtrip_finding_id_in_load(self):
         inv_id = _new_id("roundtrip")
@@ -891,7 +1067,7 @@ class TestInvestigationACL(unittest.TestCase):
         server.investigation_start(investigation_id=inv_shared, title="Shared investigation")
         server.investigation_share(investigation_id=inv_shared, agent_ids=["agent-a"])
 
-        result = _json(server.investigation_list())
+        result = _json(server.investigation_list(summary=False))
         by_id = {i["id"]: i for i in result["investigations"]}
         self.assertIn("visibility", by_id[inv_private])
         self.assertEqual(by_id[inv_private]["visibility"], "private")
@@ -1497,7 +1673,7 @@ class TestMemoryTiers(unittest.TestCase):
             source="test",
             tier="cold",
         )
-        result = _json(server.investigation_list())
+        result = _json(server.investigation_list(summary=False))
         inv_summary = next((i for i in result["investigations"] if i["id"] == inv_id), None)
         self.assertIsNotNone(inv_summary, "Investigation not found in list")
         self.assertIn("tier_counts", inv_summary)
