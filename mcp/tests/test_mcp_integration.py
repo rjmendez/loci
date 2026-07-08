@@ -268,6 +268,26 @@ class TestInvestigationLifecycle(unittest.TestCase):
                     "open_questions_count"):
             self.assertNotIn(key, rec2)
 
+    def test_investigation_list_summary_none_preserves_default(self):
+        """summary=None (JSON null) must preserve the default (summary mode).
+
+        bool(None) is False, which would force FULL-mode records and reintroduce
+        the large-output/token-overflow this pagination path exists to prevent.
+        Since summary defaults to True, an explicit null must behave like the
+        default — compact records with the verbose fields absent — not full mode.
+        """
+        inv_id = _new_id("summary-none")
+        server.investigation_start(investigation_id=inv_id, title="Summary none test")
+        result = _json(server.investigation_list(summary=None))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        # Compact fields present.
+        for key in ("id", "title", "status", "finding_counts", "updated_at"):
+            self.assertIn(key, rec)
+        # Verbose full-mode fields MUST be absent (None preserved summary mode).
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec)
+
     def test_investigation_list_empty(self):
         result = _json(server.investigation_list())
         self.assertEqual(result["investigations"], [])

@@ -5127,7 +5127,14 @@ def investigation_list(
     # passing summary='false' would otherwise be truthy and wrongly select
     # summary-mode instead of full records. Map common string falsey forms to
     # False; everything else (including real bools) goes through bool().
-    if isinstance(summary, str):
+    #
+    # None (JSON null) must PRESERVE the documented default (summary=True):
+    # bool(None) is False, which would force FULL-mode records and reintroduce
+    # the large-output/token-overflow this pagination path exists to prevent.
+    # Only string/real-bool values may select full mode.
+    if summary is None:
+        summary = True
+    elif isinstance(summary, str):
         summary = summary.strip().lower() not in ("false", "0", "no", "")
     else:
         summary = bool(summary)
