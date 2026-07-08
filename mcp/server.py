@@ -1837,6 +1837,132 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
 
 
 # ---------------------------------------------------------------------------
+# Finding lifecycle: append-only updates log + staleness (code-ref hashing).
+#
+# findings.jsonl stays pure (only real finding records) so every existing reader
+# is untouched. In-place resolution and verify-all verdicts are recorded as
+# APPEND-ONLY update records in a sibling ``finding_updates.jsonl`` and folded in
+# last-write-wins by the read path. Both features are additive + fail-open.
+# ---------------------------------------------------------------------------
+
+# Injectable generation fn for investigation_verify_all — None means "use the
+# shipped verify.py default" (lazy llm_local). Tests set this to a stub.
+_verify_gen_fn = None
+
+# Update-record types recorded in finding_updates.jsonl.
+_LIFECYCLE_UPDATE_TYPES: frozenset = frozenset({"resolution", "verification"})
+
+# A file-path-with-optional-line reference in finding text, e.g. "mcp/server.py:3204"
+# or "verify.py". Requires an extension so ordinary prose ("e.g.") doesn't match.
+_FILE_REF_RE = re.compile(r"\b((?:[\w.\-]+/)*[\w.\-]+\.[A-Za-z][\w]*)(?::(\d+))?\b")
+
+
+def _finding_updates_path(investigation_id: str) -> Path:
+    return _inv_dir(investigation_id) / "finding_updates.jsonl"
+
+
+def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
+    """Return {finding_id: resolution} from finding_updates.jsonl, last-write-wins.
+
+    Only 'resolution' update records with a valid state participate. Fail-open: any
+    read/parse error yields {} so the read path falls back to stored/default values.
+    """
+    overrides: dict[str, str] = {}
+    try:
+        for rec in _read_jsonl(_finding_updates_path(investigation_id)):
+            if not isinstance(rec, dict) or rec.get("record_type") != "resolution":
+                continue
+            fid = str(rec.get("finding_id") or "")
+            res = str(rec.get("resolution") or "").lower()
+            if fid and res in _RESOLUTION_STATES:
+                overrides[fid] = res  # later line wins
+    except Exception as exc:  # noqa: BLE001 — never block a read on the overrides log
+        logger.debug("resolution overrides load failed (fail-open): %r", exc)
+    return overrides
+
+
+def _hash_file_bytes(path_str: str) -> Optional[str]:
+    """sha256 of a referenced file's current bytes, or None if unreadable (fail-open)."""
+    try:
+        p = Path(path_str)
+        if not p.is_file():
+            return None
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _compute_code_refs(text: str, explicit=None) -> list[dict]:
+    """Best-effort: extract file paths from ``text`` (and optional ``explicit`` refs),
+    hash each file that currently exists, and return [{"path": .., "hash": ..}].
+
+    Fully optional + fail-open: unreadable/nonexistent paths are simply omitted, and
+    any error returns []. Line suffixes ("file.py:12") are stripped for hashing.
+    """
+    candidates: list[str] = []
+    try:
+        if explicit:
+            items = explicit if isinstance(explicit, list) else str(explicit).split(",")
+            candidates.extend(str(i) for i in items)
+        for m in _FILE_REF_RE.finditer(text or ""):
+            candidates.append(m.group(1))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in candidates:
+        path = (c or "").strip().split(":")[0].strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        h = _hash_file_bytes(path)
+        if h is not None:
+            out.append({"path": path, "hash": h})
+    return out
+
+
+def _finding_is_stale(finding: dict) -> Optional[bool]:
+    """Re-hash a finding's stamped code_refs. Returns True if any referenced file's
+    content changed, False if refs exist and none changed, None if the finding has
+    no usable refs (caller omits the ``stale`` key in that case). Fail-open."""
+    refs = finding.get("code_refs") if isinstance(finding, dict) else None
+    if not isinstance(refs, list) or not refs:
+        return None
+    checked = False
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        path = ref.get("path")
+        old = ref.get("hash")
+        if not path or not old:
+            continue
+        cur = _hash_file_bytes(str(path))
+        if cur is None:
+            continue  # unreadable now -> don't flag (fail-open)
+        checked = True
+        if cur != old:
+            return True
+    return False if checked else None
+
+
+def _apply_lifecycle(findings: list[dict], investigation_id: str) -> None:
+    """In-place: stamp effective ``resolution`` (append-log override else stored/'open')
+    and ``stale`` (only when the finding carries usable code_refs). Fail-open."""
+    overrides = _load_resolution_overrides(investigation_id)
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("id", ""))
+        if fid and fid in overrides:
+            f["resolution"] = overrides[fid]
+        elif not f.get("resolution"):
+            f["resolution"] = "open"
+        stale = _finding_is_stale(f)
+        if stale is not None:
+            f["stale"] = stale
+
+
+# ---------------------------------------------------------------------------
 # Session hints — module-level ring buffer updated by investigation_store so
 # that memory_hints (and the MCP resource) can surface "what changed recently"
 # without re-scanning JSONL.  Each key is an investigation_id; the value is a
@@ -2758,11 +2884,10 @@ def investigation_load(
         ]
 
     recent = findings[-last_n_findings:]
-    # Surface the lifecycle/resolution state; findings stored before this field
-    # existed read as "open" (additive, backwards-compatible).
-    for _f in recent:
-        if isinstance(_f, dict) and not _f.get("resolution"):
-            _f["resolution"] = "open"
+    # Surface the lifecycle/resolution state (append-log overrides win, else stored/
+    # default "open") and staleness for findings that carry code_refs. Additive +
+    # backwards-compatible: findings without these fields read as "open"/not-stale.
+    _apply_lifecycle(recent, investigation_id)
 
     return json.dumps({
         "manifest": manifest,
@@ -3071,6 +3196,7 @@ def investigation_store(
     authored_by: Optional[str] = None,
     tier: str = "warm",
     resolution: str = "open",
+    code_refs: Optional[str] = None,
 ) -> str:
     """
     Record a finding in the investigation.
@@ -3124,6 +3250,12 @@ def investigation_store(
               The three resolved states (fixed/intentional/wontfix) let
               exclusion-aware grounding auto-skip handled items on re-audit.
               Findings stored before this field existed read as "open".
+        code_refs: Optional comma-separated (or list of) file paths this finding
+                   refers to, e.g. "mcp/server.py,mcp/verify.py". When omitted, refs
+                   are best-effort parsed from ``text`` (tokens like "path/file.py:12").
+                   Each readable file's current sha256 is stamped so investigation_load
+                   / investigation_search can flag the finding ``stale`` once that file
+                   changes. Fully optional + fail-open: unreadable paths are skipped.
 
     Returns:
         JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -3187,6 +3319,16 @@ def investigation_store(
             return json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     finding["entities"] = _extract_entities(text)
+
+    # Staleness: stamp sha256 of any referenced code file so a later re-hash can flag
+    # the finding stale once that file changes. Best-effort + fail-open (no refs / an
+    # unreadable file -> omit; never error).
+    try:
+        _refs = _compute_code_refs(text, code_refs)
+        if _refs:
+            finding["code_refs"] = _refs
+    except Exception as _cr_exc:  # noqa: BLE001
+        logger.debug("investigation_store: code-ref hashing failed (fail-open): %r", _cr_exc)
 
     if finding_type == "procedure":
         finding["procedure_meta"] = {
@@ -3282,6 +3424,67 @@ def investigation_store(
         result["conflict_id"] = conflict_id
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def finding_resolve(
+    investigation_id: str,
+    finding_id: str,
+    resolution: str,
+    note: Optional[str] = None,
+) -> str:
+    """
+    Mark a finding's lifecycle state in place (open -> fixed / intentional / wontfix /
+    superseded, or back to open). Completes the lifecycle gap: findings could only get
+    a resolution at store time, never afterwards.
+
+    findings.jsonl is append-only, so this records an append-only update record in a
+    sibling ``finding_updates.jsonl``; investigation_load / investigation_search fold it
+    in last-write-wins. The original finding is never rewritten and no data is lost.
+
+    Args:
+        investigation_id: Investigation that owns the finding.
+        finding_id: ID of the finding to resolve.
+        resolution: One of open, fixed, intentional, wontfix, superseded.
+        note: Optional free-text note explaining the resolution.
+
+    Returns:
+        JSON: {"resolved": true, "finding_id": ..., "resolution": ...}
+        On error: {"error": "<message>"}
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    res = str(resolution or "").lower()
+    if res not in _RESOLUTION_STATES:
+        return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
+
+    # Confirm the finding exists so we don't record an orphan resolution.
+    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    if not any(str(f.get("id", "")) == str(finding_id) for f in findings):
+        return json.dumps({"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
+
+    record = {
+        "record_type": "resolution",
+        "investigation_id": investigation_id,
+        "finding_id": str(finding_id),
+        "resolution": res,
+        "note": note or "",
+        "ts": _now(),
+    }
+    _append_jsonl(_finding_updates_path(investigation_id), record)
+    _event_log_append({
+        "op": "finding_resolve",
+        "investigation_id": investigation_id,
+        "finding_id": str(finding_id),
+        "resolution": res,
+    })
+    return json.dumps({
+        "resolved": True,
+        "finding_id": str(finding_id),
+        "resolution": res,
+    }, indent=2)
 
 
 # ---- Tool: procedure_attempt ----
@@ -4347,6 +4550,7 @@ def investigation_search(
     # Absent record -> "open". Fail-open (a failed map build just falls back to the
     # per-row payload value, defaulting to "open").
     _resolution_map: dict[str, str] = {}
+    _coderefs_map: dict[str, list] = {}
     try:
         _invs_in_results = {str(r.get("investigation_id", "")) for r in deduped}
         _invs_in_results.discard("")
@@ -4355,9 +4559,16 @@ def investigation_search(
                 _fid = str(_f.get("id", ""))
                 if _fid:
                     _resolution_map[_fid] = str(_f.get("resolution") or "open").lower()
+                    _crefs = _f.get("code_refs")
+                    if isinstance(_crefs, list) and _crefs:
+                        _coderefs_map[_fid] = _crefs
+            # Fold in append-only resolution overrides (finding_resolve) last-write-wins.
+            for _ofid, _ores in _load_resolution_overrides(_inv).items():
+                _resolution_map[_ofid] = _ores
     except Exception as exc:  # fail-open — never block search on the map build
         logger.debug("resolution map build failed, using per-row values: %r", exc)
         _resolution_map = {}
+        _coderefs_map = {}
 
     def _row_resolution(row: dict) -> str:
         fid = str(row.get("finding_id") or row.get("id") or "")
@@ -4367,6 +4578,14 @@ def investigation_search(
 
     for r in deduped:
         r["resolution"] = _row_resolution(r)
+        # Staleness: rows from mnemo/qdrant don't carry code_refs, so consult the
+        # JSONL-derived map. Only set ``stale`` when the finding has usable refs.
+        _rfid = str(r.get("finding_id") or r.get("id") or "")
+        _refs = _coderefs_map.get(_rfid)
+        if _refs:
+            _st = _finding_is_stale({"code_refs": _refs})
+            if _st is not None:
+                r["stale"] = _st
     if resolution is not None:
         deduped = [r for r in deduped if r.get("resolution") == resolution]
 
@@ -7069,6 +7288,88 @@ def verify_finding(claim: str, context: str = "", investigation_id: Optional[str
     import verify as _v
     return json.dumps(_v.verify_finding(claim, context=context,
                                         investigation_id=investigation_id), indent=2)
+
+
+@mcp.tool()
+def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
+    """
+    Batch adversarial-verify the OPEN findings of an investigation — run the skeptic
+    (verify.verify_finding) over each and return per-finding {finding_id, verdict,
+    confidence}. A triage aid, NOT a lifecycle change: the verdict is recorded as an
+    append-only verification note and does NOT overwrite the finding's resolution
+    (a verdict != a lifecycle state). Use finding_resolve to actually resolve.
+
+    Skips resolved (fixed/intentional/wontfix/superseded) and soft-retracted findings.
+    Fail-open: an unavailable local model yields verdict='uncertain' per finding.
+
+    Args:
+        investigation_id: Investigation whose open findings to verify.
+        limit: Max number of open findings to verify (default 20).
+
+    Returns:
+        JSON: {"investigation_id": ..., "verified": N,
+               "results": [{"finding_id", "verdict", "confidence"}, ...]}
+        On error: {"error": "<message>"}
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    import verify as _v
+
+    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    overrides = _load_resolution_overrides(investigation_id)
+    retracted = _load_retracted_ids(investigation_id)
+
+    def _effective_res(f: dict) -> str:
+        fid = str(f.get("id", ""))
+        if fid in overrides:
+            return overrides[fid]
+        return str(f.get("resolution") or "open").lower()
+
+    open_findings = [
+        f for f in findings
+        if isinstance(f, dict)
+        and _effective_res(f) == "open"
+        and str(f.get("id", "")) not in retracted
+        and str(f.get("text") or "").strip()
+    ]
+    try:
+        _limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        _limit = 20
+    open_findings = open_findings[:_limit]
+
+    results = []
+    for f in open_findings:
+        fid = str(f.get("id", ""))
+        res = _v.verify_finding(
+            str(f.get("text") or ""),
+            investigation_id=investigation_id,
+            gen_fn=_verify_gen_fn,
+        )
+        verdict = res.get("verdict", "uncertain")
+        confidence = res.get("confidence", 0.0)
+        # Record as an append-only verification note — does NOT touch resolution.
+        _append_jsonl(_finding_updates_path(investigation_id), {
+            "record_type": "verification",
+            "investigation_id": investigation_id,
+            "finding_id": fid,
+            "verdict": verdict,
+            "confidence": confidence,
+            "ts": _now(),
+        })
+        results.append({
+            "finding_id": fid,
+            "verdict": verdict,
+            "confidence": confidence,
+        })
+
+    return json.dumps({
+        "investigation_id": investigation_id,
+        "verified": len(results),
+        "results": results,
+    }, indent=2)
 
 
 @mcp.tool()
