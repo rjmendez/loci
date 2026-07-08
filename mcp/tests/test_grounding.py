@@ -1,5 +1,10 @@
 """Tests for grounding.py — the deterministic retrieval/assembly logic."""
-import grounding as G
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import grounding as G  # noqa: E402 — must follow the path setup above
 
 
 def test_filter_noise_drops_conversation_dumps():
