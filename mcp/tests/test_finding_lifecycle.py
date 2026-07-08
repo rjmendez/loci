@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
@@ -182,6 +183,26 @@ class FindingLifecycleTest(unittest.TestCase):
         fid = self._store(inv_id, "spans two files", code_refs=["a.py", "b.py"])
         # Both files present + unchanged -> not stale (proves both hashed).
         self.assertEqual(self._load_findings(inv_id)[fid].get("stale"), False)
+
+    def test_code_refs_empty_is_authoritative_no_refs(self):
+        # PROVIDED-BUT-EMPTY ('' or []) is authoritative "no refs": text-parsing
+        # must be SKIPPED even though the text contains a parseable ref token.
+        # Contrast: omitting code_refs entirely (None) falls back to text parsing.
+        (Path(self._code_root.name) / "parsed.py").write_text("q = 1\n")
+        text = "the bug lives in parsed.py:12"
+
+        # None (not provided) -> text-parsed ref is stamped.
+        self.assertEqual(server._compute_code_refs(text, None), [{"path": "parsed.py", "hash": mock.ANY}])
+        # [] (provided-but-empty) -> authoritative no refs.
+        self.assertEqual(server._compute_code_refs(text, []), [])
+        # '' (provided-but-empty) -> authoritative no refs.
+        self.assertEqual(server._compute_code_refs(text, ""), [])
+
+        # End-to-end through investigation_store: code_refs=[] leaves no code_refs
+        # on the stored finding despite the parseable token in the text.
+        inv_id = self._start()
+        fid = self._store(inv_id, text, code_refs=[])
+        self.assertNotIn("code_refs", self._load_findings(inv_id)[fid])
 
     def test_code_ref_path_scoping_rejects_escapes(self):
         # SECURITY: absolute paths and '..' traversal must be refused outright,

@@ -1984,17 +1984,22 @@ def _compute_code_refs(text: str, explicit=None) -> list[dict]:
     """Best-effort: resolve file paths to [{"path": .., "hash": ..}] by hashing each
     file that currently exists.
 
-    ``explicit`` refs are AUTHORITATIVE when provided: the caller named exactly the
-    files this finding refers to, so text-parsing is skipped entirely. Only when no
-    explicit refs are given are paths best-effort parsed from ``text`` (tokens like
-    "path/file.py:12").
+    ``explicit`` refs are AUTHORITATIVE whenever they are *provided* — including when
+    provided but empty. The distinction is NOT-PROVIDED vs PROVIDED:
+      * ``explicit is None``       -> not provided: paths are best-effort parsed from
+                                      ``text`` (tokens like "path/file.py:12").
+      * ``explicit`` == '' or []   -> provided but empty: authoritative "no refs", so
+                                      text-parsing is skipped and [] is returned.
+      * ``explicit`` non-empty     -> the caller named exactly the files this finding
+                                      refers to; text-parsing is skipped entirely.
 
     Fully optional + fail-open: unreadable/nonexistent paths are simply omitted, and
     any error returns []. Line suffixes ("file.py:12") are stripped for hashing.
     """
     candidates: list[str] = []
     try:
-        if explicit:
+        if explicit is not None:
+            # Provided (possibly empty) -> authoritative, never fall back to text.
             items = explicit if isinstance(explicit, list) else str(explicit).split(",")
             candidates.extend(str(i) for i in items)
         else:
@@ -3345,8 +3350,10 @@ def investigation_store(
               exclusion-aware grounding auto-skip handled items on re-audit.
               Findings stored before this field existed read as "open".
         code_refs: Optional comma-separated (or list of) file paths this finding
-                   refers to, e.g. "mcp/server.py,mcp/verify.py". When omitted, refs
-                   are best-effort parsed from ``text`` (tokens like "path/file.py:12").
+                   refers to, e.g. "mcp/server.py,mcp/verify.py". Authoritative when
+                   provided: pass ``[]`` / ``""`` to assert "no refs" (text is NOT
+                   parsed). Only when omitted entirely (None) are refs best-effort
+                   parsed from ``text`` (tokens like "path/file.py:12").
                    Each readable file's current sha256 is stamped so investigation_load
                    / investigation_search can flag the finding ``stale`` once that file
                    changes. Fully optional + fail-open: unreadable paths are skipped.
