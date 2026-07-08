@@ -6959,6 +6959,22 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
 
 
 @mcp.tool()
+def verify_finding(claim: str, context: str = "", investigation_id: Optional[str] = None) -> str:
+    """
+    Adversarially VERIFY a claim/finding using the LOCAL model — a skeptic actively tries to
+    REFUTE it (candidate->skeptic->keep-if-survives), the same discipline workflows run per
+    finding. Pass optional `context` (code snippet / file refs / evidence); if omitted and an
+    `investigation_id` is given, best-effort RAG grounding is pulled (fail-open). Skeptical by
+    default: only 'confirmed' when the skeptic cannot refute it, else 'refuted'/'uncertain'.
+    Fail-open: if the local model is down or output is unparseable, returns verdict='uncertain'
+    with degraded=True. Returns JSON {verdict, refutation, confidence, degraded}.
+    """
+    import verify as _v
+    return json.dumps(_v.verify_finding(claim, context=context,
+                                        investigation_id=investigation_id), indent=2)
+
+
+@mcp.tool()
 def classify_text(text: str, labels: list) -> str:
     """
     Pick the single best label from `labels` for `text` using the LOCAL model — a cheap
