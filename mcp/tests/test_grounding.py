@@ -48,6 +48,17 @@ def test_select_memory_files_relevance_and_cap(tmp_path):
     assert any("BODY:" in p[2] for p in picks)  # body read
 
 
+def test_select_memory_files_rejects_generic_token_match(tmp_path):
+    # Two incidental English words ("event", "single") must NOT pull an off-topic memory;
+    # a candidate needs a distinctive (len>=7) shared token, not just min_score generic ones.
+    (tmp_path / "MEMORY.md").write_text(
+        "- [offtopic](offtopic.md) — resilient rover single NEAREST-base early-Aug event mock-GPS\n")
+    (tmp_path / "offtopic.md").write_text("BODY: rover stuff")
+    task = {"title": "decompose investigation_store",
+            "focus": "single-responsibility units, event-log, conflict-detect"}
+    assert G._select_memory_files(task, str(tmp_path), min_score=2) == []
+
+
 def test_select_memory_files_missing_index(tmp_path):
     assert G._select_memory_files({"title": "x"}, str(tmp_path)) == []
 

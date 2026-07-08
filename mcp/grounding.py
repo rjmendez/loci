@@ -95,13 +95,19 @@ _MEM_STOP = {"the", "and", "for", "with", "not", "via", "per", "any", "all", "ne
              "loci", "dama", "mcp", "fix", "add"}
 
 
+_MEM_DISTINCTIVE = 7  # a shared token this long is topical, not incidental English
+
+
 def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
                          min_score: int = 2) -> list[tuple[str, str, str]]:
-    """Top-`limit` MEMORY.md entries whose index line shares >= `min_score` DISTINCTIVE
-    tokens with the task. Returns [(slug, index_line, body)] with bodies read. Fail-open.
+    """Top-`limit` MEMORY.md entries that share enough DISTINCTIVE tokens with the task.
+    Returns [(slug, index_line, body)] with bodies read. Fail-open.
 
-    Distinctive = len>=4, not a common inflating token. Capped + thresholded so a loose
-    single-token match can never crowd out the precise (case/RAG) lanes."""
+    A candidate must share >= `min_score` tokens AND >= 1 *distinctive* token (len >=
+    _MEM_DISTINCTIVE) — otherwise two incidental English words ("event", "single") from
+    an unrelated memory pass the bar and inject off-topic noise. Ranked by a weight that
+    counts distinctive tokens double. Capped so a fuzzy match never crowds out the precise
+    (case/RAG) lanes."""
     out: list[tuple[str, str, str]] = []
     try:
         d = Path(memory_dir)
@@ -119,9 +125,11 @@ def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
             if not m:
                 continue
             toks = {t.lower() for t in _TOKEN_RE.findall(line) if len(t) >= 4}
-            score = len(want & toks)
-            if score >= min_score:
-                scored.append((score, m.group("file"), line.strip()))
+            shared = want & toks
+            if len(shared) < min_score or not any(len(t) >= _MEM_DISTINCTIVE for t in shared):
+                continue
+            weight = sum(2 if len(t) >= _MEM_DISTINCTIVE else 1 for t in shared)
+            scored.append((weight, m.group("file"), line.strip()))
         scored.sort(reverse=True)
         for score, fname, line in scored[:limit]:
             body = ""
