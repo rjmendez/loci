@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def _prep(args) -> int:
-    import retrieval_eval as RE
     import shadow_eval as SE
     corpus = SE._load_corpus(args.scan)
     if not corpus:
