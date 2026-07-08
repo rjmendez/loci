@@ -8,6 +8,7 @@ Run: pytest mcp/tests/test_finding_lifecycle.py -v
 """
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -41,10 +42,20 @@ class FindingLifecycleTest(unittest.TestCase):
         self._orig = server.MEMORY_DIR
         server.MEMORY_DIR = Path(self._tmp.name)
         self._orig_gen = server._verify_gen_fn
+        # Code refs are scoped UNDER the code root; point it at a temp repo so
+        # relative refs resolve there (and absolute / traversal refs are rejected).
+        self._code_root = tempfile.TemporaryDirectory()
+        self._orig_code_root = os.environ.get("LOCI_CODE_ROOT")
+        os.environ["LOCI_CODE_ROOT"] = self._code_root.name
 
     def tearDown(self):
         server.MEMORY_DIR = self._orig
         server._verify_gen_fn = self._orig_gen
+        if self._orig_code_root is None:
+            os.environ.pop("LOCI_CODE_ROOT", None)
+        else:
+            os.environ["LOCI_CODE_ROOT"] = self._orig_code_root
+        self._code_root.cleanup()
         self._tmp.cleanup()
 
     def _start(self, prefix="lc"):
@@ -100,14 +111,16 @@ class FindingLifecycleTest(unittest.TestCase):
 
     def test_staleness_flags_changed_file_only(self):
         inv_id = self._start()
-        # Two referenced files; only one will change.
-        f_change = Path(self._tmp.name) / "changing.py"
-        f_stable = Path(self._tmp.name) / "stable.py"
+        # Two referenced files under the code root; only one will change.
+        root = Path(self._code_root.name)
+        f_change = root / "changing.py"
+        f_stable = root / "stable.py"
         f_change.write_text("original = 1\n")
         f_stable.write_text("constant = 1\n")
 
-        fid_change = self._store(inv_id, "bug in changing code", code_refs=str(f_change))
-        fid_stable = self._store(inv_id, "bug in stable code", code_refs=str(f_stable))
+        # Refs are relative to the code root (absolute refs are rejected by design).
+        fid_change = self._store(inv_id, "bug in changing code", code_refs="changing.py")
+        fid_stable = self._store(inv_id, "bug in stable code", code_refs="stable.py")
 
         # Nothing changed yet -> both present-with-refs read as not stale.
         loaded = self._load_findings(inv_id)
@@ -126,6 +139,45 @@ class FindingLifecycleTest(unittest.TestCase):
         fid = self._store(inv_id, "a plain finding with no file references")
         # No usable code_refs -> the stale key is omitted entirely.
         self.assertNotIn("stale", self._load_findings(inv_id)[fid])
+
+    def test_code_refs_accepts_list_form(self):
+        # The type hint widened to str | list — a list of refs must still resolve.
+        inv_id = self._start()
+        (Path(self._code_root.name) / "a.py").write_text("x = 1\n")
+        (Path(self._code_root.name) / "b.py").write_text("y = 1\n")
+        fid = self._store(inv_id, "spans two files", code_refs=["a.py", "b.py"])
+        # Both files present + unchanged -> not stale (proves both hashed).
+        self.assertEqual(self._load_findings(inv_id)[fid].get("stale"), False)
+
+    def test_code_ref_path_scoping_rejects_escapes(self):
+        # SECURITY: absolute paths and '..' traversal must be refused outright,
+        # and a rogue ref must never let the server hash a file outside the root.
+        outside = Path(self._tmp.name) / "secret.txt"  # under MEMORY_DIR, NOT code root
+        outside.write_text("top secret\n")
+
+        self.assertIsNone(server._safe_repo_path(str(outside)))         # absolute
+        self.assertIsNone(server._safe_repo_path("/etc/passwd"))        # absolute
+        self.assertIsNone(server._safe_repo_path("../secret.txt"))      # traversal
+        self.assertIsNone(server._safe_repo_path("a/../../secret.txt")) # nested traversal
+        self.assertIsNone(server._hash_file_bytes(str(outside)))        # not hashed
+
+        # A legitimate in-root ref still resolves + hashes.
+        (Path(self._code_root.name) / "ok.py").write_text("z = 1\n")
+        self.assertIsNotNone(server._safe_repo_path("ok.py"))
+        self.assertIsNotNone(server._hash_file_bytes("ok.py"))
+
+    def test_hash_file_size_cap_skips_oversized(self):
+        # SECURITY: files over the cap are skipped (returns None), never read whole.
+        big = Path(self._code_root.name) / "big.bin"
+        big.write_bytes(b"\0" * 64)
+        orig = server._HASH_FILE_MAX_BYTES
+        try:
+            server._HASH_FILE_MAX_BYTES = 16
+            self.assertIsNone(server._hash_file_bytes("big.bin"))
+            server._HASH_FILE_MAX_BYTES = 1024
+            self.assertIsNotNone(server._hash_file_bytes("big.bin"))
+        finally:
+            server._HASH_FILE_MAX_BYTES = orig
 
     # -- #5 investigation_verify_all -----------------------------------------
 

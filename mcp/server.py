@@ -1881,11 +1881,56 @@ def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
     return overrides
 
 
-def _hash_file_bytes(path_str: str) -> Optional[str]:
-    """sha256 of a referenced file's current bytes, or None if unreadable (fail-open)."""
+# Files larger than this are never hashed — a code ref points at source, not
+# blobs, and this caps how much a rogue ref can make the server read. Overridable.
+_HASH_FILE_MAX_BYTES = int(os.environ.get("LOCI_HASH_FILE_MAX_BYTES", str(8 * 1024 * 1024)))
+
+
+def _code_root() -> Path:
+    """Root that user-supplied code refs must stay under. Defaults to the process
+    working directory (the repo being investigated); overridable via LOCI_CODE_ROOT.
+    Re-read each call so tests / re-rooted runs are honored."""
+    root = os.environ.get("LOCI_CODE_ROOT") or os.getcwd()
+    return Path(root).resolve()
+
+
+def _safe_repo_path(path_str: str) -> Optional[Path]:
+    """Resolve a user-controlled ref to a real path UNDER the code root, else None.
+
+    Security boundary for _hash_file_bytes: file refs come from finding text /
+    caller-supplied code_refs, so an absolute path or ``..`` traversal could probe
+    any readable file on the host. This rejects absolute paths and any ``..``
+    component, resolves relative to the code root, and requires the resolved path
+    (symlinks included) to remain inside that root. Fail-open — returns None on
+    anything rejected or unresolvable so the caller simply skips the ref."""
     try:
-        p = Path(path_str)
-        if not p.is_file():
+        raw = (path_str or "").strip()
+        if not raw:
+            return None
+        p = Path(raw)
+        if p.is_absolute() or any(part == ".." for part in p.parts):
+            return None
+        root = _code_root()
+        resolved = (root / p).resolve()
+        if not resolved.is_relative_to(root):
+            return None
+        return resolved
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _hash_file_bytes(path_str: str) -> Optional[str]:
+    """sha256 of a referenced file's current bytes, or None if unreadable (fail-open).
+
+    The path is scoped to the code root via _safe_repo_path (absolute paths, ``..``
+    traversal, and anything escaping the root are rejected) and files larger than
+    _HASH_FILE_MAX_BYTES are skipped — so this only ever hashes in-repo source,
+    never arbitrary or oversized files on the host."""
+    try:
+        p = _safe_repo_path(path_str)
+        if p is None or not p.is_file():
+            return None
+        if p.stat().st_size > _HASH_FILE_MAX_BYTES:
             return None
         return hashlib.sha256(p.read_bytes()).hexdigest()
     except Exception:  # noqa: BLE001
@@ -3196,7 +3241,7 @@ def investigation_store(
     authored_by: Optional[str] = None,
     tier: str = "warm",
     resolution: str = "open",
-    code_refs: Optional[str] = None,
+    code_refs: str | list[str] | None = None,
 ) -> str:
     """
     Record a finding in the investigation.
@@ -3462,7 +3507,7 @@ def finding_resolve(
 
     # Confirm the finding exists so we don't record an orphan resolution.
     findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-    if not any(str(f.get("id", "")) == str(finding_id) for f in findings):
+    if not any(isinstance(f, dict) and str(f.get("id", "")) == str(finding_id) for f in findings):
         return json.dumps({"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
 
     record = {
