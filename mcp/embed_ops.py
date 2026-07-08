@@ -97,8 +97,12 @@ def warm(embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None) ->
 
     Idempotent (fires at most once per process), non-blocking, fail-open — never
     blocks the caller and never raises even if the endpoint is down. Returns True if
-    this call started the warm-ping, False if one was already started. `embed_fn` is
-    injectable for tests (defaults to embed_texts, which is itself fail-open)."""
+    this call started the warm-ping. Returns False in EITHER of two cases: (a) a
+    warm-ping was already started by an earlier call, or (b) the daemon thread could
+    not be created/started (in which case _warm_started is left unlatched so a later
+    call can retry). Callers must NOT treat a False return as proof the model is
+    warmed — use warmed() for that. `embed_fn` is injectable for tests (defaults to
+    embed_texts, which is itself fail-open)."""
     global _warm_started
     with _warm_lock:
         if _warm_started:
