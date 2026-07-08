@@ -19,6 +19,14 @@ Design mirrors mcp/query_expand.py:
   we LAZILY + fail-open pull a little RAG context (rag_context_search) to help the skeptic.
   This is injectable via `rag_fn` for tests; a dead/absent RAG lane just means no extra context.
 
+- Code grounding is optional. For CODE claims a prose summary is a poor thing to reason over
+  (the live smoke saw a clearly-true code claim come back 'uncertain'), so when the claim /
+  context / an explicit `code_refs` arg carry ``file:line`` (or ``file:start-end``) references
+  we FETCH the actual source lines and put them in the prompt so the skeptic reasons over real
+  code. The file reader is injectable via `reader` for tests; it is fail-open (an unreadable
+  path just contributes no code). We also surface the model's RAW `reasoning` alongside the
+  verdict so a caller can still judge when the verdict is the cautious 'uncertain'.
+
 - Fail-open + skeptical default: on not-ok / timeout / parse failure / any error we return a
   well-formed {"verdict": "uncertain"} result rather than raising. We also default to the
   cautious verdict when the model is unsure — a claim is only 'confirmed' when the skeptic
@@ -37,8 +45,19 @@ from typing import Callable, Optional
 # Injectable function types: match the shared [interface] contracts.
 GenFn = Callable[..., dict]
 RagFn = Callable[..., dict]
+# reader(path) -> full file text; fail-open to "" on any error.
+ReaderFn = Callable[..., str]
 
 _VALID_VERDICTS = ("confirmed", "refuted", "uncertain")
+
+# Caps so a stray/huge ref can't blow up the prompt. Fail-open, additive.
+_MAX_REFS = 8
+_MAX_LINES_PER_REF = 60
+
+# "file:line" or "file:start-end". Require the path to contain a '.' or '/' so bare
+# "10:30"-style tokens don't get mistaken for refs; anything that still slips through
+# just fails-open at read time (unreadable path -> no code).
+_REF_RE = re.compile(r"([\w./\-]*[./][\w./\-]*):(\d+)(?:-(\d+))?")
 
 _PROMPT_TMPL = (
     "You are a rigorous SKEPTIC performing adversarial verification of a claim.\n"
@@ -51,9 +70,11 @@ _PROMPT_TMPL = (
     "  - \"uncertain\": you cannot tell from the claim and context (default when unsure).\n"
     "Prefer \"refuted\" or \"uncertain\" over \"confirmed\" when in doubt.\n\n"
     "Respond with ONLY a JSON object of this exact shape, no prose:\n"
-    '{{"verdict": "confirmed|refuted|uncertain", "refutation": "your strongest attack or '
-    'why it survives", "confidence": 0.0}}\n\n'
+    '{{"verdict": "confirmed|refuted|uncertain", "reasoning": "your step-by-step skeptical '
+    'analysis", "refutation": "your strongest attack or why it survives", "confidence": 0.0}}\n\n'
     "CLAIM:\n{claim}\n\n"
+    "REFERENCED CODE (actual source at the cited locations — trust this over any summary):\n"
+    "{code}\n\n"
     "CONTEXT (may be empty — do not assume it is complete):\n{context}\n"
 )
 
@@ -80,6 +101,66 @@ def _lazy_rag(query: str, *, limit: int = 5) -> dict:
         return obj if isinstance(obj, dict) else {}
     except Exception:
         return {}
+
+
+def _lazy_read_file(path: str) -> str:
+    """Default reader: read a source file's full text. Fail-open to "" on any error."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _parse_refs(*texts: str):
+    """Pull unique (path, start, end) file:line refs out of the given strings, in order.
+
+    Deduplicated and capped at _MAX_REFS. Non-string inputs are ignored (fail-open).
+    """
+    refs = []
+    seen = set()
+    for t in texts:
+        if not isinstance(t, str):
+            continue
+        for m in _REF_RE.finditer(t):
+            path = m.group(1)
+            start = int(m.group(2))
+            end = int(m.group(3)) if m.group(3) else start
+            key = (path, start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(key)
+            if len(refs) >= _MAX_REFS:
+                return refs
+    return refs
+
+
+def _fetch_code(refs, reader: ReaderFn) -> str:
+    """Read the cited line ranges via `reader` and format them (line-numbered) for the prompt.
+
+    Fail-open per ref: an unreadable/missing file or out-of-range span just contributes nothing.
+    """
+    blocks = []
+    for path, start, end in refs:
+        try:
+            text = reader(path)
+        except Exception:
+            text = ""
+        if not isinstance(text, str) or not text:
+            continue
+        lines = text.splitlines()
+        n = len(lines)
+        s = max(1, start)
+        if s > n:
+            continue
+        e = min(n, end if end >= start else start)
+        if e - s + 1 > _MAX_LINES_PER_REF:
+            e = s + _MAX_LINES_PER_REF - 1
+        numbered = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
+        header = f"--- {path}:{start}" + (f"-{end}" if end != start else "") + " ---"
+        blocks.append(header + "\n" + numbered)
+    return "\n\n".join(blocks)
 
 
 def _extract_json_object(text: str) -> Optional[dict]:
@@ -146,17 +227,22 @@ def _coerce_confidence(raw) -> float:
     return max(0.0, min(1.0, c))
 
 
-def _degraded(refutation: str = "") -> dict:
-    """Well-formed skeptical fallback: uncertain, low confidence, degraded=True."""
-    return {"verdict": "uncertain", "refutation": refutation, "confidence": 0.0,
-            "degraded": True}
+def _degraded(refutation: str = "", reasoning: str = "") -> dict:
+    """Well-formed skeptical fallback: uncertain, low confidence, degraded=True.
+
+    `reasoning` carries any raw model text we did manage to get, so a caller can still judge.
+    """
+    return {"verdict": "uncertain", "refutation": refutation, "reasoning": reasoning,
+            "confidence": 0.0, "degraded": True}
 
 
 def verify_finding(claim: str,
                    context: str = "",
                    investigation_id: Optional[str] = None,
                    gen_fn: Optional[GenFn] = None,
-                   rag_fn: Optional[RagFn] = None) -> dict:
+                   rag_fn: Optional[RagFn] = None,
+                   code_refs: Optional[list] = None,
+                   reader: Optional[ReaderFn] = None) -> dict:
     """Adversarially verify a `claim`: run a skeptic that tries to refute it.
 
     Args:
@@ -166,11 +252,16 @@ def verify_finding(claim: str,
             (fail-open) to give the skeptic something to attack with.
         gen_fn: injectable generation fn (shared contract). None -> lazy llm_local.generate.
         rag_fn: injectable grounding fn. None -> lazy rag_context_search.
+        code_refs: optional list of ``file:line`` / ``file:start-end`` strings whose source
+            should be fetched into the prompt. ``file:line`` refs found in the claim/context
+            are also picked up automatically. Fail-open: unreadable refs contribute nothing.
+        reader: injectable file reader ``reader(path) -> text``. None -> lazy FS read.
 
     Returns:
-        {"verdict": "confirmed"|"refuted"|"uncertain", "refutation": str,
-         "confidence": float, "degraded": bool}. Fail-open: on any failure returns a
-        skeptical uncertain result. Never raises.
+        {"verdict": "confirmed"|"refuted"|"uncertain", "refutation": str, "reasoning": str,
+         "confidence": float, "degraded": bool}. `reasoning` surfaces the model's raw analysis
+         so a caller can judge even on 'uncertain'. Fail-open: on any failure returns a
+         skeptical uncertain result. Never raises.
     """
     c = (claim or "").strip()
     if not c:
@@ -187,7 +278,17 @@ def verify_finding(claim: str,
         except Exception:
             ctx = ""
 
-    prompt = _PROMPT_TMPL.format(claim=c, context=ctx or "(none)")
+    # Optional, fail-open code grounding: fetch real source for any cited file:line refs so
+    # the skeptic reasons over code, not a prose summary. Explicit code_refs are authoritative.
+    code_block = ""
+    try:
+        refs = _parse_refs(*(list(code_refs) if code_refs else []), c, ctx)
+        if refs:
+            code_block = _fetch_code(refs, reader or _lazy_read_file)
+    except Exception:
+        code_block = ""
+
+    prompt = _PROMPT_TMPL.format(claim=c, code=code_block or "(none)", context=ctx or "(none)")
     fn = gen_fn or _lazy_generate
     try:
         res = fn(prompt, fmt="json", max_tokens=384)
@@ -195,16 +296,21 @@ def verify_finding(claim: str,
         return _degraded()
 
     if not isinstance(res, dict) or not res.get("ok"):
-        return _degraded()
+        return _degraded(reasoning=(res.get("text", "") if isinstance(res, dict) else ""))
 
-    obj = _extract_json_object(res.get("text", ""))
+    raw = res.get("text", "")
+    obj = _extract_json_object(raw)
     if obj is None:
-        return _degraded()
+        return _degraded(reasoning=raw if isinstance(raw, str) else "")
 
     verdict = _coerce_verdict(obj.get("verdict"))
     refutation = obj.get("refutation")
     if not isinstance(refutation, str):
         refutation = "" if refutation is None else str(refutation)
     confidence = _coerce_confidence(obj.get("confidence"))
+    # Surface raw reasoning: prefer the model's own field, fall back to its raw text.
+    reasoning = obj.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = raw if isinstance(raw, str) else ""
     return {"verdict": verdict, "refutation": refutation.strip(),
-            "confidence": confidence, "degraded": False}
+            "reasoning": reasoning.strip(), "confidence": confidence, "degraded": False}

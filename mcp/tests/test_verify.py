@@ -39,6 +39,11 @@ _CONFIRMED_PROSE = (
     "Hope that helps."
 )
 
+_CONFIRMED_REASONING = (
+    '{"verdict": "confirmed", "reasoning": "Line 2 assigns x=1 and returns it, so the claim '
+    'that it returns 1 holds.", "refutation": "cannot refute", "confidence": 0.8}'
+)
+
 
 def test_refutation_yields_refuted():
     r = V.verify_finding("The base omits RTCM 1005", gen_fn=_ok(_REFUTED))
@@ -150,6 +155,79 @@ def test_explicit_context_skips_rag():
     r = V.verify_finding("claim", context="explicit evidence here",
                          investigation_id="inv-3", gen_fn=_ok(_REFUTED), rag_fn=_rag)
     assert r["verdict"] == "refuted"
+
+
+def test_code_ref_fetches_source_into_prompt():
+    # A stubbed reader returns file text; the cited lines must land in the skeptic's prompt.
+    captured = {}
+    file_text = "def f():\n    x = 1\n    return x\n"
+
+    def _reader(path):
+        captured["path"] = path
+        return file_text
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _CONFIRMED, "ok": True}
+
+    r = V.verify_finding("f() returns 1", code_refs=["mymod.py:2-3"],
+                         gen_fn=_gen, reader=_reader)
+    assert r["verdict"] == "confirmed"
+    assert captured["path"] == "mymod.py"
+    # The fetched, line-numbered source is present (not just the prose claim).
+    assert "2: " in captured["prompt"] and "x = 1" in captured["prompt"]
+    assert "return x" in captured["prompt"]
+    assert "mymod.py:2-3" in captured["prompt"]
+
+
+def test_file_ref_in_context_is_auto_fetched():
+    # A ref embedded in the context string is picked up without an explicit code_refs arg.
+    captured = {}
+
+    def _reader(path):
+        return "alpha\nbeta\ngamma\n"
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _REFUTED, "ok": True}
+
+    r = V.verify_finding("the second line is beta", context="see src/data.py:2",
+                         gen_fn=_gen, reader=_reader)
+    assert r["verdict"] == "refuted"
+    assert "beta" in captured["prompt"]
+
+
+def test_unreadable_ref_fails_open_and_still_verifies():
+    def _reader(path):
+        raise FileNotFoundError(path)
+
+    r = V.verify_finding("claim", code_refs=["nope.py:1-3"],
+                         gen_fn=_ok(_CONFIRMED), reader=_reader)
+    # Reader blew up but verification proceeds ungrounded.
+    assert r["verdict"] == "confirmed"
+
+
+def test_reasoning_field_is_surfaced():
+    r = V.verify_finding("f() returns 1", gen_fn=_ok(_CONFIRMED_REASONING))
+    assert r["verdict"] == "confirmed"
+    assert "Line 2 assigns x=1" in r["reasoning"]
+
+
+def test_reasoning_falls_back_to_raw_text_when_absent():
+    # No explicit reasoning field -> caller still gets the model's raw output to judge.
+    r = V.verify_finding("c", gen_fn=_ok('{"verdict": "confirmed", "confidence": 0.6}'))
+    assert r["verdict"] == "confirmed"
+    assert '"verdict": "confirmed"' in r["reasoning"]
+
+
+def test_claim_only_still_works_without_refs():
+    # No code_refs, no file:line anywhere -> reader must never be consulted; behavior unchanged.
+    def _reader(path):
+        raise AssertionError("reader must not be called when there are no refs")
+
+    r = V.verify_finding("The base omits RTCM 1005", gen_fn=_ok(_REFUTED), reader=_reader)
+    assert r["verdict"] == "refuted"
+    assert r["confidence"] == 0.9
 
 
 def test_default_gen_fn_is_lazy_and_fails_open(monkeypatch):
