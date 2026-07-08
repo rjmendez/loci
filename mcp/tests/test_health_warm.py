@@ -47,8 +47,9 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
         return False
 
     monkeypatch.setattr(backends, "_alive", fake_alive)
-    monkeypatch.setattr(backends, "ollama_url", lambda: "http://localhost:11434")
-    monkeypatch.setattr(backends, "vllm_url", lambda: "http://localhost:8000")
+    # Resolvers now accept a probe_timeout arg (loci_health passes a short one).
+    monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
+    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
     out = json.loads(server.loci_health())
@@ -62,11 +63,47 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
 def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
     # Even if every backend endpoint resolver raises, the tool still returns a dict
     # with the full key set (each probe is independent + fail-open).
-    monkeypatch.setattr(backends, "ollama_url", lambda: (_ for _ in ()).throw(RuntimeError("x")))
-    monkeypatch.setattr(backends, "vllm_url", lambda: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "qdrant", lambda: (_ for _ in ()).throw(RuntimeError("x")))
     out = json.loads(server.loci_health())
     assert _EXPECTED_KEYS <= set(out.keys())
+
+
+def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
+    # First-call safety (round 4): with backends DOWN and no env override, EVERY
+    # reachability probe loci_health triggers — including the resolvers' OWN internal
+    # local probe — must use a short (<= 0.5s) timeout, so the first call cannot block
+    # on backends._alive's 1.0s default.
+    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(backends, "_config", lambda: {})
+    backends.ollama_url.cache_clear()
+    backends.vllm_url.cache_clear()
+
+    seen_timeouts = []
+
+    def recording_alive(url, timeout=1.0):
+        seen_timeouts.append(timeout)
+        return False
+
+    monkeypatch.setattr(backends, "_alive", recording_alive)
+
+    out = json.loads(server.loci_health())
+
+    # The resolvers' internal probe (localhost:11434 / :8000) ran, proving we didn't
+    # merely short-circuit — and every probe timeout is bounded.
+    assert seen_timeouts, "expected reachability probes to have run"
+    assert all(t <= 0.5 for t in seen_timeouts), (
+        f"all loci_health probe timeouts must be <= 0.5s, got {seen_timeouts}")
+    # Backends down -> all reachability False, full key set still returned (fail-open).
+    assert out["ollama_reachable"] is False
+    assert out["vllm_reachable"] is False
+    assert out["qdrant_reachable"] is False
+    assert _EXPECTED_KEYS <= set(out.keys())
+    # Reset so a later real caller re-resolves cleanly.
+    backends.ollama_url.cache_clear()
+    backends.vllm_url.cache_clear()
 
 
 def test_code_version_first_compute_is_thread_safe(monkeypatch):

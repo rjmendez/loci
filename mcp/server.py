@@ -7225,15 +7225,20 @@ def loci_health() -> str:
         pass
     try:
         import backends
-        # Each probe independent + fail-open: one raising/unreachable backend must
-        # not mask the others.
+        # Bounded, fast even on the FIRST call with backends down: resolve each
+        # endpoint URL ONCE (the resolvers are memoized) and pass a SHORT probe
+        # timeout so the resolvers' own internal local probe cannot block for the
+        # 1.0s default. Then run loci_health's own reachability check with the same
+        # short timeout. Each probe is independent + fail-open: one raising /
+        # unreachable backend must not mask the others.
+        _PROBE_T = 0.5
         for key, resolver in (
-            ("ollama_reachable", backends.ollama_url),
-            ("vllm_reachable", backends.vllm_url),
+            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
+            ("vllm_reachable", lambda: backends.vllm_url(_PROBE_T)),
             ("qdrant_reachable", lambda: backends.qdrant()[0]),
         ):
             try:
-                out[key] = bool(backends._alive(resolver(), timeout=0.75))
+                out[key] = bool(backends._alive(resolver(), timeout=_PROBE_T))
             except Exception:
                 pass
         try:

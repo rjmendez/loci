@@ -78,24 +78,32 @@ def _alive(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
-@functools.lru_cache(maxsize=1)
-def ollama_url() -> str:
-    """Ollama base URL: env -> local probe -> config -> ''. Memoized (probe runs once)."""
+@functools.lru_cache(maxsize=8)
+def ollama_url(probe_timeout: float = 1.0) -> str:
+    """Ollama base URL: env -> local probe -> config -> ''. Memoized (probe runs once).
+
+    `probe_timeout` bounds the local reachability probe. Callers that need a fast,
+    bounded resolution (e.g. loci_health on a first call with backends down) pass a
+    short value; the result is memoized per distinct timeout so the probe still runs
+    at most once per process per timeout.
+    """
     env = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL")
     if env:
         return env
-    if _alive(_LOCAL_OLLAMA):
+    if _alive(_LOCAL_OLLAMA, timeout=probe_timeout):
         return _LOCAL_OLLAMA
     return _cfg("ollama", "url", "") or ""
 
 
-@functools.lru_cache(maxsize=1)
-def vllm_url() -> str:
-    """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama)."""
+@functools.lru_cache(maxsize=8)
+def vllm_url(probe_timeout: float = 1.0) -> str:
+    """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).
+
+    `probe_timeout` bounds the local reachability probe (see ollama_url)."""
     env = os.environ.get("VLLM_BASE_URL")
     if env:
         return env
-    if _alive(_LOCAL_VLLM):
+    if _alive(_LOCAL_VLLM, timeout=probe_timeout):
         return _LOCAL_VLLM
     return _cfg("vllm", "url", "") or ""
 
