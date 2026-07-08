@@ -76,8 +76,14 @@ def test_empty_docs():
     assert R.rerank("q", []) == []
 
 
-def test_model_id_reads_env(monkeypatch):
+def test_model_id_reads_env(monkeypatch, tmp_path):
+    # Isolate from any real gitignored ~/.loci/backends.toml so we test the CODE default.
     monkeypatch.delenv("RERANK_MODEL", raising=False)
-    assert R._model_id() == "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    monkeypatch.setenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+    monkeypatch.setenv("LOCI_CONFIG", str(tmp_path / "no-such.toml"))
+    import backends as B
+    B._reset_cache()
+    # Default flipped to bge on judge-eval evidence (+14% nDCG@10).
     assert R._model_id() == "BAAI/bge-reranker-v2-m3"
+    monkeypatch.setenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    assert R._model_id() == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    B._reset_cache()

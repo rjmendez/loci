@@ -62,6 +62,24 @@ def test_evaluate_fail_open_skips_bad_query():
     assert r["n"] == 1 and r["skipped"] == 1              # one scored, one skipped, no raise
 
 
+def test_score_configs_and_aggregate():
+    # two queries, judge-relevant sets; two configs with different rankings.
+    q1 = RE.score_configs({"a": ["x", "y", "z"], "b": ["z", "y", "x"]}, {"x"}, k=3)
+    assert q1["a"]["mrr"] == 1.0 and q1["b"]["mrr"] == 1 / 3     # 'a' ranks the relevant doc first
+    q2 = RE.score_configs({"a": ["p", "q"], "b": ["q", "p"]}, {"q"}, k=3)
+    agg = RE.aggregate([q1, q2], k=3)
+    assert agg["a"]["n"] == 2 and agg["b"]["n"] == 2
+    assert agg["a"]["mrr"] > agg["b"]["mrr"]                     # 'a' wins on average
+    # aggregate output feeds compare() unchanged
+    out = RE.compare("a", agg["a"], "b", agg["b"])
+    assert out["recommend_flip"] is False                        # b does not beat a
+
+
+def test_score_configs_empty_relevant():
+    s = RE.score_configs({"a": ["x", "y"]}, set(), k=3)
+    assert s["a"] == {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0}    # nothing relevant -> all 0
+
+
 def test_compare_recommends_flip_only_on_clear_win():
     base = {"recall@10": 0.50, "mrr": 0.40, "ndcg@10": 0.45}
     better = {"recall@10": 0.55, "mrr": 0.44, "ndcg@10": 0.52}   # +15% ndcg, no regression

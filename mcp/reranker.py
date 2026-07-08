@@ -5,11 +5,12 @@ This factors the cross-encoder reranking that currently lives inline in server.p
 importable primitive. server.py should delegate to `rerank()` here instead of
 carrying its own CrossEncoder singleton.
 
-Two backends, chosen by env RERANK_MODEL:
-  - 'cross-encoder/ms-marco-MiniLM-L-6-v2'  (DEFAULT — reproduces current server.py
-    behavior exactly [rerank]: the 22M-param ms-marco MiniLM cross-encoder.)
-  - 'BAAI/bge-reranker-v2-m3'               (opt-in — a stronger reranker that lifts
-    retrieval precision [rerank]; heavier, multilingual.)
+Two backends, chosen by env RERANK_MODEL (default resolved via backends.rerank_model()):
+  - 'BAAI/bge-reranker-v2-m3'               (DEFAULT — a stronger reranker that lifts
+    retrieval precision [rerank]; heavier (~600MB), multilingual. Flipped in on
+    judge-eval evidence: +14% nDCG@10, no regression. See scripts/judge_eval.py.)
+  - 'cross-encoder/ms-marco-MiniLM-L-6-v2'  (opt-in — the lighter 22M-param ms-marco
+    MiniLM cross-encoder; pin it back on constrained hosts via RERANK_MODEL.)
 Any other value is passed through verbatim to CrossEncoder, so operators can point at
 an arbitrary sentence-transformers cross-encoder without a code change.
 
@@ -49,8 +50,9 @@ from typing import Callable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Default backend reproduces current server.py behavior [rerank].
-_DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Ultimate fallback if `backends` can't be imported. Flipped to bge on judge-eval
+# evidence (+14% nDCG@10); pin MiniLM back via RERANK_MODEL on constrained hosts.
+_DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Module-global model cache, mirroring server.py's `_cross_encoder` singleton [rerank]:
 #   None  -> not yet attempted (lazy)

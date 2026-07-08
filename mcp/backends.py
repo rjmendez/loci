@@ -108,8 +108,11 @@ def vllm_model() -> str:
 
 
 def rerank_model() -> str:
+    # Default flipped MiniLM -> bge on judge-eval evidence (+14% nDCG@10, no regression;
+    # see scripts/judge_eval.py). bge is heavier (~600MB, slower/query); constrained hosts
+    # pin the lighter model back via RERANK_MODEL / [rerank].model in the gitignored config.
     return os.environ.get("RERANK_MODEL") or _cfg(
-        "rerank", "model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        "rerank", "model", "BAAI/bge-reranker-v2-m3")
 
 
 def qdrant() -> tuple[str, str]:
