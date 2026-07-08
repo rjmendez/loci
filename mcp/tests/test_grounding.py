@@ -7,6 +7,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import grounding as G  # noqa: E402 — must follow the path setup above
 
 
+def test_ground_fail_open_on_raising_source(monkeypatch):
+    # A raising server tool (or malformed finding) must NOT propagate out of ground() —
+    # the fail-open discipline the flagship dogfood found violated in sections 1 & 3.
+    import types
+    fake = types.ModuleType("server")
+
+    def _boom(*a, **k):
+        raise RuntimeError("dead DB")
+
+    fake.investigation_load = _boom
+    fake.investigation_entity_lookup = _boom
+    fake.rag_context_search = _boom
+    fake.investigation_search = _boom
+    monkeypatch.setitem(sys.modules, "server", fake)
+    r = G.ground({"title": "x", "focus": "y", "caseIds": ["c1"], "entities": ["1.2.3.4"]},
+                 {"budgetChars": 500, "memoryDir": "/nonexistent", "allowKeyword": True})
+    assert set(r) == {"block", "sources", "chars", "degraded"}   # well-formed, never raised
+
+
+def test_ground_skips_malformed_findings(monkeypatch):
+    # recent_findings with a non-dict element must be skipped, not raise AttributeError.
+    import types
+    fake = types.ModuleType("server")
+    fake.investigation_load = lambda cid, **k: {
+        "manifest": {"hypothesis": "h"}, "recent_findings": ["not-a-dict", {"text": "ok"}]}
+    monkeypatch.setitem(sys.modules, "server", fake)
+    r = G.ground({"title": "x", "caseIds": ["c1"]}, {"budgetChars": 500, "memoryDir": "/nonexistent"})
+    assert "ok" in r["block"] and set(r) == {"block", "sources", "chars", "degraded"}
+
+
 def test_filter_noise_drops_conversation_dumps():
     items = [
         {"text": "genuine finding: the flock patch prevents interleaved appends", "source": "graph-tools"},

@@ -180,26 +180,34 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     except Exception:
         S = None
 
-    # 1. Named cases -> investigation_load (structured, retracted excluded).
+    # 1. Named cases -> investigation_load (structured, retracted excluded). Fail-open per
+    # case: a raising server tool (or malformed finding) skips that case, never aborts ground().
     for cid in (task.get("caseIds") or [])[:3]:
         if not S:
             break
-        data = _jload(S.investigation_load(cid, last_n_findings=6))
-        if isinstance(data, dict) and not data.get("error"):
-            man = data.get("manifest", {})
-            summary = f"{cid} :: hypothesis={man.get('hypothesis')} | next={man.get('next_step')}"
-            add(f"case:{cid}", summary, 0.12)
-            for f in (data.get("recent_findings") or [])[:3]:
-                add(f"case:{cid}:finding", str(f.get("text", "")), 0.08)
+        try:
+            data = _jload(S.investigation_load(cid, last_n_findings=6))
+            if isinstance(data, dict) and not data.get("error"):
+                man = data.get("manifest", {})
+                summary = f"{cid} :: hypothesis={man.get('hypothesis')} | next={man.get('next_step')}"
+                add(f"case:{cid}", summary, 0.12)
+                for f in (data.get("recent_findings") or [])[:3]:
+                    if isinstance(f, dict):
+                        add(f"case:{cid}:finding", str(f.get("text", "")), 0.08)
+        except Exception:
+            continue
 
-    # 3. Exact entities -> entity_lookup (O(1), no embedding).
+    # 3. Exact entities -> entity_lookup (O(1), no embedding). Fail-open per entity.
     for ent in (task.get("entities") or [])[:5]:
         if not S:
             break
-        data = _jload(S.investigation_entity_lookup(ent, limit=3))
-        if isinstance(data, dict) and data.get("total_findings"):
-            add(f"entity:{ent}", f"seen in {data.get('investigations_count')} case(s), "
-                                 f"{data.get('total_findings')} finding(s)", 0.06)
+        try:
+            data = _jload(S.investigation_entity_lookup(ent, limit=3))
+            if isinstance(data, dict) and data.get("total_findings"):
+                add(f"entity:{ent}", f"seen in {data.get('investigations_count')} case(s), "
+                                     f"{data.get('total_findings')} finding(s)", 0.06)
+        except Exception:
+            continue
 
     # 4. Code graph (only if reconnected / available).
     if opts.get("graphAvailable") and task.get("codeRefs") and S:
