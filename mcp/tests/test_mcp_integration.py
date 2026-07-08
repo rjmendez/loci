@@ -14,6 +14,7 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 """
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -160,6 +161,58 @@ class TestInvestigationLifecycle(unittest.TestCase):
         ids = [i.get("id") for i in result["investigations"]]
         self.assertIn(inv_a, ids)
         self.assertIn(inv_b, ids)
+
+    def _set_updated_order(self, inv_ids):
+        """Force directory mtimes so inv_ids[0] is the most-recently updated.
+
+        The list is sorted by directory st_mtime; creating investigations in
+        fast succession can tie, so pin distinct mtimes for deterministic order.
+        """
+        base = 1_000_000
+        for i, inv_id in enumerate(inv_ids):
+            d = server.MEMORY_DIR / inv_id
+            ts = base + (len(inv_ids) - i) * 10  # earlier in list => newer
+            os.utime(d, (ts, ts))
+
+    def test_investigation_list_respects_limit_and_offset(self):
+        ids = [_new_id("page") for _ in range(5)]
+        for inv_id in ids:
+            server.investigation_start(investigation_id=inv_id, title=f"Page {inv_id}")
+        # ids[0] newest ... ids[4] oldest
+        self._set_updated_order(ids)
+
+        first = _json(server.investigation_list(limit=2, offset=0))
+        self.assertEqual(first["total"], 5)
+        self.assertEqual([i["id"] for i in first["investigations"]], ids[:2])
+
+        second = _json(server.investigation_list(limit=2, offset=2))
+        self.assertEqual(second["total"], 5)
+        self.assertEqual([i["id"] for i in second["investigations"]], ids[2:4])
+
+    def test_investigation_list_summary_omits_verbose_fields(self):
+        inv_id = _new_id("summary")
+        server.investigation_start(investigation_id=inv_id, title="Summary test")
+        result = _json(server.investigation_list(summary=True))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        for key in ("id", "title", "status", "finding_counts", "updated_at"):
+            self.assertIn(key, rec)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec)
+
+    def test_investigation_list_full_includes_verbose_fields(self):
+        inv_id = _new_id("full")
+        server.investigation_start(investigation_id=inv_id, title="Full test")
+        result = _json(server.investigation_list(summary=False))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertIn(key, rec)
+
+    def test_investigation_list_empty(self):
+        result = _json(server.investigation_list())
+        self.assertEqual(result["investigations"], [])
+        self.assertEqual(result["total"], 0)
 
     def test_store_roundtrip_finding_id_in_load(self):
         inv_id = _new_id("roundtrip")
@@ -891,7 +944,7 @@ class TestInvestigationACL(unittest.TestCase):
         server.investigation_start(investigation_id=inv_shared, title="Shared investigation")
         server.investigation_share(investigation_id=inv_shared, agent_ids=["agent-a"])
 
-        result = _json(server.investigation_list())
+        result = _json(server.investigation_list(summary=False))
         by_id = {i["id"]: i for i in result["investigations"]}
         self.assertIn("visibility", by_id[inv_private])
         self.assertEqual(by_id[inv_private]["visibility"], "private")
@@ -1497,7 +1550,7 @@ class TestMemoryTiers(unittest.TestCase):
             source="test",
             tier="cold",
         )
-        result = _json(server.investigation_list())
+        result = _json(server.investigation_list(summary=False))
         inv_summary = next((i for i in result["investigations"] if i["id"] == inv_id), None)
         self.assertIsNotNone(inv_summary, "Investigation not found in list")
         self.assertIn("tier_counts", inv_summary)

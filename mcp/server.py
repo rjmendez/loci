@@ -5072,25 +5072,70 @@ def investigation_evidence_precheck(
 # ---- Tool: investigation_list ----
 
 @mcp.tool()
-def investigation_list() -> str:
+def investigation_list(
+    limit: int = 30,
+    offset: int = 0,
+    summary: bool = True,
+) -> str:
     """
-    List all investigations with status and finding counts, most recently
+    List investigations with status and finding counts, most recently
     updated first.
 
+    Bounded by default to avoid overflowing the tool-result token cap: only
+    `limit` investigations are returned starting at `offset`, and `summary`
+    mode returns a compact record per investigation (id, title, status,
+    finding_counts, updated_at). Set summary=False for the full record
+    (created_at, open_questions_count, hypothesis, visibility, tier_counts)
+    and/or raise limit to page through or fetch everything.
+
+    Args:
+        limit: Max investigations to return (default 30). Use 0 or a negative
+            value for no limit (return all).
+        offset: Number of investigations to skip from the front (default 0).
+        summary: If True (default), return only compact fields; if False,
+            return the full record including tier counts.
+
     Returns:
-        JSON list of investigation summaries.
+        JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
     """
     if not MEMORY_DIR.exists():
-        return json.dumps({"investigations": []})
+        return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
 
-    investigations = []
+    # Collect valid investigation dirs (most-recently-updated first) before
+    # doing any per-record work, so pagination is over investigations — not
+    # over stray files/dirs — and the expensive findings scan only runs for
+    # the page actually returned.
+    entries = []
     for d in sorted(MEMORY_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if not d.is_dir():
             continue
         manifest = _load_manifest(d.name)
         if manifest:
-            acl = manifest.get("acl") or []
-            # Scan findings.jsonl to build tier counts
+            entries.append((d, manifest))
+
+    total = len(entries)
+
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    if limit is None or limit <= 0:
+        page = entries[offset:]
+    else:
+        page = entries[offset:offset + limit]
+
+    investigations = []
+    for d, manifest in page:
+        acl = manifest.get("acl") or []
+        record = {
+            "id": manifest["id"],
+            "title": manifest["title"],
+            "status": manifest["status"],
+            "updated_at": manifest["updated_at"],
+            "finding_counts": manifest["finding_counts"],
+        }
+        if not summary:
+            # Scan findings.jsonl to build tier counts (only in full mode)
             tier_counts = {"hot": 0, "warm": 0, "cold": 0}
             try:
                 findings_path = d / "findings.jsonl"
@@ -5102,20 +5147,21 @@ def investigation_list() -> str:
                         tier_counts["warm"] += 1  # default for legacy findings
             except Exception:
                 pass  # fail-open
-            investigations.append({
-                "id": manifest["id"],
-                "title": manifest["title"],
-                "status": manifest["status"],
+            record.update({
                 "created_at": manifest["created_at"],
-                "updated_at": manifest["updated_at"],
-                "finding_counts": manifest["finding_counts"],
                 "open_questions_count": len(manifest["open_questions"]),
                 "hypothesis": manifest["hypothesis"],
                 "visibility": "shared" if acl else "private",
                 "tier_counts": tier_counts,
             })
+        investigations.append(record)
 
-    return json.dumps({"investigations": investigations}, indent=2)
+    return json.dumps({
+        "investigations": investigations,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }, indent=2)
 
 
 # ---- Tool: investigation_share ----
