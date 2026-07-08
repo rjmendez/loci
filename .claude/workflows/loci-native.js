@@ -1,8 +1,7 @@
 export const meta = {
   name: 'loci-native',
   description: 'Grounded, model/effort-tiered fan-out over a task list (Loci-native template)',
-  whenToUse: 'Fan out N planning/impl/verify agents that all share ONE injected grounding block ' +
-    '(produced up front by scripts/ground.py) instead of each re-querying Loci. Tier model/effort per task.',
+  whenToUse: 'Fan out N planning/impl/verify agents that all share ONE injected grounding block (produced up front by scripts/ground.py) instead of each re-querying Loci. Tier model/effort per task.',
   phases: [
     { title: 'Fanout', detail: 'one grounded agent per task, tiered by kind' },
     { title: 'Verify', detail: 'adversarial check of each non-trivial result' },
@@ -31,8 +30,10 @@ export const meta = {
 //   by parallel agents (that is what the _append_jsonl flock + single-writer rule buy us).
 // -----------------------------------------------------------------------------
 
-const GROUND = (args && args.ground) || ''
-const TASKS = (args && Array.isArray(args.tasks) && args.tasks) || []
+// args may arrive as an object OR a JSON string depending on how it was passed — coerce.
+const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
+const GROUND = A.ground || ''
+const TASKS = Array.isArray(A.tasks) ? A.tasks : []
 
 // Model/effort tiers. Omitting model => inherit the session model (right default).
 // Only the reasoning-heavy lane names a bigger model; mechanical work drops to low effort.
@@ -41,7 +42,7 @@ const DEFAULT_TIERS = {
   impl: { effort: 'high' },                       // default: implementation/planning
   reason: { model: 'opus', effort: 'high' },      // hardest analysis/synthesis
 }
-const TIERS = Object.assign({}, DEFAULT_TIERS, (args && args.tiers) || {})
+const TIERS = Object.assign({}, DEFAULT_TIERS, A.tiers || {})
 
 if (!GROUND) log('warning: args.ground is empty — agents run UNGROUNDED (did you run scripts/ground.py?)')
 if (!TASKS.length) { log('no tasks provided'); return { results: [] } }
