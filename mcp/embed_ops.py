@@ -18,6 +18,7 @@ embed function is injectable so callers can reuse a warm client and tests can st
 from __future__ import annotations
 
 import os
+import threading
 from typing import Callable, Optional
 
 _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
@@ -75,6 +76,47 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         except Exception:
             return []             # non-retryable (HTTP error, bad JSON) -> fail-open
     return []
+
+
+# --- Cold-load warm-ping ----------------------------------------------------
+# The first real /api/embed call pays the ~9s nomic cold-load. warm() fires a tiny
+# throwaway embed in a daemon thread so that cost is absorbed BEFORE the first real
+# RAG/dedup call (called from a startup hook and/or lazily). Idempotent, non-blocking,
+# fail-open: it never blocks startup and never raises.
+_warm_lock = threading.Lock()
+_warm_started = False
+
+
+def warmed() -> bool:
+    """True once a warm-ping has been fired this process (best-effort diagnostic)."""
+    return _warm_started
+
+
+def warm(embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None) -> bool:
+    """Fire a best-effort 1-token embed in a daemon thread to warm the model.
+
+    Idempotent (fires at most once per process), non-blocking, fail-open — never
+    blocks the caller and never raises even if the endpoint is down. Returns True if
+    this call started the warm-ping, False if one was already started. `embed_fn` is
+    injectable for tests (defaults to embed_texts, which is itself fail-open)."""
+    global _warm_started
+    with _warm_lock:
+        if _warm_started:
+            return False
+        _warm_started = True
+    ef = embed_fn or embed_texts
+
+    def _run() -> None:
+        try:
+            ef(["warm"])
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_run, name="embed-warm", daemon=True).start()
+    except Exception:
+        pass
+    return True
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
