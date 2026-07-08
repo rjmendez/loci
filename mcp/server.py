@@ -1852,9 +1852,31 @@ _verify_gen_fn = None
 # Update-record types recorded in finding_updates.jsonl.
 _LIFECYCLE_UPDATE_TYPES: frozenset = frozenset({"resolution", "verification"})
 
+# Known source/config/doc file extensions a code ref may end in. Requiring the
+# extension to be from THIS set (not merely "some letters after a dot") is what
+# keeps ordinary prose out: "e.g." would otherwise parse as file "e" ext "g".
+_CODE_REF_EXTS = (
+    "pyi|pyx|py|ipynb|"
+    "tsx|ts|jsx|js|mjs|cjs|vue|svelte|"
+    "kts|kt|java|scala|sc|groovy|gradle|"
+    "cpp|cxx|cc|hpp|hxx|hh|c|h|"
+    "rs|go|rb|php|swift|mm|m|cs|dart|lua|"
+    "sh|bash|zsh|fish|ps1|"
+    "sql|proto|graphql|"
+    "html|htm|css|scss|sass|less|"
+    "json|jsonl|yaml|yml|toml|ini|cfg|conf|xml|"
+    "md|rst|txt|"
+    "tf|hcl|dockerfile|mk|cmake|bzl"
+)
 # A file-path-with-optional-line reference in finding text, e.g. "mcp/server.py:3204"
-# or "verify.py". Requires an extension so ordinary prose ("e.g.") doesn't match.
-_FILE_REF_RE = re.compile(r"\b((?:[\w.\-]+/)*[\w.\-]+\.[A-Za-z][\w]*)(?::(\d+))?\b")
+# or "verify.py". The path segment ends in a KNOWN code/config/doc extension (see
+# _CODE_REF_EXTS, case-insensitive), so ordinary prose such as "e.g." — which would
+# parse as file "e" with extension "g" — does not match. A trailing lookahead keeps
+# "file.pyc"-style longer suffixes from matching only the "py" prefix.
+_FILE_REF_RE = re.compile(
+    r"\b((?:[\w.\-]+/)*[\w.\-]+\.(?:" + _CODE_REF_EXTS + r"))(?![\w.\-])(?::(\d+))?",
+    re.IGNORECASE,
+)
 
 
 def _finding_updates_path(investigation_id: str) -> Path:
@@ -3574,7 +3596,11 @@ def finding_resolve(
         "note": note or "",
         "ts": _now(),
     }
-    _append_jsonl(_finding_updates_path(investigation_id), record)
+    try:
+        _append_jsonl(_finding_updates_path(investigation_id), record)
+    except Exception as exc:  # noqa: BLE001 — fail-open: never raise out of a tool
+        logger.warning("finding_resolve append failed (fail-open): %r", exc)
+        return json.dumps({"error": f"Could not record resolution: {exc}"})
     _event_log_append({
         "op": "finding_resolve",
         "investigation_id": investigation_id,
@@ -7453,15 +7479,21 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
         confidence = res.get("confidence", 0.0)
         # Record as an append-only verification note in a SEPARATE log so these
         # accumulating records never slow the resolution read path — does NOT
-        # touch resolution.
-        _append_jsonl(_finding_verifications_path(investigation_id), {
-            "record_type": "verification",
-            "investigation_id": investigation_id,
-            "finding_id": fid,
-            "verdict": verdict,
-            "confidence": confidence,
-            "ts": _now(),
-        })
+        # touch resolution. Guarded per-finding: a single write failure (disk
+        # full, permission) is logged and skipped so the rest of the run
+        # continues rather than aborting the whole verification batch.
+        try:
+            _append_jsonl(_finding_verifications_path(investigation_id), {
+                "record_type": "verification",
+                "investigation_id": investigation_id,
+                "finding_id": fid,
+                "verdict": verdict,
+                "confidence": confidence,
+                "ts": _now(),
+            })
+        except Exception as exc:  # noqa: BLE001 — never abort the batch on one write
+            logger.warning("verification note append failed for %s (fail-open, skipped): %r",
+                           fid, exc)
         results.append({
             "finding_id": fid,
             "verdict": verdict,

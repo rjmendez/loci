@@ -308,6 +308,62 @@ class FindingLifecycleTest(unittest.TestCase):
         out = _json(server.investigation_verify_all(inv_id, limit=2))
         self.assertEqual(out["verified"], 2)
 
+    # -- fail-open write guards (Copilot round 5) ----------------------------
+
+    def test_resolve_append_failure_fails_open(self):
+        # An I/O error while recording the resolution must return a fail-open
+        # error result, NOT raise out of the tool.
+        inv_id = self._start()
+        fid = self._store(inv_id, "the bug is here")
+        with mock.patch.object(server, "_append_jsonl", side_effect=OSError("disk full")):
+            res = _json(server.finding_resolve(inv_id, fid, "fixed"))
+        self.assertIn("error", res)
+        self.assertNotIn("resolved", res)
+        # Nothing was recorded, so the finding is still open.
+        self.assertEqual(self._load_findings(inv_id)[fid]["resolution"], "open")
+
+    def test_verify_all_continues_when_a_note_write_fails(self):
+        # A single verification-note write failure must be skipped so the rest of
+        # the batch still runs (and every finding still gets a verdict result).
+        inv_id = self._start()
+        fids = [self._store(inv_id, f"claim {i}") for i in range(3)]
+
+        server._verify_gen_fn = lambda *a, **k: {"ok": True, "text": json.dumps(
+            {"verdict": "confirmed", "refutation": "", "confidence": 0.5})}
+
+        with mock.patch.object(server, "_append_jsonl", side_effect=OSError("disk full")):
+            out = _json(server.investigation_verify_all(inv_id))
+
+        # Every finding produced a verdict despite every note write failing.
+        self.assertEqual(out["verified"], 3)
+        self.assertEqual({r["finding_id"] for r in out["results"]}, set(fids))
+
+    # -- code-ref regex prose tightening (Copilot round 5) -------------------
+
+    def test_file_ref_re_ignores_prose_but_matches_code_refs(self):
+        # Prose tokens with a non-code trailing letter must NOT parse as refs.
+        for prose in ("e.g.", "i.e.", "et al.", "U.S.", "vs.", "a.m."):
+            self.assertEqual(
+                [m.group(1) for m in server._FILE_REF_RE.finditer(prose)],
+                [],
+                f"prose {prose!r} should not match as a code ref",
+            )
+        # Real code refs still match (bare, with dir, with line, case-insensitive).
+        cases = {
+            "see verify.py for details": "verify.py",
+            "in mcp/server.py:3204 the bug": "mcp/server.py",
+            "config lives in settings.yaml": "settings.yaml",
+            "the README.md file": "README.md",
+        }
+        for text, expected in cases.items():
+            matched = [m.group(1) for m in server._FILE_REF_RE.finditer(text)]
+            self.assertIn(expected, matched, f"{text!r} should match {expected!r}")
+        # A longer, non-code suffix ("file.pyc") must not match only the "py" prefix.
+        self.assertEqual(
+            [m.group(1) for m in server._FILE_REF_RE.finditer("compiled file.pyc here")],
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
