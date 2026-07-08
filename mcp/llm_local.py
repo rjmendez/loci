@@ -25,8 +25,17 @@ import json
 import os
 from typing import Optional
 
-# [substrate] read the base URL from env, same convention as embed_ops.py.
+# [substrate] read the base URL from env, same convention as embed_ops.py. When unset, the
+# call-time _resolve_ollama() falls back to backends (local probe -> config) for portability.
 _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
+
+
+def _resolve_ollama() -> str:
+    try:
+        import backends
+        return backends.ollama_url()
+    except Exception:
+        return ""
 
 # Timeout is generous because a cold model load can take ~70s even when we pin with
 # keep_alive (grounding is silent on an exact value; 120s covers a cold load plus generation).
@@ -55,7 +64,8 @@ def generate(prompt: str,
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
     """
     fail = {"text": "", "ok": False, "model": model}
-    if not prompt or not _OLLAMA:
+    base = _OLLAMA or _resolve_ollama()   # env wins; else backends (local probe -> config)
+    if not prompt or not base:
         return fail
 
     body = {
@@ -73,7 +83,7 @@ def generate(prompt: str,
 
     try:
         import requests
-        r = requests.post(f"{_OLLAMA}/api/generate", json=body, timeout=_TIMEOUT)
+        r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         text = (r.json().get("response") or "")
     except Exception:
