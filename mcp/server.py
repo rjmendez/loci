@@ -207,13 +207,22 @@ _verdict_backend_failed = False        # permanent-failure sentinel — don't re
 # the module is unavailable, every consumer degrades to the pre-existing path.
 # ---------------------------------------------------------------------------
 _kuzu_store = None                     # KuzuStore singleton once initialized
-_kuzu_failed = False                   # permanent-failure sentinel — don't retry
+_kuzu_failed = False                   # PERMANENT-failure latch (kuzu unimportable) — don't retry
+_kuzu_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
+_KUZU_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
 _kuzu_lock = threading.Lock()
 
 
 def _get_kuzu():
-    """Lazy, fail-open KuzuStore singleton. Returns None if unavailable."""
-    global _kuzu_store, _kuzu_failed
+    """Lazy, fail-open KuzuStore singleton. Returns None if unavailable.
+
+    Distinguishes a genuinely UNRECOVERABLE failure (kuzu is not importable) — which
+    latches permanently so we stop retrying — from a TRANSIENT one (another process
+    holds Kuzu's single-writer lock, or a transient IO error at open time), which does
+    NOT latch: a later call retries after a short backoff so the code graph self-heals
+    once the other writer releases the lock. Never raises.
+    """
+    global _kuzu_store, _kuzu_failed, _kuzu_last_attempt
     if _kuzu_store is not None:
         return _kuzu_store
     if _kuzu_failed:
@@ -223,18 +232,36 @@ def _get_kuzu():
             return _kuzu_store
         if _kuzu_failed:
             return None
+        # Back off between transient-failure retries so we don't hammer a held lock.
+        if _kuzu_last_attempt and (time.monotonic() - _kuzu_last_attempt) < _KUZU_RETRY_SECONDS:
+            return None
         try:
-            from graph.kuzu_store import KuzuStore
-            MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # kuzu won't create parents
-            ks = KuzuStore(str(MEMORY_DIR / "graph.kuzu"))
-            if not ks.available():
+            from graph import kuzu_store as _kz
+            if not getattr(_kz, "_HAS_KUZU", True):
+                # kuzu itself isn't importable — unrecoverable, latch permanently.
                 _kuzu_failed = True
-                logger.warning("Kuzu graph store unavailable — graph features disabled.")
+                logger.warning("Kuzu not importable — graph features disabled (permanent).")
+                return None
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # kuzu won't create parents
+            ks = _kz.KuzuStore(str(MEMORY_DIR / "graph.kuzu"))
+            if not ks.available():
+                # Import worked but open failed — almost always another process holds
+                # the single-writer lock. Treat as TRANSIENT: retry after the backoff.
+                _kuzu_last_attempt = time.monotonic()
+                logger.warning("Kuzu store unavailable (lock contention or transient IO?) "
+                               "— will retry after %ss.", _KUZU_RETRY_SECONDS)
                 return None
             _kuzu_store = ks
-        except Exception as exc:  # fail-open — never break the server on graph init
+            _kuzu_last_attempt = 0.0
+        except ImportError as exc:
+            # graph module / kuzu genuinely missing — unrecoverable, latch permanently.
             _kuzu_failed = True
-            logger.warning("Kuzu graph init failed (%r) — graph features disabled.", exc)
+            logger.warning("Kuzu graph module missing (%r) — graph features disabled (permanent).", exc)
+            return None
+        except Exception as exc:  # fail-open — never break the server on graph init
+            # Unknown/transient error (e.g. IO on mkdir/open) — do NOT latch; retry later.
+            _kuzu_last_attempt = time.monotonic()
+            logger.warning("Kuzu graph init failed (%r) — will retry after %ss.", exc, _KUZU_RETRY_SECONDS)
             return None
     # One-time backfill of pre-existing findings, guarded by an empty-graph check.
     try:
@@ -6995,7 +7022,13 @@ def semantic_dedup(items: list, threshold: float = 0.88, text_key: Optional[str]
     Returns JSON {clusters:[{rep_index, member_indices, text}], kept:[...], dropped:int, degraded}.
     """
     import embed_ops
-    return json.dumps(embed_ops.dedup(items or [], threshold=threshold, key=text_key), indent=2)
+    result = embed_ops.dedup(items or [], threshold=threshold, key=text_key)
+    # Fail-open is preserved (nothing dropped), but make the silent degradation
+    # observable: without embeddings, semantic_dedup returns every item unchanged.
+    if result.get("degraded") and len(items or []) > 1:
+        logger.warning("semantic_dedup degraded (embeddings unavailable) — %d items "
+                       "returned unchanged, nothing deduped.", len(items or []))
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
