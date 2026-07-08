@@ -39,20 +39,24 @@ copy and the JSON schema {verdict,refutation,confidence} are this task's design.
 from __future__ import annotations
 
 import json
+import os
 import re
+from functools import lru_cache
 from typing import Callable, Optional
 
 # Injectable function types: match the shared [interface] contracts.
 GenFn = Callable[..., dict]
 RagFn = Callable[..., dict]
 # reader(path) -> full file text; fail-open to "" on any error.
-ReaderFn = Callable[..., str]
+ReaderFn = Callable[[str], str]
 
 _VALID_VERDICTS = ("confirmed", "refuted", "uncertain")
 
 # Caps so a stray/huge ref can't blow up the prompt. Fail-open, additive.
 _MAX_REFS = 8
 _MAX_LINES_PER_REF = 60
+# Size cap on a single file read so an oversized/binary file can't blow up memory/prompt.
+_MAX_FILE_BYTES = 1_000_000
 
 # "file:line" or "file:start-end". Require the path to contain a '.' or '/' so bare
 # "10:30"-style tokens don't get mistaken for refs; anything that still slips through
@@ -103,11 +107,63 @@ def _lazy_rag(query: str, *, limit: int = 5) -> dict:
         return {}
 
 
-def _lazy_read_file(path: str) -> str:
-    """Default reader: read a source file's full text. Fail-open to "" on any error."""
+@lru_cache(maxsize=1)
+def _repo_root() -> str:
+    """Best-effort repo root used to sandbox file refs. Walk up from this module for a
+    ``.git`` marker; fall back to the package parent. Cached; never raises."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        here = os.path.dirname(os.path.abspath(__file__))
+        d = here
+        while True:
+            if os.path.exists(os.path.join(d, ".git")):
+                return os.path.realpath(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return os.path.realpath(os.path.dirname(here))  # mcp/ -> repo root
+    except Exception:
+        return os.path.realpath(os.getcwd())
+
+
+def _safe_resolve(path: str) -> Optional[str]:
+    """Resolve a repo-relative ref path to an absolute path UNDER the repo root.
+
+    SECURITY: file refs are parsed from free-form (attacker-influenceable) claim/context
+    text, so the default reader must never read arbitrary files. Rejects absolute paths and
+    any ``..`` traversal segment, resolves relative to the repo root, and returns None for
+    anything that still lands outside the root (e.g. via a symlink). Returns None on reject
+    (caller fails open by contributing no code). Never raises.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    if os.path.isabs(path):
+        return None
+    if ".." in path.replace("\\", "/").split("/"):
+        return None
+    try:
+        root = _repo_root()
+        full = os.path.realpath(os.path.join(root, path))
+        # realpath collapses symlinks/traversal; require the result to stay under the root.
+        if full == root or full.startswith(root + os.sep):
+            return full
+    except Exception:
+        return None
+    return None
+
+
+def _lazy_read_file(path: str) -> str:
+    """Default reader: read a repo-relative source file, SANDBOXED under the repo root.
+
+    Rejects absolute paths, ``..`` traversal, and anything resolving outside the repo, and
+    caps the read at ``_MAX_FILE_BYTES``. Fail-open to "" on any rejection or error.
+    """
+    try:
+        full = _safe_resolve(path)
+        if not full or not os.path.isfile(full):
+            return ""
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(_MAX_FILE_BYTES)
     except Exception:
         return ""
 
@@ -116,6 +172,9 @@ def _parse_refs(*texts: str):
     """Pull unique (path, start, end) file:line refs out of the given strings, in order.
 
     Deduplicated and capped at _MAX_REFS. Non-string inputs are ignored (fail-open).
+    SECURITY: absolute paths and ``..`` traversal are dropped here (defense-in-depth; the
+    default reader also sandboxes reads under the repo root) so a ref like ``/etc/passwd:1``
+    or ``../../secret.txt:1`` parsed from free-form text never becomes a fetched ref.
     """
     refs = []
     seen = set()
@@ -124,6 +183,8 @@ def _parse_refs(*texts: str):
             continue
         for m in _REF_RE.finditer(t):
             path = m.group(1)
+            if os.path.isabs(path) or ".." in path.replace("\\", "/").split("/"):
+                continue
             start = int(m.group(2))
             end = int(m.group(3)) if m.group(3) else start
             key = (path, start, end)
@@ -161,6 +222,22 @@ def _fetch_code(refs, reader: ReaderFn) -> str:
         header = f"--- {path}:{start}" + (f"-{end}" if end != start else "") + " ---"
         blocks.append(header + "\n" + numbered)
     return "\n\n".join(blocks)
+
+
+def _coerce_code_refs(code_refs) -> list:
+    """Normalize the ``code_refs`` arg to a list of ref strings; ignore other types.
+
+    Documented as a list, but a caller may pass a single ``file:line`` string; ``list(str)``
+    would split it into characters. Accept a list/tuple (keeping only its string items) or a
+    lone string; anything else yields []. Never raises.
+    """
+    if code_refs is None:
+        return []
+    if isinstance(code_refs, str):
+        return [code_refs]
+    if isinstance(code_refs, (list, tuple)):
+        return [x for x in code_refs if isinstance(x, str)]
+    return []
 
 
 def _extract_json_object(text: str) -> Optional[dict]:
@@ -282,7 +359,7 @@ def verify_finding(claim: str,
     # the skeptic reasons over code, not a prose summary. Explicit code_refs are authoritative.
     code_block = ""
     try:
-        refs = _parse_refs(*(list(code_refs) if code_refs else []), c, ctx)
+        refs = _parse_refs(*_coerce_code_refs(code_refs), c, ctx)
         if refs:
             code_block = _fetch_code(refs, reader or _lazy_read_file)
     except Exception:

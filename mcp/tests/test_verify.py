@@ -230,6 +230,92 @@ def test_claim_only_still_works_without_refs():
     assert r["confidence"] == 0.9
 
 
+# --- SECURITY: file refs from free-form text must not read arbitrary files ---
+
+def test_parse_refs_drops_absolute_and_traversal_paths():
+    # Absolute paths and '..' traversal parsed from free-form text must never become refs.
+    refs = V._parse_refs("see /etc/passwd:1 and ../../secret.txt:2 but src/ok.py:3 is fine")
+    paths = [p for (p, _s, _e) in refs]
+    assert "/etc/passwd" not in paths
+    assert not any(".." in p.split("/") for p in paths)
+    assert "src/ok.py" in paths        # the legitimate repo-relative ref survives
+
+
+def test_default_reader_rejects_absolute_path():
+    # The default FS reader must refuse to read an absolute path (local file disclosure).
+    assert V._lazy_read_file("/etc/passwd") == ""
+
+
+def test_default_reader_rejects_traversal():
+    assert V._lazy_read_file("../../../../../../etc/passwd") == ""
+
+
+def test_default_reader_reads_repo_relative_file():
+    # A legitimate repo-relative path resolves under the repo root and reads.
+    text = V._lazy_read_file("mcp/verify.py")
+    assert "_safe_resolve" in text
+
+
+def test_default_reader_size_cap(monkeypatch):
+    # An oversized read is capped, not slurped whole.
+    monkeypatch.setattr(V, "_MAX_FILE_BYTES", 16)
+    text = V._lazy_read_file("mcp/verify.py")
+    assert 0 < len(text) <= 16
+
+
+def test_absolute_code_ref_reads_nothing_end_to_end():
+    # Passing an absolute path via code_refs with the default reader leaks no file content.
+    fetched = {}
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        fetched["prompt"] = prompt
+        return {"text": _CONFIRMED, "ok": True}
+
+    r = V.verify_finding("claim", code_refs=["/etc/passwd:1-3"], gen_fn=_gen)
+    assert r["verdict"] == "confirmed"          # still verifies (fail-open)
+    assert "root:" not in fetched["prompt"]     # no /etc/passwd content in the prompt
+    assert "(none)" in fetched["prompt"]        # code block was empty
+
+
+# --- code_refs coercion: accept list or single string, ignore other types ---
+
+def test_code_refs_single_string_is_accepted():
+    # A bare string (not a list) must be treated as one ref, not split into characters.
+    captured = {}
+
+    def _reader(path):
+        captured["path"] = path
+        return "def f():\n    x = 1\n    return x\n"
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _CONFIRMED, "ok": True}
+
+    r = V.verify_finding("f() returns 1", code_refs="mymod.py:2-3",
+                         gen_fn=_gen, reader=_reader)
+    assert r["verdict"] == "confirmed"
+    assert captured["path"] == "mymod.py"       # whole path, not a single char
+    assert "x = 1" in captured["prompt"]
+
+
+def test_code_refs_nonlist_type_is_ignored_and_autodetect_survives():
+    # A junk type (e.g. int) must be ignored without raising, and auto-detection from the
+    # context must still work (the broad try must not be killed by list(code_refs)).
+    def _reader(path):
+        return "alpha\nbeta\ngamma\n"
+
+    captured = {}
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _REFUTED, "ok": True}
+
+    r = V.verify_finding("second line is beta", context="see src/data.py:2",
+                         code_refs=123, gen_fn=_gen, reader=_reader)
+    assert r["verdict"] == "refuted"
+    assert "beta" in captured["prompt"]         # auto-detected ref still fetched
+
+
 def test_default_gen_fn_is_lazy_and_fails_open(monkeypatch):
     # With no llm_local importable, the lazy default must fail-open, not raise.
     import builtins
