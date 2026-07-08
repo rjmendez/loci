@@ -698,6 +698,57 @@ class KuzuStore:
             logger.debug("ingest_code failed: %s", exc)
             return counts
 
+    def delete_code_under(self, path_prefix: str) -> dict:
+        """Delete code-graph nodes under ``path_prefix`` so a re-ingest is clean.
+
+        Removes ``CodeFile`` + ``CodeSymbol`` nodes whose path/file is the prefix
+        itself or lies strictly beneath it, plus their attached edges
+        (DEFINES/CALLS/IMPORTS and any inbound REFERENCES) via ``DETACH DELETE``.
+        Finding / Entity / Investigation nodes are never deleted — only a
+        REFERENCES edge pointing INTO a removed CodeSymbol goes away with it.
+
+        Powers ``code_graph_ingest(replace=True)`` for a moved/updated checkout.
+        Guards against an empty or root-only prefix so a stray call cannot wipe
+        the whole code graph. Fail-open: returns zero counts on any error.
+
+        Returns ``{"files_deleted": int, "symbols_deleted": int}``.
+        """
+        out = {"files_deleted": 0, "symbols_deleted": 0}
+        if not self.ok:
+            return out
+        prefix = (path_prefix or "").strip()
+        # Over-broad guard: empty, or a path made only of separators ("/", "//").
+        if not prefix or not prefix.strip("/"):
+            logger.warning("delete_code_under refused over-broad prefix: %r", path_prefix)
+            return out
+        # Match the prefix exactly (single-file ingest) AND everything strictly
+        # beneath it, but never a sibling that merely shares the string prefix
+        # ("/a/b" must not match "/a/bc").
+        sub = prefix.rstrip("/") + "/"
+        try:
+            srows = self._rows(
+                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub "
+                "RETURN count(s)", {"p": prefix, "sub": sub},
+            )
+            frows = self._rows(
+                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub "
+                "RETURN count(c)", {"p": prefix, "sub": sub},
+            )
+            self._exec(
+                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub "
+                "DETACH DELETE s", {"p": prefix, "sub": sub},
+            )
+            self._exec(
+                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub "
+                "DETACH DELETE c", {"p": prefix, "sub": sub},
+            )
+            out["symbols_deleted"] = int(srows[0][0]) if srows else 0
+            out["files_deleted"] = int(frows[0][0]) if frows else 0
+            return out
+        except Exception as exc:
+            logger.debug("delete_code_under failed: %s", exc)
+            return out
+
     def _resolve_symbol(self, ref: str) -> Optional[str]:
         """Resolve a CALLS dst to a CodeSymbol id: try id, then by name (best-effort)."""
         try:

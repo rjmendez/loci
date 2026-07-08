@@ -14,7 +14,7 @@ logger = logging.getLogger("loci-mcp")
 _get_kuzu = None  # injected by register()
 
 
-def code_graph_ingest(path: str, max_files: Optional[int] = None) -> str:
+def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool = False) -> str:
     """
     Parse a source file or directory with tree-sitter and ingest its symbol graph
     into the Kuzu code graph (CodeFile / CodeSymbol nodes; DEFINES / CALLS / IMPORTS
@@ -24,12 +24,21 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None) -> str:
     parse but currently yield file-level nodes only). Binary/oversized files and
     common vendor dirs (.git, node_modules, .venv, build, dist, target) are skipped.
 
+    Ingest is additive (MERGE) by default. When ``replace=True`` the existing
+    CodeFile/CodeSymbol nodes under this ``path`` (and their DEFINES/CALLS/IMPORTS
+    edges + inbound REFERENCES) are deleted BEFORE parsing, so re-ingesting a
+    moved or updated checkout stays idempotent and drops stale-path nodes. Only
+    code nodes are pruned — Findings / Investigations / Entities are untouched.
+
     Args:
         path: A source file or a directory root to walk.
         max_files: Optional cap on files parsed (directory mode).
+        replace: If True, prune existing code nodes under ``path`` before ingest
+            (idempotent re-ingest). Default False preserves additive behaviour.
 
     Returns:
-        JSON with per-run counts {files, symbols, defines, calls, imports} or an error.
+        JSON with per-run counts {files, symbols, defines, calls, imports} (and a
+        ``pruned`` block when ``replace`` is set) or an error.
     """
     ks = _get_kuzu()
     if not ks:
@@ -50,8 +59,13 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None) -> str:
             parsed = [parse_source(str(p), src, lang)]
         else:
             parsed = parse_path(str(p), max_files=max_files)
+        # Prune stale/duplicate code nodes under this path so re-ingest is clean.
+        pruned = ks.delete_code_under(str(p)) if replace else None
         counts = ks.ingest_code(parsed)
-        return json.dumps({"path": str(p), "parsed_files": len(parsed), "ingested": counts}, indent=2)
+        out = {"path": str(p), "parsed_files": len(parsed), "ingested": counts}
+        if pruned is not None:
+            out["pruned"] = pruned
+        return json.dumps(out, indent=2)
     except Exception as exc:
         logger.debug("code_graph_ingest failed: %r", exc)
         return json.dumps({"error": f"code_graph_ingest failed: {exc!r}"})

@@ -398,6 +398,100 @@ def test_code_query_write_guard(tmp_path):
             store.code_query(bad)
 
 
+def _sym(sid, name, file, line=1, lang="python"):
+    return {"id": sid, "name": name, "kind": "function",
+            "line": line, "lang": lang, "file": file}
+
+
+def test_delete_code_under_scopes_to_prefix(tmp_path):
+    """delete_code_under removes only code nodes under the prefix, leaving
+    sibling code AND non-code (Finding/Entity/Investigation) nodes intact."""
+    store = KuzuStore(str(tmp_path / "deldb"))
+    assert store.available()
+
+    store.ingest_code([
+        {"file": "/repo/a/x.py", "lang": "python",
+         "symbols": [_sym("/repo/a/x.py::f", "f", "/repo/a/x.py")],
+         "edges": [], "imports": []},
+        # Sibling that merely shares the "/repo/a" string prefix — must survive.
+        {"file": "/repo/ab/y.py", "lang": "python",
+         "symbols": [_sym("/repo/ab/y.py::g", "g", "/repo/ab/y.py")],
+         "edges": [], "imports": []},
+    ])
+    # A finding referencing the to-be-deleted symbol; the finding must survive.
+    store.upsert_finding({"id": "F1", "text": "about f", "investigation": "invZ"})
+    store.link_references("F1", ["/repo/a/x.py::f"])
+
+    res = store.delete_code_under("/repo/a")
+    assert res["symbols_deleted"] == 1
+    assert res["files_deleted"] == 1
+
+    # Deleted symbol/file gone; sibling under /repo/ab untouched.
+    assert store.code_query("MATCH (s:CodeSymbol {id:'/repo/a/x.py::f'}) RETURN s.id") == []
+    assert store.code_query("MATCH (c:CodeFile {path:'/repo/a/x.py'}) RETURN c.path") == []
+    assert ["/repo/ab/y.py::g"] in store.code_query("MATCH (s:CodeSymbol) RETURN s.id")
+    assert ["/repo/ab/y.py"] in store.code_query("MATCH (c:CodeFile) RETURN c.path")
+
+    # Non-code nodes survive (only the REFERENCES edge into the dead symbol went away).
+    assert store.code_query("MATCH (f:Finding {id:'F1'}) RETURN f.id") == [["F1"]]
+    assert store.code_query("MATCH (i:Investigation {id:'invZ'}) RETURN i.id") == [["invZ"]]
+
+
+def test_delete_code_under_rejects_overbroad_prefix(tmp_path):
+    """Empty / whitespace / root-only prefixes are refused (no deletion)."""
+    store = KuzuStore(str(tmp_path / "guardpref"))
+    assert store.available()
+    store.ingest_code([
+        {"file": "/repo/x.py", "lang": "python",
+         "symbols": [_sym("/repo/x.py::f", "f", "/repo/x.py")],
+         "edges": [], "imports": []},
+    ])
+    for bad in ("", "   ", "/", "//"):
+        res = store.delete_code_under(bad)
+        assert res == {"files_deleted": 0, "symbols_deleted": 0}
+    # The code node is still there — nothing was wiped.
+    assert ["/repo/x.py::f"] in store.code_query("MATCH (s:CodeSymbol) RETURN s.id")
+
+
+def test_reingest_replace_is_idempotent(tmp_path):
+    """code_graph_ingest(replace=True) re-ingesting the same tree does not double
+    node counts, and a file removed between runs has its symbols pruned."""
+    import graph_tools
+
+    store = KuzuStore(str(tmp_path / "reingestdb"))
+    assert store.available()
+    _orig = graph_tools._get_kuzu
+    graph_tools._get_kuzu = lambda: store
+
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    keep = src / "pkg" / "keep.py"
+    drop = src / "pkg" / "drop.py"
+    keep.write_text("def kept():\n    return 1\n")
+    drop.write_text("def dropped():\n    return 2\n")
+
+    try:
+        graph_tools.code_graph_ingest(str(src))
+        files_1 = store.code_query("MATCH (c:CodeFile) RETURN count(c)")[0][0]
+        syms_1 = store.code_query("MATCH (s:CodeSymbol) RETURN count(s)")[0][0]
+        assert files_1 >= 2 and syms_1 >= 2
+
+        # Remove one file, then re-ingest with replace=True.
+        drop.unlink()
+        graph_tools.code_graph_ingest(str(src), replace=True)
+
+        files_2 = store.code_query("MATCH (c:CodeFile) RETURN count(c)")[0][0]
+        syms_2 = store.code_query("MATCH (s:CodeSymbol) RETURN count(s)")[0][0]
+    finally:
+        graph_tools._get_kuzu = _orig
+    # Counts did not double (idempotent) and the removed file's symbol is gone.
+    assert files_2 <= files_1
+    assert syms_2 < syms_1
+    assert store.callers_of("dropped") == []  # nothing references it; symbol pruned
+    assert store.code_query("MATCH (s:CodeSymbol {name:'dropped'}) RETURN s.id") == []
+    assert ["kept"] in store.code_query("MATCH (s:CodeSymbol) RETURN s.name")
+
+
 def test_fail_open_on_bad_query(tmp_path):
     store = KuzuStore(str(tmp_path / "faildb"))
     assert store.available()
