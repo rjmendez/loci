@@ -585,14 +585,14 @@ def _get_sparse_embedder():
 def _get_cross_encoder():
     """The two-stage reranker's CrossEncoder, or None when unavailable (fail-open).
 
-    Delegates to reranker.get_model() so the backend is env-pluggable via RERANK_MODEL:
-    default 'cross-encoder/ms-marco-MiniLM-L-6-v2' reproduces the historical behavior; opt-in
-    'BAAI/bge-reranker-v2-m3' is a stronger reranker. Lazy-init, globally cached, loaded on
-    cuda:0 (the 4070 Ti) when available. Call sites keep calling `.predict(pairs)` unchanged.
+    Delegates to reranker.get_model() so the backend is env-pluggable via RERANK_MODEL (and the
+    backends config): default 'BAAI/bge-reranker-v2-m3' (flipped in on judge-eval evidence,
+    +14% nDCG@10); pin the lighter 'cross-encoder/ms-marco-MiniLM-L-6-v2' back on constrained
+    hosts. Lazy-init, globally cached, loaded on GPU (cuda:0) when available. Call sites keep
+    calling `.predict(pairs)` unchanged.
 
-    NOTE: flipping RERANK_MODEL to bge is a retrieval-QUALITY change — shadow-eval / A-B it on
-    a held-out query set before making it the default (mirrors the DAMA shadow-eval + canary
-    gate; see scripts/gpu_placement.md and dama-gotchi/training/GPU_PACKING_POLICY.md).
+    NOTE: changing RERANK_MODEL is a retrieval-QUALITY change — A/B it on a held-out query set
+    first (scripts/judge_eval.py is the judge-based harness that gated the bge flip).
     """
     try:
         import reranker

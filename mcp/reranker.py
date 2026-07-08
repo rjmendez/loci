@@ -15,9 +15,9 @@ Any other value is passed through verbatim to CrossEncoder, so operators can poi
 an arbitrary sentence-transformers cross-encoder without a code change.
 
 Substrate facts this is built against (session grounding):
-  - [hardware] torch in mcp/.venv sees cuda:0 (RTX 4070 Ti). We load the model on
-    'cuda' when torch.cuda.is_available(), else 'cpu' — mirroring the intent of the
-    server.py cross-encoder path.
+  - [hardware] We load the model on 'cuda' (cuda:0) when torch.cuda.is_available(), else
+    'cpu' — mirroring the intent of the server.py cross-encoder path. Which physical GPU
+    cuda:0 maps to is host-specific; see scripts/gpu_placement.md.
   - [rerank] server.py already reranks on GPU with a lazily-loaded, globally-cached
     CrossEncoder. This module mirrors that: lazy-init, cache in a module global, and
     on load failure set the cache to `False` PERMANENTLY so we never re-attempt a
@@ -94,7 +94,7 @@ def _get_model():
             return _model if _model is not False else None
         _model_name = wanted
         try:
-            # Resolve device lazily: cuda:0 (RTX 4070 Ti) when torch sees it, else cpu [hardware].
+            # Resolve device lazily: cuda:0 when torch sees a GPU, else cpu [hardware].
             device = "cpu"
             try:
                 import torch
