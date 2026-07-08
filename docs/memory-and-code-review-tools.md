@@ -215,7 +215,7 @@ $HERMES_MEMORY_DIR/
 | `investigation_store(investigation_id, finding_type, text, source, confidence?, tags?, derived_from?)` | Record a finding. Writes to JSONL + Mnemosyne + Qdrant. `derived_from` links lineage for retraction cleanup. |
 | `investigation_note(investigation_id, field, value)` | Update manifest fields: `context`, `hypothesis`, `next_step`, `open_question_add/remove`, `checked_source`, `closed_summary`. |
 | `investigation_reflect(investigation_id)` | Synthesize current state — finding breakdown, open questions, gaps, key entities, advisory self-check. |
-| `investigation_list()` | List all investigations with status and finding counts, most-recently-updated first. |
+| `investigation_list(limit?, offset?, summary?)` | List investigations with status and finding counts, most-recently-updated first. Bounded by default to avoid token overflow: returns `limit` (default 30) compact records (`summary=True`) starting at `offset` (default 0). Pass `summary=False` for full records (created_at, open_questions_count, hypothesis, visibility, tier_counts); `limit=0`/negative for all remaining. Response wraps results with `total`/`limit`/`offset`. |
 
 #### Investigation Search and Evidence
 
@@ -1009,7 +1009,7 @@ mismatch. Either set `EMBED_DIM=384` when using fastembed, or restore Ollama.
 | `investigation_entity_lookup` | Find every finding mentioning a specific IP, email, hostname, hash, or CVE. O(1) via Qdrant payload indexes. |
 | `investigation_related_cases` | Find prior investigations that dealt with the same entities. Call before opening a new investigation. |
 | `investigation_finding_provenance` | Trace a finding back through `derived_from` links to root observed evidence. |
-| `investigation_list` | List all investigations with status and finding counts, most-recently-updated first. |
+| `investigation_list` | List investigations with status and finding counts, most-recently-updated first. Paginated + compact by default (`limit=30`, `offset=0`, `summary=True`) to stay under the tool-result token cap. `summary=False` returns full records; `limit=0`/negative returns all remaining. Result is `{investigations, total, limit, offset}`. |
 | `audit_log` | Record a tool call and full output to global daily JSONL, investigation JSONL, Mnemosyne, and Qdrant. |
 | `memory_self_check` | Advisory provenance and contradiction checks over stored findings. Surfaces hallucination candidates. Never auto-retracts. |
 | `memory_retract` | Soft-tombstone a hallucinated finding and its contaminated lineage. `dry_run=True` (default) previews without changing anything. |
