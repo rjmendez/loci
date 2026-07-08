@@ -5123,6 +5123,15 @@ def investigation_list(
         except (TypeError, ValueError):
             limit = 30
 
+    # Coerce summary like limit/offset: a stringly-typed client (JSON tool args)
+    # passing summary='false' would otherwise be truthy and wrongly select
+    # summary-mode instead of full records. Map common string falsey forms to
+    # False; everything else (including real bools) goes through bool().
+    if isinstance(summary, str):
+        summary = summary.strip().lower() not in ("false", "0", "no", "")
+    else:
+        summary = bool(summary)
+
     if not MEMORY_DIR.exists():
         return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
 

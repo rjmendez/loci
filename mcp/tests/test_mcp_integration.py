@@ -245,6 +245,29 @@ class TestInvestigationLifecycle(unittest.TestCase):
                     "open_questions_count"):
             self.assertIn(key, rec)
 
+    def test_investigation_list_summary_false_string_returns_full(self):
+        """String summary='false' must coerce to full mode, not summary mode.
+
+        Mirrors the limit/offset string-coercion guards: a stringly-typed
+        client (JSON tool args) passing the truthy string 'false' must not be
+        treated as truthy True and wrongly select the compact summary record.
+        """
+        inv_id = _new_id("summary-false-str")
+        server.investigation_start(investigation_id=inv_id, title="Summary false string test")
+        result = _json(server.investigation_list(summary="false"))
+        rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+        # Full-mode fields must be present (summary='false' == full records).
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertIn(key, rec)
+
+        # The truthy string 'true' still selects summary mode.
+        summ = _json(server.investigation_list(summary="true"))
+        rec2 = next(i for i in summ["investigations"] if i["id"] == inv_id)
+        for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                    "open_questions_count"):
+            self.assertNotIn(key, rec2)
+
     def test_investigation_list_empty(self):
         result = _json(server.investigation_list())
         self.assertEqual(result["investigations"], [])
