@@ -88,7 +88,7 @@ Add to `~/.claude/settings.json` under `mcpServers`:
 - `investigation_load(investigation_id, last_n_findings?, include_retracted?)` — load manifest + recent findings
 - `investigation_note(investigation_id, field, value)` — update hypothesis/next_step/open_questions/checked_source
 - `investigation_reflect(investigation_id)` — synthesize current investigation state
-- `investigation_list(limit?, offset?, summary?)` — list sessions, most-recent first; paginated (`limit=30`, `offset=0`) and compact (`summary=True`) by default. Pass `summary=False` for full records, `limit=0` for all. Returns `{investigations, total, limit, offset}`
+- `investigation_list(limit?, offset?, summary?)` — list sessions, most-recent first; paginated (`limit=30`, `offset=0`) and compact (`summary=True`) by default. Pass `summary=False` for full records, `limit=0` (or any value `<=0`) for all — `offset` is still honored in no-limit mode, so it returns all *remaining* records starting at `offset`. Returns `{investigations, total, limit, offset}`
 
 **Finding storage:**
 - `investigation_store(investigation_id, finding_type, text, source, confidence?, tags?, derived_from?)` — store a finding

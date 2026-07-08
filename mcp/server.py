@@ -5132,10 +5132,17 @@ def investigation_list(
     # bool(None) is False, which would force FULL-mode records and reintroduce
     # the large-output/token-overflow this pagination path exists to prevent.
     # Only string/real-bool values may select full mode.
+    #
+    # An empty / whitespace-only string is treated as UNSET (not falsey): a
+    # client accidentally passing summary='' is far more likely to have meant
+    # "leave the default" than "give me full/overflow-prone output", so it must
+    # also preserve summary=True. Only the explicit tokens 'false'/'0'/'no'
+    # select full mode. (Empty string is simply absent from the falsey tuple,
+    # so `not in` yields True for it.)
     if summary is None:
         summary = True
     elif isinstance(summary, str):
-        summary = summary.strip().lower() not in ("false", "0", "no", "")
+        summary = summary.strip().lower() not in ("false", "0", "no")
     else:
         summary = bool(summary)
 

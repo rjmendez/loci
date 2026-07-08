@@ -288,6 +288,28 @@ class TestInvestigationLifecycle(unittest.TestCase):
                     "open_questions_count"):
             self.assertNotIn(key, rec)
 
+    def test_investigation_list_summary_empty_string_preserves_default(self):
+        """summary='' (empty / whitespace-only string) must preserve the default.
+
+        An empty string for an optional arg is far more likely UNSET than an
+        intentional falsey value; treating it as falsey would force FULL-mode
+        records and reintroduce the token-overflow this path prevents. So ''
+        (and whitespace-only) must behave like the default summary=True —
+        compact records — while only 'false'/'0'/'no' select full mode.
+        """
+        inv_id = _new_id("summary-empty-str")
+        server.investigation_start(investigation_id=inv_id, title="Summary empty string test")
+        for empty in ("", "   "):
+            result = _json(server.investigation_list(summary=empty))
+            rec = next(i for i in result["investigations"] if i["id"] == inv_id)
+            # Compact fields present.
+            for key in ("id", "title", "status", "finding_counts", "updated_at"):
+                self.assertIn(key, rec)
+            # Verbose full-mode fields MUST be absent ('' preserved summary mode).
+            for key in ("hypothesis", "tier_counts", "created_at", "visibility",
+                        "open_questions_count"):
+                self.assertNotIn(key, rec)
+
     def test_investigation_list_empty(self):
         result = _json(server.investigation_list())
         self.assertEqual(result["investigations"], [])
