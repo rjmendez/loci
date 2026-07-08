@@ -1883,7 +1883,39 @@ def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
 
 # Files larger than this are never hashed — a code ref points at source, not
 # blobs, and this caps how much a rogue ref can make the server read. Overridable.
-_HASH_FILE_MAX_BYTES = int(os.environ.get("LOCI_HASH_FILE_MAX_BYTES", str(8 * 1024 * 1024)))
+_HASH_FILE_MAX_BYTES_DEFAULT = 8 * 1024 * 1024
+
+
+def _parse_hash_file_max_bytes() -> int:
+    """Parse the file-hash size cap from the environment, fail-open to the default.
+
+    A non-integer (or non-positive) LOCI_HASH_FILE_MAX_BYTES must never crash
+    server startup — the whole code-ref hashing path is best-effort, so a bad
+    override falls back to the default cap rather than raising at import time.
+    """
+    raw = os.environ.get("LOCI_HASH_FILE_MAX_BYTES")
+    if raw is None:
+        return _HASH_FILE_MAX_BYTES_DEFAULT
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "invalid LOCI_HASH_FILE_MAX_BYTES=%r; falling back to default %d",
+            raw,
+            _HASH_FILE_MAX_BYTES_DEFAULT,
+        )
+        return _HASH_FILE_MAX_BYTES_DEFAULT
+    if val <= 0:
+        logger.warning(
+            "non-positive LOCI_HASH_FILE_MAX_BYTES=%r; falling back to default %d",
+            raw,
+            _HASH_FILE_MAX_BYTES_DEFAULT,
+        )
+        return _HASH_FILE_MAX_BYTES_DEFAULT
+    return val
+
+
+_HASH_FILE_MAX_BYTES = _parse_hash_file_max_bytes()
 
 
 def _code_root() -> Path:

@@ -179,6 +179,27 @@ class FindingLifecycleTest(unittest.TestCase):
         finally:
             server._HASH_FILE_MAX_BYTES = orig
 
+    def test_hash_file_max_bytes_env_parse_fails_open(self):
+        # A bad LOCI_HASH_FILE_MAX_BYTES must fall back to the default cap and
+        # NEVER raise (an import-time ValueError would block server startup).
+        default = server._HASH_FILE_MAX_BYTES_DEFAULT
+        orig = os.environ.get("LOCI_HASH_FILE_MAX_BYTES")
+        try:
+            for bad in ("not-a-number", "", "8MB", "  ", "-1", "0"):
+                os.environ["LOCI_HASH_FILE_MAX_BYTES"] = bad
+                self.assertEqual(server._parse_hash_file_max_bytes(), default)
+            # A valid positive override is honored.
+            os.environ["LOCI_HASH_FILE_MAX_BYTES"] = "4096"
+            self.assertEqual(server._parse_hash_file_max_bytes(), 4096)
+            # Unset falls back to the default.
+            del os.environ["LOCI_HASH_FILE_MAX_BYTES"]
+            self.assertEqual(server._parse_hash_file_max_bytes(), default)
+        finally:
+            if orig is None:
+                os.environ.pop("LOCI_HASH_FILE_MAX_BYTES", None)
+            else:
+                os.environ["LOCI_HASH_FILE_MAX_BYTES"] = orig
+
     # -- #5 investigation_verify_all -----------------------------------------
 
     def test_verify_all_returns_per_finding_verdicts_with_stub(self):
