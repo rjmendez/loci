@@ -134,6 +134,40 @@ class FindingLifecycleTest(unittest.TestCase):
         self.assertTrue(loaded[fid_change].get("stale"))
         self.assertFalse(loaded[fid_stable].get("stale"))
 
+    def test_search_surfaces_staleness_after_file_change(self):
+        # Staleness is surfaced on investigation_search() too (via the JSONL
+        # code_refs map), not just investigation_load(). Stub _mnemo_recall so the
+        # search returns our finding row without needing Mnemosyne/Qdrant.
+        inv_id = self._start()
+        root = Path(self._code_root.name)
+        (root / "searched.py").write_text("value = 1\n")
+        fid = self._store(inv_id, "bug in searched code", code_refs="searched.py")
+
+        orig_recall = server._mnemo_recall
+        try:
+            server._mnemo_recall = lambda *a, **k: [{
+                "investigation_id": inv_id,
+                "finding_id": fid,
+                "text": "bug in searched code",
+                "score": 1.0,
+            }]
+
+            def _search_row():
+                out = _json(server.investigation_search("bug", investigation_id=inv_id))
+                rows = out if isinstance(out, list) else out.get("results", out.get("findings", []))
+                match = [r for r in rows if str(r.get("finding_id") or r.get("id")) == fid]
+                self.assertTrue(match, f"finding row not in search results: {out}")
+                return match[0]
+
+            # Unchanged file -> not stale.
+            self.assertEqual(_search_row().get("stale"), False)
+
+            # Mutate the referenced file -> the same search row now reads stale.
+            (root / "searched.py").write_text("value = 2  # edited\n")
+            self.assertTrue(_search_row().get("stale"))
+        finally:
+            server._mnemo_recall = orig_recall
+
     def test_staleness_absent_when_no_refs(self):
         inv_id = self._start()
         fid = self._store(inv_id, "a plain finding with no file references")

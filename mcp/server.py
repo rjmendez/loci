@@ -1858,13 +1858,24 @@ _FILE_REF_RE = re.compile(r"\b((?:[\w.\-]+/)*[\w.\-]+\.[A-Za-z][\w]*)(?::(\d+))?
 
 
 def _finding_updates_path(investigation_id: str) -> Path:
+    """Resolution overrides log — scanned by every read path (load/search), so it
+    stays SMALL: only finding_resolve appends here (last-write-wins resolutions)."""
     return _inv_dir(investigation_id) / "finding_updates.jsonl"
+
+
+def _finding_verifications_path(investigation_id: str) -> Path:
+    """Verify-all verdict notes — kept in a SEPARATE, high-churn log so the
+    resolution read path (_load_resolution_overrides) never has to scan the
+    accumulating per-finding verification records. Write-only for now."""
+    return _inv_dir(investigation_id) / "finding_verifications.jsonl"
 
 
 def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
     """Return {finding_id: resolution} from finding_updates.jsonl, last-write-wins.
 
-    Only 'resolution' update records with a valid state participate. Fail-open: any
+    Only 'resolution' update records with a valid state participate; any other
+    record type is skipped cheaply. Verification verdicts live in a separate log
+    (finding_verifications.jsonl) so they never bloat this scan. Fail-open: any
     read/parse error yields {} so the read path falls back to stored/default values.
     """
     overrides: dict[str, str] = {}
@@ -1970,8 +1981,13 @@ def _hash_file_bytes(path_str: str) -> Optional[str]:
 
 
 def _compute_code_refs(text: str, explicit=None) -> list[dict]:
-    """Best-effort: extract file paths from ``text`` (and optional ``explicit`` refs),
-    hash each file that currently exists, and return [{"path": .., "hash": ..}].
+    """Best-effort: resolve file paths to [{"path": .., "hash": ..}] by hashing each
+    file that currently exists.
+
+    ``explicit`` refs are AUTHORITATIVE when provided: the caller named exactly the
+    files this finding refers to, so text-parsing is skipped entirely. Only when no
+    explicit refs are given are paths best-effort parsed from ``text`` (tokens like
+    "path/file.py:12").
 
     Fully optional + fail-open: unreadable/nonexistent paths are simply omitted, and
     any error returns []. Line suffixes ("file.py:12") are stripped for hashing.
@@ -1981,8 +1997,9 @@ def _compute_code_refs(text: str, explicit=None) -> list[dict]:
         if explicit:
             items = explicit if isinstance(explicit, list) else str(explicit).split(",")
             candidates.extend(str(i) for i in items)
-        for m in _FILE_REF_RE.finditer(text or ""):
-            candidates.append(m.group(1))
+        else:
+            for m in _FILE_REF_RE.finditer(text or ""):
+                candidates.append(m.group(1))
     except Exception:  # noqa: BLE001
         return []
     out: list[dict] = []
@@ -7427,8 +7444,10 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
-        # Record as an append-only verification note — does NOT touch resolution.
-        _append_jsonl(_finding_updates_path(investigation_id), {
+        # Record as an append-only verification note in a SEPARATE log so these
+        # accumulating records never slow the resolution read path — does NOT
+        # touch resolution.
+        _append_jsonl(_finding_verifications_path(investigation_id), {
             "record_type": "verification",
             "investigation_id": investigation_id,
             "finding_id": fid,
