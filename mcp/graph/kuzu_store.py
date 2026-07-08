@@ -95,7 +95,7 @@ class KuzuStore:
     _SCHEMA = (
         "CREATE NODE TABLE IF NOT EXISTS CodeFile(path STRING PRIMARY KEY, lang STRING)",
         "CREATE NODE TABLE IF NOT EXISTS CodeSymbol(id STRING PRIMARY KEY, name STRING, "
-        "kind STRING, file STRING, line INT64, lang STRING, decorators STRING)",
+        "kind STRING, file STRING, line INT64, lang STRING, decorators STRING, referenced BOOL)",
         "CREATE NODE TABLE IF NOT EXISTS Finding(id STRING PRIMARY KEY, investigation STRING, "
         "ftype STRING, text STRING, confidence STRING, source STRING, ts INT64)",
         "CREATE NODE TABLE IF NOT EXISTS Entity(name STRING PRIMARY KEY, etype STRING, distinctive BOOL)",
@@ -115,7 +115,8 @@ class KuzuStore:
             self._conn.execute(ddl)
         # Additive migrations for graphs created before a column existed. ALTER ADD
         # errors harmlessly if the column is already present -> ignore.
-        for alt in ("ALTER TABLE CodeSymbol ADD decorators STRING DEFAULT ''",):
+        for alt in ("ALTER TABLE CodeSymbol ADD decorators STRING DEFAULT ''",
+                    "ALTER TABLE CodeSymbol ADD referenced BOOL DEFAULT false"):
             try:
                 self._conn.execute(alt)
             except Exception:
@@ -430,6 +431,7 @@ class KuzuStore:
         # scope symbol id -> {declared var/field/param name -> declared type simple}
         # (last decl wins; null types skipped). Powers receiver-type inference.
         decls_by_scope: dict[str, dict] = {}
+        ident_total: dict[str, int] = {}    # name -> total identifier occurrences (usage signal)
         for pf in parsed_files:
             if not isinstance(pf, dict):
                 continue
@@ -438,6 +440,8 @@ class KuzuStore:
                 continue
             fpath = str(fpath)
             files.setdefault(fpath, str(pf.get("lang") or ""))
+            for _n, _c in (pf.get("ident_counts") or {}).items():
+                ident_total[str(_n)] = ident_total.get(str(_n), 0) + int(_c or 0)
             imap = pf.get("import_map")
             if isinstance(imap, dict) and imap:
                 dst = file_import_map.setdefault(fpath, {})
@@ -492,12 +496,19 @@ class KuzuStore:
             for chunk in self._chunks(file_rows):
                 self._exec("UNWIND $rows AS r MERGE (c:CodeFile {path:r.p}) SET c.lang=r.l", {"rows": chunk})
             counts["files"] = len(files)
-            # Symbols + DEFINES.
+            # Symbols + DEFINES. Compute `referenced`: a name that occurs as an
+            # identifier more often than it is defined is USED somewhere (called,
+            # in a registry list, a callback, polymorphic dispatch). Recall-independent.
+            def_count: dict[str, int] = {}
+            for row in symbols.values():
+                def_count[row["name"]] = def_count.get(row["name"], 0) + 1
+            for row in symbols.values():
+                row["referenced"] = ident_total.get(row["name"], 0) > def_count.get(row["name"], 0)
             for chunk in self._chunks(list(symbols.values())):
                 self._exec(
                     "UNWIND $rows AS r MERGE (s:CodeSymbol {id:r.id}) "
                     "SET s.name=r.name, s.kind=r.kind, s.file=r.file, s.line=r.line, "
-                    "s.lang=r.lang, s.decorators=r.decorators",
+                    "s.lang=r.lang, s.decorators=r.decorators, s.referenced=r.referenced",
                     {"rows": chunk},
                 )
             counts["symbols"] = len(symbols)

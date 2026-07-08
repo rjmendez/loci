@@ -33,4 +33,4 @@ loci-mcp = "server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["memcheck*"]
+include = ["memcheck*", "graph*"]

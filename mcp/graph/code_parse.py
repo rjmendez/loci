@@ -778,7 +778,32 @@ def _empty(file: str, lang: Optional[str]) -> Dict[str, Any]:
         "imports": [],
         "import_map": {},
         "decls": [],
+        "ident_counts": {},
     }
+
+
+def _identifier_counts(root) -> Dict[str, int]:
+    """Count every identifier token in the tree (name -> occurrences).
+
+    A defined symbol whose name occurs MORE than it is defined is *used* somewhere
+    (called, referenced in a registry list, passed as a callback, dispatched
+    polymorphically). This is recall-independent (pure token counting) and so a far
+    more reliable "is it used" signal than the resolved call graph — it powers
+    dead-code detection.
+    """
+    counts: Dict[str, int] = {}
+    stack = [root]
+    try:
+        while stack:
+            n = stack.pop()
+            if n.type == "identifier":
+                t = _text(n)
+                if t:
+                    counts[t] = counts.get(t, 0) + 1
+            stack.extend(n.children)
+    except Exception:
+        return counts
+    return counts
 
 
 def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[str, Any]:
@@ -956,6 +981,7 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
         result["imports"] = imports
         result["import_map"] = import_map
         result["decls"] = decls
+        result["ident_counts"] = _identifier_counts(root)
         return result
     except Exception:
         return _empty(file, lang)
