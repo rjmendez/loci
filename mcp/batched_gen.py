@@ -9,12 +9,10 @@ continuous batching, which is a large throughput win when you have dozens of sho
 Substrate facts this is built against (session grounding):
   - [gen] The local generation tier (mcp/llm_local.py) already exists and speaks to Ollama
     (qwen2.5:3b, pinned via keep_alive). This module's FALLBACK path lazily reuses it.
-  - [hardware] Oxalis exposes TWO GPUs shared with the DAMA ant-trainer. GPU placement is
-    governed by ONE authoritative policy (dama-gotchi/training/GPU_PACKING_POLICY.md): the
-    2080 Ti is the ant-TRAINER GPU, the 4070 Ti hosts persistent inference. A batched-gen
-    server must therefore NOT squat the 2080 Ti persistently (it would collide with training
-    bursts) — it shares the 4070 Ti inference GPU or runs opportunistically and yields to
-    training. See scripts/gpu_placement.md for the reconciled placement.
+  - [hardware] The vLLM endpoint is resolved via backends.vllm_url() (env VLLM_BASE_URL ->
+    local :8000 probe -> config -> Ollama fallback) — no host is hardcoded here. When it runs
+    on a GPU also serving the latency-sensitive reranker/embeddings, keep the two tiers from
+    contending: see scripts/gpu_placement.md for portable dual-GPU placement guidance.
   - [pattern:fail-open] Every op fails open: on missing config / HTTP error / timeout /
     parse failure we return a well-formed degraded result and NEVER raise. A failed prompt
     yields {"text": "", "ok": False}, so the output list ALWAYS aligns 1:1 with `prompts`.

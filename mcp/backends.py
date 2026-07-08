@@ -6,22 +6,23 @@ machine-specific endpoint/key OUT of this (public) code. Each backend resolves v
 
   1. explicit env var (OLLAMA_BASE_URL, VLLM_BASE_URL, EMBED_MODEL, ...) — power-user override
   2. a LOCAL probe (e.g. localhost:11434 for Ollama) — a laptop auto-uses its own hardware
-  3. a gitignored config file — remote infra (e.g. the oxalis tailscale endpoint + Qdrant key)
+  3. a gitignored config file — remote infra (e.g. a GPU host over the network + Qdrant key)
   4. a safe default / empty — the tiers already fail-open when a backend is empty
 
-Config file: `$LOCI_CONFIG`, else `~/.loci/backends.toml`. TOML (stdlib `tomllib`), e.g.:
+Config file: `$LOCI_CONFIG`, else `~/.loci/backends.toml`. TOML (stdlib `tomllib`). Hosts
+below are PLACEHOLDERS — put your own local-GPU / remote-infra endpoints here, never in code:
 
     [ollama]
-    url = "http://100.73.200.19:11434"   # tailscale endpoint when there's no local GPU
+    url = "http://gpu-host:11434"        # a GPU host reachable over your network (omit -> local :11434)
     [embed]
     model = "nomic-embed-text"
     [vllm]
-    url = "http://100.73.200.19:8000"
+    url = "http://gpu-host:8000"         # vLLM/OpenAI-compatible server (omit -> Ollama fallback)
     model = "Qwen/Qwen2.5-3B-Instruct"
     [rerank]
     model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     [qdrant]
-    url = "http://172.21.171.198:30633"
+    url = "http://qdrant-host:6333"
     api_key = "..."
     [memory]
     dir = "/path/to/curated/MEMORY.md/dir"
