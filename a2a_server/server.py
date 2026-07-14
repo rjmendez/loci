@@ -30,6 +30,12 @@ Required:
                             Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
 
 Optional / tunable:
+  HERMES_A2A_BOOTSTRAP_KEY  Pre-shared key for POST /bootstrap. Callers
+                            present this to receive a 24h session token
+                            usable as a bearer without TOTP. Eliminates
+                            the need to distribute HERMES_A2A_TOKEN+TOTP
+                            to every new session. If unset, /bootstrap 501s.
+                            Generate: python3 -c "import secrets;print(secrets.token_hex(24))"
   HERMES_A2A_HOST           Bind address.  Default: 0.0.0.0
   HERMES_A2A_PORT           Bind port.     Default: 8201
   HERMES_A2A_URL            Public base URL injected into the agent card.
@@ -94,6 +100,7 @@ ENDPOINTS
   GET  /.well-known/agent.json      Agent card (RFC-002) — no auth required
   GET  /.well-known/agent-card.json Agent card alias — no auth
   GET  /health                       Liveness + config check — no auth required
+  POST /bootstrap                    Exchange bootstrap key → 24h session token — no auth
   POST /a2a                          JSON-RPC 2.0 dispatch — Bearer required
   GET  /a2a/tasks/{task_id}          Task status — Bearer required
 
@@ -156,7 +163,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets
 from typing import Optional, Any
 
 # ── load .env before anything else ─────────────────────────────────────────────
@@ -187,7 +194,8 @@ if not A2A_TOKEN:
     print('ERROR: HERMES_A2A_TOKEN is not set. Generate one with: '
           'python3 -c "import secrets;print(secrets.token_hex(32))"', flush=True)
     sys.exit(1)
-TOTP_SEED = os.environ.get('HERMES_A2A_TOTP_SEED', '')
+TOTP_SEED      = os.environ.get('HERMES_A2A_TOTP_SEED', '')
+BOOTSTRAP_KEY  = os.environ.get('HERMES_A2A_BOOTSTRAP_KEY', '')
 AGENT_ID  = os.environ.get('HERMES_AGENT_ID', 'hermes-agent')
 AGENT_URL = os.environ.get('HERMES_A2A_URL', 'http://127.0.0.1:8201')
 
@@ -358,14 +366,24 @@ def _store_task(task_id: str, task: dict) -> None:
         del _tasks[oldest]
     _tasks[task_id] = task
 
+# session tokens issued by /bootstrap — token → expiry (UTC)
+_session_tokens: dict[str, datetime.datetime] = {}
+
 # ── FastAPI app + auth ──────────────────────────────────────────────────────────
 app = FastAPI(title=f'{_LOG_AGENT_ID} A2A', version='0.1.0')
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
-    if not creds or not hmac.compare_digest(creds.credentials, A2A_TOKEN):
-        raise HTTPException(status_code=401, detail='Unauthorized — invalid or missing bearer token')
+    if not creds:
+        raise HTTPException(status_code=401, detail='Unauthorized — missing bearer token')
+    tok = creds.credentials
+    if hmac.compare_digest(tok, A2A_TOKEN):
+        return
+    exp = _session_tokens.get(tok)
+    if exp and exp > datetime.datetime.now(datetime.timezone.utc):
+        return
+    raise HTTPException(status_code=401, detail='Unauthorized — invalid or expired token')
 
 
 # TOTP rate limiter: max 5 attempts per 60 seconds per client IP
@@ -1254,6 +1272,41 @@ async def health():
         'qdrant_configured': bool(QDRANT_URL),
         'ollama_configured': bool(OLLAMA_BASE),
         'totp_enabled': bool(TOTP_SEED),
+        'bootstrap_configured': bool(BOOTSTRAP_KEY),
+        'active_sessions': len(_session_tokens),
+    })
+
+
+@app.post('/bootstrap')
+async def bootstrap(request: Request):
+    """Exchange a bootstrap key for a 24h session token (no TOTP required on session token)."""
+    if not BOOTSTRAP_KEY:
+        raise HTTPException(status_code=501, detail='Bootstrap not configured — set HERMES_A2A_BOOTSTRAP_KEY')
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='Invalid JSON')
+    presented = body.get('bootstrap_key', '')
+    if not secrets.compare_digest(presented, BOOTSTRAP_KEY):
+        raise HTTPException(status_code=401, detail='Invalid bootstrap key')
+
+    ttl_hours = min(int(body.get('ttl_hours', 24)), 168)  # cap at 7 days
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires_at = now + datetime.timedelta(hours=ttl_hours)
+    session_token = secrets.token_hex(32)
+    _session_tokens[session_token] = expires_at
+
+    # Prune expired sessions
+    expired = [t for t, exp in list(_session_tokens.items()) if exp <= now]
+    for t in expired:
+        _session_tokens.pop(t, None)
+
+    agent_id = body.get('agent_id', 'unknown')
+    log.info(f'Bootstrap: issued session token for agent_id={agent_id} ttl={ttl_hours}h expires={expires_at.isoformat()}')
+    return JSONResponse({
+        'session_token': session_token,
+        'expires_at': expires_at.isoformat(),
+        'totp_required': False,
     })
 
 
@@ -1344,6 +1397,7 @@ def main() -> None:
     log.info(f'Qdrant:        {QDRANT_URL}')
     log.info(f'Ollama embed:  {OLLAMA_BASE}  model={EMBED_MODEL}')
     log.info(f'TOTP:          {"enabled" if TOTP_SEED else "disabled (set HERMES_A2A_TOTP_SEED to enable)"}')
+    log.info(f'Bootstrap:     {"enabled (POST /bootstrap)" if BOOTSTRAP_KEY else "disabled (set HERMES_A2A_BOOTSTRAP_KEY to enable)"}')
     log.info(f'Skills:        {", ".join(_SKILL_MAP.keys())}')
     uvicorn.run(app, host=A2A_HOST, port=A2A_PORT, log_level='info', timeout_graceful_shutdown=5)
 

@@ -27,7 +27,7 @@ like a set of notes.
 ![Loci architecture](docs/img/loci-overview.svg)
 
 Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
-something, it calls one of Loci's 25 tools — the same way it calls any other tool. Your
+something, it calls one of Loci's 24 tools — the same way it calls any other tool. Your
 data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
 > **New to terms like "vector search", "RAG", or "MCP"?**
@@ -227,7 +227,7 @@ HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
 
 ```
 loci/
-├── mcp/                   MCP server — 25 tools: investigation memory, RAG, claim validation
+├── mcp/                   MCP server — 24 tools: investigation memory, RAG, claim validation
 │   ├── server.py          FastMCP server entry point
 │   ├── memcheck/          Standalone claim-validation + code-hallucination module
 │   ├── pyproject.toml     Package definition (pip install -e .)

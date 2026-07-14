@@ -43,8 +43,8 @@ services:
       - path: .env
         required: false
     environment:
-      LOCI_A2A_TOKEN: ${LOCI_A2A_TOKEN:?LOCI_A2A_TOKEN is required}
-      LOCI_A2A_URL: ${LOCI_A2A_URL:-http://localhost:8201}
+      HERMES_A2A_TOKEN: ${HERMES_A2A_TOKEN:?HERMES_A2A_TOKEN is required}
+      HERMES_A2A_URL: ${HERMES_A2A_URL:-http://localhost:8201}
       HERMES_AGENT_ID: ${HERMES_AGENT_ID:-loci}
       QDRANT_URL: ${QDRANT_URL:-http://localhost:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
