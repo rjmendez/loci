@@ -59,10 +59,11 @@ def _writes(failopen):
 _LEASE_TIMEOUT_S = 6.0
 _LEASE_POLL_S = 0.05
 
-try:  # kuzu is optional — the store degrades to unavailable without it.
-    import kuzu  # type: ignore
+try:  # kuzu (now ladybug — same project, renamed; API-compatible) is optional —
+    # the store degrades to unavailable without it.
+    import ladybug as kuzu  # type: ignore
     _HAS_KUZU = True
-except Exception:  # pragma: no cover - environment without kuzu
+except Exception:  # pragma: no cover - environment without kuzu/ladybug
     kuzu = None  # type: ignore
     _HAS_KUZU = False
 
