@@ -14,6 +14,13 @@ Two backends, chosen by env RERANK_MODEL (default resolved via backends.rerank_m
 Any other value is passed through verbatim to CrossEncoder, so operators can point at
 an arbitrary sentence-transformers cross-encoder without a code change.
 
+Third backend — RERANK_HTTP_URL: point at a llama.cpp `llama-server --rerank --pooling
+rank` endpoint (e.g. serving gpustack/bge-reranker-v2-m3-GGUF) instead of loading
+sentence-transformers/torch in this process at all. Takes priority over RERANK_MODEL when
+set. Same real cross-encoder model, quantized and served out-of-process — removes the
+~900MB torch install and its CUDA-context overhead from this process on hosts where that
+matters (e.g. a shared Jetson also running an LLM/VLM stack via llama.cpp already).
+
 Substrate facts this is built against (session grounding):
   - [hardware] We load the model on 'cuda' (cuda:0) when torch.cuda.is_available(), else
     'cpu' — mirroring the intent of the server.py cross-encoder path. Which physical GPU
@@ -77,15 +84,53 @@ def _model_id() -> str:
         return _DEFAULT_MODEL
 
 
+class _HttpCrossEncoder:
+    """`.predict(pairs)`-compatible shim calling a llama.cpp `/rerank` endpoint instead
+    of an in-process sentence-transformers CrossEncoder. `pairs` are [query, doc]
+    two-element lists — matches CrossEncoder.predict()'s input shape. Every call site in
+    this module builds pairs as [[query, d] for d in docs], i.e. one shared query per
+    call, which this assumes (asserts on mixed queries rather than silently mis-scoring).
+    """
+
+    def __init__(self, url: str):
+        self._url = url
+
+    def predict(self, pairs):
+        import json
+        import urllib.request
+
+        if not pairs:
+            return []
+        query = pairs[0][0]
+        assert all(p[0] == query for p in pairs), "_HttpCrossEncoder requires one shared query per call"
+        docs = [p[1] for p in pairs]
+        body = json.dumps({"query": query, "documents": docs}).encode()
+        req = urllib.request.Request(
+            self._url, data=body, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+        scores = [0.0] * len(docs)
+        for r in data.get("results", []):
+            scores[r["index"]] = float(r["relevance_score"])
+        return scores
+
+
+def _http_url() -> str:
+    return os.environ.get("RERANK_HTTP_URL", "")
+
+
 def _get_model():
-    """Lazy-init + globally cache a sentence_transformers.CrossEncoder on GPU if available.
+    """Lazy-init + globally cache the reranker backend (HTTP shim or local
+    sentence_transformers.CrossEncoder on GPU if available).
 
     Mirrors server.py ~588-609: double-checked locking, cache in a module global, and on
     ANY load failure set the global to `False` permanently so we never re-attempt per call.
     Returns the loaded model, or None if unavailable/failed (fail-open — never raises).
     """
     global _model, _model_name
-    wanted = _model_id()
+    http_url = _http_url()
+    wanted = f"http:{http_url}" if http_url else _model_id()
     # Fast path: already loaded for the currently-configured model.
     if _model is not None and _model_name == wanted:
         return _model if _model is not False else None
@@ -93,6 +138,10 @@ def _get_model():
         if _model is not None and _model_name == wanted:  # re-check under lock
             return _model if _model is not False else None
         _model_name = wanted
+        if http_url:
+            _model = _HttpCrossEncoder(http_url)
+            logger.info("Reranker enabled via HTTP backend (%s)", http_url)
+            return _model
         try:
             # Resolve device lazily: cuda:0 when torch sees a GPU, else cpu [hardware].
             device = "cpu"
