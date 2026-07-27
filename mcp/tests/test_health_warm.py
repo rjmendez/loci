@@ -29,7 +29,9 @@ def test_loci_health_returns_expected_keys():
     # Subset (not ==) so additive fields don't break this contract.
     assert _EXPECTED_KEYS <= set(out.keys())
     # kuzu is one of the documented states
-    assert out["kuzu"] in ("available", "unavailable", "latched", "backoff")
+    assert out["kuzu"] in (
+        "available", "contended", "unavailable", "latched", "backoff"
+    )
     # booleans for reachability, strings for model names / version
     for k in ("ollama_reachable", "vllm_reachable", "qdrant_reachable", "warm"):
         assert isinstance(out[k], bool)
