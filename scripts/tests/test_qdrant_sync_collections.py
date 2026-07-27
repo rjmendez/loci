@@ -12,7 +12,6 @@ import importlib.util
 import os
 import pathlib
 import sqlite3
-import sys
 import tempfile
 import unittest
 from unittest import mock
