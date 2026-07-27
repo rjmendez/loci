@@ -69,6 +69,30 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=30
 
+  test-scripts:
+    name: Sync script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: scripts
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-timeout
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --timeout=30
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest

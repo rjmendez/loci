@@ -85,6 +85,70 @@ def embed_and_get_vector(chunks):
 def stable_num_id(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest()[:15], 16)
 
+def ensure_collection(name=None, dim=None):
+    """Create the collection if it does not exist.
+
+    Nothing in this repo ever created one -- every sync path only upserts points, and
+    a2a_server's _qdrant_search swallows a 404 and returns [], so a missing collection
+    surfaces as "0 results" rather than an error. That is how `mnemosyne` and
+    `hermes_sessions` sat absent on a host while every consumer reported success.
+
+    Schema matches what the consumers require: a NAMED "dense" vector, Cosine.
+    """
+    name = name or COLLECTION
+    dim  = int(dim or os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+    # curl() swallows every exception and returns {} -- the same fail-quiet habit that let this
+    # bug hide -- so probe by response shape rather than by catching HTTPError, which never
+    # reaches us. A present collection answers {"result": {...}, "status": "ok"}.
+    if curl("GET", f"{QDRANT}/collections/{name}").get("result"):
+        return False
+    curl("PUT", f"{QDRANT}/collections/{name}",
+         {"vectors": {"dense": {"size": dim, "distance": "Cosine"}}})
+    # Re-read: PUT on an existing collection conflicts and curl() would hide that too, so
+    # confirm the collection is actually there before the caller starts upserting into it.
+    if not curl("GET", f"{QDRANT}/collections/{name}").get("result"):
+        print(f"[mnemosyne->qdrant] WARNING: {name} still missing after create attempt",
+              file=sys.stderr)
+        return False
+    print(f"[mnemosyne->qdrant] created missing collection {name} (dense {dim}d Cosine)")
+    return True
+
+def load_memories(conn, tables=(("memories", "memory"), ("working_memory", "working"))):
+    """Read every memory tier out of the Mnemosyne DB, newest tier precedence first.
+
+    `conn` must have row_factory = sqlite3.Row.
+
+    This used to be an inline SELECT against working_memory alone -- the short-lived staging
+    tier. On a real node that is a couple of rows while the corpus sits in `memories` (137 vs 2
+    on hugbot5000-jetson), so the sync ran clean, printed a success line, and left the semantic
+    index essentially empty.
+
+    Rows with empty content are dropped (nothing to embed). An id present in more than one tier
+    keeps its FIRST occurrence, so the durable `memories` copy wins over a staging duplicate.
+    A missing table is skipped rather than fatal -- schemas differ across hosts.
+    """
+    out, seen = [], set()
+    for table, tier in tables:
+        try:
+            rows = conn.execute(
+                f"SELECT id, content, source, importance, session_id, created_at FROM {table} "
+                "WHERE content IS NOT NULL AND TRIM(content) != '' ORDER BY created_at ASC"
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            print(f"[mnemosyne->qdrant] skipping {table}: {e}")
+            continue
+        kept = 0
+        for r in rows:
+            d = dict(r)
+            if d["id"] in seen:
+                continue
+            seen.add(d["id"])
+            d["tier"] = tier
+            out.append(d)
+            kept += 1
+        print(f"[mnemosyne->qdrant]   {table}: {len(rows)} rows, {kept} new")
+    return out
+
 def get_synced_ids():
     """Return set of memory_ids already in the mnemosyne Qdrant collection.
     Uses paginated scroll to handle collections with >10000 points."""
@@ -106,20 +170,21 @@ def get_synced_ids():
     return synced
 
 def main():
+    ensure_collection()
+
     conn = sqlite3.connect(MNEMOSYNE_DB)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, content, source, importance, session_id, created_at FROM working_memory ORDER BY created_at ASC"
-    ).fetchall()
-    memories = [dict(r) for r in rows]
+    memories = load_memories(conn)
     conn.close()
     print(f"[mnemosyne->qdrant] Found {len(memories)} memories")
 
     # Check what's already in mnemosyne collection (paginated)
     existing_ids = get_synced_ids()
-    print(f"[mnemosyne->qdrant] {len(existing_ids)} already synced, {len(memories) - len(existing_ids)} to add")
-
     to_sync = [m for m in memories if m["id"] not in existing_ids]
+    # Count the actual delta, not len(memories) - len(existing_ids): existing_ids is every
+    # point in the collection, so that subtraction goes negative once the index outgrows
+    # whatever this run happens to read.
+    print(f"[mnemosyne->qdrant] {len(existing_ids)} already synced, {len(to_sync)} to add")
     if not to_sync:
         print("[mnemosyne->qdrant] All up to date.")
         return
