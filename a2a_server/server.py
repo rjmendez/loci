@@ -374,14 +374,19 @@ app = FastAPI(title=f'{_LOG_AGENT_ID} A2A', version='0.1.0')
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+def _is_live_session_token(tok: str) -> bool:
+    """True if tok is a /bootstrap-issued session token that has not expired."""
+    exp = _session_tokens.get(tok)
+    return bool(exp and exp > datetime.datetime.now(datetime.timezone.utc))
+
+
 def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
     if not creds:
         raise HTTPException(status_code=401, detail='Unauthorized — missing bearer token')
     tok = creds.credentials
     if hmac.compare_digest(tok, A2A_TOKEN):
         return
-    exp = _session_tokens.get(tok)
-    if exp and exp > datetime.datetime.now(datetime.timezone.utc):
+    if _is_live_session_token(tok):
         return
     raise HTTPException(status_code=401, detail='Unauthorized — invalid or expired token')
 
@@ -392,7 +397,16 @@ _TOTP_MAX_ATTEMPTS = 5
 _totp_attempts: dict = collections.defaultdict(list)
 
 
-def _verify_totp(request: Request, x_totp: Optional[str] = Header(default=None)):
+def _verify_totp(request: Request,
+                 x_totp: Optional[str] = Header(default=None),
+                 creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
+    # A /bootstrap session token already proves possession of the pre-shared
+    # bootstrap key and carries its own expiry, so it stands alone as a bearer —
+    # that is the entire point of issuing one. Without this, enabling TOTP makes
+    # session tokens useless (they'd still need X-TOTP) and /bootstrap's
+    # 'totp_required': False response would be a lie.
+    if creds and _is_live_session_token(creds.credentials):
+        return
     if TOTP_SEED:
         if x_totp is None:
             raise HTTPException(status_code=401, detail='X-TOTP header required (TOTP is enabled)')
