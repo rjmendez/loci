@@ -12,16 +12,13 @@ RUN pip install --no-cache-dir \
 
 COPY server.py client.py ./
 
-# MRPINK_A2A_TOKEN is required — server exits at startup if unset.
+# HERMES_A2A_TOKEN is required — server exits at startup if unset.
 # Provide it via .env file or environment injection.
 # Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
 
 # Mnemosyne SQLite path — mount a volume here for persistence across restarts
 ENV MNEMOSYNE_DATA_DIR=/data/mnemosyne
 # A2A identity
-ENV MRPINK_A2A_HOST=0.0.0.0
-ENV MRPINK_A2A_PORT=8201
-ENV MRPINK_A2A_URL=http://localhost:8201
 ENV HERMES_AGENT_ID=mrpink
 # External services
 ENV QDRANT_URL=http://localhost:6333
