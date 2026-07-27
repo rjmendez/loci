@@ -307,7 +307,9 @@ AGENT_CARD = {
             'description': (
                 'Store a memory locally AND push it to all peer A2A endpoints (PEER_A2A_URLS). '
                 'Used by the context bridge cron to propagate discoveries across the mesh. '
-                'Input: {content: str, source?: str, importance?: float=0.5, bank?: str}'
+                'Set store_local=false when relaying something this node already holds. '
+                'Input: {content: str, source?: str, importance?: float=0.5, bank?: str, '
+                'store_local?: bool=true}'
             )
         },
         {
@@ -984,13 +986,21 @@ async def skill_context_broadcast(task: dict) -> dict:
     if not content:
         return {'error': 'content is required'}
 
-    # 1. Store locally first
-    local_result = await skill_memory_remember({
-        'input': {'content': content, 'source': source,
-                  'importance': importance, 'bank': bank},
-        'sender': sender
-    })
-    stored_locally = 'error' not in local_result
+    # 1. Store locally first — unless the caller is relaying something it already holds.
+    # The context bridge reads this node's own database and pushes through this skill, so
+    # storing would insert a fresh copy of a memory that is already here, with a new id and
+    # a new created_at. That copy then looks "new" to the next bridge run and gets relayed
+    # again: unbounded local growth with no peer involved.
+    store_local = bool(inp.get('store_local', True))
+    if store_local:
+        local_result = await skill_memory_remember({
+            'input': {'content': content, 'source': source,
+                      'importance': importance, 'bank': bank},
+            'sender': sender
+        })
+        stored_locally = 'error' not in local_result
+    else:
+        stored_locally = False
 
     # 2. Fan-out to peers
     peer_urls_raw = os.environ.get('PEER_A2A_URLS', '')
