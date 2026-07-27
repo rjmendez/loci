@@ -1,0 +1,41 @@
+[Unit]
+Description=Loci A2A context bridge (push local memories to mesh peers)
+Documentation=https://github.com/rjmendez/loci
+# The bridge relays through THIS node's own A2A server, which may be a container or a
+# systemd unit depending on the host. No hard dependency either way: a run that cannot
+# reach it logs a failure and the next tick retries.
+After=network-online.target
+# Where the A2A server runs as a container, add docker.service here so a boot-time run does
+# not fire before it exists:
+#   After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# ── adjust these three for your host ────────────────────────────────────────────
+User=rjmendez
+Group=rjmendez
+WorkingDirectory=/home/rjmendez/loci
+
+# a2a_context_bridge.py looks for ~/.hermes/.env (or ~/.hermes/profiles/$HERMES_PROFILE/.env)
+# and loads it with os.environ.setdefault, so whatever systemd supplies here WINS. Point this
+# at wherever HERMES_A2A_TOKEN actually lives on this host — on a node where the A2A server
+# runs as a container that is usually the checkout's own .env, not ~/.hermes/.env.
+EnvironmentFile=/home/rjmendez/loci/.env
+
+ExecStart=/usr/bin/python3 /home/rjmendez/loci/scripts/a2a_context_bridge.py
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Requires aiohttp: the script sys.exit()s at import without it, so a missing dependency
+# looks like a unit that fails instantly rather than one that does nothing.
+#   apt install python3-aiohttp   (or pip install aiohttp)
+
+# Nothing here is urgent, and mesh nodes are often memory-constrained.
+Nice=10
+MemoryMax=256M
+TimeoutStartSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=loci-bridge
