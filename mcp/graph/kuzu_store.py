@@ -21,12 +21,43 @@ a write-shaped query before touching the database.
 
 from __future__ import annotations
 
+import fcntl
+import functools
 import logging
+import os
 import re
 import threading
+import time
+from contextlib import contextmanager
 from typing import Any, Optional
 
 logger = logging.getLogger("loci-mcp.kuzu")
+
+
+def _writes(failopen):
+    """Decorator for a multi-statement WRITE method: open ONE leased RW session for the
+    whole call so the method's inner _exec/_rows reuse a single connection + lease
+    (instead of opening the DB per statement). Fails open to ``failopen`` immediately
+    when the store is down or the lease is contended — one bounded lease wait per call,
+    never a per-statement storm. Execution errors inside are still caught by the
+    method's own try/except (which returns the same fail-open value)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *a, **k):
+            if not self.ok:
+                return failopen
+            with self._session(write=True) as conn:
+                if conn is None:
+                    return failopen
+                return fn(self, *a, **k)
+        return wrapper
+    return deco
+
+# How long a single operation will wait to acquire the cross-process lease before
+# giving up and failing-open. Bounded so a wedged holder can NEVER hang the server
+# (the whole point of per-op leasing vs the old open-once-hold-forever model).
+_LEASE_TIMEOUT_S = 6.0
+_LEASE_POLL_S = 0.05
 
 try:  # kuzu is optional — the store degrades to unavailable without it.
     import kuzu  # type: ignore
@@ -69,25 +100,139 @@ class KuzuStore:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.ok = False
-        self._db = None
-        self._conn = None
-        # Kuzu connections are not guaranteed thread-safe for concurrent writes;
-        # serialise all access behind a lock so the store is safe to share.
+        # The cross-process lease file. Every Loci server coordinates on this ONE
+        # path (fcntl advisory lock): shared lock for reads, exclusive for writes.
+        # It is NOT the Kuzu data file, so an old server that still holds Kuzu's
+        # internal single-writer lock will still make our RW open fail (fail-open),
+        # but two servers BOTH running this per-op code coordinate cleanly here.
+        self._lease_path = db_path + ".loci-lease"
+        # Serialise in-process access (Kuzu connections are not concurrency-safe);
+        # re-entrant so a write method's nested _exec calls reuse the open session.
         self._lock = threading.RLock()
+        self._active = None           # the currently-open scoped Connection, if any
+        self._schema_ready = False    # schema ensured once per process (idempotent)
+        # ok == "worth attempting". We do NOT open the DB here — every operation opens
+        # a short-lived leased connection and fails-open on contention, so the store
+        # SELF-HEALS the instant the lock frees (no process-lifetime hold, no startup
+        # latch that stays dead for the whole session).
+        self.ok = bool(_HAS_KUZU and db_path)
         if not _HAS_KUZU:
             logger.info("kuzu not importable; KuzuStore unavailable")
+
+    # ------------------------------------------------------------------ #
+    # Per-operation leased sessions (the concurrency contract)
+    # ------------------------------------------------------------------ #
+    def _acquire_lease(self, fd: int, exclusive: bool) -> bool:
+        """Acquire the advisory lease (fcntl.flock) with a bounded, non-blocking wait.
+        Returns True on success, False if it could not acquire within the timeout —
+        so a wedged holder can never hang the server. LOCK_SH for reads (many can
+        share) / LOCK_EX for writes (one at a time, waits out readers)."""
+        mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+        deadline = time.monotonic() + _LEASE_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, mode)
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_LEASE_POLL_S)
+
+    @contextmanager
+    def _session(self, write: bool):
+        """Yield a short-lived Kuzu Connection under the cross-process lease, then
+        close it (releasing the lock) — nothing is held between operations.
+
+        Nesting: a write method whose helpers call _exec re-enter here on the same
+        thread (RLock) and REUSE the already-open connection instead of opening a
+        second one. Fail-open: if kuzu is absent, the lease can't be acquired in
+        time, or the open fails (another process holds Kuzu's writer lock), yields
+        None and the caller degrades to []/False."""
+        if not _HAS_KUZU:
+            yield None
             return
+        with self._lock:
+            if self._active is not None:
+                # Reuse the enclosing scoped session (an outer write already holds a
+                # RW connection + the exclusive lease). Callers never nest a write
+                # inside a read, so the mode is always compatible.
+                yield self._active
+                return
+            fd = os.open(self._lease_path, os.O_CREAT | os.O_RDWR, 0o644)
+            got = False
+            db = conn = None
+            try:
+                if not self._acquire_lease(fd, exclusive=write):
+                    logger.debug("kuzu lease busy (%s) — fail-open",
+                                 "write" if write else "read")
+                    yield None
+                    return
+                got = True
+                db = kuzu.Database(self.db_path, read_only=not write)
+                conn = kuzu.Connection(db)
+                if write:
+                    self._ensure_schema(conn)
+                    self._stamp_holder(fd)
+                self._active = conn
+                yield conn
+            except Exception as exc:  # open/lock failure -> fail-open, retried next op
+                logger.debug("kuzu session (%s) unavailable: %s",
+                             "write" if write else "read", exc)
+                yield None
+            finally:
+                self._active = None
+                for c in (conn, db):
+                    try:
+                        if c is not None:
+                            c.close()
+                    except Exception:
+                        pass
+                try:
+                    if got:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+    def _stamp_holder(self, fd: int) -> None:
+        """Record the current writer's PID in the lease file (diagnostics only) so a
+        contended state can name who is writing. Best-effort; never raises."""
         try:
-            self._db = kuzu.Database(db_path)
-            self._conn = kuzu.Connection(self._db)
-            self._init_schema()
-            self.ok = True
-        except Exception as exc:  # pragma: no cover - open/schema failure
-            logger.warning("KuzuStore init failed (%s); unavailable", exc)
-            self._db = None
-            self._conn = None
-            self.ok = False
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()} {int(time.time())}\n".encode(), 0)
+        except Exception:
+            pass
+
+    def writable_probe(self) -> bool:
+        """True if a RW connection can be opened right now (lease free AND Kuzu's own
+        writer lock free). Cheap, non-blocking-ish, always closes."""
+        if not self.ok:
+            return False
+        try:
+            with self._session(write=True) as conn:
+                return conn is not None
+        except Exception:
+            return False
+
+    def readable_probe(self) -> bool:
+        """True if a READ-ONLY connection can be opened right now. Used by health so a
+        probe never grabs the writer lock (a RO open still FAILS if another process
+        holds Kuzu's exclusive writer lock, so False == contended). Always closes."""
+        if not self.ok:
+            return False
+        try:
+            with self._session(write=False) as conn:
+                return conn is not None
+        except Exception:
+            return False
+
+    def lock_holder_pid(self) -> Optional[int]:
+        """Best-effort PID of whoever holds the lease writer stamp (diagnostics)."""
+        try:
+            with open(self._lease_path, "r") as f:
+                tok = f.read().split()
+            return int(tok[0]) if tok else None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------ #
     # Schema
@@ -110,34 +255,63 @@ class KuzuStore:
         "CREATE REL TABLE IF NOT EXISTS RELATED(FROM Investigation TO Investigation)",
     )
 
-    def _init_schema(self) -> None:
+    def _ensure_schema(self, conn) -> None:
+        """Create the node/rel tables once per process (idempotent, RW conn required).
+        CREATE ... IF NOT EXISTS is a no-op on an existing graph, so this is cheap."""
+        if self._schema_ready:
+            return
         for ddl in self._SCHEMA:
-            self._conn.execute(ddl)
+            conn.execute(ddl)
         # Additive migrations for graphs created before a column existed. ALTER ADD
         # errors harmlessly if the column is already present -> ignore.
         for alt in ("ALTER TABLE CodeSymbol ADD decorators STRING DEFAULT ''",
                     "ALTER TABLE CodeSymbol ADD referenced BOOL DEFAULT false"):
             try:
-                self._conn.execute(alt)
+                conn.execute(alt)
             except Exception:
                 pass
+        self._schema_ready = True
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _close_result(res) -> None:
+        """Close a Kuzu QueryResult while its connection is still open. A QueryResult
+        must NEVER outlive its Connection/Database: its native __del__ -> close() would
+        touch freed memory (segfault) once the per-op session closes the conn. So every
+        result is drained+closed INSIDE the session, before _session tears it down."""
+        try:
+            res.close()
+        except Exception:
+            pass
+
     def _exec(self, cypher: str, params: Optional[dict] = None):
-        """Execute a statement under the lock. Raises on error (callers catch)."""
-        with self._lock:
-            if params is None:
-                return self._conn.execute(cypher)
-            return self._conn.execute(cypher, params)
+        """Execute a WRITE statement in a leased RW session; returns None (writes have no
+        result callers use). Raises RuntimeError if the session is unavailable (fail-open
+        callers catch it). A write method with several statements wraps them in ONE
+        `self._session(True)` so they share a single lease + connection + schema-init."""
+        with self._session(write=True) as conn:
+            if conn is None:
+                raise RuntimeError("kuzu write session unavailable")
+            res = conn.execute(cypher) if params is None else conn.execute(cypher, params)
+            self._close_result(res)     # never let it outlive the session (segfault guard)
+            return None
 
     def _rows(self, cypher: str, params: Optional[dict] = None) -> list[list]:
-        res = self._exec(cypher, params)
-        out: list[list] = []
-        while res.has_next():
-            out.append(res.get_next())
-        return out
+        """Read rows in a leased READ-ONLY session (many readers share). Drains AND closes
+        the result INSIDE the session — the QueryResult is invalid once the conn closes."""
+        with self._session(write=False) as conn:
+            if conn is None:
+                return []
+            res = conn.execute(cypher) if params is None else conn.execute(cypher, params)
+            out: list[list] = []
+            try:
+                while res.has_next():
+                    out.append(res.get_next())
+            finally:
+                self._close_result(res)
+            return out
 
     def available(self) -> bool:
         return bool(self.ok)
@@ -145,6 +319,7 @@ class KuzuStore:
     # ------------------------------------------------------------------ #
     # Writes (idempotent via MERGE; fail-open)
     # ------------------------------------------------------------------ #
+    @_writes(False)
     def upsert_investigation(self, id: str, title: str = "") -> bool:
         if not self.ok or not id:
             return False
@@ -158,6 +333,7 @@ class KuzuStore:
             logger.debug("upsert_investigation failed: %s", exc)
             return False
 
+    @_writes(False)
     def upsert_finding(self, finding: dict) -> bool:
         if not self.ok or not isinstance(finding, dict):
             return False
@@ -193,6 +369,7 @@ class KuzuStore:
             logger.debug("upsert_finding failed: %s", exc)
             return False
 
+    @_writes(False)
     def upsert_entity(self, name: str, etype: str = "", distinctive: bool = False) -> bool:
         if not self.ok or not name:
             return False
@@ -206,6 +383,7 @@ class KuzuStore:
             logger.debug("upsert_entity failed: %s", exc)
             return False
 
+    @_writes(False)
     def link_mentions(self, finding_id: str, entities: list) -> bool:
         """Link a finding to entities. ``entities`` is a list of (name, etype, distinctive)."""
         if not self.ok or not finding_id or not entities:
@@ -231,6 +409,7 @@ class KuzuStore:
             logger.debug("link_mentions failed: %s", exc)
             return False
 
+    @_writes(False)
     def link_derived_from(self, finding_id: str, parent_ids: list) -> bool:
         if not self.ok or not finding_id or not parent_ids:
             return False
@@ -253,6 +432,7 @@ class KuzuStore:
             logger.debug("link_derived_from failed: %s", exc)
             return False
 
+    @_writes(False)
     def link_references(self, finding_id: str, symbol_ids: list) -> bool:
         if not self.ok or not finding_id or not symbol_ids:
             return False
@@ -272,6 +452,7 @@ class KuzuStore:
             logger.debug("link_references failed: %s", exc)
             return False
 
+    @_writes(False)
     def link_related(self, a: str, b: str) -> bool:
         if not self.ok or not a or not b or a == b:
             return False
@@ -297,6 +478,7 @@ class KuzuStore:
         for i in range(0, len(seq), n):
             yield seq[i:i + n]
 
+    @_writes(0)
     def upsert_findings_batch(self, rows: list) -> int:
         """Batch upsert findings (+ Investigation nodes + IN_INVESTIGATION).
 
@@ -351,6 +533,7 @@ class KuzuStore:
             logger.debug("upsert_findings_batch failed: %s", exc)
             return 0
 
+    @_writes(0)
     def link_mentions_batch(self, rows: list) -> int:
         """Batch link findings->entities. ``rows``: dicts {f, name, etype, distinctive}."""
         if not self.ok or not rows:
@@ -383,6 +566,7 @@ class KuzuStore:
             logger.debug("link_mentions_batch failed: %s", exc)
             return 0
 
+    @_writes(0)
     def link_derived_from_batch(self, rows: list) -> int:
         """Batch link findings->parents. ``rows``: dicts {f, p} (child id, parent id)."""
         if not self.ok or not rows:
@@ -406,6 +590,7 @@ class KuzuStore:
             logger.debug("link_derived_from_batch failed: %s", exc)
             return 0
 
+    @_writes({})
     def ingest_code(self, parsed_files: list) -> dict:
         """Ingest ``code_parse`` per-file dicts into the code graph.
 
@@ -698,6 +883,7 @@ class KuzuStore:
             logger.debug("ingest_code failed: %s", exc)
             return counts
 
+    @_writes({})
     def delete_code_under(self, path_prefix: str) -> dict:
         """Delete code-graph nodes under ``path_prefix`` so a re-ingest is clean.
 

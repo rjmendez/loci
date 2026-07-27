@@ -279,12 +279,17 @@ def _get_kuzu():
 
 def _kuzu_health_state() -> str:
     """Read-only view of the Kuzu store state for loci_health, WITHOUT grabbing the
-    single-writer lock (so a health probe never contends with a real writer):
-    'available' (open) | 'latched' (permanent failure, won't retry) |
+    single-writer lock (a RO probe never steals a writer's lock): 'available' (open +
+    readable now) | 'contended' (store up but another process holds Kuzu's writer lock
+    right now — a RO open fails) | 'latched' (permanent failure, won't retry) |
     'backoff' (transient failure, retrying after the window) | 'unavailable' (not yet
-    initialized / unknown). Never raises."""
+    initialized / unknown). With per-op leasing the store no longer holds the lock
+    between ops, so 'contended' is transient and self-heals. Never raises."""
     try:
         if _kuzu_store is not None:
+            probe = getattr(_kuzu_store, "readable_probe", None)
+            if probe is not None and not probe():
+                return "contended"
             return "available"
         if _kuzu_failed:
             return "latched"
@@ -293,6 +298,18 @@ def _kuzu_health_state() -> str:
         return "unavailable"
     except Exception:
         return "unavailable"
+
+
+def _kuzu_writer_pid() -> Optional[int]:
+    """Best-effort PID currently stamped as the Kuzu write-lease holder (diagnostics;
+    only populated once holders run the per-op-lease code). None if unknown."""
+    try:
+        if _kuzu_store is not None:
+            fn = getattr(_kuzu_store, "lock_holder_pid", None)
+            return fn() if fn is not None else None
+    except Exception:
+        pass
+    return None
 
 
 _code_version_cache: Optional[str] = None  # computed once per process (incl. '' failure)
@@ -7737,8 +7754,11 @@ def loci_health() -> str:
 
     Returns JSON:
       code_version:      short git SHA of the running code ('' if not a git checkout)
-      kuzu:              'available' | 'unavailable' | 'latched' | 'backoff' — reflects
-                         the graph store state WITHOUT grabbing the single-writer lock
+      kuzu:              'available' | 'contended' | 'unavailable' | 'latched' | 'backoff'
+                         — reflects the graph store state via a READ-ONLY probe (never
+                         grabs the writer lock). 'contended' = another process holds the
+                         writer lock right now (transient with per-op leasing).
+      kuzu_writer_pid:   (optional) PID stamped as the current write-lease holder
       ollama_reachable:  TCP reachability of the resolved Ollama endpoint
       vllm_reachable:    TCP reachability of the resolved vLLM endpoint
       qdrant_reachable:  TCP reachability of the resolved Qdrant endpoint
@@ -7762,6 +7782,9 @@ def loci_health() -> str:
         pass
     try:
         out["kuzu"] = _kuzu_health_state()
+        pid = _kuzu_writer_pid()
+        if pid is not None:
+            out["kuzu_writer_pid"] = pid
     except Exception:
         pass
     try:
