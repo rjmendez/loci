@@ -45,6 +45,14 @@ Optional / tunable:
                             Default: '' (TOTP disabled)
   HERMES_AGENT_ID           Agent identity tag written into memory metadata.
                             Default: 'hermes-agent'
+  RERANK_HTTP_URL           llama.cpp `llama-server --rerank --pooling rank` endpoint,
+                            e.g. http://127.0.0.1:8082/rerank. When set, rag_search
+                            reorders its merged cross-collection hits with a
+                            cross-encoder instead of trusting raw cosine scores that
+                            are not comparable across collections. Adds no torch
+                            dependency here. Unset = cosine order (previous behaviour).
+                            Fails open on any error.
+  RERANK_TIMEOUT_S          Rerank request timeout. Default: 10
 
 Qdrant (shared with session_end_sync.py + state_db_qdrant_sync.py):
 
@@ -289,6 +297,7 @@ AGENT_CARD = {
                 'Fan-out semantic search across Qdrant collections without requiring '
                 'direct Qdrant credentials. Core: hermes_memory, hermes_sessions, mnemosyne. '
                 'Additional collections: set EXTRA_RAG_COLLECTIONS env var (comma-separated). '
+                'Cross-encoder reranking when RERANK_HTTP_URL is set (fails open to cosine order). '
                 'Input: {query: str, top_k?: int=5, collections?: [str]}'
             )
         },
@@ -744,6 +753,70 @@ async def skill_memory_sleep(task: dict) -> dict:
 
 
 # ── skill: rag_search ────────────────────────────────────────────────────────────
+async def _rerank(query: str, hits: list) -> bool:
+    """
+    Reorder `hits` IN PLACE with a cross-encoder, if RERANK_HTTP_URL is configured.
+
+    rag_search fans out across collections and then merges on raw cosine score. Those
+    scores are not comparable across collections -- different content types, different
+    chunk sizes, different embedding neighbourhoods -- so the merge is the weakest link
+    in the whole path, and it is exactly what a cross-encoder is good at.
+
+    Points at a llama.cpp `llama-server --rerank --pooling rank` endpoint (the same one
+    mcp/reranker.py's RERANK_HTTP_URL uses), so a host already serving a reranker needs
+    no second model and this process gains no torch dependency.
+
+    FAILS OPEN. Unset URL, unreachable server, malformed response, or a short/oversized
+    result list all leave the cosine ordering untouched and return False. Search
+    degrading to "slightly worse ordering" is correct; degrading to an error is not.
+
+    Returns True only if the order was actually replaced.
+    """
+    url = os.environ.get('RERANK_HTTP_URL', '').strip()
+    if not url or len(hits) < 2:
+        return False
+
+    docs = [(h.get('content') or '') for h in hits]
+    if not any(d.strip() for d in docs):
+        return False
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=float(os.environ.get('RERANK_TIMEOUT_S', 10)))
+        ) as sess, sess.post(url, json={'query': query, 'documents': docs}) as r:
+            if r.status != 200:
+                log.warning(f'rerank: HTTP {r.status} — keeping cosine order')
+                return False
+            data = await r.json()
+    except Exception as e:
+        log.warning(f'rerank: {e!r} — keeping cosine order')
+        return False
+
+    scored = []
+    for item in (data.get('results') or []):
+        try:
+            idx = int(item['index'])
+            if 0 <= idx < len(hits):
+                scored.append((idx, float(item['relevance_score'])))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # Partial coverage would silently drop hits, so only accept a complete permutation.
+    if len(scored) != len(hits) or len({i for i, _ in scored}) != len(hits):
+        log.warning(f'rerank: got {len(scored)} scores for {len(hits)} hits — keeping cosine order')
+        return False
+
+    scored.sort(key=lambda t: t[1], reverse=True)
+    reordered = []
+    for idx, score in scored:
+        h = hits[idx]
+        h['cosine_score'] = h.get('score')      # keep the original so callers can compare
+        h['rerank_score'] = round(score, 4)
+        reordered.append(h)
+    hits[:] = reordered
+    return True
+
+
 async def skill_rag_search(task: dict) -> dict:
     """
     Fan-out semantic search across ALL 768-dim Qdrant collections.
@@ -810,10 +883,13 @@ async def skill_rag_search(task: dict) -> dict:
             seen.add(key)
             deduped.append(h)
 
+    reranked = await _rerank(query, deduped)
+
     return {
         'results':              deduped[:top_k * 2],   # return more than top_k since multi-collection
         'query':                query,
         'collections_searched': collections,
+        'reranked':             reranked,
         'total_hits':           len(deduped),
     }
 
