@@ -89,6 +89,9 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install pytest pytest-timeout
+          # a2a_context_bridge sys.exit()s at import without aiohttp, which aborts
+          # collection for the whole directory rather than failing one test.
+          pip install aiohttp
 
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=30
