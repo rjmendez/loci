@@ -249,7 +249,7 @@ def _get_kuzu():
                 logger.warning("Kuzu not importable — graph features disabled (permanent).")
                 return None
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # kuzu won't create parents
-            ks = _kz.KuzuStore(str(MEMORY_DIR / "graph.kuzu"))
+            ks = _kz.KuzuStore(str(MEMORY_DIR / "graph.ladybug"))
             if not ks.available():
                 # Import worked but open failed — almost always another process holds
                 # the single-writer lock. Treat as TRANSIENT: retry after the backoff.

@@ -805,6 +805,70 @@ async def skill_rag_search(task: dict) -> dict:
 
 
 # ── skill: context_broadcast ─────────────────────────────────────────────────────
+def _peer_base_url(peer_url: str) -> str:
+    """
+    Strip a trailing '/a2a' path segment to get a peer's base URL.
+
+    Uses an explicit suffix check rather than str.rstrip('/a2a'), which strips
+    any trailing run of the characters '/', 'a' and '2' and so mangles ports:
+    'http://host:8202/a2a'.rstrip('/a2a') == 'http://host:820'.
+    """
+    url = peer_url.rstrip('/')
+    if url.endswith('/a2a'):
+        url = url[:-len('/a2a')]
+    return url.rstrip('/')
+
+
+def _peer_credentials() -> tuple[dict, str, dict, str]:
+    """
+    Read peer auth config from the environment.
+
+    Returns (token_map, default_token, seed_map, default_seed).
+
+    PEER_A2A_TOKEN / PEER_A2A_TOKENS_JSON      -> Bearer token, shared or per-peer
+    PEER_A2A_TOTP_SEED / PEER_A2A_TOTP_SEEDS_JSON -> base32 TOTP seed, shared or per-peer
+    """
+    default_token = os.environ.get('PEER_A2A_TOKEN', '')
+    default_seed  = os.environ.get('PEER_A2A_TOTP_SEED', '')
+    try:
+        token_map = json.loads(os.environ.get('PEER_A2A_TOKENS_JSON', '{}'))
+    except Exception:
+        token_map = {}
+    try:
+        seed_map = json.loads(os.environ.get('PEER_A2A_TOTP_SEEDS_JSON', '{}'))
+    except Exception:
+        seed_map = {}
+    return token_map, default_token, seed_map, default_seed
+
+
+def _peer_headers(peer_url: str, token_map: dict, default_token: str,
+                  seed_map: dict, default_seed: str):
+    """
+    Build outbound headers for a peer.
+
+    Returns (headers, None) on success or (None, reason) if the peer is not
+    callable. A peer that sets HERMES_A2A_TOTP_SEED rejects bearer-only
+    requests with 401, so X-TOTP is attached whenever a seed is configured
+    for that peer.
+    """
+    base  = _peer_base_url(peer_url)
+    token = token_map.get(peer_url) or token_map.get(base) or default_token
+    if not token:
+        return None, 'no token configured'
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type':  'application/json',
+    }
+    seed = seed_map.get(peer_url) or seed_map.get(base) or default_seed
+    if seed:
+        try:
+            headers['X-TOTP'] = pyotp.TOTP(seed).now()
+        except Exception as e:
+            return None, f'invalid TOTP seed: {e}'
+    return headers, None
+
+
 async def skill_context_broadcast(task: dict) -> dict:
     """
     Push a memory to all configured peer A2A endpoints (PEER_A2A_URLS env var).
@@ -817,6 +881,8 @@ async def skill_context_broadcast(task: dict) -> dict:
         http://peer-a:8201/a2a,http://peer-b:8201/a2a
     PEER_A2A_TOKEN: shared Bearer token for all peers (or set per-peer in PEER_A2A_TOKENS_JSON)
     PEER_A2A_TOKENS_JSON: JSON dict mapping base_url -> token (overrides PEER_A2A_TOKEN per peer)
+    PEER_A2A_TOTP_SEED: shared base32 TOTP seed for peers that require X-TOTP
+    PEER_A2A_TOTP_SEEDS_JSON: JSON dict mapping base_url -> seed (overrides PEER_A2A_TOTP_SEED)
     """
     inp        = task.get('input', {})
     content    = (inp.get('content') or task.get('message', '')).strip()
@@ -838,11 +904,7 @@ async def skill_context_broadcast(task: dict) -> dict:
 
     # 2. Fan-out to peers
     peer_urls_raw = os.environ.get('PEER_A2A_URLS', '')
-    default_token = os.environ.get('PEER_A2A_TOKEN', '')
-    try:
-        token_map = json.loads(os.environ.get('PEER_A2A_TOKENS_JSON', '{}'))
-    except Exception:
-        token_map = {}
+    token_map, default_token, seed_map, default_seed = _peer_credentials()
 
     peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
     broadcast_results = []
@@ -850,11 +912,10 @@ async def skill_context_broadcast(task: dict) -> dict:
     import uuid as _uuid
 
     async def _push_to_peer(peer_url: str):
-        # Derive base URL for token lookup (strip /a2a suffix)
-        base = peer_url.rstrip('/a2a').rstrip('/')
-        token = token_map.get(peer_url) or token_map.get(base) or default_token
-        if not token:
-            return {'peer': peer_url, 'status': 'skipped', 'error': 'no token configured'}
+        headers, reason = _peer_headers(
+            peer_url, token_map, default_token, seed_map, default_seed)
+        if headers is None:
+            return {'peer': peer_url, 'status': 'skipped', 'error': reason}
 
         payload = {
             'jsonrpc': '2.0',
@@ -867,10 +928,6 @@ async def skill_context_broadcast(task: dict) -> dict:
                              'importance': importance, 'bank': bank},
                 'sender':   AGENT_ID,
             }
-        }
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type':  'application/json',
         }
         try:
             async with aiohttp.ClientSession(
@@ -1164,6 +1221,12 @@ async def skill_memory_prime(task: dict) -> dict:
     state  = {t: v for t, v in state.items() if v.get('expires_at', 0) > now_ts}
 
     try:
+        # The state dir may not exist — notably in the Docker image, where HOME
+        # is /root and nothing has ever created /root/.hermes. Without this the
+        # skill fails every call with ENOENT on the .tmp write.
+        parent = os.path.dirname(state_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         tmp = state_path + '.tmp'
         with open(tmp, 'w') as f:
             json.dump(state, f)
@@ -1173,21 +1236,17 @@ async def skill_memory_prime(task: dict) -> dict:
 
     broadcast_results = []
     if do_broadcast:
-        peer_urls_raw  = os.environ.get('PEER_A2A_URLS', '')
-        default_token  = os.environ.get('PEER_A2A_TOKEN', '')
-        try:
-            token_map = json.loads(os.environ.get('PEER_A2A_TOKENS_JSON', '{}'))
-        except Exception:
-            token_map = {}
+        peer_urls_raw = os.environ.get('PEER_A2A_URLS', '')
+        token_map, default_token, seed_map, default_seed = _peer_credentials()
         peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
 
         import uuid as _uuid
 
         async def _prime_peer(peer_url: str):
-            base  = peer_url.rstrip('/a2a').rstrip('/')
-            token = token_map.get(peer_url) or token_map.get(base) or default_token
-            if not token:
-                return {'peer': peer_url, 'status': 'skipped', 'error': 'no token'}
+            headers, reason = _peer_headers(
+                peer_url, token_map, default_token, seed_map, default_seed)
+            if headers is None:
+                return {'peer': peer_url, 'status': 'skipped', 'error': reason}
             payload = {
                 'jsonrpc': '2.0', 'id': str(_uuid.uuid4()), 'method': 'tasks/send',
                 'params': {
@@ -1202,7 +1261,7 @@ async def skill_memory_prime(task: dict) -> dict:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         peer_url, json=payload,
-                        headers={'Authorization': f'Bearer {token}'},
+                        headers=headers,
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
                         return {'peer': peer_url, 'status': resp.status}
