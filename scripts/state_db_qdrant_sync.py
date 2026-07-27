@@ -46,6 +46,28 @@ def curl_json(method, url, data=None, key=""):
     except json.JSONDecodeError:
         return {"_raw": r.stdout[:200]}
 
+def ensure_collection(key, name=None, dim=None):
+    """Create the collection if it does not exist.
+
+    Same gap as mnemosyne_qdrant_sync: this script only ever upserts points, and
+    a2a_server's _qdrant_search turns a 404 into [], so a `hermes_sessions` collection that
+    was never created reads as "session_search found nothing" on every call.
+
+    curl_json returns {} rather than raising, so probe by response shape.
+    """
+    name = name or COLLECTION
+    dim  = int(dim or os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+    if curl_json("GET", f"{QDRANT}/collections/{name}", key=key).get("result"):
+        return False
+    curl_json("PUT", f"{QDRANT}/collections/{name}",
+              {"vectors": {"dense": {"size": dim, "distance": "Cosine"}}}, key=key)
+    if not curl_json("GET", f"{QDRANT}/collections/{name}", key=key).get("result"):
+        print(f"[state_db->qdrant] WARNING: {name} still missing after create attempt",
+              file=sys.stderr)
+        return False
+    print(f"[state_db->qdrant] created missing collection {name} (dense {dim}d Cosine)")
+    return True
+
 def stable_id(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest()[:15], 16)
 
@@ -180,6 +202,8 @@ def main():
     if not key:
         print("ERROR: could not retrieve Qdrant API key", file=sys.stderr)
         sys.exit(1)
+
+    ensure_collection(key)
 
     conn = sqlite3.connect(STATE_DB)
     conn.row_factory = sqlite3.Row
