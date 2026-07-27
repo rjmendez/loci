@@ -85,39 +85,77 @@ def _save_state(state: dict):
 
 
 # ── Mnemosyne query ───────────────────────────────────────────────────────────────
+# Sources that must never be re-bridged. Anything already in flight through the mesh will
+# come back with one of these stamps, and re-sending it is what turns two nodes into an
+# infinite loop. `bridge:` is what THIS script stamps on what it sends (see
+# _broadcast_memory), `broadcast:` is what a peer's context_broadcast stamps on what it
+# receives, and `context_broadcast` marks a memory the local server has already fanned out
+# to every peer itself.
+ECHO_SOURCE_PREFIXES = [
+    p.strip() for p in os.environ.get(
+        "BRIDGE_EXCLUDE_SOURCES", "bridge:,broadcast:,context_broadcast"
+    ).split(",") if p.strip()
+]
+
+
 def _fetch_recent_memories(since: str, min_importance: float, max_items: int) -> list[dict]:
     """
-    Fetch working_memory rows newer than `since` (ISO timestamp) with importance >= min_importance.
-    Falls back to memories table if working_memory doesn't exist.
+    Fetch memories newer than `since` (ISO timestamp) with importance >= min_importance,
+    excluding anything that arrived through the mesh (see ECHO_SOURCE_PREFIXES).
+
+    Reads BOTH tiers. This used to read working_memory and fall back to `memories` only on
+    OperationalError -- i.e. only if the table did not exist. working_memory does exist, and
+    it is the small staging tier (2 rows on hugbot5000-jetson against 139 in `memories`), so
+    the fallback was unreachable and the real corpus was never bridged at all.
+
+    created_at is normalised before comparison. Mnemosyne writes mostly ISO-with-T but not
+    exclusively (138 T-separated vs 1 space-separated on that same host), and a raw string
+    compare puts every space-separated row below every T-separated one, because ' ' (0x20)
+    sorts under 'T' (0x54). Those rows would be silently skipped forever once `since` is a
+    T-format timestamp.
     """
     if not os.path.exists(MNEMOSYNE_DB):
         log.warning("Mnemosyne DB not found: %s", MNEMOSYNE_DB)
         return []
 
+    echo_clause = ""
+    params_tail: list = []
+    if ECHO_SOURCE_PREFIXES:
+        echo_clause = " AND source IS NOT NULL AND " + " AND ".join(
+            ["source NOT LIKE ?"] * len(ECHO_SOURCE_PREFIXES)
+        )
+        # An exact name like context_broadcast needs no wildcard; a prefix like bridge: does.
+        params_tail = [p + "%" if p.endswith(":") else p for p in ECHO_SOURCE_PREFIXES]
+
     conn = sqlite3.connect(MNEMOSYNE_DB, timeout=10)
     conn.row_factory = sqlite3.Row
-    rows = []
+    out: list[dict] = []
+    seen: set = set()
+    since_norm = (since or "").replace(" ", "T")
     try:
-        # Try working_memory first (primary store)
-        try:
-            rows = conn.execute(
-                "SELECT id, content, importance, created_at, source FROM working_memory "
-                "WHERE created_at > ? AND importance >= ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (since, min_importance, max_items)
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # Fallback to memories table
-            rows = conn.execute(
-                "SELECT id, content, importance, created_at, source FROM memories "
-                "WHERE created_at > ? AND importance >= ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (since, min_importance, max_items)
-            ).fetchall()
+        for table in ("memories", "working_memory"):
+            try:
+                rows = conn.execute(
+                    f"SELECT id, content, importance, created_at, source FROM {table} "
+                    "WHERE REPLACE(created_at, ' ', 'T') > ? AND importance >= ?"
+                    + echo_clause +
+                    " ORDER BY created_at DESC LIMIT ?",
+                    (since_norm, min_importance, *params_tail, max_items)
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                log.debug("skipping %s: %s", table, e)
+                continue
+            for r in rows:
+                d = dict(r)
+                if d["id"] in seen:
+                    continue
+                seen.add(d["id"])
+                out.append(d)
     finally:
         conn.close()
 
-    return [dict(r) for r in rows]
+    out.sort(key=lambda m: (m.get("created_at") or "").replace(" ", "T"), reverse=True)
+    return out[:max_items]
 
 
 # ── A2A call ──────────────────────────────────────────────────────────────────────
@@ -134,9 +172,19 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
             "message":  mem["content"],
             "input": {
                 "content":    mem["content"],
-                "source":     mem.get("source") or "bridge",
+                # Stamp what WE send so both ends can recognise it as mesh traffic and refuse
+                # to bridge it onward. Passing the original source through (the old behaviour)
+                # meant a bridged memory arrived at the peer looking locally-authored, so the
+                # peer's own filter could not identify it and bridged it straight back.
+                "source":     f"bridge:{AGENT_ID}",
                 "importance": float(mem.get("importance") or 0.5),
                 "bank":       "default",
+                # We are relaying through our OWN server, and context_broadcast stores before
+                # it fans out. Without this the bridge re-inserts a fresh copy of each memory
+                # into the database it just read from -- with a new id and a new created_at,
+                # so the copy is "new" next run and gets bridged again. That is unbounded
+                # growth on a SINGLE node, no peer required.
+                "store_local": False,
             },
             "sender": AGENT_ID,
         },
