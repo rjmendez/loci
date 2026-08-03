@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-kuzu = pytest.importorskip("kuzu")
+pytest.importorskip("ladybug")
 
 from graph import kuzu_store as kz
 from graph.kuzu_store import KuzuStore

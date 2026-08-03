@@ -91,6 +91,16 @@ def _internal_id(id_dict: Any) -> Optional[tuple]:
     return None
 
 
+def _meta(node: dict, name: str) -> Any:
+    """Read an internal key off a returned node/rel dict.
+
+    ladybug returns these upper-cased (``_ID``/``_LABEL``/``_SRC``/``_DST``);
+    kuzu used lower-case. Accept either so the reader survives the rename.
+    """
+    up = f"_{name.upper()}"
+    return node[up] if up in node else node.get(f"_{name.lower()}")
+
+
 def _rel_pattern(rels: Any) -> str:
     """Build the type filter for a var-length pattern: ``""`` or ``":A|B"``.
 
@@ -169,7 +179,7 @@ def subgraph(
         for node in [anchor_node, *path_nodes]:
             if not isinstance(node, dict):
                 continue
-            nid = _internal_id(node.get("_id"))
+            nid = _internal_id(_meta(node, "id"))
             if nid is None or nid in seen:
                 continue
             seen.add(nid)
@@ -180,7 +190,7 @@ def subgraph(
     id_to_key: dict = {}
     nodes_out: list = []
     for nid, node in kept:
-        label = node.get("_label")
+        label = _meta(node, "label")
         key = node.get(_PK.get(label, ""))
         id_to_key[nid] = key
         nodes_out.append({"label": label, "key": key, "props": _props(node)})
@@ -192,11 +202,11 @@ def subgraph(
         for rel in (row[2] or []):
             if not isinstance(rel, dict):
                 continue
-            src = _internal_id(rel.get("_src"))
-            dst = _internal_id(rel.get("_dst"))
+            src = _internal_id(_meta(rel, "src"))
+            dst = _internal_id(_meta(rel, "dst"))
             if src not in kept_ids or dst not in kept_ids:
                 continue
-            rel_label = rel.get("_label")
+            rel_label = _meta(rel, "label")
             sig = (src, dst, rel_label)
             if sig in edge_seen:
                 continue
