@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-kuzu = pytest.importorskip("kuzu")
+pytest.importorskip("ladybug")
 
 from graph.kuzu_store import KuzuStore
 from graph.linker import (
