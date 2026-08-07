@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Loci — persistent memory and knowledge MCP server for AI agent meshes"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.2.0",
+    "mcp[cli]>=1.2.0,<2",
     "python-dotenv>=1.0.0",
     "qdrant-client>=1.17.0,<1.19.0",
     "fastembed>=0.7.0",
