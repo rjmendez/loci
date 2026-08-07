@@ -77,7 +77,8 @@ are completely different.
 MCP stands for **Model Context Protocol** — a standard that lets AI tools like Claude Code
 call external functions. Think of it like browser extensions, but for AI agents.
 
-Loci ships 24 MCP tools that Claude can call. They fall into five groups:
+Loci ships 71 MCP tools that Claude can call. The map below groups the most commonly used
+ones into five families:
 
 ![Tool map](img/loci-tools.svg)
 

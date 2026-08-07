@@ -27,7 +27,7 @@ like a set of notes.
 ![Loci architecture](docs/img/loci-overview.svg)
 
 Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
-something, it calls one of Loci's 24 tools — the same way it calls any other tool. Your
+something, it calls one of Loci's 71 tools — the same way it calls any other tool. Your
 data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
 > **New to terms like "vector search", "RAG", or "MCP"?**
@@ -80,36 +80,88 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
 ---
 
-## MCP tools (24)
+## MCP tools (71)
 
 ![Tool groups](docs/img/loci-tools.svg)
+
+*This diagram groups an earlier 24-tool snapshot by purpose — the groupings still
+hold, but the surface has since grown to 71 tools: 60 defined in `mcp/server.py`
+plus 11 code-graph tools registered from `mcp/graph_tools.py` at import time. See
+the table below for the current inventory.*
 
 | Tool | Purpose |
 |---|---|
 | `investigation_start` | Open a new investigation session |
 | `investigation_load` | Load an existing investigation by ID |
+| `investigation_as_of` | Return findings as they were believed at a point in time |
 | `investigation_store` | Persist findings to the investigation |
-| `investigation_note` | Append a free-form note |
+| `finding_resolve` | Mark a finding's lifecycle state — fixed / intentional / wontfix / superseded, or back to open |
+| `procedure_attempt` | Record a pass/fail attempt against a procedure-type finding |
+| `procedure_search` | Search for procedure-type findings matching a query |
+| `investigation_note` | Update a manifest field — hypothesis, next step, context, open questions, checked sources, closing summary |
 | `investigation_reflect` | Run reflection over current findings |
+| `investigation_reason` | Reason over findings with grounded, multi-perspective analysis |
 | `investigation_search` | Search within an investigation |
 | `investigation_pre_answer_check` | Validate a claim against stored evidence before answering |
 | `investigation_evidence_precheck` | Pre-screen evidence before ingestion |
 | `investigation_entity_lookup` | Look up an entity by name across stored findings |
+| `entity_list` | List all named entities extracted from an investigation's findings |
+| `entity_timeline` | Chronological timeline of every finding mentioning an entity |
 | `investigation_related_cases` | Find related prior investigations |
 | `investigation_finding_provenance` | Trace source provenance for a finding |
+| `causal_edges_list` | List causal edges inferred for an investigation |
+| `conflict_list` | List detected conflicts for an investigation |
+| `conflict_resolve` | Resolve a detected conflict by recording a verdict |
 | `investigation_list` | List investigations, most-recent first. Paginated (`limit=30`, `offset=0`) and compact by default (`summary=True`); pass `summary=False` for full records and `limit=0` (or any value `<=0`) for all — note `offset` still applies in no-limit mode, returning all *remaining* records starting at `offset`. Response includes `total`/`limit`/`offset`. |
+| `investigation_share` | Grant read/write access to an investigation for one or more agents |
+| `investigation_unshare` | Revoke access to an investigation for one or more agents |
+| `investigation_export` | Export an investigation as a portable JSON bundle |
+| `investigation_import` | Import an investigation bundle produced by `investigation_export` |
 | `audit_log` | Append to the audit trail |
 | `memory_self_check` | Cross-check stored memories for consistency |
-| `code_memory_correlate` | Correlate a code change with stored memory context |
+| `code_memory_correlate` | Link a detected code hallucination to the memories it contaminated (advisory, read-only) |
 | `memory_health` | Report memory system health |
+| `loci_health` | Read-only self-diagnosis of the MCP server as a JSON snapshot |
 | `memory_retract` | Soft-retract an incorrect or stale memory |
 | `memory_restore` | Restore a previously retracted memory |
+| `memory_promote` | Promote a finding to a higher memory tier |
+| `memory_demote` | Demote a finding to a lower memory tier |
+| `memory_hints` | Return the most recent findings as lightweight hints |
+| `memory_surface` | Proactively surface prior findings relevant to the current working context |
+| `memory_route` | Mesh-aware search across all investigations — no `investigation_id` filter |
 | `reflection_loop_seed` | Seed the reflection loop with new material |
 | `reflection_loop_tick` | Advance the reflection loop one step |
 | `reflection_loop_status` | Report reflection loop queue status |
 | `rag_context_search` | Fan-out semantic search across all configured Qdrant collections |
+| `ground` | Assemble a provenance-tagged, character-budgeted grounding block for a task |
 | `memory_consolidate` | Trigger memory consolidation (dedup + merge) |
 | `memory_confidence` | Estimate confidence in a memory-derived claim before asserting it |
+| `contract_declare` | Store a cross-boundary contract declaration for an entity |
+| `contract_query` | Query stored contract declarations for an entity |
+| `contract_check` | Check whether a field name conflicts with stored contract declarations |
+| `wiring_obligation_declare` | Declare a wiring obligation — a method that should integrate but is unverified |
+| `wiring_obligation_list` | List wiring obligations for an investigation |
+| `wiring_obligation_resolve` | Resolve a wiring obligation with evidence of fulfilment |
+| `llm_local` | Generate with a local Ollama model — the generation tier of the offload path |
+| `generate_batch` | Generate for many prompts at once, for high-concurrency fan-out |
+| `query_expand` | Expand a search query (HyDE-lite) using the local model |
+| `verify_finding` | Adversarially verify a claim with the local model |
+| `investigation_verify_all` | Batch adversarial-verify an investigation's open findings |
+| `classify_text` | Pick the single best label for a text using the local model |
+| `compress_text` | Semantically condense text to a character budget using the local model |
+| `semantic_dedup` | Cluster near-duplicate items by embedding cosine similarity |
+| `semantic_relevance` | Score each text's cosine relevance to a topic on the local embedding path |
+| `code_graph_ingest` | Parse source with tree-sitter and ingest its symbol graph |
+| `code_graph_query` | Run a read-only Cypher query over the code + memory graph |
+| `code_memory_relink` | Rebuild every finding → code-symbol `REFERENCES` edge |
+| `code_memory_map` | Map the code/memory neighbourhood around an anchor node |
+| `symbol_impact` | Blast radius of a code symbol across code and memory |
+| `impact_report` | Change blast radius for a symbol or class, with the findings that reference it |
+| `finding_code_context` | The code a finding references, each symbol with its callers/callees |
+| `investigation_code_briefing` | The code story of an investigation in a single call |
+| `subsystem_report` | Full picture of a subsystem: code, call boundary, memory hotspots |
+| `related_investigations_via_code` | Other investigations that reference the same code symbols |
+| `dead_code_candidates` | Functions with no code caller and no finding reference |
 
 ---
 
@@ -227,7 +279,7 @@ HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
 
 ```
 loci/
-├── mcp/                   MCP server — 24 tools: investigation memory, RAG, claim validation
+├── mcp/                   MCP server — 71 tools: investigation memory, RAG, claim validation, code graph
 │   ├── server.py          FastMCP server entry point
 │   ├── memcheck/          Standalone claim-validation + code-hallucination module
 │   ├── pyproject.toml     Package definition (pip install -e .)

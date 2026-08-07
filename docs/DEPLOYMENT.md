@@ -35,7 +35,7 @@ The external services are swappable — see options below.
 | API | REST (HTTP) or gRPC |
 | Version | ≥ 1.7 (named-vector support required) |
 | Collection format | 768-dim Cosine, named vectors `{"dense": [...]}` |
-| Env var | `QDRANT_URL` (default: `http://localhost:6333`) |
+| Env var | `QDRANT_URL` (no code default — unset disables Qdrant; the Docker image sets `http://localhost:6333`) |
 | Auth | `QDRANT_API_KEY` (optional — leave blank if no auth) |
 
 **Options:**
@@ -43,7 +43,7 @@ The external services are swappable — see options below.
 - [Qdrant Cloud](https://cloud.qdrant.io/) — managed, free tier available
 - Any Qdrant-compatible endpoint
 
-Collections are created automatically on first run. If you change `QDRANT_COLLECTION_PREFIX`, new collections are created — existing data in the old names is unaffected.
+The findings collection is created automatically on first use. Despite the name, `QDRANT_COLLECTION_PREFIX` is the *whole* collection name, not a prefix — all findings live in one collection and `investigation_id` is a payload field. Changing it creates a new collection; data under the old name is untouched. **Caveat:** `memory_confidence` hardcodes `hermes_memory`, so it keeps reading the old collection after an override.
 
 ### Embedding API
 
@@ -183,9 +183,9 @@ Qdrant data persists in your external Qdrant instance and is not managed by thes
 
 ## First-run initialization
 
-On first startup the MCP server creates two Qdrant collections:
-- `hermes_memory` — investigation findings (30-day TTL sweep at startup)
-- `hermes_verdicts` — claim validation history
+The MCP server creates its Qdrant collections lazily, not at process start:
+- `hermes_memory` (or whatever `QDRANT_COLLECTION_PREFIX` is set to) — investigation findings; created on the first Qdrant-touching tool call, along with its payload indexes and a 30-day retention purge
+- `hermes_verdicts` — claim validation history; created on the first verdict write (`memory_self_check(record=True)` or `investigation_pre_answer_check`). Until then `memory_health` reports it as "not yet created", which is benign.
 
 The A2A server creates the Mnemosyne SQLite schema on first connect if the DB file does not exist.
 
@@ -216,9 +216,9 @@ Set `HERMES_A2A_TOKEN` in your `.env` file (or export it in the environment) reg
 
 | Variable | Default | Used by | Purpose |
 |---|---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | both | Qdrant REST endpoint |
+| `QDRANT_URL` | `http://localhost:6333` (Docker/compose only) | both | Qdrant REST endpoint; **no code default** — unset silently disables Qdrant and drops to keyword-only recall |
 | `QDRANT_API_KEY` | _(empty)_ | both | Qdrant auth key; omit for unauthenticated instances |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | hermes-mcp | Base URL of the embedding/LLM API |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` (Docker/compose only) | hermes-mcp | Base URL of the embedding/LLM API; **no code default** — unset forces the 384-dim fastembed fallback, which mismatches the 768-dim collection |
 | `MNEMOSYNE_EMBEDDING_API_URL` | `http://localhost:11434/v1` | hermes-a2a | OpenAI-compat embedding endpoint for Mnemosyne |
 | `EMBED_MODEL` | `nomic-embed-text` | both | Embedding model name |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | hermes-a2a | Embedding model for Mnemosyne |
@@ -241,6 +241,6 @@ Set `HERMES_A2A_TOKEN` in your `.env` file (or export it in the environment) reg
 |---|---|---|
 | `LOCI_NAMESPACE` | _(empty)_ | Namespace tag stamped on all Qdrant writes; use to partition a shared instance |
 | `EXTRA_RAG_COLLECTIONS` | _(empty)_ | Comma-separated Qdrant collection names included in fan-out RAG search |
-| `GROUNDING_EXTRA_COLLECTIONS` | _(empty)_ | Same as above, scoped to the grounding hook only; defaults to `EXTRA_RAG_COLLECTIONS` |
+| `GROUNDING_EXTRA_COLLECTIONS` | _(empty)_ | Extra Qdrant collections for the grounding hook only; read independently of `EXTRA_RAG_COLLECTIONS` (different process) — set both if you want the same collections in both paths |
 | `CODE_CHUNKS_COLLECTION` | _(empty)_ | Collection of code-chunk embeddings for the `code_memory_correlate` tool |
-| `ROUTING_DECISIONS_COLLECTION` | _(empty)_ | Collection of routing/decision records for the routing query tool |
+| `ROUTING_DECISIONS_COLLECTION` | _(empty)_ | **Unused** — documented but read by no code; `memory_route` searches `QDRANT_COLLECTION_PREFIX` |

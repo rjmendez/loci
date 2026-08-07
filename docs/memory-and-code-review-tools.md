@@ -39,7 +39,7 @@ Written from the actual running config and source code, not assumed behavior.
   User message ──────►  │  pre_llm_call hook                             │
                         │    └─ grounding_client.py → daemon socket      │
                         │    └─ embed message (nomic-embed-text, 768d)   │
-                        │    └─ parallel fan-out to 7 Qdrant collections │
+                        │    └─ parallel fan-out to 3 Qdrant collections │
                         │    └─ inject MEMORY MATCH block (~100ms)       │
                         │    └─ inject rules files (≤1200 chars)         │
                         │                                                 │
@@ -48,7 +48,7 @@ Written from the actual running config and source code, not assumed behavior.
                         │  pre_tool_call hook (every tool use)           │
                         │    └─ grounding enforcement (read before write) │
                         │    └─ dangerous command detection (log; BLOCK  │
-                        │       if BLOCK_MODE=1 in config)               │
+                        │       if HOOK_BLOCK_MODE=1 in config)          │
                         │    └─ audit log write                          │
                         │                                                 │
   Session ends ──────►  │  on_session_end hook                           │
@@ -67,7 +67,7 @@ Written from the actual running config and source code, not assumed behavior.
     hermes-grounding            — systemd --user — grounding daemon (UNIX socket)
 
   Interactive tools (in-session):
-    loci-mcp (hermes_memory)  — investigation/memory layer, 25 tools (see Section 2d)
+    loci-mcp (hermes_memory)  — investigation/memory/code-graph layer, 71 tools (see Section 2d)
     Mnemosyne MCP             — episodic facts, store/recall with semantic search
     Serena MCP                — LSP-powered code navigation (symbols, refs, diagnostics)
     CocoIndex MCP             — semantic code search (ccc) across indexed repos
@@ -198,13 +198,31 @@ $HERMES_MEMORY_DIR/
     YYYY-MM-DD.jsonl     — global cross-investigation audit log
 ```
 
-**finding_type enum:** `observed` | `inferred` | `assumed` | `gap`
+**finding_type enum:** `observed` | `inferred` | `assumed` | `gap` | `procedure`
 - `observed` — from a direct tool response; cite source and key values
 - `inferred` — reasoned from observations but not directly stated
 - `assumed` — working hypothesis with no current evidence
 - `gap` — something that should be checked but hasn't been
+- `procedure` — a reusable step-by-step runbook/playbook entry; takes
+  `procedure_preconditions`, `procedure_steps`, `procedure_postconditions`
 
-**25 MCP tools provided by loci-mcp:**
+**71 MCP tools provided by loci-mcp** — 60 decorated `@mcp.tool()` in `mcp/server.py`
+plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_kuzu)`.
+The tables below cover the 24 most-used ones. The rest are:
+`investigation_as_of`, `investigation_share`, `investigation_unshare`,
+`investigation_verify_all`, `investigation_reason`, `investigation_export`,
+`investigation_import`, `finding_resolve`, `procedure_attempt`, `procedure_search`,
+`entity_list`, `entity_timeline`, `contract_declare`, `contract_query`,
+`contract_check`, `wiring_obligation_declare`, `wiring_obligation_list`,
+`wiring_obligation_resolve`, `llm_local`, `generate_batch`, `query_expand`,
+`verify_finding`, `classify_text`, `compress_text`, `semantic_dedup`,
+`semantic_relevance`, `loci_health`, `ground`, `memory_surface`, `memory_promote`,
+`memory_demote`, `memory_hints`, `memory_route`, `causal_edges_list`,
+`conflict_list`, `conflict_resolve`, and the 11 code-graph tools
+(`code_graph_ingest`, `code_graph_query`, `code_memory_relink`, `code_memory_map`,
+`symbol_impact`, `impact_report`, `finding_code_context`,
+`investigation_code_briefing`, `subsystem_report`,
+`related_investigations_via_code`, `dead_code_candidates`).
 
 #### Investigation CRUD
 
@@ -319,32 +337,44 @@ The daemon must be running for the fast path. See Section 4.
 ```
 1. Receive the user's message text
 2. Embed via nomic-embed-text on <your-host> Ollama → 768-dim vector
-3. Fan out to 7 Qdrant collections in parallel (ThreadPoolExecutor, 8 workers):
+3. Fan out to the 3 base Qdrant collections in parallel (ThreadPoolExecutor, 8 workers):
    - mnemosyne          — personal facts, preferences
    - hermes_sessions    — past conversation history
    - hermes_memory      — investigation notes, findings (written by loci-mcp)
-   - ecc_skills         — skill library
-   - agent_core_chunks  — knowledge base (infra, code, research)
-   - (any extra collections configured via GROUNDING_EXTRA_COLLECTIONS)
-4. Score fusion: Qdrant cosine_score × importance_weight (where available)
+   - plus any collections named in GROUNDING_EXTRA_COLLECTIONS (empty by default) — e.g.
+     ecc_skills (skill library), agent_core_chunks (infra/code/research KB)
+4. Rank: multi-signal score = 0.50 × relevance (Qdrant cosine × importance_weight)
+   + 0.20 × recency (7-day half-life) + 0.15 × source trust + 0.15 × record type,
+   plus a stigmergic pheromone boost on memories retrieved in earlier turns
+   (HOOK_RANKER_W_*, HOOK_RECENCY_HALFLIFE_DAYS, HOOK_PHERO_BETA)
 5. Filter: score ≥ 0.55, importance ≥ 0.2, deduplicate
-6. Take top 5 results, truncate each to 200 chars
+6. Take top HOOK_RECALL_TOP_K results (code default 3; `.env.example` ships 5),
+   truncate each to 200 chars
 7. Inject MEMORY MATCH block into the system prompt
 8. Inject rules files (≤1200 chars from ~/.hermes/rules/)
 ```
 
 **Guard conditions — hook skips if:**
-- Message is < 15 chars (too short to embed meaningfully)
-- Session is a subagent (avoid circular context injection)
+- Message is empty after stripping, or is a navigation-only slash command
+  (`/help`, `/clear`, `/compact`, `/cost`, `/status`, `/history`, `/ide`,
+  `/doctor`, `/login`, `/logout`) — code-affecting commands like `/fix`,
+  `/review` and `/remember` are still grounded, and there is no minimum
+  message length
 - Ollama is unreachable (falls back to BeamMemory FTS path — best-effort,
   requires mnemosyne library importable)
 
+**Subagent sessions are not skipped.** They take a lightweight path instead of the
+full fan-out: a single `hermes_memory` search capped at top 2, plus the rules
+summary. Skipping them (the pre-v4 behaviour) left workflow subagents ungrounded,
+which is where wrong import names and renamed fields crept in.
+
 **Output injected into context looks like:**
 ```
-[MEMORY MATCH — top 5 results across 7 collections]
-[mnemosyne 0.87] User prefers direct commands over explanations...
-[hermes_sessions 0.82] ...investigated proxy.ts dead middleware June 13...
-[agent_core_chunks 0.79] ...FedAvg implementation requires matching...
+MEMORY MATCH (3 results from 3 Qdrant collections) for "why is auth failing":
+[mnemosyne|0.87] User prefers direct commands over explanations...
+[hermes-sessions|0.82] ...investigated proxy.ts dead middleware June 13...
+[hermes-memory|0.79] ...auth guard short-circuits when the header is absent...
+Use mcp_mnemosyne_mnemosyne_recall for full content if relevant. Disclose recalled context to the user if it changes your answer.
 ```
 
 **Also reads:** `~/.hermes/.env` at startup for env overrides.
@@ -361,16 +391,23 @@ The hook's env vars are set both in config.yaml hooks stanza AND this .env file.
    first. Prevents "edit without reading" patterns.
 
 2. **Dangerous command detection** — scans terminal commands for:
-   `rm -rf`, `DROP TABLE`, `force-push`, `kubectl delete`, `chmod +x + execute`
-   Logs a warning to the audit log. Set `BLOCK_MODE=1` to also enforce blocking.
-   **Default is `BLOCK_MODE=0` — log only, no blocking.** This is an advisory
-   control in current config. Treat it as a record, not a guarantee.
+   `rm -rf`, `DROP TABLE/DATABASE/SCHEMA`, `git push --force` (without
+   `--force-with-lease`) and `git push -f`, `kubectl delete namespace`,
+   `docker system|volume|image prune`, `dd if=`, `mkfs`, `shred`, and raw device
+   writes (`> /dev/sdX`) — plus a separate Hades/Miasma supply-chain IOC pattern set.
+   Logs a warning to the audit log. Set `HOOK_BLOCK_MODE=1` to also enforce blocking.
+   **Default is `HOOK_BLOCK_MODE=0` — log only, no blocking of terminal commands.**
+   One narrow exception blocks even at the default: a write to an agent config file
+   (CLAUDE.md, AGENTS.md, `.cursorrules`, …) whose content matches a prompt-injection
+   pattern or whose target matches a supply-chain path IOC. Treat everything else as
+   a record, not a guarantee.
 
 3. **Audit log** — writes every tool call to a local audit log (capped at 5MB).
 
 **GROUNDING_TOOLS** (always allowed, no audit noise):
   All Mnemosyne MCP tools, Serena read tools, session_search, web_search,
-  web_extract, read_file, search_files, Open Design read tools.
+  web_extract, read_file, search_files, and the Claude Code read tools (Read,
+  ToolSearch, WebFetch, WebSearch). Open Design tools were removed 2026-06-13.
 
 ---
 
@@ -556,7 +593,8 @@ cd ~/open-design/deploy && docker compose up -d
 
 **Tools available:** `mcp_open_design_get_artifact`, `mcp_open_design_get_project`,
 `mcp_open_design_list_projects`, `mcp_open_design_search_files`, etc.
-These are GROUNDING_TOOLS — always allowed, no audit noise.
+These were removed from GROUNDING_TOOLS on 2026-06-13 — Open Design calls are now
+audited like any other tool.
 
 ### 6d. deep_think MCP (parallel perspective reasoning)
 
@@ -933,7 +971,9 @@ rules/quality.md               — verification and correctness rules
 rules/infra.md                 — infrastructure and security rules
 rules/knowledge.md             — skill/knowledge management rules
 skills/                        — 186 skill files across 26 categories
-mcp/server.py                  — loci-mcp server (hermes_memory MCP, 25 tools)
+mcp/server.py                  — loci-mcp server (hermes_memory MCP, 60 tools)
+mcp/graph_tools.py             — 11 code-graph tools registered onto the same
+                                 server (71 tools total at runtime)
 scripts/grounding_client.py    — pre_llm_call hook entry (UNIX socket client)
 scripts/grounding_daemon.py    — persistent daemon (systemd --user)
 scripts/hooks/pre_llm_grounding.py  — grounding logic v3
@@ -943,7 +983,9 @@ scripts/state_db_qdrant_sync.py     — 5-min catch-all cron sync
 scripts/mnemosyne_qdrant_sync.py    — 30-min Mnemosyne → Qdrant sync
 scripts/mnemosyne_activity_check.py — gate script for consolidation crons
 scripts/mnemosyne_sleep_all.sh      — CLI-level sleep script
-cron/jobs.json                 — all 5 cron job definitions
+scripts/dtl_harvest.sh              — deep-think-loci harvest (ships disabled)
+cron/jobs.json                 — all 6 cron job definitions (5 enabled, plus
+                                 deep-think-loci-harvest, disabled by default)
 state.db                       — SQLite session store (session_search queries this)
 mnemosyne/data/                — Mnemosyne SQLite + embeddings (local)
 hermes.db                      — Hermes internal state
@@ -994,13 +1036,15 @@ vectors. If `MNEMOSYNE_EMBEDDING_DIM` is set to 768 (the default) and Ollama
 becomes unavailable, fastembed upserts will fail silently with a dimension
 mismatch. Either set `EMBED_DIM=384` when using fastembed, or restore Ollama.
 
-**loci-mcp tool index (`mcp/server.py` — 25 `@mcp.tool()` functions):**
+**loci-mcp tool index (`mcp/server.py` — 60 `@mcp.tool()` functions, plus 11
+registered by `mcp/graph_tools.py` for 71 total at runtime; the 24 core
+investigation/memory tools are indexed below):**
 
 | Tool | Brief description |
 |------|------------------|
 | `investigation_start` | Create or resume an investigation by ID. Idempotent — resuming returns the current manifest without overwriting. |
 | `investigation_load` | Retrieve manifest and recent findings for context recovery at session start. Retracted findings excluded by default. |
-| `investigation_store` | Record a finding (observed/inferred/assumed/gap). Writes to JSONL, Mnemosyne, and Qdrant `hermes_memory`. |
+| `investigation_store` | Record a finding (observed/inferred/assumed/gap/procedure). Writes to JSONL, Mnemosyne, and Qdrant `hermes_memory`. |
 | `investigation_note` | Update manifest fields: context, hypothesis, next_step, open questions, checked sources, or close the investigation. |
 | `investigation_reflect` | Synthesize current investigation state — finding breakdown, open questions, gaps, and advisory self-check. |
 | `investigation_search` | Hybrid Mnemosyne+Qdrant search over findings with cross-encoder reranking. Retracted findings excluded by default. |
@@ -1033,7 +1077,7 @@ HOOK_RULES_MAX_CHARS=1200     total chars budget for rules injection
 HOOK_EMBED_TIMEOUT=3.0        Ollama embed call timeout (seconds)
 HOOK_QDRANT_TIMEOUT=2.0       per-collection Qdrant query timeout
 HOOK_QDRANT_WORKERS=8         parallel workers for fan-out
-BLOCK_MODE=0                  0=log only, 1=block dangerous commands
+HOOK_BLOCK_MODE=0             0=log only, 1=block dangerous commands
 ```
 
 ---
@@ -1103,10 +1147,12 @@ outside the hook (manual runs, cron) use shell env, not the hook's .env.
 Always pass env vars explicitly when running hook scripts manually.
 
 ### 13. Dangerous command detection is advisory by default
-`BLOCK_MODE=0` means the pre_tool_call hook logs dangerous commands but does
+`HOOK_BLOCK_MODE=0` means the pre_tool_call hook logs dangerous commands but does
 NOT block them. An `rm -rf` or `kubectl delete` will proceed. This is intentional
 for development flexibility but means the "dangerous command detection" is a
-record, not a safety net. Set `BLOCK_MODE=1` if you want enforcement.
+record, not a safety net. Set `HOOK_BLOCK_MODE=1` if you want enforcement.
+(One case blocks even at the default: writing injection-flagged or supply-chain-IOC
+content to an agent config file such as CLAUDE.md, AGENTS.md, or `.cursorrules`.)
 
 ### 14. fastembed fallback produces 384-dim vectors
 When Ollama is unavailable, the loci-mcp server falls back to
