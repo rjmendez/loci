@@ -54,7 +54,7 @@ With optional Mnemosyne:
 | `QDRANT_URL` | _(unset — Qdrant search disabled)_ | Qdrant instance URL, e.g. `http://localhost:6333` |
 | `QDRANT_API_KEY` | _(none)_ | Qdrant API key if required |
 | `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Name of the shared findings collection (used verbatim, nothing is appended) |
-| `OLLAMA_BASE_URL` | _(unset — no dense embeddings; batch falls back to fastembed)_ | Ollama instance URL, e.g. `http://localhost:11434` |
+| `OLLAMA_BASE_URL` | _(unset — falls back to 384-dim fastembed, which mismatches the 768-dim collection unless `EMBED_DIM=384`)_ | Ollama instance URL, e.g. `http://localhost:11434` |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `HERMES_MEMORY_DIR` | `~/.hermes/memory-sessions` | Local JSONL storage root |
 | `HERMES_MNEMO_BANK` | `default` | Mnemosyne bank name (optional) |
