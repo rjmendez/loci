@@ -11,17 +11,21 @@ configured schedule and must be run on demand.
 ## Grounding pipeline
 
 ### `scripts/hooks/pre_llm_grounding.py`
-**Purpose:** Per-turn grounding. Embeds user message intent, fans out to 7 Qdrant
-collections in parallel, fuses scores, keyword-reranks, injects MEMORY MATCH context.
+**Purpose:** Per-turn grounding. Embeds user message intent, fans out to 3 base Qdrant
+collections (`mnemosyne`, `hermes_sessions`, `hermes_memory`) plus any named in
+`GROUNDING_EXTRA_COLLECTIONS`, in parallel; fuses scores, keyword-reranks, injects
+MEMORY MATCH context.
 
 **Invoked by:** `grounding_client.py` (via UDS or subprocess) on every UserPromptSubmit.
 
 **Key env vars:**
-- `QDRANT_URL` (default: `http://localhost:6333`)
-- `OLLAMA_BASE_URL` (default: `http://localhost:11434`)
+- `QDRANT_URL` (no default — Qdrant fan-out is skipped if unset)
+- `OLLAMA_BASE_URL` (no default — embedding falls back to BeamMemory FTS if unset)
 - `QDRANT_API_KEY`
 - `MNEMOSYNE_EMBEDDING_MODEL` (default: `nomic-embed-text`)
-- `HOOK_RECALL_TOP_K` (default: `5`)
+- `GROUNDING_EXTRA_COLLECTIONS` (default: empty) — comma-separated extra collections
+  to search alongside the 3 base ones
+- `HOOK_RECALL_TOP_K` (default: `3`; the shipped `.env.example` sets `5`)
 - `HOOK_RECALL_MIN_SCORE` (default: `0.55`)
 - `HOOK_QDRANT_WORKERS` (default: `8`)
 
@@ -119,12 +123,15 @@ a minimum accumulated signal count before the expensive embedding pass runs.
 
 ### `scripts/mnemosyne_qdrant_sync.py`
 **Purpose:** Syncs all Mnemosyne memories to the Qdrant `mnemosyne` collection.
-Uses embed-worker (`:30888`) and copies vectors from `agent_core_chunks` into `mnemosyne`.
-Runs incrementally to avoid re-uploading already-synced entries.
+Embeds via Ollama `/v1/embeddings` (`MNEMOSYNE_EMBEDDING_API_URL`) and upserts directly
+into the `mnemosyne` collection. Runs incrementally to avoid re-uploading already-synced
+entries.
 
 **Cron:** every 30m (`mnemosyne-qdrant-sync` in `cron/jobs.json`)
 
-**Key env vars:** `QDRANT_URL`, `EMBED_WORKER_URL` (default: `http://localhost:30888`)
+**Key env vars:** `QDRANT_URL`, `MNEMOSYNE_EMBEDDING_API_URL`, `MNEMOSYNE_EMBEDDING_MODEL`
+(default: `nomic-embed-text`), `MNEMOSYNE_DATA_DIR` (default: `~/.hermes/mnemosyne/data`),
+`EMBED_WORKER_URL` (no default; read but currently unused — this script embeds via Ollama only)
 
 ---
 
@@ -167,7 +174,7 @@ how to..."), stores synthetic positives back to both Mnemosyne SQLite and the Qd
 aggregates failures by tool_name, finds matching SKILL.md files, writes or updates
 "## Learned constraints" sections with top-3 failure patterns.
 
-**Cron:** every 120m
+**Cron:** No configured schedule — run on demand.
 
 **Key env vars:**
 - `STATE_DIR` (default: `~/.claude/hook-state`)
@@ -222,7 +229,7 @@ all SKILL.md frontmatter.
 **Run on demand** (or weekly; no cron currently)
 
 **Key env vars:**
-- `SKILL_SHADOW_THRESHOLD` (default: `0.92`)
+- `SHADOW_THRESHOLD` (default: `0.92`)
 - `OLLAMA_URL`, `EMBED_MODEL`
 
 **Research basis:** Skill Shadowing (arxiv 2605.24050, May 2026)
@@ -335,6 +342,7 @@ the workflow defaults to. Idempotent.
 | `state_db_qdrant_sync.py` | `state-db-qdrant-sync` | every 5m |
 
 Scripts not in this table (`ebbinghaus_consolidation.py`, `amem_consolidation.py`,
-`agentHER_relabeler.py`, `exif_skill_discovery.py`, `score_trace_collector.py`,
-`skillops_maintenance.py`, `memgas_hierarchy.py`) have no configured cron schedule
+`agentHER_relabeler.py`, `skill_annotation_updater.py`, `exif_skill_discovery.py`,
+`score_trace_collector.py`, `skillops_maintenance.py`, `memgas_hierarchy.py`)
+have no configured cron schedule
 and must be run on demand.

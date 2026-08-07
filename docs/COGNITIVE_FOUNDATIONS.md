@@ -46,7 +46,7 @@ cron intervals.
 |---|---|
 | `ebbinghaus_consolidation.py` triggers on R < 0.3 | Consolidate when 70%+ of memory trace has likely decayed |
 | Stability: FSRS DSR model — `S = (1 + recall_count)^(1/D) * (D/2)` initialized; success/failure FSRS update rules applied thereafter | Empirically outperforms SM-2 and linear approximations (open-spaced-repetition/FSRS); maps directly to the Difficulty/Stability/Retrievability DSR model |
-| Ebbinghaus cron at 47-minute intervals (prime) | Avoids resonance with other consolidation jobs; decay is checked per entry, not assumed |
+| Ebbinghaus consolidation is decay-triggered, not interval-triggered — no cron ships enabled; run on demand, or on a prime-numbered interval if you schedule it | Decay is checked per entry rather than assumed, so the cadence is a sampling rate, not the mechanism; a prime interval avoids resonance with the other consolidation jobs |
 | `working_memory.last_recalled` and `recall_count` drive Ebbinghaus stability updates | Recall history is load-bearing state — updated on every consolidation run |
 
 **FSRS parameters (all tunable via env vars):**
@@ -233,7 +233,7 @@ window allows memories to be updated with new context or corrected.
 | Design decision | Empirical basis |
 |---|---|
 | `agentHER_relabeler.py` — reads failure memories, runs Ollama relabeling, writes positive traces back | Computationally equivalent to reconsolidation: the memory is "recalled" (read), transformed (relabeled), and re-encoded (upserted) |
-| AgentHER runs nightly (720m cron), not in real time | Reconsolidation requires a consolidation window; nightly batch mirrors the offline consolidation that occurs during sleep in biological systems |
+| AgentHER runs as an offline batch (on demand; nightly is the intended cadence), not in real time | Reconsolidation requires a consolidation window; batch relabeling mirrors the offline consolidation that occurs during sleep in biological systems |
 
 **DB schema note:** `agentHER_relabeler.py` reads from the `working_memory` table directly.
 `exif_skill_discovery.py` reads from a `memories` table (with a `bank` column filter for

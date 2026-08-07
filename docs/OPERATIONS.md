@@ -10,7 +10,7 @@ Override any default by exporting the variable before running, or by editing
 
 | Variable | Default | Used by |
 |---|---|---|
-| `QDRANT_URL` | `http://localhost:6333` | all Qdrant-touching scripts |
+| `QDRANT_URL` | _(none — required; unset means Qdrant steps are skipped or the script errors out, never a localhost fallback)_ | all Qdrant-touching scripts |
 | `QDRANT_API_KEY` | _(none)_ | all Qdrant-touching scripts |
 | `OLLAMA_URL` | _(none, required)_ | most embedding + generation scripts (memgas_hierarchy.py, ebbinghaus_consolidation.py, amem_consolidation.py, agentHER_relabeler.py, skillops_maintenance.py, exif_skill_discovery.py, score_trace_collector.py, eval/harness.py) |
 | `OLLAMA_BASE_URL` | _(none)_ | hook scripts only: hooks/pre_llm_grounding.py, hooks/session_end_sync.py, swr_replay.py |
@@ -48,7 +48,7 @@ Hook scripts read `OLLAMA_BASE_URL` and append `/v1` internally.
 
 ## Cron jobs
 
-Live cron config: `cron/jobs.json` (in repo root; deployed path depends on your cron runner setup).
+Live cron config: `cron/jobs.json` (in repo root; deployed path depends on your cron runner setup). Six jobs are defined; the five enabled ones are below. `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled and is omitted from the table.
 
 | ID | Name | Interval | Script |
 |---|---|---|---|

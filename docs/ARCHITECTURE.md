@@ -30,8 +30,10 @@ Primary structured store. Tables queried by this codebase:
 | `facts` | Structured fact store | Updated by fact-extraction pipeline |
 | `gists` | Compressed memory gists | Produced by consolidation |
 
-> Note: `graph_edges`, `conflicts`, and `annotations` may exist in the Mnemosyne
-> schema but are not directly queried by the scripts in this repository.
+> Note: `graph_edges` and `conflicts` *are* queried — written by
+> `scripts/amem_consolidation.py` and read/updated by `scripts/glymphatic_sweep.py`,
+> `scripts/spreading_activation.py`, and `scripts/mnem_fix.py`. `annotations` may
+> exist in the Mnemosyne schema but is not directly queried by this repository.
 
 ### Qdrant (configured via `QDRANT_URL`)
 
@@ -82,12 +84,13 @@ pre_llm_grounding.py (v3)
     ├── 6. Multi-signal ranking on four axes:
     │       relevance (cosine × importance) · recency (exponential decay)
     │       · trust (confidence tier) · record type (observed > inferred > assumed > gap)
-    │       Weights: RANKER_W_RELEVANCE, RANKER_W_RECENCY, RANKER_W_TRUST, RANKER_W_TYPE
+    │       Weights: HOOK_RANKER_W_RELEVANCE, HOOK_RANKER_W_RECENCY, HOOK_RANKER_W_TRUST,
+    │                HOOK_RANKER_W_TYPE
     ├── 7. Stigmergic pheromone deposit on retrieved hermes_memory points
-    │       (pheromone stored in Qdrant payload; decays by PHERO_HALFLIFE_H)
+    │       (pheromone stored in Qdrant payload; decays by HOOK_PHERO_HALFLIFE_H)
     ├── 8. MMR diversity selection with ε-exploration
-    │       (MMR_LAMBDA controls relevance-vs-diversity trade-off;
-    │        PHERO_EPSILON controls random exploration probability)
+    │       (HOOK_MMR_LAMBDA controls relevance-vs-diversity trade-off;
+    │        HOOK_PHERO_EPSILON controls random exploration probability)
     ├── 9. Optional spreading activation enrichment (SA-RAG, arxiv 2512.15922)
     │       Seeds from mnemosyne hits with mnemosyne_id payload;
     │       skipped if SA takes > HOOK_SA_TIMEOUT_MS or SA module is absent
@@ -115,9 +118,9 @@ grounding injection before tool calls.
 | `GROUNDING_EXTRA_COLLECTIONS` | `""` | Extra Qdrant collections for the grounding hook only |
 | `HOOK_SA_ENABLED` | `true` | Enable spreading activation enrichment |
 | `HOOK_SA_TIMEOUT_MS` | `25` | SA budget in ms; skipped if exceeded |
-| `MMR_LAMBDA` | `0.75` | MMR relevance weight (1.0 = pure relevance) |
-| `PHERO_BETA` | `0.08` | Pheromone score boost coefficient |
-| `PHERO_HALFLIFE_H` | `24` | Pheromone evaporation half-life (hours) |
+| `HOOK_MMR_LAMBDA` | `0.75` | MMR relevance weight (1.0 = pure relevance) |
+| `HOOK_PHERO_BETA` | `0.08` | Pheromone score boost coefficient |
+| `HOOK_PHERO_HALFLIFE_H` | `24` | Pheromone evaporation half-life (hours) |
 
 > `GROUNDING_EXTRA_COLLECTIONS` is read independently by the grounding hook.
 > `EXTRA_RAG_COLLECTIONS` is a separate variable read by `a2a_server/server.py`
@@ -176,8 +179,10 @@ all hooks.
 
 ## MCP server (loci-mcp)
 
-`mcp/server.py` is registered as `FastMCP('loci')` and exposes 18 tools under
-the `loci-mcp` server name. Key env vars:
+`mcp/server.py` is registered as `FastMCP('loci')` and exposes 71 tools under
+the `loci-mcp` server name — 60 declared with `@mcp.tool()` in `server.py` plus 11
+code-graph tools registered from `mcp/graph_tools.py` by
+`graph_tools.register(mcp, _get_kuzu)` at import time. Key env vars:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -200,18 +205,16 @@ the `loci-mcp` server name. Key env vars:
 
 ## Consolidation and self-improvement pipeline
 
-Cron jobs (live in `~/.hermes/cron/jobs.json`):
+Cron jobs (defined in `cron/jobs.json`; deployed copy lives in `~/.hermes/cron/`):
 
 | Job | Script / Command | Interval | Purpose |
 |---|---|---|---|
 | mnemosyne-consolidation | `mnemosyne_activity_check.py` (agent decides whether to call `mnemosyne_sleep`) | 20m | Activity-gated Mnemosyne consolidation |
 | mnemosyne-session-summarizer | `mnemosyne_activity_check.py` (agent writes memories, triples, scratchpad) | 20m | Full session archival: memories, triples, scratchpad, sleep |
 | mnemosyne-sleep-cli | `mnemosyne_sleep_all.sh` | 30m | Prune expired working memory (no-agent mode) |
-| ebbinghaus-memory-decay | `ebbinghaus_consolidation.py` | 47m | Decay-triggered Qdrant refresh |
-| amem-consolidation | `amem_consolidation.py` | 61m | Cross-link graph + conflict detection |
-| skill-annotation-updater | `skill_annotation_updater.py` | 120m | SKILL.md learned constraints |
-| agentHER-relabeler | `agentHER_relabeler.py` | 720m | Failure → positive trace relabeling |
-| eval-harness-weekly | `eval/harness.py` | 10080m | Longitudinal grounding quality score |
+| deep-think-loci-harvest | `dtl_harvest.sh` | 7d | Rebuild dataset + retrain the bleed-detector (`enabled: false` — retrains a model from the corpus; enable deliberately) |
+| mnemosyne-qdrant-sync | `mnemosyne_qdrant_sync.py` | 30m | Sync Mnemosyne → mnemosyne Qdrant collection (no-agent mode) |
+| state-db-qdrant-sync | `state_db_qdrant_sync.py` | 5m | Sync Hermes state.db sessions → hermes_sessions Qdrant (no-agent mode) |
 
 > The `mnemosyne-consolidation` and `mnemosyne-session-summarizer` jobs both use
 > `mnemosyne_activity_check.py` as the script. The cron runner provides that
@@ -225,8 +228,11 @@ On-demand scripts (not croned):
 - `exif_skill_discovery.py` — EXIF skill gap analysis → candidate SKILL.md
 - `score_trace_collector.py` — build SCoRe fine-tuning dataset from logs
 - `skillops_maintenance.py` — skill shadow detection + last_validated update
-- `state_db_qdrant_sync.py` — sync Hermes state.db sessions → hermes_sessions Qdrant
-- `mnemosyne_qdrant_sync.py` — sync Mnemosyne → mnemosyne Qdrant collection
+- `ebbinghaus_consolidation.py` — decay-triggered Qdrant refresh
+- `amem_consolidation.py` — cross-link graph + conflict detection
+- `skill_annotation_updater.py` — SKILL.md learned constraints
+- `agentHER_relabeler.py` — failure → positive trace relabeling
+- `eval/harness.py` — longitudinal grounding quality score
 
 ---
 
@@ -259,16 +265,16 @@ post_tool_failure_reflection.sh
     │  - Mnemosyne (importance=7)
     │  - guard_tool_reflections.log (JSONL)
     │
-    ├──► ebbinghaus_consolidation.py (every 47m)
+    ├──► ebbinghaus_consolidation.py (on demand)
     │    Re-embeds decayed memories → Qdrant refresh
     │
-    ├──► amem_consolidation.py (every 61m)
+    ├──► amem_consolidation.py (on demand)
     │    Builds semantic cross-links, flags near-duplicate conflicts
     │
-    ├──► skill_annotation_updater.py (every 120m)
+    ├──► skill_annotation_updater.py (on demand)
     │    Reads guard_tool_reflections.log → updates SKILL.md "Learned constraints"
     │
-    ├──► agentHER_relabeler.py (every 720m)
+    ├──► agentHER_relabeler.py (on demand)
     │    Relabels failure memories as positive examples via Ollama
     │    Writes synthetic positives back to Mnemosyne + Qdrant
     │
@@ -302,6 +308,7 @@ credentials.
 | `memory_sleep` | Trigger Mnemosyne sleep consolidation via dashboard API |
 | `rag_search` | Fan-out semantic search across all configured Qdrant collections |
 | `context_broadcast` | Store locally and push to all peer A2A endpoints (PEER_A2A_URLS) |
+| `memory_prime` | SAR-style priming broadcast — decaying skepticism boost for a topic cluster, written to `~/.hermes/sar-priming.json` and optionally pushed to peers |
 | `mnemosyne_triple_add` | Store a knowledge triple in the SQLite `triples` table |
 | `mnemosyne_triple_query` | Query the knowledge graph by subject/predicate/object |
 | `gpu_inference` | Run a prompt through local Ollama |
@@ -320,7 +327,7 @@ credentials.
 | `HERMES_AGENT_ID` | `hermes-agent` | Agent identity tag |
 | `QDRANT_URL` | _(none)_ | Qdrant instance URL |
 | `QDRANT_API_KEY` | `""` | Qdrant API key |
-| `MNEMOSYNE_EMBEDDING_API_URL` | _(none)_ | Embedding base URL (with `/v1`) |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `http://localhost:11434/v1` | Embedding base URL (with `/v1`) |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model |
 | `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension |
 | `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Directory containing mnemosyne.db |
