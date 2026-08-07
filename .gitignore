@@ -68,3 +68,6 @@ backends.toml
 # A2A deploy env (holds PEER_A2A_TOKENS_JSON / PEER_A2A_TOTP_SEEDS_JSON)
 .a2a-deploy.env
 .a2a-deploy.env.bak-*
+
+# Claude Code agent worktrees (transient; created by workflow isolation)
+.claude/worktrees/
