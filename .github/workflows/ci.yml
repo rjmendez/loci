@@ -94,7 +94,59 @@ jobs:
           pip install aiohttp
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short --timeout=30
+        run: pytest tests/ hooks/tests/ -v --tb=short --timeout=30
+
+  test-mlops:
+    name: MLOps tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-timeout
+          # mlops/embedding and mlops/finetune import these at module scope,
+          # so collection fails without them.
+          pip install numpy transformers datasets sentence-transformers
+
+      - name: Run tests
+        # 120s, not the 30s used elsewhere: the first import of
+        # sentence_transformers/torch on a cold runner takes over a minute and
+        # trips a shorter per-test timeout as ~18 spurious errors.
+        run: pytest mlops -v --tb=short --timeout=120
+
+  test-eval:
+    name: Eval tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-timeout
+          # numpy/joblib/sklearn are imported INSIDE functions in
+          # grounding_gate_oos_eval and grounding_gate_qf_eval, so a scan of
+          # module-level imports alone misses them and the job fails at runtime.
+          pip install numpy joblib scikit-learn
+
+      - name: Run tests
+        run: pytest eval -v --tb=short --timeout=30
 
   lint:
     name: Lint (ruff)
