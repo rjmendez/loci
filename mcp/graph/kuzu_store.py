@@ -69,12 +69,6 @@ except Exception:  # pragma: no cover - environment without kuzu/ladybug
 
 __all__ = ["KuzuStore"]
 
-# Entity buckets considered "distinctive" — mirrors contagion._DISTINCTIVE_BUCKETS.
-_DISTINCTIVE_BUCKETS = (
-    "urls", "url", "hosts", "hostnames", "host", "paths", "path",
-    "ips", "ip", "hashes", "cves", "emails", "identifiers", "endpoints",
-)
-
 # Query shapes that mutate the graph — rejected by code_query's read-only guard.
 _WRITE_GUARD_RE = re.compile(
     r"\b(CREATE|DELETE|SET|DROP|COPY|ALTER|MERGE)\b", re.IGNORECASE
@@ -451,23 +445,6 @@ class KuzuStore:
             return True
         except Exception as exc:
             logger.debug("link_references failed: %s", exc)
-            return False
-
-    @_writes(False)
-    def link_related(self, a: str, b: str) -> bool:
-        if not self.ok or not a or not b or a == b:
-            return False
-        try:
-            self._exec("MERGE (i:Investigation {id:$id})", {"id": str(a)})
-            self._exec("MERGE (i:Investigation {id:$id})", {"id": str(b)})
-            self._exec(
-                "MATCH (x:Investigation {id:$a}), (y:Investigation {id:$b}) "
-                "MERGE (x)-[:RELATED]->(y)",
-                {"a": str(a), "b": str(b)},
-            )
-            return True
-        except Exception as exc:
-            logger.debug("link_related failed: %s", exc)
             return False
 
     # ------------------------------------------------------------------ #
@@ -936,21 +913,6 @@ class KuzuStore:
             logger.debug("delete_code_under failed: %s", exc)
             return out
 
-    def _resolve_symbol(self, ref: str) -> Optional[str]:
-        """Resolve a CALLS dst to a CodeSymbol id: try id, then by name (best-effort)."""
-        try:
-            rows = self._rows("MATCH (s:CodeSymbol {id:$id}) RETURN s.id", {"id": ref})
-            if rows:
-                return rows[0][0]
-            rows = self._rows(
-                "MATCH (s:CodeSymbol) WHERE s.name=$n RETURN s.id LIMIT 1", {"n": ref}
-            )
-            if rows:
-                return rows[0][0]
-        except Exception:
-            pass
-        return None
-
     # ------------------------------------------------------------------ #
     # Reads (fail-open)
     # ------------------------------------------------------------------ #
@@ -1021,6 +983,7 @@ class KuzuStore:
                 _bump(r[0], r[1], "derivation_links", r[2])
 
             # Explicit RELATED links (either direction) count as a shared signal.
+            # NOTE: no writer creates RELATED edges today, so this lane always scores 0.
             for r in self._rows(
                 "MATCH (a:Investigation {id:$id})-[:RELATED]-(b:Investigation) "
                 "RETURN DISTINCT b.id, b.title",

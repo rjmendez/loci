@@ -18,14 +18,18 @@ exception yields an empty (but well-formed) result dict. Nothing here raises.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import tree_sitter as ts
 
+logger = logging.getLogger("loci-mcp.code_parse")
+
 try:  # language grammars
     from tree_sitter_language_pack import get_language as _get_language
-except Exception:  # pragma: no cover - grammar pack missing entirely
+except Exception as _exc:  # pragma: no cover - grammar pack missing entirely
+    logger.debug("code_parse: tree-sitter language pack unavailable: %s", _exc)
     _get_language = None  # type: ignore
 
 
@@ -61,7 +65,8 @@ def detect_lang(path: str) -> Optional[str]:
     try:
         _, ext = os.path.splitext(path)
         return LANG_BY_EXT.get(ext.lower())
-    except Exception:
+    except Exception as exc:
+        logger.debug("code_parse: detect_lang failed for %r: %s", path, exc)
         return None
 
 
@@ -117,17 +122,6 @@ KINDS: Dict[str, Dict[str, str]] = {
         "method_declaration": "method",
         "type_spec": "struct",  # refined by the query capture name
     },
-    "c": {
-        "function_definition": "function",
-        "struct_specifier": "struct",
-        "enum_specifier": "enum",
-    },
-    "cpp": {
-        "function_definition": "function",
-        "struct_specifier": "struct",
-        "class_specifier": "class",
-        "enum_specifier": "enum",
-    },
 }
 KINDS["tsx"] = KINDS["typescript"]
 
@@ -136,7 +130,6 @@ CLASS_LIKE: Dict[str, set] = {
     "python": {"class_definition"},
     "kotlin": {"class_declaration", "object_declaration"},
     "rust": {"impl_item", "trait_item"},
-    "cpp": {"class_specifier", "struct_specifier"},
 }
 
 # Tree-sitter queries. Definition captures are named ``d.<kind>`` so the kind is
@@ -548,7 +541,23 @@ def _import_map_entries(node, lang: str):
 # --------------------------------------------------------------------------- #
 # Query capture normalisation
 # --------------------------------------------------------------------------- #
-def _run_query(lang_obj, query_str: str, root) -> Dict[str, List[Any]]:
+# Warn-once keys for _run_query total failures: (lang, tier). A whole-repo index
+# must log once per language, not once per file.
+_WARNED: set = set()
+
+# Languages already warned about for "grammar present but no query defined".
+_WARNED_NO_QUERY: set[str] = set()
+
+
+def _warn_once(lang: str, tier: str, msg: str, *args) -> None:
+    key = (lang, tier)
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    logger.warning(msg, *args)
+
+
+def _run_query(lang_obj, query_str: str, root, lang: str = "?") -> Dict[str, List[Any]]:
     """Return {capture_name: [nodes]}, tolerant across tree-sitter API variants."""
     out: Dict[str, List[Any]] = {}
     caps = None
@@ -558,16 +567,30 @@ def _run_query(lang_obj, query_str: str, root) -> Dict[str, List[Any]]:
         try:
             cursor = ts.QueryCursor(q)
             caps = cursor.captures(root)
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "code_parse: QueryCursor unavailable for %s, using Query.captures: %s",
+                lang, exc,
+            )
             caps = q.captures(root)  # some builds expose captures on Query
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "code_parse: ts.Query construction failed for %s, trying legacy API: %s",
+            lang, exc,
+        )
         caps = None
     # Older API: Language.query(str).captures(root)
     if caps is None:
         try:
             q = lang_obj.query(query_str)
             caps = q.captures(root)
-        except Exception:
+        except Exception as exc:
+            _warn_once(
+                lang, "query",
+                "code_parse: no working tree-sitter query API for %s (%s) - "
+                "every %s file will extract zero symbols",
+                lang, exc, lang,
+            )
             return out
     try:
         if isinstance(caps, dict):
@@ -577,10 +600,19 @@ def _run_query(lang_obj, query_str: str, root) -> Dict[str, List[Any]]:
             for item in caps:
                 try:
                     node, name = item
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        "code_parse: malformed capture item for %s: %s", lang, exc
+                    )
                     continue
                 out.setdefault(name, []).append(node)
-    except Exception:
+    except Exception as exc:
+        _warn_once(
+            lang, "captures",
+            "code_parse: capture normalisation failed for %s (%s) - "
+            "every %s file will extract zero symbols",
+            lang, exc, lang,
+        )
         return {}
     return out
 
@@ -826,7 +858,8 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
 
         try:
             lang_obj = _get_language(lang)
-        except Exception:
+        except Exception as exc:
+            logger.debug("code_parse: grammar load failed for %s: %s", lang, exc)
             return _empty(file, lang)
 
         parser = ts.Parser(lang_obj)
@@ -835,7 +868,14 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
 
         query_str = QUERIES.get(lang)
         if not query_str:
-            # Grammar available but no query defined: file node only.
+            # Grammar available but no query defined: file node only. Keyed on LANG,
+            # not file — a large C checkout must not emit one warning per file.
+            if lang not in _WARNED_NO_QUERY:
+                _WARNED_NO_QUERY.add(lang)
+                logger.warning(
+                    "code_parse: no tree-sitter query for %s - %s parses to an "
+                    "empty result", lang, file,
+                )
             return result
 
         def_types = KINDS.get(lang, {})
@@ -862,7 +902,7 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
                 cur = cur.parent
             return file
 
-        caps = _run_query(lang_obj, query_str, root)
+        caps = _run_query(lang_obj, query_str, root, lang)
 
         symbols: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
@@ -973,8 +1013,8 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
             _collect_decls(
                 root, lang, def_types, enclosing_symbol_src, _in_method, add_decl
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("code_parse: _collect_decls failed for %s: %s", file, exc)
 
         result["symbols"] = symbols
         result["edges"] = edges
@@ -983,7 +1023,8 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
         result["decls"] = decls
         result["ident_counts"] = _identifier_counts(root)
         return result
-    except Exception:
+    except Exception as exc:
+        logger.debug("code_parse: parse_source failed for %s (%s): %s", file, lang, exc)
         return _empty(file, lang)
 
 
@@ -1024,7 +1065,13 @@ def parse_path(
                 data = _read_and_parse(full, lang)
                 if data is not None:
                     results.append(data)
-    except Exception:
+    except Exception as exc:
+        # The walk stopped early: `results` is a SHORT list that otherwise reads
+        # as a complete index of the tree. Warn, not debug.
+        logger.warning(
+            "code_parse: directory walk of %s aborted after %d files: %s",
+            root, len(results), exc,
+        )
         return results
     return results
 
@@ -1039,5 +1086,6 @@ def _read_and_parse(full: str, lang: str) -> Optional[Dict[str, Any]]:
         if b"\x00" in source[:4096]:  # crude binary guard
             return None
         return parse_source(full, source, lang)
-    except Exception:
+    except Exception as exc:
+        logger.debug("code_parse: read/parse failed for %s: %s", full, exc)
         return _empty(full, lang)

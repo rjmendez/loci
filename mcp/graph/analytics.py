@@ -14,15 +14,19 @@ unavailable store or any error they return an empty structure of the documented 
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from . import queries as Q
+
+logger = logging.getLogger("loci-mcp.analytics")
 
 
 def _ok(ks: Any) -> bool:
     try:
         return bool(ks) and ks.available()
-    except Exception:
+    except Exception as exc:
+        logger.debug("analytics: store unavailable: %s", exc)
         return False
 
 
@@ -30,18 +34,9 @@ def _q(ks: Any, cypher: str, params: dict | None = None) -> list:
     """Fail-open read via the store's read-only code_query."""
     try:
         return ks.code_query(cypher, params) or []
-    except Exception:
+    except Exception as exc:
+        logger.debug("analytics query failed: %s", exc)
         return []
-
-
-def _enclosing_class_id(symbol_id: str) -> str | None:
-    """"file::A.B.m" -> "file::A.B" (the member's enclosing symbol), else None."""
-    if "::" not in symbol_id:
-        return None
-    file, _, qual = symbol_id.partition("::")
-    if "." not in qual:
-        return None
-    return f"{file}::{qual.rpartition('.')[0]}"
 
 
 def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict:
