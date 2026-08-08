@@ -146,8 +146,9 @@ class MnemosyneBackend(VerdictBackend):
                 continue
             try:
                 verdict = Verdict.from_payload(metadata)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as exc:
                 # Malformed payload — skip rather than fail the whole recall.
+                _log.debug("recall: fail-open swallow: %r", exc)
                 continue
             scored.append(
                 ScoredVerdict(verdict=verdict, similarity=_extract_score(result))

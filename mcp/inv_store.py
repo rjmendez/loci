@@ -110,8 +110,8 @@ def _atomic_write_text(path: Path, data: str) -> None:
     except Exception:
         try:
             os.unlink(tmp_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_atomic_write_text: fail-open swallow: %r", exc)
         raise
 
 
@@ -136,8 +136,8 @@ def _append_jsonl(path: Path, entry: dict) -> None:
         finally:
             try:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("_append_jsonl: fail-open swallow: %r", exc)
 
 
 def _read_jsonl(path: Path) -> list[dict]:

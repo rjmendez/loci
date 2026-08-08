@@ -17,9 +17,12 @@ embed function is injectable so callers can reuse a warm client and tests can st
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Callable, Optional
+
+logger = logging.getLogger("loci-mcp.embed_ops")
 
 _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
 _EMBED_MODEL = os.environ.get("EMBED_MODEL", "")   # empty -> resolved via backends at call time
@@ -112,8 +115,8 @@ def warm(embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None) ->
         def _run() -> None:
             try:
                 ef(["warm"])
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("_run: fail-open swallow: %r", exc)
 
         try:
             threading.Thread(target=_run, name="embed-warm", daemon=True).start()

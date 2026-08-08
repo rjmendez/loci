@@ -92,8 +92,8 @@ def extract_json(text: str) -> dict | None:
     t = text.strip()
     try:
         return json.loads(t)
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("extract_json: fail-open swallow: %r", exc)
     if "```" in t:
         inner = t.split("```", 1)[1]
         if inner.startswith("json"):
@@ -101,8 +101,8 @@ def extract_json(text: str) -> dict | None:
         inner = inner.split("```", 1)[0].strip()
         try:
             return json.loads(inner)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("extract_json: fail-open swallow: %r", exc)
     start = t.find("{")
     if start != -1:
         depth = 0
@@ -149,7 +149,8 @@ def _gate_and_judge(
         for j in range(i + 1, len(prepared)):
             try:
                 c = cosine_fn(vectors[i], vectors[j])
-            except Exception:
+            except Exception as exc:
+                _log.debug("_gate_and_judge: fail-open swallow: %r", exc)
                 continue
             if c >= subject_threshold:
                 candidates.append((c, i, j))

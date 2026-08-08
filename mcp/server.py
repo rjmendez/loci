@@ -314,8 +314,8 @@ def _ladybug_writer_pid() -> Optional[int]:
         if _ladybug_store is not None:
             fn = getattr(_ladybug_store, "lock_holder_pid", None)
             return fn() if fn is not None else None
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_ladybug_writer_pid: fail-open swallow: %r", exc)
     return None
 
 
@@ -717,8 +717,8 @@ def _embed_sparse(text: str):
         try:
             from qdrant_client.models import SparseVector
             return SparseVector(indices=list(cached[0]), values=list(cached[1]))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_embed_sparse: fail-open swallow: %r", exc)
     model = _get_sparse_embedder()
     if model is None:
         return None
@@ -2038,8 +2038,8 @@ def _session_hints_push(investigation_id: str, hint: dict) -> None:
         buf.append(hint)
         if len(buf) > _SESSION_HINTS_MAX_PER_INV:
             del buf[0]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_session_hints_push: fail-open swallow: %r", exc)
 
 
 _REFLECTION_ERROR_RE = re.compile(r"\b(error|exception|traceback|failed|failure|timeout|conflict)\b", re.I)
@@ -2377,8 +2377,8 @@ def _normalize_claims(claims: str | list[str]) -> list[str]:
             parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return [str(c).strip() for c in parsed if str(c).strip()]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_normalize_claims: fail-open swallow: %r", exc)
 
     lines = [line.strip(" -\t") for line in raw.splitlines() if line.strip()]
     if len(lines) > 1:
@@ -2567,8 +2567,8 @@ def _compute_aggregate_confidence(
             nc = node.get("numeric_confidence", 1.0)
             try:
                 product *= float(nc)
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as exc:
+                logger.debug("_compute_aggregate_confidence: fail-open swallow: %r", exc)
             parents = node.get("derived_from") or []
             current_id = str(parents[0]) if parents else None
             depth += 1
@@ -3397,8 +3397,8 @@ def procedure_attempt(
         except Exception:
             try:
                 os.unlink(tmp_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("procedure_attempt: fail-open swallow: %r", exc)
             raise
 
         # Update Qdrant payload for the finding
@@ -6262,7 +6262,8 @@ def contract_check(
             continue
         try:
             declared = json.loads(m.group(1))
-        except Exception:
+        except Exception as exc:
+            logger.debug("contract_check: fail-open swallow: %r", exc)
             continue
         for stored_field, stored_type in declared.items():
             sf = stored_field.lower()
@@ -7119,7 +7120,8 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
                         if m:
                             try:
                                 obj = json.loads(m.group(0))
-                            except Exception:
+                            except Exception as exc:
+                                logger.debug("_run_causal_inference: fail-open swallow: %r", exc)
                                 continue
                         else:
                             continue
@@ -8229,8 +8231,8 @@ def main() -> None:
     try:
         import embed_ops
         embed_ops.warm()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("main: fail-open swallow: %r", exc)
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
         host = os.environ.get("HERMES_MCP_HOST", "0.0.0.0")

@@ -31,11 +31,14 @@ See backends.toml.example. Resolutions are memoized (the probe runs once per pro
 """
 from __future__ import annotations
 
+import logging
 import functools
 import os
 import socket
 from pathlib import Path
 from urllib.parse import urlparse
+
+logger = logging.getLogger("loci-mcp.backends")
 
 _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "backends.toml")
 
@@ -53,8 +56,8 @@ def _config() -> dict:
         p = Path(_CONFIG_PATH)
         if p.exists():
             return tomllib.loads(p.read_text())
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_config: fail-open swallow: %r", exc)
     return {}
 
 

@@ -31,6 +31,8 @@ from ..code_rules import (
 )
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
+logger = logging.getLogger("loci-mcp.code_hallucination")
+
 __all__ = ["run_code_checks"]
 
 # Advisory confidence for a vendored static code smell (LH00x) — surfaced, not
@@ -63,8 +65,8 @@ def _relpath(path: Path, repo_root: str | None) -> str:
     if repo_root:
         try:
             return path.resolve().relative_to(Path(repo_root).resolve()).as_posix()
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as exc:
+            logger.debug("_relpath: fail-open swallow: %r", exc)
     return path.name
 
 
