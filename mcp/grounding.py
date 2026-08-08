@@ -195,6 +195,12 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     except Exception as exc:
         logger.warning("grounding: server module unavailable, all lanes disabled: %s", exc)
         S = None
+        # Every server-backed lane (1, 2, 3, 6) short-circuits on S is None, and only
+        # lanes 4 and 5 set this flag. Without marking it here, a total grounding
+        # failure returns {block:"", chars:0, degraded:False} -- byte-identical to a
+        # healthy "nothing stored for this task" result, so callers consume a lookup
+        # that consulted nothing as full coverage.
+        degraded = True
 
     # 1. Named cases -> investigation_load (structured, retracted excluded). Fail-open per
     # case: a raising server tool (or malformed finding) skips that case, never aborts ground().
