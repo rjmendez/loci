@@ -154,3 +154,30 @@ def test_ground_budget_respected(tmp_path, monkeypatch):
                  {"budgetChars": 800, "memoryDir": str(tmp_path)})
     # block stays within budget + bounded header/footer overhead
     assert r["chars"] <= 800 + 500
+
+
+def test_ground_marks_degraded_when_server_import_fails(monkeypatch):
+    """A total grounding failure must be distinguishable from 'nothing stored'.
+
+    Regression: `degraded` was set only in lanes 4 and 5. When `import server`
+    failed, every server-backed lane short-circuited without touching the flag, so
+    ground() returned {block:"", chars:0, degraded:False} -- identical to a healthy
+    empty result. Downstream fan-out agents read that as full coverage.
+    """
+    import importlib
+    real = importlib.import_module
+
+    def _boom(name, *a, **k):
+        if name == "server":
+            raise ImportError("simulated: server module unavailable")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(importlib, "import_module", _boom)
+    r = G.ground({"title": "why is auth failing", "caseIds": ["c1"], "entities": ["auth"]},
+                 {"budgetChars": 500, "memoryDir": "/nonexistent"})
+
+    assert r["chars"] == 0                    # nothing was assembled...
+    assert r["degraded"] is True, (           # ...and the caller must be told why
+        "total grounding failure reported degraded=False — indistinguishable "
+        "from a healthy 'no prior context' result"
+    )
