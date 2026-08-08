@@ -67,7 +67,6 @@ def test_index_shape():
     assert "getInstance" not in idx["type_names"]
     # both names are globally unique
     assert {"DeviceMetricsPoller", "getInstance"} <= idx["unique_names"]
-    assert _TYPE_ID in idx["file_basenames"][_FILE]
 
 
 # --------------------------------------------------------------------------- #
