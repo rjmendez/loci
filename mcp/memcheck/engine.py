@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from .backend import InMemoryBackend, VerdictBackend
-from .verdict import Verdict, make_signature, new_verdict
+from .verdict import Verdict
 
 __all__ = [
     "EmlConfig",
@@ -127,66 +127,6 @@ class VerdictEngine:
             confidence=best.verdict.confidence,
             similarity=best.similarity,
         )
-
-    async def enforce(
-        self,
-        kind: str,
-        subject_text: str,
-        embedding: list[float],
-        cold_path: Callable[[], Awaitable[Optional[tuple[str, str, float]]]],
-    ) -> dict:
-        """Recall-first enforcement, falling back to ``cold_path``.
-
-        On a promoted recall, returns the memory-backed decision WITHOUT calling
-        ``cold_path``. Otherwise awaits ``cold_path`` which returns
-        ``(verdict_type, rationale, confidence)`` to flag, or ``None`` to allow.
-        On a flag, records a new verdict (source inferred from kind) and returns
-        it. Fail-open throughout.
-        """
-        hit = await self.recall_decision(subject_text, embedding, kind)
-        if hit is not None:
-            return {
-                "decision": hit.decision,
-                "from_memory": True,
-                "verdict_type": hit.verdict_type,
-                "rationale": hit.rationale,
-                "confidence": hit.confidence,
-                "similarity": hit.similarity,
-                "subject_signature": hit.subject_signature,
-            }
-
-        try:
-            result = await cold_path()
-        except Exception as exc:  # noqa: BLE001 — fail-open boundary
-            _log.debug("memcheck cold_path failed, degrading to allow: %r", exc)
-            return {"decision": "allow", "from_memory": False}
-
-        if result is None:
-            return {"decision": "allow", "from_memory": False}
-
-        verdict_type, rationale, confidence = result
-        # "memory" subjects are judged by rule checks; action/output are
-        # judged by an LLM guardian. This only labels provenance of the verdict.
-        source = "rule" if kind == "memory" else "llm"
-        verdict = new_verdict(
-            subject_kind=kind,
-            subject_signature=make_signature(kind, subject_text),
-            subject_excerpt=subject_text,
-            verdict_type=verdict_type,
-            decision="flag",
-            confidence=confidence,
-            rationale=rationale,
-            source=source,
-        )
-        await self.record(verdict, embedding)
-        return {
-            "decision": "flag",
-            "from_memory": False,
-            "verdict_type": verdict_type,
-            "rationale": rationale,
-            "confidence": confidence,
-            "subject_signature": verdict.subject_signature,
-        }
 
     async def forget(self, subject_excerpt: str, kind: str) -> int:
         """Remove matching verdicts. Fail-open: returns 0 on backend error."""

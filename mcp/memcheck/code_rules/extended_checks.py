@@ -36,6 +36,7 @@ silently dropped.
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from pathlib import Path
 
@@ -46,6 +47,8 @@ __all__ = [
     "run_extended_checks",
     "ALL_PATTERN_IDS",
 ]
+
+_log = logging.getLogger("memcheck.extended_checks")
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +563,9 @@ ALL_PATTERN_IDS: tuple[str, ...] = tuple(PATTERN_META.keys())
 # Small AST/source helpers
 # ---------------------------------------------------------------------------
 _METRIC_CTORS = {"Counter", "Gauge", "Histogram", "Summary"}
+# Source-level counterpart of _METRIC_CTORS for the regex checks. sorted() keeps
+# the alternation stable so the pattern does not depend on set iteration order.
+_METRIC_CTOR_RE = re.compile(r"\b(" + "|".join(sorted(_METRIC_CTORS)) + r")\s*\(")
 
 
 def _issue(code: str, node: ast.AST, message: str) -> Issue:
@@ -593,6 +599,33 @@ def _is_test_file(filename: str) -> bool:
     return "test" in filename
 
 
+def _metric_ctor(call: ast.Call) -> str | None:
+    """Return the prometheus metric constructor a call invokes, else ``None``.
+
+    Resolves both ``Counter(...)`` and ``prometheus_client.Counter(...)``, and
+    returns the bare name only when it is one of :data:`_METRIC_CTORS`.
+    """
+    fn = call.func
+    ctor = fn.attr if isinstance(fn, ast.Attribute) else (
+        fn.id if isinstance(fn, ast.Name) else None
+    )
+    return ctor if ctor in _METRIC_CTORS else None
+
+
+def _metric_literal_name(call: ast.Call) -> str | None:
+    """Return the metric's literal name (first positional arg), else ``None``.
+
+    Returns the string exactly as written; callers that match case-insensitively
+    must lower it themselves, since the original spelling goes into the message.
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # H2 — Duplicate prometheus metric registration (same literal name in file)
 # ---------------------------------------------------------------------------
@@ -602,18 +635,11 @@ def check_h2_duplicate_metric(tree: ast.AST) -> list[Issue]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        fn = node.func
-        ctor = fn.attr if isinstance(fn, ast.Attribute) else (
-            fn.id if isinstance(fn, ast.Name) else None
-        )
-        if ctor not in _METRIC_CTORS:
+        if _metric_ctor(node) is None:
             continue
-        if not node.args:
+        name = _metric_literal_name(node)
+        if name is None:
             continue
-        first = node.args[0]
-        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
-            continue
-        name = first.value
         if name in seen:
             issues.append(_issue(
                 "H2", node,
@@ -814,11 +840,7 @@ def check_sd3_labeled_metric_bare_call(tree: ast.AST) -> list[Issue]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
             call = node.value
-            fn = call.func
-            ctor = fn.attr if isinstance(fn, ast.Attribute) else (
-                fn.id if isinstance(fn, ast.Name) else None
-            )
-            if ctor not in _METRIC_CTORS:
+            if _metric_ctor(call) is None:
                 continue
             has_labels = len(call.args) >= 3 or any(
                 kw.arg == "labelnames" for kw in call.keywords
@@ -1314,7 +1336,7 @@ def check_tec1_registry_leak(source: str, filename: str) -> list[Issue]:
     if not _is_test_file(filename):
         return []
     uses_metric = bool(
-        re.search(r"\b(Counter|Gauge|Histogram|Summary)\s*\(", source)
+        _METRIC_CTOR_RE.search(source)
         or re.search(r"\._value\b", source)
     )
     if not uses_metric:
@@ -1347,20 +1369,17 @@ def check_mc1b_counter_should_be_gauge(tree: ast.AST) -> list[Issue]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        fn = node.func
-        ctor = fn.attr if isinstance(fn, ast.Attribute) else (
-            fn.id if isinstance(fn, ast.Name) else None
-        )
-        if ctor != "Counter" or not node.args:
+        if _metric_ctor(node) != "Counter":
             continue
-        first = node.args[0]
-        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        metric_name = _metric_literal_name(node)
+        if metric_name is None:
             continue
-        name = first.value.lower()
+        # Match case-insensitively, but report the name as it was written.
+        name = metric_name.lower()
         if any(w in name for w in _GAUGE_WORDS):
             issues.append(_issue(
                 "MC1b", node,
-                f"MC1b Counter('{first.value}') names a value that can decrease — "
+                f"MC1b Counter('{metric_name}') names a value that can decrease — "
                 "a Counter only goes up, producing a meaningless monotonic series. "
                 "Use a Gauge for queue depth / active connections / utilization "
                 "(MC1b: Counter Used Where Gauge Required).",
@@ -1380,7 +1399,11 @@ def check_mc1b_counter_should_be_gauge(tree: ast.AST) -> list[Issue]:
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-# (check_fn, needs) where needs is "tree", "source", "tree+name", "source+name"
+# Four registries, one per check signature. run_extended_checks pairs each with
+# the argument tuple it takes and dispatches them in the order listed below:
+# _AST_CHECKS(tree) -> _AST_NAME_CHECKS(tree, filename) -> _SOURCE_CHECKS(source)
+# -> _SOURCE_NAME_CHECKS(source, filename). Output order does not depend on this,
+# as run_extended_checks sorts by (line, col, code) before returning.
 _AST_CHECKS = (
     check_h2_duplicate_metric,
     check_h6_deprecated_api,
@@ -1440,28 +1463,21 @@ def run_extended_checks(path: str | Path) -> list[Issue]:
     filename = p.name
     issues: list[Issue] = []
 
-    for check in _AST_CHECKS:
-        try:
-            issues.extend(check(tree))
-        except Exception:  # noqa: BLE001 — a broken check must not break the hook
-            continue
-
-    for check in _AST_NAME_CHECKS:
-        try:
-            issues.extend(check(tree, filename))
-        except Exception:  # noqa: BLE001
-            continue
-
-    for check in _SOURCE_CHECKS:
-        try:
-            issues.extend(check(source))
-        except Exception:  # noqa: BLE001
-            continue
-
-    for check in _SOURCE_NAME_CHECKS:
-        try:
-            issues.extend(check(source, filename))
-        except Exception:  # noqa: BLE001
-            continue
+    for registry, args in (
+        (_AST_CHECKS, (tree,)),
+        (_AST_NAME_CHECKS, (tree, filename)),
+        (_SOURCE_CHECKS, (source,)),
+        (_SOURCE_NAME_CHECKS, (source, filename)),
+    ):
+        for check in registry:
+            try:
+                issues.extend(check(*args))
+            except Exception as exc:  # noqa: BLE001 - a broken check must not break the hook
+                _log.debug(
+                    "extended check %s failed on %s: %s",
+                    getattr(check, "__name__", check),
+                    filename,
+                    exc,
+                )
 
     return sorted(issues, key=lambda i: (i.line, i.col, i.code))

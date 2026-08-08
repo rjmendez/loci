@@ -29,7 +29,7 @@ import re
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger("loci-mcp.kuzu")
 
@@ -88,6 +88,181 @@ _DUCK_STOPWORDS = frozenset({
     "flush", "group", "groups", "groupdict", "match", "search", "finditer", "findall",
     "sub", "send", "throw", "next", "name", "value", "isdigit", "isalpha", "isspace",
 })
+
+
+def _enclosing_class(sym_id: str) -> Optional[str]:
+    # id is "file::Qual"; enclosing simple class = segment before the
+    # method name (e.g. "A.B.m" -> "B"). Top-level func -> None.
+    qual = sym_id.split("::", 1)[1] if "::" in sym_id else sym_id
+    segs = qual.split(".")
+    return segs[-2] if len(segs) >= 2 else None
+
+
+def _enclosing_class_id(sym_id: str) -> Optional[str]:
+    # "file::A.m" -> enclosing class SYMBOL ID "file::A" (fields are
+    # scoped by class id). Top-level func -> None.
+    if "::" not in sym_id:
+        return None
+    fpref, qual = sym_id.split("::", 1)
+    if "." not in qual:
+        return None
+    return f"{fpref}::{qual.rsplit('.', 1)[0]}"
+
+
+_TYPE_KINDS = {"class", "interface", "enum", "struct", "trait"}
+
+
+def _resolve_calls(
+    call_edges: list, symbols: dict, files: dict,
+    file_import_map: dict, decls_by_scope: dict,
+) -> tuple[list[dict], dict]:
+    """Resolve parsed call edges into ``CALLS`` rows for one ingest batch.
+
+    Type-aware resolution over the parsed batch. We NEVER resolve a call that
+    has an explicit receiver by bare global name; only bare/self calls use
+    name scoping (class > file > unique).
+
+    Returns ``(call_rows, stats)`` where ``stats`` holds the per-strategy
+    counters: ``external``, ``unresolved``, ``by_type``, ``by_module``,
+    ``by_duck``. Reads its inputs only — none of them are mutated.
+    """
+    # Precompute the lookup tables the resolver needs.
+    app_type_names: set[str] = {
+        row["name"] for row in symbols.values()
+        if row["kind"].lower() in _TYPE_KINDS and row["name"]
+    }
+    # simpleClassName -> list of member (method) symbol ids.
+    class_methods: dict[str, list] = {}
+    # file path -> list of symbol ids defined in that file.
+    file_methods: dict[str, list] = {}
+    # method simple-name -> count, and -> a representative id.
+    name_count: dict[str, int] = {}
+    name_first: dict[str, str] = {}
+    for sid, row in symbols.items():
+        cls = _enclosing_class(sid)
+        if cls:
+            class_methods.setdefault(cls, []).append(sid)
+        file_methods.setdefault(row["file"], []).append(sid)
+        nm = row["name"]
+        if nm:
+            name_count[nm] = name_count.get(nm, 0) + 1
+            name_first.setdefault(nm, sid)
+    by_name_unique: dict[str, str] = {
+        nm: name_first[nm] for nm, c in name_count.items() if c == 1
+    }
+    # module simple-name (file stem) -> file path, for resolving module-
+    # qualified calls (Python "from . import queries as Q; Q.func()").
+    module_files: dict[str, str] = {}
+    for _fp in files:
+        _stem = _fp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        module_files.setdefault(_stem, _fp)
+
+    def _find_named(ids: Optional[list], name: str) -> Optional[str]:
+        for mid in (ids or []):
+            if symbols[mid]["name"] == name:
+                return mid
+        return None
+
+    call_rows: list[dict] = []
+    n_external = 0
+    n_unresolved = 0
+    n_by_type = 0
+    n_by_duck = 0
+    n_by_module = 0
+    for edge in call_edges:
+        src = edge["src"]
+        if src not in symbols:
+            continue  # caller not in this batch
+        callee = edge["callee"]
+        # An explicit dst id in the batch is authoritative.
+        if callee in symbols:
+            call_rows.append({"a": src, "b": callee})
+            continue
+        rk = edge["recv_kind"]
+        recv = edge["receiver"]
+        tgt: Optional[str] = None
+        if rk in ("none", "self"):
+            caller_cls = _enclosing_class(src)
+            tgt = _find_named(class_methods.get(caller_cls), callee) \
+                or _find_named(file_methods.get(edge["file"]), callee) \
+                or by_name_unique.get(callee)
+            if tgt:
+                call_rows.append({"a": src, "b": tgt})
+            else:
+                n_unresolved += 1
+        elif rk == "name" and recv:
+            if recv in app_type_names:
+                # Static / typed call on a repo-defined type.
+                tgt = _find_named(class_methods.get(recv), callee)
+                if tgt:
+                    call_rows.append({"a": src, "b": tgt})
+                else:
+                    n_unresolved += 1
+            elif recv in file_import_map.get(edge["file"], {}):
+                fqn = file_import_map[edge["file"]][recv]
+                fqn_cls = fqn.split(".")[-1]
+                if fqn_cls in app_type_names:
+                    # Import points at a repo type -> resolve as app call.
+                    tgt = _find_named(class_methods.get(fqn_cls), callee)
+                    if tgt:
+                        call_rows.append({"a": src, "b": tgt})
+                    else:
+                        n_unresolved += 1
+                elif fqn_cls in module_files:
+                    # Import points at a repo MODULE (Python module-qualified
+                    # call, e.g. "Q.finding_symbols()") -> resolve the callee
+                    # within that module's file. Unambiguous, so precision-safe.
+                    tgt = _find_named(file_methods.get(module_files[fqn_cls]), callee)
+                    if tgt:
+                        call_rows.append({"a": src, "b": tgt})
+                        n_by_module += 1
+                    else:
+                        n_unresolved += 1
+                else:
+                    # Import points outside the repo (Log, Collections…).
+                    n_external += 1
+            else:
+                # 2.5: receiver-type inference from captured declarations.
+                # Look up R as a local/param of the calling method first,
+                # then as a field of the enclosing class. Only resolve when
+                # the inferred type is an APP type; external/unknown -> DROP
+                # (never fall back to global by-name).
+                t = decls_by_scope.get(src, {}).get(recv)
+                if not t:
+                    encl_id = _enclosing_class_id(src)
+                    if encl_id:
+                        t = decls_by_scope.get(encl_id, {}).get(recv)
+                if t and t in app_type_names:
+                    tgt = _find_named(class_methods.get(t), callee)
+                    if tgt:
+                        call_rows.append({"a": src, "b": tgt})
+                        n_by_type += 1
+                    else:
+                        n_unresolved += 1
+                else:
+                    # Unknown / Any-typed receiver. The duck-typing fallback (resolve
+                    # by globally-UNIQUE method name) is sound only for dynamically
+                    # typed Python, where such a receiver is an app object
+                    # (`ks.code_query()` where ks: Any). In statically-typed langs an
+                    # untyped receiver calling a method that merely happens to be
+                    # unique in the repo (someList.isEmpty()) is usually a STDLIB call
+                    # -> we must NOT guess there. Ambiguous names stay dropped anyway.
+                    if symbols[src]["lang"] == "python" and callee not in _DUCK_STOPWORDS:
+                        tgt = by_name_unique.get(callee)
+                    if tgt:
+                        call_rows.append({"a": src, "b": tgt})
+                        n_by_duck += 1
+                    else:
+                        n_unresolved += 1
+        else:
+            # rk == "expr" (complex receiver) or a receiver'd call with no
+            # receiver text. v1: drop.
+            n_unresolved += 1
+    return call_rows, {
+        "external": n_external, "unresolved": n_unresolved,
+        "by_type": n_by_type, "by_module": n_by_module,
+        "by_duck": n_by_duck,
+    }
 
 
 class KuzuStore:
@@ -690,160 +865,11 @@ class KuzuStore:
                     {"rows": chunk},
                 )
             counts["imports"] = len(imports)
-            # CALLS — type-aware resolution over the parsed batch. We NEVER
-            # resolve a call that has an explicit receiver by bare global name;
-            # only bare/self calls use name scoping (class > file > unique).
-            #
-            # Precompute the lookup tables the resolver needs.
-            def _enclosing_class(sym_id: str) -> Optional[str]:
-                # id is "file::Qual"; enclosing simple class = segment before the
-                # method name (e.g. "A.B.m" -> "B"). Top-level func -> None.
-                qual = sym_id.split("::", 1)[1] if "::" in sym_id else sym_id
-                segs = qual.split(".")
-                return segs[-2] if len(segs) >= 2 else None
-
-            def _enclosing_class_id(sym_id: str) -> Optional[str]:
-                # "file::A.m" -> enclosing class SYMBOL ID "file::A" (fields are
-                # scoped by class id). Top-level func -> None.
-                if "::" not in sym_id:
-                    return None
-                fpref, qual = sym_id.split("::", 1)
-                if "." not in qual:
-                    return None
-                return f"{fpref}::{qual.rsplit('.', 1)[0]}"
-
-            _TYPE_KINDS = {"class", "interface", "enum", "struct", "trait"}
-            app_type_names: set[str] = {
-                row["name"] for row in symbols.values()
-                if row["kind"].lower() in _TYPE_KINDS and row["name"]
-            }
-            # simpleClassName -> list of member (method) symbol ids.
-            class_methods: dict[str, list] = {}
-            # file path -> list of symbol ids defined in that file.
-            file_methods: dict[str, list] = {}
-            # method simple-name -> count, and -> a representative id.
-            name_count: dict[str, int] = {}
-            name_first: dict[str, str] = {}
-            for sid, row in symbols.items():
-                cls = _enclosing_class(sid)
-                if cls:
-                    class_methods.setdefault(cls, []).append(sid)
-                file_methods.setdefault(row["file"], []).append(sid)
-                nm = row["name"]
-                if nm:
-                    name_count[nm] = name_count.get(nm, 0) + 1
-                    name_first.setdefault(nm, sid)
-            by_name_unique: dict[str, str] = {
-                nm: name_first[nm] for nm, c in name_count.items() if c == 1
-            }
-            # module simple-name (file stem) -> file path, for resolving module-
-            # qualified calls (Python "from . import queries as Q; Q.func()").
-            module_files: dict[str, str] = {}
-            for _fp in files:
-                _stem = _fp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                module_files.setdefault(_stem, _fp)
-
-            def _find_named(ids: Optional[list], name: str) -> Optional[str]:
-                for mid in (ids or []):
-                    if symbols[mid]["name"] == name:
-                        return mid
-                return None
-
-            call_rows: list[dict] = []
-            n_external = 0
-            n_unresolved = 0
-            n_by_type = 0
-            n_by_duck = 0
-            n_by_module = 0
-            for edge in call_edges:
-                src = edge["src"]
-                if src not in symbols:
-                    continue  # caller not in this batch
-                callee = edge["callee"]
-                # An explicit dst id in the batch is authoritative.
-                if callee in symbols:
-                    call_rows.append({"a": src, "b": callee})
-                    continue
-                rk = edge["recv_kind"]
-                recv = edge["receiver"]
-                tgt: Optional[str] = None
-                if rk in ("none", "self"):
-                    caller_cls = _enclosing_class(src)
-                    tgt = _find_named(class_methods.get(caller_cls), callee) \
-                        or _find_named(file_methods.get(edge["file"]), callee) \
-                        or by_name_unique.get(callee)
-                    if tgt:
-                        call_rows.append({"a": src, "b": tgt})
-                    else:
-                        n_unresolved += 1
-                elif rk == "name" and recv:
-                    if recv in app_type_names:
-                        # Static / typed call on a repo-defined type.
-                        tgt = _find_named(class_methods.get(recv), callee)
-                        if tgt:
-                            call_rows.append({"a": src, "b": tgt})
-                        else:
-                            n_unresolved += 1
-                    elif recv in file_import_map.get(edge["file"], {}):
-                        fqn = file_import_map[edge["file"]][recv]
-                        fqn_cls = fqn.split(".")[-1]
-                        if fqn_cls in app_type_names:
-                            # Import points at a repo type -> resolve as app call.
-                            tgt = _find_named(class_methods.get(fqn_cls), callee)
-                            if tgt:
-                                call_rows.append({"a": src, "b": tgt})
-                            else:
-                                n_unresolved += 1
-                        elif fqn_cls in module_files:
-                            # Import points at a repo MODULE (Python module-qualified
-                            # call, e.g. "Q.finding_symbols()") -> resolve the callee
-                            # within that module's file. Unambiguous, so precision-safe.
-                            tgt = _find_named(file_methods.get(module_files[fqn_cls]), callee)
-                            if tgt:
-                                call_rows.append({"a": src, "b": tgt})
-                                n_by_module += 1
-                            else:
-                                n_unresolved += 1
-                        else:
-                            # Import points outside the repo (Log, Collections…).
-                            n_external += 1
-                    else:
-                        # 2.5: receiver-type inference from captured declarations.
-                        # Look up R as a local/param of the calling method first,
-                        # then as a field of the enclosing class. Only resolve when
-                        # the inferred type is an APP type; external/unknown -> DROP
-                        # (never fall back to global by-name).
-                        t = decls_by_scope.get(src, {}).get(recv)
-                        if not t:
-                            encl_id = _enclosing_class_id(src)
-                            if encl_id:
-                                t = decls_by_scope.get(encl_id, {}).get(recv)
-                        if t and t in app_type_names:
-                            tgt = _find_named(class_methods.get(t), callee)
-                            if tgt:
-                                call_rows.append({"a": src, "b": tgt})
-                                n_by_type += 1
-                            else:
-                                n_unresolved += 1
-                        else:
-                            # Unknown / Any-typed receiver. The duck-typing fallback (resolve
-                            # by globally-UNIQUE method name) is sound only for dynamically
-                            # typed Python, where such a receiver is an app object
-                            # (`ks.code_query()` where ks: Any). In statically-typed langs an
-                            # untyped receiver calling a method that merely happens to be
-                            # unique in the repo (someList.isEmpty()) is usually a STDLIB call
-                            # -> we must NOT guess there. Ambiguous names stay dropped anyway.
-                            if symbols[src]["lang"] == "python" and callee not in _DUCK_STOPWORDS:
-                                tgt = by_name_unique.get(callee)
-                            if tgt:
-                                call_rows.append({"a": src, "b": tgt})
-                                n_by_duck += 1
-                            else:
-                                n_unresolved += 1
-                else:
-                    # rk == "expr" (complex receiver) or a receiver'd call with no
-                    # receiver text. v1: drop.
-                    n_unresolved += 1
+            # CALLS — resolution runs inside this try so a resolver error keeps
+            # the documented fail-open contract of ingest_code.
+            call_rows, _stats = _resolve_calls(
+                call_edges, symbols, files, file_import_map, decls_by_scope,
+            )
             for chunk in self._chunks(call_rows):
                 self._exec(
                     "UNWIND $rows AS r MATCH (a:CodeSymbol {id:r.a}), (b:CodeSymbol {id:r.b}) "
@@ -851,11 +877,11 @@ class KuzuStore:
                     {"rows": chunk},
                 )
             counts["calls"] = len(call_rows)
-            counts["calls_dropped_external"] = n_external
-            counts["calls_dropped_unresolved"] = n_unresolved
-            counts["calls_resolved_by_type"] = n_by_type
-            counts["calls_resolved_by_module"] = n_by_module
-            counts["calls_resolved_by_duck"] = n_by_duck
+            counts["calls_dropped_external"] = _stats["external"]
+            counts["calls_dropped_unresolved"] = _stats["unresolved"]
+            counts["calls_resolved_by_type"] = _stats["by_type"]
+            counts["calls_resolved_by_module"] = _stats["by_module"]
+            counts["calls_resolved_by_duck"] = _stats["by_duck"]
             return counts
         except Exception as exc:
             logger.debug("ingest_code failed: %s", exc)

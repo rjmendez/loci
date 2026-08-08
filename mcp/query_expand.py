@@ -26,9 +26,13 @@ is silent on them.
 """
 from __future__ import annotations
 
-import json
-import re
 from typing import Callable, Optional
+
+from model_json import extract_json_object
+
+# Private alias kept so existing call sites and test monkeypatches of the private
+# name keep working after the shared extraction moved to mcp/model_json.py.
+_extract_json_object = extract_json_object
 
 # Injectable generation function type: matches the shared [interface] contract.
 GenFn = Callable[..., dict]
@@ -53,51 +57,6 @@ def _lazy_generate(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 
         return generate(prompt, fmt=fmt, max_tokens=max_tokens)
     except Exception:
         return {"text": "", "ok": False}
-
-
-def _extract_json_object(text: str) -> Optional[dict]:
-    """Defensively pull a JSON object out of possibly-noisy model text.
-
-    Handles: clean JSON, JSON wrapped in ```json fences, and JSON embedded in stray prose.
-    Returns the parsed dict, or None if nothing parseable is found.
-    """
-    if not text or not isinstance(text, str):
-        return None
-    # 1) straight parse
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    # 2) strip code fences and retry
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        try:
-            obj = json.loads(fenced.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-    # 3) brace-match scan: find the first '{' whose balanced span parses as an object
-    depth = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except Exception:
-                        start = -1  # keep scanning for a later valid object
-    return None
 
 
 def _clean_list(raw, cap: int, seed: Optional[str] = None) -> list[str]:
