@@ -182,7 +182,7 @@ all hooks.
 `mcp/server.py` is registered as `FastMCP('loci')` and exposes 71 tools under
 the `loci-mcp` server name — 60 declared with `@mcp.tool()` in `server.py` plus 11
 code-graph tools registered from `mcp/graph_tools.py` by
-`graph_tools.register(mcp, _get_kuzu)` at import time. Key env vars:
+`graph_tools.register(mcp, _get_ladybug)` at import time. Key env vars:
 
 | Variable | Default | Purpose |
 |---|---|---|

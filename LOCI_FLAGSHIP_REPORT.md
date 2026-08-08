@@ -12,7 +12,7 @@ and it earned its keep by finding (and we then fixed) a real bug in its own grou
 | Metric | Value |
 |---|---|
 | Tasks | 4 (`graph` 1 · `impl` 2 · `reason` 1) |
-| **Graph tier resolved at 0 tokens** | **1** (no agent spawned — deterministic Kuzu fact) |
+| **Graph tier resolved at 0 tokens** | **1** (no agent spawned — deterministic LadybugDB fact) |
 | Graph-fallback agents | 0 |
 | Claude agents | 3 |
 | **Verify pass-rate** | **100 %** (2 / 2 adversarial checks confirmed) |

@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 def _find_graph() -> str | None:
     import glob
+    # "graph.kuzu" is the ON-DISK database directory name. It predates the
+    # Kuzu -> LadybugDB rename and is deliberately NOT renamed: every existing
+    # deployment has its database at this path, and changing it would orphan them.
     for p in glob.glob(os.path.expanduser("~/.hermes/**/graph.kuzu"), recursive=True):
         return p
     return None
@@ -98,9 +101,9 @@ def main() -> int:
         print("[graph_facts: no graph.kuzu found]", file=sys.stderr)
         return 0
 
-    from graph.kuzu_store import KuzuStore
+    from graph.ladybug_store import LadybugStore
     from graph import analytics as A
-    ks = KuzuStore(db)
+    ks = LadybugStore(db)
 
     for req in spec:
         key = req.get("key", "?")

@@ -1,6 +1,6 @@
-"""Tests for graph.kuzu_store.KuzuStore.
+"""Tests for graph.ladybug_store.LadybugStore.
 
-Verifies the Kuzu graph port of ``find_contamination`` is byte-for-byte
+Verifies the LadybugDB graph port of ``find_contamination`` is byte-for-byte
 equivalent to the in-memory reference, plus code ingestion and the read APIs.
 """
 
@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("ladybug")
 
-from graph.kuzu_store import KuzuStore
+from graph.ladybug_store import LadybugStore
 from memcheck.checks.contagion import find_contamination
 
 
@@ -45,8 +45,8 @@ MEM_FINDINGS = [
 ]
 
 
-def _build_store(tmp_path) -> KuzuStore:
-    store = KuzuStore(str(tmp_path / "graphdb"))
+def _build_store(tmp_path) -> LadybugStore:
+    store = LadybugStore(str(tmp_path / "graphdb"))
     assert store.available()
 
     store.upsert_investigation("invA", "Investigation A")
@@ -120,7 +120,7 @@ def test_related_investigations(tmp_path):
 
 
 def test_ingest_code_and_reads(tmp_path):
-    store = KuzuStore(str(tmp_path / "codedb"))
+    store = LadybugStore(str(tmp_path / "codedb"))
     assert store.available()
 
     parsed = [
@@ -163,7 +163,7 @@ def test_ingest_code_and_reads(tmp_path):
 def test_ingest_code_type_aware_calls(tmp_path):
     """Type-aware CALLS resolution: receiver'd calls are never resolved by bare
     global name; external-import receivers (Log.w) are dropped entirely."""
-    store = KuzuStore(str(tmp_path / "typedb"))
+    store = LadybugStore(str(tmp_path / "typedb"))
     assert store.available()
 
     parsed = [
@@ -213,7 +213,7 @@ def test_ingest_code_type_aware_calls(tmp_path):
 def test_ingest_code_module_qualified_call(tmp_path):
     """Python module-qualified call: `from . import querymod as Q; Q.helper()`
     resolves to querymod's helper (repo module import), NOT dropped as external."""
-    store = KuzuStore(str(tmp_path / "moddb"))
+    store = LadybugStore(str(tmp_path / "moddb"))
     assert store.available()
     parsed = [
         {
@@ -241,7 +241,7 @@ def test_ingest_code_module_qualified_call(tmp_path):
 def test_ingest_code_python_duck_typing(tmp_path):
     """Python Any-typed receiver: `ks.code_query()` resolves by globally-unique method
     name; stdlib-name calls (`ks.get()`) and Java untyped receivers do NOT (precision)."""
-    store = KuzuStore(str(tmp_path / "duckdb"))
+    store = LadybugStore(str(tmp_path / "duckdb"))
     parsed = [{
         "file": "m.py", "lang": "python", "import_map": {},
         "symbols": [
@@ -279,7 +279,7 @@ def test_ingest_code_python_duck_typing(tmp_path):
 def test_ingest_code_drops_untyped_and_expr_receivers(tmp_path):
     """Untyped variable receivers and complex-expression receivers are dropped
     in v1 (no global by-name fallback)."""
-    store = KuzuStore(str(tmp_path / "untypeddb"))
+    store = LadybugStore(str(tmp_path / "untypeddb"))
     assert store.available()
 
     parsed = [
@@ -315,7 +315,7 @@ def test_ingest_code_receiver_type_inference(tmp_path):
     """Receiver-type inference (step 2.5): a receiver variable whose declared type
     is an APP type resolves to that type's method; a receiver typed to an imported
     non-app class is dropped external; unknown/import-only receivers still drop."""
-    store = KuzuStore(str(tmp_path / "recvtypedb"))
+    store = LadybugStore(str(tmp_path / "recvtypedb"))
     assert store.available()
 
     parsed = [
@@ -374,7 +374,7 @@ def test_ingest_code_receiver_type_inference(tmp_path):
 
 
 def test_code_query_write_guard(tmp_path):
-    store = KuzuStore(str(tmp_path / "guarddb"))
+    store = LadybugStore(str(tmp_path / "guarddb"))
     assert store.available()
     store.ingest_code([{
         "file": "x.py", "lang": "python",
@@ -406,7 +406,7 @@ def _sym(sid, name, file, line=1, lang="python"):
 def test_delete_code_under_scopes_to_prefix(tmp_path):
     """delete_code_under removes only code nodes under the prefix, leaving
     sibling code AND non-code (Finding/Entity/Investigation) nodes intact."""
-    store = KuzuStore(str(tmp_path / "deldb"))
+    store = LadybugStore(str(tmp_path / "deldb"))
     assert store.available()
 
     store.ingest_code([
@@ -439,7 +439,7 @@ def test_delete_code_under_scopes_to_prefix(tmp_path):
 
 def test_delete_code_under_rejects_overbroad_prefix(tmp_path):
     """Empty / whitespace / root-only prefixes are refused (no deletion)."""
-    store = KuzuStore(str(tmp_path / "guardpref"))
+    store = LadybugStore(str(tmp_path / "guardpref"))
     assert store.available()
     store.ingest_code([
         {"file": "/repo/x.py", "lang": "python",
@@ -458,10 +458,10 @@ def test_reingest_replace_is_idempotent(tmp_path):
     node counts, and a file removed between runs has its symbols pruned."""
     import graph_tools
 
-    store = KuzuStore(str(tmp_path / "reingestdb"))
+    store = LadybugStore(str(tmp_path / "reingestdb"))
     assert store.available()
-    _orig = graph_tools._get_kuzu
-    graph_tools._get_kuzu = lambda: store
+    _orig = graph_tools._get_ladybug
+    graph_tools._get_ladybug = lambda: store
 
     src = tmp_path / "src"
     (src / "pkg").mkdir(parents=True)
@@ -483,7 +483,7 @@ def test_reingest_replace_is_idempotent(tmp_path):
         files_2 = store.code_query("MATCH (c:CodeFile) RETURN count(c)")[0][0]
         syms_2 = store.code_query("MATCH (s:CodeSymbol) RETURN count(s)")[0][0]
     finally:
-        graph_tools._get_kuzu = _orig
+        graph_tools._get_ladybug = _orig
     # Counts did not double (idempotent) and the removed file's symbol is gone.
     assert files_2 <= files_1
     assert syms_2 < syms_1
@@ -493,7 +493,7 @@ def test_reingest_replace_is_idempotent(tmp_path):
 
 
 def test_fail_open_on_bad_query(tmp_path):
-    store = KuzuStore(str(tmp_path / "faildb"))
+    store = LadybugStore(str(tmp_path / "faildb"))
     assert store.available()
     # Nonsense read via code_query is swallowed -> [].
     assert store.code_query("MATCH (n:NoSuchTable) RETURN n") == []

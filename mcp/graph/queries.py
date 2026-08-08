@@ -1,9 +1,9 @@
-"""Composable code<->memory query primitives over :class:`KuzuStore`.
+"""Composable code<->memory query primitives over :class:`LadybugStore`.
 
 These are the low-level building blocks higher-level MCP tools compose from.
 Every function:
 
-* takes a :class:`~graph.kuzu_store.KuzuStore` as its first argument,
+* takes a :class:`~graph.ladybug_store.LadybugStore` as its first argument,
 * issues exactly **one** focused read query via ``ks.code_query`` (the
   read-only, write-guarded entry point) and shapes the result in Python,
 * is **fail-open**: on an unavailable store, a bad argument, or any raised
@@ -11,7 +11,7 @@ Every function:
 * returns only JSON-serializable data (dicts / lists / str / int / bool).
 
 The graph carries two overlaid subgraphs (code + investigation); see
-``graph.kuzu_store`` for the schema. Symbol ids are ``"file::Qualname"`` and the
+``graph.ladybug_store`` for the schema. Symbol ids are ``"file::Qualname"`` and the
 ``REFERENCES`` edge has no properties — its existence *is* the finding<->symbol
 link.
 """
@@ -72,9 +72,9 @@ def _symbol_row(row: list) -> dict:
 
 
 def _props(node: dict) -> dict:
-    """Public, non-null properties of a returned Kuzu node dict.
+    """Public, non-null properties of a returned LadybugDB node dict.
 
-    Kuzu returns a node as a dict of every node table's property (irrelevant
+    LadybugDB returns a node as a dict of every node table's property (irrelevant
     ones ``None``) plus internal ``_id`` / ``_label`` keys. Drop the internals
     and the nulls to leave a clean, JSON-serializable prop bag.
     """
@@ -85,7 +85,7 @@ def _props(node: dict) -> dict:
 
 
 def _internal_id(id_dict: Any) -> Optional[tuple]:
-    """Hashable identity for a Kuzu internal node id (``{table, offset}``)."""
+    """Hashable identity for a LadybugDB internal node id (``{table, offset}``)."""
     if isinstance(id_dict, dict):
         return (id_dict.get("table"), id_dict.get("offset"))
     return None

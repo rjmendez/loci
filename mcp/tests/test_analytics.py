@@ -1,13 +1,13 @@
 """Tests for graph.analytics — the composed code<->memory tools."""
 import pytest
 
-from graph.kuzu_store import KuzuStore
+from graph.ladybug_store import LadybugStore
 from graph import analytics as A
 
 
 @pytest.fixture
 def ks(tmp_path):
-    s = KuzuStore(str(tmp_path / "g.kuzu"))
+    s = LadybugStore(str(tmp_path / "g.kuzu"))
     assert s.available()
     e = s._exec
     e("MERGE (c:CodeFile {path:'a.java'}) SET c.lang='java'")
@@ -89,8 +89,8 @@ def test_investigation_code_briefing(ks):
 
 
 def test_dead_code_candidates(tmp_path):
-    from graph.kuzu_store import KuzuStore
-    s = KuzuStore(str(tmp_path / "dc.kuzu"))
+    from graph.ladybug_store import LadybugStore
+    s = LadybugStore(str(tmp_path / "dc.kuzu"))
     e = s._exec
     # `referenced` is the usage signal now (name occurs more than it's defined).
     def sym(sid, name, kind="function", decs="", referenced=False):

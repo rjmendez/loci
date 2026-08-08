@@ -59,9 +59,9 @@ def test_main_dispatches_per_request(monkeypatch, capsys):
         "subsystem_report": staticmethod(lambda ks, p: {"files": []}),
         "dead_code_candidates": staticmethod(lambda ks: {"candidates": []}),
     })
-    import graph.kuzu_store as kstore
+    import graph.ladybug_store as kstore
     import graph.analytics as analytics
-    monkeypatch.setattr(kstore, "KuzuStore", FakeKS)
+    monkeypatch.setattr(kstore, "LadybugStore", FakeKS)
     for name in ("impact_report", "subsystem_report", "dead_code_candidates"):
         monkeypatch.setattr(analytics, name, getattr(fake_analytics, name))
 

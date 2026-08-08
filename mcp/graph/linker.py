@@ -2,7 +2,7 @@
 
 A **precision-focused** engine that scans ``Finding`` text for references to
 ``CodeSymbol`` nodes and records each as a ``REFERENCES`` edge in the embedded
-Kuzu graph (:class:`graph.kuzu_store.KuzuStore`).
+LadybugDB graph (:class:`graph.ladybug_store.LadybugStore`).
 
 The whole point is *precision, not recall* — it mirrors the hard-won call-graph
 lesson: never resolve on a bare, common, ambiguous word. A finding that says

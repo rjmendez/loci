@@ -1,4 +1,4 @@
-"""Embedded Kuzu graph store for the Loci MCP server.
+"""Embedded LadybugDB graph store for the Loci MCP server.
 
 Persists two overlaid graphs in a single embedded Kuzu database:
 
@@ -12,7 +12,7 @@ Persists two overlaid graphs in a single embedded Kuzu database:
 It answers relationship queries over both, including a full graph port of the
 in-memory contamination algorithm (``memcheck.checks.contagion.find_contamination``).
 
-Design contract: **fail-open everywhere.** If ``import kuzu`` fails, the db
+Design contract: **fail-open everywhere.** If ``import ladybug`` fails, the db
 cannot be opened, or any query raises, public methods return ``False`` / ``[]``
 / ``{}`` and :meth:`available` stays ``False`` — nothing propagates out. The
 sole intentional exception is :meth:`code_query`, which raises ``ValueError`` on
@@ -31,7 +31,7 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
-logger = logging.getLogger("loci-mcp.kuzu")
+logger = logging.getLogger("loci-mcp.ladybug")
 
 
 def _writes(failopen):
@@ -59,15 +59,16 @@ def _writes(failopen):
 _LEASE_TIMEOUT_S = 6.0
 _LEASE_POLL_S = 0.05
 
-try:  # kuzu (now ladybug — same project, renamed; API-compatible) is optional —
+try:  # ladybug (LadybugDB) is optional — the store degrades to unavailable.
+      # Formerly Kuzu, which is unmaintained; LadybugDB is the maintained successor.
     # the store degrades to unavailable without it.
-    import ladybug as kuzu  # type: ignore
-    _HAS_KUZU = True
-except Exception:  # pragma: no cover - environment without kuzu/ladybug
-    kuzu = None  # type: ignore
-    _HAS_KUZU = False
+    import ladybug  # type: ignore
+    _HAS_LADYBUG = True
+except Exception:  # pragma: no cover - environment without ladybug
+    ladybug = None  # type: ignore
+    _HAS_LADYBUG = False
 
-__all__ = ["KuzuStore"]
+__all__ = ["LadybugStore"]
 
 # Query shapes that mutate the graph — rejected by code_query's read-only guard.
 _WRITE_GUARD_RE = re.compile(
@@ -265,8 +266,8 @@ def _resolve_calls(
     }
 
 
-class KuzuStore:
-    """Embedded Kuzu graph store. All public methods are fail-open."""
+class LadybugStore:
+    """Embedded LadybugDB graph store. All public methods are fail-open."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -285,9 +286,9 @@ class KuzuStore:
         # a short-lived leased connection and fails-open on contention, so the store
         # SELF-HEALS the instant the lock frees (no process-lifetime hold, no startup
         # latch that stays dead for the whole session).
-        self.ok = bool(_HAS_KUZU and db_path)
-        if not _HAS_KUZU:
-            logger.info("kuzu not importable; KuzuStore unavailable")
+        self.ok = bool(_HAS_LADYBUG and db_path)
+        if not _HAS_LADYBUG:
+            logger.info("ladybug not importable; LadybugStore unavailable")
 
     # ------------------------------------------------------------------ #
     # Per-operation leased sessions (the concurrency contract)
@@ -310,15 +311,15 @@ class KuzuStore:
 
     @contextmanager
     def _session(self, write: bool):
-        """Yield a short-lived Kuzu Connection under the cross-process lease, then
+        """Yield a short-lived LadybugDB Connection under the cross-process lease, then
         close it (releasing the lock) — nothing is held between operations.
 
         Nesting: a write method whose helpers call _exec re-enter here on the same
         thread (RLock) and REUSE the already-open connection instead of opening a
-        second one. Fail-open: if kuzu is absent, the lease can't be acquired in
+        second one. Fail-open: if ladybug is absent, the lease can't be acquired in
         time, or the open fails (another process holds Kuzu's writer lock), yields
         None and the caller degrades to []/False."""
-        if not _HAS_KUZU:
+        if not _HAS_LADYBUG:
             yield None
             return
         with self._lock:
@@ -333,20 +334,20 @@ class KuzuStore:
             db = conn = None
             try:
                 if not self._acquire_lease(fd, exclusive=write):
-                    logger.debug("kuzu lease busy (%s) — fail-open",
+                    logger.debug("ladybug lease busy (%s) — fail-open",
                                  "write" if write else "read")
                     yield None
                     return
                 got = True
-                db = kuzu.Database(self.db_path, read_only=not write)
-                conn = kuzu.Connection(db)
+                db = ladybug.Database(self.db_path, read_only=not write)
+                conn = ladybug.Connection(db)
                 if write:
                     self._ensure_schema(conn)
                     self._stamp_holder(fd)
                 self._active = conn
                 yield conn
             except Exception as exc:  # open/lock failure -> fail-open, retried next op
-                logger.debug("kuzu session (%s) unavailable: %s",
+                logger.debug("ladybug session (%s) unavailable: %s",
                              "write" if write else "read", exc)
                 yield None
             finally:
@@ -373,7 +374,7 @@ class KuzuStore:
             pass
 
     def writable_probe(self) -> bool:
-        """True if a RW connection can be opened right now (lease free AND Kuzu's own
+        """True if a RW connection can be opened right now (lease free AND LadybugDB's own
         writer lock free). Cheap, non-blocking-ish, always closes."""
         if not self.ok:
             return False
@@ -447,7 +448,7 @@ class KuzuStore:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _close_result(res) -> None:
-        """Close a Kuzu QueryResult while its connection is still open. A QueryResult
+        """Close a LadybugDB QueryResult while its connection is still open. A QueryResult
         must NEVER outlive its Connection/Database: its native __del__ -> close() would
         touch freed memory (segfault) once the per-op session closes the conn. So every
         result is drained+closed INSIDE the session, before _session tears it down."""
@@ -463,7 +464,7 @@ class KuzuStore:
         `self._session(True)` so they share a single lease + connection + schema-init."""
         with self._session(write=True) as conn:
             if conn is None:
-                raise RuntimeError("kuzu write session unavailable")
+                raise RuntimeError("ladybug write session unavailable")
             res = conn.execute(cypher) if params is None else conn.execute(cypher, params)
             self._close_result(res)     # never let it outlive the session (segfault guard)
             return None

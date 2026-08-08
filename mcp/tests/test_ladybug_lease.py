@@ -1,4 +1,4 @@
-"""Tests for the per-operation cross-process lease in graph.kuzu_store.KuzuStore.
+"""Tests for the per-operation cross-process lease in graph.ladybug_store.LadybugStore.
 
 The old store opened Kuzu read-write at construction and held it for the whole
 process life, so N Loci servers contended on Kuzu's single-writer lock and all but
@@ -17,16 +17,16 @@ import pytest
 
 pytest.importorskip("ladybug")
 
-from graph import kuzu_store as kz
-from graph.kuzu_store import KuzuStore
+from graph import ladybug_store as kz
+from graph.ladybug_store import LadybugStore
 
 
 def test_no_lock_held_between_ops_two_instances(tmp_path):
-    """Two KuzuStore instances on the same DB both read+write — proving neither holds
+    """Two LadybugStore instances on the same DB both read+write — proving neither holds
     the writer lock between operations (the whole point of the fix)."""
     path = str(tmp_path / "graphdb")
-    a = KuzuStore(path)
-    b = KuzuStore(path)
+    a = LadybugStore(path)
+    b = LadybugStore(path)
     assert a.available() and b.available()
 
     assert a.upsert_investigation("inv1", "from A") is True
@@ -44,8 +44,8 @@ def test_write_visible_to_a_fresh_instance(tmp_path):
     """A write committed by one instance is visible to a brand-new instance opening a
     read-only session — proves the write session flushes on close (durability)."""
     path = str(tmp_path / "graphdb")
-    KuzuStore(path).upsert_finding({"id": "f9", "investigation": "invZ", "text": "hello"})
-    fresh = KuzuStore(path)
+    LadybugStore(path).upsert_finding({"id": "f9", "investigation": "invZ", "text": "hello"})
+    fresh = LadybugStore(path)
     rows = fresh._rows("MATCH (f:Finding {id:'f9'}) RETURN f.text")
     assert rows and rows[0][0] == "hello"
 
@@ -53,7 +53,7 @@ def test_write_visible_to_a_fresh_instance(tmp_path):
 def test_concurrent_readers_share(tmp_path):
     """Many reader sessions run concurrently (shared lease) without error."""
     path = str(tmp_path / "graphdb")
-    s = KuzuStore(path)
+    s = LadybugStore(path)
     s.upsert_investigation("invR", "reader test")
     errors: list = []
 
@@ -78,7 +78,7 @@ def test_failopen_when_lease_is_held(tmp_path, monkeypatch):
     monkeypatch.setattr(kz, "_LEASE_TIMEOUT_S", 0.4)  # keep the test fast
     monkeypatch.setattr(kz, "_LEASE_POLL_S", 0.02)
     path = str(tmp_path / "graphdb")
-    s = KuzuStore(path)
+    s = LadybugStore(path)
     s.upsert_investigation("seed", "seed")           # create the lease file + schema
 
     # Hold the lease EXCLUSIVELY from an independent fd (stands in for another process).
@@ -100,7 +100,7 @@ def test_failopen_when_lease_is_held(tmp_path, monkeypatch):
 def test_holder_pid_is_stamped(tmp_path):
     """A completed write stamps this process's PID in the lease file (diagnostics)."""
     path = str(tmp_path / "graphdb")
-    s = KuzuStore(path)
+    s = LadybugStore(path)
     s.upsert_investigation("p", "pid test")
     assert s.lock_holder_pid() == os.getpid()
 

@@ -1,7 +1,7 @@
 """Code<->memory graph MCP tools — split out of server.py (P1 of the Loci self-review).
 
-Thin wrappers over the graph.* layer; they need only a _get_kuzu accessor, injected by
-register(). server.py calls register(mcp, _get_kuzu) after the FastMCP instance exists,
+Thin wrappers over the graph.* layer; they need only a _get_ladybug accessor, injected by
+register(). server.py calls register(mcp, _get_ladybug) after the FastMCP instance exists,
 so the tools register identically (FastMCP reads each function signature + docstring).
 """
 import json
@@ -11,7 +11,7 @@ from typing import Optional
 
 logger = logging.getLogger("loci-mcp")
 
-_get_kuzu = None  # injected by register()
+_get_ladybug = None  # injected by register()
 
 
 def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool = False) -> str:
@@ -40,9 +40,9 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool 
         JSON with per-run counts {files, symbols, defines, calls, imports} (and a
         ``pruned`` block when ``replace`` is set) or an error.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable — cannot ingest code graph."})
+        return json.dumps({"error": "LadybugDB graph store unavailable — cannot ingest code graph."})
     try:
         from graph.code_parse import parse_path, parse_source, detect_lang
         p = Path(path).expanduser()
@@ -73,7 +73,7 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool 
 
 def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     """
-    Run a READ-ONLY Cypher query against the Kuzu graph (code symbols + findings +
+    Run a READ-ONLY Cypher query against the LadybugDB graph (code symbols + findings +
     entities + investigations) and return the rows.
 
     Write-shaped queries (CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER) are rejected —
@@ -98,9 +98,9 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     Returns:
         JSON with {rows: [...], row_count} or an error (including a write-guard rejection).
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         rows = ks.code_query(cypher, params or None)
         return json.dumps({"row_count": len(rows), "rows": rows}, indent=2, default=str)
@@ -125,9 +125,9 @@ def code_memory_relink() -> str:
         JSON ``{"findings_scanned": int, "links_created": int}`` (zeros if the
         graph store is unavailable).
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph import linker
         result = linker.relink_all(ks)
@@ -162,9 +162,9 @@ def code_memory_map(anchor: str, anchor_type: str = "auto", hops: int = 1) -> st
         JSON ``{"matched": {"label", "key"} | None, "nodes": [...],
         "edges": [...]}``. ``matched`` reports which anchor label resolved.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph import queries
         candidates = (
@@ -210,9 +210,9 @@ def symbol_impact(symbol: str, hops: int = 3) -> str:
         JSON ``{"callers": [...symbols...], "findings": [...],
         "investigations": [...]}``.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph import queries
         return json.dumps(queries.symbol_impact(ks, symbol, hops=hops), indent=2, default=str)
@@ -239,9 +239,9 @@ def impact_report(symbol: str, hops: int = 3) -> str:
         referencing findings, affected investigations (by finding count, with samples),
         and the symbols most co-referenced with it. Empty structure if unavailable.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import impact_report as _impact
         return json.dumps(_impact(ks, symbol, hops=hops), indent=2, default=str)
@@ -265,9 +265,9 @@ def finding_code_context(finding_id: str) -> str:
         JSON {finding_id, text, symbols:[{id,name,kind,file,line,callers,callees}]}.
         Empty symbols if the finding references no code (or is unavailable).
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import finding_code_context as _ctx
         return json.dumps(_ctx(ks, finding_id), indent=2, default=str)
@@ -294,9 +294,9 @@ def investigation_code_briefing(investigation_id: str, top: int = 3) -> str:
         top_symbols:[{symbol, in_investigation_findings, transitive_callers,
         total_referencing_findings, other_investigations}], related_investigations}.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import investigation_code_briefing as _brief
         return json.dumps(_brief(ks, investigation_id, top=top), indent=2, default=str)
@@ -322,9 +322,9 @@ def subsystem_report(anchor: str, limit: int = 15) -> str:
         JSON {anchor, files, symbol_count, kinds, inbound_callers, outbound_callees,
         hotspot_symbols, investigations}.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import subsystem_report as _sub
         return json.dumps(_sub(ks, anchor, limit=limit), indent=2, default=str)
@@ -348,9 +348,9 @@ def related_investigations_via_code(investigation_id: str, limit: int = 15) -> s
     Returns:
         JSON list of {investigation, shared_symbols, sample_symbols}, ranked desc.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import related_investigations_via_code as _rel
         return json.dumps({"investigation_id": investigation_id,
@@ -377,9 +377,9 @@ def dead_code_candidates(lang: Optional[str] = None, limit: int = 50) -> str:
     Returns:
         JSON {candidates:[{name,kind,file,line,decorators}], count, note}.
     """
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
-        return json.dumps({"error": "Kuzu graph store unavailable."})
+        return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
         from graph.analytics import dead_code_candidates as _dead
         return json.dumps(_dead(ks, lang=lang, limit=limit), indent=2, default=str)
@@ -388,10 +388,10 @@ def dead_code_candidates(lang: Optional[str] = None, limit: int = 50) -> str:
         return json.dumps({"error": f"dead_code_candidates failed: {exc!r}"})
 
 
-def register(mcp, get_kuzu):
+def register(mcp, get_ladybug):
     """Inject deps and register every graph tool on the shared FastMCP instance."""
-    global _get_kuzu
-    _get_kuzu = get_kuzu
+    global _get_ladybug
+    _get_ladybug = get_ladybug
     for fn in (
         code_graph_ingest,
         code_graph_query,

@@ -28,7 +28,7 @@ def test_loci_health_returns_expected_keys():
     assert isinstance(out, dict)
     # Subset (not ==) so additive fields don't break this contract.
     assert _EXPECTED_KEYS <= set(out.keys())
-    # kuzu is one of the documented states
+    # the "kuzu" key name is retained for wire compatibility (backend is LadybugDB)
     assert out["kuzu"] in (
         "available", "contended", "unavailable", "latched", "backoff"
     )
