@@ -109,8 +109,9 @@ def _event_log_append(event: dict) -> None:
             _sys.path.insert(0, _scripts)
         from event_log import append as _el_append
         _el_append(event)
-    except Exception:
-        pass  # Never let event log failures block memory operations
+    except Exception as exc:
+        logger.debug("event log append failed (fail-open): %r", exc)
+        # Never let event log failures block memory operations
 _HOST_RE = re.compile(
     r'\b[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?'
     r'(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)*'
@@ -119,11 +120,6 @@ _HOST_RE = re.compile(
 _URL_RE = re.compile(r'https?://[^\s"\' <>;]+', re.I)
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _extract_entities(text: str) -> dict:
@@ -136,14 +132,14 @@ def _extract_entities(text: str) -> dict:
             # with .lower()) never miss a mixed-case value from the IOC extractor.
             out["hashes"] = [h.lower() for h in (ioc.get("SHA256") or [])]
             out["cves"]   = [c.lower() for c in (ioc.get("CVE") or [])]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("cy_ioc extract failed (fail-open): %r", exc)
     if _HAS_IOCEXTRACT and not out["ips"]:
         # fallback: iocextract handles defanged IPs (e.g. 198[.]51[.]100[.]1)
         try:
             out["ips"] = list(_iocextract.extract_ips(text))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("iocextract extract_ips failed (fail-open): %r", exc)
     out["emails"]    = [e.lower() for e in _EMAIL_RE.findall(text)]
     out["hostnames"] = list({m.lower() for m in _HOST_RE.findall(text)})
     out["urls"] = [u for u in _URL_RE.findall(text)]
@@ -181,14 +177,26 @@ REFLECTION_LOG_TAIL_READ_BYTES = 512_000
 REFLECTION_SIGNATURE_OBSERVE_LIMIT = 3
 REFLECTION_SIGNATURE_MAP_LIMIT = 500
 
-# Confidence tier ranking — used by investigation_search and _qdrant_similarity_search.
-# Defined once here to avoid the same dict appearing inline in multiple functions.
-_CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+# ---------------------------------------------------------------------------
+# Investigation storage layer (P2b of the Loci self-review split)
+#
+# The store lives in inv_store.py. Its memory root is injected as a LAMBDA closing
+# over MEMORY_DIR above — not the Path value — so that rebinding server.MEMORY_DIR
+# (which ~10 tests do, to a tmpdir) still redirects every store write. Registered
+# here, immediately after MEMORY_DIR, so the helpers are bound before first use.
+# ---------------------------------------------------------------------------
 
-# Finding lifecycle/resolution states. "open" is the default and the implied value for
-# any finding record stored before this field existed (absent -> "open"). The three
-# resolved states are what exclusion-aware grounding treats as "handled — do not re-report".
-_RESOLUTION_STATES: frozenset = frozenset({"open", "fixed", "intentional", "wontfix", "superseded"})
+import inv_store  # noqa: E402
+inv_store.register(lambda: MEMORY_DIR)
+# Re-exported so `server.<helper>()` keeps working for the rest of this module,
+# for in-process callers, and for tests (which patch e.g. server._append_jsonl).
+from inv_store import (  # noqa: E402,F401
+    _now, _inv_dir, _manifest_cache, _load_manifest, _save_manifest,
+    _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
+    _load_resolution_overrides, _load_retracted_ids, _make_ref, _tag_finding_ids,
+    _summarise_finding, _safe_float, _CONFIDENCE_RANK, _RESOLUTION_STATES,
+)
+
 
 # ---------------------------------------------------------------------------
 # Optional Qdrant + fastembed
@@ -1208,6 +1216,51 @@ def _record_claim_verdicts(
     return {"recorded": recorded, "qdrant": "ok" if qdrant_ok else "partial"}
 
 
+def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success: bool) -> tuple[bool, str | None]:
+    """Classify Qdrant degraded mode for the ``degraded_mode`` tool payload.
+
+    Returns ``(active, reason)``.  ``errors`` is only tested for truthiness, so any
+    container (or None) is accepted.
+    """
+    degraded_active = (not enabled) or (not available) or bool(errors) or (enabled and available and not query_success)
+    degraded_reason = None
+    if not enabled:
+        degraded_reason = "qdrant_disabled"
+    elif not available:
+        degraded_reason = "qdrant_unavailable"
+    elif errors:
+        degraded_reason = "qdrant_semantic_error"
+    elif not query_success:
+        degraded_reason = "qdrant_semantic_not_executed"
+    return degraded_active, degraded_reason
+
+
+def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
+    """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
+
+    Returns ``(rows, True)`` only when the cross-encoder scored every row and the
+    sort completed.  Returns ``(rows, False)`` — original bi-encoder order, still
+    truncated to ``top_k`` — when the cross-encoder is unavailable or scoring
+    raised, so the return count is consistent whether CE is installed or not.
+    """
+    ce = _get_cross_encoder()
+    if ce is not None and rows:
+        try:
+            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
+            ce_scores = ce.predict(pairs)
+            for row, ce_score in zip(rows, ce_scores):
+                row["ce_score"] = round(float(ce_score), 4)
+            return sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:top_k], True
+        except Exception as exc:
+            logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
+            # Strip any partial ce_score annotations written before the exception
+            # so downstream consumers see a consistent payload (all rows scored,
+            # or none — never a mix).
+            for row in rows:
+                row.pop("ce_score", None)
+    return rows[:top_k], False
+
+
 def _qdrant_similarity_search(
     query: str,
     *,
@@ -1303,28 +1356,15 @@ def _qdrant_similarity_search(
         rows.append({"score": round(float(p.score), 4), **payload, "origin": payload.get("origin", "qdrant")})
 
     # Stage 2: cross-encoder reranking — full query-passage joint scoring.
-    ce = _get_cross_encoder() if rerank else None
-    if ce is not None and rows:
-        try:
-            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
-            ce_scores = ce.predict(pairs)
-            for row, ce_score in zip(rows, ce_scores):
-                row["ce_score"] = round(float(ce_score), 4)
-            rows = sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:output_k]
+    if rerank:
+        rows, reranked = _ce_rerank(query, rows, output_k)
+        if reranked:
             mode = mode + "+reranked"
-        except Exception as exc:
-            logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
-            # Strip any partial ce_score annotations written before the exception
-            # so downstream consumers see a consistent payload (all rows scored,
-            # or none — never a mix).
-            for row in rows:
-                row.pop("ce_score", None)
-            rows = rows[:output_k]
     else:
-        # CE not available — honour output_k so the function's return count is
-        # consistent whether CE is installed or not.  investigation_search still
-        # gets enough dedup candidates from mnemosyne (up to limit*4 rows) so
-        # capping here at output_k does not starve the dedup loop.
+        # Reranking disabled — honour output_k so the function's return count is
+        # consistent whether CE runs or not.  investigation_search still gets
+        # enough dedup candidates from mnemosyne (up to limit*4 rows) so capping
+        # here at output_k does not starve the dedup loop.
         rows = rows[:output_k]
 
     return {"ok": True, "reason": mode, "results": rows}
@@ -1481,21 +1521,7 @@ def _qdrant_search_collection(
         })
 
     # Cross-encoder rerank if available
-    ce = _get_cross_encoder()
-    if ce is not None and rows:
-        try:
-            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
-            ce_scores = ce.predict(pairs)
-            for row, ce_score in zip(rows, ce_scores):
-                row["ce_score"] = round(float(ce_score), 4)
-            rows = sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:limit]
-        except Exception as exc:
-            logger.debug("_qdrant_search_collection: CE rerank failed: %s", exc)
-            for row in rows:
-                row.pop("ce_score", None)
-            rows = rows[:limit]
-    else:
-        rows = rows[:limit]
+    rows, _ = _ce_rerank(query, rows, limit)
 
     return rows
 
@@ -1540,13 +1566,7 @@ def _search_benign_context_qdrant(
 
     seen: dict[str, dict] = {}
 
-    entity_field_map = {
-        "ips":       "entities.ips",
-        "emails":    "entities.emails",
-        "hostnames": "entities.hostnames",
-        "hashes":    "entities.hashes",
-        "cves":      "entities.cves",
-    }
+    entity_field_map = {p: f"entities.{p}" for _, p in _ENTITY_TYPES}
 
     for entity_type, field in entity_field_map.items():
         for val in list(entities.get(entity_type, []))[:2]:
@@ -1577,31 +1597,25 @@ def _search_benign_context_qdrant(
                 logger.debug("benign_context lookup failed (%s=%r): %s", field, val, exc)
 
     findings = sorted(seen.values(), key=lambda f: f.get("created_at_ts", 0), reverse=True)[:limit]
-    return [
-        {
-            "finding_id": f.get("id"),
-            "investigation_id": f.get("investigation_id"),
-            "ts": f.get("ts"),
-            "record_type": f.get("record_type") or f.get("type"),
-            "confidence": f.get("confidence"),
-            "source": f.get("source"),
-            "text": str(f.get("text", ""))[:300],
-        }
-        for f in findings
-    ]
+    return [_summarise_finding(f, include_tags=False) for f in findings]
 
 
 # ---------------------------------------------------------------------------
 # Entity lookup helpers
 # ---------------------------------------------------------------------------
 
-_ENTITY_FIELD_MAP = {
-    "ip":       "entities.ips",
-    "email":    "entities.emails",
-    "hostname": "entities.hostnames",
-    "hash":     "entities.hashes",
-    "cve":      "entities.cves",
-}
+# Explicit map avoids "hash" + "s" = "hashs" (should be "hashes").
+# Order is observable: rendered into the entity_type error message below.
+_ENTITY_TYPES = (
+    ("ip", "ips"),
+    ("email", "emails"),
+    ("hostname", "hostnames"),
+    ("hash", "hashes"),
+    ("cve", "cves"),
+)
+
+_ENTITY_FIELD_MAP = {s: f"entities.{p}" for s, p in _ENTITY_TYPES}
+_PLURAL = dict(_ENTITY_TYPES)
 
 _IP_RE   = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 # IPv6: all chars are hex digits or colons, at least two colons (covers ::1,
@@ -1669,9 +1683,6 @@ def _entity_lookup_jsonl(
 ) -> list[dict]:
     """JSONL fallback: scan findings files checking stored entities, then raw text."""
     entity_lower = entity.lower()
-    # Explicit map avoids "hash" + "s" = "hashs" (should be "hashes").
-    _PLURAL = {"ip": "ips", "email": "emails", "hostname": "hostnames",
-               "hash": "hashes", "cve": "cves"}
     field_plural = _PLURAL.get(entity_type, entity_type + "s")
     results: list[dict] = []
 
@@ -1706,95 +1717,48 @@ def _entity_lookup_jsonl(
     return results
 
 
-def _summarise_finding(f: dict) -> dict:
-    """Compact finding summary for entity-lookup results."""
-    return {
-        "finding_id": f.get("id"),
-        "investigation_id": f.get("investigation_id"),
-        "ts": f.get("ts"),
-        "record_type": f.get("record_type") or f.get("type"),
-        "confidence": f.get("confidence"),
-        "source": f.get("source"),
-        "text": str(f.get("text", ""))[:300],
-        "tags": f.get("tags", []),
-    }
+def _entity_lookup_cascade(
+    entity: str,
+    entity_type: str,
+    investigation_id: Optional[str],
+    limit: int,
+) -> tuple[list[dict], str]:
+    """Prefer the Kuzu graph (primary), then Qdrant (indexed), then JSONL scan.
+
+    Returns ``(findings, method)`` where ``method`` names the tier that produced
+    the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
+    """
+    findings = _entity_lookup_kuzu(entity, investigation_id, limit)
+    method = "kuzu"
+    if not findings:
+        findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
+        method = "qdrant"
+    if not findings:
+        findings = _entity_lookup_jsonl(entity, entity_type, investigation_id, limit)
+        method = "jsonl_fallback"
+    return findings, method
+
+
 
 
 # ---------------------------------------------------------------------------
 # Storage helpers
 # ---------------------------------------------------------------------------
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
-def _inv_dir(investigation_id: str) -> Path:
-    d = MEMORY_DIR / investigation_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
 
 
-_manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
 
 
-def _load_manifest(investigation_id: str) -> dict | None:
-    raw = _manifest_cache.get(investigation_id)
-    if raw is None:
-        p = MEMORY_DIR / investigation_id / "manifest.json"
-        if not p.exists():
-            return None
-        raw = p.read_text()
-        _manifest_cache[investigation_id] = raw
-    manifest = json.loads(raw)
-    # Backward compat: initialize ACL fields if missing (old investigations)
-    if "owner" not in manifest:
-        manifest["owner"] = ""
-    if "acl" not in manifest:
-        manifest["acl"] = []
-    return manifest
 
 
-def _save_manifest(manifest: dict) -> None:
-    manifest["updated_at"] = _now()
-    p = _inv_dir(manifest["id"]) / "manifest.json"
-    data = json.dumps(manifest, indent=2)
-    dir_ = p.parent
-    with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
-        tf.write(data)
-        tmp_path = Path(tf.name)
-    tmp_path.replace(p)
-    _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
 
 
-def _append_jsonl(path: Path, entry: dict) -> None:
-    # Exclusive advisory lock around the append so concurrent writers (e.g. parallel
-    # workflow agents recording to the same investigation) can't interleave a >PIPE_BUF
-    # line and corrupt the file. flock is POSIX-only; degrade to a bare append elsewhere.
-    line = json.dumps(entry) + "\n"
-    with open(path, "a") as f:
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.write(line)
-            f.flush()
-        finally:
-            try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
 
 
-def _read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line:
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-    return out
+
+
 
 
 def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> int:
@@ -1828,13 +1792,7 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
             else:
                 new_lines.append(line)
         # Atomic replace via temp file in the same directory
-        dir_ = path.parent
-        with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
-            tf.write("\n".join(new_lines))
-            if new_lines:
-                tf.write("\n")
-            tmp_path = Path(tf.name)
-        tmp_path.replace(path)
+        _atomic_write_text(path, "\n".join(new_lines) + ("\n" if new_lines else ""))
         return modified
     except Exception as exc:
         logger.debug("_rewrite_jsonl_set_field failed (fail-open): %r", exc)
@@ -1883,10 +1841,6 @@ _FILE_REF_RE = re.compile(
 )
 
 
-def _finding_updates_path(investigation_id: str) -> Path:
-    """Resolution overrides log — scanned by every read path (load/search), so it
-    stays SMALL: only finding_resolve appends here (last-write-wins resolutions)."""
-    return _inv_dir(investigation_id) / "finding_updates.jsonl"
 
 
 def _finding_verifications_path(investigation_id: str) -> Path:
@@ -1896,26 +1850,6 @@ def _finding_verifications_path(investigation_id: str) -> Path:
     return _inv_dir(investigation_id) / "finding_verifications.jsonl"
 
 
-def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
-    """Return {finding_id: resolution} from finding_updates.jsonl, last-write-wins.
-
-    Only 'resolution' update records with a valid state participate; any other
-    record type is skipped cheaply. Verification verdicts live in a separate log
-    (finding_verifications.jsonl) so they never bloat this scan. Fail-open: any
-    read/parse error yields {} so the read path falls back to stored/default values.
-    """
-    overrides: dict[str, str] = {}
-    try:
-        for rec in _read_jsonl(_finding_updates_path(investigation_id)):
-            if not isinstance(rec, dict) or rec.get("record_type") != "resolution":
-                continue
-            fid = str(rec.get("finding_id") or "")
-            res = str(rec.get("resolution") or "").lower()
-            if fid and res in _RESOLUTION_STATES:
-                overrides[fid] = res  # later line wins
-    except Exception as exc:  # noqa: BLE001 — never block a read on the overrides log
-        logger.debug("resolution overrides load failed (fail-open): %r", exc)
-    return overrides
 
 
 # Files larger than this are never hashed — a code ref points at source, not
@@ -2160,20 +2094,8 @@ def _load_reflection_state() -> dict:
 
 
 def _save_reflection_state(state: dict) -> None:
-    import tempfile
-    REFLECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = _now()
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=REFLECTION_STATE_DIR, prefix=".reflection_tmp_")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            f.write(json.dumps(state, indent=2))
-        os.replace(tmp_path, REFLECTION_STATE_FILE)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        raise
+    _atomic_write_text(REFLECTION_STATE_FILE, json.dumps(state, indent=2))
 
 
 def _canonicalize_reflection_signature(text: str) -> str:
@@ -2426,24 +2348,6 @@ def _normalize_derived_from(derived_from: str | list[str] | None) -> list[str]:
     return out
 
 
-def _load_retracted_ids(investigation_id: str) -> set[str]:
-    """Fold ``retractions.jsonl`` into the set of currently-retracted finding ids.
-
-    A finding is retracted iff its id has an ``active:true`` retraction with no
-    later ``active:false`` (restore) entry. The log is append-only, so we replay
-    it in order and the last entry per finding id wins. Fail-safe: a missing or
-    malformed log yields an empty set, never raises.
-    """
-    path = _inv_dir(investigation_id) / "retractions.jsonl"
-    state: dict[str, bool] = {}
-    for entry in _read_jsonl(path):
-        if not isinstance(entry, dict):
-            continue
-        fid = entry.get("finding_id")
-        if not fid:
-            continue
-        state[str(fid)] = bool(entry.get("active", True))
-    return {fid for fid, active in state.items() if active}
 
 
 _NEGATION_RE = re.compile(r"\b(?:no|not|never|none|without|cannot|can't|didn't|isn't|aren't|won't)\b", re.I)
@@ -2637,19 +2541,6 @@ def _lexical_match_score(claim_tokens: set[str], evidence_tokens: set[str]) -> f
     return len(overlap) / max(1, len(claim_tokens))
 
 
-def _make_ref(record: dict, match_type: str, score: float | None = None) -> dict:
-    ref = {
-        "evidence_id": record.get("evidence_id"),
-        "record_type": record.get("record_type"),
-        "source": record.get("source"),
-        "ts": record.get("ts"),
-        "origin": record.get("origin"),
-        "snippet": record.get("snippet", ""),
-        "match_type": match_type,
-    }
-    if score is not None:
-        ref["score"] = round(score, 4)
-    return ref
 
 
 def _compute_aggregate_confidence(
@@ -2690,20 +2581,6 @@ def _compute_aggregate_confidence(
 # Memory self-check helpers (advisory-only; never mutate/delete findings)
 # ---------------------------------------------------------------------------
 
-def _tag_finding_ids(findings: list[dict], investigation_id: str) -> list[dict]:
-    """Return shallow copies of findings each carrying a stable ``id``.
-
-    Reuses an existing id field when present, else derives
-    ``f"{investigation_id}:{index}"``. Findings on disk are never mutated — this
-    only annotates the in-memory copies the checks operate on.
-    """
-    tagged: list[dict] = []
-    for index, f in enumerate(findings or []):
-        if not isinstance(f, dict):
-            continue
-        fid = f.get("id") or f.get("finding_id") or f"{investigation_id}:{index}"
-        tagged.append({**f, "id": str(fid)})
-    return tagged
 
 
 def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict:
@@ -2851,179 +2728,7 @@ async def health(request):  # noqa: ARG001
 
 # ---- Tool: investigation_start ----
 
-@mcp.tool()
-def investigation_start(
-    investigation_id: str,
-    title: str,
-    context: Optional[str] = None,
-) -> str:
-    """
-    Create or resume an investigation. Call at the start of any session to
-    initialize the manifest. Idempotent — resuming an existing ID returns
-    the current manifest without overwriting it.
-
-    Args:
-        investigation_id: Short identifier — ticket number, case ID, or a
-                          descriptive slug (e.g. "RQ41919026", "pww-actor-2026").
-        title: One-line description of the investigation.
-        context: Optional background to record on first creation only.
-
-    Returns:
-        JSON: {"status": "created"|"resumed", "manifest": {id, title, context, status,
-               created_at, updated_at, hypothesis, open_questions, next_step,
-               checked_sources, finding_counts, closed_at, closed_summary}}
-
-        The investigation ID is at result["manifest"]["id"], NOT result["investigation_id"].
-        Example extraction: inv_id = json.loads(result)["manifest"]["id"]
-    """
-    existing = _load_manifest(investigation_id)
-    if existing:
-        _kuzu_upsert_investigation(investigation_id, existing.get("title", ""))
-        return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
-
-    manifest = {
-        "id": investigation_id,
-        "title": title,
-        "context": context or "",
-        "status": "active",
-        "created_at": _now(),
-        "updated_at": _now(),
-        "hypothesis": None,
-        "open_questions": [],
-        "next_step": None,
-        "checked_sources": {},
-        "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
-        "closed_at": None,
-        "closed_summary": None,
-        "owner": "",
-        "acl": [],
-        "summary_l1": [],
-        "summary_l2": "",
-    }
-    _save_manifest(manifest)
-    _kuzu_upsert_investigation(investigation_id, title)
-    logger.info("Created investigation %s", investigation_id)
-    return json.dumps({"status": "created", "manifest": manifest}, indent=2)
-
-
 # ---- Tool: investigation_load ----
-
-@mcp.tool()
-def investigation_load(
-    investigation_id: str,
-    last_n_findings: int = 20,
-    include_retracted: bool = False,
-    requesting_agent_id: Optional[str] = None,
-    fidelity: str = "full",
-) -> str:
-    """
-    Retrieve manifest and recent findings for an investigation.
-    Use at session start to recover context without re-running all previous
-    tool calls. The manifest contains hypothesis, open questions, checked
-    sources, and next step — everything needed to resume cleanly.
-
-    Soft-tombstoned (retracted) findings are excluded by default so a known
-    hallucination and its contaminated lineage don't re-enter recall. The data
-    is never lost — pass ``include_retracted=True`` to see them, and the count
-    of excluded findings is always reported as ``excluded_retracted``.
-
-    Args:
-        investigation_id: Investigation identifier.
-        last_n_findings: How many recent findings to include (default 20).
-        include_retracted: Include soft-retracted findings (default False).
-        requesting_agent_id: Optional agent_id of the requesting agent. When
-                             provided and the investigation has a non-empty ACL,
-                             findings are filtered to those authored by agents
-                             in the ACL or by the requesting agent itself.
-        fidelity: Controls how much detail is returned. One of:
-                  "full"    — existing behavior: returns manifest + all recent findings.
-                  "summary" — returns manifest + summary_l1 (bullets) + summary_l2
-                              (paragraph) instead of full findings list. Useful when
-                              context window is constrained.
-                  "brief"   — returns manifest + summary_l2 only (single paragraph).
-                              Most compact form; good for quick orientation.
-
-    Returns:
-        JSON with manifest, total finding count, recent findings, and
-        ``excluded_retracted`` (count of findings filtered out).
-        When fidelity is "summary" or "brief", the ``recent_findings`` key is
-        omitted and replaced with ``summary_l1`` and/or ``summary_l2``.
-    """
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return json.dumps({
-            "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
-        })
-
-    # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
-    summary_l1 = manifest.get("summary_l1") or []
-    summary_l2 = manifest.get("summary_l2") or ""
-
-    if fidelity == "brief":
-        return json.dumps({
-            "manifest": manifest,
-            "fidelity": "brief",
-            "summary_l2": summary_l2,
-        }, indent=2)
-
-    if fidelity == "summary":
-        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-        all_retracted = _load_retracted_ids(investigation_id)
-        total_retracted = len(all_retracted)
-        retracted = set() if include_retracted else all_retracted
-        excluded_retracted = 0
-        if retracted:
-            kept = [f for f in findings if str(f.get("id", "")) not in retracted]
-            excluded_retracted = len(findings) - len(kept)
-            findings = kept
-        return json.dumps({
-            "manifest": manifest,
-            "fidelity": "summary",
-            "total_findings": len(findings),
-            "summary_l1": summary_l1,
-            "summary_l2": summary_l2,
-            "excluded_retracted": excluded_retracted,
-            "total_retracted": total_retracted,
-            "include_retracted": include_retracted,
-        }, indent=2)
-
-    # Default: fidelity == "full"
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-    all_retracted = _load_retracted_ids(investigation_id)
-    total_retracted = len(all_retracted)
-    retracted = set() if include_retracted else all_retracted
-    excluded_retracted = 0
-    if retracted:
-        kept = [f for f in findings if str(f.get("id", "")) not in retracted]
-        excluded_retracted = len(findings) - len(kept)
-        findings = kept
-
-    # ACL filtering: only apply when requesting_agent_id is given AND acl is non-empty
-    acl = manifest.get("acl") or []
-    if requesting_agent_id and acl:
-        acl_set = set(acl)
-        findings = [
-            f for f in findings
-            if f.get("authored_by", "") == requesting_agent_id
-            or f.get("authored_by", "") in acl_set
-        ]
-
-    recent = findings[-last_n_findings:]
-    # Surface the lifecycle/resolution state (append-log overrides win, else stored/
-    # default "open") and staleness for findings that carry code_refs. Additive +
-    # backwards-compatible: findings without these fields read as "open"/not-stale.
-    _apply_lifecycle(recent, investigation_id)
-
-    return json.dumps({
-        "manifest": manifest,
-        "fidelity": "full",
-        "total_findings": len(findings),
-        "recent_findings": recent,
-        "excluded_retracted": excluded_retracted,
-        "total_retracted": total_retracted,
-        "include_retracted": include_retracted,
-    }, indent=2)
-
 
 # ---------------------------------------------------------------------------
 # Conflict detection helpers
@@ -3297,7 +3002,8 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
             for ent in existing:
                 f.write(json.dumps(ent) + "\n")
         tmp_path.replace(entities_path)
-    except Exception:
+    except Exception as exc:
+        logger.debug("_update_entities_jsonl: entity extraction/merge/write failed (fail-open): %r", exc)
         pass  # fail-open — never crash investigation_store
 
 
@@ -3827,324 +3533,9 @@ def procedure_search(
 
 # ---- Tool: investigation_as_of ----
 
-@mcp.tool()
-def investigation_as_of(
-    investigation_id: str,
-    as_of_timestamp: str,
-) -> str:
-    """
-    Return findings from an investigation as they were believed at a specific point in time.
-
-    A finding is included when BOTH of the following hold:
-      - created_at_ts <= as_of_epoch  (the finding existed by that moment)
-      - valid_until is null OR valid_until >= as_of_timestamp  (it was still believed valid)
-
-    This supports bi-temporal analysis: you can reconstruct the investigation's
-    knowledge state at any historical moment, even after findings have been
-    superseded or retracted.
-
-    Args:
-        investigation_id: Investigation identifier.
-        as_of_timestamp: ISO8601 timestamp (e.g. "2024-01-15T10:30:00+00:00").
-                         Findings created after this moment are excluded, and
-                         findings whose valid_until is before this moment are
-                         also excluded.
-
-    Returns:
-        JSON: {
-          "investigation_id": "<id>",
-          "as_of": "<as_of_timestamp>",
-          "findings": [...],
-          "count": <int>
-        }
-        On error: {"error": "<message>"}
-    """
-    try:
-        manifest = _load_manifest(investigation_id)
-        if not manifest:
-            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-        try:
-            as_of_dt = datetime.fromisoformat(as_of_timestamp)
-            # Make timezone-aware if naive (assume UTC)
-            if as_of_dt.tzinfo is None:
-                as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
-            as_of_epoch = int(as_of_dt.timestamp())
-        except (ValueError, TypeError) as exc:
-            return json.dumps({"error": f"Invalid as_of_timestamp: {exc}"})
-
-        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
-        all_findings = _read_jsonl(findings_path)
-
-        result_findings = []
-        for f in all_findings:
-            created_at_ts = f.get("created_at_ts")
-            if created_at_ts is None:
-                # Older findings without created_at_ts: include them (fail-open)
-                pass
-            elif int(created_at_ts) > as_of_epoch:
-                continue
-
-            valid_until = f.get("valid_until")
-            if valid_until is not None:
-                try:
-                    vu_dt = datetime.fromisoformat(str(valid_until))
-                    if vu_dt.tzinfo is None:
-                        vu_dt = vu_dt.replace(tzinfo=timezone.utc)
-                    if vu_dt < as_of_dt:
-                        continue
-                except (ValueError, TypeError):
-                    pass  # fail-open: include if valid_until can't be parsed
-
-            result_findings.append(f)
-
-        return json.dumps({
-            "investigation_id": investigation_id,
-            "as_of": as_of_timestamp,
-            "findings": result_findings,
-            "count": len(result_findings),
-        }, indent=2)
-    except Exception as exc:
-        logger.exception("investigation_as_of failed")
-        return json.dumps({"error": f"investigation_as_of failed: {exc}"})
-
-
 # ---- Tool: investigation_note ----
 
-@mcp.tool()
-def investigation_note(
-    investigation_id: str,
-    field: str,
-    value: str,
-) -> str:
-    """
-    Update a manifest field for the investigation. Use to track the working
-    hypothesis, next action, open questions, and which sources have been checked.
-
-    Args:
-        investigation_id: Investigation identifier.
-        field: One of:
-               context             — overwrite the investigation context (corrects stale
-                                     framing set at creation time).
-               hypothesis          — current working hypothesis (overwrite).
-               next_step           — recommended next action (overwrite).
-               open_question_add   — append a question to the open list.
-               open_question_remove — remove a question from the open list.
-               checked_source      — mark a source as checked; format as
-                                     "tool_name: one-line summary of what was found".
-               closed_summary      — close the investigation with a final summary.
-
-    Returns:
-        JSON with the updated manifest.
-    """
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-    if field in ("context", "hypothesis", "next_step"):
-        stripped = value.strip() if value else ""
-        if not stripped:
-            return json.dumps({"error": f"Field '{field}' must not be empty or whitespace-only."})
-        manifest[field] = stripped
-        manifest[f"{field}_ts"] = _now()
-    elif field == "open_question_add":
-        if value not in manifest["open_questions"]:
-            manifest["open_questions"].append(value)
-    elif field == "open_question_remove":
-        manifest["open_questions"] = [q for q in manifest["open_questions"] if q != value]
-    elif field == "checked_source":
-        parts = value.split(":", 1)
-        tool = parts[0].strip()
-        summary = parts[1].strip() if len(parts) > 1 else ""
-        manifest["checked_sources"][tool] = {"summary": summary, "ts": _now()}
-    elif field == "closed_summary":
-        manifest["closed_summary"] = value
-        manifest["status"] = "closed"
-        manifest["closed_at"] = _now()
-    else:
-        return json.dumps({
-            "error": (
-                f"Unknown field '{field}'. Valid: context, hypothesis, next_step, "
-                "open_question_add, open_question_remove, checked_source, closed_summary"
-            )
-        })
-
-    _save_manifest(manifest)
-    _event_log_append({
-        "op": "note",
-        "investigation_id": investigation_id,
-        "field": field,
-    })
-    return json.dumps({"updated": field, "manifest": manifest}, indent=2)
-
-
 # ---- Tool: investigation_reflect ----
-
-@mcp.tool()
-def investigation_reflect(investigation_id: str) -> str:
-    """
-    Synthesize the current state of an investigation. Returns a structured
-    summary of what has been established, what is still open, and what has
-    not been checked. Call before write actions, at handoff points, or when
-    context is growing long.
-
-    Args:
-        investigation_id: Investigation identifier.
-
-    Returns:
-        JSON reflection: finding breakdown, open questions, gaps, hypothesis,
-        checked vs unchecked sources, and most recent findings per type.
-    """
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-    retracted = _load_retracted_ids(investigation_id)
-    excluded_retracted = 0
-    if retracted:
-        kept = [f for f in findings if str(f.get("id", "")) not in retracted]
-        excluded_retracted = len(findings) - len(kept)
-        findings = kept
-
-    by_type: dict[str, list] = {"observed": [], "inferred": [], "assumed": [], "gap": []}
-    for f in findings:
-        by_type.setdefault(f.get("type", "observed"), []).append(f)
-
-    # Advisory self-check (additive): surface observed findings with no audit
-    # receipt and findings that appear to contradict. Pure over the JSONL — no
-    # qdrant required. Fail-open: degrades to empty lists, never blocks reflect.
-    checks = _compute_self_check(investigation_id)
-    self_check = {
-        "unsupported_observed": [
-            {
-                "refs": v.refs,
-                "excerpt": v.subject_excerpt,
-                "rationale": v.rationale,
-                "decision": v.decision,
-                "confidence": v.confidence,
-            }
-            for v in checks["unsupported_observed"]
-        ],
-        "contradictions": [
-            {
-                "refs": v.refs,
-                "excerpt": v.subject_excerpt,
-                "rationale": v.rationale,
-                "decision": v.decision,
-                "confidence": v.confidence,
-            }
-            for v in checks["contradictions"]
-        ],
-        "hallucination_candidates": checks.get("hallucination_candidates", []),
-    }
-
-    # Entity frequency — count entity mentions across all non-retracted findings.
-    # Surfacing the most-discussed observables gives analysts instant pivot points
-    # and feeds investigation_entity_lookup calls.
-    entity_counts: dict[str, dict[str, int]] = {
-        "ips": {}, "emails": {}, "hostnames": {}, "hashes": {}, "cves": {}
-    }
-    for f in findings:
-        for etype, vals in (f.get("entities") or {}).items():
-            if etype in entity_counts:
-                for v in (vals or []):
-                    v = str(v).lower()
-                    if v:
-                        entity_counts[etype][v] = entity_counts[etype].get(v, 0) + 1
-    key_entities = {
-        etype: sorted(freq.items(), key=lambda x: x[1], reverse=True)[:5]
-        for etype, freq in entity_counts.items()
-        if freq
-    }
-
-    # Progressive summary ladder — compute L1 (bullets) and L2 (paragraph) and
-    # persist them to the manifest so investigation_load can serve them without
-    # re-reading all findings. Fail-open: any failure falls back to a deterministic
-    # non-LLM summary and never blocks the rest of the reflect response.
-    summary_l1: list[str] = []
-    summary_l2: str = ""
-    try:
-        last_20 = findings[-20:]
-        try:
-            from memcheck import llm as _llm
-            if _llm.llm_available() and last_20:
-                context_bullets = "\n".join(
-                    f"- [{f.get('type', '?')}] {str(f.get('text', ''))[:300]}"
-                    for f in last_20
-                )
-                l1_prompt = (
-                    f"Investigation: {manifest['title']}\n"
-                    f"Recent findings (up to 20):\n{context_bullets}\n\n"
-                    "Produce exactly 5-7 concise key-point bullet strings that capture "
-                    "the most important things known so far. Each bullet should be a "
-                    "single sentence under 120 characters. Reply with ONLY a JSON array "
-                    "of strings, no other text. Example: [\"First point.\", \"Second point.\"]"
-                )
-                l1_raw = _llm.call_llm(l1_prompt, json_mode=True, timeout=60.0)
-                if l1_raw:
-                    try:
-                        parsed = json.loads(l1_raw)
-                        if isinstance(parsed, list):
-                            summary_l1 = [str(b) for b in parsed if str(b).strip()][:7]
-                    except Exception:
-                        pass
-
-                if summary_l1:
-                    l2_prompt = (
-                        f"Investigation: {manifest['title']}\n"
-                        f"Key points:\n" + "\n".join(f"- {b}" for b in summary_l1) + "\n\n"
-                        "Write a 2-3 sentence 'state of knowledge' paragraph summarising "
-                        "what is established, what is uncertain, and what remains to check. "
-                        "Be direct and concise. Reply with only the paragraph text."
-                    )
-                    l2_raw = _llm.call_llm(l2_prompt, timeout=60.0)
-                    if l2_raw:
-                        summary_l2 = l2_raw.strip()
-        except Exception as exc:
-            logger.debug("investigation_reflect: LLM summary ladder failed (fail-open): %r", exc)
-
-        # Deterministic fallback when LLM is unavailable or failed to produce output
-        if not summary_l1:
-            summary_l1 = [
-                str(f.get("text", ""))[:100]
-                for f in findings[-5:]
-                if str(f.get("text", "")).strip()
-            ]
-        if not summary_l2:
-            n = len(findings)
-            latest_text = str(findings[-1].get("text", "")) if findings else ""
-            summary_l2 = (
-                f"Investigation with {n} finding{'s' if n != 1 else ''}."
-                + (f" Latest: {latest_text[:200]}" if latest_text else "")
-            )
-
-        # Persist to manifest (write-through cache via _save_manifest)
-        manifest["summary_l1"] = summary_l1
-        manifest["summary_l2"] = summary_l2
-        _save_manifest(manifest)
-    except Exception as exc:
-        logger.debug("investigation_reflect: summary ladder persist failed (fail-open): %r", exc)
-        pass  # fail-open: summary generation never breaks reflect
-
-    return json.dumps({
-        "investigation_id": investigation_id,
-        "title": manifest["title"],
-        "status": manifest["status"],
-        "hypothesis": manifest["hypothesis"],
-        "next_step": manifest["next_step"],
-        "finding_counts": {t: len(v) for t, v in by_type.items()},
-        "open_questions": manifest["open_questions"],
-        "checked_sources": manifest["checked_sources"],
-        "gaps": [f["text"] for f in by_type.get("gap", [])],
-        "recent_per_type": {t: entries[-3:] for t, entries in by_type.items() if entries},
-        "key_entities": key_entities,
-        "excluded_retracted": excluded_retracted,
-        "self_check": self_check,
-        "summary_l1": summary_l1,
-        "summary_l2": summary_l2,
-    }, indent=2)
-
 
 # ---- Tool: reflection_loop_seed ----
 
@@ -4874,16 +4265,9 @@ def investigation_pre_answer_check(
         })
 
     unique_errors = sorted(set(qdrant_errors))
-    degraded_active = (not qdrant_enabled) or (not qdrant_available) or bool(unique_errors) or (qdrant_enabled and qdrant_available and not qdrant_query_success)
-    degraded_reason = None
-    if not qdrant_enabled:
-        degraded_reason = "qdrant_disabled"
-    elif not qdrant_available:
-        degraded_reason = "qdrant_unavailable"
-    elif unique_errors:
-        degraded_reason = "qdrant_semantic_error"
-    elif not qdrant_query_success:
-        degraded_reason = "qdrant_semantic_not_executed"
+    degraded_active, degraded_reason = _qdrant_degraded_mode(
+        qdrant_enabled, qdrant_available, unique_errors, qdrant_query_success
+    )
 
     verdict_summary = _record_claim_verdicts(investigation_id, claim_results, record=record)
 
@@ -4989,15 +4373,7 @@ def investigation_entity_lookup(
             "error": f"entity_type must be one of: {', '.join(_ENTITY_FIELD_MAP)} or 'auto'"
         })
 
-    # Prefer the Kuzu graph (primary), then Qdrant (indexed), then JSONL scan.
-    findings = _entity_lookup_kuzu(entity, investigation_id, limit)
-    method = "kuzu"
-    if not findings:
-        findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
-        method = "qdrant"
-    if not findings:
-        findings = _entity_lookup_jsonl(entity, entity_type, investigation_id, limit)
-        method = "jsonl_fallback"
+    findings, method = _entity_lookup_cascade(entity, entity_type, investigation_id, limit)
 
     # Group by investigation and build compact summaries.
     by_inv: dict[str, list[dict]] = {}
@@ -5184,14 +4560,7 @@ def investigation_related_cases(
     results: list[dict] = []
     for entity in entities[:10]:  # cap total entities to avoid runaway queries
         etype = entity_type if entity_type != "auto" else _detect_entity_type(entity)
-        findings = _entity_lookup_kuzu(entity, None, limit_per_entity * 4)
-        method = "kuzu"
-        if not findings:
-            findings = _entity_lookup_qdrant(entity, etype, None, limit_per_entity * 4)
-            method = "qdrant"
-        if not findings:
-            findings = _entity_lookup_jsonl(entity, etype, None, limit_per_entity * 4)
-            method = "jsonl_fallback"
+        findings, method = _entity_lookup_cascade(entity, etype, None, limit_per_entity * 4)
 
         # Group by investigation, exclude findings with no investigation context
         by_inv: dict[str, list[dict]] = {}
@@ -5225,108 +4594,6 @@ def investigation_related_cases(
 
 
 # ---- Tool: investigation_finding_provenance ----
-
-@mcp.tool()
-def investigation_finding_provenance(
-    finding_id: str,
-    investigation_id: str,
-) -> str:
-    """
-    Trace a finding back through its derivation chain to root observed evidence.
-
-    Follows the ``derived_from`` links stored on each finding, walking up the
-    chain until it reaches findings with no parent (root observations) or a
-    cycle is detected. Returns the full chain so the analyst can verify that
-    an inference is actually grounded in observed data and not built on top of
-    another inference or assumption.
-
-    A chain that terminates in an ``assumed`` finding — rather than ``observed``
-    data — means the conclusion is a hypothesis chain, not an evidence chain.
-
-    Args:
-        finding_id: The ID of the finding to trace.
-        investigation_id: The investigation containing the finding.
-
-    Returns:
-        JSON with the chain from the target finding to its root evidence,
-        each node annotated with its type, confidence, source, and text.
-    """
-    # Use MEMORY_DIR directly — _inv_dir() creates the directory, which would
-    # silently create an empty investigation dir for any non-existent id.
-    inv_path = MEMORY_DIR / investigation_id
-    if not inv_path.is_dir():
-        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-    findings_by_id: dict[str, dict] = {
-        str(f.get("id", "")): f
-        for f in _read_jsonl(inv_path / "findings.jsonl")
-        if f.get("id")
-    }
-
-    target = findings_by_id.get(finding_id)
-    if not target:
-        return json.dumps({"error": f"Finding '{finding_id}' not found in '{investigation_id}'"})
-
-    chain: list[dict] = []
-    visited: set[str] = set()
-    current_id = finding_id
-    _MAX_CHAIN_DEPTH = 5
-
-    while current_id and current_id not in visited and len(chain) < _MAX_CHAIN_DEPTH:
-        visited.add(current_id)
-        node = findings_by_id.get(current_id)
-        if not node:
-            chain.append({"finding_id": current_id, "error": "not_found"})
-            break
-        chain.append({
-            "finding_id": current_id,
-            "ts": node.get("ts"),
-            "record_type": node.get("record_type") or node.get("type"),
-            "confidence": node.get("confidence"),
-            "numeric_confidence": node.get("numeric_confidence", 1.0),
-            "source": node.get("source"),
-            "text": str(node.get("text", ""))[:400],
-            "derived_from": node.get("derived_from", []),
-        })
-        # Only the first parent is followed.  Multi-parent derived_from chains
-        # (a finding citing two or more independent observations) are not fully
-        # traversed — grounded_in_observed reflects the first-listed branch only.
-        parents = node.get("derived_from") or []
-        if not parents:
-            break
-        current_id = str(parents[0]) if parents else None
-
-    root = chain[-1] if chain else None
-    root_type = root.get("record_type") if root else None
-    grounded = root_type == "observed"
-
-    # Compute aggregate_confidence: product of numeric_confidence values along the chain.
-    # Findings without numeric_confidence are treated as 1.0 (backward compat).
-    try:
-        aggregate_confidence = 1.0
-        for node_entry in chain:
-            if "error" not in node_entry:
-                nc = node_entry.get("numeric_confidence", 1.0)
-                try:
-                    aggregate_confidence *= float(nc)
-                except (TypeError, ValueError):
-                    pass
-        aggregate_confidence = round(aggregate_confidence, 6)
-    except Exception:
-        aggregate_confidence = None
-
-    return json.dumps({
-        "investigation_id": investigation_id,
-        "chain_length": len(chain),
-        "grounded_in_observed": grounded,
-        "grounding_assessment": (
-            "fully grounded" if grounded
-            else f"chain terminates in '{root_type}' — not directly observed evidence"
-        ),
-        "aggregate_confidence": aggregate_confidence,
-        "chain": chain,
-    }, indent=2, default=str)
-
 
 # ---- Tool: investigation_evidence_precheck ----
 
@@ -5368,16 +4635,9 @@ def investigation_evidence_precheck(
     qdrant_available = bool(qdrant_status.get("available"))
     qdrant_errors = [qdrant_status["error"]] if qdrant_status.get("error") else []
     qdrant_query_success = bool(qdrant_status.get("query_attempted")) and not qdrant_errors
-    degraded_active = (not qdrant_enabled) or (not qdrant_available) or bool(qdrant_errors) or (qdrant_enabled and qdrant_available and not qdrant_query_success)
-    degraded_reason = None
-    if not qdrant_enabled:
-        degraded_reason = "qdrant_disabled"
-    elif not qdrant_available:
-        degraded_reason = "qdrant_unavailable"
-    elif qdrant_errors:
-        degraded_reason = "qdrant_semantic_error"
-    elif not qdrant_query_success:
-        degraded_reason = "qdrant_semantic_not_executed"
+    degraded_active, degraded_reason = _qdrant_degraded_mode(
+        qdrant_enabled, qdrant_available, qdrant_errors, qdrant_query_success
+    )
 
     qdrant_matches = []
     for ref in qdrant_refs:
@@ -5417,230 +4677,9 @@ def investigation_evidence_precheck(
 
 # ---- Tool: investigation_list ----
 
-@mcp.tool()
-def investigation_list(
-    limit: int = 30,
-    offset: int = 0,
-    summary: bool = True,
-) -> str:
-    """
-    List investigations with status and finding counts, most recently
-    updated first.
-
-    Bounded by default to avoid overflowing the tool-result token cap: only
-    `limit` investigations are returned starting at `offset`, and `summary`
-    mode returns a compact record per investigation (id, title, status,
-    finding_counts, updated_at). Set summary=False for the full record
-    (created_at, open_questions_count, hypothesis, visibility, tier_counts)
-    and/or raise limit to page through or fetch everything.
-
-    Args:
-        limit: Max investigations to return (default 30). Use 0 or a negative
-            value for no limit (return all remaining). Note: offset is still
-            honored when limit<=0, so this returns everything *starting at*
-            offset, not the entire list.
-        offset: Number of investigations to skip from the front (default 0).
-            Always applied, including when limit<=0.
-        summary: If True (default), return only compact fields; if False,
-            return the full record including tier counts.
-
-    Returns:
-        JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
-    """
-    # Coerce limit/offset once up front, BEFORE any early return, so both the
-    # empty-MEMORY_DIR path and the normal path echo normalized ints. String
-    # JSON tool args must not leak through inconsistently (early return echoing
-    # raw strings while the non-empty path echoes coerced ints).
-    try:
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        offset = 0
-    # A string limit (e.g. via JSON tool args) would otherwise raise TypeError
-    # in the `limit <= 0` comparison and `offset + limit` slice below,
-    # contradicting the documented "limit<=0 returns everything" behavior.
-    # Normalize None to 0 so it collapses into the documented limit<=0 no-limit
-    # case; the echoed `limit` is then always an int, matching the signature
-    # (limit: int) and docstring. Garbage falls back to the default.
-    if limit is None:
-        limit = 0
-    else:
-        try:
-            limit = int(limit)
-        except (TypeError, ValueError):
-            limit = 30
-
-    # Coerce summary like limit/offset: a stringly-typed client (JSON tool args)
-    # passing summary='false' would otherwise be truthy and wrongly select
-    # summary-mode instead of full records. Map common string falsey forms to
-    # False; everything else (including real bools) goes through bool().
-    #
-    # None (JSON null) must PRESERVE the documented default (summary=True):
-    # bool(None) is False, which would force FULL-mode records and reintroduce
-    # the large-output/token-overflow this pagination path exists to prevent.
-    # Only string/real-bool values may select full mode.
-    #
-    # An empty / whitespace-only string is treated as UNSET (not falsey): a
-    # client accidentally passing summary='' is far more likely to have meant
-    # "leave the default" than "give me full/overflow-prone output", so it must
-    # also preserve summary=True. Only the explicit tokens 'false'/'0'/'no'
-    # select full mode. (Empty string is simply absent from the falsey tuple,
-    # so `not in` yields True for it.)
-    if summary is None:
-        summary = True
-    elif isinstance(summary, str):
-        summary = summary.strip().lower() not in ("false", "0", "no")
-    else:
-        summary = bool(summary)
-
-    if not MEMORY_DIR.exists():
-        return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
-
-    # Collect valid investigation dirs (most-recently-updated first) before
-    # doing any per-record work, so pagination is over investigations — not
-    # over stray files/dirs — and the expensive findings scan only runs for
-    # the page actually returned.
-    entries = []
-    for d in sorted(MEMORY_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not d.is_dir():
-            continue
-        manifest = _load_manifest(d.name)
-        if manifest:
-            entries.append((d, manifest))
-
-    total = len(entries)
-
-    if limit <= 0:
-        page = entries[offset:]
-    else:
-        page = entries[offset:offset + limit]
-
-    investigations = []
-    for d, manifest in page:
-        record = {
-            "id": manifest["id"],
-            "title": manifest["title"],
-            "status": manifest["status"],
-            "updated_at": manifest["updated_at"],
-            "finding_counts": manifest["finding_counts"],
-        }
-        if not summary:
-            # Scan findings.jsonl to build tier counts (only in full mode)
-            tier_counts = {"hot": 0, "warm": 0, "cold": 0}
-            try:
-                findings_path = d / "findings.jsonl"
-                for f in _read_jsonl(findings_path):
-                    t = f.get("tier", "warm")
-                    if t in tier_counts:
-                        tier_counts[t] += 1
-                    else:
-                        tier_counts["warm"] += 1  # default for legacy findings
-            except Exception:
-                pass  # fail-open
-            # acl is only needed to derive visibility, which is a full-mode-only
-            # field — skip the lookup entirely on the default summary path.
-            acl = manifest.get("acl") or []
-            record.update({
-                "created_at": manifest["created_at"],
-                "open_questions_count": len(manifest["open_questions"]),
-                "hypothesis": manifest["hypothesis"],
-                "visibility": "shared" if acl else "private",
-                "tier_counts": tier_counts,
-            })
-        investigations.append(record)
-
-    return json.dumps({
-        "investigations": investigations,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-    }, indent=2)
-
-
 # ---- Tool: investigation_share ----
 
-@mcp.tool()
-def investigation_share(
-    investigation_id: str,
-    agent_ids: list,
-) -> str:
-    """
-    Grant read/write access to an investigation for one or more agents.
-    Adds the given agent_ids to the investigation's ACL (access control list).
-    Idempotent — adding an agent already in the ACL has no effect.
-
-    Args:
-        investigation_id: Investigation identifier.
-        agent_ids: List of agent_id strings to add to the ACL.
-
-    Returns:
-        JSON: {"shared_with": [...], "total_acl": N}
-        On error: {"error": "<message>"}
-    """
-    try:
-        manifest = _load_manifest(investigation_id)
-        if not manifest:
-            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-        current_acl = list(manifest.get("acl") or [])
-        current_set = set(current_acl)
-        added = []
-        for agent_id in (agent_ids or []):
-            if agent_id and agent_id not in current_set:
-                current_acl.append(agent_id)
-                current_set.add(agent_id)
-                added.append(agent_id)
-
-        manifest["acl"] = current_acl
-        _save_manifest(manifest)
-
-        return json.dumps({
-            "shared_with": added,
-            "total_acl": len(current_acl),
-        }, indent=2)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
-
-
 # ---- Tool: investigation_unshare ----
-
-@mcp.tool()
-def investigation_unshare(
-    investigation_id: str,
-    agent_ids: list,
-) -> str:
-    """
-    Revoke access to an investigation for one or more agents.
-    Removes the given agent_ids from the investigation's ACL.
-    Idempotent — removing an agent not in the ACL has no effect.
-
-    Args:
-        investigation_id: Investigation identifier.
-        agent_ids: List of agent_id strings to remove from the ACL.
-
-    Returns:
-        JSON: {"removed": [...], "total_acl": N}
-        On error: {"error": "<message>"}
-    """
-    try:
-        manifest = _load_manifest(investigation_id)
-        if not manifest:
-            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-        current_acl = list(manifest.get("acl") or [])
-        remove_set = set(agent_ids or [])
-        removed = [a for a in current_acl if a in remove_set]
-        current_acl = [a for a in current_acl if a not in remove_set]
-
-        manifest["acl"] = current_acl
-        _save_manifest(manifest)
-
-        return json.dumps({
-            "removed": removed,
-            "total_acl": len(current_acl),
-        }, indent=2)
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
-
 
 # ---- Tool: audit_log ----
 
@@ -6912,24 +5951,6 @@ def memory_retract(
         except Exception as exc:  # fail-open
             logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
 
-        # Record a quarantine verdict to the store (fail-open) for recall.
-        try:
-            seed_text = str(seeds[0].get("text", "") or "")
-            quarantine_verdict = new_verdict(
-                subject_kind="memory",
-                subject_signature=make_signature("memory", seed_anchor),
-                subject_excerpt=redact_excerpt(seed_text),
-                verdict_type="retracted",
-                decision="quarantine",
-                confidence=0.9,
-                rationale=reason or "hallucination retracted with contaminated lineage",
-                source="human",
-                refs=list(contaminated_ids),
-            )
-            _record_verdicts([quarantine_verdict])
-        except Exception as exc:  # fail-open
-            logger.debug("quarantine verdict record failed, degrading: %r", exc)
-
         _append_jsonl(audit_path, {
             "action": "retract",
             "ts": ts,
@@ -7449,67 +6470,6 @@ def wiring_obligation_resolve(
 
 
 @mcp.tool()
-def llm_local(prompt: str, model: str = "qwen2.5:3b", fmt: Optional[str] = None,
-              max_tokens: int = 256, temperature: float = 0.2, keep_alive: str = "30m") -> str:
-    """
-    Generate with a LOCAL model on the GPU (Ollama) — the generation tier of the offload
-    hierarchy, for cheap high-volume ops (classify/expand/compress) that shouldn't spend
-    Claude tokens. Verified-good model: qwen2.5:3b (sub-second warm, ~111 tok/s).
-
-    keep_alive pins the model resident (default '30m') to avoid the ~70s cold load — keep it
-    long for hot paths. Set fmt='json' to constrain + validate JSON output. Fail-open: on any
-    error/timeout, or invalid JSON when fmt='json', returns ok=False (the caller should then
-    fall back to a Claude model). Returns JSON {text, ok, model}.
-    """
-    import llm_local as _llm
-    return json.dumps(_llm.generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens,
-                                    temperature=temperature, keep_alive=keep_alive), indent=2)
-
-
-@mcp.tool()
-def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int = 256,
-                   fmt: Optional[str] = None) -> str:
-    """
-    Generate for MANY prompts at once — for high-concurrency fan-out (per-item classify/expand
-    gates, map stages). Uses a batched OpenAI-compatible server (vLLM/TGI at VLLM_BASE_URL,
-    dispatched concurrently so continuous batching engages) when configured, else fails open to
-    the sequential Ollama tier (llm_local). Returns JSON: a list of {text, ok} aligned 1:1 to
-    `prompts` (a failed prompt is {text:'', ok:False}; never raises).
-    """
-    import batched_gen
-    return json.dumps(batched_gen.generate_batch(list(prompts or []), model=model,
-                                                 max_tokens=max_tokens, fmt=fmt), indent=2)
-
-
-@mcp.tool()
-def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
-    """
-    Expand a search query (HyDE-lite) using the LOCAL model — alternative phrasings + domain
-    keywords to improve retrieval recall before an embedding search. Runs on the GPU, ~zero
-    Claude tokens. Fail-open: if the local model is down, returns the original query with
-    degraded=True. Returns JSON {queries, keywords, degraded}.
-    """
-    import query_expand as _qe
-    return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
-
-
-@mcp.tool()
-def verify_finding(claim: str, context: str = "", investigation_id: Optional[str] = None) -> str:
-    """
-    Adversarially VERIFY a claim/finding using the LOCAL model — a skeptic actively tries to
-    REFUTE it (candidate->skeptic->keep-if-survives), the same discipline workflows run per
-    finding. Pass optional `context` (code snippet / file refs / evidence); if omitted and an
-    `investigation_id` is given, best-effort RAG grounding is pulled (fail-open). Skeptical by
-    default: only 'confirmed' when the skeptic cannot refute it, else 'refuted'/'uncertain'.
-    Fail-open: if the local model is down or output is unparseable, returns verdict='uncertain'
-    with degraded=True. Returns JSON {verdict, refutation, confidence, degraded}.
-    """
-    import verify as _v
-    return json.dumps(_v.verify_finding(claim, context=context,
-                                        investigation_id=investigation_id), indent=2)
-
-
-@mcp.tool()
 def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     """
     Batch adversarial-verify the OPEN findings of an investigation — run the skeptic
@@ -7607,69 +6567,6 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
 
 
 @mcp.tool()
-def classify_text(text: str, labels: list) -> str:
-    """
-    Pick the single best label from `labels` for `text` using the LOCAL model — a cheap
-    gate/router that replaces a classifier agent. Fail-open: label=None + degraded=True if the
-    model is down or returns an out-of-set label. Returns JSON {label, degraded}.
-    """
-    import text_ops as _to
-    return json.dumps(_to.classify(text, list(labels or [])), indent=2)
-
-
-@mcp.tool()
-def compress_text(text: str, max_chars: int = 600) -> str:
-    """
-    Semantically condense `text` to <= max_chars using the LOCAL model — e.g. shrink a long
-    agent output before a Claude synthesis stage (saves Claude input tokens). Fail-open:
-    returns a char-truncation + degraded=True if the model is down. Returns JSON {text, degraded}.
-    """
-    import text_ops as _to
-    return json.dumps(_to.compress(text, max_chars=max_chars), indent=2)
-
-
-@mcp.tool()
-def semantic_dedup(items: list, threshold: float = 0.88, text_key: Optional[str] = None) -> str:
-    """
-    Cluster near-duplicate items by embedding cosine similarity on the local-GPU path —
-    no generation model, ~zero token cost. Use in a fan-out's synthesis step so an N-way
-    search doesn't triple-report the same finding: pass the aggregated items, feed the
-    returned `kept` (one representative per cluster) downstream.
-
-    items: list of strings OR dicts (text pulled from text_key, else text/content/summary/title).
-    threshold: cosine >= this counts as a duplicate (default 0.88; raise to be stricter).
-    Fail-open: if embeddings are unavailable, nothing is dropped and degraded=True.
-
-    Returns JSON {clusters:[{rep_index, member_indices, text}], kept:[...], dropped:int, degraded}.
-    """
-    import embed_ops
-    result = embed_ops.dedup(items or [], threshold=threshold, key=text_key)
-    # Fail-open is preserved (nothing dropped), but make the silent degradation
-    # observable: without embeddings, semantic_dedup returns every item unchanged.
-    if result.get("degraded") and len(items or []) > 1:
-        logger.warning("semantic_dedup degraded (embeddings unavailable) — %d items "
-                       "returned unchanged, nothing deduped.", len(items or []))
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
-def semantic_relevance(texts: list, topic: str) -> str:
-    """
-    Cosine relevance of each text to `topic` on the local-GPU embedding path — a cheap
-    gate/router (keep texts above a score) that trims what reaches Claude, replacing a
-    classifier agent. No generation model.
-
-    Returns JSON {scores:[float|None], degraded}; scores align with `texts` (None when
-    embeddings are unavailable, degraded=True).
-    """
-    if not topic or not str(topic).strip():
-        return json.dumps({"scores": [None] * len(texts or []), "degraded": True,
-                           "error": "topic must not be empty"})
-    import embed_ops
-    return json.dumps(embed_ops.relevance(list(texts or []), topic), indent=2)
-
-
-@mcp.tool()
 def loci_health() -> str:
     """
     Read-only self-diagnosis of the Loci MCP server. Returns a JSON snapshot of the
@@ -7754,61 +6651,6 @@ def loci_health() -> str:
         logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
     return json.dumps(out, indent=2)
-
-
-@mcp.tool()
-def ground(
-    title: str,
-    focus: str = "",
-    case_ids: Optional[list] = None,
-    entities: Optional[list] = None,
-    code_refs: Optional[list] = None,
-    budget_chars: int = 4000,
-    allow_keyword: bool = False,
-    graph_available: bool = False,
-) -> str:
-    """
-    Assemble a compact, provenance-tagged, char-budgeted GROUNDING block for a task —
-    run ONCE in an orchestrator before a fan-out and inject the block into every agent
-    prompt, so agents start with relevant prior context instead of each re-querying Loci
-    (the cost win). Structured-first, embedding-independent retrieval order: named cases
-    (investigation_load) -> exact entities (investigation_entity_lookup) -> code graph
-    (when graph_available) -> semantic RAG -> curated MEMORY.md -> keyword FTS (opt-in).
-    Every lane is fail-open: a dead source sets degraded=True rather than aborting.
-
-    Prefer this over calling the individual investigation_*/rag tools when preparing a
-    workflow — one warm call here beats N cold ones (and keeps the cross-encoder loaded,
-    which the ground.py CLI cannot). The block is tagged read-only reference, NOT ground
-    truth: consumers must verify against live code/data and cite the [tag] they rely on.
-
-    Args:
-        title: Short task title (drives retrieval).
-        focus: Optional longer task description.
-        case_ids: Named investigation IDs to load.
-        entities: Exact entity IDs to look up (O(1), no embedding).
-        code_refs: Symbol names for code-graph grounding (used only if graph_available).
-        budget_chars: Max characters of the assembled block (default 4000).
-        allow_keyword: Enable the noisy keyword/FTS fallback lane (default off).
-        graph_available: Enable the code-graph lane (default off; needs the Kuzu graph).
-
-    Returns:
-        JSON with {block, sources, chars, degraded}.
-    """
-    if not title or not title.strip():
-        return json.dumps({"error": "title must not be empty",
-                           "block": "", "sources": [], "chars": 0, "degraded": True})
-    import grounding
-    task = {
-        "title": title, "focus": focus or "",
-        "caseIds": case_ids or [], "entities": entities or [],
-        "codeRefs": code_refs or [],
-    }
-    opts = {
-        "budgetChars": budget_chars,
-        "allowKeyword": allow_keyword,
-        "graphAvailable": graph_available,
-    }
-    return json.dumps(grounding.ground(task, opts), indent=2)
 
 
 @mcp.tool()
@@ -7944,7 +6786,8 @@ def rag_context_search(
                     raw_score = float(r.get("score") or 0.0)
                     r["score"] = round(raw_score * math.exp(-_MEMORY_DECAY_LAMBDA * age_days), 4)
                     r["decay_applied"] = True
-                except Exception:
+                except Exception as exc:
+                    logger.debug("rag_context_search: recency decay scoring failed (fail-open): %r", exc)
                     pass
         except Exception as _decay_exc:
             logger.debug("rag_context_search: decay rescoring failed: %s", _decay_exc)
@@ -7966,31 +6809,28 @@ def rag_context_search(
 
     # Best-effort access tracking: append last_accessed timestamp to each returned finding's JSONL.
     # Failures are silently ignored — this must never block the response.
-    try:
-        _access_ts = int(time.time())
-        for r in all_results:
-            try:
-                if r.get("origin") != QDRANT_COLLECTION_PREFIX:
-                    continue
-                finding_id = r.get("id")
-                inv_id = r.get("investigation_id")
-                if not finding_id or not inv_id:
-                    continue
-                _findings_path = _inv_dir(inv_id) / "findings.jsonl"
-                if not _findings_path.exists():
-                    continue
-                _access_entry = {
-                    "id": finding_id,
-                    "investigation_id": inv_id,
-                    "record_type": "access",
-                    "last_accessed": _access_ts,
-                    "query": query[:200],
-                }
-                _append_jsonl(_findings_path, _access_entry)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    _access_ts = int(time.time())
+    for r in all_results:
+        try:
+            if r.get("origin") != QDRANT_COLLECTION_PREFIX:
+                continue
+            finding_id = r.get("id")
+            inv_id = r.get("investigation_id")
+            if not finding_id or not inv_id:
+                continue
+            _findings_path = _inv_dir(inv_id) / "findings.jsonl"
+            if not _findings_path.exists():
+                continue
+            _access_entry = {
+                "id": finding_id,
+                "investigation_id": inv_id,
+                "record_type": "access",
+                "last_accessed": _access_ts,
+                "query": query[:200],
+            }
+            _append_jsonl(_findings_path, _access_entry)
+        except Exception as exc:
+            logger.debug("rag access-log write-back failed for %s: %r", r.get("id"), exc)
 
     ctx = context_assemble(all_results, query, budget_chars=budget_chars)
     ctx["mode"] = "rag_hybrid"
@@ -8107,7 +6947,8 @@ def memory_surface(
                     age_days = (now_ts - created_ts) / 86400.0
                     decay = _math.exp(-float(_decay_lambda) * age_days)
                     r["score"] = round(float(r.get("score") or 0.0) * decay, 4)
-            except Exception:
+            except Exception as exc:
+                logger.debug("memory_surface: recency decay scoring failed (fail-open): %r", exc)
                 pass  # decay is optional enhancement; never break the tool
 
         # Re-sort after possible decay adjustment, then take top_k
@@ -8297,7 +7138,8 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
                             "inferred_at": _now(),
                             "method": "llm_slow_path",
                         })
-    except Exception:
+    except Exception as exc:
+        logger.debug("_run_causal_inference: LLM causal-edge slow path failed (fail-open): %r", exc)
         pass  # LLM path failed; fall through to heuristic
 
     if not edges:
@@ -9163,205 +8005,9 @@ def memory_hints_resource(investigation_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def investigation_export(
-    investigation_id: str,
-    include_embeddings: bool = False,
-) -> str:
-    """
-    Export an investigation as a portable JSON bundle suitable for archival or
-    transfer to another Loci instance.
-
-    Bundles the manifest, all findings, conflicts, and entities into a single
-    JSON string.  The ``include_embeddings`` parameter is accepted for forward
-    compatibility but embeddings are not yet included in the bundle (future work).
-
-    Args:
-        investigation_id: Investigation identifier to export.
-        include_embeddings: Reserved for future use — embeddings are not yet
-                            included.  Pass ``True`` to opt-in once supported.
-
-    Returns:
-        JSON: {"exported": true, "investigation_id": str, "bundle": {...},
-               "finding_count": int, "size_bytes": int}
-        On error: {"error": str}
-    """
-    try:
-        manifest = _load_manifest(investigation_id)
-        if not manifest:
-            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-
-        inv_dir = _inv_dir(investigation_id)
-
-        findings = _read_jsonl(inv_dir / "findings.jsonl")
-        conflicts = _read_jsonl(inv_dir / "conflicts.jsonl")
-        entities = _read_jsonl(inv_dir / "entities.jsonl")
-
-        bundle = {
-            "schema_version": "1.0",
-            "exported_at": _now(),
-            "manifest": manifest,
-            "findings": findings,
-            "conflicts": conflicts,
-            "entities": entities,
-        }
-
-        bundle_str = json.dumps(bundle)
-        size_bytes = len(bundle_str.encode("utf-8"))
-
-        return json.dumps({
-            "exported": True,
-            "investigation_id": investigation_id,
-            "bundle": bundle,
-            "finding_count": len(findings),
-            "size_bytes": size_bytes,
-        })
-    except Exception as exc:
-        logger.warning("investigation_export failed: %s", exc)
-        return json.dumps({"error": f"Export failed: {exc}"})
-
-
 # ---------------------------------------------------------------------------
 # Tool: investigation_import
 # ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-def investigation_import(
-    bundle_json: str,
-    new_title: Optional[str] = None,
-) -> str:
-    """
-    Import an investigation bundle (produced by ``investigation_export``) into
-    this Loci instance under a brand-new investigation ID.
-
-    A fresh UUID is always assigned — the original investigation ID is preserved
-    in the manifest as ``imported_from``.  Findings are re-indexed into Qdrant
-    on a best-effort basis (fail-open: Qdrant may be unavailable).
-
-    Args:
-        bundle_json: The JSON string produced by ``investigation_export`` (the
-                     value of the ``bundle`` key, or the whole export response).
-        new_title: Optional override for the investigation title.  When omitted
-                   the original title from the bundle is used.
-
-    Returns:
-        JSON: {"imported": true, "new_investigation_id": str,
-               "original_investigation_id": str, "findings_imported": int,
-               "qdrant_indexed": int}
-        On error: {"error": str}
-    """
-    _MAX_BUNDLE_BYTES = 10 * 1024 * 1024  # 10 MB
-    try:
-        raw_bytes = bundle_json.encode("utf-8") if isinstance(bundle_json, str) else bundle_json
-        if len(raw_bytes) > _MAX_BUNDLE_BYTES:
-            return json.dumps({"error": "bundle too large"})
-
-        try:
-            data = json.loads(bundle_json)
-        except Exception as exc:
-            return json.dumps({"error": f"Invalid JSON in bundle_json: {exc}"})
-
-        # Support two calling conventions:
-        #   1. The raw bundle dict (schema_version at top level)
-        #   2. The full export response dict (bundle nested under "bundle" key)
-        if "bundle" in data and isinstance(data.get("bundle"), dict):
-            data = data["bundle"]
-
-        # Validate required keys.
-        schema_version = data.get("schema_version")
-        if schema_version != "1.0":
-            return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
-
-        required_keys = {"manifest", "findings"}
-        missing = required_keys - set(data.keys())
-        if missing:
-            return json.dumps({"error": f"Bundle is missing required keys: {sorted(missing)}"})
-
-        src_manifest = data["manifest"]
-        if not isinstance(src_manifest, dict):
-            return json.dumps({"error": "Bundle manifest is not a dict."})
-
-        original_id = src_manifest.get("id", "unknown")
-
-        # Generate a new investigation ID.
-        new_id = str(uuid.uuid4())
-
-        # Build a new manifest.
-        now = _now()
-        new_manifest = dict(src_manifest)
-        new_manifest["id"] = new_id
-        new_manifest["created_at"] = now
-        new_manifest["updated_at"] = now
-        new_manifest["imported_from"] = original_id
-        if new_title:
-            new_manifest["title"] = new_title
-
-        # Create the investigation directory and write the manifest.
-        inv_dir = _inv_dir(new_id)
-        _save_manifest(new_manifest)
-
-        # Write findings.jsonl with updated investigation_id.
-        findings = data.get("findings") or []
-        if not isinstance(findings, list):
-            findings = []
-
-        findings_path = inv_dir / "findings.jsonl"
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-            f = dict(finding)
-            f["investigation_id"] = new_id
-            _append_jsonl(findings_path, f)
-
-        # Write conflicts.jsonl if present.
-        conflicts = data.get("conflicts")
-        if conflicts and isinstance(conflicts, list):
-            conflicts_path = inv_dir / "conflicts.jsonl"
-            for entry in conflicts:
-                if isinstance(entry, dict):
-                    _append_jsonl(conflicts_path, entry)
-
-        # Write entities.jsonl if present.
-        entities = data.get("entities")
-        if entities and isinstance(entities, list):
-            entities_path = inv_dir / "entities.jsonl"
-            for entry in entities:
-                if isinstance(entry, dict):
-                    _append_jsonl(entities_path, entry)
-
-        # Re-index findings into Qdrant (fail-open).
-        qdrant_indexed = 0
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-            text = str(finding.get("text") or "").strip()
-            finding_id = str(finding.get("id") or "")
-            if not text or not finding_id:
-                continue
-            try:
-                payload = {
-                    "investigation_id": new_id,
-                    "type": finding.get("type") or finding.get("record_type") or "observed",
-                    "source": finding.get("source") or "",
-                    "confidence": finding.get("confidence") or "medium",
-                    "tags": finding.get("tags") or [],
-                }
-                _qdrant_upsert(finding_id, text, payload)
-                qdrant_indexed += 1
-            except Exception as exc:
-                logger.debug("investigation_import: qdrant upsert skipped for %s: %s", finding_id, exc)
-
-        return json.dumps({
-            "imported": True,
-            "new_investigation_id": new_id,
-            "original_investigation_id": original_id,
-            "findings_imported": len(findings),
-            "qdrant_indexed": qdrant_indexed,
-        })
-    except Exception as exc:
-        logger.warning("investigation_import failed: %s", exc)
-        return json.dumps({"error": f"Import failed: {exc}"})
 
 
 # Memory-as-a-Service: cross-investigation routing
@@ -9536,6 +8182,42 @@ from graph_tools import (  # noqa: E402,F401
     code_graph_ingest, code_graph_query, code_memory_relink, code_memory_map,
     symbol_impact, impact_report, finding_code_context, investigation_code_briefing,
     subsystem_report, related_investigations_via_code, dead_code_candidates,
+)
+
+# Local-model / embedding passthrough tools live in llm_tools.py (P2a of the split).
+import llm_tools  # noqa: E402
+llm_tools.register(mcp)
+# Re-exported so `server.<tool>()` keeps working for in-process callers and tests
+# (e.g. tests/test_ground_tool.py calls server.ground and patches grounding.ground).
+from llm_tools import (  # noqa: E402,F401
+    llm_local, generate_batch, query_expand, verify_finding, classify_text,
+    compress_text, semantic_dedup, semantic_relevance, ground,
+)
+
+# Investigation lifecycle tools live in investigation_tools.py (P2b of the split).
+# The memory root is injected as a lambda over MEMORY_DIR (same contract as
+# inv_store); the five collaborators below stayed in server.py and are passed in
+# explicitly so investigation_tools never has to import server.
+import investigation_tools  # noqa: E402
+investigation_tools.register(mcp, lambda: MEMORY_DIR, {
+    "_apply_lifecycle": _apply_lifecycle,
+    "_compute_self_check": _compute_self_check,
+    "_event_log_append": _event_log_append,
+    "_kuzu_upsert_investigation": _kuzu_upsert_investigation,
+    "_qdrant_upsert": _qdrant_upsert,
+})
+# Re-exported so `server.<tool>()` keeps working for in-process callers and tests.
+# NOTE: these tools now resolve their storage helpers in investigation_tools' own
+# namespace. A test that needs to intercept one (e.g. force _append_jsonl to fail)
+# must patch `investigation_tools.<helper>` — patching `server.<helper>` no longer
+# reaches them. No current test does; the two mock.patch.object(server,
+# "_append_jsonl") sites target finding_resolve and investigation_verify_all,
+# both of which stayed in this module.
+from investigation_tools import (  # noqa: E402,F401
+    investigation_start, investigation_load, investigation_as_of,
+    investigation_note, investigation_reflect, investigation_finding_provenance,
+    investigation_list, investigation_share, investigation_unshare,
+    investigation_export, investigation_import,
 )
 
 

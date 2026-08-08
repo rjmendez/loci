@@ -55,9 +55,6 @@ __all__ = [
     "main",
 ]
 
-# Tools whose payloads carry a file path we should run code checks against.
-_CODE_TOOLS = ("Write", "Edit", "MultiEdit")
-
 EMBED_DIM = 384
 COLLECTION = "hermes_verdicts"
 VECTOR_NAME = "dense"
@@ -360,9 +357,10 @@ def process_action(payload: dict, engine) -> dict:
 def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> dict:
     """Audit-only code-hallucination check for one PostToolUse payload.
 
-    The PostToolUse counterpart of :func:`process_action`. Reads ``tool_name``
-    (``Write`` / ``Edit`` / ``MultiEdit``) and the target ``file_path`` from
-    ``tool_input``; if that resolves to an existing ``*.py`` file, runs the
+    The PostToolUse counterpart of :func:`process_action`. Dispatch is decided
+    purely by the target ``file_path`` in ``tool_input`` -- ``tool_name`` is read
+    only to echo into the audit record. If that path resolves to an existing
+    ``*.py`` file, runs the
     vendored static checker via ``run_code_checks`` and records each resulting
     ``code`` verdict to the engine's backend (fail-open). Appends ONE audit line.
 

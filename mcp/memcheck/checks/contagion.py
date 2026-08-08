@@ -24,9 +24,12 @@ is skipped, never raised; ``derived_from`` cycles are guarded.
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, Iterable, Optional, Union
 
 __all__ = ["find_contamination"]
+
+_log = logging.getLogger("memcheck.contagion")
 
 # Entity buckets considered "distinctive" — structured identifiers an agent
 # would not coincidentally share between unrelated findings. Common-word
@@ -147,7 +150,14 @@ def find_contamination(
             text = str(finding.get("text", "") or "")
             try:
                 ents = _distinctive_entities(entities_of(text)) if text else set()
-            except Exception:
+            except Exception as exc:
+                # Degrade to no entities for this finding; it still participates
+                # in seed/semantic/derived propagation, just without an anchor.
+                _log.debug(
+                    "contagion: entity extraction failed for %s, degrading to empty: %s",
+                    fid,
+                    exc,
+                )
                 ents = set()
             entities_by_id[fid] = ents
 
@@ -163,8 +173,9 @@ def find_contamination(
                         parents.add(ps)
             if parents:
                 derived_edges[fid] = parents
-        except Exception:
+        except Exception as exc:
             # Fail-safe: a malformed finding is skipped, never raised.
+            _log.debug("contagion: skipping malformed finding at index %s: %s", index, exc)
             continue
 
     contaminated: set[str] = set(seed_set)
@@ -175,7 +186,10 @@ def find_contamination(
     for nid in (semantic_neighbor_ids or []):
         try:
             n = str(nid)
-        except Exception:
+        except Exception as exc:
+            # A caller-supplied object with a broken __str__; skip it. Do not
+            # interpolate nid here -- formatting it would raise the same way.
+            _log.debug("contagion: skipping unstringable semantic neighbor id: %s", exc)
             continue
         if not n:
             continue
