@@ -17,6 +17,7 @@ the full set.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Callable, Optional
@@ -24,6 +25,8 @@ from typing import Callable, Optional
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
 __all__ = ["run_contradiction"]
+
+_log = logging.getLogger("memcheck.contradiction")
 
 # EWC-style finding protection (Kirkpatrick 2017; CLS McClelland 1995).
 # A finding with confidence >= HIGH_PROTECTION_THRESH is considered established;
@@ -128,7 +131,8 @@ def run_contradiction(
                 continue
             negated = bool(neg_re.search(text))
             prepared.append((_finding_id(finding, index), text, tokens, negated, finding))
-        except Exception:
+        except Exception as exc:
+            _log.debug("contradiction: skipping malformed finding at index %s: %s", index, exc)
             continue
 
     verdicts: list[Verdict] = []
@@ -186,7 +190,10 @@ def run_contradiction(
                         provisional=provisional,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                _log.debug(
+                    "contradiction: skipping verdict for pair (%s, %s): %s", id_a, id_b, exc
+                )
                 continue
 
     return verdicts

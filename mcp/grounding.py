@@ -21,10 +21,14 @@ does not create an import cycle.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger("loci-mcp.grounding")
+
 
 def _default_memory_dir() -> str:
     """Curated MEMORY.md dir via backends (env -> gitignored config -> HERMES_MEMORY_DIR).
@@ -188,7 +192,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     import importlib
     try:
         S = importlib.import_module("server")
-    except Exception:
+    except Exception as exc:
+        logger.warning("grounding: server module unavailable, all lanes disabled: %s", exc)
         S = None
 
     # 1. Named cases -> investigation_load (structured, retracted excluded). Fail-open per
@@ -205,7 +210,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                 for f in (data.get("recent_findings") or [])[:3]:
                     if isinstance(f, dict):
                         add(f"case:{cid}:finding", str(f.get("text", "")), 0.08)
-        except Exception:
+        except Exception as exc:
+            logger.debug("grounding: case lane failed for %r: %r", cid, exc)
             continue
 
     # 2. Exclusion lane: findings already resolved (fixed/intentional/wontfix) for the
@@ -236,7 +242,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                     continue
                 _seen_known.add(h)
                 resolved_known.append(f"[{res}] {txt[:180]}")
-        except Exception:
+        except Exception as exc:
+            logger.debug("grounding: resolved-findings lane failed for %r: %r", cid, exc)
             continue
     if resolved_known:
         add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15)
@@ -250,7 +257,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             if isinstance(data, dict) and data.get("total_findings"):
                 add(f"entity:{ent}", f"seen in {data.get('investigations_count')} case(s), "
                                      f"{data.get('total_findings')} finding(s)", 0.06)
-        except Exception:
+        except Exception as exc:
+            logger.debug("grounding: entity lane failed for %r: %r", ent, exc)
             continue
 
     # 4. Code graph (only if reconnected / available).
@@ -262,7 +270,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                     add(f"code:{ref}", f"callers={rep.get('transitive_caller_count')} "
                                        f"findings={rep.get('referencing_finding_count')} "
                                        f"co={[c.get('name') for c in rep.get('co_referenced', [])[:4]]}", 0.10)
-            except Exception:
+            except Exception as exc:
+                logger.debug("grounding: code-graph lane failed for %r: %r", ref, exc)
                 pass
     elif task.get("codeRefs"):
         degraded = True  # code-graph grounding wanted but unavailable
@@ -277,7 +286,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                 add("rag", ctx, 0.35)
             elif isinstance(res, dict) and not res.get("qdrant_available", True):
                 degraded = True
-        except Exception:
+        except Exception as exc:
+            logger.debug("grounding: rag lane failed for %r: %r", task.get("title", ""), exc)
             degraded = True
 
     # Curated memory files — a SUPPLEMENT after the precise (case/RAG) lanes, so a
@@ -292,7 +302,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             items = (res or {}).get("results", []) if isinstance(res, dict) else []
             for it in filter_noise([{"text": r.get("text"), "source": r.get("source")} for r in items])[:3]:
                 add("recall", str(it.get("text", "")), 0.10)
-        except Exception:
+        except Exception as exc:
+            logger.debug("grounding: keyword fallback lane failed for %r: %r", task.get("title", ""), exc)
             pass
 
     header = ("## GROUNDING — prior context (read-only reference, NOT ground truth; verify "

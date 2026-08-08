@@ -11,12 +11,15 @@ skipped, never raised.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Optional
 
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
 __all__ = ["run_contract_contradiction"]
+
+_log = logging.getLogger("memcheck.contract_contradiction")
 
 _TOKEN_RE = re.compile(r"[a-z][a-z0-9_]{1,}", re.I)
 _FIELD_CONTEXT_RE = re.compile(
@@ -49,7 +52,8 @@ def _parse_contract_fields(finding: dict) -> dict[str, str]:
         return {}
     try:
         return {k.lower(): str(v).lower() for k, v in json.loads(match.group(1)).items()}
-    except Exception:
+    except Exception as exc:
+        _log.debug("contract_contradiction: unparseable fields= JSON, treating as none: %s", exc)
         return {}
 
 
@@ -101,7 +105,10 @@ def run_contract_contradiction(
         new_field_tokens = _extract_field_tokens(new_text)
         if not new_field_tokens:
             return []
-    except Exception:
+    except Exception as exc:
+        _log.debug(
+            "contract_contradiction: could not extract field tokens from new finding: %s", exc
+        )
         return []
 
     verdicts: list[Verdict] = []
@@ -162,7 +169,12 @@ def run_contract_contradiction(
                                 provisional=True,
                             )
                         )
-        except Exception:
+        except Exception as exc:
+            _log.debug(
+                "contract_contradiction: skipping stored finding %s: %s",
+                stored.get("id", ""),
+                exc,
+            )
             continue
 
     return verdicts

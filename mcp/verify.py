@@ -44,6 +44,12 @@ import re
 from functools import lru_cache
 from typing import Callable, Optional
 
+from model_json import extract_json_object
+
+# Private alias kept so existing call sites and test monkeypatches of the private
+# name keep working after the shared extraction moved to mcp/model_json.py.
+_extract_json_object = extract_json_object
+
 # Injectable function types: match the shared [interface] contracts.
 GenFn = Callable[..., dict]
 RagFn = Callable[..., dict]
@@ -249,51 +255,6 @@ def _coerce_code_refs(code_refs) -> list:
     if isinstance(code_refs, (list, tuple)):
         return [x for x in code_refs if isinstance(x, str)]
     return []
-
-
-def _extract_json_object(text: str) -> Optional[dict]:
-    """Defensively pull a JSON object out of possibly-noisy model text.
-
-    Handles: clean JSON, JSON wrapped in ```json fences, and JSON embedded in stray prose.
-    Returns the parsed dict, or None if nothing parseable is found.
-    """
-    if not text or not isinstance(text, str):
-        return None
-    # 1) straight parse
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    # 2) strip code fences and retry
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        try:
-            obj = json.loads(fenced.group(1))
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-    # 3) brace-match scan: first '{' whose balanced span parses as an object
-    depth = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start:i + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except Exception:
-                        start = -1  # keep scanning for a later valid object
-    return None
 
 
 def _coerce_verdict(raw) -> str:
