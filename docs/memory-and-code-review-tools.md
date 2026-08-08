@@ -1025,16 +1025,17 @@ collections — cosine similarity breaks.
 | `CODE_CHUNKS_COLLECTION` | Qdrant collection for code-chunk correlation | unset |
 | `HERMES_AGENT_ID` | Agent identity stamp on Qdrant points | unset |
 | `LOCI_NAMESPACE` | Namespace stamp on Qdrant points | unset |
-| `FASTEMBED_MODEL` | Fallback local embedder (used if Ollama is unavailable) | `BAAI/bge-small-en-v1.5` |
 | `HERMES_REFLECTION_INVESTIGATION` | Default investigation id for reflection loop | `copilot-self-reflection-loop` |
 | `HERMES_MCP_TRANSPORT` | Server transport: `stdio`, `sse`, `streamable-http` | `stdio` |
 | `HERMES_MCP_HOST` | Bind host for HTTP transports | `0.0.0.0` |
 | `HERMES_MCP_PORT` | Port for HTTP transports | `8000` |
 
-**Warning:** The fastembed fallback (`BAAI/bge-small-en-v1.5`) produces 384-dim
-vectors. If `MNEMOSYNE_EMBEDDING_DIM` is set to 768 (the default) and Ollama
-becomes unavailable, fastembed upserts will fail silently with a dimension
-mismatch. Either set `EMBED_DIM=384` when using fastembed, or restore Ollama.
+**Warning:** There is no dense-embedding fallback. Dense vectors come from Ollama
+only (`OLLAMA_BASE_URL` + `EMBED_MODEL`). If Ollama is unavailable, `_embed()`
+returns `None`, `_qdrant_upsert()` skips the point entirely, and the server
+degrades to keyword-only search. `fastembed` is still a requirement, but it is
+used solely for the *sparse* BM25 vector (`Qdrant/bm25`), which is unaffected by
+`MNEMOSYNE_EMBEDDING_DIM`.
 
 **loci-mcp tool index (`mcp/server.py` — 60 `@mcp.tool()` functions, plus 11
 registered by `mcp/graph_tools.py` for 71 total at runtime; the 24 core
@@ -1154,12 +1155,12 @@ record, not a safety net. Set `HOOK_BLOCK_MODE=1` if you want enforcement.
 (One case blocks even at the default: writing injection-flagged or supply-chain-IOC
 content to an agent config file such as CLAUDE.md, AGENTS.md, or `.cursorrules`.)
 
-### 14. fastembed fallback produces 384-dim vectors
-When Ollama is unavailable, the loci-mcp server falls back to
-`BAAI/bge-small-en-v1.5` (384-dim). If the `hermes_memory` collection was
-created with 768-dim vectors, upserts will fail and new findings won't be
-indexed to Qdrant. The JSONL and Mnemosyne writes still succeed — no data is
-lost, but semantic search will degrade. Restore Ollama or align dimensions.
+### 14. Without Ollama there is no dense embedding at all
+Dense embeddings come from Ollama only — there is no local dense fallback. When
+Ollama is unavailable `_embed()` returns `None` and `_qdrant_upsert()` returns
+early, so the finding is not indexed to Qdrant at all. The JSONL and Mnemosyne
+writes still succeed — no data is lost — but semantic search degrades to
+keyword-only until Ollama is restored and the findings are re-indexed.
 
 ### 15. memory_retract dry_run=True is the default — nothing changes until False
 `memory_retract` defaults to `dry_run=True` intentionally. The first call
