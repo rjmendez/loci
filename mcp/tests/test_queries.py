@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("ladybug")
 
-from graph.kuzu_store import KuzuStore
+from graph.ladybug_store import LadybugStore
 from graph import queries as Q
 
 
@@ -22,8 +22,8 @@ SH = "a.py::A.h"
 SX = "b.py::B.x"
 
 
-def _build_store(tmp_path) -> KuzuStore:
-    store = KuzuStore(str(tmp_path / "graphdb"))
+def _build_store(tmp_path) -> LadybugStore:
+    store = LadybugStore(str(tmp_path / "graphdb"))
     assert store.available()
 
     # --- code graph: 2 files, a CALLS chain x -> f -> g -> h ---

@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("ladybug")
 
-from graph.kuzu_store import KuzuStore
+from graph.ladybug_store import LadybugStore
 from graph.linker import (
     build_symbol_index,
     extract_symbol_refs,
@@ -38,8 +38,8 @@ def _index():
     return build_symbol_index(_SYMBOLS)
 
 
-def _build_store(tmp_path) -> KuzuStore:
-    store = KuzuStore(str(tmp_path / "graphdb"))
+def _build_store(tmp_path) -> LadybugStore:
+    store = LadybugStore(str(tmp_path / "graphdb"))
     assert store.available()
     parsed = [{
         "file": _FILE, "lang": "java",
@@ -50,7 +50,7 @@ def _build_store(tmp_path) -> KuzuStore:
     return store
 
 
-def _references(store: KuzuStore) -> set[tuple[str, str]]:
+def _references(store: LadybugStore) -> set[tuple[str, str]]:
     rows = store._rows(
         "MATCH (f:Finding)-[:REFERENCES]->(s:CodeSymbol) RETURN f.id, s.id"
     )

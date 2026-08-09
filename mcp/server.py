@@ -214,78 +214,78 @@ _verdict_backend = None                # QdrantBackend for hermes_verdicts (pre_
 _verdict_backend_failed = False        # permanent-failure sentinel — don't retry
 
 # ---------------------------------------------------------------------------
-# Kuzu graph store (primary relationship/graph backend) — fail-open like Qdrant.
+# LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
 # Mirrors findings/entities/derivation into an embedded graph and backs the
-# entity-lookup / related-cases / contamination / code-symbol paths. If kuzu or
+# entity-lookup / related-cases / contamination / code-symbol paths. If ladybug or
 # the module is unavailable, every consumer degrades to the pre-existing path.
 # ---------------------------------------------------------------------------
-_kuzu_store = None                     # KuzuStore singleton once initialized
-_kuzu_failed = False                   # PERMANENT-failure latch (kuzu unimportable) — don't retry
-_kuzu_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
-_KUZU_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
-_kuzu_lock = threading.Lock()
+_ladybug_store = None                     # LadybugStore singleton once initialized
+_ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
+_ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
+_LADYBUG_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
+_ladybug_lock = threading.Lock()
 
 
-def _get_kuzu():
-    """Lazy, fail-open KuzuStore singleton. Returns None if unavailable.
+def _get_ladybug():
+    """Lazy, fail-open LadybugStore singleton. Returns None if unavailable.
 
-    Distinguishes a genuinely UNRECOVERABLE failure (kuzu is not importable) — which
+    Distinguishes a genuinely UNRECOVERABLE failure (ladybug is not importable) — which
     latches permanently so we stop retrying — from a TRANSIENT one (another process
     holds Kuzu's single-writer lock, or a transient IO error at open time), which does
     NOT latch: a later call retries after a short backoff so the code graph self-heals
     once the other writer releases the lock. Never raises.
     """
-    global _kuzu_store, _kuzu_failed, _kuzu_last_attempt
-    if _kuzu_store is not None:
-        return _kuzu_store
-    if _kuzu_failed:
+    global _ladybug_store, _ladybug_failed, _ladybug_last_attempt
+    if _ladybug_store is not None:
+        return _ladybug_store
+    if _ladybug_failed:
         return None
-    with _kuzu_lock:
-        if _kuzu_store is not None:
-            return _kuzu_store
-        if _kuzu_failed:
+    with _ladybug_lock:
+        if _ladybug_store is not None:
+            return _ladybug_store
+        if _ladybug_failed:
             return None
         # Back off between transient-failure retries so we don't hammer a held lock.
-        if _kuzu_last_attempt and (time.monotonic() - _kuzu_last_attempt) < _KUZU_RETRY_SECONDS:
+        if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
             return None
         try:
-            from graph import kuzu_store as _kz
-            if not getattr(_kz, "_HAS_KUZU", True):
-                # kuzu itself isn't importable — unrecoverable, latch permanently.
-                _kuzu_failed = True
-                logger.warning("Kuzu not importable — graph features disabled (permanent).")
+            from graph import ladybug_store as _kz
+            if not getattr(_kz, "_HAS_LADYBUG", True):
+                # ladybug itself isn't importable — unrecoverable, latch permanently.
+                _ladybug_failed = True
+                logger.warning("LadybugDB not importable — graph features disabled (permanent).")
                 return None
-            MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # kuzu won't create parents
-            ks = _kz.KuzuStore(str(MEMORY_DIR / "graph.ladybug"))
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
+            ks = _kz.LadybugStore(str(MEMORY_DIR / "graph.ladybug"))
             if not ks.available():
                 # Import worked but open failed — almost always another process holds
                 # the single-writer lock. Treat as TRANSIENT: retry after the backoff.
-                _kuzu_last_attempt = time.monotonic()
-                logger.warning("Kuzu store unavailable (lock contention or transient IO?) "
-                               "— will retry after %ss.", _KUZU_RETRY_SECONDS)
+                _ladybug_last_attempt = time.monotonic()
+                logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
+                               "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
                 return None
-            _kuzu_store = ks
-            _kuzu_last_attempt = 0.0
+            _ladybug_store = ks
+            _ladybug_last_attempt = 0.0
         except ImportError as exc:
-            # graph module / kuzu genuinely missing — unrecoverable, latch permanently.
-            _kuzu_failed = True
-            logger.warning("Kuzu graph module missing (%r) — graph features disabled (permanent).", exc)
+            # graph module / ladybug genuinely missing — unrecoverable, latch permanently.
+            _ladybug_failed = True
+            logger.warning("LadybugDB graph module missing (%r) — graph features disabled (permanent).", exc)
             return None
         except Exception as exc:  # fail-open — never break the server on graph init
             # Unknown/transient error (e.g. IO on mkdir/open) — do NOT latch; retry later.
-            _kuzu_last_attempt = time.monotonic()
-            logger.warning("Kuzu graph init failed (%r) — will retry after %ss.", exc, _KUZU_RETRY_SECONDS)
+            _ladybug_last_attempt = time.monotonic()
+            logger.warning("LadybugDB graph init failed (%r) — will retry after %ss.", exc, _LADYBUG_RETRY_SECONDS)
             return None
     # One-time backfill of pre-existing findings, guarded by an empty-graph check.
     try:
-        _kuzu_backfill_if_empty(_kuzu_store)
+        _ladybug_backfill_if_empty(_ladybug_store)
     except Exception as exc:
-        logger.debug("Kuzu backfill skipped (fail-open): %r", exc)
-    return _kuzu_store
+        logger.debug("LadybugDB backfill skipped (fail-open): %r", exc)
+    return _ladybug_store
 
 
-def _kuzu_health_state() -> str:
-    """Read-only view of the Kuzu store state for loci_health, WITHOUT grabbing the
+def _ladybug_health_state() -> str:
+    """Read-only view of the LadybugDB store state for loci_health, WITHOUT grabbing the
     single-writer lock (a RO probe never steals a writer's lock): 'available' (open +
     readable now) | 'contended' (store up but another process holds Kuzu's writer lock
     right now — a RO open fails) | 'latched' (permanent failure, won't retry) |
@@ -293,26 +293,26 @@ def _kuzu_health_state() -> str:
     initialized / unknown). With per-op leasing the store no longer holds the lock
     between ops, so 'contended' is transient and self-heals. Never raises."""
     try:
-        if _kuzu_store is not None:
-            probe = getattr(_kuzu_store, "readable_probe", None)
+        if _ladybug_store is not None:
+            probe = getattr(_ladybug_store, "readable_probe", None)
             if probe is not None and not probe():
                 return "contended"
             return "available"
-        if _kuzu_failed:
+        if _ladybug_failed:
             return "latched"
-        if _kuzu_last_attempt and (time.monotonic() - _kuzu_last_attempt) < _KUZU_RETRY_SECONDS:
+        if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
             return "backoff"
         return "unavailable"
     except Exception:
         return "unavailable"
 
 
-def _kuzu_writer_pid() -> Optional[int]:
+def _ladybug_writer_pid() -> Optional[int]:
     """Best-effort PID currently stamped as the Kuzu write-lease holder (diagnostics;
     only populated once holders run the per-op-lease code). None if unknown."""
     try:
-        if _kuzu_store is not None:
-            fn = getattr(_kuzu_store, "lock_holder_pid", None)
+        if _ladybug_store is not None:
+            fn = getattr(_ladybug_store, "lock_holder_pid", None)
             return fn() if fn is not None else None
     except Exception:
         pass
@@ -352,14 +352,14 @@ def _code_version() -> str:
         return result
 
 
-def _kuzu_upsert_investigation(investigation_id: str, title: str = "") -> None:
-    ks = _get_kuzu()
+def _ladybug_upsert_investigation(investigation_id: str, title: str = "") -> None:
+    ks = _get_ladybug()
     if not ks:
         return
     try:
         ks.upsert_investigation(str(investigation_id), str(title or ""))
     except Exception as exc:
-        logger.debug("Kuzu investigation upsert failed (fail-open): %r", exc)
+        logger.debug("LadybugDB investigation upsert failed (fail-open): %r", exc)
 
 
 def _coerce_ts(v) -> int:
@@ -380,9 +380,9 @@ def _coerce_ts(v) -> int:
     return 0
 
 
-def _mirror_finding_to_kuzu(finding: dict, investigation_id: str, ks=None) -> None:
+def _mirror_finding_to_ladybug(finding: dict, investigation_id: str, ks=None) -> None:
     """Mirror one finding (node + MENTIONS + DERIVED_FROM) into the graph. Fail-open."""
-    ks = ks or _get_kuzu()
+    ks = ks or _get_ladybug()
     if not ks or not isinstance(finding, dict):
         return
     fid = finding.get("id")
@@ -414,7 +414,7 @@ def _mirror_finding_to_kuzu(finding: dict, investigation_id: str, ks=None) -> No
         if df:
             ks.link_derived_from(fid, list(df) if isinstance(df, (list, tuple, set)) else [df])
     except Exception as exc:
-        logger.debug("Kuzu finding mirror failed (fail-open): %r", exc)
+        logger.debug("LadybugDB finding mirror failed (fail-open): %r", exc)
 
 
 # --- Finding -> CodeSymbol auto-linker (REFERENCES) --------------------------
@@ -449,10 +449,10 @@ def _get_symbol_index(ks):
         return None
 
 
-def _autolink_finding_to_kuzu(finding: dict, ks=None) -> None:
+def _autolink_finding_to_ladybug(finding: dict, ks=None) -> None:
     """Auto-create REFERENCES edges from one just-mirrored finding to CodeSymbols.
     Cheap single-finding link over a cached index. Fail-open — never raises."""
-    ks = ks or _get_kuzu()
+    ks = ks or _get_ladybug()
     if not ks or not isinstance(finding, dict):
         return
     fid = finding.get("id")
@@ -466,10 +466,10 @@ def _autolink_finding_to_kuzu(finding: dict, ks=None) -> None:
         from graph import linker
         linker.link_findings(ks, [{"id": fid, "text": text}], index)
     except Exception as exc:
-        logger.debug("Kuzu finding auto-link failed (fail-open): %r", exc)
+        logger.debug("LadybugDB finding auto-link failed (fail-open): %r", exc)
 
 
-def _kuzu_backfill_if_empty(ks) -> None:
+def _ladybug_backfill_if_empty(ks) -> None:
     """Backfill existing on-disk findings into a freshly-created graph (once)."""
     try:
         rows = ks.code_query("MATCH (f:Finding) RETURN count(f)")
@@ -517,7 +517,7 @@ def _kuzu_backfill_if_empty(ks) -> None:
                         if p:
                             derived_rows.append({"f": fid, "p": str(p)})
     except Exception as exc:
-        logger.debug("Kuzu backfill scan failed (fail-open): %r", exc)
+        logger.debug("LadybugDB backfill scan failed (fail-open): %r", exc)
     if not finding_rows:
         return
     try:
@@ -526,15 +526,15 @@ def _kuzu_backfill_if_empty(ks) -> None:
         n = ks.upsert_findings_batch(finding_rows)
         ks.link_mentions_batch(mention_rows)
         ks.link_derived_from_batch(derived_rows)
-        logger.info("Kuzu backfill: mirrored %d findings, %d mentions, %d derivations (batched).",
+        logger.info("LadybugDB backfill: mirrored %d findings, %d mentions, %d derivations (batched).",
                     n, len(mention_rows), len(derived_rows))
     except Exception as exc:
-        logger.debug("Kuzu backfill batch failed (fail-open): %r", exc)
+        logger.debug("LadybugDB backfill batch failed (fail-open): %r", exc)
 
 
-def _entity_lookup_kuzu(entity: str, investigation_id, limit: int) -> list[dict]:
+def _entity_lookup_ladybug(entity: str, investigation_id, limit: int) -> list[dict]:
     """Graph-primary entity lookup. Normalizes to the finding shape the tools use."""
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if not ks:
         return []
     try:
@@ -1723,12 +1723,12 @@ def _entity_lookup_cascade(
     investigation_id: Optional[str],
     limit: int,
 ) -> tuple[list[dict], str]:
-    """Prefer the Kuzu graph (primary), then Qdrant (indexed), then JSONL scan.
+    """Prefer the LadybugDB graph (primary), then Qdrant (indexed), then JSONL scan.
 
     Returns ``(findings, method)`` where ``method`` names the tier that produced
     the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
     """
-    findings = _entity_lookup_kuzu(entity, investigation_id, limit)
+    findings = _entity_lookup_ladybug(entity, investigation_id, limit)
     method = "kuzu"
     if not findings:
         findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
@@ -3213,8 +3213,8 @@ def investigation_store(
     })
     # graph store: mirror into Kuzu + auto-link to code symbols (fail-open, tier-agnostic —
     # the relationship graph carries findings regardless of index tier).
-    _mirror_finding_to_kuzu(finding, investigation_id)
-    _autolink_finding_to_kuzu(finding)
+    _mirror_finding_to_ladybug(finding, investigation_id)
+    _autolink_finding_to_ladybug(finding)
 
     # Conflict detection — fail-open; never blocks a successful store.
     conflict_detected = False
@@ -5079,10 +5079,10 @@ def _correlate_memories(
         logger.debug("semantic neighbor lookup failed in correlate, skipping: %r", exc)
         semantic_ids = []
 
-    # Primary: the Kuzu graph traversal (semantics identical to find_contamination).
+    # Primary: the LadybugDB graph traversal (semantics identical to find_contamination).
     # Fallback: the in-memory traversal if the graph is unavailable or errors.
     cluster = None
-    ks = _get_kuzu()
+    ks = _get_ladybug()
     if ks:
         try:
             graph_cluster = ks.contamination(
@@ -5093,7 +5093,7 @@ def _correlate_memories(
             if isinstance(graph_cluster, dict) and "contaminated_ids" in graph_cluster:
                 cluster = graph_cluster
         except Exception as exc:
-            logger.debug("Kuzu contamination failed, falling back to in-memory: %r", exc)
+            logger.debug("LadybugDB contamination failed, falling back to in-memory: %r", exc)
     if cluster is None:
         try:
             cluster = find_contamination(
@@ -5203,7 +5203,7 @@ def code_memory_correlate(
                 try:
                     from graph.code_parse import parse_source, detect_lang
                     _lang = detect_lang(tf)
-                    _ks = _get_kuzu()
+                    _ks = _get_ladybug()
                     if _lang and _ks:
                         _ks.ingest_code([parse_source(tf, content.encode("utf-8", "replace"), _lang)])
                 except Exception as exc:
@@ -6578,6 +6578,7 @@ def loci_health() -> str:
     Returns JSON:
       code_version:      short git SHA of the running code ('' if not a git checkout)
       kuzu:              'available' | 'contended' | 'unavailable' | 'latched' | 'backoff'
+                         (key name retained for wire compatibility; the backend is LadybugDB)
                          — reflects the graph store state via a READ-ONLY probe (never
                          grabs the writer lock). 'contended' = another process holds the
                          writer lock right now (transient with per-op leasing).
@@ -6605,12 +6606,12 @@ def loci_health() -> str:
         logger.debug("loci_health: code_version probe failed: %r", exc)
         pass
     try:
-        out["kuzu"] = _kuzu_health_state()
-        pid = _kuzu_writer_pid()
+        out["kuzu"] = _ladybug_health_state()
+        pid = _ladybug_writer_pid()
         if pid is not None:
             out["kuzu_writer_pid"] = pid
     except Exception as exc:
-        logger.debug("loci_health: kuzu health-state probe failed: %r", exc)
+        logger.debug("loci_health: ladybug health-state probe failed: %r", exc)
         pass
     try:
         import backends
@@ -8175,9 +8176,9 @@ def memory_route(
 # Code<->memory graph tools are defined in graph_tools.py; register them on the
 # shared FastMCP instance here (P1 of the Loci self-review split).
 import graph_tools  # noqa: E402
-graph_tools.register(mcp, _get_kuzu)
+graph_tools.register(mcp, _get_ladybug)
 # Re-export the graph tool callables so `server.<tool>()` keeps working for
-# in-process callers and tests (they use graph_tools' injected _get_kuzu).
+# in-process callers and tests (they use graph_tools' injected _get_ladybug).
 from graph_tools import (  # noqa: E402,F401
     code_graph_ingest, code_graph_query, code_memory_relink, code_memory_map,
     symbol_impact, impact_report, finding_code_context, investigation_code_briefing,
@@ -8203,7 +8204,7 @@ investigation_tools.register(mcp, lambda: MEMORY_DIR, {
     "_apply_lifecycle": _apply_lifecycle,
     "_compute_self_check": _compute_self_check,
     "_event_log_append": _event_log_append,
-    "_kuzu_upsert_investigation": _kuzu_upsert_investigation,
+    "_ladybug_upsert_investigation": _ladybug_upsert_investigation,
     "_qdrant_upsert": _qdrant_upsert,
 })
 # Re-exported so `server.<tool>()` keeps working for in-process callers and tests.

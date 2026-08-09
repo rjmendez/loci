@@ -164,7 +164,7 @@ def ground(
         code_refs: Symbol names for code-graph grounding (used only if graph_available).
         budget_chars: Max characters of the assembled block (default 4000).
         allow_keyword: Enable the noisy keyword/FTS fallback lane (default off).
-        graph_available: Enable the code-graph lane (default off; needs the Kuzu graph).
+        graph_available: Enable the code-graph lane (default off; needs the LadybugDB graph).
 
     Returns:
         JSON with {block, sources, chars, degraded}.

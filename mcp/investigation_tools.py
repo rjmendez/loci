@@ -35,7 +35,7 @@ _get_memory_dir = None
 _apply_lifecycle = None
 _compute_self_check = None
 _event_log_append = None
-_kuzu_upsert_investigation = None
+_ladybug_upsert_investigation = None
 _qdrant_upsert = None
 
 
@@ -70,7 +70,7 @@ def investigation_start(
     """
     existing = _load_manifest(investigation_id)
     if existing:
-        _kuzu_upsert_investigation(investigation_id, existing.get("title", ""))
+        _ladybug_upsert_investigation(investigation_id, existing.get("title", ""))
         return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
 
     manifest = {
@@ -93,7 +93,7 @@ def investigation_start(
         "summary_l2": "",
     }
     _save_manifest(manifest)
-    _kuzu_upsert_investigation(investigation_id, title)
+    _ladybug_upsert_investigation(investigation_id, title)
     logger.info("Created investigation %s", investigation_id)
     return json.dumps({"status": "created", "manifest": manifest}, indent=2)
 
@@ -1047,12 +1047,12 @@ def register(mcp, get_memory_dir, deps):
     them explicitly (rather than importing server) is what keeps this module acyclic.
     """
     global _get_memory_dir, _apply_lifecycle, _compute_self_check
-    global _event_log_append, _kuzu_upsert_investigation, _qdrant_upsert
+    global _event_log_append, _ladybug_upsert_investigation, _qdrant_upsert
     _get_memory_dir = get_memory_dir
     _apply_lifecycle = deps["_apply_lifecycle"]
     _compute_self_check = deps["_compute_self_check"]
     _event_log_append = deps["_event_log_append"]
-    _kuzu_upsert_investigation = deps["_kuzu_upsert_investigation"]
+    _ladybug_upsert_investigation = deps["_ladybug_upsert_investigation"]
     _qdrant_upsert = deps["_qdrant_upsert"]
     for fn in (
         investigation_start,

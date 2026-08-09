@@ -1,4 +1,4 @@
-"""End-to-end integration tests for the Kuzu + tree-sitter graph migration.
+"""End-to-end integration tests for the LadybugDB + tree-sitter graph migration.
 
 Drives the server tool functions in-process (no MCP transport needed) against a
 temp memory dir, verifying findings mirror into the graph and that the
@@ -12,10 +12,10 @@ import server as S
 
 @pytest.fixture
 def srv(tmp_path, monkeypatch):
-    """Point the server at an isolated temp memory dir + reset the Kuzu singleton."""
+    """Point the server at an isolated temp memory dir + reset the LadybugDB singleton."""
     monkeypatch.setattr(S, "MEMORY_DIR", tmp_path / "mem")
-    monkeypatch.setattr(S, "_kuzu_store", None, raising=False)
-    monkeypatch.setattr(S, "_kuzu_failed", False, raising=False)
+    monkeypatch.setattr(S, "_ladybug_store", None, raising=False)
+    monkeypatch.setattr(S, "_ladybug_failed", False, raising=False)
     return S
 
 
@@ -29,7 +29,7 @@ def test_findings_mirror_into_graph(srv):
     S.investigation_start("inv-a", "Case A")
     f1 = _store(S, "inv-a", "observed", "malicious beacon to 203.0.113.9", "edr", "high")
     _store(S, "inv-a", "inferred", "host 203.0.113.9 again", "edr", "medium", derived_from=f1)
-    ks = S._get_kuzu()
+    ks = S._get_ladybug()
     assert ks is not None
     assert ks.code_query("MATCH (f:Finding) RETURN count(f)")[0][0] == 2
     assert ks.code_query(
@@ -68,7 +68,7 @@ def test_contamination_via_graph_matches_reference(srv):
     child = _store(S, "inv-a", "inferred", "escalation note", "an", "medium", derived_from=seed)
     S.investigation_start("inv-b", "B")
     cross = _store(S, "inv-b", "observed", "same 198.51.100.7 elsewhere", "edr", "high")
-    ks = S._get_kuzu()
+    ks = S._get_ladybug()
     out = ks.contamination([seed])
     ids = set(out["contaminated_ids"])
     assert seed in ids and child in ids and cross in ids  # derived + cross-case entity
@@ -78,7 +78,7 @@ def test_contamination_via_graph_matches_reference(srv):
 
 def test_code_graph_ingest_and_query(srv):
     S = srv
-    ing = json.loads(S.code_graph_ingest("graph/kuzu_store.py"))
+    ing = json.loads(S.code_graph_ingest("graph/ladybug_store.py"))
     assert ing["ingested"]["symbols"] > 0 and ing["ingested"]["calls"] > 0
     q = json.loads(S.code_graph_query(
         "MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol) RETURN c.name, t.name LIMIT 3"))
@@ -95,14 +95,14 @@ def test_backfill_of_preexisting_findings(srv, tmp_path):
     S.investigation_start("inv-old", "Old case")
     _store(S, "inv-old", "observed", "old beacon 203.0.113.99", "edr", "high")
     _store(S, "inv-old", "observed", "old beacon 203.0.113.99 again", "edr", "high")
-    # drop the graph + its file, reset singleton -> next _get_kuzu triggers backfill
+    # drop the graph + its file, reset singleton -> next _get_ladybug triggers backfill
     import shutil
-    ks = S._get_kuzu()
+    ks = S._get_ladybug()
     graph_path = tmp_path / "mem" / "graph.kuzu"
     del ks
-    S._kuzu_store = None
-    S._kuzu_failed = False
+    S._ladybug_store = None
+    S._ladybug_failed = False
     if graph_path.exists():
         shutil.rmtree(graph_path, ignore_errors=True)
-    ks2 = S._get_kuzu()  # empty graph -> backfill runs
+    ks2 = S._get_ladybug()  # empty graph -> backfill runs
     assert ks2.code_query("MATCH (f:Finding) RETURN count(f)")[0][0] == 2

@@ -207,7 +207,7 @@ $HERMES_MEMORY_DIR/
   `procedure_preconditions`, `procedure_steps`, `procedure_postconditions`
 
 **71 MCP tools provided by loci-mcp** — 60 decorated `@mcp.tool()` in `mcp/server.py`
-plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_kuzu)`.
+plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)`.
 The tables below cover the 24 most-used ones. The rest are:
 `investigation_as_of`, `investigation_share`, `investigation_unshare`,
 `investigation_verify_all`, `investigation_reason`, `investigation_export`,

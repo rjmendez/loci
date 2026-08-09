@@ -84,7 +84,7 @@ Add to `~/.claude/settings.json` under `mcpServers`:
 ## Tools (71)
 
 71 tools are registered at runtime: 60 defined in `server.py`, plus 11 code-graph
-tools registered from `graph_tools.py` via `graph_tools.register(mcp, _get_kuzu)` at
+tools registered from `graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)` at
 server startup — which is why they do not appear as `@mcp.tool()` in `server.py`.
 The same inventory is listed in the [top-level README](../README.md#mcp-tools-71).
 
