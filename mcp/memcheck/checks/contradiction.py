@@ -23,6 +23,7 @@ import re
 from typing import Callable, Optional
 
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
+from ._common import _default_tokenize, _finding_id
 
 __all__ = ["run_contradiction"]
 
@@ -38,31 +39,9 @@ EWC_HIGH_THRESH = float(os.environ.get("MEMCHECK_EWC_HIGH_THRESH", "0.75"))
 _DEFAULT_NEGATION_RE = re.compile(
     r"\b(?:no|not|never|none|without|cannot|can't|didn't|isn't|aren't|won't)\b", re.I
 )
-_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:/-]{2,}", re.I)
-_GENERIC_MATCH_TOKENS = {
-    "host", "user", "device", "query", "result", "results", "output", "input", "tool",
-    "found", "seen", "shows", "reported", "detected", "contacted", "event", "events",
-    "record", "records", "row", "rows",
-}
 
 # Cap on the number of findings compared pairwise, newest-last preserved.
 _MAX_FINDINGS = 300
-
-
-def _default_tokenize(text: str) -> set[str]:
-    return {
-        token
-        for token in (m.group(0).lower() for m in _TOKEN_RE.finditer(text or ""))
-        if token not in _GENERIC_MATCH_TOKENS
-    }
-
-
-def _finding_id(finding: dict, index: int) -> str:
-    fid = finding.get("id") or finding.get("finding_id")
-    if fid:
-        return str(fid)
-    inv = finding.get("investigation_id")
-    return f"{inv}:{index}" if inv else f"finding:{index}"
 
 
 def _overlap(a: set, b: set) -> float:
