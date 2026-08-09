@@ -25,6 +25,7 @@ Socket: ``MEMCHECK_SOCKET`` env, default ``~/.hermes/memcheck.sock`` (perms 0600
 
 from __future__ import annotations
 
+import logging
 import json
 import os
 import signal
@@ -36,6 +37,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import cli
+
+logger = logging.getLogger("loci-mcp.daemon")
 
 __all__ = [
     "DEFAULT_SOCKET",
@@ -164,8 +167,8 @@ class _Handler(socketserver.BaseRequestHandler):
                 self._write_response(
                     {"would_flag": False, "occurrences": 0, "qdrant": "unavailable"}
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("handle: fail-open swallow: %r", exc)
 
     def _read_all(self) -> bytes:
         chunks: list[bytes] = []
@@ -184,8 +187,8 @@ class _Handler(socketserver.BaseRequestHandler):
         line = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
         try:
             self.request.sendall(line)
-        except Exception:  # noqa: BLE001 — client may have already gone away
-            pass
+        except Exception as exc:  # noqa: BLE001 — client may have already gone away
+            logger.debug("_write_response: fail-open swallow: %r", exc)
 
 
 class MemcheckDaemon(socketserver.ThreadingUnixStreamServer):
@@ -220,8 +223,8 @@ def _prepare_socket_path(path: Path) -> None:
     if path.exists() or path.is_symlink():
         try:
             path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("_prepare_socket_path: fail-open swallow: %r", exc)
 
 
 def serve(
@@ -244,8 +247,8 @@ def serve(
     # User-only access to the socket (0600).
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("serve: fail-open swallow: %r", exc)
 
     def _shutdown(_signum, _frame) -> None:
         # shutdown() must run off the serve thread; spawn a tiny stopper.
@@ -256,9 +259,9 @@ def serve(
         try:
             signal.signal(sig, _shutdown)
             installed_signals.append(sig)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
             # Not on the main thread (e.g. under a test) — skip signal install.
-            pass
+            logger.debug("serve: fail-open swallow: %r", exc)
 
     if ready_event is not None:
         ready_event.set()
@@ -270,8 +273,8 @@ def serve(
         try:
             if path.exists() or path.is_symlink():
                 path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("serve: fail-open swallow: %r", exc)
     return 0
 
 

@@ -356,8 +356,8 @@ class LadybugStore:
                     try:
                         if c is not None:
                             c.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("_session: fail-open swallow: %r", exc)
                 try:
                     if got:
                         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -370,8 +370,8 @@ class LadybugStore:
         try:
             os.ftruncate(fd, 0)
             os.pwrite(fd, f"{os.getpid()} {int(time.time())}\n".encode(), 0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_stamp_holder: fail-open swallow: %r", exc)
 
     def writable_probe(self) -> bool:
         """True if a RW connection can be opened right now (lease free AND LadybugDB's own
@@ -439,8 +439,8 @@ class LadybugStore:
                     "ALTER TABLE CodeSymbol ADD referenced BOOL DEFAULT false"):
             try:
                 conn.execute(alt)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("_ensure_schema: fail-open swallow: %r", exc)
         self._schema_ready = True
 
     # ------------------------------------------------------------------ #
@@ -454,8 +454,8 @@ class LadybugStore:
         result is drained+closed INSIDE the session, before _session tears it down."""
         try:
             res.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_close_result: fail-open swallow: %r", exc)
 
     def _exec(self, cypher: str, params: Optional[dict] = None):
         """Execute a WRITE statement in a leased RW session; returns None (writes have no

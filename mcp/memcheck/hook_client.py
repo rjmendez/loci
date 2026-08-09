@@ -22,9 +22,12 @@ Importing this module must not connect to anything — only ``main()`` /
 ``run()`` do I/O, so it stays ``python -m memcheck.hook_client`` friendly.
 """
 
+import logging
 import os
 import socket
 import sys
+
+logger = logging.getLogger("loci-mcp.hook_client")
 
 # Keep stdlib-only and lazy: ``subprocess`` is imported inside the spawn path so
 # the common (daemon-up) case never pays for it.
@@ -58,9 +61,9 @@ def _spawn_daemon():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except Exception as exc:
         # Spawning is opportunistic; failure just means the next call retries.
-        pass
+        logger.debug("_spawn_daemon: fail-open swallow: %r", exc)
 
 
 def run(stdin_bytes):
@@ -88,13 +91,13 @@ def run(stdin_bytes):
             try:
                 while sock.recv(65536):
                     pass
-            except (TimeoutError, OSError):
-                pass
+            except (TimeoutError, OSError) as exc:
+                logger.debug("run: fail-open swallow: %r", exc)
         finally:
             sock.close()
-    except Exception:
+    except Exception as exc:
         # Absolute fail-open boundary: timeout, reset, anything — exit 0.
-        pass
+        logger.debug("run: fail-open swallow: %r", exc)
     return 0
 
 

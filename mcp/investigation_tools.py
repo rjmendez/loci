@@ -608,8 +608,8 @@ def investigation_finding_provenance(
                 nc = node_entry.get("numeric_confidence", 1.0)
                 try:
                     aggregate_confidence *= float(nc)
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as exc:
+                    logger.debug("investigation_finding_provenance: fail-open swallow: %r", exc)
         aggregate_confidence = round(aggregate_confidence, 6)
     except Exception:
         aggregate_confidence = None

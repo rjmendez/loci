@@ -1,5 +1,4 @@
 """Tests for scripts/graph_facts.py — the deterministic code-graph fact producer."""
-import io
 import json
 import os
 import sys

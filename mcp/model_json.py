@@ -9,9 +9,12 @@ wrapper over Ollama; this is a pure parser with no backend of its own.
 """
 from __future__ import annotations
 
+import logging
 import json
 import re
 from typing import Optional
+
+logger = logging.getLogger("loci-mcp.model_json")
 
 
 def extract_json_object(text: str) -> Optional[dict]:
@@ -27,8 +30,8 @@ def extract_json_object(text: str) -> Optional[dict]:
         obj = json.loads(text)
         if isinstance(obj, dict):
             return obj
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("extract_json_object: fail-open swallow: %r", exc)
     # 2) strip code fences and retry
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if fenced:
@@ -36,8 +39,8 @@ def extract_json_object(text: str) -> Optional[dict]:
             obj = json.loads(fenced.group(1))
             if isinstance(obj, dict):
                 return obj
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("extract_json_object: fail-open swallow: %r", exc)
     # 3) brace-match scan: first '{' whose balanced span parses as an object
     depth = 0
     start = -1

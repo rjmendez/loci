@@ -239,8 +239,8 @@ def _node_name(node, lang: str) -> Optional[str]:
         for c in node.named_children:
             if c.type in _NAME_LEAVES:
                 return _text(c)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_node_name: fail-open swallow: %r", exc)
     return None
 
 
@@ -776,13 +776,13 @@ def _collect_decls(root, lang, def_types, enclosing_symbol_src, in_method, add_d
                                 nm = _first_child_type(c, {"identifier"})
                             if nm is not None:
                                 add_decl(_text(nm), None, enclosing_symbol_src(node), "param")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_collect_decls: fail-open swallow: %r", exc)
 
         try:
             stack.extend(node.children)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_collect_decls: fail-open swallow: %r", exc)
 
 
 def _python_is_class_field(assign_node, def_types) -> bool:

@@ -25,6 +25,7 @@ not on the hook path).
 
 from __future__ import annotations
 
+import logging
 import hashlib
 import json
 import os
@@ -38,6 +39,8 @@ from typing import Any, Optional
 # for it only when qdrant is actually reachable.
 from .backend import VerdictBackend
 from .verdict import make_signature, new_verdict, redact_excerpt
+
+logger = logging.getLogger("loci-mcp.cli")
 
 __all__ = [
     "EMBED_DIM",
@@ -184,8 +187,8 @@ def _append_audit_line(record: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
-    except Exception:  # noqa: BLE001 — logging must never break the hook
-        pass
+    except Exception as exc:  # noqa: BLE001 — logging must never break the hook
+        logger.debug("_append_audit_line: fail-open swallow: %r", exc)
 
 
 def _now_iso() -> str:
@@ -398,8 +401,8 @@ def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> d
         if repo_root:
             try:
                 return p.resolve().relative_to(Path(repo_root).resolve()).as_posix()
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as exc:
+                logger.debug("_audit_relpath: fail-open swallow: %r", exc)
         return p.name
 
     # Skip: no path, not a .py file, or the file doesn't exist.
@@ -505,9 +508,9 @@ def _check_action_from_stdin() -> int:
             )
 
         check_action(payload, backend)
-    except Exception:  # noqa: BLE001 — absolute fail-open boundary
+    except Exception as exc:  # noqa: BLE001 — absolute fail-open boundary
         # Never let anything escape to stdout or a non-zero exit.
-        pass
+        logger.debug("_check_action_from_stdin: fail-open swallow: %r", exc)
     return 0
 
 
@@ -625,8 +628,8 @@ def _cmd_check_code(argv: list[str]) -> int:
                     {"tool_name": "Write", "tool_input": {"file_path": f}},
                     _BackendEngine(backend),
                 )
-            except Exception:  # noqa: BLE001 — recording must never break the CLI
-                pass
+            except Exception as exc:  # noqa: BLE001 — recording must never break the CLI
+                logger.debug("_cmd_check_code: fail-open swallow: %r", exc)
 
     if total_issues == 0:
         print("no code-hallucination issues found")
