@@ -189,7 +189,6 @@ _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 # any finding record stored before this field existed (absent -> "open"). The three
 # resolved states are what exclusion-aware grounding treats as "handled — do not re-report".
 _RESOLUTION_STATES: frozenset = frozenset({"open", "fixed", "intentional", "wontfix", "superseded"})
-_RESOLVED_STATES: frozenset = frozenset({"fixed", "intentional", "wontfix"})
 
 # ---------------------------------------------------------------------------
 # Optional Qdrant + fastembed
@@ -900,7 +899,6 @@ _OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL")
 _EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
-_EMBED_BATCH_SIZE = 32  # Ollama stalls on >32
 _EMBED_CACHE_MAXSIZE = 512
 _embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
 _embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
@@ -962,67 +960,6 @@ def _embed(text: str) -> list[float] | None:
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
         return None
-
-
-_EMBED_BACKEND: str | None = None   # "ollama" | "fastembed" | None
-_FE_MODEL = None                    # lazy fastembed TextEmbedding instance
-
-
-def _embed_batch(texts: list[str]) -> list[list[float] | None]:
-    """Batch embed. Tries Ollama /v1/embeddings first; falls back to fastembed.
-    Hard ceiling: _EMBED_BATCH_SIZE (32) items per call.
-    Returns one vector (or None) per input text, preserving order.
-    """
-    global _EMBED_BACKEND, _FE_MODEL
-    if not texts:
-        return []
-    import requests as _req
-    results: list[list[float] | None] = []
-    for i in range(0, len(texts), _EMBED_BATCH_SIZE):
-        batch = texts[i:i + _EMBED_BATCH_SIZE]
-        vecs = None
-
-        # --- Try Ollama /v1/embeddings (OpenAI-compatible) ---
-        if _EMBED_BACKEND != "fastembed" and _OLLAMA_BASE:
-            try:
-                r = _req.post(
-                    f"{_OLLAMA_BASE.rstrip('/')}/v1/embeddings",
-                    json={"model": _EMBED_MODEL, "input": batch},
-                    headers=_embed_auth_headers(),
-                    timeout=30,
-                )
-                r.raise_for_status()
-                data = r.json()
-                vecs = [item["embedding"] for item in data.get("data", [])]
-                if vecs:
-                    _EMBED_BACKEND = "ollama"
-            except Exception as exc:
-                logger.warning("Ollama /v1/embeddings failed, falling back to fastembed: %s", exc)
-                _EMBED_BACKEND = "fastembed"
-
-        # --- fastembed fallback (CPU, BAAI/bge-small-en-v1.5, 384-dim) ---
-        if vecs is None:
-            fe_model_name = os.environ.get("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
-            if int(os.environ.get("EMBED_DIM", VECTOR_DIM)) != 384:
-                logger.warning(
-                    "fastembed fallback produces 384-dim but VECTOR_DIM=%d"
-                    " — upserts may fail. Set EMBED_DIM=384 or restore Ollama.",
-                    VECTOR_DIM,
-                )
-            try:
-                from fastembed import TextEmbedding
-                if _FE_MODEL is None:
-                    _FE_MODEL = TextEmbedding(model_name=fe_model_name)
-                vecs = [v.tolist() for v in _FE_MODEL.embed(batch)]
-                _EMBED_BACKEND = "fastembed"
-                logger.info("Using fastembed fallback (%s)", fe_model_name)
-            except Exception as exc:
-                logger.error("fastembed fallback also failed: %s", exc)
-                vecs = []
-
-        for j in range(len(batch)):
-            results.append(list(vecs[j]) if vecs and j < len(vecs) else None)
-    return results
 
 
 def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
@@ -1918,11 +1855,6 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
 # Injectable generation fn for investigation_verify_all — None means "use the
 # shipped verify.py default" (lazy llm_local). Tests set this to a stub.
 _verify_gen_fn = None
-
-# Update-record types recorded in finding_updates.jsonl. Only 'resolution' records
-# land here; verify-all verdicts are written to the separate finding_verifications.jsonl
-# (see _finding_verifications_path) and are NOT part of this constant.
-_LIFECYCLE_UPDATE_TYPES: frozenset = frozenset({"resolution"})
 
 # Known source/config/doc file extensions a code ref may end in. Requiring the
 # extension to be from THIS set (not merely "some letters after a dot") is what
@@ -4134,11 +4066,9 @@ def investigation_reflect(investigation_id: str) -> str:
     summary_l2: str = ""
     try:
         last_20 = findings[-20:]
-        _llm_summary_attempted = False
         try:
             from memcheck import llm as _llm
             if _llm.llm_available() and last_20:
-                _llm_summary_attempted = True
                 context_bullets = "\n".join(
                     f"- [{f.get('type', '?')}] {str(f.get('text', ''))[:300]}"
                     for f in last_20
@@ -4171,8 +4101,8 @@ def investigation_reflect(investigation_id: str) -> str:
                     l2_raw = _llm.call_llm(l2_prompt, timeout=60.0)
                     if l2_raw:
                         summary_l2 = l2_raw.strip()
-        except Exception:
-            _llm_summary_attempted = False
+        except Exception as exc:
+            logger.debug("investigation_reflect: LLM summary ladder failed (fail-open): %r", exc)
 
         # Deterministic fallback when LLM is unavailable or failed to produce output
         if not summary_l1:
@@ -4193,7 +4123,8 @@ def investigation_reflect(investigation_id: str) -> str:
         manifest["summary_l1"] = summary_l1
         manifest["summary_l2"] = summary_l2
         _save_manifest(manifest)
-    except Exception:
+    except Exception as exc:
+        logger.debug("investigation_reflect: summary ladder persist failed (fail-open): %r", exc)
         pass  # fail-open: summary generation never breaks reflect
 
     return json.dumps({
@@ -4683,14 +4614,6 @@ def investigation_search(
         if text and rtexts and text in rtexts:
             return True
         return False
-    def _iter_target_investigations() -> list[str]:
-        if investigation_id:
-            if not (MEMORY_DIR / investigation_id).exists():
-                return []
-            return [investigation_id]
-        if not MEMORY_DIR.exists():
-            return []
-        return [p.name for p in MEMORY_DIR.iterdir() if p.is_dir()]
 
     _, recall_fn = _get_mnemo_funcs()
     mnemo_enabled = recall_fn is not None
@@ -4986,7 +4909,10 @@ def investigation_pre_answer_check(
                 confidence_summary = "medium (0.5-0.8)"
             else:
                 confidence_summary = "low (<0.5)"
-    except Exception:
+    except Exception as exc:
+        logger.debug(
+            "investigation_pre_answer_check: chain-confidence computation failed (fail-open): %r", exc
+        )
         pass
 
     response = {
@@ -7778,14 +7704,16 @@ def loci_health() -> str:
     }
     try:
         out["code_version"] = _code_version()
-    except Exception:
+    except Exception as exc:
+        logger.debug("loci_health: code_version probe failed: %r", exc)
         pass
     try:
         out["kuzu"] = _kuzu_health_state()
         pid = _kuzu_writer_pid()
         if pid is not None:
             out["kuzu_writer_pid"] = pid
-    except Exception:
+    except Exception as exc:
+        logger.debug("loci_health: kuzu health-state probe failed: %r", exc)
         pass
     try:
         import backends
@@ -7803,22 +7731,27 @@ def loci_health() -> str:
         ):
             try:
                 out[key] = bool(backends._alive(resolver(), timeout=_PROBE_T))
-            except Exception:
+            except Exception as exc:
+                logger.debug("loci_health: reachability probe %s failed: %r", key, exc)
                 pass
         try:
             out["embed_model"] = backends.embed_model()
-        except Exception:
+        except Exception as exc:
+            logger.debug("loci_health: embed_model probe failed: %r", exc)
             pass
         try:
             out["rerank_model"] = backends.rerank_model()
-        except Exception:
+        except Exception as exc:
+            logger.debug("loci_health: rerank_model probe failed: %r", exc)
             pass
-    except Exception:
+    except Exception as exc:
+        logger.debug("loci_health: backends import/probe block failed: %r", exc)
         pass
     try:
         import embed_ops
         out["warm"] = embed_ops.warmed()
-    except Exception:
+    except Exception as exc:
+        logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
     return json.dumps(out, indent=2)
 
@@ -8126,7 +8059,11 @@ def memory_surface(
                 query_filter = Filter(
                     must=[FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))]
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "memory_surface: investigation filter construction failed for %s "
+                    "- search will NOT be scoped: %r", investigation_id, exc,
+                )
                 pass
 
         # Fetch top_k * 3 candidates with a lower threshold via _qdrant_search_collection
@@ -8519,7 +8456,8 @@ def memory_confidence(
 
     try:
         emb = _embed(query)
-    except Exception:
+    except Exception as exc:
+        logger.debug("memory_confidence embed failed: %r", exc)
         emb = None
     if not emb:
         return json.dumps({
@@ -8529,12 +8467,13 @@ def memory_confidence(
 
     try:
         results = client.search(
-            collection_name="hermes_memory",
+            collection_name=col,
             query_vector={"dense": emb} if isinstance(emb, list) else emb,
             limit=top_k,
             with_payload=True,
         )
-    except Exception:
+    except Exception as exc:
+        logger.debug("memory_confidence search failed: %r", exc)
         results = []
 
     if not results:
@@ -9060,6 +8999,7 @@ def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> s
         return json.dumps({"resolved": True, "conflict_id": conflict_id, "verdict": verdict}, indent=2)
     except Exception as exc:
         logger.exception("conflict_resolve failed: %s", exc)
+        return json.dumps({"error": str(exc)})
 
 
 # Memory hints — polling tool + MCP resource
@@ -9508,7 +9448,8 @@ def memory_route(
                             if isinstance(acl, list) and agent_id in acl:
                                 filtered.append(hit)
                                 continue
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("memory_route: ACL check failed for %s: %r", inv_id, exc)
                         pass  # graceful skip
             raw_hits = filtered
 
@@ -9548,7 +9489,8 @@ def memory_route(
                     manifest = _load_manifest(inv_id)
                     if manifest:
                         inv_title = manifest.get("title", "")
-                except Exception:
+                except Exception as exc:
+                    logger.debug("memory_route: manifest title lookup failed for %s: %r", inv_id, exc)
                     pass
 
             routed.append({

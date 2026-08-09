@@ -30,7 +30,6 @@ an empty result rather than propagating, exactly like the rest of the store.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from typing import Optional
 
@@ -99,16 +98,14 @@ def build_symbol_index(symbols: list[dict]) -> dict:
     * ``type_ids``      — ``name -> list[symbol_id]`` restricted to type symbols.
     * ``unique_names``  — ``set[str]`` of names that resolve to exactly one
                           symbol id (eligible for MEDIUM matching).
-    * ``file_basenames``— ``basename -> list[symbol_id]`` for ``SomeFile.java``
-                          style references.
+
+    The index has exactly these four keys.
     """
     by_name: dict[str, list[str]] = {}
     type_names: set[str] = set()
     type_ids: dict[str, list[str]] = {}
-    file_basenames: dict[str, list[str]] = {}
-    # track seen (name,id) / (base,id) to collapse duplicate rows
+    # track seen (name,id) to collapse duplicate rows
     _seen_name: set[tuple[str, str]] = set()
-    _seen_base: set[tuple[str, str]] = set()
 
     for s in (symbols or []):
         if not isinstance(s, dict):
@@ -128,12 +125,6 @@ def build_symbol_index(symbols: list[dict]) -> dict:
                 type_names.add(name)
                 if sid not in type_ids.setdefault(name, []):
                     type_ids[name].append(sid)
-        f = s.get("file")
-        if f:
-            base = os.path.basename(str(f))
-            if base and (base, sid) not in _seen_base:
-                _seen_base.add((base, sid))
-                file_basenames.setdefault(base, []).append(sid)
 
     unique_names = {n for n, ids in by_name.items() if len(ids) == 1}
 
@@ -142,7 +133,6 @@ def build_symbol_index(symbols: list[dict]) -> dict:
         "type_names": type_names,
         "type_ids": type_ids,
         "unique_names": unique_names,
-        "file_basenames": file_basenames,
     }
 
 
@@ -184,7 +174,6 @@ def extract_symbol_refs(text: str, index: dict) -> list[tuple[str, str]]:
     type_names: set = index.get("type_names") or set()
     type_ids: dict = index.get("type_ids") or {}
     unique_names: set = index.get("unique_names") or set()
-    file_basenames: dict = index.get("file_basenames") or {}
 
     best: dict[str, str] = {}
 
