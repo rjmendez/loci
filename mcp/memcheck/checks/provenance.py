@@ -21,12 +21,15 @@ record is skipped, never raised.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Callable, Optional
 
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
 __all__ = ["run_provenance"]
+
+_log = logging.getLogger("memcheck.provenance")
 
 # Mirrors server.py's _TOKEN_RE / _GENERIC_MATCH_TOKENS so the internal
 # fallback tokenizer behaves like the server's when no tokenizer is injected.
@@ -118,7 +121,8 @@ def run_provenance(
             continue
         try:
             receipts.append((tok(_audit_text(entry)), _audit_names(entry)))
-        except Exception:
+        except Exception as exc:
+            _log.debug("provenance: skipping malformed audit entry: %s", exc)
             continue
 
     verdicts: list[Verdict] = []
@@ -173,8 +177,9 @@ def run_provenance(
                     refs=[fid],
                 )
             )
-        except Exception:
+        except Exception as exc:
             # Fail-safe: a malformed finding is skipped, never raised.
+            _log.debug("provenance: skipping malformed finding at index %s: %s", index, exc)
             continue
 
     return verdicts
