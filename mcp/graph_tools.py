@@ -132,9 +132,11 @@ def code_memory_relink() -> str:
         from graph import linker
         result = linker.relink_all(ks)
         # A relink can change the symbol set relationship; drop the cached index
-        # so subsequent auto-links rebuild against the current graph.
-        global _symbol_index_cache, _symbol_index_count
-        _symbol_index_cache, _symbol_index_count = None, -1
+        # so subsequent auto-links rebuild against the current graph. Must go
+        # through ladybug_ops -- assigning the names here would bind graph_tools'
+        # own globals and leave the real cache stale.
+        import ladybug_ops
+        ladybug_ops.invalidate_symbol_index()
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.debug("code_memory_relink failed: %r", exc)

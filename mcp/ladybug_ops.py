@@ -107,6 +107,18 @@ _symbol_index_cache = None             # built graph.linker index
 _symbol_index_count = -1               # CodeSymbol count the cache was built at
 
 
+def invalidate_symbol_index() -> None:
+    """Drop the cached symbol index so the next auto-link rebuilds it.
+
+    Callers outside this module MUST use this rather than assigning the module
+    globals themselves: a `global _symbol_index_cache` in another module binds
+    names in THAT module's namespace and leaves this cache untouched, which is
+    exactly the dead write that made code_memory_relink's invalidation a no-op.
+    """
+    global _symbol_index_cache, _symbol_index_count
+    _symbol_index_cache, _symbol_index_count = None, -1
+
+
 def _get_symbol_index(ks):
     """Return a cached graph.linker symbol index, rebuilding it when the graph's
     CodeSymbol count changes. Returns None (fail-open) if unavailable/empty."""
