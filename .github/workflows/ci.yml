@@ -130,6 +130,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The regression tests build the graph at historical revisions
+          # (69adfa4^, c1c40a9~1, 08c9198^) to prove the tool still catches the
+          # bugs it was validated against. A shallow clone makes git rev-parse
+          # exit 128 on those.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

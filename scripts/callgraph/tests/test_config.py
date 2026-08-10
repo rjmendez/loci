@@ -1,3 +1,4 @@
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """config.py against the REAL repo: acceptance criterion is an exact file
 count (114), not a vibe. If this drifts, either the repo changed shape or
 the exclusion rules regressed — both worth failing loudly on."""
@@ -45,6 +46,7 @@ def test_stdlib_module_names_contains_known_stdlib():
     assert "graph_tools" not in names
 
 
+@needs_corpus_deps
 def test_third_party_names_finds_installed_packages():
     # The venv is fully provisioned per the task brief; fastmcp's dependency
     # stack (dotenv, starlette, ...) should be discoverable.

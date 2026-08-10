@@ -5,6 +5,7 @@ bar for steps 1-3, not just the synthetic fixtures.
 Most of these share the `head_build` session fixture (see conftest.py) so
 the corpus is only parsed once per test run; a few need a different
 `--rev` or `--scope` and build independently."""
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 from ..analyze.deadcode import registered_but_dead
 from ..analyze.reach import (
     direct_callers, entrypoints_reaching, function_at_line, path_confidence, shortest_path,
@@ -95,6 +96,7 @@ def test_callers_of_symbol_impact_do_not_double_count_the_alias(head_build):
     assert aliasers[0].src == "name:mcp/server.py::symbol_impact"
 
 
+@needs_git_history
 def test_bug_c_dangling_global_regression_before_the_fix():
     # At c1c40a9^ (the commit before "make code_memory_relink actually
     # invalidate the symbol-index cache"), graph_tools.py declares these
@@ -114,6 +116,7 @@ def test_bug_c_is_fixed_on_head(head_build):
     assert "_symbol_index_count" not in dangling
 
 
+@needs_corpus_deps
 def test_unresolved_imports_are_all_genuinely_optional_third_party(head_build):
     unresolved = [e for e in head_build.store.edges_of_kind("IMPORTS") if e.attrs.get("resolved_via") == "unresolved"]
     modules = {e.attrs["module"] for e in unresolved}
