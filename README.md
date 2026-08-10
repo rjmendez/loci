@@ -48,7 +48,9 @@ cp ../.env.example .env   # fill in QDRANT_URL and OLLAMA_BASE_URL at minimum
 .venv/bin/python server.py
 ```
 
-Wire into Claude Code (`~/.claude/settings.json`):
+A Claude Code session started **inside this checkout** picks the server up from
+the checked-in `.mcp.json` — no wiring needed once the venv above exists. To use
+it from anywhere else, add absolute paths to `~/.claude/settings.json`:
 
 ```json
 "loci": {

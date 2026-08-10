@@ -55,7 +55,11 @@ def _load_qdrant_api_key() -> str:
     try:
         with open(settings_path) as fh:
             cfg = json.load(fh)
-        return cfg["mcpServers"]["hermes_memory"]["env"]["QDRANT_API_KEY"]
+        servers = cfg["mcpServers"]
+        # "loci" is the current registration name; "hermes_memory" is what older
+        # settings.json files used. Accept either.
+        entry = servers.get("loci") or servers["hermes_memory"]
+        return entry["env"]["QDRANT_API_KEY"]
     except (KeyError, FileNotFoundError, json.JSONDecodeError) as exc:
         print(f"[warn] could not read QDRANT_API_KEY from settings.json: {exc}")
         return ""

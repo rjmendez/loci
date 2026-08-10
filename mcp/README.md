@@ -62,14 +62,40 @@ With optional Mnemosyne:
 
 ## Claude Code / MCP wiring
 
-Add to `~/.claude/settings.json` under `mcpServers`:
+The repo checks in a `.mcp.json` at its root, so a Claude Code session started
+**inside this checkout** registers the server as `loci` with no per-machine
+setup. Its paths are relative — Claude Code launches stdio servers with the
+project directory as cwd, so they resolve in any clone:
 
 ```json
 {
   "mcpServers": {
-    "hermes_memory": {
-      "command": "/path/to/loci-mcp/.venv/bin/python",
-      "args": ["/path/to/loci-mcp/server.py"],
+    "loci": {
+      "type": "stdio",
+      "command": "mcp/.venv/bin/python",
+      "args": ["mcp/server.py"]
+    }
+  }
+}
+```
+
+It carries no `env` block: `server.py` loads the repo-root `.env` and then
+`mcp/.env` (override) at import, so credentials and host-specific endpoints stay
+in gitignored files rather than a committed config. Complete [Setup](#setup)
+first — the interpreter it names does not exist until you create `mcp/.venv`,
+and Claude Code will report the server as failed to start until you do.
+
+To use the server from **outside** this checkout, register it by absolute path
+in `~/.claude/settings.json` instead. Keep the name `loci`; registering the same
+server twice under two names publishes every tool twice:
+
+```json
+{
+  "mcpServers": {
+    "loci": {
+      "type": "stdio",
+      "command": "/path/to/loci/mcp/.venv/bin/python",
+      "args": ["/path/to/loci/mcp/server.py"],
       "env": {
         "QDRANT_URL": "http://localhost:6333",
         "QDRANT_API_KEY": "",

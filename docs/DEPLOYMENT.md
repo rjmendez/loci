@@ -118,7 +118,7 @@ Configure Claude Code (`~/.claude/settings.json`):
 ```json
 {
   "mcpServers": {
-    "hermes_memory": {
+    "loci": {
       "command": "/path/to/mcp/.venv/bin/python",
       "args": ["/path/to/mcp/server.py"],
       "env": {
@@ -139,7 +139,7 @@ Configure Claude Code to use HTTP transport:
 ```json
 {
   "mcpServers": {
-    "hermes_memory": {
+    "loci": {
       "transport": "sse",
       "url": "http://your-host:8000/sse"
     }

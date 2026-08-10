@@ -44,7 +44,7 @@ Always run the dry-run first, eyeball `targeted`, then re-run with `--apply`.
 | var | purpose | default |
 |-----|---------|---------|
 | `QDRANT_URL` | Qdrant endpoint (separate k3s host, CPU) | — (required) |
-| `QDRANT_API_KEY` | Qdrant key; falls back to `~/.claude/settings.json` `mcpServers.hermes_memory.env` | "" |
+| `QDRANT_API_KEY` | Qdrant key; falls back to `~/.claude/settings.json` `mcpServers.loci.env` (or the legacy `mcpServers.hermes_memory.env`) | "" |
 | `OLLAMA_BASE_URL` / `OLLAMA_URL` | Ollama for the warm-GPU nomic embed path | — |
 | `EMBED_MODEL` | current embed model tag | `nomic-embed-text` |
 | `EMBED_VERSION` | current embed version marker | `1` |

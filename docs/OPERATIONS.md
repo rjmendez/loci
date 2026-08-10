@@ -177,7 +177,7 @@ All hook paths and infra addresses are driven by env vars. To stand up on a new 
 3. Update `~/.claude/settings.json` hook paths (currently hardcoded — no env expansion in JSON)
 4. Create `~/.claude/hook-state/` directory
 5. Ensure Qdrant API key is in `~/.claude/settings.json` at
-   `mcpServers.hermes_memory.env.QDRANT_API_KEY`
+   `mcpServers.loci.env.QDRANT_API_KEY` (or the legacy `mcpServers.hermes_memory.env.QDRANT_API_KEY`)
 
 ---
 
