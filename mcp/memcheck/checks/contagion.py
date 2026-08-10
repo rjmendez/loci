@@ -27,6 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Callable, Iterable, Optional, Union
 
+from ._common import _finding_id
+
 __all__ = ["find_contamination"]
 
 _log = logging.getLogger("memcheck.contagion")
@@ -38,15 +40,6 @@ _DISTINCTIVE_BUCKETS = (
     "urls", "url", "hosts", "hostnames", "host", "paths", "path",
     "ips", "ip", "hashes", "cves", "emails", "identifiers", "endpoints",
 )
-
-
-def _finding_id(finding: dict, index: int) -> str:
-    """Stable id for a finding: prefer an explicit id, else derive from index."""
-    fid = finding.get("id") or finding.get("finding_id")
-    if fid:
-        return str(fid)
-    inv = finding.get("investigation_id")
-    return f"{inv}:{index}" if inv else f"finding:{index}"
 
 
 def _distinctive_entities(raw: Union[dict, set, list, None]) -> set[str]:

@@ -65,6 +65,19 @@ def _summarise_finding(f: dict, *, include_tags: bool = True) -> dict:
     return out
 
 
+def _distinctive_entity_set(entities: dict | None) -> set[str]:
+    """Flatten the server's typed-entity dict to a set of distinctive entity tokens."""
+    out: set[str] = set()
+    if not isinstance(entities, dict):
+        return out
+    for bucket in ("ips", "hashes", "cves", "emails", "hostnames"):
+        for v in entities.get(bucket, []) or []:
+            s = str(v).strip().lower()
+            if s:
+                out.add(s)
+    return out
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

@@ -43,7 +43,7 @@ Tools:
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401  (kept on the module namespace; live users import it function-locally)
 import fcntl
 import hashlib
 import json
@@ -164,8 +164,17 @@ MEMORY_DIR = Path(os.environ.get(
     "HERMES_MEMORY_DIR",
     Path.home() / ".hermes" / "memory-sessions",
 ))
-QDRANT_COLLECTION_PREFIX = os.environ.get("QDRANT_COLLECTION_PREFIX", "hermes_memory")
-VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+# Embedding + Qdrant cluster lives in qdrant_ops.py. Imported here (after
+# load_dotenv above) so its import-time os.environ reads see the same env.
+# Re-exported so `server.<helper>()` keeps working for the rest of this module,
+# for in-process callers, and for tests (which patch e.g. server._get_qdrant).
+import qdrant_ops  # noqa: E402,F401
+from qdrant_ops import (  # noqa: E402,F401
+    QDRANT_COLLECTION_PREFIX, VECTOR_DIM,
+    _get_sparse_embedder, _get_cross_encoder, _embed_sparse, _create_payload_indexes,
+    _purge_old_records, _get_qdrant, _embed_auth_headers, _embed, _qdrant_upsert,
+    _qdrant_degraded_mode, _ce_rerank, _qdrant_similarity_search, _qdrant_search_collection,
+)
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
 REFLECTION_STATE_FILE = REFLECTION_STATE_DIR / "state.json"
 REFLECTION_DEFAULT_INVESTIGATION = os.environ.get(
@@ -195,6 +204,7 @@ from inv_store import (  # noqa: E402,F401
     _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
     _load_resolution_overrides, _load_retracted_ids, _make_ref, _tag_finding_ids,
     _summarise_finding, _safe_float, _CONFIDENCE_RANK, _RESOLUTION_STATES,
+    _distinctive_entity_set,
 )
 
 
@@ -202,16 +212,8 @@ from inv_store import (  # noqa: E402,F401
 # Optional Qdrant + fastembed
 # ---------------------------------------------------------------------------
 
-_sparse_model = None
 _investigation_locks: dict[str, threading.Lock] = {}  # per-investigation lock for atomic JSONL appends
 _investigation_locks_lock = threading.Lock()          # guards _investigation_locks dict itself
-_qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
-_qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
-_QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
-_mnemo_remember_fn = None
-_mnemo_recall_fn = None
-_verdict_backend = None                # QdrantBackend for hermes_verdicts (pre_answer_check)
-_verdict_backend_failed = False        # permanent-failure sentinel — don't retry
 
 # ---------------------------------------------------------------------------
 # LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
@@ -352,1022 +354,43 @@ def _code_version() -> str:
         return result
 
 
-def _ladybug_upsert_investigation(investigation_id: str, title: str = "") -> None:
-    ks = _get_ladybug()
-    if not ks:
-        return
-    try:
-        ks.upsert_investigation(str(investigation_id), str(title or ""))
-    except Exception as exc:
-        logger.debug("LadybugDB investigation upsert failed (fail-open): %r", exc)
+# Leaf LadybugDB helpers live in ladybug_ops.py (P2c of the split). Only the leaves
+# moved: the singleton above (_ladybug_store / _ladybug_failed / _ladybug_last_attempt
+# / _LADYBUG_RETRY_SECONDS) and _get_ladybug stay HERE, because tests monkeypatch those
+# latches on this module and assert on server._get_ladybug(). Deps are injected on the
+# same contract as inv_store/graph_tools: _get_ladybug by reference (so the helpers
+# reach the store through these same patchable globals) and the memory root as a lambda
+# over MEMORY_DIR (not the Path) so tmpdir rebinds still steer the backfill scan.
+import ladybug_ops  # noqa: E402
+ladybug_ops.register(_get_ladybug, lambda: MEMORY_DIR)
+# Re-exported so `server.<helper>()` keeps working for the rest of this module, for
+# in-process callers, and for tests.
+from ladybug_ops import (  # noqa: E402,F401
+    _ladybug_upsert_investigation, _coerce_ts, _mirror_finding_to_ladybug,
+    _get_symbol_index,
+    _autolink_finding_to_ladybug, _ladybug_backfill_if_empty, _entity_lookup_ladybug,
+)
+# NOTE: ladybug_ops._symbol_index_cache / _symbol_index_count are deliberately NOT
+# re-exported. `from x import y` binds by VALUE, so re-exporting mutable module state
+# would pin server.<name> to a None/-1 snapshot while the real cache moves on --
+# a name that looks live and is permanently stale. Read them via ladybug_ops.
 
 
-def _coerce_ts(v) -> int:
-    """Coerce a finding timestamp (int, epoch-string, or ISO-8601) to an int epoch. 0 on failure."""
-    if isinstance(v, bool):
-        return 0
-    if isinstance(v, (int, float)):
-        return int(v)
-    if isinstance(v, str) and v.strip():
-        s = v.strip()
-        if s.isdigit():
-            return int(s)
-        try:
-            from datetime import datetime
-            return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
-        except Exception:
-            return 0
-    return 0
+import mnemo_ops  # noqa: E402,F401
+from mnemo_ops import (  # noqa: E402,F401
+    _mnemo_bank, _get_mnemo_funcs, _mnemo_remember, _coerce_mnemo_results, _mnemo_recall,
+)
 
 
-def _mirror_finding_to_ladybug(finding: dict, investigation_id: str, ks=None) -> None:
-    """Mirror one finding (node + MENTIONS + DERIVED_FROM) into the graph. Fail-open."""
-    ks = ks or _get_ladybug()
-    if not ks or not isinstance(finding, dict):
-        return
-    fid = finding.get("id")
-    if not fid:
-        return
-    try:
-        ks.upsert_finding({
-            "id": fid,
-            "investigation": investigation_id or finding.get("investigation_id") or "",
-            "type": (finding.get("finding_type") or finding.get("type")
-                     or finding.get("ftype") or ""),
-            "text": finding.get("text", "") or "",
-            "confidence": finding.get("confidence", "") or "",
-            "source": finding.get("source", "") or "",
-            "ts": _coerce_ts(finding.get("ts") or finding.get("created_at") or finding.get("timestamp")),
-        })
-        ents = finding.get("entities")
-        if isinstance(ents, dict):
-            distinctive = _distinctive_entity_set(ents)
-            triples = []
-            for etype, vals in ents.items():
-                for v in vals or []:
-                    name = str(v).strip()
-                    if name:
-                        triples.append((name, str(etype), name.lower() in distinctive))
-            if triples:
-                ks.link_mentions(fid, triples)
-        df = finding.get("derived_from")
-        if df:
-            ks.link_derived_from(fid, list(df) if isinstance(df, (list, tuple, set)) else [df])
-    except Exception as exc:
-        logger.debug("LadybugDB finding mirror failed (fail-open): %r", exc)
-
-
-# --- Finding -> CodeSymbol auto-linker (REFERENCES) --------------------------
-# A tiny cache so the per-write auto-link doesn't rebuild the symbol index on
-# every finding. Invalidated when the CodeSymbol count changes (e.g. after a new
-# code_graph_ingest / code_memory_relink). Fail-open throughout.
-_symbol_index_cache = None             # built graph.linker index
-_symbol_index_count = -1               # CodeSymbol count the cache was built at
-
-
-def _get_symbol_index(ks):
-    """Return a cached graph.linker symbol index, rebuilding it when the graph's
-    CodeSymbol count changes. Returns None (fail-open) if unavailable/empty."""
-    global _symbol_index_cache, _symbol_index_count
-    if not ks:
-        return None
-    try:
-        rows = ks.code_query("MATCH (s:CodeSymbol) RETURN count(s)")
-        count = int(rows[0][0]) if rows and rows[0] else 0
-        if count == 0:
-            _symbol_index_cache, _symbol_index_count = None, 0
-            return None
-        if _symbol_index_cache is None or count != _symbol_index_count:
-            from graph import linker
-            srows = ks._rows("MATCH (s:CodeSymbol) RETURN s.id, s.name, s.kind, s.file")
-            symbols = [{"id": r[0], "name": r[1], "kind": r[2], "file": r[3]} for r in srows]
-            _symbol_index_cache = linker.build_symbol_index(symbols)
-            _symbol_index_count = count
-        return _symbol_index_cache
-    except Exception as exc:
-        logger.debug("symbol index build failed (fail-open): %r", exc)
-        return None
-
-
-def _autolink_finding_to_ladybug(finding: dict, ks=None) -> None:
-    """Auto-create REFERENCES edges from one just-mirrored finding to CodeSymbols.
-    Cheap single-finding link over a cached index. Fail-open — never raises."""
-    ks = ks or _get_ladybug()
-    if not ks or not isinstance(finding, dict):
-        return
-    fid = finding.get("id")
-    text = finding.get("text")
-    if not fid or not text:
-        return
-    try:
-        index = _get_symbol_index(ks)
-        if not index:
-            return  # no code graph ingested yet — nothing to link against
-        from graph import linker
-        linker.link_findings(ks, [{"id": fid, "text": text}], index)
-    except Exception as exc:
-        logger.debug("LadybugDB finding auto-link failed (fail-open): %r", exc)
-
-
-def _ladybug_backfill_if_empty(ks) -> None:
-    """Backfill existing on-disk findings into a freshly-created graph (once)."""
-    try:
-        rows = ks.code_query("MATCH (f:Finding) RETURN count(f)")
-        existing = int(rows[0][0]) if rows and rows[0] else 0
-    except Exception:
-        existing = 0
-    if existing > 0:
-        return
-    finding_rows: list[dict] = []
-    mention_rows: list[dict] = []
-    derived_rows: list[dict] = []
-    invs: list[str] = []
-    try:
-        for inv_dir in sorted(MEMORY_DIR.iterdir()):
-            if not inv_dir.is_dir() or inv_dir.name.startswith("_"):
-                continue
-            fjsonl = inv_dir / "findings.jsonl"
-            if not fjsonl.exists():
-                continue
-            invs.append(inv_dir.name)
-            for f in _read_jsonl(fjsonl):
-                fid = f.get("id")
-                if not fid:
-                    continue
-                inv = str(f.get("investigation_id") or inv_dir.name)
-                finding_rows.append({
-                    "id": fid, "investigation": inv,
-                    "type": f.get("finding_type") or f.get("type") or f.get("ftype") or "",
-                    "text": f.get("text", "") or "", "confidence": f.get("confidence", "") or "",
-                    "source": f.get("source", "") or "",
-                    "ts": _coerce_ts(f.get("ts") or f.get("created_at") or f.get("timestamp")),
-                })
-                ents = f.get("entities")
-                if isinstance(ents, dict):
-                    distinctive = _distinctive_entity_set(ents)
-                    for etype, vals in ents.items():
-                        for v in vals or []:
-                            name = str(v).strip()
-                            if name:
-                                mention_rows.append({"f": fid, "name": name, "etype": str(etype),
-                                                     "distinctive": name.lower() in distinctive})
-                df = f.get("derived_from")
-                if df:
-                    for p in (df if isinstance(df, (list, tuple, set)) else [df]):
-                        if p:
-                            derived_rows.append({"f": fid, "p": str(p)})
-    except Exception as exc:
-        logger.debug("LadybugDB backfill scan failed (fail-open): %r", exc)
-    if not finding_rows:
-        return
-    try:
-        for iv in invs:
-            ks.upsert_investigation(iv, "")
-        n = ks.upsert_findings_batch(finding_rows)
-        ks.link_mentions_batch(mention_rows)
-        ks.link_derived_from_batch(derived_rows)
-        logger.info("LadybugDB backfill: mirrored %d findings, %d mentions, %d derivations (batched).",
-                    n, len(mention_rows), len(derived_rows))
-    except Exception as exc:
-        logger.debug("LadybugDB backfill batch failed (fail-open): %r", exc)
-
-
-def _entity_lookup_ladybug(entity: str, investigation_id, limit: int) -> list[dict]:
-    """Graph-primary entity lookup. Normalizes to the finding shape the tools use."""
-    ks = _get_ladybug()
-    if not ks:
-        return []
-    try:
-        rows = ks.entity_findings(entity, limit=max(limit * 2, limit))
-    except Exception as exc:
-        logger.debug("Kuzu entity_findings failed (fail-open): %r", exc)
-        return []
-    out: list[dict] = []
-    for r in rows or []:
-        inv = r.get("investigation") or ""
-        if investigation_id and inv != investigation_id:
-            continue
-        out.append({
-            "id": r.get("id"),
-            "investigation_id": inv,
-            "finding_type": r.get("ftype", "") or "",
-            "text": r.get("text", "") or "",
-            "confidence": r.get("confidence", "") or "",
-            "source": r.get("source", "") or "",
-        })
-        if len(out) >= limit:
-            break
-    return out
-
-
-def _mnemo_bank() -> str:
-    return os.environ.get("HERMES_MNEMO_BANK", "default")
-
-
-def _get_mnemo_funcs() -> tuple[Any | None, Any | None]:
-    global _mnemo_remember_fn, _mnemo_recall_fn
-    if _mnemo_remember_fn is None or _mnemo_recall_fn is None:
-        try:
-            import mnemosyne as _mnemo
-            _mnemo_remember_fn = getattr(_mnemo, "remember", False)
-            _mnemo_recall_fn = getattr(_mnemo, "recall", False)
-        except Exception as exc:
-            logger.info("Mnemosyne unavailable — using JSONL/Qdrant paths: %s", exc)
-            _mnemo_remember_fn = False
-            _mnemo_recall_fn = False
-    remember = _mnemo_remember_fn if _mnemo_remember_fn is not False else None
-    recall = _mnemo_recall_fn if _mnemo_recall_fn is not False else None
-    return remember, recall
-
-
-def _mnemo_remember(content: str, *, importance: float = 0.6, metadata: Optional[dict] = None) -> bool:
-    remember, _ = _get_mnemo_funcs()
-    if remember is None or not content.strip():
-        return False
-    try:
-        remember(
-            content=content,
-            source="loci-mcp",
-            importance=float(max(0.0, min(importance, 1.0))),
-            metadata=metadata or {},
-            # Disable entity/fact extraction — Qdrant handles embedding/search.
-            # These flags trigger fastembed model downloads and block for 30-60s
-            # on first call in the venv, causing MCP timeouts.
-            extract_entities=False,
-            extract=False,
-            bank=_mnemo_bank(),
-        )
-        return True
-    except TypeError:
-        # Older Mnemosyne signatures may not support bank/extract flags.
-        try:
-            remember(content=content, source="loci-mcp", importance=importance, metadata=metadata or {})
-            return True
-        except Exception as exc:
-            logger.debug("Mnemo remember fallback failed: %s", exc)
-            return False
-    except Exception as exc:
-        logger.debug("Mnemo remember failed: %s", exc)
-        return False
-
-
-def _coerce_mnemo_results(raw: Any) -> list[dict]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            return [{"content": raw}]
-    if isinstance(raw, dict):
-        for key in ("results", "memories", "items", "data"):
-            if isinstance(raw.get(key), list):
-                raw = raw[key]
-                break
-        else:
-            raw = [raw]
-    if not isinstance(raw, list):
-        return []
-    out: list[dict] = []
-    for item in raw:
-        if isinstance(item, str):
-            out.append({"content": item})
-        elif isinstance(item, dict):
-            out.append(item)
-    return out
-
-
-def _mnemo_recall(query: str, *, top_k: int = 10, investigation_id: Optional[str] = None) -> list[dict]:
-    _, recall = _get_mnemo_funcs()
-    if recall is None or not query.strip():
-        return []
-    try:
-        result = recall(query=query, top_k=max(1, min(top_k, 100)), bank=_mnemo_bank())
-    except TypeError:
-        try:
-            result = recall(query=query, top_k=max(1, min(top_k, 100)))
-        except Exception as exc:
-            logger.debug("Mnemo recall fallback failed: %s", exc)
-            return []
-    except Exception as exc:
-        logger.debug("Mnemo recall failed: %s", exc)
-        return []
-
-    rows = []
-    for item in _coerce_mnemo_results(result):
-        metadata = item.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        inv_from_meta = metadata.get("investigation_id") or metadata.get("investigation")
-        if investigation_id and str(inv_from_meta or "") != investigation_id:
-            continue
-        text = str(item.get("content") or item.get("text") or item.get("memory") or "")
-        if not text:
-            continue
-        score = _safe_float(item.get("score", item.get("similarity", 0.0)), default=0.0)
-        rows.append({
-            "score": round(score, 4),
-            "investigation_id": str(inv_from_meta or investigation_id or metadata.get("investigation_id") or ""),
-            "record_type": str(metadata.get("record_type") or metadata.get("type") or "memory"),
-            "source": str(metadata.get("source") or item.get("source") or "mnemosyne"),
-            "ts": item.get("ts") or item.get("created_at"),
-            "text": text,
-            "origin": "mnemosyne",
-        })
-    return rows
-
-
-
-def _get_sparse_embedder():
-    global _sparse_model
-    if _sparse_model is None:
-        try:
-            from fastembed import SparseTextEmbedding
-            _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
-        except Exception as exc:
-            logger.warning("SparseTextEmbedding unavailable: %s", exc)
-            _sparse_model = False
-    return _sparse_model if _sparse_model is not False else None
-
-
-def _get_cross_encoder():
-    """The two-stage reranker's CrossEncoder, or None when unavailable (fail-open).
-
-    Delegates to reranker.get_model() so the backend is env-pluggable via RERANK_MODEL (and the
-    backends config): default 'BAAI/bge-reranker-v2-m3' (flipped in on judge-eval evidence,
-    +14% nDCG@10); pin the lighter 'cross-encoder/ms-marco-MiniLM-L-6-v2' back on constrained
-    hosts. Lazy-init, globally cached, loaded on GPU (cuda:0) when available. Call sites keep
-    calling `.predict(pairs)` unchanged.
-
-    NOTE: changing RERANK_MODEL is a retrieval-QUALITY change — A/B it on a held-out query set
-    first (scripts/judge_eval.py is the judge-based harness that gated the bge flip).
-    """
-    try:
-        import reranker
-        return reranker.get_model()
-    except Exception as exc:
-        logger.warning("Reranker unavailable — reranking disabled: %s", exc)
-        return None
-
-
-def _embed_sparse(text: str):
-    """Returns a SparseVector or None."""
-    cached = _embed_sparse_cache.get(text)
-    if cached is not None:
-        try:
-            from qdrant_client.models import SparseVector
-            return SparseVector(indices=list(cached[0]), values=list(cached[1]))
-        except Exception as exc:
-            logger.debug("_embed_sparse: fail-open swallow: %r", exc)
-    model = _get_sparse_embedder()
-    if model is None:
-        return None
-    try:
-        from qdrant_client.models import SparseVector
-        result = list(model.embed([text]))[0]
-        indices = result.indices.tolist()
-        values = result.values.tolist()
-        if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
-            _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
-        _embed_sparse_cache[text] = (tuple(indices), tuple(values))
-        return SparseVector(indices=indices, values=values)
-    except Exception as exc:
-        logger.debug("sparse embed failed: %s", exc)
-        return None
-
-
-def _create_payload_indexes(client, col: str) -> None:
-    """Create payload indexes for filtered search. Idempotent."""
-    from qdrant_client.models import (
-        KeywordIndexParams, KeywordIndexType,
-        IntegerIndexParams, IntegerIndexType,
-    )
-    indexes = [
-        # Core investigation fields
-        ("investigation_id", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
-        ("record_type", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("server", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("tool", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("created_at_ts", IntegerIndexParams(
-            type=IntegerIndexType.INTEGER, lookup=False, range=True, on_disk=False)),
-        # Evidence quality fields — enable confidence-filtered retrieval
-        ("confidence", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("tags", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        # Multi-tenancy fields (agent_id + operator_id use is_tenant=True for
-        # HNSW partition hints — same pattern as investigation_id)
-        ("agent_id",    KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
-        ("operator_id", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
-        ("namespace",   KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("promoted_at_ts", IntegerIndexParams(
-            type=IntegerIndexType.INTEGER, lookup=False, range=True, on_disk=False)),
-        ("promoted_from", KeywordIndexParams(
-            type=KeywordIndexType.KEYWORD, on_disk=False)),
-        # Entity fields — enable O(log N) indexed lookup vs. full collection scan.
-        # Qdrant indexes array elements individually so MatchValue on a list field
-        # matches any element in the array (standard inverted-index behaviour).
-        # Note: dot-notation indexing of arrays inside nested JSON objects
-        # (entities.ips is an array inside the "entities" dict) is an implicit
-        # behaviour of qdrant-client 1.17.x — not formally documented in the API
-        # spec.  Works at this version but should be re-verified on upgrade.
-        ("entities.ips",       KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("entities.emails",    KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("entities.hostnames", KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("entities.hashes",    KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
-        ("entities.cves",      KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
-    ]
-    for field_name, schema in indexes:
-        try:
-            client.create_payload_index(col, field_name=field_name,
-                                        field_schema=schema, wait=False)
-        except Exception as exc:
-            logger.debug("payload index %r creation skipped: %s", field_name, exc)
-
-
-def _purge_old_records(client, col: str, retention_days: int = 30) -> None:
-    """Delete records older than retention_days. Requires created_at_ts payload index."""
-    from qdrant_client.models import Filter, FieldCondition, Range, FilterSelector
-    cutoff = int(time.time()) - (retention_days * 86400)
-    try:
-        client.delete(
-            collection_name=col,
-            points_selector=FilterSelector(
-                filter=Filter(must=[
-                    FieldCondition(key="created_at_ts", range=Range(lt=cutoff))
-                ])
-            ),
-            wait=False,
-        )
-        logger.info("Qdrant TTL purge: deleted records older than %d days", retention_days)
-    except Exception as exc:
-        logger.debug("Qdrant TTL purge failed (non-fatal): %s", exc)
-
-
-def _get_qdrant():
-    """Return (QdrantClient, collection_name) or (None, None) if unavailable.
-    All findings share one collection; investigation_id is a payload field.
-    Reads QDRANT_URL lazily so the env var is picked up even if set after import.
-
-    Connection failures are cached for _QDRANT_RETRY_SECONDS so a transient
-    startup race (container not yet ready) doesn't permanently disable Qdrant
-    for the process lifetime.
-    """
-    import time as _time
-    global _qdrant_client, _qdrant_failed_at
-    qdrant_url = os.environ.get("QDRANT_URL", "")
-    if not qdrant_url:
-        return None, None
-    # Return cached failure if still within the backoff window
-    if _qdrant_client == (None, None) and _qdrant_failed_at is not None:
-        if _time.monotonic() - _qdrant_failed_at < _QDRANT_RETRY_SECONDS:
-            return None, None
-        _qdrant_client = None
-        _qdrant_failed_at = None
-    if _qdrant_client is None:
-        try:
-            from qdrant_client import QdrantClient
-            from qdrant_client.models import (
-                Distance, VectorParams, SparseVectorParams,
-                SparseIndexParams, Modifier,
-                HnswConfigDiff,
-                ScalarQuantization, ScalarQuantizationConfig, ScalarType,
-            )
-
-            qdrant_api_key = os.environ.get("QDRANT_API_KEY", "") or None
-            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=5)
-            col = QDRANT_COLLECTION_PREFIX
-            existing = {c.name for c in client.get_collections().collections}
-
-            _hnsw   = HnswConfigDiff(m=32, ef_construct=200, on_disk=False)
-            _quant  = ScalarQuantization(
-                scalar=ScalarQuantizationConfig(
-                    type=ScalarType.INT8,
-                    quantile=0.99,
-                    always_ram=True,
-                )
-            )
-
-            if col not in existing:
-                client.create_collection(
-                    col,
-                    vectors_config={"dense": VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)},
-                    sparse_vectors_config={
-                        "sparse": SparseVectorParams(
-                            index=SparseIndexParams(on_disk=False),
-                            modifier=Modifier.IDF,
-                        )
-                    },
-                    # Stronger HNSW graph: m=32 doubles recall at high similarity
-                    # thresholds; ef_construct=200 improves index quality at build time.
-                    hnsw_config=_hnsw,
-                    # INT8 scalar quantization: ~4x memory reduction, <1% recall loss.
-                    # always_ram keeps quantized vectors hot; originals rescored on search.
-                    quantization_config=_quant,
-                )
-                logger.info(
-                    "Created Qdrant collection '%s' (named-vector + sparse + INT8 quant)", col
-                )
-            else:
-                # Upgrade existing collection: apply quantization + HNSW if not configured.
-                # update_collection is idempotent; the optimizer applies changes in the
-                # background without interrupting reads or writes.
-                try:
-                    client.update_collection(
-                        col,
-                        hnsw_config=_hnsw,
-                        quantization_config=_quant,
-                    )
-                    logger.debug("Applied INT8 quant + HNSW config to existing collection '%s'", col)
-                except Exception as upd_exc:
-                    logger.debug("Collection config update skipped: %s", upd_exc)
-
-            # Create payload indexes — idempotent, safe on existing collection
-            _create_payload_indexes(client, col)
-
-            # Purge records older than 30 days on startup
-            _purge_old_records(client, col, retention_days=30)
-
-            _qdrant_client = (client, col)
-        except Exception as exc:
-            logger.warning("Qdrant connection failed — using Mnemo/keyword fallback: %s", exc)
-            _qdrant_client = (None, None)
-            _qdrant_failed_at = _time.monotonic()
-    return _qdrant_client
-
-
-_OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL")
-_EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-_EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
-_EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
-_EMBED_CACHE_MAXSIZE = 512
-_embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
-_embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
 _MEMORY_DECAY_LAMBDA  = float(os.environ.get("MEMORY_DECAY_LAMBDA", "0.007"))  # Ebbinghaus decay; half-life ~100 days
 
-# Startup validation — warn clearly when required backends are not configured.
-# Server runs in degraded mode (keyword-only) rather than refusing to start.
-if not os.environ.get("QDRANT_URL"):
-    logger.warning(
-        "QDRANT_URL is not set — Qdrant semantic search disabled. "
-        "Set QDRANT_URL in your .env to enable vector search."
-    )
-if not _OLLAMA_BASE and not _EMBED_API_KEY:
-    logger.warning(
-        "OLLAMA_BASE_URL and EMBED_API_KEY are both unset — embedding disabled. "
-        "Set OLLAMA_BASE_URL for local Ollama or EMBED_API_KEY for a cloud provider."
-    )
-
-
-def _embed_auth_headers() -> dict:
-    h = {"Content-Type": "application/json"}
-    if _EMBED_API_KEY:
-        if _EMBED_API_KEY_HEADER.lower() == "authorization":
-            h["Authorization"] = f"Bearer {_EMBED_API_KEY}"
-        else:
-            h[_EMBED_API_KEY_HEADER] = _EMBED_API_KEY
-    return h
 
 # Optional extra collection for code-chunk correlation (set CODE_CHUNKS_COLLECTION
 # to the name of a Qdrant collection that holds code embeddings).
 _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 
 
-
-def _embed(text: str) -> list[float] | None:
-    """Single-text embed via OpenAI-compat /v1/embeddings.
-    Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
-    cached = _embed_cache.get(text)
-    if cached is not None:
-        return cached
-    if not _OLLAMA_BASE:
-        return None
-    try:
-        import requests as _req
-        r = _req.post(
-            f"{_OLLAMA_BASE.rstrip('/')}/v1/embeddings",
-            json={"model": _EMBED_MODEL, "input": [text]},
-            headers=_embed_auth_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        result = list(data[0]["embedding"]) if data else None
-        if result is not None:
-            if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
-                _embed_cache.pop(next(iter(_embed_cache)))
-            _embed_cache[text] = result
-        return result
-    except Exception as exc:
-        logger.warning("embed failed: %s", exc)
-        return None
-
-
-def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
-    """Store a point with dense + sparse vectors. Fails silently."""
-    client, col = _get_qdrant()
-    if client is None:
-        return
-    dense_vec = _embed(text)
-    if dense_vec is None:
-        return
-    sparse_vec = _embed_sparse(text)
-    # Stamp multi-tenancy fields if not already set by the caller.
-    _agent_id  = os.environ.get("HERMES_AGENT_ID", "")
-    _namespace = os.environ.get("LOCI_NAMESPACE", "")
-    if _agent_id and "agent_id" not in payload:
-        payload = {**payload, "agent_id": _agent_id}
-    if _namespace and "namespace" not in payload:
-        payload = {**payload, "namespace": _namespace}
-    try:
-        from qdrant_client.models import PointStruct
-        vector_dict: dict = {"dense": dense_vec}
-        if sparse_vec is not None:
-            vector_dict["sparse"] = sparse_vec
-        client.upsert(
-            col,
-            points=[PointStruct(id=point_id, vector=vector_dict, payload=payload)],
-        )
-    except Exception as exc:
-        logger.warning("Qdrant upsert failed — finding stored in JSONL but not indexed: %s", exc)
-
-
-def _get_verdict_backend():
-    """Lazy QdrantBackend for the hermes_verdicts collection (pre_answer_check verdicts).
-
-    Reuses the same Qdrant instance as investigations but in a separate collection
-    so claim-check history never pollutes finding storage. Fail-open: returns None
-    when Qdrant is unavailable or memcheck is not importable.
-    """
-    global _verdict_backend, _verdict_backend_failed
-    if _verdict_backend_failed:
-        return None
-    if _verdict_backend is not None:
-        return _verdict_backend
-    qdrant_url = os.environ.get("QDRANT_URL", "")
-    if not qdrant_url:
-        return None
-    try:
-        from memcheck.qdrant import QdrantBackend
-        from qdrant_client import QdrantClient
-        _vb_api_key = os.environ.get("QDRANT_API_KEY", "") or None
-        client = QdrantClient(url=qdrant_url, api_key=_vb_api_key, timeout=5)
-        _verdict_backend = QdrantBackend(
-            client,
-            collection="hermes_verdicts",
-            embed=_embed,
-            vector_name="dense",
-        )
-        return _verdict_backend
-    except Exception as exc:
-        logger.debug("Verdict backend unavailable: %s", exc)
-        _verdict_backend_failed = True
-        return None
-
-
-def _record_claim_verdicts(
-    investigation_id: str,
-    claim_results: list[dict],
-    *,
-    record: bool,
-) -> dict:
-    """Record a verdict per claim to hermes_verdicts and annotate claim_results in-place.
-
-    Each claim result gains three fields: ``verdict_type`` (claim_supported /
-    claim_contradicted / claim_unsupported), ``prior_occurrences`` (how many
-    times this exact claim was checked before in this investigation), and
-    ``verdict_conflict`` (True when the current verdict contradicts the most
-    recent prior verdict — e.g. was supported before, now contradicted).
-    All steps are fail-open. Returns a summary dict.
-    """
-    if not record:
-        for cr in claim_results:
-            cr.update({"verdict_type": None, "prior_occurrences": 0, "verdict_conflict": False})
-        return {"recorded": 0, "qdrant": "disabled"}
-
-    backend = _get_verdict_backend()
-    if backend is None:
-        for cr in claim_results:
-            cr.update({"verdict_type": None, "prior_occurrences": 0, "verdict_conflict": False})
-        return {"recorded": 0, "qdrant": "unavailable"}
-
-    from memcheck.verdict import Verdict, make_signature, new_verdict, redact_excerpt
-
-    _VERDICT_MAP = {
-        "claim_ambiguous":    ("warn",  0.75, "claim has supporting evidence but cross-investigation benign baseline also exists — disambiguation required"),
-        "claim_contradicted": ("flag",  0.90, "claim contradicted by negation-mismatch evidence"),
-        "claim_supported":    ("allow", 0.85, "claim supported by investigation evidence"),
-        "claim_unsupported":  ("warn",  0.70, "no supporting evidence found in investigation"),
-    }
-
-    # PE-gated reconsolidation (Nader 2000 / Sevenster 2013).
-    # Verdict severity order: supported(1) < ambiguous(2) < unsupported(3) < contradicted(4).
-    # Prediction error = |new_severity - prior_severity| / 3. High PE on an
-    # established prior → verdict is provisional (recorded, not enforced) until
-    # a second independent observation confirms the direction change.
-    _VERDICT_SEVERITY = {
-        "claim_supported": 1, "claim_ambiguous": 2,
-        "claim_unsupported": 3, "claim_contradicted": 4,
-    }
-    _PE_HIGH_THRESH = float(os.environ.get("HERMES_PE_HIGH_THRESH", "0.5"))
-    _PE_PROTECTION_MIN_OCC = int(os.environ.get("HERMES_PE_PROTECTION_MIN_OCC", "3"))
-
-    recorded = 0
-    qdrant_ok = True
-
-    async def _process() -> None:
-        nonlocal recorded, qdrant_ok
-        for cr in claim_results:
-            claim = str(cr.get("claim", ""))
-            if cr.get("contradicted"):
-                vtype = "claim_contradicted"
-            elif cr.get("ambiguous"):
-                # Supported but cross-investigation benign baseline also present.
-                # Record as ambiguous so the signal survives in verdict history.
-                vtype = "claim_ambiguous"
-            elif cr.get("supported"):
-                vtype = "claim_supported"
-            else:
-                vtype = "claim_unsupported"
-
-            sig = make_signature("claim_check", f"{investigation_id}:{claim}")
-            decision, confidence, rationale = _VERDICT_MAP[vtype]
-
-            # Recall prior verdict by exact point-id to detect conflicts and count history.
-            prior_vtype: Optional[str] = None
-            prior_count: int = 0
-            try:
-                pid_fn = getattr(backend, "point_id", None)
-                retrieve_fn = getattr(getattr(backend, "_client", None), "retrieve", None)
-                if callable(pid_fn) and callable(retrieve_fn):
-                    pid = pid_fn(sig)
-                    hits = await asyncio.to_thread(
-                        retrieve_fn,
-                        collection_name="hermes_verdicts",
-                        ids=[pid],
-                        with_payload=True,
-                    )
-                    if hits:
-                        pl = getattr(hits[0], "payload", None)
-                        if pl:
-                            prior = Verdict.from_payload(dict(pl))
-                            prior_vtype = prior.verdict_type
-                            prior_count = prior.occurrences
-            except Exception as exc:
-                logger.debug("Verdict recall failed for claim %r: %s", claim[:60], exc)
-
-            cr["verdict_type"] = vtype
-            cr["prior_occurrences"] = prior_count
-            # Flag a conflict whenever the verdict transitions into or out of a
-            # "warning" state (contradicted or ambiguous).  Transitions between
-            # supported↔ambiguous matter: a claim that was clean and now has a
-            # benign baseline (or had one and now appears clean) deserves scrutiny.
-            cr["verdict_conflict"] = bool(
-                prior_vtype and prior_vtype != vtype and (
-                    vtype in ("claim_contradicted", "claim_ambiguous") or
-                    prior_vtype in ("claim_contradicted", "claim_ambiguous")
-                )
-            )
-
-            refs = [
-                str(r.get("evidence_id", ""))
-                for r in cr.get("support_refs", [])
-                if r.get("evidence_id")
-            ][:5]
-
-            # PE-gated reconsolidation: measure direction change against prior.
-            provisional = False
-            if prior_vtype and prior_vtype != vtype:
-                prior_sev = _VERDICT_SEVERITY.get(prior_vtype, 2)
-                new_sev   = _VERDICT_SEVERITY.get(vtype, 2)
-                pe = abs(new_sev - prior_sev) / 3.0
-                if pe >= _PE_HIGH_THRESH and prior_count >= _PE_PROTECTION_MIN_OCC:
-                    provisional = True
-                    rationale = (
-                        rationale
-                        + f" [PROVISIONAL: PE={pe:.2f}, prior={prior_vtype}×{prior_count},"
-                        " requires second confirmation before enforcement]"
-                    )
-                    logger.debug(
-                        "PE-provisional verdict for claim %r: PE=%.2f prior=%s×%d",
-                        claim[:60], pe, prior_vtype, prior_count,
-                    )
-
-            v = new_verdict(
-                subject_kind="memory",
-                subject_signature=sig,
-                subject_excerpt=redact_excerpt(f"{investigation_id}: {claim}"),
-                verdict_type=vtype,
-                decision=decision,
-                confidence=confidence,
-                rationale=rationale,
-                source="rule",
-                refs=refs,
-                provisional=provisional,
-            )
-            try:
-                await backend.record(v)
-                recorded += 1
-            except Exception as exc:
-                logger.debug("Verdict record failed for claim %r: %s", claim[:60], exc)
-                qdrant_ok = False
-
-    # FastMCP dispatches sync @mcp.tool() functions inline on the running event
-    # loop (fn(**kwargs), no executor).  asyncio.run() requires *no* running loop
-    # and raises RuntimeError when one already exists.  Detect the situation and
-    # delegate to a fresh thread that owns its own event loop instead.
-    try:
-        asyncio.get_running_loop()
-        # A loop IS running — we are being called from a sync tool on the loop
-        # thread (FastMCP inline dispatch).  Delegate to a daemon thread that
-        # owns its own event loop; threading.Thread is lighter than a full
-        # ThreadPoolExecutor for a one-shot fire-and-join.
-        _exc: list[Exception] = []
-
-        def _run() -> None:
-            try:
-                asyncio.run(_process())
-            except Exception as e:
-                _exc.append(e)
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        t.join()
-        if _exc:
-            raise _exc[0]
-    except RuntimeError:
-        # No running loop — safe to call asyncio.run() directly.
-        try:
-            asyncio.run(_process())
-        except Exception as exc:
-            logger.debug("_record_claim_verdicts failed: %s", exc)
-            qdrant_ok = False
-    except Exception as exc:
-        logger.debug("_record_claim_verdicts failed: %s", exc)
-        qdrant_ok = False
-
-    return {"recorded": recorded, "qdrant": "ok" if qdrant_ok else "partial"}
-
-
-def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success: bool) -> tuple[bool, str | None]:
-    """Classify Qdrant degraded mode for the ``degraded_mode`` tool payload.
-
-    Returns ``(active, reason)``.  ``errors`` is only tested for truthiness, so any
-    container (or None) is accepted.
-    """
-    degraded_active = (not enabled) or (not available) or bool(errors) or (enabled and available and not query_success)
-    degraded_reason = None
-    if not enabled:
-        degraded_reason = "qdrant_disabled"
-    elif not available:
-        degraded_reason = "qdrant_unavailable"
-    elif errors:
-        degraded_reason = "qdrant_semantic_error"
-    elif not query_success:
-        degraded_reason = "qdrant_semantic_not_executed"
-    return degraded_active, degraded_reason
-
-
-def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
-    """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
-
-    Returns ``(rows, True)`` only when the cross-encoder scored every row and the
-    sort completed.  Returns ``(rows, False)`` — original bi-encoder order, still
-    truncated to ``top_k`` — when the cross-encoder is unavailable or scoring
-    raised, so the return count is consistent whether CE is installed or not.
-    """
-    ce = _get_cross_encoder()
-    if ce is not None and rows:
-        try:
-            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
-            ce_scores = ce.predict(pairs)
-            for row, ce_score in zip(rows, ce_scores):
-                row["ce_score"] = round(float(ce_score), 4)
-            return sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:top_k], True
-        except Exception as exc:
-            logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
-            # Strip any partial ce_score annotations written before the exception
-            # so downstream consumers see a consistent payload (all rows scored,
-            # or none — never a mix).
-            for row in rows:
-                row.pop("ce_score", None)
-    return rows[:top_k], False
-
-
-def _qdrant_similarity_search(
-    query: str,
-    *,
-    investigation_id: Optional[str] = None,
-    limit: int = 10,
-    rerank: bool = True,
-    min_confidence: Optional[str] = None,
-    rerank_top_k: Optional[int] = None,
-) -> dict:
-    """Hybrid dense + sparse retrieval with optional cross-encoder reranking.
-
-    Two-stage pipeline (per arXiv production recommendations):
-    Stage 1 — bi-encoder: retrieve ``limit * 5`` candidates fast via RRF fusion.
-    Stage 2 — cross-encoder: if sentence-transformers is available, rerank the
-    candidates by full query-passage cross-attention and return the top ``limit``.
-
-    The cross-encoder dramatically improves precision on noisy finding sets (10-40%
-    accuracy improvement in the literature) by evaluating query and passage jointly
-    instead of as independent vectors. Falls back to bi-encoder scores if the
-    cross-encoder is unavailable.
-    """
-    client, col = _get_qdrant()
-    if client is None:
-        return {"ok": False, "reason": "qdrant_unavailable", "results": []}
-
-    from qdrant_client.models import (
-        Filter, FieldCondition, MatchValue,
-        Prefetch, FusionQuery, Fusion,
-    )
-
-    # Normalise confidence floor; callers may pass mixed-case ("High", "MEDIUM").
-    if min_confidence:
-        min_confidence = min_confidence.lower()
-    # Build filter: investigation scope + optional confidence floor.
-    must_conditions = []
-    if investigation_id:
-        must_conditions.append(FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id)))
-    if min_confidence and min_confidence in _CONFIDENCE_RANK:
-        from qdrant_client.models import MatchAny
-        allowed = [c for c, rank in _CONFIDENCE_RANK.items() if rank >= _CONFIDENCE_RANK[min_confidence]]
-        must_conditions.append(FieldCondition(key="confidence", match=MatchAny(any=allowed)))
-    search_filter = Filter(must=must_conditions) if must_conditions else None
-
-    dense_vec = _embed(query)
-    if dense_vec is None:
-        return {"ok": False, "reason": "embedding_unavailable", "results": []}
-
-    # rerank_top_k separates "how many CE-ranked results to return" from "how
-    # many candidates to fetch for dedup".  investigation_search inflates limit
-    # to compensate for dedup losses; without rerank_top_k that inflation would
-    # multiply the CE batch size (limit*3 caller → limit*15 CE pairs).
-    # Clamp to limit so the function never returns more rows than requested.
-    output_k = min(rerank_top_k, limit) if rerank_top_k is not None else limit
-    fetch_limit = output_k * 5 if rerank else limit * 4
-
-    from qdrant_client.models import SearchParams, QuantizationSearchParams
-    # rescore=True: after ANN candidate selection from quantized index, re-score
-    # with original full-precision vectors. Recovers ~0.5-1% recall lost to INT8.
-    # oversampling fetches 2x candidates to give rescore more to work with.
-    _search_params = SearchParams(
-        quantization=QuantizationSearchParams(rescore=True, oversampling=2.0)
-    )
-
-    sparse_vec = _embed_sparse(query)
-    if sparse_vec is not None:
-        result = client.query_points(
-            collection_name=col,
-            prefetch=[
-                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2, filter=search_filter),
-                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2, filter=search_filter),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            limit=fetch_limit,
-            with_payload=True,
-            search_params=_search_params,
-        )
-        mode = "hybrid"
-    else:
-        result = client.query_points(
-            collection_name=col,
-            query=dense_vec,
-            using="dense",
-            query_filter=search_filter,
-            limit=fetch_limit,
-            with_payload=True,
-            search_params=_search_params,
-        )
-        mode = "semantic"
-
-    rows = []
-    for p in result.points:
-        payload = dict(p.payload or {})
-        rows.append({"score": round(float(p.score), 4), **payload, "origin": payload.get("origin", "qdrant")})
-
-    # Stage 2: cross-encoder reranking — full query-passage joint scoring.
-    if rerank:
-        rows, reranked = _ce_rerank(query, rows, output_k)
-        if reranked:
-            mode = mode + "+reranked"
-    else:
-        # Reranking disabled — honour output_k so the function's return count is
-        # consistent whether CE runs or not.  investigation_search still gets
-        # enough dedup candidates from mnemosyne (up to limit*4 rows) so capping
-        # here at output_k does not starve the dedup loop.
-        rows = rows[:output_k]
-
-    return {"ok": True, "reason": mode, "results": rows}
+from verdict_ops import _get_verdict_backend, _record_claim_verdicts  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
@@ -1438,92 +461,6 @@ def context_assemble(
         "truncated": False,
         "result_count": len(results),
     }
-
-
-def _qdrant_search_collection(
-    query: str,
-    collection_name: str,
-    limit: int = 10,
-    query_filter=None,
-) -> list[dict]:
-    """
-    Dense + sparse (RRF) search against any named Qdrant collection.
-    Falls back to dense-only when sparse vectors are unavailable.
-    Returns a flat list of payload dicts with an added 'score' key.
-    Raises on Qdrant errors so callers can catch per-collection failures.
-    """
-    client, _default_col = _get_qdrant()
-    if client is None:
-        raise RuntimeError("qdrant_unavailable")
-
-    dense_vec = _embed(query)
-    if dense_vec is None:
-        raise RuntimeError("embedding_unavailable")
-
-    fetch_limit = limit * 5
-    sparse_vec = _embed_sparse(query)
-
-    from qdrant_client.models import Prefetch, FusionQuery, Fusion, SearchParams, QuantizationSearchParams
-
-    # Detect whether this collection uses named vectors (dense/sparse) or a flat vector.
-    try:
-        col_info = client.get_collection(collection_name)
-        vectors_config = col_info.config.params.vectors
-        has_named_vectors = isinstance(vectors_config, dict)
-        has_sparse_index = has_named_vectors and "sparse" in (vectors_config or {})
-    except Exception:
-        has_named_vectors = False
-        has_sparse_index = False
-
-    _qsp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
-
-    if has_named_vectors and has_sparse_index and sparse_vec is not None:
-        result = client.query_points(
-            collection_name=collection_name,
-            prefetch=[
-                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2),
-                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
-        )
-    elif has_named_vectors:
-        result = client.query_points(
-            collection_name=collection_name,
-            query=dense_vec,
-            using="dense",
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
-        )
-    else:
-        # Flat/unnamed vector collection (agent_core_chunks, gl_decision_library, etc.)
-        result = client.query_points(
-            collection_name=collection_name,
-            query=dense_vec,
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
-        )
-
-    rows = []
-    for p in result.points:
-        payload = dict(p.payload or {})
-        rows.append({
-            "score": round(float(p.score), 4),
-            **payload,
-            "origin": collection_name,
-        })
-
-    # Cross-encoder rerank if available
-    rows, _ = _ce_rerank(query, rows, limit)
-
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -3659,6 +2596,69 @@ def reflection_loop_status(queue_preview: int = 8) -> str:
     }, indent=2)
 
 
+def _reflection_filter_signatures(
+    raw: dict[str, int],
+    observations: dict[str, int],
+) -> tuple[dict[str, int], int, int]:
+    """Drop signatures already observed ``REFLECTION_SIGNATURE_OBSERVE_LIMIT`` times.
+
+    Returns ``(visible, suppressed_hits, suppressed_signatures)``. ``observations``
+    is mutated in place: every signature that stays visible has its observation
+    count bumped by one.
+    """
+    visible: dict[str, int] = {}
+    suppressed_hits = 0
+    suppressed_signatures = 0
+    for sig, count in raw.items():
+        observed_count = int(observations.get(sig) or 0)
+        if observed_count >= REFLECTION_SIGNATURE_OBSERVE_LIMIT:
+            suppressed_hits += count
+            suppressed_signatures += 1
+            continue
+        visible[sig] = count
+        observations[sig] = observed_count + 1
+    return visible, suppressed_hits, suppressed_signatures
+
+
+def _reflection_signature_summary(
+    visible: dict[str, int],
+    suppressed_signatures: int,
+    suppressed_hits: int,
+) -> str:
+    """Render the top-3 visible signatures, with a saturation suffix when suppressing."""
+    summary = ", ".join(
+        f"{sig} ({count})" for sig, count in list(visible.items())[:3]
+    ) or "none"
+    if suppressed_signatures:
+        summary += (
+            f"; saturated={suppressed_signatures} signatures "
+            f"({suppressed_hits} hits)"
+        )
+    return summary
+
+
+def _reflection_store_finding(
+    investigation_id: str,
+    finding_type: str,
+    text: str,
+    confidence: str,
+    tags: str,
+) -> bool:
+    """Store one reflection-loop finding; True when it was actually written.
+
+    ``source`` is always ``"reflection_loop_tick"``. No try/except on purpose —
+    a failing store must propagate exactly as it does inline.
+    """
+    return bool(json.loads(investigation_store(
+        investigation_id=investigation_id,
+        finding_type=finding_type,
+        text=text,
+        source="reflection_loop_tick",
+        confidence=confidence,
+        tags=tags,
+    )).get("stored"))
+
+
 # ---- Tool: reflection_loop_tick ----
 
 @mcp.tool()
@@ -3755,46 +2755,20 @@ def reflection_loop_tick(
                     "tools": summary.get("tools") or {},
                 })
                 continue
-            visible_errors: dict[str, int] = {}
-            visible_warnings: dict[str, int] = {}
-            suppressed_error_hits = 0
-            suppressed_warning_hits = 0
-            suppressed_error_signatures = 0
-            suppressed_warning_signatures = 0
-            for sig, count in raw_errors.items():
-                observed_count = int(error_observations.get(sig) or 0)
-                if observed_count >= REFLECTION_SIGNATURE_OBSERVE_LIMIT:
-                    suppressed_error_hits += count
-                    suppressed_error_signatures += 1
-                    continue
-                visible_errors[sig] = count
-                error_observations[sig] = observed_count + 1
-            for sig, count in raw_warnings.items():
-                observed_count = int(warning_observations.get(sig) or 0)
-                if observed_count >= REFLECTION_SIGNATURE_OBSERVE_LIMIT:
-                    suppressed_warning_hits += count
-                    suppressed_warning_signatures += 1
-                    continue
-                visible_warnings[sig] = count
-                warning_observations[sig] = observed_count + 1
+            visible_errors, suppressed_error_hits, suppressed_error_signatures = (
+                _reflection_filter_signatures(raw_errors, error_observations)
+            )
+            visible_warnings, suppressed_warning_hits, suppressed_warning_signatures = (
+                _reflection_filter_signatures(raw_warnings, warning_observations)
+            )
             stats["error_signatures_suppressed"] += suppressed_error_hits
             stats["warning_signatures_suppressed"] += suppressed_warning_hits
-            top_error = ", ".join(
-                f"{sig} ({count})" for sig, count in list(visible_errors.items())[:3]
-            ) or "none"
-            top_warning = ", ".join(
-                f"{sig} ({count})" for sig, count in list(visible_warnings.items())[:3]
-            ) or "none"
-            if suppressed_error_signatures:
-                top_error += (
-                    f"; saturated={suppressed_error_signatures} signatures "
-                    f"({suppressed_error_hits} hits)"
-                )
-            if suppressed_warning_signatures:
-                top_warning += (
-                    f"; saturated={suppressed_warning_signatures} signatures "
-                    f"({suppressed_warning_hits} hits)"
-                )
+            top_error = _reflection_signature_summary(
+                visible_errors, suppressed_error_signatures, suppressed_error_hits
+            )
+            top_warning = _reflection_signature_summary(
+                visible_warnings, suppressed_warning_signatures, suppressed_warning_hits
+            )
             finding_text = (
                 f"reflection_loop_tick processed {kind} target={path}; "
                 f"lines={summary.get('lines_scanned', 0)} bytes={summary.get('bytes_scanned', 0)}; "
@@ -3802,15 +2776,13 @@ def reflection_loop_tick(
                 f"top_events={summary.get('events', {})}; top_tools={summary.get('tools', {})}; "
                 f"errors={top_error}; warnings={top_warning}."
             )
-            store_res = json.loads(investigation_store(
+            if _reflection_store_finding(
                 investigation_id=investigation_id,
                 finding_type="observed",
                 text=finding_text,
-                source="reflection_loop_tick",
                 confidence="low",
                 tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
-            ))
-            if bool(store_res.get("stored")):
+            ):
                 findings_written += 1
 
     if store_item_findings and low_signal_session_events:
@@ -3827,15 +2799,13 @@ def reflection_loop_tick(
             f"top_events={dict(event_counts.most_common(8))}; top_tools={dict(tool_counts.most_common(8))}; "
             f"sample_paths={sample_paths}."
         )
-        low_signal_res = json.loads(investigation_store(
+        if _reflection_store_finding(
             investigation_id=investigation_id,
             finding_type="observed",
             text=low_signal_text,
-            source="reflection_loop_tick",
             confidence="low",
             tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal",
-        ))
-        if bool(low_signal_res.get("stored")):
+        ):
             findings_written += 1
 
     if store_item_findings and batch_error_signatures:
@@ -3844,15 +2814,13 @@ def reflection_loop_tick(
             "Batch dominant error signature suggests reliability hotspot: "
             f"{sig} (count={count}) in latest processed artifacts."
         )
-        infer_res = json.loads(investigation_store(
+        if _reflection_store_finding(
             investigation_id=investigation_id,
             finding_type="inferred",
             text=infer_text,
-            source="reflection_loop_tick",
             confidence="medium",
             tags="self-reflection,error-cluster,inference",
-        ))
-        if bool(infer_res.get("stored")):
+        ):
             findings_written += 1
 
     stats["last_error_signatures"] = [
@@ -3875,15 +2843,13 @@ def reflection_loop_tick(
                 f"reflection_loop_tick could not process item kind={d_kind} path={d_path}; "
                 "item re-queued for future processing."
             )
-            gap_res = json.loads(investigation_store(
+            if _reflection_store_finding(
                 investigation_id=investigation_id,
                 finding_type="gap",
                 text=gap_text,
-                source="reflection_loop_tick",
                 confidence="low",
                 tags="self-reflection,loop-tick,dropped-item,re-queued",
-            ))
-            if bool(gap_res.get("stored")):
+            ):
                 findings_written += 1
 
     state["stats"] = stats
@@ -3908,6 +2874,103 @@ def reflection_loop_tick(
 
 
 # ---- Tool: investigation_search ----
+
+def _search_resolution_maps(rows: list[dict]) -> tuple[dict[str, str], dict[str, list]]:
+    """Build authoritative ``finding_id -> resolution`` / ``-> code_refs`` maps.
+
+    Scoped to only the investigations that actually produced ``rows``, so cost is
+    bounded regardless of how many investigations exist. Fail-open: a failed build
+    returns two empty dicts, and the caller falls back to per-row payload values.
+    """
+    resolution_map: dict[str, str] = {}
+    coderefs_map: dict[str, list] = {}
+    try:
+        _invs_in_results = {str(r.get("investigation_id", "")) for r in rows}
+        _invs_in_results.discard("")
+        for _inv in _invs_in_results:
+            for _f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
+                _fid = str(_f.get("id", ""))
+                if _fid:
+                    resolution_map[_fid] = str(_f.get("resolution") or "open").lower()
+                    _crefs = _f.get("code_refs")
+                    if isinstance(_crefs, list) and _crefs:
+                        coderefs_map[_fid] = _crefs
+            # Fold in append-only resolution overrides (finding_resolve) last-write-wins.
+            for _ofid, _ores in _load_resolution_overrides(_inv).items():
+                resolution_map[_ofid] = _ores
+    except Exception as exc:  # fail-open — never block search on the map build
+        logger.debug("resolution map build failed, using per-row values: %r", exc)
+        return {}, {}
+    return resolution_map, coderefs_map
+
+
+def _search_row_resolution(row: dict, resolution_map: dict[str, str]) -> str:
+    """Resolve one search row's resolution, preferring the JSONL-derived map."""
+    fid = str(row.get("finding_id") or row.get("id") or "")
+    if fid and fid in resolution_map:
+        return resolution_map[fid]
+    return str(row.get("resolution") or "open").lower()
+
+
+def _search_retraction_scope(
+    investigation_id: Optional[str],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Precompute retracted finding ids (and their texts) per investigation in scope.
+
+    Fail-safe: on any error both maps come back empty, which means nothing is
+    filtered rather than everything.
+    """
+    retracted_by_inv: dict[str, set[str]] = {}
+    retracted_text_by_inv: dict[str, set[str]] = {}
+    try:
+        scope_invs = (
+            [investigation_id] if investigation_id
+            else ([p.name for p in MEMORY_DIR.iterdir() if p.is_dir()] if MEMORY_DIR.exists() else [])
+        )
+        for _inv in scope_invs:
+            rids = _load_retracted_ids(_inv)
+            if not rids:
+                continue
+            retracted_by_inv[_inv] = rids
+            texts: set[str] = set()
+            for f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
+                if str(f.get("id", "")) in rids:
+                    t = str(f.get("text", "") or "").strip()
+                    if t:
+                        texts.add(t)
+            retracted_text_by_inv[_inv] = texts
+    except Exception as exc:  # fail-safe — never block search on filtering
+        logger.debug("retraction scope precompute failed, not filtering: %r", exc)
+        return {}, {}
+    return retracted_by_inv, retracted_text_by_inv
+
+
+def _search_row_is_retracted(
+    row: dict,
+    rids_by_inv: dict[str, set[str]],
+    texts_by_inv: dict[str, set[str]],
+) -> bool:
+    """True when a search row names — or repeats the text of — a retracted finding.
+
+    An empty ``rids_by_inv`` means no filtering is in effect (either nothing is
+    retracted in scope, the precompute failed, or the caller asked for retracted
+    rows to be included).
+    """
+    if not rids_by_inv:
+        return False
+    inv = str(row.get("investigation_id", ""))
+    rids = rids_by_inv.get(inv)
+    rtexts = texts_by_inv.get(inv)
+    if not rids and not rtexts:
+        return False
+    rid = row.get("finding_id") or row.get("id")
+    if rid is not None and str(rid) in (rids or set()):
+        return True
+    text = str(row.get("text", "") or "").strip()
+    if text and rtexts and text in rtexts:
+        return True
+    return False
+
 
 @mcp.tool()
 def investigation_search(
@@ -3963,48 +3026,11 @@ def investigation_search(
     # Precompute retracted finding ids per investigation in scope. A row is
     # filtered when it names a finding id (or matches text of one) that is
     # retracted. Fail-safe: an empty map means nothing is filtered.
-    _retracted_by_inv: dict[str, set[str]] = {}
-    _retracted_text_by_inv: dict[str, set[str]] = {}
-    if not include_retracted:
-        try:
-            scope_invs = (
-                [investigation_id] if investigation_id
-                else ([p.name for p in MEMORY_DIR.iterdir() if p.is_dir()] if MEMORY_DIR.exists() else [])
-            )
-            for _inv in scope_invs:
-                rids = _load_retracted_ids(_inv)
-                if not rids:
-                    continue
-                _retracted_by_inv[_inv] = rids
-                texts: set[str] = set()
-                for f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
-                    if str(f.get("id", "")) in rids:
-                        t = str(f.get("text", "") or "").strip()
-                        if t:
-                            texts.add(t)
-                _retracted_text_by_inv[_inv] = texts
-        except Exception as exc:  # fail-safe — never block search on filtering
-            logger.debug("retraction scope precompute failed, not filtering: %r", exc)
-            _retracted_by_inv = {}
-            _retracted_text_by_inv = {}
+    _retracted_by_inv, _retracted_text_by_inv = (
+        _search_retraction_scope(investigation_id) if not include_retracted else ({}, {})
+    )
 
     _excluded_retracted = {"n": 0}
-
-    def _is_retracted_row(row: dict) -> bool:
-        if include_retracted or not _retracted_by_inv:
-            return False
-        inv = str(row.get("investigation_id", ""))
-        rids = _retracted_by_inv.get(inv)
-        rtexts = _retracted_text_by_inv.get(inv)
-        if not rids and not rtexts:
-            return False
-        rid = row.get("finding_id") or row.get("id")
-        if rid is not None and str(rid) in (rids or set()):
-            return True
-        text = str(row.get("text", "") or "").strip()
-        if text and rtexts and text in rtexts:
-            return True
-        return False
 
     _, recall_fn = _get_mnemo_funcs()
     mnemo_enabled = recall_fn is not None
@@ -4014,7 +3040,7 @@ def investigation_search(
     seen: set[str] = set()
 
     def _add_row(row: dict) -> None:
-        if _is_retracted_row(row):
+        if _search_row_is_retracted(row, _retracted_by_inv, _retracted_text_by_inv):
             _excluded_retracted["n"] += 1
             return
         key = "|".join([
@@ -4064,35 +3090,10 @@ def investigation_search(
     # produced rows, so cost is bounded regardless of how many investigations exist.
     # Absent record -> "open". Fail-open (a failed map build just falls back to the
     # per-row payload value, defaulting to "open").
-    _resolution_map: dict[str, str] = {}
-    _coderefs_map: dict[str, list] = {}
-    try:
-        _invs_in_results = {str(r.get("investigation_id", "")) for r in deduped}
-        _invs_in_results.discard("")
-        for _inv in _invs_in_results:
-            for _f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
-                _fid = str(_f.get("id", ""))
-                if _fid:
-                    _resolution_map[_fid] = str(_f.get("resolution") or "open").lower()
-                    _crefs = _f.get("code_refs")
-                    if isinstance(_crefs, list) and _crefs:
-                        _coderefs_map[_fid] = _crefs
-            # Fold in append-only resolution overrides (finding_resolve) last-write-wins.
-            for _ofid, _ores in _load_resolution_overrides(_inv).items():
-                _resolution_map[_ofid] = _ores
-    except Exception as exc:  # fail-open — never block search on the map build
-        logger.debug("resolution map build failed, using per-row values: %r", exc)
-        _resolution_map = {}
-        _coderefs_map = {}
-
-    def _row_resolution(row: dict) -> str:
-        fid = str(row.get("finding_id") or row.get("id") or "")
-        if fid and fid in _resolution_map:
-            return _resolution_map[fid]
-        return str(row.get("resolution") or "open").lower()
+    _resolution_map, _coderefs_map = _search_resolution_maps(deduped)
 
     for r in deduped:
-        r["resolution"] = _row_resolution(r)
+        r["resolution"] = _search_row_resolution(r, _resolution_map)
         # Staleness: rows from mnemo/qdrant don't carry code_refs, so consult the
         # JSONL-derived map. Only set ``stale`` when the finding has usable refs.
         _rfid = str(r.get("finding_id") or r.get("id") or "")
@@ -4154,6 +3155,43 @@ def investigation_search(
 
 
 # ---- Tool: investigation_pre_answer_check ----
+
+def _pre_answer_chain_confidence(
+    investigation_id: str, matched_ids: set[str]
+) -> tuple[float | None, str | None]:
+    """Compute ``(min_chain_confidence, confidence_summary)`` for the matched evidence.
+
+    Fail-open: any error yields ``(None, None)`` so the pre-answer check itself
+    never breaks on a confidence computation.
+    """
+    min_chain_confidence = None
+    confidence_summary = None
+    try:
+        findings_by_id_for_conf: dict[str, dict] = {
+            str(f.get("id", "")): f
+            for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+            if f.get("id")
+        }
+        chain_confidences: list[float] = []
+        for ev_id in matched_ids:
+            if ev_id and ev_id in findings_by_id_for_conf:
+                agg = _compute_aggregate_confidence(ev_id, findings_by_id_for_conf)
+                chain_confidences.append(agg)
+        if chain_confidences:
+            min_chain_confidence = round(min(chain_confidences), 6)
+            if min_chain_confidence >= 0.8:
+                confidence_summary = "high (≥0.8)"
+            elif min_chain_confidence >= 0.5:
+                confidence_summary = "medium (0.5-0.8)"
+            else:
+                confidence_summary = "low (<0.5)"
+    except Exception as exc:
+        logger.debug(
+            "investigation_pre_answer_check: chain-confidence computation failed (fail-open): %r", exc
+        )
+        return (None, None)
+    return (min_chain_confidence, confidence_summary)
+
 
 @mcp.tool()
 def investigation_pre_answer_check(
@@ -4272,32 +3310,9 @@ def investigation_pre_answer_check(
     verdict_summary = _record_claim_verdicts(investigation_id, claim_results, record=record)
 
     # Compute min_chain_confidence and confidence_summary from supporting findings.
-    min_chain_confidence = None
-    confidence_summary = None
-    try:
-        findings_by_id_for_conf: dict[str, dict] = {
-            str(f.get("id", "")): f
-            for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-            if f.get("id")
-        }
-        chain_confidences: list[float] = []
-        for ev_id in matched_ids:
-            if ev_id and ev_id in findings_by_id_for_conf:
-                agg = _compute_aggregate_confidence(ev_id, findings_by_id_for_conf)
-                chain_confidences.append(agg)
-        if chain_confidences:
-            min_chain_confidence = round(min(chain_confidences), 6)
-            if min_chain_confidence >= 0.8:
-                confidence_summary = "high (≥0.8)"
-            elif min_chain_confidence >= 0.5:
-                confidence_summary = "medium (0.5-0.8)"
-            else:
-                confidence_summary = "low (<0.5)"
-    except Exception as exc:
-        logger.debug(
-            "investigation_pre_answer_check: chain-confidence computation failed (fail-open): %r", exc
-        )
-        pass
+    min_chain_confidence, confidence_summary = _pre_answer_chain_confidence(
+        investigation_id, matched_ids
+    )
 
     response = {
         "investigation_id": investigation_id,
@@ -5367,6 +4382,302 @@ def _health_collection_dim(info: dict) -> int | None:
     return None
 
 
+# The two memory_health probes below are STATELESS — they read no enclosing local,
+# only module globals (_embed_sparse; _get_mnemo_funcs/_mnemo_bank), which is why they
+# live out here rather than as closures inside memory_health. Each returns the same
+# (status, detail, remediation) 3-tuple _health_check expects, and _health_check still
+# wraps them, so a raising probe still degrades to a "fail" entry (fail-open).
+def _health_probe_embeddings_sparse():
+    """memory_health probe 4: optional sparse (fastembed BM25) embedder."""
+    sparse = _embed_sparse("memory_health probe")  # transient, never stored
+    if sparse is None:
+        return (
+            "warn",
+            "sparse embedder (fastembed BM25) unavailable — hybrid search "
+            "degrades to dense-only; this is optional.",
+            "install the fastembed sparse model if hybrid scoring is wanted",
+        )
+    n = len(getattr(sparse, "indices", []) or [])
+    return ("ok", f"sparse embedder active; {n} non-zero terms on probe", None)
+
+
+def _health_probe_mnemo_mirror():
+    """memory_health probe 5: mnemosyne importable in THIS venv (the silent-flag bug)."""
+    remember, recall = _get_mnemo_funcs()
+    bank = _mnemo_bank()
+    resolved = {"remember": remember is not None, "recall": recall is not None}
+    if remember is None and recall is None:
+        return (
+            "fail",
+            {
+                "target_bank": bank,
+                "resolved": resolved,
+                "note": "mnemosyne is not importable in the server's venv — the "
+                        "loci->mnemo mirror is silently inert.",
+            },
+            "install mnemosyne into the server's venv: "
+            "pip install 'mnemosyne-memory[embeddings]' sqlite-vec",
+        )
+    if remember is None or recall is None:
+        return (
+            "warn",
+            {"target_bank": bank, "resolved": resolved,
+             "note": "mnemosyne partially resolved — one of remember/recall is missing."},
+            "reinstall 'mnemosyne-memory[embeddings]' to restore both entry points",
+        )
+    return ("ok", {"target_bank": bank, "resolved": resolved}, None)
+
+
+# The next three probes are the *stateful* trio: probe 1 discovers the qdrant
+# client and main collection, probe 2 reads them and records per-collection
+# dims, and probe 3 records the embedder dimension probe 6 compares against.
+# What used to be ``nonlocal`` writes into memory_health's frame are now writes
+# into an explicit ``sink`` dict the tool body owns, which is what lets these
+# live at module level. Their call sites wrap them in lambdas, so the reads are
+# still deferred to probe-execution time exactly as the closures were.
+def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
+    """memory_health probe 1: is QDRANT_URL set and the server answering?
+
+    On a successful ``_get_qdrant()`` this publishes ``sink["client"]`` and
+    ``sink["main_col"]`` for probe 2. The assignment happens only *after*
+    ``_get_qdrant()`` returns, so if it raises the sink keeps its ``None``
+    initialisers and ``_health_check`` synthesizes the ``fail`` entry — the same
+    fail-open behaviour the ``nonlocal`` version had.
+    """
+    if not qdrant_url:
+        return (
+            "warn",
+            "QDRANT_URL is not set — qdrant indexing disabled; loci falls back"
+            "to mnemosyne/keyword search.",
+            "set QDRANT_URL if vector search is expected; otherwise this is benign",
+        )
+    client, main_col = _get_qdrant()
+    sink["client"], sink["main_col"] = client, main_col
+    if client is None:
+        return (
+            "fail",
+            f"QDRANT_URL={qdrant_url} is set but the server is unreachable.",
+            "confirm the qdrant container is up and reachable at QDRANT_URL "
+            "(docker ps; curl $QDRANT_URL/healthz)",
+        )
+    return ("ok", f"connected to qdrant at {qdrant_url}", None)
+
+
+def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) -> tuple:
+    """memory_health probe 2: expected collections present + their layout.
+
+    ``collection_dims`` is mutated in place, so probe 6 observes whatever dims
+    are discovered here.
+    """
+    if client is None:
+        return ("warn", "skipped — qdrant not reachable", None)
+    existing = {c.name for c in client.get_collections().collections}
+    report: dict = {}
+    main = main_col or QDRANT_COLLECTION_PREFIX
+    main_present = main in existing
+    verdicts_present = "hermes_verdicts" in existing
+    if main_present:
+        info = _health_qdrant_collection_info(client, main)
+        report[main] = info
+        collection_dims[main] = _health_collection_dim(info)
+    if verdicts_present:
+        info = _health_qdrant_collection_info(client, "hermes_verdicts")
+        report["hermes_verdicts"] = info
+        collection_dims["hermes_verdicts"] = _health_collection_dim(info)
+    report["expected_main_collection"] = main
+    report["main_present"] = main_present
+    report["hermes_verdicts_present"] = verdicts_present
+    if not main_present:
+        return (
+            "fail",
+            report,
+            f"main memory collection '{main}' is missing while qdrant is up — "
+            "it is created lazily on first store; run a store/search or "
+            "backfill (scripts/backfill_qdrant.py)",
+        )
+    if not verdicts_present:
+        return (
+            "warn",
+            report,
+            "'hermes_verdicts' not yet created — it appears on first "
+            "memory_self_check(record=True); benign until then",
+        )
+    return ("ok", report, None)
+
+
+def _health_probe_embeddings_dense(sink: dict) -> tuple:
+    """memory_health probe 3: fastembed dense embedder loads and embeds.
+
+    Publishes ``sink["embed_dim"]`` for the dimension-consistency probe.
+    """
+    vec = _embed("memory_health probe")  # transient throwaway, never stored
+    if not vec:
+        return (
+            "fail",
+            "dense embedder (Ollama) unavailable — semantic/hybrid search "
+            "is disabled; hermes runs on keyword fallback only.",
+            "ensure Ollama is running and the nomic-embed-text model is available "
+            "(OLLAMA_BASE_URL and EMBED_MODEL env vars can override defaults).",
+        )
+    sink["embed_dim"] = len(vec)
+    return ("ok", f"dense embedder active; dimension={sink['embed_dim']}", None)
+
+
+# The next three probes are pure functions of their arguments: what used to be
+# read from memory_health's enclosing scope is now passed in explicitly.
+# ``collection_dims`` is handed over by reference, so the dimension probe still
+# observes whatever the qdrant_collections probe wrote into that same dict.
+def _health_probe_dimension_consistency(
+    embed_dim: int | None, collection_dims: dict[str, int | None]
+) -> tuple:
+    """memory_health probe 6: embedder dim vs configured collection dim(s)."""
+    known = {c: d for c, d in collection_dims.items() if isinstance(d, int)}
+    if embed_dim is None and not known:
+        return ("warn", "neither embedder dim nor any collection dim known — cannot compare", None)
+    detail = {"embedder_dim": embed_dim, "configured_expected": VECTOR_DIM,
+              "collection_dims": known}
+    mismatches = []
+    if embed_dim is not None:
+        if embed_dim != VECTOR_DIM:
+            mismatches.append(f"embedder dim {embed_dim} != configured VECTOR_DIM {VECTOR_DIM}")
+        for col, dim in known.items():
+            if dim != embed_dim:
+                mismatches.append(f"collection '{col}' dim {dim} != embedder dim {embed_dim}")
+    else:
+        for col, dim in known.items():
+            if dim != VECTOR_DIM:
+                mismatches.append(f"collection '{col}' dim {dim} != configured VECTOR_DIM {VECTOR_DIM}")
+    if mismatches:
+        detail["mismatches"] = mismatches
+        return (
+            "fail",
+            detail,
+            "dimension mismatch causes silent search corruption — recreate the "
+            "collection or align the embedding model so all dims match",
+        )
+    return ("ok", detail, None)
+
+
+def _health_resolve_inv_scope(investigation_id: Optional[str]) -> tuple[list[str], str | None]:
+    """Resolve the target investigations for memory_health's store-scoped checks.
+
+    Returns ``(inv_targets, inv_missing)``. Read-only: never use ``_inv_dir``
+    here, which would mkdir.
+    """
+    if investigation_id is not None:
+        inv_targets = [investigation_id] if (MEMORY_DIR / investigation_id).exists() else []
+        inv_missing = investigation_id if not inv_targets else None
+    elif MEMORY_DIR.exists():
+        inv_targets = sorted(p.name for p in MEMORY_DIR.iterdir() if p.is_dir())
+        inv_missing = None
+    else:
+        inv_targets = []
+        inv_missing = None
+    return inv_targets, inv_missing
+
+
+def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str | None) -> tuple:
+    """memory_health probe 7: retraction logs parse cleanly + no orphans."""
+    if inv_missing is not None:
+        return ("warn", f"investigation '{inv_missing}' not found", None)
+    per_inv: list[dict] = []
+    total_active = 0
+    total_orphans = 0
+    parse_errors: list[str] = []
+    for inv in inv_targets:
+        inv_path = MEMORY_DIR / inv
+        findings = _read_jsonl(inv_path / "findings.jsonl")
+        valid_ids = {
+            str(f.get("id") or f.get("finding_id") or f"{inv}:{i}")
+            for i, f in enumerate(findings) if isinstance(f, dict)
+        }
+        ret_path = inv_path / "retractions.jsonl"
+        audit_path = inv_path / "retraction_audit.jsonl"
+        # parse-cleanliness: count raw non-empty lines vs parsed rows
+        for label, path in (("retractions.jsonl", ret_path),
+                            ("retraction_audit.jsonl", audit_path)):
+            if path.exists():
+                raw = [ln for ln in path.read_text().splitlines() if ln.strip()]
+                parsed = _read_jsonl(path)
+                if len(parsed) != len(raw):
+                    parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
+        active = _load_retracted_ids(inv) if ret_path.exists() else set()
+        orphans = sorted(fid for fid in active if fid not in valid_ids)
+        total_active += len(active)
+        total_orphans += len(orphans)
+        if active or orphans:
+            per_inv.append({
+                "investigation_id": inv,
+                "active_retractions": len(active),
+                "orphaned_retractions": orphans,
+            })
+    detail = {
+        "investigations_scanned": len(inv_targets),
+        "active_retractions": total_active,
+        "orphaned_retractions": total_orphans,
+        "per_investigation": per_inv,
+    }
+    if parse_errors:
+        detail["parse_errors"] = parse_errors
+        return (
+            "fail",
+            detail,
+            "retraction log has unparseable lines — inspect the JSONL; "
+            "append-only integrity may be compromised",
+        )
+    if total_orphans:
+        return (
+            "warn",
+            detail,
+            "orphaned retraction(s): a retraction references a finding id "
+            "not present in findings.jsonl — verify the finding wasn't lost",
+        )
+    return ("ok", detail, None)
+
+
+def _health_probe_store_counts(inv_targets: list[str], inv_missing: str | None) -> tuple:
+    """memory_health probe 8: inventory of findings/audit/retraction records."""
+    if inv_missing is not None:
+        return ("warn", f"investigation '{inv_missing}' not found", None)
+    per_inv: list[dict] = []
+    totals = {"findings": 0, "audit": 0, "retractions": 0}
+    for inv in inv_targets:
+        inv_path = MEMORY_DIR / inv
+        f_n = len(_read_jsonl(inv_path / "findings.jsonl"))
+        a_n = len(_read_jsonl(inv_path / "audit.jsonl"))
+        r_n = len(_read_jsonl(inv_path / "retractions.jsonl"))
+        totals["findings"] += f_n
+        totals["audit"] += a_n
+        totals["retractions"] += r_n
+        per_inv.append({"investigation_id": inv, "findings": f_n,
+                        "audit": a_n, "retractions": r_n})
+    detail = {
+        "investigations": len(inv_targets),
+        "totals": totals,
+        "per_investigation": per_inv,
+    }
+    return ("ok", detail, None)
+
+
+def _health_rollup(checks: list[dict]) -> tuple[str, str]:
+    """Roll per-check results up into ``(status, summary)`` for memory_health."""
+    worst = max((_HEALTH_SEVERITY.get(c["status"], 0) for c in checks), default=0)
+    if worst >= 2:
+        status = "unhealthy"
+    elif worst == 1:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    n_fail = sum(1 for c in checks if c["status"] == "fail")
+    n_warn = sum(1 for c in checks if c["status"] == "warn")
+    summary = (
+        f"{len(checks)} checks: {n_fail} fail, {n_warn} warn, "
+        f"{len(checks) - n_fail - n_warn} ok -> {status}"
+    )
+    return status, summary
+
+
 @mcp.tool()
 def memory_health(investigation_id: Optional[str] = None) -> str:
     """
@@ -5397,278 +4708,66 @@ def memory_health(investigation_id: Optional[str] = None) -> str:
         usable), any warn -> degraded, all ok -> ok.
     """
     checks: list[dict] = []
+    # State shared between the first three probes and the dimension check. The
+    # probes are module-level functions now, so what they used to reach via
+    # ``nonlocal`` they write into this explicit holder instead.
+    qd: dict = {"client": None, "main_col": None, "embed_dim": None}
 
     # 1. qdrant_reachable — is QDRANT_URL set and the server answering?
     qdrant_url = os.environ.get("QDRANT_URL", "")
-    client = None
-    main_col = None
-
-    def _probe_qdrant_reachable():
-        nonlocal client, main_col
-        if not qdrant_url:
-            return (
-                "warn",
-                "QDRANT_URL is not set — qdrant indexing disabled; loci falls back"
-                "to mnemosyne/keyword search.",
-                "set QDRANT_URL if vector search is expected; otherwise this is benign",
-            )
-        client, main_col = _get_qdrant()
-        if client is None:
-            return (
-                "fail",
-                f"QDRANT_URL={qdrant_url} is set but the server is unreachable.",
-                "confirm the qdrant container is up and reachable at QDRANT_URL "
-                "(docker ps; curl $QDRANT_URL/healthz)",
-            )
-        return ("ok", f"connected to qdrant at {qdrant_url}", None)
-
-    checks.append(_health_check("qdrant_reachable", _probe_qdrant_reachable))
+    checks.append(_health_check(
+        "qdrant_reachable",
+        lambda: _health_probe_qdrant_reachable(qdrant_url, qd),
+    ))
 
     # 2. qdrant_collections — expected collections present + their layout.
+    # The lambda defers reading ``qd`` until after probe 1 has populated it.
     collection_dims: dict[str, int | None] = {}
-
-    def _probe_qdrant_collections():
-        if client is None:
-            return ("warn", "skipped — qdrant not reachable", None)
-        existing = {c.name for c in client.get_collections().collections}
-        report: dict = {}
-        main = main_col or QDRANT_COLLECTION_PREFIX
-        main_present = main in existing
-        verdicts_present = "hermes_verdicts" in existing
-        if main_present:
-            info = _health_qdrant_collection_info(client, main)
-            report[main] = info
-            collection_dims[main] = _health_collection_dim(info)
-        if verdicts_present:
-            info = _health_qdrant_collection_info(client, "hermes_verdicts")
-            report["hermes_verdicts"] = info
-            collection_dims["hermes_verdicts"] = _health_collection_dim(info)
-        report["expected_main_collection"] = main
-        report["main_present"] = main_present
-        report["hermes_verdicts_present"] = verdicts_present
-        if not main_present:
-            return (
-                "fail",
-                report,
-                f"main memory collection '{main}' is missing while qdrant is up — "
-                "it is created lazily on first store; run a store/search or "
-                "backfill (scripts/backfill_qdrant.py)",
-            )
-        if not verdicts_present:
-            return (
-                "warn",
-                report,
-                "'hermes_verdicts' not yet created — it appears on first "
-                "memory_self_check(record=True); benign until then",
-            )
-        return ("ok", report, None)
-
-    checks.append(_health_check("qdrant_collections", _probe_qdrant_collections))
+    checks.append(_health_check(
+        "qdrant_collections",
+        lambda: _health_probe_qdrant_collections(
+            qd["client"], qd["main_col"], collection_dims
+        ),
+    ))
 
     # 3. embeddings_dense — fastembed dense embedder loads and embeds.
-    embed_dim: int | None = None
+    checks.append(_health_check(
+        "embeddings_dense",
+        lambda: _health_probe_embeddings_dense(qd),
+    ))
 
-    def _probe_embeddings_dense():
-        nonlocal embed_dim
-        vec = _embed("memory_health probe")  # transient throwaway, never stored
-        if not vec:
-            return (
-                "fail",
-                "dense embedder (Ollama) unavailable — semantic/hybrid search "
-                "is disabled; hermes runs on keyword fallback only.",
-                "ensure Ollama is running and the nomic-embed-text model is available "
-                "(OLLAMA_BASE_URL and EMBED_MODEL env vars can override defaults).",
-            )
-        embed_dim = len(vec)
-        return ("ok", f"dense embedder active; dimension={embed_dim}", None)
-
-    checks.append(_health_check("embeddings_dense", _probe_embeddings_dense))
-
-    # 4. embeddings_sparse — optional sparse embedder.
-    def _probe_embeddings_sparse():
-        sparse = _embed_sparse("memory_health probe")  # transient, never stored
-        if sparse is None:
-            return (
-                "warn",
-                "sparse embedder (fastembed BM25) unavailable — hybrid search "
-                "degrades to dense-only; this is optional.",
-                "install the fastembed sparse model if hybrid scoring is wanted",
-            )
-        n = len(getattr(sparse, "indices", []) or [])
-        return ("ok", f"sparse embedder active; {n} non-zero terms on probe", None)
-
-    checks.append(_health_check("embeddings_sparse", _probe_embeddings_sparse))
+    # 4. embeddings_sparse — optional sparse embedder. (module-level probe)
+    checks.append(_health_check("embeddings_sparse", _health_probe_embeddings_sparse))
 
     # 5. mnemo_mirror — mnemosyne importable in THIS venv (the silent-flag bug).
-    def _probe_mnemo_mirror():
-        remember, recall = _get_mnemo_funcs()
-        bank = _mnemo_bank()
-        resolved = {"remember": remember is not None, "recall": recall is not None}
-        if remember is None and recall is None:
-            return (
-                "fail",
-                {
-                    "target_bank": bank,
-                    "resolved": resolved,
-                    "note": "mnemosyne is not importable in the server's venv — the "
-                            "loci->mnemo mirror is silently inert.",
-                },
-                "install mnemosyne into the server's venv: "
-                "pip install 'mnemosyne-memory[embeddings]' sqlite-vec",
-            )
-        if remember is None or recall is None:
-            return (
-                "warn",
-                {"target_bank": bank, "resolved": resolved,
-                 "note": "mnemosyne partially resolved — one of remember/recall is missing."},
-                "reinstall 'mnemosyne-memory[embeddings]' to restore both entry points",
-            )
-        return ("ok", {"target_bank": bank, "resolved": resolved}, None)
-
-    checks.append(_health_check("mnemo_mirror", _probe_mnemo_mirror))
+    checks.append(_health_check("mnemo_mirror", _health_probe_mnemo_mirror))
 
     # 6. dimension_consistency — embedder dim vs configured collection dim(s).
-    def _probe_dimension_consistency():
-        known = {c: d for c, d in collection_dims.items() if isinstance(d, int)}
-        if embed_dim is None and not known:
-            return ("warn", "neither embedder dim nor any collection dim known — cannot compare", None)
-        detail = {"embedder_dim": embed_dim, "configured_expected": VECTOR_DIM,
-                  "collection_dims": known}
-        mismatches = []
-        if embed_dim is not None:
-            if embed_dim != VECTOR_DIM:
-                mismatches.append(f"embedder dim {embed_dim} != configured VECTOR_DIM {VECTOR_DIM}")
-            for col, dim in known.items():
-                if dim != embed_dim:
-                    mismatches.append(f"collection '{col}' dim {dim} != embedder dim {embed_dim}")
-        else:
-            for col, dim in known.items():
-                if dim != VECTOR_DIM:
-                    mismatches.append(f"collection '{col}' dim {dim} != configured VECTOR_DIM {VECTOR_DIM}")
-        if mismatches:
-            detail["mismatches"] = mismatches
-            return (
-                "fail",
-                detail,
-                "dimension mismatch causes silent search corruption — recreate the "
-                "collection or align the embedding model so all dims match",
-            )
-        return ("ok", detail, None)
-
-    checks.append(_health_check("dimension_consistency", _probe_dimension_consistency))
+    # The lambda defers the read of ``qd["embed_dim"]`` to probe-execution time,
+    # exactly as the closure this replaced did — by then probe 3 has run.
+    checks.append(_health_check(
+        "dimension_consistency",
+        lambda: _health_probe_dimension_consistency(qd["embed_dim"], collection_dims),
+    ))
 
     # Resolve target investigations for the store-scoped checks (read-only:
     # never use _inv_dir here, which would mkdir).
-    if investigation_id is not None:
-        inv_targets = [investigation_id] if (MEMORY_DIR / investigation_id).exists() else []
-        inv_missing = investigation_id if not inv_targets else None
-    elif MEMORY_DIR.exists():
-        inv_targets = sorted(p.name for p in MEMORY_DIR.iterdir() if p.is_dir())
-        inv_missing = None
-    else:
-        inv_targets = []
-        inv_missing = None
+    inv_targets, inv_missing = _health_resolve_inv_scope(investigation_id)
 
     # 7. retraction_integrity — parse cleanly + flag orphaned retractions.
-    def _probe_retraction_integrity():
-        if inv_missing is not None:
-            return ("warn", f"investigation '{inv_missing}' not found", None)
-        per_inv: list[dict] = []
-        total_active = 0
-        total_orphans = 0
-        parse_errors: list[str] = []
-        for inv in inv_targets:
-            inv_path = MEMORY_DIR / inv
-            findings = _read_jsonl(inv_path / "findings.jsonl")
-            valid_ids = {
-                str(f.get("id") or f.get("finding_id") or f"{inv}:{i}")
-                for i, f in enumerate(findings) if isinstance(f, dict)
-            }
-            ret_path = inv_path / "retractions.jsonl"
-            audit_path = inv_path / "retraction_audit.jsonl"
-            # parse-cleanliness: count raw non-empty lines vs parsed rows
-            for label, path in (("retractions.jsonl", ret_path),
-                                ("retraction_audit.jsonl", audit_path)):
-                if path.exists():
-                    raw = [ln for ln in path.read_text().splitlines() if ln.strip()]
-                    parsed = _read_jsonl(path)
-                    if len(parsed) != len(raw):
-                        parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
-            active = _load_retracted_ids(inv) if ret_path.exists() else set()
-            orphans = sorted(fid for fid in active if fid not in valid_ids)
-            total_active += len(active)
-            total_orphans += len(orphans)
-            if active or orphans:
-                per_inv.append({
-                    "investigation_id": inv,
-                    "active_retractions": len(active),
-                    "orphaned_retractions": orphans,
-                })
-        detail = {
-            "investigations_scanned": len(inv_targets),
-            "active_retractions": total_active,
-            "orphaned_retractions": total_orphans,
-            "per_investigation": per_inv,
-        }
-        if parse_errors:
-            detail["parse_errors"] = parse_errors
-            return (
-                "fail",
-                detail,
-                "retraction log has unparseable lines — inspect the JSONL; "
-                "append-only integrity may be compromised",
-            )
-        if total_orphans:
-            return (
-                "warn",
-                detail,
-                "orphaned retraction(s): a retraction references a finding id "
-                "not present in findings.jsonl — verify the finding wasn't lost",
-            )
-        return ("ok", detail, None)
-
-    checks.append(_health_check("retraction_integrity", _probe_retraction_integrity))
+    checks.append(_health_check(
+        "retraction_integrity",
+        lambda: _health_probe_retraction_integrity(inv_targets, inv_missing),
+    ))
 
     # 8. store_counts — inventory of findings/audit/retraction records.
-    def _probe_store_counts():
-        if inv_missing is not None:
-            return ("warn", f"investigation '{inv_missing}' not found", None)
-        per_inv: list[dict] = []
-        totals = {"findings": 0, "audit": 0, "retractions": 0}
-        for inv in inv_targets:
-            inv_path = MEMORY_DIR / inv
-            f_n = len(_read_jsonl(inv_path / "findings.jsonl"))
-            a_n = len(_read_jsonl(inv_path / "audit.jsonl"))
-            r_n = len(_read_jsonl(inv_path / "retractions.jsonl"))
-            totals["findings"] += f_n
-            totals["audit"] += a_n
-            totals["retractions"] += r_n
-            per_inv.append({"investigation_id": inv, "findings": f_n,
-                            "audit": a_n, "retractions": r_n})
-        detail = {
-            "investigations": len(inv_targets),
-            "totals": totals,
-            "per_investigation": per_inv,
-        }
-        return ("ok", detail, None)
-
-    checks.append(_health_check("store_counts", _probe_store_counts))
+    checks.append(_health_check(
+        "store_counts",
+        lambda: _health_probe_store_counts(inv_targets, inv_missing),
+    ))
 
     # Roll up overall status from the worst check.
-    worst = max((_HEALTH_SEVERITY.get(c["status"], 0) for c in checks), default=0)
-    if worst >= 2:
-        status = "unhealthy"
-    elif worst == 1:
-        status = "degraded"
-    else:
-        status = "ok"
-
-    n_fail = sum(1 for c in checks if c["status"] == "fail")
-    n_warn = sum(1 for c in checks if c["status"] == "warn")
-    summary = (
-        f"{len(checks)} checks: {n_fail} fail, {n_warn} warn, "
-        f"{len(checks) - n_fail - n_warn} ok -> {status}"
-    )
+    status, summary = _health_rollup(checks)
 
     return json.dumps({
         "checked_at": _now(),
@@ -5720,19 +4819,6 @@ def _resolve_seed_findings(investigation_id: str, target: str, findings: list[di
         scored.sort(key=lambda x: x[0], reverse=True)
         return [scored[0][1]]
     return []
-
-
-def _distinctive_entity_set(entities: dict | None) -> set[str]:
-    """Flatten the server's typed-entity dict to a set of distinctive entity tokens."""
-    out: set[str] = set()
-    if not isinstance(entities, dict):
-        return out
-    for bucket in ("ips", "hashes", "cves", "emails", "hostnames"):
-        for v in entities.get(bucket, []) or []:
-            s = str(v).strip().lower()
-            if s:
-                out.add(s)
-    return out
 
 
 def _semantic_neighbor_ids(seed_findings: list[dict], investigation_id: str) -> list[str]:
@@ -8199,14 +7285,13 @@ from llm_tools import (  # noqa: E402,F401
 
 # Investigation lifecycle tools live in investigation_tools.py (P2b of the split).
 # The memory root is injected as a lambda over MEMORY_DIR (same contract as
-# inv_store); the five collaborators below stayed in server.py and are passed in
+# inv_store); the collaborators below stayed in server.py and are passed in
 # explicitly so investigation_tools never has to import server.
 import investigation_tools  # noqa: E402
 investigation_tools.register(mcp, lambda: MEMORY_DIR, {
     "_apply_lifecycle": _apply_lifecycle,
     "_compute_self_check": _compute_self_check,
     "_event_log_append": _event_log_append,
-    "_ladybug_upsert_investigation": _ladybug_upsert_investigation,
     "_qdrant_upsert": _qdrant_upsert,
 })
 # Re-exported so `server.<tool>()` keeps working for in-process callers and tests.

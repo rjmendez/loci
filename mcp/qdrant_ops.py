@@ -1,0 +1,588 @@
+"""Embedding + Qdrant vector-store helpers (extracted from server.py).
+
+Every ``from qdrant_client ...`` / ``import requests`` import in here is kept
+FUNCTION-LOCAL on purpose: that laziness is what makes the whole cluster
+fail-open when Qdrant / fastembed / the embedding endpoint are unavailable.
+
+The singletons below (`_qdrant_client`, `_sparse_model`, `_embed_cache`,
+`_embed_sparse_cache`) live here and only here — server.py re-exports the
+functions, not the state, so there is exactly one latch per process.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Optional
+
+from inv_store import _CONFIDENCE_RANK
+
+logger = logging.getLogger("loci-mcp")
+
+
+# --- Configuration (public: re-exported by server.py) ---
+QDRANT_COLLECTION_PREFIX = os.environ.get("QDRANT_COLLECTION_PREFIX", "hermes_memory")
+VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+
+
+# --- Lazy singletons / fail-open latches ---
+_sparse_model = None
+_qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
+_qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
+_QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
+
+
+def _get_sparse_embedder():
+    global _sparse_model
+    if _sparse_model is None:
+        try:
+            from fastembed import SparseTextEmbedding
+            _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
+        except Exception as exc:
+            logger.warning("SparseTextEmbedding unavailable: %s", exc)
+            _sparse_model = False
+    return _sparse_model if _sparse_model is not False else None
+
+
+def _get_cross_encoder():
+    """The two-stage reranker's CrossEncoder, or None when unavailable (fail-open).
+
+    Delegates to reranker.get_model() so the backend is env-pluggable via RERANK_MODEL (and the
+    backends config): default 'BAAI/bge-reranker-v2-m3' (flipped in on judge-eval evidence,
+    +14% nDCG@10); pin the lighter 'cross-encoder/ms-marco-MiniLM-L-6-v2' back on constrained
+    hosts. Lazy-init, globally cached, loaded on GPU (cuda:0) when available. Call sites keep
+    calling `.predict(pairs)` unchanged.
+
+    NOTE: changing RERANK_MODEL is a retrieval-QUALITY change — A/B it on a held-out query set
+    first (scripts/judge_eval.py is the judge-based harness that gated the bge flip).
+    """
+    try:
+        import reranker
+        return reranker.get_model()
+    except Exception as exc:
+        logger.warning("Reranker unavailable — reranking disabled: %s", exc)
+        return None
+
+
+def _embed_sparse(text: str):
+    """Returns a SparseVector or None."""
+    cached = _embed_sparse_cache.get(text)
+    if cached is not None:
+        try:
+            from qdrant_client.models import SparseVector
+            return SparseVector(indices=list(cached[0]), values=list(cached[1]))
+        except Exception as exc:
+            logger.debug("_embed_sparse: fail-open swallow: %r", exc)
+    model = _get_sparse_embedder()
+    if model is None:
+        return None
+    try:
+        from qdrant_client.models import SparseVector
+        result = list(model.embed([text]))[0]
+        indices = result.indices.tolist()
+        values = result.values.tolist()
+        if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
+            _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
+        _embed_sparse_cache[text] = (tuple(indices), tuple(values))
+        return SparseVector(indices=indices, values=values)
+    except Exception as exc:
+        logger.debug("sparse embed failed: %s", exc)
+        return None
+
+
+def _create_payload_indexes(client, col: str) -> None:
+    """Create payload indexes for filtered search. Idempotent."""
+    from qdrant_client.models import (
+        KeywordIndexParams, KeywordIndexType,
+        IntegerIndexParams, IntegerIndexType,
+    )
+    indexes = [
+        # Core investigation fields
+        ("investigation_id", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
+        ("record_type", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("server", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("tool", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("created_at_ts", IntegerIndexParams(
+            type=IntegerIndexType.INTEGER, lookup=False, range=True, on_disk=False)),
+        # Evidence quality fields — enable confidence-filtered retrieval
+        ("confidence", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("tags", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        # Multi-tenancy fields (agent_id + operator_id use is_tenant=True for
+        # HNSW partition hints — same pattern as investigation_id)
+        ("agent_id",    KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
+        ("operator_id", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
+        ("namespace",   KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("promoted_at_ts", IntegerIndexParams(
+            type=IntegerIndexType.INTEGER, lookup=False, range=True, on_disk=False)),
+        ("promoted_from", KeywordIndexParams(
+            type=KeywordIndexType.KEYWORD, on_disk=False)),
+        # Entity fields — enable O(log N) indexed lookup vs. full collection scan.
+        # Qdrant indexes array elements individually so MatchValue on a list field
+        # matches any element in the array (standard inverted-index behaviour).
+        # Note: dot-notation indexing of arrays inside nested JSON objects
+        # (entities.ips is an array inside the "entities" dict) is an implicit
+        # behaviour of qdrant-client 1.17.x — not formally documented in the API
+        # spec.  Works at this version but should be re-verified on upgrade.
+        ("entities.ips",       KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("entities.emails",    KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("entities.hostnames", KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("entities.hashes",    KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
+        ("entities.cves",      KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
+    ]
+    for field_name, schema in indexes:
+        try:
+            client.create_payload_index(col, field_name=field_name,
+                                        field_schema=schema, wait=False)
+        except Exception as exc:
+            logger.debug("payload index %r creation skipped: %s", field_name, exc)
+
+
+def _purge_old_records(client, col: str, retention_days: int = 30) -> None:
+    """Delete records older than retention_days. Requires created_at_ts payload index."""
+    from qdrant_client.models import Filter, FieldCondition, Range, FilterSelector
+    cutoff = int(time.time()) - (retention_days * 86400)
+    try:
+        client.delete(
+            collection_name=col,
+            points_selector=FilterSelector(
+                filter=Filter(must=[
+                    FieldCondition(key="created_at_ts", range=Range(lt=cutoff))
+                ])
+            ),
+            wait=False,
+        )
+        logger.info("Qdrant TTL purge: deleted records older than %d days", retention_days)
+    except Exception as exc:
+        logger.debug("Qdrant TTL purge failed (non-fatal): %s", exc)
+
+
+def _get_qdrant():
+    """Return (QdrantClient, collection_name) or (None, None) if unavailable.
+    All findings share one collection; investigation_id is a payload field.
+    Reads QDRANT_URL lazily so the env var is picked up even if set after import.
+
+    Connection failures are cached for _QDRANT_RETRY_SECONDS so a transient
+    startup race (container not yet ready) doesn't permanently disable Qdrant
+    for the process lifetime.
+    """
+    import time as _time
+    global _qdrant_client, _qdrant_failed_at
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    if not qdrant_url:
+        return None, None
+    # Return cached failure if still within the backoff window
+    if _qdrant_client == (None, None) and _qdrant_failed_at is not None:
+        if _time.monotonic() - _qdrant_failed_at < _QDRANT_RETRY_SECONDS:
+            return None, None
+        _qdrant_client = None
+        _qdrant_failed_at = None
+    if _qdrant_client is None:
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import (
+                Distance, VectorParams, SparseVectorParams,
+                SparseIndexParams, Modifier,
+                HnswConfigDiff,
+                ScalarQuantization, ScalarQuantizationConfig, ScalarType,
+            )
+
+            qdrant_api_key = os.environ.get("QDRANT_API_KEY", "") or None
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=5)
+            col = QDRANT_COLLECTION_PREFIX
+            existing = {c.name for c in client.get_collections().collections}
+
+            _hnsw   = HnswConfigDiff(m=32, ef_construct=200, on_disk=False)
+            _quant  = ScalarQuantization(
+                scalar=ScalarQuantizationConfig(
+                    type=ScalarType.INT8,
+                    quantile=0.99,
+                    always_ram=True,
+                )
+            )
+
+            if col not in existing:
+                client.create_collection(
+                    col,
+                    vectors_config={"dense": VectorParams(size=VECTOR_DIM, distance=Distance.COSINE)},
+                    sparse_vectors_config={
+                        "sparse": SparseVectorParams(
+                            index=SparseIndexParams(on_disk=False),
+                            modifier=Modifier.IDF,
+                        )
+                    },
+                    # Stronger HNSW graph: m=32 doubles recall at high similarity
+                    # thresholds; ef_construct=200 improves index quality at build time.
+                    hnsw_config=_hnsw,
+                    # INT8 scalar quantization: ~4x memory reduction, <1% recall loss.
+                    # always_ram keeps quantized vectors hot; originals rescored on search.
+                    quantization_config=_quant,
+                )
+                logger.info(
+                    "Created Qdrant collection '%s' (named-vector + sparse + INT8 quant)", col
+                )
+            else:
+                # Upgrade existing collection: apply quantization + HNSW if not configured.
+                # update_collection is idempotent; the optimizer applies changes in the
+                # background without interrupting reads or writes.
+                try:
+                    client.update_collection(
+                        col,
+                        hnsw_config=_hnsw,
+                        quantization_config=_quant,
+                    )
+                    logger.debug("Applied INT8 quant + HNSW config to existing collection '%s'", col)
+                except Exception as upd_exc:
+                    logger.debug("Collection config update skipped: %s", upd_exc)
+
+            # Create payload indexes — idempotent, safe on existing collection
+            _create_payload_indexes(client, col)
+
+            # Purge records older than 30 days on startup
+            _purge_old_records(client, col, retention_days=30)
+
+            _qdrant_client = (client, col)
+        except Exception as exc:
+            logger.warning("Qdrant connection failed — using Mnemo/keyword fallback: %s", exc)
+            _qdrant_client = (None, None)
+            _qdrant_failed_at = _time.monotonic()
+    return _qdrant_client
+
+
+_OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL")
+_EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+_EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
+_EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
+_EMBED_CACHE_MAXSIZE = 512
+_embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
+_embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
+
+# Startup validation — warn clearly when required backends are not configured.
+# Server runs in degraded mode (keyword-only) rather than refusing to start.
+if not os.environ.get("QDRANT_URL"):
+    logger.warning(
+        "QDRANT_URL is not set — Qdrant semantic search disabled. "
+        "Set QDRANT_URL in your .env to enable vector search."
+    )
+if not _OLLAMA_BASE and not _EMBED_API_KEY:
+    logger.warning(
+        "OLLAMA_BASE_URL and EMBED_API_KEY are both unset — embedding disabled. "
+        "Set OLLAMA_BASE_URL for local Ollama or EMBED_API_KEY for a cloud provider."
+    )
+
+
+def _embed_auth_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if _EMBED_API_KEY:
+        if _EMBED_API_KEY_HEADER.lower() == "authorization":
+            h["Authorization"] = f"Bearer {_EMBED_API_KEY}"
+        else:
+            h[_EMBED_API_KEY_HEADER] = _EMBED_API_KEY
+    return h
+
+
+def _embed(text: str) -> list[float] | None:
+    """Single-text embed via OpenAI-compat /v1/embeddings.
+    Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
+    cached = _embed_cache.get(text)
+    if cached is not None:
+        return cached
+    if not _OLLAMA_BASE:
+        return None
+    try:
+        import requests as _req
+        r = _req.post(
+            f"{_OLLAMA_BASE.rstrip('/')}/v1/embeddings",
+            json={"model": _EMBED_MODEL, "input": [text]},
+            headers=_embed_auth_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        result = list(data[0]["embedding"]) if data else None
+        if result is not None:
+            if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
+                _embed_cache.pop(next(iter(_embed_cache)))
+            _embed_cache[text] = result
+        return result
+    except Exception as exc:
+        logger.warning("embed failed: %s", exc)
+        return None
+
+
+def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
+    """Store a point with dense + sparse vectors. Fails silently."""
+    client, col = _get_qdrant()
+    if client is None:
+        return
+    dense_vec = _embed(text)
+    if dense_vec is None:
+        return
+    sparse_vec = _embed_sparse(text)
+    # Stamp multi-tenancy fields if not already set by the caller.
+    _agent_id  = os.environ.get("HERMES_AGENT_ID", "")
+    _namespace = os.environ.get("LOCI_NAMESPACE", "")
+    if _agent_id and "agent_id" not in payload:
+        payload = {**payload, "agent_id": _agent_id}
+    if _namespace and "namespace" not in payload:
+        payload = {**payload, "namespace": _namespace}
+    try:
+        from qdrant_client.models import PointStruct
+        vector_dict: dict = {"dense": dense_vec}
+        if sparse_vec is not None:
+            vector_dict["sparse"] = sparse_vec
+        client.upsert(
+            col,
+            points=[PointStruct(id=point_id, vector=vector_dict, payload=payload)],
+        )
+    except Exception as exc:
+        logger.warning("Qdrant upsert failed — finding stored in JSONL but not indexed: %s", exc)
+
+
+def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success: bool) -> tuple[bool, str | None]:
+    """Classify Qdrant degraded mode for the ``degraded_mode`` tool payload.
+
+    Returns ``(active, reason)``.  ``errors`` is only tested for truthiness, so any
+    container (or None) is accepted.
+    """
+    degraded_active = (not enabled) or (not available) or bool(errors) or (enabled and available and not query_success)
+    degraded_reason = None
+    if not enabled:
+        degraded_reason = "qdrant_disabled"
+    elif not available:
+        degraded_reason = "qdrant_unavailable"
+    elif errors:
+        degraded_reason = "qdrant_semantic_error"
+    elif not query_success:
+        degraded_reason = "qdrant_semantic_not_executed"
+    return degraded_active, degraded_reason
+
+
+def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
+    """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
+
+    Returns ``(rows, True)`` only when the cross-encoder scored every row and the
+    sort completed.  Returns ``(rows, False)`` — original bi-encoder order, still
+    truncated to ``top_k`` — when the cross-encoder is unavailable or scoring
+    raised, so the return count is consistent whether CE is installed or not.
+    """
+    ce = _get_cross_encoder()
+    if ce is not None and rows:
+        try:
+            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
+            ce_scores = ce.predict(pairs)
+            for row, ce_score in zip(rows, ce_scores):
+                row["ce_score"] = round(float(ce_score), 4)
+            return sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:top_k], True
+        except Exception as exc:
+            logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
+            # Strip any partial ce_score annotations written before the exception
+            # so downstream consumers see a consistent payload (all rows scored,
+            # or none — never a mix).
+            for row in rows:
+                row.pop("ce_score", None)
+    return rows[:top_k], False
+
+
+def _qdrant_similarity_search(
+    query: str,
+    *,
+    investigation_id: Optional[str] = None,
+    limit: int = 10,
+    rerank: bool = True,
+    min_confidence: Optional[str] = None,
+    rerank_top_k: Optional[int] = None,
+) -> dict:
+    """Hybrid dense + sparse retrieval with optional cross-encoder reranking.
+
+    Two-stage pipeline (per arXiv production recommendations):
+    Stage 1 — bi-encoder: retrieve ``limit * 5`` candidates fast via RRF fusion.
+    Stage 2 — cross-encoder: if sentence-transformers is available, rerank the
+    candidates by full query-passage cross-attention and return the top ``limit``.
+
+    The cross-encoder dramatically improves precision on noisy finding sets (10-40%
+    accuracy improvement in the literature) by evaluating query and passage jointly
+    instead of as independent vectors. Falls back to bi-encoder scores if the
+    cross-encoder is unavailable.
+    """
+    client, col = _get_qdrant()
+    if client is None:
+        return {"ok": False, "reason": "qdrant_unavailable", "results": []}
+
+    from qdrant_client.models import (
+        Filter, FieldCondition, MatchValue,
+        Prefetch, FusionQuery, Fusion,
+    )
+
+    # Normalise confidence floor; callers may pass mixed-case ("High", "MEDIUM").
+    if min_confidence:
+        min_confidence = min_confidence.lower()
+    # Build filter: investigation scope + optional confidence floor.
+    must_conditions = []
+    if investigation_id:
+        must_conditions.append(FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id)))
+    if min_confidence and min_confidence in _CONFIDENCE_RANK:
+        from qdrant_client.models import MatchAny
+        allowed = [c for c, rank in _CONFIDENCE_RANK.items() if rank >= _CONFIDENCE_RANK[min_confidence]]
+        must_conditions.append(FieldCondition(key="confidence", match=MatchAny(any=allowed)))
+    search_filter = Filter(must=must_conditions) if must_conditions else None
+
+    dense_vec = _embed(query)
+    if dense_vec is None:
+        return {"ok": False, "reason": "embedding_unavailable", "results": []}
+
+    # rerank_top_k separates "how many CE-ranked results to return" from "how
+    # many candidates to fetch for dedup".  investigation_search inflates limit
+    # to compensate for dedup losses; without rerank_top_k that inflation would
+    # multiply the CE batch size (limit*3 caller → limit*15 CE pairs).
+    # Clamp to limit so the function never returns more rows than requested.
+    output_k = min(rerank_top_k, limit) if rerank_top_k is not None else limit
+    fetch_limit = output_k * 5 if rerank else limit * 4
+
+    from qdrant_client.models import SearchParams, QuantizationSearchParams
+    # rescore=True: after ANN candidate selection from quantized index, re-score
+    # with original full-precision vectors. Recovers ~0.5-1% recall lost to INT8.
+    # oversampling fetches 2x candidates to give rescore more to work with.
+    _search_params = SearchParams(
+        quantization=QuantizationSearchParams(rescore=True, oversampling=2.0)
+    )
+
+    sparse_vec = _embed_sparse(query)
+    if sparse_vec is not None:
+        result = client.query_points(
+            collection_name=col,
+            prefetch=[
+                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2, filter=search_filter),
+                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2, filter=search_filter),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=fetch_limit,
+            with_payload=True,
+            search_params=_search_params,
+        )
+        mode = "hybrid"
+    else:
+        result = client.query_points(
+            collection_name=col,
+            query=dense_vec,
+            using="dense",
+            query_filter=search_filter,
+            limit=fetch_limit,
+            with_payload=True,
+            search_params=_search_params,
+        )
+        mode = "semantic"
+
+    rows = []
+    for p in result.points:
+        payload = dict(p.payload or {})
+        rows.append({"score": round(float(p.score), 4), **payload, "origin": payload.get("origin", "qdrant")})
+
+    # Stage 2: cross-encoder reranking — full query-passage joint scoring.
+    if rerank:
+        rows, reranked = _ce_rerank(query, rows, output_k)
+        if reranked:
+            mode = mode + "+reranked"
+    else:
+        # Reranking disabled — honour output_k so the function's return count is
+        # consistent whether CE runs or not.  investigation_search still gets
+        # enough dedup candidates from mnemosyne (up to limit*4 rows) so capping
+        # here at output_k does not starve the dedup loop.
+        rows = rows[:output_k]
+
+    return {"ok": True, "reason": mode, "results": rows}
+
+
+def _qdrant_search_collection(
+    query: str,
+    collection_name: str,
+    limit: int = 10,
+    query_filter=None,
+) -> list[dict]:
+    """
+    Dense + sparse (RRF) search against any named Qdrant collection.
+    Falls back to dense-only when sparse vectors are unavailable.
+    Returns a flat list of payload dicts with an added 'score' key.
+    Raises on Qdrant errors so callers can catch per-collection failures.
+    """
+    client, _default_col = _get_qdrant()
+    if client is None:
+        raise RuntimeError("qdrant_unavailable")
+
+    dense_vec = _embed(query)
+    if dense_vec is None:
+        raise RuntimeError("embedding_unavailable")
+
+    fetch_limit = limit * 5
+    sparse_vec = _embed_sparse(query)
+
+    from qdrant_client.models import Prefetch, FusionQuery, Fusion, SearchParams, QuantizationSearchParams
+
+    # Detect whether this collection uses named vectors (dense/sparse) or a flat vector.
+    try:
+        col_info = client.get_collection(collection_name)
+        vectors_config = col_info.config.params.vectors
+        has_named_vectors = isinstance(vectors_config, dict)
+        has_sparse_index = has_named_vectors and "sparse" in (vectors_config or {})
+    except Exception:
+        has_named_vectors = False
+        has_sparse_index = False
+
+    _qsp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
+
+    if has_named_vectors and has_sparse_index and sparse_vec is not None:
+        result = client.query_points(
+            collection_name=collection_name,
+            prefetch=[
+                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2),
+                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=fetch_limit,
+            with_payload=True,
+            query_filter=query_filter,
+            search_params=_qsp,
+        )
+    elif has_named_vectors:
+        result = client.query_points(
+            collection_name=collection_name,
+            query=dense_vec,
+            using="dense",
+            limit=fetch_limit,
+            with_payload=True,
+            query_filter=query_filter,
+            search_params=_qsp,
+        )
+    else:
+        # Flat/unnamed vector collection (agent_core_chunks, gl_decision_library, etc.)
+        result = client.query_points(
+            collection_name=collection_name,
+            query=dense_vec,
+            limit=fetch_limit,
+            with_payload=True,
+            query_filter=query_filter,
+            search_params=_qsp,
+        )
+
+    rows = []
+    for p in result.points:
+        payload = dict(p.payload or {})
+        rows.append({
+            "score": round(float(p.score), 4),
+            **payload,
+            "origin": collection_name,
+        })
+
+    # Cross-encoder rerank if available
+    rows, _ = _ce_rerank(query, rows, limit)
+
+    return rows
+

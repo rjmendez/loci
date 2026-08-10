@@ -237,6 +237,24 @@ def _build_qdrant_backend() -> Optional[VerdictBackend]:
     )
 
 
+async def _record_verdict(backend, verdict, embedding) -> None:
+    """Record ``verdict``, passing ``embedding`` when the backend supports it.
+
+    ``backend`` and ``verdict`` are deliberately unannotated: cli.py imports
+    ``Verdict`` lazily inside :func:`process_action` to keep the hook path
+    cheap, so a module-level annotation would reference an unbound name.
+
+    Not the same rule as ``VerdictEngine._record_backend``, which additionally
+    gates on ``embedding is not None``; here the caller always passes a
+    hash_embed vector, so the callable check alone decides the branch.
+    """
+    rwe = getattr(backend, "record_with_embedding", None)
+    if callable(rwe):
+        await rwe(verdict, embedding)
+    else:
+        await backend.record(verdict)
+
+
 # --------------------------------------------------------------------------- #
 # process_action — the shared testable core (used by check-action AND daemon)
 # --------------------------------------------------------------------------- #
@@ -325,12 +343,7 @@ def process_action(payload: dict, engine) -> dict:
             rationale="audit-only observed CLI/tool action",
             source="rule",
         )
-        embedding = hash_embed(descriptor)
-        rwe = getattr(backend, "record_with_embedding", None)
-        if callable(rwe):
-            await rwe(verdict, embedding)
-        else:
-            await backend.record(verdict)
+        await _record_verdict(backend, verdict, hash_embed(descriptor))
 
     if backend is not None:
         try:
@@ -427,12 +440,9 @@ def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> d
     if backend is not None and verdicts:
         async def _record_all() -> None:
             for verdict in verdicts:
-                embedding = hash_embed(verdict.subject_excerpt)
-                rwe = getattr(backend, "record_with_embedding", None)
-                if callable(rwe):
-                    await rwe(verdict, embedding)
-                else:
-                    await backend.record(verdict)
+                await _record_verdict(
+                    backend, verdict, hash_embed(verdict.subject_excerpt)
+                )
 
         try:
             asyncio.run(_record_all())

@@ -38,6 +38,7 @@ from __future__ import annotations
 import ast
 import logging
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from .llm_hallucination_checks import Issue
@@ -568,6 +569,30 @@ _METRIC_CTORS = {"Counter", "Gauge", "Histogram", "Summary"}
 _METRIC_CTOR_RE = re.compile(r"\b(" + "|".join(sorted(_METRIC_CTORS)) + r")\s*\(")
 
 
+def _iter_source_lines(source: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(lineno, line)`` for each source line that is not a comment.
+
+    The line is yielded **raw**: callers report ``m.start()`` as the issue
+    column, so stripping it here would shift every reported column.
+    """
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        yield lineno, line
+
+
+def _walk(node: ast.AST, *types: type) -> Iterator[ast.AST]:
+    """Yield the descendants of ``node`` (including itself) matching ``types``.
+
+    Exactly one :func:`ast.walk` pass with a single tuple-isinstance test, so
+    the yield order is identical to the inline ``for x in ast.walk(n): if
+    isinstance(x, T)`` form it replaces — including when two types are passed.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, types):
+            yield child
+
+
 def _issue(code: str, node: ast.AST, message: str) -> Issue:
     """Build an Issue from an AST node, defaulting line/col safely."""
     return Issue(
@@ -593,6 +618,16 @@ def _call_dotted_name(call: ast.Call) -> str | None:
         parts.append(func.id)
         return ".".join(reversed(parts))
     return None
+
+
+def _dotted(call: ast.Call) -> str:
+    """:func:`_call_dotted_name` with ``None`` normalised to ``""``.
+
+    For substring/suffix tests only. A check that must tell "not a dotted call"
+    apart from a real name (:func:`check_h6_deprecated_api`) needs the ``None``
+    and must keep calling :func:`_call_dotted_name` directly.
+    """
+    return _call_dotted_name(call) or ""
 
 
 def _is_test_file(filename: str) -> bool:
@@ -632,9 +667,7 @@ def _metric_literal_name(call: ast.Call) -> str | None:
 def check_h2_duplicate_metric(tree: ast.AST) -> list[Issue]:
     seen: dict[str, ast.Call] = {}
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
+    for node in _walk(tree, ast.Call):
         if _metric_ctor(node) is None:
             continue
         name = _metric_literal_name(node)
@@ -719,8 +752,8 @@ def check_h6_deprecated_api(tree: ast.AST) -> list[Issue]:
 # ---------------------------------------------------------------------------
 def check_h9_async_init(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "__init__":
+    for node in _walk(tree, ast.AsyncFunctionDef):
+        if node.name == "__init__":
             issues.append(_issue(
                 "H9", node,
                 "H9 'async def __init__' is not a valid async constructor — the "
@@ -740,10 +773,7 @@ _CHAIN_RE = re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*\([^()]*\)"
 
 def check_h4_method_chain(source: str) -> list[Issue]:
     issues: list[Issue] = []
-    for i, line in enumerate(source.splitlines(), start=1):
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            continue
+    for i, line in _iter_source_lines(source):
         m = _CHAIN_RE.search(line)
         if m:
             issues.append(_src_issue(
@@ -762,9 +792,7 @@ def check_h5_hardcoded_float_assert(tree: ast.AST, filename: str) -> list[Issue]
     if not _is_test_file(filename):
         return []
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assert):
-            continue
+    for node in _walk(tree, ast.Assert):
         test = node.test
         if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(
             test.ops[0], ast.Eq
@@ -793,9 +821,7 @@ def check_sd1_positional_index(source: str, filename: str) -> list[Issue]:
     if not _is_test_file(filename):
         return []
     issues: list[Issue] = []
-    for i, line in enumerate(source.splitlines(), start=1):
-        if line.lstrip().startswith("#"):
-            continue
+    for i, line in _iter_source_lines(source):
         m = _POS_INDEX_RE.search(line)
         if m:
             issues.append(_src_issue(
@@ -815,10 +841,7 @@ _SQL_RE = re.compile(r"\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM)\b", re.IGNO
 
 def check_sd2_hardcoded_sql(source: str) -> list[Issue]:
     issues: list[Issue] = []
-    for i, line in enumerate(source.splitlines(), start=1):
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            continue
+    for i, line in _iter_source_lines(source):
         if _SQL_RE.search(line) and ('"' in line or "'" in line):
             issues.append(_src_issue(
                 "SD2", i, 0,
@@ -837,8 +860,8 @@ def check_sd3_labeled_metric_bare_call(tree: ast.AST) -> list[Issue]:
     labelnames=), then flag bare .inc()/.set()/.observe() on that variable that
     do not first go through .labels(...)."""
     labeled: dict[str, ast.Call] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+    for node in _walk(tree, ast.Assign):
+        if isinstance(node.value, ast.Call):
             call = node.value
             if _metric_ctor(call) is None:
                 continue
@@ -854,9 +877,7 @@ def check_sd3_labeled_metric_bare_call(tree: ast.AST) -> list[Issue]:
         return []
 
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
+    for node in _walk(tree, ast.Call):
         fn = node.func
         if not (isinstance(fn, ast.Attribute) and fn.attr in {"inc", "set", "observe"}):
             continue
@@ -876,9 +897,7 @@ def check_sd3_labeled_metric_bare_call(tree: ast.AST) -> list[Issue]:
 # SS3 — Validation raise after an early-return guard (AST)
 # ---------------------------------------------------------------------------
 def _function_bodies(tree: ast.AST):
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield node
+    yield from _walk(tree, ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def check_ss3_validation_after_guard(tree: ast.AST) -> list[Issue]:
@@ -913,18 +932,15 @@ def check_ss3_validation_after_guard(tree: ast.AST) -> list[Issue]:
 # ---------------------------------------------------------------------------
 def check_ss5_per_record_swallow(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.For, ast.While)):
-            continue
+    for node in _walk(tree, ast.For, ast.While):
         for child in node.body:
             if not isinstance(child, ast.Try):
                 continue
             # try body must contain an execute()-ish call
             has_execute = any(
-                isinstance(c, ast.Call)
-                and isinstance(c.func, ast.Attribute)
+                isinstance(c.func, ast.Attribute)
                 and c.func.attr in {"execute", "executemany", "insert", "save"}
-                for c in ast.walk(child)
+                for c in _walk(child, ast.Call)
             )
             if not has_execute:
                 continue
@@ -1012,8 +1028,8 @@ def _assigned_names(stmts: list[ast.stmt]) -> set[str]:
 
 def _loaded_names(stmt: ast.stmt) -> set[str]:
     names: set[str] = set()
-    for node in ast.walk(stmt):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+    for node in _walk(stmt, ast.Name):
+        if isinstance(node.ctx, ast.Load):
             names.add(node.id)
     return names
 
@@ -1036,7 +1052,7 @@ def _with_is_patch(node: ast.With) -> bool:
     for item in node.items:
         ctx = item.context_expr
         if isinstance(ctx, ast.Call):
-            name = _call_dotted_name(ctx) or ""
+            name = _dotted(ctx)
             if name.endswith("patch") or ".patch." in (name + "."):
                 return True
     return False
@@ -1047,34 +1063,35 @@ def check_sl2_fixture_return_in_patch(tree: ast.AST) -> list[Issue]:
     for fn in _function_bodies(tree):
         if not _is_fixture(fn):
             continue
-        for node in ast.walk(fn):
-            if isinstance(node, ast.With) and _with_is_patch(node):
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Return):
-                        issues.append(_issue(
-                            "SL2", child,
-                            "SL2 pytest fixture uses `return` inside a "
-                            "`with mock.patch(...)` block — the patch is torn down "
-                            "at the return, so the test body hits the real backend. "
-                            "Use `yield` to keep the mock alive through the test.",
-                        ))
-                        break
+        for node in _walk(fn, ast.With):
+            if not _with_is_patch(node):
+                continue
+            for child in _walk(node, ast.Return):
+                issues.append(_issue(
+                    "SL2", child,
+                    "SL2 pytest fixture uses `return` inside a "
+                    "`with mock.patch(...)` block — the patch is torn down "
+                    "at the return, so the test body hits the real backend. "
+                    "Use `yield` to keep the mock alive through the test.",
+                ))
                 break
+            break
     return issues
 
 
 # ---------------------------------------------------------------------------
 # SB1 — json.dumps in a scope that also references numpy arrays (regex)
 # ---------------------------------------------------------------------------
+_JSON_DUMPS_RE = re.compile(r"\bjson\.dumps\s*\(")
+
+
 def check_sb1_ndarray_json(source: str) -> list[Issue]:
     has_numpy = bool(re.search(r"\bnp\.array\b|\bnumpy\b|\bndarray\b", source))
     if not has_numpy:
         return []
     issues: list[Issue] = []
-    for i, line in enumerate(source.splitlines(), start=1):
-        if line.lstrip().startswith("#"):
-            continue
-        m = re.search(r"\bjson\.dumps\s*\(", line)
+    for i, line in _iter_source_lines(source):
+        m = _JSON_DUMPS_RE.search(line)
         if m:
             issues.append(_src_issue(
                 "SB1", i, m.start(),
@@ -1090,8 +1107,8 @@ def check_sb1_ndarray_json(source: str) -> list[Issue]:
 # ---------------------------------------------------------------------------
 def check_ac2_unbounded_retry(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.While) and _is_true(node.test)):
+    for node in _walk(tree, ast.While):
+        if not _is_true(node.test):
             continue
         # body is essentially a single try whose except sleeps and loops
         tries = [s for s in node.body if isinstance(s, ast.Try)]
@@ -1100,9 +1117,8 @@ def check_ac2_unbounded_retry(tree: ast.AST) -> list[Issue]:
         for tnode in tries:
             for handler in tnode.handlers:
                 sleeps = [
-                    c for c in ast.walk(handler)
-                    if isinstance(c, ast.Call)
-                    and (_call_dotted_name(c) or "").endswith("sleep")
+                    c for c in _walk(handler, ast.Call)
+                    if _dotted(c).endswith("sleep")
                 ]
                 # no break / no raise / no attempt-cap in handler → unbounded
                 has_exit = any(
@@ -1129,10 +1145,10 @@ def _is_true(node: ast.expr) -> bool:
 # ---------------------------------------------------------------------------
 def check_ac4_orphan_task(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
+    for node in _walk(tree, ast.Expr):
         # bare expression statement that is asyncio.create_task(...)
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            name = _call_dotted_name(node.value) or ""
+        if isinstance(node.value, ast.Call):
+            name = _dotted(node.value)
             if name.endswith("create_task"):
                 issues.append(_issue(
                     "AC4", node,
@@ -1152,20 +1168,18 @@ def check_mf2_reconnect_no_jitter(tree: ast.AST) -> list[Issue]:
     asyncio.sleep / time.sleep with a plain constant arg and no random jitter
     is a reconnect-storm risk."""
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.For, ast.While)):
-            continue
-        calls = [c for c in ast.walk(node) if isinstance(c, ast.Call)]
+    for node in _walk(tree, ast.For, ast.While):
+        calls = list(_walk(node, ast.Call))
         has_connect = any(
-            "connect" in (_call_dotted_name(c) or "").lower() for c in calls
+            "connect" in _dotted(c).lower() for c in calls
         )
         if not has_connect:
             continue
-        uses_random = any("random" in (_call_dotted_name(c) or "") for c in calls)
+        uses_random = any("random" in _dotted(c) for c in calls)
         if uses_random:
             continue
         for c in calls:
-            name = _call_dotted_name(c) or ""
+            name = _dotted(c)
             if name.endswith("sleep") and c.args:
                 arg = c.args[0]
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, (int, float)):
@@ -1185,14 +1199,14 @@ def check_mf2_reconnect_no_jitter(tree: ast.AST) -> list[Issue]:
 # ---------------------------------------------------------------------------
 def check_mf3_log_in_loop(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.While) and _is_true(node.test)):
+    for node in _walk(tree, ast.While):
+        if not _is_true(node.test):
             continue
         for stmt in node.body:
             # a logger.warning/error called directly at loop top level (not
             # inside a state-change `if`)
             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-                name = _call_dotted_name(stmt.value) or ""
+                name = _dotted(stmt.value)
                 if name.endswith(("logger.warning", "logger.error",
                                   "log.warning", "log.error",
                                   "logging.warning", "logging.error")):
@@ -1211,9 +1225,7 @@ def check_mf3_log_in_loop(tree: ast.AST) -> list[Issue]:
 # ---------------------------------------------------------------------------
 def check_og1_swallowed_exception(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ExceptHandler):
-            continue
+    for node in _walk(tree, ast.ExceptHandler):
         body = node.body
         # handler body is only pass, or only `return None`/bare return
         only_pass = len(body) == 1 and isinstance(body[0], ast.Pass)
@@ -1273,7 +1285,7 @@ def _is_mutation(stmt: ast.stmt) -> bool:
     if isinstance(stmt, ast.Assign):
         return any(_is_self_attr(t) for t in stmt.targets)
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-        name = _call_dotted_name(stmt.value) or ""
+        name = _dotted(stmt.value)
         return name.endswith(("insert", "execute", "executemany", "append",
                               "write", "commit"))
     return False
@@ -1298,9 +1310,7 @@ _OUTBOUND_HINTS = ("post", "get", "put", "request", "send", "sendall",
 
 def check_wg1_noop_integration(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
+    for node in _walk(tree, ast.ClassDef):
         if not node.name.endswith(_WIRING_SUFFIXES):
             continue
         for item in node.body:
@@ -1309,15 +1319,14 @@ def check_wg1_noop_integration(tree: ast.AST) -> list[Issue]:
             if item.name not in _SEND_METHODS:
                 continue
             outbound = False
-            for c in ast.walk(item):
-                if isinstance(c, ast.Call):
-                    name = (_call_dotted_name(c) or "").lower()
-                    if any(name.endswith(h) for h in _OUTBOUND_HINTS):
-                        # exclude logger.* false positives by ignoring logger.
-                        if not name.startswith(("logger.", "log.", "logging.",
-                                                "print")):
-                            outbound = True
-                            break
+            for c in _walk(item, ast.Call):
+                name = _dotted(c).lower()
+                if any(name.endswith(h) for h in _OUTBOUND_HINTS):
+                    # exclude logger.* false positives by ignoring logger.
+                    if not name.startswith(("logger.", "log.", "logging.",
+                                            "print")):
+                        outbound = True
+                        break
             if not outbound:
                 issues.append(_issue(
                     "WG1", item,
@@ -1366,9 +1375,7 @@ _GAUGE_WORDS = ("depth", "size", "active", "current", "usage", "level",
 
 def check_mc1b_counter_should_be_gauge(tree: ast.AST) -> list[Issue]:
     issues: list[Issue] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
+    for node in _walk(tree, ast.Call):
         if _metric_ctor(node) != "Counter":
             continue
         metric_name = _metric_literal_name(node)

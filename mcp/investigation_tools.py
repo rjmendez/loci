@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
     _append_jsonl,
     _inv_dir,
@@ -35,7 +36,6 @@ _get_memory_dir = None
 _apply_lifecycle = None
 _compute_self_check = None
 _event_log_append = None
-_ladybug_upsert_investigation = None
 _qdrant_upsert = None
 
 
@@ -1047,12 +1047,11 @@ def register(mcp, get_memory_dir, deps):
     them explicitly (rather than importing server) is what keeps this module acyclic.
     """
     global _get_memory_dir, _apply_lifecycle, _compute_self_check
-    global _event_log_append, _ladybug_upsert_investigation, _qdrant_upsert
+    global _event_log_append, _qdrant_upsert
     _get_memory_dir = get_memory_dir
     _apply_lifecycle = deps["_apply_lifecycle"]
     _compute_self_check = deps["_compute_self_check"]
     _event_log_append = deps["_event_log_append"]
-    _ladybug_upsert_investigation = deps["_ladybug_upsert_investigation"]
     _qdrant_upsert = deps["_qdrant_upsert"]
     for fn in (
         investigation_start,

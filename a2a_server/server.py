@@ -53,10 +53,35 @@ Optional / tunable:
                             dependency here. Unset = cosine order (previous behaviour).
                             Fails open on any error.
   RERANK_TIMEOUT_S          Rerank request timeout. Default: 10
+  HERMES_ENV_FILE           Path to the .env file loaded at import time.
+                            Default: ~/.hermes/.env
+  EXTRA_RAG_COLLECTIONS     Comma-separated extra Qdrant collections appended to
+                            the core three for rag_search / memory_stats.
+                            Default: '' (core collections only)
+  EMBED_API_KEY             API key for the embedding endpoint. Default: ''
+                            (no auth header sent)
+  EMBED_API_KEY_HEADER      Header carrying EMBED_API_KEY. 'Authorization'
+                            sends 'Bearer <key>'; any other name sends the raw
+                            key.  Default: Authorization
+  PEER_A2A_URLS             Comma-separated peer A2A base URLs for the fan-out
+                            skills (memory_broadcast, memory_prime).
+                            Default: '' (fan-out returns "not configured")
+  PEER_A2A_TOKEN            Shared Bearer token used for every peer. Default: ''
+  PEER_A2A_TOKENS_JSON      JSON dict base_url -> token; overrides
+                            PEER_A2A_TOKEN per peer. Default: '{}'
+  PEER_A2A_TOTP_SEED        Shared base32 TOTP seed for peers requiring X-TOTP.
+                            Default: ''
+  PEER_A2A_TOTP_SEEDS_JSON  JSON dict base_url -> seed; overrides
+                            PEER_A2A_TOTP_SEED per peer. Default: '{}'
+  SAR_PRIMING_STATE_PATH    Where memory_prime persists per-peer priming state.
+                            Default: ~/.hermes/sar-priming.json
+  UA_SEARCH_SCRIPT          Path to the external UA search helper script.
+                            Default: '' (skill returns "not configured")
 
 Qdrant (shared with session_end_sync.py + state_db_qdrant_sync.py):
 
-  QDRANT_URL                Default: http://localhost:6333
+  QDRANT_URL                Default: none — unset disables Qdrant-backed legs
+                            (they fail open to [])
   QDRANT_API_KEY            Qdrant API key.  No default — set in .env.
 
 Ollama embedding (shared with sync scripts):
@@ -75,9 +100,9 @@ EXTERNAL SERVICE DEPENDENCIES
 
 Qdrant  http://localhost:6333
   Collections used:
-    mnemosyne        198 pts  768d/Cosine  named-vector "dense"
-    hermes_sessions  151 pts  768d/Cosine  named-vector "dense"
-    hermes_memory     89 pts  768d/Cosine  named-vector "dense"
+    mnemosyne        768d/Cosine  named-vector "dense"
+    hermes_sessions  768d/Cosine  named-vector "dense"
+    hermes_memory    768d/Cosine  named-vector "dense"
   Auth: api-key header from QDRANT_API_KEY
   Used by: memory_recall (semantic), session_search, memory_stats
   NOTE: search payload must include "vector": {"name": "dense", "vector": [...]}
@@ -116,28 +141,9 @@ ENDPOINTS
 SKILLS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  memory_recall    FTS5 (fts_working + fts_episodes) + optional Qdrant semantic
-                   Input:  {query: str, top_k?: int=5, semantic?: bool=true}
-                   Output: {memories: [...], total: int, query: str}
-
-  memory_remember  Write a memory to SQLite memories table.
-                   Input:  {content: str, source?: str, importance?: float=0.5,
-                            bank?: str="default"}
-                   Output: {id: str, status: "stored", bank: str, importance: float}
-                   Note:   metadata_json records sender + HERMES_AGENT_ID for
-                           cross-agent provenance (per PR #1 pattern).
-
-  memory_stats     Point counts across all monitored tables and Qdrant collections.
-                   Input:  {}
-                   Output: {sqlite: {...}, qdrant: {...}, db_path: str}
-
-  session_search   Semantic search over hermes_sessions Qdrant collection.
-                   Input:  {query: str, top_k?: int=5, agent_id?: str}
-                   Output: {sessions: [...], total: int, query: str}
-
-  memory_sleep     Trigger Mnemosyne consolidation (working → episodic).
-                   Input:  {dry_run?: bool=false}
-                   Output: {status: "consolidated"|"deferred", ...}
+  Skills are defined by _SKILL_MAP (single source of truth, also served by
+  GET /health); their public descriptions live in AGENT_CARD. See the root
+  README.md "A2A skills (13)" table.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 JSON-RPC CALL SHAPE
@@ -173,6 +179,7 @@ JSON-RPC CALL SHAPE
 
 import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets
 from typing import Optional, Any
+from contextlib import contextmanager
 
 # ── load .env before anything else ─────────────────────────────────────────────
 # Override with HERMES_ENV_FILE env var. Default searches ~/.hermes/.env then
@@ -230,16 +237,13 @@ _EXTRA_RAG_COLLECTIONS = [
     if c.strip()
 ]
 
-# Optional named collection for domain-specific skills. Skill returns "not configured"
-# if the env var is unset, so the server works without the backing collection.
-_LOG_AGENT_ID = os.environ.get('HERMES_AGENT_ID', 'hermes-agent')
 logging.basicConfig(level=logging.INFO,
-                    format=f'%(asctime)s [{_LOG_AGENT_ID}] %(message)s')
+                    format=f'%(asctime)s [{AGENT_ID}] %(message)s')
 log = logging.getLogger(__name__)
 
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
 AGENT_CARD = {
-    'name': _LOG_AGENT_ID,
+    'name': AGENT_ID,
     'description': (
         'Persistent memory and knowledge node for the Hermes agent mesh. '
         'FTS + semantic search over session history, episodic memory, and working memory. '
@@ -381,7 +385,7 @@ def _store_task(task_id: str, task: dict) -> None:
 _session_tokens: dict[str, datetime.datetime] = {}
 
 # ── FastAPI app + auth ──────────────────────────────────────────────────────────
-app = FastAPI(title=f'{_LOG_AGENT_ID} A2A', version='0.1.0')
+app = FastAPI(title=f'{AGENT_ID} A2A', version='0.1.0')
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -434,7 +438,6 @@ def _verify_totp(request: Request,
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
-from contextlib import contextmanager
 
 @contextmanager
 def _db():
@@ -507,18 +510,9 @@ async def _qdrant_search(
 
 
 # ── skill: memory_recall ────────────────────────────────────────────────────────
-async def skill_memory_recall(task: dict) -> dict:
-    inp      = task.get('input', {})
-    query    = (inp.get('query') or task.get('message', '')).strip()
-    top_k    = int(inp.get('top_k', 5))
-    do_sem   = inp.get('semantic', True)
-
-    if not query:
-        return {'error': 'query is required'}
-
-    results = []
-
-    # 1. FTS on fts_working (stores id + content directly — not external content)
+def _recall_fts_working(query: str, top_k: int) -> list:
+    """FTS on fts_working (stores id + content directly — not external content)."""
+    out = []
     try:
         with _db() as conn:
             rows = conn.execute(
@@ -526,15 +520,19 @@ async def skill_memory_recall(task: dict) -> dict:
                 (query, top_k)
             ).fetchall()
             for r in rows:
-                results.append({
+                out.append({
                     'id': r['id'], 'content': r['content'],
                     'tier': 'working', 'source': 'fts_working', 'score': 0.8,
                     'importance': 0.5, 'created_at': ''
                 })
     except Exception as e:
         log.warning(f'fts_working search: {e}')
+    return out
 
-    # 2. FTS on fts_episodes (external content table — join via rowid)
+
+def _recall_fts_episodes(query: str, top_k: int) -> list:
+    """FTS on fts_episodes (external content table — join via rowid)."""
+    out = []
     try:
         with _db() as conn:
             rows = conn.execute(
@@ -545,7 +543,7 @@ async def skill_memory_recall(task: dict) -> dict:
                 (query, top_k)
             ).fetchall()
             for r in rows:
-                results.append({
+                out.append({
                     'id': r['id'], 'content': r['content'],
                     'importance': float(r['importance'] or 0.5),
                     'created_at': r['created_at'] or '',
@@ -553,8 +551,12 @@ async def skill_memory_recall(task: dict) -> dict:
                 })
     except Exception as e:
         log.warning(f'fts_episodes search: {e}')
+    return out
 
-    # 3. LIKE fallback on plain memories table (no FTS index on this table)
+
+def _recall_memories_like(query: str, top_k: int, seen: set) -> list:
+    """LIKE fallback on plain memories table (no FTS index on this table)."""
+    out = []
     try:
         with _db() as conn:
             rows = conn.execute(
@@ -562,10 +564,9 @@ async def skill_memory_recall(task: dict) -> dict:
                 "WHERE content LIKE ? LIMIT ?",
                 (f'%{query}%', top_k)
             ).fetchall()
-            seen = {r['id'] for r in results}
             for r in rows:
                 if r['id'] not in seen:
-                    results.append({
+                    out.append({
                         'id': r['id'], 'content': r['content'],
                         'importance': float(r['importance'] or 0.5),
                         'created_at': r['created_at'] or '',
@@ -573,26 +574,48 @@ async def skill_memory_recall(task: dict) -> dict:
                     })
     except Exception as e:
         log.warning(f'memories LIKE search: {e}')
+    return out
 
-    # 4. Semantic via Qdrant mnemosyne collection
-    if do_sem:
-        vec = await _embed(query)
-        if vec:
-            hits = await _qdrant_search('mnemosyne', vec, top_k=top_k)
-            seen_ids = {r['id'] for r in results}
-            for h in hits:
-                pl = h.get('payload', {})
-                mid = pl.get('memory_id', str(h.get('id', '')))
-                if float(h.get('score', 0)) < 0.59:
-                    continue
-                if mid not in seen_ids:
-                    results.append({
-                        'id': mid, 'content': pl.get('content', ''),
-                        'importance': float(pl.get('importance', 0.5)),
-                        'created_at': pl.get('created_at', ''),
-                        'tier': 'episodic', 'source': 'qdrant_mnemosyne',
-                        'score': round(float(h.get('score', 0)), 4)
-                    })
+
+async def _recall_semantic(query: str, top_k: int, seen_ids: set) -> list:
+    """Semantic via Qdrant mnemosyne collection."""
+    out = []
+    vec = await _embed(query)
+    if vec:
+        hits = await _qdrant_search('mnemosyne', vec, top_k=top_k)
+        for h in hits:
+            pl = h.get('payload', {})
+            mid = pl.get('memory_id', str(h.get('id', '')))
+            if float(h.get('score', 0)) < 0.59:
+                continue
+            if mid not in seen_ids:
+                out.append({
+                    'id': mid, 'content': pl.get('content', ''),
+                    'importance': float(pl.get('importance', 0.5)),
+                    'created_at': pl.get('created_at', ''),
+                    'tier': 'episodic', 'source': 'qdrant_mnemosyne',
+                    'score': round(float(h.get('score', 0)), 4)
+                })
+    return out
+
+
+async def skill_memory_recall(task: dict) -> dict:
+    inp      = task.get('input', {})
+    query    = (inp.get('query') or task.get('message', '')).strip()
+    top_k    = int(inp.get('top_k', 5))
+    do_sem   = inp.get('semantic', True)
+
+    if not query:
+        return {'error': 'query is required'}
+
+    results = []
+    results += _recall_fts_working(query, top_k)          # 1. FTS on fts_working
+    results += _recall_fts_episodes(query, top_k)         # 2. FTS on fts_episodes
+    results += _recall_memories_like(                     # 3. LIKE on memories
+        query, top_k, {r['id'] for r in results})
+    if do_sem:                                            # 4. Semantic via Qdrant
+        results += await _recall_semantic(
+            query, top_k, {r['id'] for r in results})
 
     # Sort by score desc, deduplicate, cap at top_k
     results.sort(key=lambda x: x.get('score', 0), reverse=True)
@@ -650,7 +673,8 @@ async def skill_memory_stats(task: dict) -> dict:
                 try:
                     n = conn.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
                     sqlite_stats[tbl] = n
-                except Exception:
+                except Exception as e:
+                    log.debug(f'memory_stats: table {tbl}: {e}')
                     sqlite_stats[tbl] = -1
     except Exception as e:
         sqlite_stats['error'] = str(e)
@@ -844,8 +868,6 @@ async def skill_rag_search(task: dict) -> dict:
     if not vec:
         return {'error': 'embedding failed — Ollama may be unreachable', 'results': []}
 
-    import asyncio
-
     async def _search_one(col: str) -> list:
         hits = await _qdrant_search(col, vec, top_k=top_k)
         results = []
@@ -924,11 +946,15 @@ def _peer_credentials() -> tuple[dict, str, dict, str]:
     default_seed  = os.environ.get('PEER_A2A_TOTP_SEED', '')
     try:
         token_map = json.loads(os.environ.get('PEER_A2A_TOKENS_JSON', '{}'))
-    except Exception:
+    except Exception as e:
+        log.debug(f'_peer_credentials: PEER_A2A_TOKENS_JSON unparseable ({e!r}) '
+                  f'— falling back to per-peer map {{}}')
         token_map = {}
     try:
         seed_map = json.loads(os.environ.get('PEER_A2A_TOTP_SEEDS_JSON', '{}'))
-    except Exception:
+    except Exception as e:
+        log.debug(f'_peer_credentials: PEER_A2A_TOTP_SEEDS_JSON unparseable ({e!r}) '
+                  f'— falling back to per-peer map {{}}')
         seed_map = {}
     return token_map, default_token, seed_map, default_seed
 
@@ -959,6 +985,41 @@ def _peer_headers(peer_url: str, token_map: dict, default_token: str,
         except Exception as e:
             return None, f'invalid TOTP seed: {e}'
     return headers, None
+
+
+def _peer_targets() -> list[tuple[str, Optional[dict], Optional[str]]]:
+    """
+    Resolve PEER_A2A_URLS into one (peer_url, headers, skip_reason) triple per
+    peer, in the order they appear in the env var. Credentials are read once.
+
+    headers is None exactly when the peer is not callable, in which case
+    skip_reason says why; otherwise skip_reason is None.
+    """
+    token_map, default_token, seed_map, default_seed = _peer_credentials()
+    targets: list[tuple[str, Optional[dict], Optional[str]]] = []
+    for raw in os.environ.get('PEER_A2A_URLS', '').split(','):
+        peer_url = raw.strip()
+        if not peer_url:
+            continue
+        headers, reason = _peer_headers(
+            peer_url, token_map, default_token, seed_map, default_seed)
+        targets.append((peer_url, headers, reason))
+    return targets
+
+
+def _peer_task_payload(skill_id: str, message: str, inp: dict) -> dict:
+    """Build the JSON-RPC tasks/send envelope used for every peer fan-out."""
+    return {
+        'jsonrpc': '2.0',
+        'id': str(uuid.uuid4()),
+        'method': 'tasks/send',
+        'params': {
+            'skill_id': skill_id,
+            'message':  message,
+            'input':    inp,
+            'sender':   AGENT_ID,
+        },
+    }
 
 
 async def skill_context_broadcast(task: dict) -> dict:
@@ -1003,32 +1064,19 @@ async def skill_context_broadcast(task: dict) -> dict:
         stored_locally = False
 
     # 2. Fan-out to peers
-    peer_urls_raw = os.environ.get('PEER_A2A_URLS', '')
-    token_map, default_token, seed_map, default_seed = _peer_credentials()
-
-    peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
+    targets   = _peer_targets()
+    peer_urls = [u for u, _, _ in targets]
     broadcast_results = []
 
-    import uuid as _uuid
-
-    async def _push_to_peer(peer_url: str):
-        headers, reason = _peer_headers(
-            peer_url, token_map, default_token, seed_map, default_seed)
+    async def _push_to_peer(peer_url: str, headers: Optional[dict], reason: Optional[str]):
         if headers is None:
             return {'peer': peer_url, 'status': 'skipped', 'error': reason}
 
-        payload = {
-            'jsonrpc': '2.0',
-            'id': str(_uuid.uuid4()),
-            'method': 'tasks/send',
-            'params': {
-                'skill_id': 'memory_remember',
-                'message':  content,
-                'input':    {'content': content, 'source': f'broadcast:{AGENT_ID}',
-                             'importance': importance, 'bank': bank},
-                'sender':   AGENT_ID,
-            }
-        }
+        payload = _peer_task_payload(
+            'memory_remember', content,
+            {'content': content, 'source': f'broadcast:{AGENT_ID}',
+             'importance': importance, 'bank': bank},
+        )
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
@@ -1044,8 +1092,7 @@ async def skill_context_broadcast(task: dict) -> dict:
             return {'peer': peer_url, 'status': 'error', 'error': str(e)}
 
     if peer_urls:
-        import asyncio as _asyncio
-        results = await _asyncio.gather(*[_push_to_peer(u) for u in peer_urls])
+        results = await asyncio.gather(*[_push_to_peer(*t) for t in targets])
         broadcast_results = list(results)
         log.info(f'context_broadcast: pushed to {len(peer_urls)} peers — '
                  f'{sum(1 for r in broadcast_results if r.get("status") == "ok")} ok')
@@ -1254,7 +1301,7 @@ async def skill_ua_search(task: dict) -> dict:
     if not query:
         return {'error': 'query required'}
 
-    import subprocess, sys
+    import subprocess
     ua_script = os.environ.get('UA_SEARCH_SCRIPT', '')
     if not ua_script or not os.path.exists(ua_script):
         return {'error': 'UA_SEARCH_SCRIPT env var not set or script not found', 'query': query}
@@ -1288,7 +1335,6 @@ async def skill_memory_prime(task: dict) -> dict:
     (~/.hermes/sar-priming.json) and read by the grounding hook / memcheck
     to lower block thresholds for the primed topic window.
     """
-    import time as _time
     inp              = task.get('input', {})
     topic            = str(inp.get('topic', '') or task.get('message', '')).strip()
     skepticism_delta = float(inp.get('skepticism_delta', 0.2))
@@ -1307,17 +1353,19 @@ async def skill_memory_prime(task: dict) -> dict:
     try:
         with open(state_path) as f:
             state: dict = json.load(f)
-    except Exception:
+    except Exception as e:
+        log.debug(f'memory_prime: priming state at {state_path} unreadable '
+                  f'({e!r}) — starting fresh')
         state = {}
 
-    expires_at = int(_time.time()) + ttl_seconds
+    expires_at = int(time.time()) + ttl_seconds
     state[topic] = {
         'skepticism_delta': skepticism_delta,
         'expires_at': expires_at,
         'source': task.get('sender', AGENT_ID),
     }
     # Prune expired entries while we have the file open.
-    now_ts = int(_time.time())
+    now_ts = int(time.time())
     state  = {t: v for t, v in state.items() if v.get('expires_at', 0) > now_ts}
 
     try:
@@ -1336,27 +1384,16 @@ async def skill_memory_prime(task: dict) -> dict:
 
     broadcast_results = []
     if do_broadcast:
-        peer_urls_raw = os.environ.get('PEER_A2A_URLS', '')
-        token_map, default_token, seed_map, default_seed = _peer_credentials()
-        peer_urls = [u.strip() for u in peer_urls_raw.split(',') if u.strip()]
+        targets = _peer_targets()
 
-        import uuid as _uuid
-
-        async def _prime_peer(peer_url: str):
-            headers, reason = _peer_headers(
-                peer_url, token_map, default_token, seed_map, default_seed)
+        async def _prime_peer(peer_url: str, headers: Optional[dict], reason: Optional[str]):
             if headers is None:
                 return {'peer': peer_url, 'status': 'skipped', 'error': reason}
-            payload = {
-                'jsonrpc': '2.0', 'id': str(_uuid.uuid4()), 'method': 'tasks/send',
-                'params': {
-                    'skill_id': 'memory_prime',
-                    'message': topic,
-                    'input': {'topic': topic, 'skepticism_delta': skepticism_delta,
-                              'ttl_seconds': ttl_seconds, 'broadcast': False},
-                    'sender': AGENT_ID,
-                },
-            }
+            payload = _peer_task_payload(
+                'memory_prime', topic,
+                {'topic': topic, 'skepticism_delta': skepticism_delta,
+                 'ttl_seconds': ttl_seconds, 'broadcast': False},
+            )
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
@@ -1369,7 +1406,7 @@ async def skill_memory_prime(task: dict) -> dict:
                 return {'peer': peer_url, 'status': 'error', 'error': str(e)}
 
         broadcast_results = await asyncio.gather(
-            *[_prime_peer(u) for u in peer_urls], return_exceptions=False
+            *[_prime_peer(*t) for t in targets], return_exceptions=False
         )
 
     return {
@@ -1550,7 +1587,7 @@ async def _handle_task_get(rpc_id: str, params: dict) -> JSONResponse:
 
 # ── entrypoint ───────────────────────────────────────────────────────────────────
 def main() -> None:
-    log.info(f'{_LOG_AGENT_ID} A2A v0.1.0  {A2A_HOST}:{A2A_PORT}')
+    log.info(f'{AGENT_ID} A2A v0.1.0  {A2A_HOST}:{A2A_PORT}')
     log.info(f'Agent card:    {AGENT_URL}/.well-known/agent.json')
     log.info(f'Mnemosyne DB:  {MNEMOSYNE_DB}  ({"found" if os.path.exists(MNEMOSYNE_DB) else "MISSING"})')
     log.info(f'Qdrant:        {QDRANT_URL}')
