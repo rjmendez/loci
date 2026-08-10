@@ -106,3 +106,44 @@ def test_backfill_of_preexisting_findings(srv, tmp_path):
         shutil.rmtree(graph_path, ignore_errors=True)
     ks2 = S._get_ladybug()  # empty graph -> backfill runs
     assert ks2.code_query("MATCH (f:Finding) RETURN count(f)")[0][0] == 2
+
+
+def test_relink_invalidates_the_symbol_index_cache(tmp_path, monkeypatch):
+    """code_memory_relink must actually drop the cached symbol index.
+
+    Regression: graph_tools.code_memory_relink declared
+    `global _symbol_index_cache, _symbol_index_count` and assigned None/-1. Those
+    names are not defined in graph_tools, so the `global` bound them in
+    graph_tools' OWN namespace and the real cache -- which lives in ladybug_ops --
+    was never touched. Auto-linking after a relink kept using a stale index until
+    the CodeSymbol count happened to change; a relink that rewires edges without
+    changing the symbol count never triggered a rebuild, producing wrong or
+    missing REFERENCES edges on findings stored afterwards.
+    """
+    import graph_tools
+    import ladybug_ops
+
+    # Prime the cache with a recognisable value.
+    ladybug_ops._symbol_index_cache = {"sentinel": True}
+    ladybug_ops._symbol_index_count = 7
+
+    # Force relink_all to succeed without needing a live graph.
+    class _FakeLinker:
+        @staticmethod
+        def relink_all(ks):
+            return {"relinked": 0}
+
+    monkeypatch.setattr(graph_tools, "_get_kuzu", lambda: object(), raising=False)
+    monkeypatch.setattr(graph_tools, "_get_ladybug", lambda: object(), raising=False)
+    import sys, types
+    fake_graph = types.ModuleType("graph")
+    fake_graph.linker = _FakeLinker
+    monkeypatch.setitem(sys.modules, "graph.linker", _FakeLinker)
+
+    graph_tools.code_memory_relink()
+
+    assert ladybug_ops._symbol_index_cache is None, (
+        "relink did not clear the real cache — the invalidation wrote to the "
+        "wrong namespace"
+    )
+    assert ladybug_ops._symbol_index_count == -1
