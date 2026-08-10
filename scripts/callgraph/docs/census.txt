@@ -1,0 +1,611 @@
+================================================================================
+                    CALL-GRAPH CENSUS REPORT
+            Dispatch patterns and constructs in mcp/ | scripts/ | a2a_server/ | mlops/ | eval/
+
+Generated: 2026-08-10
+Target: Build dependency-light call-graph tool for debugging (no LadybugDB required)
+================================================================================
+
+EXECUTIVE SUMMARY
+─────────────────
+
+A call-graph builder for this codebase MUST handle:
+
+  1. 40 @mcp.tool() decorated functions — never called by name, registered dynamically
+  2. ~30 register(mcp, deps) functions — pass bare function references in tuple/list literals
+  3. 856 bare function references in tuple/list/dict literals (registration manifests)
+  4. 288 local imports (import INSIDE function bodies — not module-level)
+  5. 2 importlib.import_module() calls (dynamic module loading)
+  6. 2,140 direct calls (Name + Attribute chains)
+  7. 280 plain function/method defs across target areas
+  8. 22 decorated defs (decorators other than @mcp.tool)
+  9. 240 module-level imports
+  10. 187 string literals that look like paths or special identifiers
+
+The corpus spans 13,805 files total; focus areas have ~150 "real" .py files. Target
+analysis regions (mcp/graph/** + mcp/memcheck/**): 28 files, 7,277 lines.
+
+================================================================================
+I. PLAIN FUNCTION & METHOD DEFINITIONS
+================================================================================
+
+Census: 280 plain function/method defs across mcp/ + scripts/ + a2a_server/ + mlops/ + eval/
+
+Distribution by directory:
+  mcp/               ~150 functions
+  a2a_server/        ~40 functions
+  scripts/           ~50 functions
+  eval/              ~30 functions
+  mlops/             ~10 functions
+
+Examples (from target areas):
+
+  File: mcp/graph/code_parse.py:66
+    def detect_lang(path: str) -> Optional[str]:
+        """Detect language from file extension."""
+
+  File: mcp/graph/ladybug_store.py:313
+    @contextmanager
+    def _session(self):
+        """Context manager for database sessions."""
+
+  File: mcp/graph/analytics.py:45
+    def impact_report(ks, symbol):
+        """Change blast radius for a symbol."""
+
+  File: mcp/memcheck/checks/code_hallucination.py:57
+    def run_code_checks(llm, code, context: CodeContext) -> list[VerdictReading]:
+        """Check for code hallucinations."""
+
+Methods on classes (mcp/graph/ladybug_store.py has LadybugStore class):
+  - __init__(self, db_path: str)  [line 143]
+  - available(self) -> bool  [line 173]
+  - code_query(self, cypher: str, params: dict = None)  [line 185]
+  - upsert_investigation(self, **fields)  [line 494]
+  - upsert_finding(self, **fields)  [line 508]
+
+================================================================================
+II. DECORATED FUNCTION DEFINITIONS (grouped by decorator)
+================================================================================
+
+Census: 22 decorated defs total, 7 distinct decorator patterns
+
+Distribution:
+  _writes               11 occurrences  (custom LadybugDB write-session decorator)
+  abc.abstractmethod     3 occurrences  (abstract methods)
+  @staticmethod          4 occurrences  (static methods on classes)
+  @classmethod           2 occurrences  (class methods)
+  @contextmanager        1 occurrence   (context manager)
+  functools.wraps        1 occurrence   (wrapper decorator)
+
+Concrete examples:
+
+  1. @mcp.tool() — FastMCP registration decorator
+     File: mcp/server.py:2118
+       @mcp.tool()
+       def investigation_store(investigation_id: str, finding_type: str, ...):
+           """Record an observation, inference, or assumption."""
+
+     File: mcp/server.py:2258
+       @mcp.tool()
+       def finding_resolve(finding_id: str, status: str):
+           """Resolve a finding (mark as fixed/duplicate/wontfix)."""
+
+     TOTAL: 40 @mcp.tool() decorated functions across mcp/server.py
+
+  2. _writes decorator (custom multi-statement write pattern)
+     File: mcp/graph/ladybug_store.py:494
+       @_writes
+       def upsert_investigation(self, **fields):
+           """Atomically write investigation to graph store."""
+
+     File: mcp/graph/ladybug_store.py:508
+       @_writes
+       def upsert_finding(self, **fields):
+           """Record finding node in graph."""
+
+     TOTAL: 11 occurrences; defined at mcp/graph/ladybug_store.py:38
+
+  3. abc.abstractmethod (abstract base class methods)
+     File: mcp/memcheck/backend.py:70
+       @abc.abstractmethod
+       def record(self, verdict: ScoredVerdict) -> bool:
+           """Write a verdict to the backend."""
+
+     File: mcp/memcheck/backend.py:75
+       @abc.abstractmethod
+       def recall(self, finding_id: str) -> Optional[ScoredVerdict]:
+           """Retrieve a stored verdict."""
+
+  4. @staticmethod
+     File: mcp/graph/ladybug_store.py:450
+       @staticmethod
+       def _close_result(result):
+           """Close a database cursor."""
+
+  5. @classmethod
+     File: mcp/memcheck/engine.py:63
+       @classmethod
+       def in_memory(cls):
+           """Create an in-memory verdict engine."""
+
+     File: mcp/memcheck/verdict.py:101
+       @classmethod
+       def from_payload(cls, payload: dict):
+           """Deserialize verdict from JSON."""
+
+  6. @contextmanager
+     File: mcp/graph/ladybug_store.py:313
+       @contextmanager
+       def _session(self):
+           """Lease a database session with bounded timeout."""
+
+================================================================================
+III. DIRECT CALLS (Name + Attribute chains)
+================================================================================
+
+Census: 2,140 direct calls across corpus
+  - Name calls (direct function name):    1,066
+  - Attribute calls (obj.method):         1,074
+
+Call patterns are standard; examples of each:
+
+  File: mcp/graph/code_parse.py:66
+    Name call:
+      lang = LANG_BY_EXT.get(ext)  # lookup in dict
+      Call: get() [Attribute]
+
+  File: mcp/graph/analytics.py:27
+    Name call:
+      bool_result = ks.available()  # method call
+      Call: available() [Attribute]
+
+  File: mcp/graph/code_parse.py:32
+    Module-level call:
+      logger.debug("...")  # logging
+      Call: logger.debug() [Attribute]
+
+Common patterns:
+  - Method calls on self: self.available(), self.code_query()
+  - Dict operations: dict.get(), dict.items(), dict.setdefault()
+  - String operations: str.split(), str.strip(), str.startswith()
+  - Logging: logger.debug(), logger.error()
+  - Object creation: Path(...), dict(...), list(...)
+
+================================================================================
+IV. REGISTRATION ROOTS: @mcp.tool() DECORATED FUNCTIONS
+================================================================================
+
+Census: 40 @mcp.tool() decorated functions (never called by name, only registered)
+
+Location: mcp/server.py (all 40 in a single file)
+
+Key registration roots:
+  Line 2118:  investigation_store(investigation_id, finding_type, text, ...)
+  Line 2258:  finding_resolve(finding_id, status)
+  Line 2327:  procedure_attempt(procedure_id, attempt_text)
+  Line 2420:  procedure_search(investigation_id, query)
+  Line 2538:  reflection_loop_seed(iteration_limit)
+  Line 2635:  reflection_loop_status()
+  Line 2776:  reflection_loop_tick()
+  Line 3053:  investigation_search(investigation_id, query, top_k)
+  Line 3274:  investigation_pre_answer_check(investigation_id, response)
+  Line 3425:  investigation_entity_lookup(investigation_id, entity_name)
+  Line 3490:  entity_list(investigation_id)
+  Line 3541:  entity_timeline(investigation_id, entity_name)
+  Line 3620:  investigation_related_cases(investigation_id)
+  Line 3693:  investigation_evidence_precheck(investigation_id, query)
+  Line 3779:  audit_log(tool_name, result, start_time, error_msg)
+
+These functions are never called by their Python name; FastMCP's introspection
+reads their decorators and signatures, then dispatches via HTTP MCP protocol.
+
+================================================================================
+V. REGISTRATION MANIFESTS: register(mcp, deps) PATTERN
+================================================================================
+
+Census: ~30 register() functions across mcp/ (zero in other directories)
+
+Pattern: Each module defines tools with a bare register() that:
+  1. Accepts a FastMCP instance + dependency injector
+  2. Takes bare function references in a tuple/list (not strings)
+  3. Calls mcp.tool()(fn) for each, registering them on the shared instance
+
+Example: mcp/graph_tools.py
+
+  File: mcp/graph_tools.py (full register function)
+
+    _get_ladybug = None  # module-level, injected by register()
+
+    def register(mcp, get_ladybug):
+        """Inject deps and register every graph tool on the shared FastMCP instance."""
+        global _get_ladybug
+        _get_ladybug = get_ladybug
+
+        for fn in (
+            code_graph_ingest,          # bare function ref (tuple literal)
+            code_graph_query,
+            code_memory_relink,
+            code_memory_map,
+            symbol_impact,
+            impact_report,
+            finding_code_context,
+            investigation_code_briefing,
+            subsystem_report,
+            related_investigations_via_code,
+            dead_code_candidates,
+        ):
+            mcp.tool()(fn)  # register each tool via decorator
+
+Call site (mcp/server.py:7398):
+
+    import graph_tools
+    graph_tools.register(mcp, _get_ladybug)
+
+Other examples:
+  File: mcp/llm_tools.py:register(mcp)
+    Registers: llm_json, llm_extract, llm_rank, llm_rewrite, ...
+
+  File: mcp/investigation_tools.py:register(mcp, get_memory_dir, deps)
+    Registers: investigation_start, investigation_load, investigation_reflect, ...
+
+  File: mcp/ladybug_ops.py:register(get_ladybug, get_memory_dir)
+    Registers: graph_impact, symbol_impact_v2, finding_code_context_v2, ...
+
+================================================================================
+VI. BARE FUNCTION REFERENCES IN TUPLE/LIST/DICT LITERALS
+================================================================================
+
+Census: 856 bare function references in literals (not strings)
+
+This is a KEY pattern for call-graph builders. Examples show why:
+
+  File: mcp/graph_tools.py (shown above):
+    Tuple of bare function refs — each name must resolve to a function definition
+    for fn in (
+        code_graph_ingest,        # <- bare ref, must resolve to function def
+        code_graph_query,
+        symbol_impact,
+        ...
+    ):
+        mcp.tool()(fn)
+
+  File: mcp/backends.py (function-local dict):
+    def _resolve_vllm_model(model_name: str):
+        from backends import models  # local import
+        supported = {
+            "mistral-7b": models.mistral,       # <- bare ref to imported module.attr
+            "llama-2-7b": models.llama2,
+        }
+        return supported.get(model_name)()
+
+  File: a2a_server/server.py (module-level tuple dispatch):
+    # Line 375
+    (str, dict)  # built-in types, not callables but treated as "refs"
+
+  File: a2a_server/server.py (module-level function tuple):
+    # Line 520
+    def _recall_fts_working(query, top_k):
+        ...
+
+    def _recall_fts_episodes(query, top_k):
+        ...
+
+    # used in tuple literal
+    (_recall_fts_working, _recall_fts_episodes)
+
+Distribution:
+  mcp/           394 bare refs
+  scripts/       277 bare refs
+  a2a_server/     50 bare refs
+  mlops/          92 bare refs
+  eval/           43 bare refs
+
+================================================================================
+VII. DICT-OF-CALLABLES DISPATCH
+================================================================================
+
+Census: 23 dict-of-callables assignments (some are test doubles, data, not dispatch)
+
+True dispatch dicts (handlers keyed by string):
+
+  File: mcp/memcheck/checks/code_hallucination.py:46
+    _LH_TO_PATTERN = {
+        'LLM_HALLUCINATION_FUNCTION_CALL': 'suspected_function_call',
+        'LLM_HALLUCINATION_OBJECT_ATTR': 'suspected_attr_access',
+        'LLM_HALLUCINATION_IMPORT': 'suspected_import',
+        'LLM_HALLUCINATION_BUILTIN': 'suspected_builtin',
+    }
+    [Maps string verdict codes to pattern identifiers]
+
+  File: mcp/memcheck/checks/contradiction.py:35
+    _CONF_PROTECTION = {
+        'high': 0.9,
+        'medium': 0.6,
+        'low': 0.3,
+    }
+    [Config dispatch: string confidence level -> float threshold]
+
+  File: mcp/verdict_ops.py (function-local):
+    _VERDICT_MAP = {
+        'HALLUCINATED': VerdictType.HALLUCINATED,
+        'OUTDATED': VerdictType.OUTDATED,
+        'CONTRADICTED': VerdictType.CONTRADICTED,
+    }
+    [Enum-like mapping; string -> function/type]
+
+Data-like dicts (not dispatch):
+  File: mcp/graph/queries.py:38
+    _PK = {
+        'CodeSymbol': 'id',
+        'Finding': 'id',
+        'Entity': 'name',
+        'Investigation': 'id',
+    }
+    [Metadata, not handler dispatch]
+
+  File: eval/grounding_gate_qf_eval.py:42
+    DEFAULT_FOCUS = {
+        'strategy': 'balanced',
+        'diversity': 0.5,
+        'depth': 3,
+    }
+    [Config data]
+
+================================================================================
+VIII. LAZY IMPORTS (module-local, function-scoped)
+================================================================================
+
+Census: 288 local imports across corpus (import INSIDE function body)
+
+Distribution by directory:
+  mcp/               207 local imports
+  scripts/            30 local imports
+  mlops/              41 local imports
+  eval/                8 local imports
+  a2a_server/          2 local imports
+
+These defeat static analysis and are performance optimizations or workarounds for:
+  1. Circular dependencies
+  2. Optional dependencies (fail gracefully if not installed)
+  3. Lazy initialization to delay expensive module setup
+
+Examples:
+
+  File: mcp/batched_gen.py:51 (inside _resolve_vllm function)
+    def _resolve_vllm():
+        import backends  # <- local import
+        return backends.vllm_pipeline()
+
+  File: mcp/backends.py:55 (inside _config function)
+    def _config():
+        import tomllib  # <- local import, only if needed
+        with open(...) as f:
+            return tomllib.load(f)
+
+  File: a2a_server/server.py:1247 (inside skill_docker_status function)
+    def skill_docker_status():
+        import subprocess  # <- local import to avoid top-level dependency
+        result = subprocess.run(...)
+
+  File: eval/grounding_gate_oos_eval.py:32 (inside run function)
+    def run():
+        import np  # NumPy only if OOD check is needed
+        import LogisticRegression  # sklearn only if OOD check is needed
+        ...
+
+Call-graph implications:
+  - These imports cannot be discovered by static analysis of module-level imports
+  - CFG (control-flow graph) analysis needed to find which functions import what
+  - The imported name is only live inside that function's scope
+  - A call-graph must track which function contains the import to resolve intra-function calls
+
+================================================================================
+IX. importlib.import_module() CALLS (dynamic module loading)
+================================================================================
+
+Census: 2 importlib.import_module() calls
+
+These are runtime module loading — must be resolved at call time with string values.
+
+File: mcp/grounding.py:194
+  def _get_server():
+      """Load the server module on first access."""
+      global _server_module
+      if _server_module is None:
+          _server_module = importlib.import_module('server')
+      return _server_module
+
+File: mlops/embedding/tests/test_embedding.py:667
+  import importlib
+  ...
+  module = importlib.import_module('contrastive')
+
+Call-graph implication:
+  - Cannot resolve statically; the module name is only known at runtime
+  - A conservative call-graph might mark the loaded module as "unknown" or skip it
+  - Or defer to a runtime registry of known modules
+
+================================================================================
+X. MODULE-LEVEL ASSIGNMENTS & NAMES READ ACROSS MODULES
+================================================================================
+
+Census: 240+ module-level assignments; tracking cross-module reads is incomplete
+
+Examples of module-level names that are read by other modules:
+
+  File: mcp/graph_tools.py (module-scope injection):
+    _get_ladybug = None
+
+  Then used by every function in that module:
+    ks = _get_ladybug()  # called inside code_graph_ingest, code_graph_query, etc.
+
+  Injected from mcp/server.py:7398:
+    graph_tools.register(mcp, _get_ladybug)
+
+  Similar patterns in:
+    mcp/llm_tools.py:       _mcp, _get_memory_dir
+    mcp/investigation_tools.py:  _mcp, _deps_dict
+    mcp/ladybug_ops.py:     _get_ladybug, _get_memory_dir
+
+  File: mcp/server.py (module-level constants):
+    HERMES_MEMORY_DIR = os.environ.get('HERMES_MEMORY_DIR', '~/.hermes/findings')
+    MNEMOSYNE_DB = os.path.join(_mnem_data_dir, 'mnemosyne.db')
+
+  These are read by tools and dependencies via `from server import HERMES_MEMORY_DIR`.
+
+Call-graph implication:
+  - A complete call-graph must track which names are assigned at module level
+  - And which are imported/read by other modules
+  - This builds a "data-dependency" layer on top of call-graph
+
+================================================================================
+XI. GLOBAL STATEMENTS
+================================================================================
+
+Census: 0 global statements in target areas (mcp/graph/ + mcp/memcheck/)
+
+This is good — no function-level globals in the graph/memcheck modules.
+
+However, other areas use globals:
+  - mcp/graph_tools.py: _get_ladybug = None (module-level, injected)
+  - mcp/llm_tools.py: _mcp = None, _get_memory_dir = None (module-level)
+  - Various __init__.py files: module-level imports and re-exports
+
+================================================================================
+XII. STRING LITERALS THAT LOOK LIKE PATHS OR COLLECTION NAMES
+================================================================================
+
+Census: 187 string literals with special patterns (paths, identifiers, etc.)
+
+Paths:
+  File: mcp/graph/code_parse.py:40
+    '.py'  # file extension
+
+  File: mcp/graph/__init__.py:1
+    'Loci MCP graph package — code symbol/reference extraction + (optional) LadybugDB store.'
+
+Special identifiers:
+  File: mcp/graph/linker.py:87
+    'Build a fast lookup index over ``symbols`` for reference extraction.'
+
+  File: mcp/memcheck/backend.py (config keys read at runtime):
+    Implied patterns like 'file::Qualname' (symbol id format)
+
+Collection names and other literals used by Cypher/database queries:
+  File: mcp/graph/queries.py (database schema references):
+    Implied: 'CodeFile', 'CodeSymbol', 'Finding', 'Entity', 'Investigation'
+    (These appear as quoted strings in Cypher queries)
+
+File paths mentioned in docstrings:
+  File: mcp/graph/ladybug_store.py:1
+    'Embedded LadybugDB graph store...'
+    References layout: '$HERMES_MEMORY_DIR/<investigation_id>/manifest.json'
+
+Call-graph implication:
+  - String patterns may encode node types, collection names, or runtime configs
+  - A conservative call-graph builder might flag these as "unresolvable" data references
+  - Or maintain a separate "string-to-resource" mapping
+
+================================================================================
+XIII. GETATTR / DICT-OF-CALLABLES DISPATCH
+================================================================================
+
+Census: Limited getattr usage in target areas; more dict-based dispatch
+
+Example (getattr for optional attributes):
+  File: mcp/memcheck/backend.py
+    Method resolution is primarily through dict lookups (_VERDICT_MAP) and
+    isinstance() checks, not getattr()
+
+Dict-based dispatch is the primary pattern:
+  File: mcp/memcheck/checks/contradiction.py:35
+    _CONF_PROTECTION = { 'high': 0.9, 'medium': 0.6, 'low': 0.3 }
+    conf_value = _CONF_PROTECTION.get(confidence_level)
+
+This is safer than getattr() and more explicit.
+
+================================================================================
+XIV. CROSS-MODULE CALLS & PATTERNS
+================================================================================
+
+Key integration points where call-graph builder must track:
+
+  1. server.py (orchestration layer)
+     Imports and calls register() on sub-modules:
+       - graph_tools.register(mcp, _get_ladybug)    [line 7398]
+       - investigation_tools.register(mcp, ...)
+       - llm_tools.register(mcp)
+       - ladybug_ops.register(...)
+
+     Then imports functions from those modules:
+       - from graph_tools import (symbol_impact, ...)
+
+  2. graph/ package (code analysis layer)
+     ladybug_store.py defines LadybugStore class
+     queries.py imports and uses LadybugStore
+     code_parse.py standalone utility functions
+     linker.py uses code_parse and LadybugStore
+
+  3. memcheck/ package (verification layer)
+     backend.py defines abstract VerdictBackend
+     engine.py implements Engine (a backend)
+     checks/ subpackage defines specific checks
+     All import from backend
+
+  4. a2a_server/ (FastAPI integration)
+     server.py defines routes via @app.post(), @app.get()
+     Imports and calls skills like skill_memory_recall(), skill_memory_store()
+     Uses FastAPI Depends() for injection
+
+  5. scripts/ (CLI/daemon tools)
+     Many standalone scripts import from mcp/
+     Some use graph_tools, some use memcheck checks
+     Lazy-import patterns common for optional deps
+
+================================================================================
+XV. RECOMMENDATIONS FOR CALL-GRAPH TOOL
+================================================================================
+
+The tool must handle:
+
+  1. @mcp.tool() decorators as registration roots (40 total)
+
+  2. register(mcp, deps) pattern:
+     - Track function refs in tuple/list literals
+     - Resolve bare names to function defs in same module
+     - Model the global variable injection (_get_ladybug, etc.)
+
+  3. Dict-of-callables dispatch:
+     - String key -> handler function/type lookup
+     - Requires constant folding (dict literal analysis)
+
+  4. Local imports:
+     - Cannot resolve statically; require data-flow or CFG analysis
+     - Mark as "potentially reachable" with uncertainty
+
+  5. importlib.import_module():
+     - Cannot resolve without runtime value tracking
+     - Fall back to string literal inspection
+
+  6. Method calls on classes:
+     - LadybugStore, VerdictEngine, etc.
+     - Must resolve class definitions and method defs
+
+  7. Bare function refs in tuples (856 instances):
+     - Most are in register() calls or literal dispatch tables
+     - Must resolve to function defs in same/nearby modules
+
+  8. Cross-module imports and re-exports:
+     - mcp/__init__.py re-exports from submodules
+     - Tools may import from either location
+
+Key weakness to avoid:
+  - Assuming all function calls are direct Name or Attribute references
+  - Missing the bare function refs in tuples
+  - Not handling lazy imports (function-scoped import statements)
+  - Ignoring decorator-based registration (FastMCP's @mcp.tool())
+
+================================================================================
+                              END OF REPORT
+================================================================================

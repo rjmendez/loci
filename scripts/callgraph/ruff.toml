@@ -1,0 +1,9 @@
+# Fixtures under this package are INTENTIONALLY malformed: several are verbatim
+# line-range excerpts of real modules at the pre-fix revision, so their imports are
+# legitimately absent (F821), and one carries a deliberately unrecognised decorator.
+# Linting them would report the very defects they exist to reproduce.
+#
+# They are excluded by config rather than by a `# ruff: noqa` header because the
+# regression tests assert on exact fixture LINE NUMBERS -- prepending anything
+# shifts every assertion and breaks 10 tests.
+extend-exclude = ["fixtures"]

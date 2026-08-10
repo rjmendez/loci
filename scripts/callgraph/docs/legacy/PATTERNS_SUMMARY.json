@@ -1,0 +1,375 @@
+{
+  "census_date": "2026-08-10",
+  "purpose": "Call-graph builder pattern inventory for loci codebase",
+  "scope": "mcp/ + scripts/ + a2a_server/ + mlops/ + eval/",
+  "target_analysis_areas": ["mcp/graph/**", "mcp/memcheck/**"],
+
+  "summary": {
+    "total_files_scanned": 13805,
+    "target_area_files": 28,
+    "target_area_lines": 7277
+  },
+
+  "constructs": {
+    "plain_function_defs": {
+      "total": 280,
+      "description": "Module-level function definitions",
+      "examples": [
+        {
+          "file": "mcp/graph/code_parse.py",
+          "line": 66,
+          "name": "detect_lang",
+          "signature": "def detect_lang(path: str) -> Optional[str]:"
+        },
+        {
+          "file": "mcp/graph/analytics.py",
+          "line": 45,
+          "name": "impact_report",
+          "signature": "def impact_report(ks, symbol):"
+        },
+        {
+          "file": "mcp/memcheck/checks/code_hallucination.py",
+          "line": 57,
+          "name": "run_code_checks",
+          "signature": "def run_code_checks(llm, code, context: CodeContext) -> list[VerdictReading]:"
+        }
+      ]
+    },
+
+    "method_defs": {
+      "total": 100,
+      "description": "Methods on classes",
+      "examples": [
+        {
+          "file": "mcp/graph/ladybug_store.py",
+          "line": 143,
+          "class": "LadybugStore",
+          "name": "__init__",
+          "signature": "def __init__(self, db_path: str):"
+        },
+        {
+          "file": "mcp/graph/ladybug_store.py",
+          "line": 173,
+          "class": "LadybugStore",
+          "name": "available",
+          "signature": "def available(self) -> bool:"
+        },
+        {
+          "file": "mcp/graph/ladybug_store.py",
+          "line": 494,
+          "class": "LadybugStore",
+          "name": "upsert_investigation",
+          "signature": "def upsert_investigation(self, **fields):"
+        }
+      ]
+    },
+
+    "decorated_defs": {
+      "total": 22,
+      "by_decorator": {
+        "_writes": {
+          "count": 11,
+          "description": "Custom multi-statement write decorator (LadybugDB pattern)",
+          "examples": [
+            {
+              "file": "mcp/graph/ladybug_store.py",
+              "line": 494,
+              "func": "upsert_investigation"
+            },
+            {
+              "file": "mcp/graph/ladybug_store.py",
+              "line": 508,
+              "func": "upsert_finding"
+            }
+          ]
+        },
+        "mcp.tool": {
+          "count": 40,
+          "description": "FastMCP tool registration decorator (registration roots)",
+          "examples": [
+            {
+              "file": "mcp/server.py",
+              "line": 2118,
+              "func": "investigation_store"
+            },
+            {
+              "file": "mcp/server.py",
+              "line": 2258,
+              "func": "finding_resolve"
+            },
+            {
+              "file": "mcp/server.py",
+              "line": 3053,
+              "func": "investigation_search"
+            }
+          ]
+        },
+        "abc.abstractmethod": {
+          "count": 3,
+          "description": "Abstract base class methods",
+          "examples": [
+            {
+              "file": "mcp/memcheck/backend.py",
+              "line": 70,
+              "func": "record"
+            }
+          ]
+        },
+        "staticmethod": {
+          "count": 4,
+          "examples": [
+            {
+              "file": "mcp/graph/ladybug_store.py",
+              "line": 450,
+              "func": "_close_result"
+            }
+          ]
+        },
+        "classmethod": {
+          "count": 2,
+          "examples": [
+            {
+              "file": "mcp/memcheck/engine.py",
+              "line": 63,
+              "func": "in_memory"
+            }
+          ]
+        },
+        "contextmanager": {
+          "count": 1,
+          "examples": [
+            {
+              "file": "mcp/graph/ladybug_store.py",
+              "line": 313,
+              "func": "_session"
+            }
+          ]
+        }
+      }
+    },
+
+    "direct_calls": {
+      "total": 2140,
+      "by_type": {
+        "Name": 1066,
+        "Attribute": 1074
+      },
+      "description": "Direct function/method calls",
+      "examples": [
+        {
+          "file": "mcp/graph/code_parse.py",
+          "line": 66,
+          "caller": "detect_lang",
+          "callee": "LANG_BY_EXT.get",
+          "type": "Attribute"
+        },
+        {
+          "file": "mcp/graph/analytics.py",
+          "line": 27,
+          "caller": "_ok",
+          "callee": "ks.available",
+          "type": "Attribute"
+        }
+      ]
+    },
+
+    "bare_function_refs_in_literals": {
+      "total": 856,
+      "description": "Bare function references in tuple/list/dict literals (registration manifests)",
+      "by_directory": {
+        "mcp": 394,
+        "scripts": 277,
+        "a2a_server": 50,
+        "mlops": 92,
+        "eval": 43
+      },
+      "examples": [
+        {
+          "file": "mcp/graph_tools.py",
+          "line": 250,
+          "pattern": "for fn in (code_graph_ingest, code_graph_query, symbol_impact, ...): mcp.tool()(fn)",
+          "context": "register() function - tuple of bare function refs"
+        },
+        {
+          "file": "mcp/batched_gen.py",
+          "line": 51,
+          "pattern": "supported = { 'mistral-7b': models.mistral, 'llama-2-7b': models.llama2 }",
+          "context": "Dict dispatch with bare refs"
+        }
+      ]
+    },
+
+    "dict_of_callables": {
+      "total": 23,
+      "description": "Dictionary assignments that may contain handlers or dispatch tables",
+      "examples": [
+        {
+          "file": "mcp/memcheck/checks/code_hallucination.py",
+          "line": 46,
+          "var": "_LH_TO_PATTERN",
+          "pattern": "{ 'LLM_HALLUCINATION_FUNCTION_CALL': 'suspected_function_call', ... }"
+        },
+        {
+          "file": "mcp/memcheck/checks/contradiction.py",
+          "line": 35,
+          "var": "_CONF_PROTECTION",
+          "pattern": "{ 'high': 0.9, 'medium': 0.6, 'low': 0.3 }"
+        }
+      ]
+    },
+
+    "local_imports": {
+      "total": 288,
+      "description": "Imports inside function bodies (not module-level)",
+      "by_directory": {
+        "mcp": 207,
+        "scripts": 30,
+        "mlops": 41,
+        "eval": 8,
+        "a2a_server": 2
+      },
+      "examples": [
+        {
+          "file": "mcp/batched_gen.py",
+          "line": 51,
+          "function": "_resolve_vllm",
+          "import": "import backends"
+        },
+        {
+          "file": "mcp/backends.py",
+          "line": 55,
+          "function": "_config",
+          "import": "import tomllib"
+        },
+        {
+          "file": "a2a_server/server.py",
+          "line": 1247,
+          "function": "skill_docker_status",
+          "import": "import subprocess"
+        }
+      ]
+    },
+
+    "importlib_calls": {
+      "total": 2,
+      "description": "Dynamic module loading via importlib.import_module()",
+      "examples": [
+        {
+          "file": "mcp/grounding.py",
+          "line": 194,
+          "code": "importlib.import_module('server')"
+        },
+        {
+          "file": "mlops/embedding/tests/test_embedding.py",
+          "line": 667,
+          "code": "importlib.import_module('contrastive')"
+        }
+      ]
+    },
+
+    "module_level_imports": {
+      "total": 240,
+      "description": "Standard module-level import statements"
+    },
+
+    "global_statements": {
+      "total": 0,
+      "note": "No global statements in target areas (mcp/graph/ + mcp/memcheck/)"
+    },
+
+    "string_literals_special": {
+      "total": 187,
+      "description": "String literals that look like paths or special identifiers",
+      "examples": [
+        {
+          "file": "mcp/graph/code_parse.py",
+          "line": 40,
+          "value": "'.py'"
+        },
+        {
+          "file": "mcp/graph/ladybug_store.py",
+          "line": 1,
+          "context": "docstring with path references",
+          "value": "$HERMES_MEMORY_DIR/<investigation_id>/manifest.json"
+        }
+      ]
+    }
+  },
+
+  "registration_patterns": {
+    "mcp_tool_decorators": {
+      "total": 40,
+      "location": "mcp/server.py",
+      "description": "FastMCP @mcp.tool() decorators - these are registration roots, never called by name",
+      "why_hard": "Not callable as regular Python functions; dispatched via HTTP MCP protocol"
+    },
+
+    "register_functions": {
+      "total": 30,
+      "location": "Various mcp/*.py files",
+      "description": "Functions named register(mcp, deps) that take bare function references",
+      "pattern": "for fn in (func1, func2, ...): mcp.tool()(fn)",
+      "files": [
+        "mcp/graph_tools.py",
+        "mcp/llm_tools.py",
+        "mcp/investigation_tools.py",
+        "mcp/ladybug_ops.py",
+        "mcp/inv_store.py"
+      ],
+      "integration_point": "mcp/server.py calls register() on each module after FastMCP instantiation"
+    },
+
+    "module_level_injection": {
+      "description": "Pattern: module-level var set to None, injected by register()",
+      "examples": [
+        {
+          "file": "mcp/graph_tools.py",
+          "var": "_get_ladybug",
+          "injected_by": "register(mcp, get_ladybug)"
+        },
+        {
+          "file": "mcp/llm_tools.py",
+          "var": "_mcp",
+          "var2": "_get_memory_dir",
+          "injected_by": "register(mcp, get_memory_dir)"
+        }
+      ]
+    }
+  },
+
+  "dispatch_mechanisms": {
+    "dict_lookup": {
+      "count": 23,
+      "example": "_CONF_PROTECTION.get(confidence_level)",
+      "why": "Type-safe; preferred over getattr()"
+    },
+    "bare_function_refs": {
+      "count": 856,
+      "mechanism": "Stored in tuple/list/dict, resolved at call time",
+      "why": "Avoids string-based dispatch; dependencies are explicit in literals"
+    },
+    "module_injection": {
+      "count": 5,
+      "mechanism": "Global var set to None, filled by register()",
+      "why": "Decouples tool modules from each other; late binding for server.py"
+    }
+  },
+
+  "critical_for_call_graph": [
+    "Resolve @mcp.tool() decorators to functions they decorate",
+    "Resolve bare function refs in tuple/list literals (856 instances)",
+    "Track register() calls and the dependencies they inject",
+    "Handle local imports (inside function bodies, 288 instances)",
+    "Resolve module-level var assignments and their use",
+    "Detect cross-module imports and re-exports",
+    "Do NOT assume all calls are Name or Attribute chains",
+    "Mark importlib.import_module() as unresolvable (2 instances)"
+  ],
+
+  "known_gaps": [
+    "Cannot statically resolve local imports without CFG analysis",
+    "Cannot statically resolve importlib.import_module() calls",
+    "String-based dynamic dispatch (e.g., getattr with computed names) cannot be resolved",
+    "FastAPI route decorators require introspection to resolve"
+  ]
+}
