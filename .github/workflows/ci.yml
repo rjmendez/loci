@@ -123,6 +123,31 @@ jobs:
         # trips a shorter per-test timeout as ~18 spurious errors.
         run: pytest mlops -v --tb=short --timeout=120
 
+  test-callgraph:
+    name: Callgraph tool tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-timeout
+
+      - name: Run tests
+        # The tool is stdlib-only by design, so there is nothing else to install.
+        # PYTHONPATH points at scripts/ so `callgraph` is importable as a package.
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scripts
+        run: pytest scripts/callgraph/tests -v --tb=short --timeout=120
+
   test-eval:
     name: Eval tests
     runs-on: ubuntu-latest
