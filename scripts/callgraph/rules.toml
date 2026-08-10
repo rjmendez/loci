@@ -1,0 +1,82 @@
+# Pattern set for callgraph, in DATA not code, so a new registrar or wrapper
+# is a one-line edit here rather than a code change. Patterns match against
+# the decorator's verbatim source text (as captured by ast.get_source_segment),
+# using suffix match on the "head" (the dotted-attribute part before any
+# call parens) unless noted otherwise.
+#
+# This file currently backs extract/defs.py's DECORATED_BY classification
+# (registering | wrapping | unknown). Later steps (extract/registry.py) are
+# expected to extend this file with manifest/route/registrar rules rather
+# than inventing a second rules file.
+
+[decorators]
+# A registering decorator makes the function callable from OUTSIDE the
+# Python corpus (an MCP client tool call, an HTTP route). Matched against
+# the decorator's dotted "head" (e.g. "mcp.tool", "app.get").
+registering = [
+    "tool",             # *.tool / *.tool()  (FastMCP)
+    "resource",         # *.resource(...)    (FastMCP)
+    "custom_route",     # *.custom_route(...)
+    "get",              # *.get(...)         (FastAPI route)
+    "post",             # *.post(...)
+    "put",
+    "delete",
+    "patch",
+    "route",
+]
+
+# A wrapping decorator changes call behaviour (caching, locking, a context
+# manager, an abstract stub) but calls still flow through to the body — it
+# does not register the function anywhere external.
+wrapping = [
+    "lru_cache",
+    "functools.lru_cache",
+    "cache",
+    "functools.cache",
+    "contextmanager",
+    "contextlib.contextmanager",
+    "wraps",
+    "functools.wraps",
+    "staticmethod",
+    "classmethod",
+    "abstractmethod",
+    "abc.abstractmethod",
+    "dataclass",
+    "dataclasses.dataclass",
+    "property",
+    "_writes",
+]
+
+# extract/registry.py's REG-FN rule: a module-level function whose NAME
+# matches one of these (exact match, or a "prefix*" glob) is a candidate
+# dependency-injector — it's only actually treated as one if its body ALSO
+# assigns a `global`-declared name directly from one of its own parameters,
+# or from `<dict-param>["<literal key>"]`. Matching the name alone is not
+# enough (plenty of functions are named "register" without this shape); the
+# body-shape check is what makes REG-FN precise.
+[registrars]
+register_fn_names = [
+    "register",
+    "setup",
+    "init_*",
+]
+
+# extract/registry.py's ROOT-EXT rule: entry points that live OUTSIDE the
+# Python corpus (systemd ExecStart lines, cron entries, shell wrappers) and
+# therefore can never be discovered by parsing .py files. Hand-maintained,
+# and — per the design's own honesty rule — WILL go stale; every `cg dead`
+# footer prints this table's size and this file's mtime for exactly that
+# reason. `module` is the repo-relative .py file the external trigger runs;
+# the entered function is whatever that module's own `if __name__ ==
+# "__main__":` guard calls (ROOT-CLI's own logic, reused here) — ROOT-EXT
+# only adds a second, independently-trusted ENTRYPOINT for the same
+# function, tagged trust=declared-in-roots.toml instead of
+# declared-in-source, so a report can tell "the source says this runs
+# standalone" apart from "an operator told this tool it runs standalone."
+[[roots]]
+module = "a2a_server/server.py"
+evidence = "a2a_server/loci-a2a.service:21 (systemd ExecStart)"
+
+[[roots]]
+module = "scripts/a2a_context_bridge.py"
+evidence = "scripts/systemd/loci-context-bridge.service:27 (systemd ExecStart)"
