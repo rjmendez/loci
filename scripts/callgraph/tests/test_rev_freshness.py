@@ -1,3 +1,4 @@
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """Cache-invalidation / staleness tests for ingest.py's `--rev` path.
 
 ingest.py's own docstring is explicit: there is NO parse cache (measured
@@ -27,6 +28,7 @@ def test_rebuilding_the_same_rev_is_byte_identical():
     assert by_path_a == by_path_b
 
 
+@needs_git_history
 def test_switching_revs_does_not_leak_content_between_builds():
     # mcp/grounding.py genuinely differs between 69adfa4^ (BUG B present)
     # and 69adfa4 (the fix commit) — see docs/LIMITS.md's BUG B section and

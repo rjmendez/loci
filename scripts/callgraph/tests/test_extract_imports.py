@@ -1,3 +1,4 @@
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """extract/imports.py: IMPORTS edges (scope, resolved_via) and ALIASES
 edges (from-import re-exports, bare module-level A = B), across the
 synthetic fixtures — this is the step-3 acceptance surface."""
@@ -18,6 +19,7 @@ def _build(rel_paths: list[str]):
     return store, table
 
 
+@needs_corpus_deps
 def test_lazy_import_edge_carries_scope_and_enclosing_fn():
     store, _ = _build(["lazy_import.py"])
     edges = store.out_edges("mod:lazy_import.py", "IMPORTS")

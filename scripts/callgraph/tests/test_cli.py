@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+
 from ..cli import main
 
 
@@ -48,6 +50,7 @@ def test_defs_all_lists_qualnames(capsys):
     assert "symbol_impact" in out
 
 
+@needs_corpus_deps
 def test_imports_unresolved_small(capsys):
     code, out = _run(capsys, ["imports", "--rev", "HEAD", "--unresolved"])
     assert code == 0

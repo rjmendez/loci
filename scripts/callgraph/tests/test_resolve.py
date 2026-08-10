@@ -1,3 +1,4 @@
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """resolve.py: sys.path.insert constant-folding + the resolution table,
 against both synthetic fixtures and the real corpus's known cases."""
 from ..resolve import ResolutionTable, find_sys_path_inserts
@@ -126,6 +127,7 @@ def test_every_flat_mcp_sibling_import_in_server_resolves_same_dir(head_table):
         assert res.resolved_via == "same-dir"
 
 
+@needs_corpus_deps
 def test_real_corpus_import_unresolved_list_is_small_and_only_missing_third_party(head_sources, head_table):
     sources, table = head_sources, head_table
     unresolved = []

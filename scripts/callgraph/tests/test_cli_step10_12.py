@@ -1,3 +1,4 @@
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """CLI end-to-end tests for `cg writes-dead` / `cg literals` / `cg flags`
 against the REAL corpus at the specific revisions BUG B/C/D were introduced
 and fixed at — the regression tests the design's acceptance criteria ask
@@ -17,6 +18,7 @@ def _run(capsys, argv):
 # -- BUG C: writes-dead / dangling-global -------------------------------------
 
 
+@needs_git_history
 def test_writes_dead_finds_bug_c_at_broken_revision(capsys):
     code, out = _run(capsys, ["writes-dead", "--rev", "c1c40a9^", "--scope", "mcp/"])
     assert code == 0
@@ -50,6 +52,7 @@ def test_writes_dead_include_tests_shrinks_weak_list(capsys):
 # -- BUG D: literals -----------------------------------------------------------
 
 
+@needs_git_history
 def test_literals_orphans_finds_bug_d_at_broken_revision(capsys):
     code, out = _run(capsys, ["literals", "--paths", "--orphans", "--rev", "08c9198^"])
     assert code == 0
@@ -61,6 +64,7 @@ def test_literals_orphans_finds_bug_d_at_broken_revision(capsys):
     assert "PRODUCED BY NOBODY" in out
 
 
+@needs_git_history
 def test_literals_near_miss_pairs_the_bug_d_orphans(capsys):
     code, out = _run(capsys, ["literals", "graph", "--paths", "--near-miss", "--rev", "08c9198^"])
     assert code == 0
@@ -92,6 +96,7 @@ def test_literals_orphans_empty_at_head_for_graph_ladybug(capsys):
 # -- BUG B: flags ---------------------------------------------------------------
 
 
+@needs_git_history
 def test_flags_ranks_degraded_first_at_broken_revision(capsys):
     code, out = _run(capsys, ["flags", "mcp/grounding.py::ground", "--rev", "69adfa4^"])
     assert code == 0
@@ -102,6 +107,7 @@ def test_flags_ranks_degraded_first_at_broken_revision(capsys):
     assert "does NOT assign degraded" in out
 
 
+@needs_git_history
 def test_flags_json_row_shape(capsys):
     code, out = _run(capsys, ["flags", "mcp/grounding.py::ground", "--rev", "69adfa4^", "--format", "json"])
     assert code == 0
