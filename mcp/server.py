@@ -1946,6 +1946,174 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 
 # ---- Tool: investigation_store ----
 
+# --------------------------------------------------------------------------- #
+# investigation_store internals
+#
+# Split out of the tool body so each stage is separately readable and testable.
+# Every helper preserves the tool's original behaviour exactly, including the
+# verbatim error strings, which are part of the tool's response contract.
+# --------------------------------------------------------------------------- #
+_STORE_FINDING_TYPES = {"observed", "inferred", "assumed", "gap", "procedure"}
+_STORE_CONFIDENCES = {"high", "medium", "low"}
+_STORE_TIERS = {"hot", "warm", "cold"}
+_CONFIDENCE_TO_NUMERIC = {"high": 0.9, "medium": 0.6, "low": 0.3}
+
+
+def _store_validate(finding_type: str, confidence: str, tier: str, resolution: str) -> Optional[str]:
+    """Return the tool's error JSON for the first invalid argument, else None."""
+    if finding_type not in _STORE_FINDING_TYPES:
+        return json.dumps({"error": "finding_type must be one of: observed, inferred, assumed, gap, procedure"})
+    if confidence not in _STORE_CONFIDENCES:
+        return json.dumps({"error": "confidence must be one of: high, medium, low"})
+    if tier not in _STORE_TIERS:
+        return json.dumps({"error": "tier must be one of: hot, warm, cold"})
+    if resolution not in _RESOLUTION_STATES:
+        return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
+    return None
+
+
+def _store_numeric_confidence(confidence: str, numeric_confidence: float | None) -> float:
+    """Caller-supplied confidence (clamped to 0..1), else derived from the label."""
+    if numeric_confidence is None:
+        return _CONFIDENCE_TO_NUMERIC.get(confidence, 0.6)
+    try:
+        return max(0.0, min(1.0, float(numeric_confidence)))
+    except (TypeError, ValueError):
+        return _CONFIDENCE_TO_NUMERIC.get(confidence, 0.6)
+
+
+def _store_build_finding(investigation_id, finding_type, text, source, confidence, tags,
+                         derived_from, numeric_confidence, procedure_preconditions,
+                         procedure_steps, procedure_postconditions, valid_from,
+                         valid_until, authored_by, tier, resolution, code_refs):
+    """Build the finding record. Returns (finding, error_json); one is always None.
+
+    The only failure mode is a derived_from id with no matching parent, which the
+    tool reports rather than storing a dangling lineage link.
+    """
+    ts_now = _now()
+    finding = {
+        "id": str(uuid.uuid4()),
+        "investigation_id": investigation_id,
+        "ts": ts_now,
+        "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
+        "record_type": finding_type,   # "observed" | "inferred" | "assumed" | "gap"
+        "type": finding_type,          # kept for backwards compat with existing JSONL
+        "text": text,
+        "source": source,
+        "confidence": confidence,
+        "numeric_confidence": _store_numeric_confidence(confidence, numeric_confidence),
+        "tags": [t.strip() for t in (
+            ",".join(tags) if isinstance(tags, list) else (tags or "")
+        ).split(",") if t.strip()],
+        "valid_from": valid_from if valid_from is not None else ts_now,
+        "valid_until": valid_until,
+        "authored_by": authored_by or "",
+        "tier": tier,
+        "resolution": resolution,
+    }
+
+    derived = _normalize_derived_from(derived_from)
+    if derived:
+        existing_ids = {f["id"] for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl") if "id" in f}
+        unknown = [pid for pid in derived if pid not in existing_ids]
+        if unknown:
+            return None, json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
+        finding["derived_from"] = derived
+
+    finding["entities"] = _extract_entities(text)
+
+    # Staleness: stamp sha256 of any referenced code file so a later re-hash can flag
+    # the finding stale once that file changes. Best-effort + fail-open (no refs / an
+    # unreadable file -> omit; never error).
+    try:
+        refs = _compute_code_refs(text, code_refs)
+        if refs:
+            finding["code_refs"] = refs
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("investigation_store: code-ref hashing failed (fail-open): %r", exc)
+
+    if finding_type == "procedure":
+        finding["procedure_meta"] = {
+            "preconditions": procedure_preconditions or "",
+            "steps": procedure_steps or "",
+            "postconditions": procedure_postconditions or "",
+            "success_count": 0,
+            "attempt_count": 0,
+        }
+    return finding, None
+
+
+def _store_commit(investigation_id: str, manifest: dict, finding: dict,
+                  finding_type: str, text: str, tier: str) -> None:
+    """Append the finding and update the manifest under the per-investigation lock."""
+    lock_path = _inv_dir(investigation_id) / ".lock"
+    with open(lock_path, "w") as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        try:
+            _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
+            manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
+            # Update hot-tier manifest notes
+            if tier == "hot":
+                snippet = text[:200]
+                notes = manifest.get("notes") or ""
+                manifest["notes"] = (notes + "; " + snippet) if notes else snippet
+            _save_manifest(manifest)
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+
+
+def _store_index(investigation_id: str, finding: dict, finding_type: str,
+                 text: str, source: str, confidence: str, tier: str) -> bool:
+    """Fan the finding out to Mnemosyne, Qdrant, the event log and the graph.
+
+    Returns whether Mnemosyne accepted it. Cold tier skips Qdrant indexing; the
+    graph mirror is tier-agnostic, since the relationship graph carries findings
+    regardless of index tier.
+    """
+    mnemo_stored = _mnemo_remember(
+        text,
+        importance={"high": 0.9, "medium": 0.7, "low": 0.5}.get(confidence, 0.6),
+        metadata={
+            "investigation_id": investigation_id,
+            "record_type": finding_type,
+            "source": source,
+            "confidence": confidence,
+            "tags": finding["tags"],
+            "finding_id": finding["id"],
+        },
+    )
+    if tier != "cold":
+        _qdrant_upsert(finding["id"], text, finding)
+    _event_log_append({
+        "op": "store",
+        "investigation_id": investigation_id,
+        "finding_id": finding["id"],
+        "finding_type": finding_type,
+        "confidence": confidence,
+        "tier": tier,
+    })
+    _mirror_finding_to_ladybug(finding, investigation_id)
+    _autolink_finding_to_ladybug(finding)
+    return mnemo_stored
+
+
+def _store_conflicts(investigation_id: str, finding: dict) -> tuple:
+    """Detect conflicts with existing findings. Fail-open: never blocks a store.
+
+    Returns (detected, conflicting_finding_id, conflict_id).
+    """
+    try:
+        conflicts = _detect_conflicts(investigation_id, finding)
+        if conflicts:
+            first = conflicts[0]
+            conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"])
+            return True, first["neighbor_id"], conflict_id
+    except Exception as exc:
+        logger.debug("investigation_store: conflict detection failed (fail-open): %s", exc)
+    return False, None, None
+
+
 @mcp.tool()
 def investigation_store(
     investigation_id: str,
@@ -2040,132 +2208,23 @@ def investigation_store(
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
-    if finding_type not in {"observed", "inferred", "assumed", "gap", "procedure"}:
-        return json.dumps({"error": "finding_type must be one of: observed, inferred, assumed, gap, procedure"})
-    if confidence not in {"high", "medium", "low"}:
-        return json.dumps({"error": "confidence must be one of: high, medium, low"})
-    if tier not in {"hot", "warm", "cold"}:
-        return json.dumps({"error": "tier must be one of: hot, warm, cold"})
     resolution = str(resolution or "open").lower()
-    if resolution not in _RESOLUTION_STATES:
-        return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
+    invalid = _store_validate(finding_type, confidence, tier, resolution)
+    if invalid:
+        return invalid
 
-    # Resolve numeric_confidence: caller-supplied (clamped) or derived from string confidence.
-    _confidence_to_numeric = {"high": 0.9, "medium": 0.6, "low": 0.3}
-    if numeric_confidence is None:
-        resolved_numeric_confidence = _confidence_to_numeric.get(confidence, 0.6)
-    else:
-        try:
-            resolved_numeric_confidence = max(0.0, min(1.0, float(numeric_confidence)))
-        except (TypeError, ValueError):
-            resolved_numeric_confidence = _confidence_to_numeric.get(confidence, 0.6)
-
-    _ts_now = _now()
-    finding = {
-        "id": str(uuid.uuid4()),
-        "investigation_id": investigation_id,
-        "ts": _ts_now,
-        "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
-        "record_type": finding_type,   # "observed" | "inferred" | "assumed" | "gap"
-        "type": finding_type,          # kept for backwards compat with existing JSONL
-        "text": text,
-        "source": source,
-        "confidence": confidence,
-        "numeric_confidence": resolved_numeric_confidence,
-        "tags": [t.strip() for t in (
-            ",".join(tags) if isinstance(tags, list) else (tags or "")
-        ).split(",") if t.strip()],
-        "valid_from": valid_from if valid_from is not None else _ts_now,
-        "valid_until": valid_until,
-        "authored_by": authored_by or "",
-        "tier": tier,
-        "resolution": resolution,
-    }
-    derived = _normalize_derived_from(derived_from)
-    if derived:
-        existing_ids = {f["id"] for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl") if "id" in f}
-        unknown = [pid for pid in derived if pid not in existing_ids]
-        if unknown:
-            return json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
-        finding["derived_from"] = derived
-    finding["entities"] = _extract_entities(text)
-
-    # Staleness: stamp sha256 of any referenced code file so a later re-hash can flag
-    # the finding stale once that file changes. Best-effort + fail-open (no refs / an
-    # unreadable file -> omit; never error).
-    try:
-        _refs = _compute_code_refs(text, code_refs)
-        if _refs:
-            finding["code_refs"] = _refs
-    except Exception as _cr_exc:  # noqa: BLE001
-        logger.debug("investigation_store: code-ref hashing failed (fail-open): %r", _cr_exc)
-
-    if finding_type == "procedure":
-        finding["procedure_meta"] = {
-            "preconditions": procedure_preconditions or "",
-            "steps": procedure_steps or "",
-            "postconditions": procedure_postconditions or "",
-            "success_count": 0,
-            "attempt_count": 0,
-        }
-
-    _lock_path = _inv_dir(investigation_id) / ".lock"
-    with open(_lock_path, "w") as _lock_fh:
-        fcntl.flock(_lock_fh, fcntl.LOCK_EX)
-        try:
-            _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
-            manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
-            # Update hot-tier manifest notes
-            if tier == "hot":
-                snippet = text[:200]
-                notes = manifest.get("notes") or ""
-                manifest["notes"] = (notes + "; " + snippet) if notes else snippet
-            _save_manifest(manifest)
-        finally:
-            fcntl.flock(_lock_fh, fcntl.LOCK_UN)
-
-    mnemo_stored = _mnemo_remember(
-        text,
-        importance={"high": 0.9, "medium": 0.7, "low": 0.5}.get(confidence, 0.6),
-        metadata={
-            "investigation_id": investigation_id,
-            "record_type": finding_type,
-            "source": source,
-            "confidence": confidence,
-            "tags": finding["tags"],
-            "finding_id": finding["id"],
-        },
+    finding, invalid = _store_build_finding(
+        investigation_id, finding_type, text, source, confidence, tags, derived_from,
+        numeric_confidence, procedure_preconditions, procedure_steps,
+        procedure_postconditions, valid_from, valid_until, authored_by, tier,
+        resolution, code_refs,
     )
+    if invalid:
+        return invalid
 
-    # cold tier: skip Qdrant indexing; hot and warm: index normally
-    if tier != "cold":
-        _qdrant_upsert(finding["id"], text, finding)
-    _event_log_append({
-        "op": "store",
-        "investigation_id": investigation_id,
-        "finding_id": finding["id"],
-        "finding_type": finding_type,
-        "confidence": confidence,
-        "tier": tier,
-    })
-    # graph store: mirror into Kuzu + auto-link to code symbols (fail-open, tier-agnostic —
-    # the relationship graph carries findings regardless of index tier).
-    _mirror_finding_to_ladybug(finding, investigation_id)
-    _autolink_finding_to_ladybug(finding)
-
-    # Conflict detection — fail-open; never blocks a successful store.
-    conflict_detected = False
-    conflicting_finding_id = None
-    conflict_id = None
-    try:
-        conflicts = _detect_conflicts(investigation_id, finding)
-        if conflicts:
-            first = conflicts[0]
-            conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"])
-            conflict_detected = True
-            conflicting_finding_id = first["neighbor_id"]
-    except Exception as _cd_exc:
-        logger.debug("investigation_store: conflict detection failed (fail-open): %s", _cd_exc)
+    _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
+    mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
+    conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
     # Update the in-process session hints ring buffer so memory_hints can
     # surface this finding immediately without re-scanning JSONL.
@@ -2177,8 +2236,7 @@ def investigation_store(
         "ts": finding["ts"],
         "created_at_ts": finding["created_at_ts"],
     })
-
-        # Background entity extraction — fail-open, never blocks the response
+    # Background entity extraction — fail-open, never blocks the response
     _update_entities_jsonl(investigation_id, finding["id"], text)
 
     result = {
@@ -2661,6 +2719,59 @@ def _reflection_store_finding(
 
 # ---- Tool: reflection_loop_tick ----
 
+def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
+                             error_observations, warning_observations, stats,
+                             investigation_id, low_signal_session_events) -> bool:
+    """Store one reflection finding for a processed queue item.
+
+    Returns True when a finding was written. Session events with no errors or
+    warnings are recorded as low-signal for the batched roll-up instead, and
+    return False -- this was a `continue` at the tail of the caller's loop, so
+    returning early is equivalent.
+
+    Mutates `stats` (suppression counters) and `low_signal_session_events` in
+    place, matching the original inline behaviour.
+    """
+    if kind == "session_event" and not raw_errors and not raw_warnings:
+        low_signal_session_events.append({
+            "path": path,
+            "lines_scanned": int(summary.get("lines_scanned") or 0),
+            "bytes_scanned": int(summary.get("bytes_scanned") or 0),
+            "events": summary.get("events") or {},
+            "tools": summary.get("tools") or {},
+        })
+        return False
+
+    visible_errors, suppressed_error_hits, suppressed_error_signatures = (
+        _reflection_filter_signatures(raw_errors, error_observations)
+    )
+    visible_warnings, suppressed_warning_hits, suppressed_warning_signatures = (
+        _reflection_filter_signatures(raw_warnings, warning_observations)
+    )
+    stats["error_signatures_suppressed"] += suppressed_error_hits
+    stats["warning_signatures_suppressed"] += suppressed_warning_hits
+    top_error = _reflection_signature_summary(
+        visible_errors, suppressed_error_signatures, suppressed_error_hits
+    )
+    top_warning = _reflection_signature_summary(
+        visible_warnings, suppressed_warning_signatures, suppressed_warning_hits
+    )
+    finding_text = (
+        f"reflection_loop_tick processed {kind} target={path}; "
+        f"lines={summary.get('lines_scanned', 0)} bytes={summary.get('bytes_scanned', 0)}; "
+        f"sampling={summary.get('sampling_mode', 'full')}; "
+        f"top_events={summary.get('events', {})}; top_tools={summary.get('tools', {})}; "
+        f"errors={top_error}; warnings={top_warning}."
+    )
+    return bool(_reflection_store_finding(
+        investigation_id=investigation_id,
+        finding_type="observed",
+        text=finding_text,
+        confidence="low",
+        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+    ))
+
+
 @mcp.tool()
 def reflection_loop_tick(
     max_items: int = 3,
@@ -2745,45 +2856,11 @@ def reflection_loop_tick(
         batch_error_signatures.update(raw_errors)
         batch_warning_signatures.update(raw_warnings)
 
-        if store_item_findings:
-            if kind == "session_event" and not raw_errors and not raw_warnings:
-                low_signal_session_events.append({
-                    "path": path,
-                    "lines_scanned": int(summary.get("lines_scanned") or 0),
-                    "bytes_scanned": int(summary.get("bytes_scanned") or 0),
-                    "events": summary.get("events") or {},
-                    "tools": summary.get("tools") or {},
-                })
-                continue
-            visible_errors, suppressed_error_hits, suppressed_error_signatures = (
-                _reflection_filter_signatures(raw_errors, error_observations)
-            )
-            visible_warnings, suppressed_warning_hits, suppressed_warning_signatures = (
-                _reflection_filter_signatures(raw_warnings, warning_observations)
-            )
-            stats["error_signatures_suppressed"] += suppressed_error_hits
-            stats["warning_signatures_suppressed"] += suppressed_warning_hits
-            top_error = _reflection_signature_summary(
-                visible_errors, suppressed_error_signatures, suppressed_error_hits
-            )
-            top_warning = _reflection_signature_summary(
-                visible_warnings, suppressed_warning_signatures, suppressed_warning_hits
-            )
-            finding_text = (
-                f"reflection_loop_tick processed {kind} target={path}; "
-                f"lines={summary.get('lines_scanned', 0)} bytes={summary.get('bytes_scanned', 0)}; "
-                f"sampling={summary.get('sampling_mode', 'full')}; "
-                f"top_events={summary.get('events', {})}; top_tools={summary.get('tools', {})}; "
-                f"errors={top_error}; warnings={top_warning}."
-            )
-            if _reflection_store_finding(
-                investigation_id=investigation_id,
-                finding_type="observed",
-                text=finding_text,
-                confidence="low",
-                tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
-            ):
-                findings_written += 1
+        if store_item_findings and _reflection_item_finding(
+            kind, path, summary, raw_errors, raw_warnings, error_observations,
+            warning_observations, stats, investigation_id, low_signal_session_events,
+        ):
+            findings_written += 1
 
     if store_item_findings and low_signal_session_events:
         event_counts: Counter[str] = Counter()
@@ -4130,6 +4207,62 @@ def _correlate_memories(
     }
 
 
+def _correlate_scan_target_file(target_file: str):
+    """Scan a target .py file for suspected entities and code-hallucination verdicts.
+
+    Returns (suspected_entities, code_findings, code_note). Every stage is
+    fail-open: a missing, non-Python, unreadable, or checker-failing file yields
+    an advisory note rather than an error, and correlation proceeds on whatever
+    entities were extracted.
+    """
+    tf = str(target_file).strip()
+    path = Path(tf)
+    if not path.exists() or not path.is_file():
+        return set(), None, f"target_file {tf!r} does not exist or is not a file — skipped"
+    if path.suffix != ".py":
+        return set(), None, f"target_file {tf!r} is not a .py file — skipped"
+
+    code_note = None
+    try:
+        content = path.read_text()
+    except Exception as exc:  # fail-open — unreadable file is advisory
+        logger.debug("could not read target_file %s: %r", tf, exc)
+        return set(), None, f"target_file {tf!r} could not be read — skipped"
+
+    suspected = _suspected_entities_from_text(content)
+
+    # tree-sitter: ingest the file's AST into the code graph (fail-open) so its
+    # symbols/calls are queryable via code_graph_query and linkable to the memory
+    # graph. Targeted symbol suspicion still comes from the code checker's flagged
+    # identifiers below, not every symbol.
+    try:
+        from graph.code_parse import parse_source, detect_lang
+        lang = detect_lang(tf)
+        ks = _get_ladybug()
+        if lang and ks:
+            ks.ingest_code([parse_source(tf, content.encode("utf-8", "replace"), lang)])
+    except Exception as exc:
+        logger.debug("AST ingest for %s failed (fail-open): %r", tf, exc)
+
+    try:
+        verdicts = run_code_checks(path)
+    except Exception as exc:  # fail-open — checker errors are advisory
+        logger.debug("run_code_checks failed for %s, degrading: %r", tf, exc)
+        verdicts = []
+
+    lh_verdicts = [
+        v for v in verdicts
+        if str(getattr(v, "verdict_type", "")) in _CODE_HALLUCINATION_CODES
+    ]
+    suspected |= _verdict_symbols(lh_verdicts)
+    if not lh_verdicts:
+        code_note = (
+            f"no code-hallucination issues found in {path.name} — "
+            "correlating on its extracted entities only (advisory)"
+        )
+    return suspected, _code_findings_from_verdicts(lh_verdicts), code_note
+
+
 @mcp.tool()
 def code_memory_correlate(
     investigation_id: str,
@@ -4195,50 +4328,9 @@ def code_memory_correlate(
 
     # --- Resolve suspected entities from the target file (+ confirm LH issues). ---
     if str(target_file or "").strip():
-        tf = str(target_file).strip()
-        source["target_file"] = tf
-        p = Path(tf)
-        if not p.exists() or not p.is_file():
-            code_note = f"target_file {tf!r} does not exist or is not a file — skipped"
-        elif p.suffix != ".py":
-            code_note = f"target_file {tf!r} is not a .py file — skipped"
-        else:
-            try:
-                content = p.read_text()
-            except Exception as exc:  # fail-open — unreadable file is advisory note
-                logger.debug("could not read target_file %s: %r", tf, exc)
-                content = ""
-                code_note = f"target_file {tf!r} could not be read — skipped"
-            if content or code_note is None:
-                suspected |= _suspected_entities_from_text(content)
-                # tree-sitter: ingest the file's AST into the code graph (fail-open) so
-                # its symbols/calls are queryable via code_graph_query and linkable to
-                # the memory graph. Targeted symbol suspicion still comes from the code
-                # checker's flagged identifiers (_verdict_symbols) below, not every symbol.
-                try:
-                    from graph.code_parse import parse_source, detect_lang
-                    _lang = detect_lang(tf)
-                    _ks = _get_ladybug()
-                    if _lang and _ks:
-                        _ks.ingest_code([parse_source(tf, content.encode("utf-8", "replace"), _lang)])
-                except Exception as exc:
-                    logger.debug("AST ingest for %s failed (fail-open): %r", tf, exc)
-                try:
-                    verdicts = run_code_checks(p)
-                except Exception as exc:  # fail-open — checker errors are advisory
-                    logger.debug("run_code_checks failed for %s, degrading: %r", tf, exc)
-                    verdicts = []
-                lh_verdicts = [
-                    v for v in verdicts
-                    if str(getattr(v, "verdict_type", "")) in _CODE_HALLUCINATION_CODES
-                ]
-                suspected |= _verdict_symbols(lh_verdicts)
-                code_findings = _code_findings_from_verdicts(lh_verdicts)
-                if not lh_verdicts:
-                    code_note = (
-                        f"no code-hallucination issues found in {p.name} — "
-                        "correlating on its extracted entities only (advisory)"
-                    )
+        source["target_file"] = str(target_file).strip()
+        _tf_suspected, code_findings, code_note = _correlate_scan_target_file(target_file)
+        suspected |= _tf_suspected
 
     suspected = {s for s in suspected if s}
     if not suspected:
@@ -5740,6 +5832,127 @@ def loci_health() -> str:
     return json.dumps(out, indent=2)
 
 
+# --------------------------------------------------------------------------- #
+# rag_context_search internals
+#
+# Each stage is independently fail-open, matching the tool's contract: a dead
+# expander, collection, decay pass or access-log write never aborts the search.
+# --------------------------------------------------------------------------- #
+def _rag_expand_queries(query: str) -> tuple[list[str], dict]:
+    """Widen the recall pool with HyDE-lite expansion.
+
+    Returns (search_queries, expansion_info). The original query always leads, so
+    a degraded expander costs nothing. The cross-encoder re-pass ranks against the
+    ORIGINAL query, so expansion widens recall without diluting precision.
+    """
+    try:
+        import query_expand as _qe
+        exp = _qe.expand(query, n_queries=3, n_keywords=6)
+        sq = list(exp.get("queries") or [query])
+        kw = exp.get("keywords") or []
+        if kw:
+            sq.append(" ".join(kw))
+        seen: set = set()
+        queries = [q for q in sq if q and not (q in seen or seen.add(q))] or [query]
+        return queries, {"enabled": True, "degraded": bool(exp.get("degraded")),
+                         "n_queries": len(queries), "keywords": kw}
+    except Exception as exc:
+        logger.debug("rag_context_search: query expansion failed (fail-open): %s", exc)
+        return [query], {"enabled": True, "degraded": True, "error": str(exc)}
+
+
+def _rag_search_collections(collections, search_queries, limit, agent_filter, errors) -> list[dict]:
+    """Union hits across (collection x expanded query), deduped by (origin, id).
+
+    Keeps the best bi-encoder score per key. A failing collection is recorded in
+    `errors` and skipped rather than aborting the search.
+    """
+    best: dict = {}
+    for col in collections:
+        qf = agent_filter if col == "agent_core_chunks" else None
+        for sq in search_queries:
+            try:
+                hits = _qdrant_search_collection(sq, collection_name=col, limit=limit, query_filter=qf)
+            except Exception as exc:
+                errors.append(f"{col}: {exc}")
+                logger.warning("rag_context_search: collection %s failed: %s", col, exc)
+                continue
+            for h in hits:
+                key = (h.get("origin"), h.get("id"))
+                prev = best.get(key)
+                if prev is None or float(h.get("score") or 0.0) > float(prev.get("score") or 0.0):
+                    best[key] = h
+    return list(best.values())
+
+
+def _rag_apply_decay(results: list[dict]) -> None:
+    """Rescore findings in place with Ebbinghaus exponential time decay.
+
+    Only touches rows from the main findings collection; rows without a usable
+    timestamp keep their raw score.
+    """
+    try:
+        now_ts = time.time()
+        for r in results:
+            if r.get("origin") != QDRANT_COLLECTION_PREFIX:
+                continue
+            ts_val = r.get("created_at_ts") or r.get("ts")
+            if ts_val is None:
+                continue
+            # ts may be an ISO string; created_at_ts is always an int epoch
+            try:
+                age_days = max(0.0, (now_ts - float(ts_val)) / 86400.0)
+                raw_score = float(r.get("score") or 0.0)
+                r["score"] = round(raw_score * math.exp(-_MEMORY_DECAY_LAMBDA * age_days), 4)
+                r["decay_applied"] = True
+            except Exception as exc:
+                logger.debug("rag_context_search: recency decay scoring failed (fail-open): %r", exc)
+    except Exception as exc:
+        logger.debug("rag_context_search: decay rescoring failed: %s", exc)
+
+
+def _rag_cross_encode(results: list[dict], query: str) -> None:
+    """Re-rank the top 20 in place against the ORIGINAL query, for consistent
+    cross-collection ordering. No-op when the cross-encoder is unavailable."""
+    ce = _get_cross_encoder()
+    if ce is None or len(results) <= 1:
+        return
+    try:
+        pairs = [(query, str(r.get('text', r.get('content', '')))[:512]) for r in results[:20]]
+        for r, sc in zip(results[:20], ce.predict(pairs)):
+            r['final_ce_score'] = round(float(sc), 4)
+        results[:20] = sorted(results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)
+    except Exception as exc:
+        logger.debug('Final CE re-pass failed: %s', exc)
+
+
+def _rag_record_access(results: list[dict], query: str) -> None:
+    """Append a last_accessed marker to each returned finding's JSONL.
+
+    Best-effort per row: this must never block the response.
+    """
+    access_ts = int(time.time())
+    for r in results:
+        try:
+            if r.get("origin") != QDRANT_COLLECTION_PREFIX:
+                continue
+            finding_id, inv_id = r.get("id"), r.get("investigation_id")
+            if not finding_id or not inv_id:
+                continue
+            findings_path = _inv_dir(inv_id) / "findings.jsonl"
+            if not findings_path.exists():
+                continue
+            _append_jsonl(findings_path, {
+                "id": finding_id,
+                "investigation_id": inv_id,
+                "record_type": "access",
+                "last_accessed": access_ts,
+                "query": query[:200],
+            })
+        except Exception as exc:
+            logger.debug("rag access-log write-back failed for %s: %r", r.get("id"), exc)
+
+
 @mcp.tool()
 def rag_context_search(
     query: str,
@@ -5810,23 +6023,7 @@ def rag_context_search(
         _do_expand = os.environ.get("LOCI_RAG_EXPAND", "1").strip().lower() not in ("0", "false", "no", "off", "")
     search_queries = [query]
     if _do_expand:
-        try:
-            import query_expand as _qe
-            _exp = _qe.expand(query, n_queries=3, n_keywords=6)
-            # `queries` already leads with the original; append keywords as one extra recall probe.
-            _sq = list(_exp.get("queries") or [query])
-            _kw = _exp.get("keywords") or []
-            if _kw:
-                _sq.append(" ".join(_kw))
-            # De-dup search strings, preserving order (original stays first).
-            _seen_q: set = set()
-            search_queries = [q for q in _sq if q and not (q in _seen_q or _seen_q.add(q))] or [query]
-            expansion_info = {"enabled": True, "degraded": bool(_exp.get("degraded")),
-                              "n_queries": len(search_queries), "keywords": _kw}
-        except Exception as _exp_exc:
-            logger.debug("rag_context_search: query expansion failed (fail-open): %s", _exp_exc)
-            search_queries = [query]
-            expansion_info = {"enabled": True, "degraded": True, "error": str(_exp_exc)}
+        search_queries, expansion_info = _rag_expand_queries(query)
 
     # Build the GPS-exclusion filter for agent_core_chunks (only).
     _agent_filter = None
@@ -5837,87 +6034,22 @@ def rag_context_search(
     # Retrieve per (collection x expanded query), unioning hits deduped by (origin, id) keeping
     # the best bi-encoder score. The cross-encoder re-pass below re-ranks against the ORIGINAL
     # query, so expansion only widens the candidate pool (recall) without diluting precision.
-    _best: dict = {}
-    for col in _collections:
-        qf = _agent_filter if col == "agent_core_chunks" else None
-        for _sq in search_queries:
-            try:
-                hits = _qdrant_search_collection(_sq, collection_name=col, limit=limit, query_filter=qf)
-            except Exception as exc:
-                errors.append(f"{col}: {exc}")
-                logger.warning("rag_context_search: collection %s failed: %s", col, exc)
-                continue
-            for h in hits:
-                key = (h.get("origin"), h.get("id"))
-                prev = _best.get(key)
-                if prev is None or float(h.get("score") or 0.0) > float(prev.get("score") or 0.0):
-                    _best[key] = h
-    all_results.extend(_best.values())
+    all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
     # Apply Ebbinghaus exponential time-decay rescoring to findings from the main
     # investigation collection only (agent_core_chunks is static knowledge, not time-sensitive).
     if decay:
-        try:
-            _now_ts = time.time()
-            for r in all_results:
-                if r.get("origin") != QDRANT_COLLECTION_PREFIX:
-                    continue
-                ts_val = r.get("created_at_ts") or r.get("ts")
-                if ts_val is None:
-                    continue
-                # ts field may be an ISO string; created_at_ts is always an int epoch
-                try:
-                    age_days = (_now_ts - float(ts_val)) / 86400.0
-                    if age_days < 0:
-                        age_days = 0.0
-                    raw_score = float(r.get("score") or 0.0)
-                    r["score"] = round(raw_score * math.exp(-_MEMORY_DECAY_LAMBDA * age_days), 4)
-                    r["decay_applied"] = True
-                except Exception as exc:
-                    logger.debug("rag_context_search: recency decay scoring failed (fail-open): %r", exc)
-                    pass
-        except Exception as _decay_exc:
-            logger.debug("rag_context_search: decay rescoring failed: %s", _decay_exc)
+        _rag_apply_decay(all_results)
 
     # Merge-sort by score descending across all collections
     all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
 
     # Final cross-encoder re-pass for consistent cross-collection ranking
-    ce = _get_cross_encoder()
-    if ce is not None and len(all_results) > 1:
-        try:
-            pairs = [(query, str(r.get('text', r.get('content', '')))[:512]) for r in all_results[:20]]
-            ce_scores = ce.predict(pairs)
-            for r, s in zip(all_results[:20], ce_scores):
-                r['final_ce_score'] = round(float(s), 4)
-            all_results[:20] = sorted(all_results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)
-        except Exception as _ce_exc:
-            logger.debug('Final CE re-pass failed: %s', _ce_exc)
+    _rag_cross_encode(all_results, query)
 
     # Best-effort access tracking: append last_accessed timestamp to each returned finding's JSONL.
     # Failures are silently ignored — this must never block the response.
-    _access_ts = int(time.time())
-    for r in all_results:
-        try:
-            if r.get("origin") != QDRANT_COLLECTION_PREFIX:
-                continue
-            finding_id = r.get("id")
-            inv_id = r.get("investigation_id")
-            if not finding_id or not inv_id:
-                continue
-            _findings_path = _inv_dir(inv_id) / "findings.jsonl"
-            if not _findings_path.exists():
-                continue
-            _access_entry = {
-                "id": finding_id,
-                "investigation_id": inv_id,
-                "record_type": "access",
-                "last_accessed": _access_ts,
-                "query": query[:200],
-            }
-            _append_jsonl(_findings_path, _access_entry)
-        except Exception as exc:
-            logger.debug("rag access-log write-back failed for %s: %r", r.get("id"), exc)
+    _rag_record_access(all_results, query)
 
     ctx = context_assemble(all_results, query, budget_chars=budget_chars)
     ctx["mode"] = "rag_hybrid"
