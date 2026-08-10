@@ -18,7 +18,7 @@ import server  # noqa: E402
 
 
 _EXPECTED_KEYS = {
-    "code_version", "kuzu", "ollama_reachable", "vllm_reachable",
+    "code_version", "ladybug", "ollama_reachable", "vllm_reachable",
     "qdrant_reachable", "embed_model", "rerank_model", "warm",
 }
 
@@ -28,8 +28,8 @@ def test_loci_health_returns_expected_keys():
     assert isinstance(out, dict)
     # Subset (not ==) so additive fields don't break this contract.
     assert _EXPECTED_KEYS <= set(out.keys())
-    # the "kuzu" key name is retained for wire compatibility (backend is LadybugDB)
-    assert out["kuzu"] in (
+    # the graph-store health state is one of the documented values
+    assert out["ladybug"] in (
         "available", "contended", "unavailable", "latched", "backoff"
     )
     # booleans for reachability, strings for model names / version

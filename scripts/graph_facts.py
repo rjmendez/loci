@@ -23,10 +23,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 def _find_graph() -> str | None:
     import glob
-    # "graph.kuzu" is the ON-DISK database directory name. It predates the
-    # Kuzu -> LadybugDB rename and is deliberately NOT renamed: every existing
-    # deployment has its database at this path, and changing it would orphan them.
-    for p in glob.glob(os.path.expanduser("~/.hermes/**/graph.kuzu"), recursive=True):
+    # Must match what the server actually opens: mcp/server.py creates
+    # MEMORY_DIR / "graph.ladybug". Globbing the historical "graph.kuzu" name
+    # found nothing, so every graph_facts request reported "code graph not
+    # found" while a populated graph sat next to it.
+    for p in glob.glob(os.path.expanduser("~/.hermes/**/graph.ladybug"), recursive=True):
         return p
     return None
 
@@ -98,7 +99,7 @@ def main() -> int:
         for req in spec:
             out[req.get("key", "?")] = {"kind": "unavailable", "text": "code graph not found", "raw": {}}
         print(json.dumps(out, indent=2))
-        print("[graph_facts: no graph.kuzu found]", file=sys.stderr)
+        print("[graph_facts: no graph.ladybug found]", file=sys.stderr)
         return 0
 
     from graph.ladybug_store import LadybugStore

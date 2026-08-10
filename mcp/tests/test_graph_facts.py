@@ -46,7 +46,7 @@ def test_main_no_graph_is_fail_open(monkeypatch, capsys):
 
 
 def test_main_dispatches_per_request(monkeypatch, capsys):
-    monkeypatch.setattr(GF, "_find_graph", lambda: "/fake/graph.kuzu")
+    monkeypatch.setattr(GF, "_find_graph", lambda: "/fake/graph.ladybug")
 
     class FakeKS:
         def __init__(self, *a, **k):
@@ -71,3 +71,25 @@ def test_main_dispatches_per_request(monkeypatch, capsys):
     assert out["a"]["kind"] == "impact" and "foo" in out["a"]["text"]
     assert out["b"]["kind"] == "subsystem"
     assert out["c"]["kind"] == "dead_code"
+
+
+def test_find_graph_looks_where_the_server_actually_writes(tmp_path, monkeypatch):
+    """_find_graph must glob the same directory name mcp/server.py creates.
+
+    Regression: the server opens MEMORY_DIR / "graph.ladybug", but _find_graph
+    globbed "~/.hermes/**/graph.kuzu" -- the pre-rename name. Nothing matched, so
+    every graph_facts request reported "code graph not found" while a populated
+    graph sat beside it. Both sides pass their own tests in isolation; only the
+    agreement between them was broken.
+    """
+    home = tmp_path / "home"
+    (home / ".hermes" / "memory-sessions" / "graph.ladybug").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    found = GF._find_graph()
+
+    assert found is not None, (
+        "_find_graph did not locate the server's graph directory — it is globbing "
+        "a name the server does not create"
+    )
+    assert found.endswith("graph.ladybug")

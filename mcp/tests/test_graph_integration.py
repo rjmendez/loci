@@ -45,7 +45,7 @@ def test_entity_lookup_is_graph_primary_and_cross_case(srv):
     S.investigation_start("inv-b", "B")
     _store(S, "inv-b", "observed", "prior sighting of 203.0.113.9", "edr", "high")
     el = json.loads(S.investigation_entity_lookup("203.0.113.9"))
-    assert el["retrieval"] == "kuzu"
+    assert el["retrieval"] == "ladybug"
     assert el["total_findings"] == 2
     assert el["investigations_count"] == 2  # cross-case
 
@@ -57,7 +57,7 @@ def test_related_cases_graph_primary(srv):
     S.investigation_start("inv-b", "B")
     _store(S, "inv-b", "observed", "callback to evil.example.com", "proxy", "high")
     rc = json.loads(S.investigation_related_cases("evil.example.com"))["results"][0]
-    assert rc["retrieval"] == "kuzu"
+    assert rc["retrieval"] == "ladybug"
     assert rc["related_investigation_count"] >= 1
 
 
@@ -98,7 +98,7 @@ def test_backfill_of_preexisting_findings(srv, tmp_path):
     # drop the graph + its file, reset singleton -> next _get_ladybug triggers backfill
     import shutil
     ks = S._get_ladybug()
-    graph_path = tmp_path / "mem" / "graph.kuzu"
+    graph_path = tmp_path / "mem" / "graph.ladybug"
     del ks
     S._ladybug_store = None
     S._ladybug_failed = False
@@ -133,7 +133,6 @@ def test_relink_invalidates_the_symbol_index_cache(tmp_path, monkeypatch):
         def relink_all(ks):
             return {"relinked": 0}
 
-    monkeypatch.setattr(graph_tools, "_get_kuzu", lambda: object(), raising=False)
     monkeypatch.setattr(graph_tools, "_get_ladybug", lambda: object(), raising=False)
     import sys, types
     fake_graph = types.ModuleType("graph")
