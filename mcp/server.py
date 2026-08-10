@@ -666,7 +666,7 @@ def _entity_lookup_cascade(
     the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
     """
     findings = _entity_lookup_ladybug(entity, investigation_id, limit)
-    method = "kuzu"
+    method = "ladybug"
     if not findings:
         findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
         method = "qdrant"
@@ -5664,12 +5664,11 @@ def loci_health() -> str:
 
     Returns JSON:
       code_version:      short git SHA of the running code ('' if not a git checkout)
-      kuzu:              'available' | 'contended' | 'unavailable' | 'latched' | 'backoff'
-                         (key name retained for wire compatibility; the backend is LadybugDB)
+      ladybug:           'available' | 'contended' | 'unavailable' | 'latched' | 'backoff'
                          — reflects the graph store state via a READ-ONLY probe (never
                          grabs the writer lock). 'contended' = another process holds the
                          writer lock right now (transient with per-op leasing).
-      kuzu_writer_pid:   (optional) PID stamped as the current write-lease holder
+      ladybug_writer_pid: (optional) PID stamped as the current write-lease holder
       ollama_reachable:  TCP reachability of the resolved Ollama endpoint
       vllm_reachable:    TCP reachability of the resolved vLLM endpoint
       qdrant_reachable:  TCP reachability of the resolved Qdrant endpoint
@@ -5679,7 +5678,7 @@ def loci_health() -> str:
     """
     out: dict = {
         "code_version": "",
-        "kuzu": "unavailable",
+        "ladybug": "unavailable",
         "ollama_reachable": False,
         "vllm_reachable": False,
         "qdrant_reachable": False,
@@ -5693,10 +5692,10 @@ def loci_health() -> str:
         logger.debug("loci_health: code_version probe failed: %r", exc)
         pass
     try:
-        out["kuzu"] = _ladybug_health_state()
+        out["ladybug"] = _ladybug_health_state()
         pid = _ladybug_writer_pid()
         if pid is not None:
-            out["kuzu_writer_pid"] = pid
+            out["ladybug_writer_pid"] = pid
     except Exception as exc:
         logger.debug("loci_health: ladybug health-state probe failed: %r", exc)
         pass

@@ -5,7 +5,7 @@ entity-lookup projection, the symbol-index cache, and the one-time backfill. The
 LadybugStore singleton itself — ``_ladybug_store`` / ``_ladybug_failed`` /
 ``_ladybug_last_attempt`` / ``_LADYBUG_RETRY_SECONDS`` / ``_ladybug_lock`` and the
 ``_get_ladybug`` accessor built on them, plus ``_ladybug_health_state`` /
-``_ladybug_writer_pid`` which feed the frozen ``kuzu`` / ``kuzu_writer_pid`` wire
+``_ladybug_writer_pid`` which feed the ``ladybug`` / ``ladybug_writer_pid`` wire
 keys — DELIBERATELY stay in server.py: several tests monkeypatch those latches on
 the server module and assert on ``server._get_ladybug()``, so moving them here
 would make every one of those patches a silent no-op.

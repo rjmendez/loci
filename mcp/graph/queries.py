@@ -95,7 +95,8 @@ def _meta(node: dict, name: str) -> Any:
     """Read an internal key off a returned node/rel dict.
 
     ladybug returns these upper-cased (``_ID``/``_LABEL``/``_SRC``/``_DST``);
-    kuzu used lower-case. Accept either so the reader survives the rename.
+    its predecessor used lower-case. Accept either so the reader survives
+    the rename.
     """
     up = f"_{name.upper()}"
     return node[up] if up in node else node.get(f"_{name.lower()}")
