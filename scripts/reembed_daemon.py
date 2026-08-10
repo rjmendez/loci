@@ -72,7 +72,11 @@ def _resolve_qdrant():
             import json
             home = os.path.expanduser("~")
             cfg = json.load(open(os.path.join(home, ".claude", "settings.json")))
-            key = cfg["mcpServers"]["hermes_memory"]["env"]["QDRANT_API_KEY"]
+            servers = cfg["mcpServers"]
+            # "loci" is the current registration name; "hermes_memory" is what
+            # older settings.json files used. Accept either.
+            entry = servers.get("loci") or servers["hermes_memory"]
+            key = entry["env"]["QDRANT_API_KEY"]
         except Exception:
             key = ""
     if not url:
