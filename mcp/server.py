@@ -56,6 +56,7 @@ import threading
 import time
 import uuid
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -214,6 +215,15 @@ from inv_store import (  # noqa: E402,F401
 
 _investigation_locks: dict[str, threading.Lock] = {}  # per-investigation lock for atomic JSONL appends
 _investigation_locks_lock = threading.Lock()          # guards _investigation_locks dict itself
+
+
+def _investigation_lock(investigation_id: str) -> threading.Lock:
+    """Return the per-investigation lock, creating it under the dict-guard lock if absent.
+
+    Returns the lock UNACQUIRED — callers are responsible for `with` on the result.
+    """
+    with _investigation_locks_lock:
+        return _investigation_locks.setdefault(investigation_id, threading.Lock())
 
 # ---------------------------------------------------------------------------
 # LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
@@ -1107,6 +1117,134 @@ def _ensure_investigation_exists(investigation_id: str, *, title: str, context: 
     _save_manifest(manifest)
 
 
+@dataclass
+class _ReflectionScan:
+    event_counts: Counter = field(default_factory=Counter)
+    tool_counts: Counter = field(default_factory=Counter)
+    error_counts: Counter = field(default_factory=Counter)
+    warning_counts: Counter = field(default_factory=Counter)
+    lines_scanned: int = 0
+    bytes_scanned: int = 0
+    sampling_mode: str = "full"
+
+    def scan_line(self, line: str) -> None:
+        canon = _canonicalize_reflection_signature(line)
+        if _REFLECTION_ERROR_RE.search(line):
+            self.error_counts[canon] += 1
+        elif _REFLECTION_WARN_RE.search(line):
+            self.warning_counts[canon] += 1
+
+
+def _scan_temp_ingest(file_path: Path, scan: "_ReflectionScan") -> None:
+    content = file_path.read_text(encoding="utf-8", errors="ignore")
+    scan.bytes_scanned += len(content.encode("utf-8", errors="ignore"))
+    scan.lines_scanned = 1
+    try:
+        payload = json.loads(content)
+        if isinstance(payload, dict):
+            for key in list(payload.keys())[:30]:
+                scan.event_counts[f"payload_key:{key}"] += 1
+        scan.scan_line(json.dumps(payload)[:20000])
+    except Exception:
+        scan.scan_line(content[:20000])
+
+
+def _scan_session_event(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
+    with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for raw in fh:
+            if scan.lines_scanned >= max_lines:
+                break
+            scan.lines_scanned += 1
+            scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                scan.scan_line(line)
+                continue
+            event_type = str(event.get("type") or event.get("event") or "unknown")
+            scan.event_counts[event_type] += 1
+            tool_name = event.get("tool_start_name") or event.get("tool_complete_name") or event.get("tool_name")
+            if tool_name:
+                scan.tool_counts[str(tool_name)] += 1
+            joined = " ".join([
+                str(event.get("user_content") or ""),
+                str(event.get("assistant_content") or ""),
+                str(event.get("tool_complete_result_content") or ""),
+            ])
+            scan.scan_line(joined)
+
+
+def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
+    with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for raw in fh:
+            if scan.lines_scanned >= max_lines:
+                break
+            scan.lines_scanned += 1
+            scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                scan.scan_line(line)
+                continue
+            # Claude Code event schema: {"type": "...", "message": {...}, "attachments": [...]}
+            event_type = str(event.get("type") or "unknown")
+            scan.event_counts[event_type] += 1
+            # Tool names appear in attachments list as {"toolName": "..."} entries
+            for attachment in (event.get("attachments") or []):
+                if isinstance(attachment, dict):
+                    tool_name = attachment.get("toolName") or attachment.get("tool_name")
+                    if tool_name:
+                        scan.tool_counts[str(tool_name)] += 1
+            # Message content is nested under "message" with role/content structure
+            message = event.get("message") or {}
+            if isinstance(message, dict):
+                content = message.get("content") or ""
+                if isinstance(content, list):
+                    # content may be a list of blocks: [{"type": "text", "text": "..."}]
+                    content = " ".join(
+                        str(block.get("text") or "") for block in content
+                        if isinstance(block, dict)
+                    )
+                joined = str(content)
+            else:
+                joined = str(message)
+            scan.scan_line(joined)
+
+
+def _scan_process_log(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
+    file_bytes = int(file_path.stat().st_size)
+    if file_bytes > REFLECTION_LOG_TAIL_MIN_FILE_BYTES:
+        scan.sampling_mode = "tail"
+        for raw in _read_tail_lines(
+            file_path,
+            max_lines=max_lines,
+            max_bytes=REFLECTION_LOG_TAIL_READ_BYTES,
+        ):
+            scan.lines_scanned += 1
+            scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+            scan.scan_line(raw)
+            m = re.search(r"\btool(?:Name)?[=:\"]+([a-zA-Z0-9_.:-]+)", raw)
+            if m:
+                scan.tool_counts[m.group(1)] += 1
+    else:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for raw in fh:
+                if scan.lines_scanned >= max_lines:
+                    break
+                scan.lines_scanned += 1
+                scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+                scan.scan_line(raw)
+                m = re.search(r"\btool(?:Name)?[=:\"]+([a-zA-Z0-9_.:-]+)", raw)
+                if m:
+                    scan.tool_counts[m.group(1)] += 1
+
+
 def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
     file_path = Path(path)
     if not file_path.exists():
@@ -1122,123 +1260,16 @@ def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
             "warnings": {},
         }
 
-    event_counts: Counter[str] = Counter()
-    tool_counts: Counter[str] = Counter()
-    error_counts: Counter[str] = Counter()
-    warning_counts: Counter[str] = Counter()
-    lines_scanned = 0
-    bytes_scanned = 0
-    sampling_mode = "full"
-
-    def _scan_line(line: str) -> None:
-        canon = _canonicalize_reflection_signature(line)
-        if _REFLECTION_ERROR_RE.search(line):
-            error_counts[canon] += 1
-        elif _REFLECTION_WARN_RE.search(line):
-            warning_counts[canon] += 1
+    scan = _ReflectionScan()
 
     if kind == "temp_ingest":
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        bytes_scanned += len(content.encode("utf-8", errors="ignore"))
-        lines_scanned = 1
-        try:
-            payload = json.loads(content)
-            if isinstance(payload, dict):
-                for key in list(payload.keys())[:30]:
-                    event_counts[f"payload_key:{key}"] += 1
-            _scan_line(json.dumps(payload)[:20000])
-        except Exception:
-            _scan_line(content[:20000])
+        _scan_temp_ingest(file_path, scan)
     elif kind == "session_event":
-        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for raw in fh:
-                if lines_scanned >= max_lines:
-                    break
-                lines_scanned += 1
-                bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    _scan_line(line)
-                    continue
-                event_type = str(event.get("type") or event.get("event") or "unknown")
-                event_counts[event_type] += 1
-                tool_name = event.get("tool_start_name") or event.get("tool_complete_name") or event.get("tool_name")
-                if tool_name:
-                    tool_counts[str(tool_name)] += 1
-                joined = " ".join([
-                    str(event.get("user_content") or ""),
-                    str(event.get("assistant_content") or ""),
-                    str(event.get("tool_complete_result_content") or ""),
-                ])
-                _scan_line(joined)
+        _scan_session_event(file_path, scan, max_lines)
     elif kind == "claude_code_event":
-        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
-            for raw in fh:
-                if lines_scanned >= max_lines:
-                    break
-                lines_scanned += 1
-                bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    _scan_line(line)
-                    continue
-                # Claude Code event schema: {"type": "...", "message": {...}, "attachments": [...]}
-                event_type = str(event.get("type") or "unknown")
-                event_counts[event_type] += 1
-                # Tool names appear in attachments list as {"toolName": "..."} entries
-                for attachment in (event.get("attachments") or []):
-                    if isinstance(attachment, dict):
-                        tool_name = attachment.get("toolName") or attachment.get("tool_name")
-                        if tool_name:
-                            tool_counts[str(tool_name)] += 1
-                # Message content is nested under "message" with role/content structure
-                message = event.get("message") or {}
-                if isinstance(message, dict):
-                    content = message.get("content") or ""
-                    if isinstance(content, list):
-                        # content may be a list of blocks: [{"type": "text", "text": "..."}]
-                        content = " ".join(
-                            str(block.get("text") or "") for block in content
-                            if isinstance(block, dict)
-                        )
-                    joined = str(content)
-                else:
-                    joined = str(message)
-                _scan_line(joined)
+        _scan_claude_code_event(file_path, scan, max_lines)
     elif kind == "process_log":
-        file_bytes = int(file_path.stat().st_size)
-        if file_bytes > REFLECTION_LOG_TAIL_MIN_FILE_BYTES:
-            sampling_mode = "tail"
-            for raw in _read_tail_lines(
-                file_path,
-                max_lines=max_lines,
-                max_bytes=REFLECTION_LOG_TAIL_READ_BYTES,
-            ):
-                lines_scanned += 1
-                bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
-                _scan_line(raw)
-                m = re.search(r"\btool(?:Name)?[=:\"]+([a-zA-Z0-9_.:-]+)", raw)
-                if m:
-                    tool_counts[m.group(1)] += 1
-        else:
-            with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
-                for raw in fh:
-                    if lines_scanned >= max_lines:
-                        break
-                    lines_scanned += 1
-                    bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
-                    _scan_line(raw)
-                    m = re.search(r"\btool(?:Name)?[=:\"]+([a-zA-Z0-9_.:-]+)", raw)
-                    if m:
-                        tool_counts[m.group(1)] += 1
+        _scan_process_log(file_path, scan, max_lines)
     else:
         return {
             "status": "unsupported_kind",
@@ -1256,13 +1287,13 @@ def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
         "status": "processed",
         "kind": kind,
         "path": path,
-        "lines_scanned": lines_scanned,
-        "bytes_scanned": bytes_scanned,
-        "sampling_mode": sampling_mode,
-        "events": dict(event_counts.most_common(8)),
-        "tools": dict(tool_counts.most_common(8)),
-        "errors": dict(error_counts.most_common(8)),
-        "warnings": dict(warning_counts.most_common(8)),
+        "lines_scanned": scan.lines_scanned,
+        "bytes_scanned": scan.bytes_scanned,
+        "sampling_mode": scan.sampling_mode,
+        "events": dict(scan.event_counts.most_common(8)),
+        "tools": dict(scan.tool_counts.most_common(8)),
+        "errors": dict(scan.error_counts.most_common(8)),
+        "warnings": dict(scan.warning_counts.most_common(8)),
     }
 
 
@@ -2772,6 +2803,88 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
     ))
 
 
+def _reflection_batch_low_signal(investigation_id: str, low_signal_session_events: list[dict]) -> int:
+    """Store the batched low-signal session_event roll-up finding.
+
+    Returns the number to add to ``findings_written`` (0 or 1). Caller must
+    only invoke this when ``store_item_findings and low_signal_session_events``.
+    """
+    event_counts: Counter[str] = Counter()
+    tool_counts: Counter[str] = Counter()
+    for entry in low_signal_session_events:
+        event_counts.update(entry.get("events") or {})
+        tool_counts.update(entry.get("tools") or {})
+    sample_paths = [e["path"] for e in low_signal_session_events[:3]]
+    low_signal_text = (
+        f"reflection_loop_tick batched low-signal session_event files count={len(low_signal_session_events)}; "
+        f"total_lines={sum(e['lines_scanned'] for e in low_signal_session_events)} "
+        f"total_bytes={sum(e['bytes_scanned'] for e in low_signal_session_events)}; "
+        f"top_events={dict(event_counts.most_common(8))}; top_tools={dict(tool_counts.most_common(8))}; "
+        f"sample_paths={sample_paths}."
+    )
+    if _reflection_store_finding(
+        investigation_id=investigation_id,
+        finding_type="observed",
+        text=low_signal_text,
+        confidence="low",
+        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal",
+    ):
+        return 1
+    return 0
+
+
+def _reflection_batch_error_signature(investigation_id: str, batch_error_signatures: Counter) -> int:
+    """Store the batch dominant-error-signature inference finding.
+
+    Returns the number to add to ``findings_written`` (0 or 1). Caller must
+    only invoke this when ``store_item_findings and batch_error_signatures``.
+    """
+    sig, count = batch_error_signatures.most_common(1)[0]
+    infer_text = (
+        "Batch dominant error signature suggests reliability hotspot: "
+        f"{sig} (count={count}) in latest processed artifacts."
+    )
+    if _reflection_store_finding(
+        investigation_id=investigation_id,
+        finding_type="inferred",
+        text=infer_text,
+        confidence="medium",
+        tags="self-reflection,error-cluster,inference",
+    ):
+        return 1
+    return 0
+
+
+def _reflection_requeue_dropped(
+    queue: list, dropped_items: list[dict], investigation_id: str, store_item_findings: bool
+) -> int:
+    """Re-queue dropped items and record a gap finding for each, in place.
+
+    Mutates ``queue`` via ``.append`` -- never rebinds it, since the caller
+    persists the same list object via ``state["queue"] = queue``. Returns the
+    number to add to ``findings_written``.
+    """
+    added = 0
+    for dropped in dropped_items:
+        queue.append(dropped)
+        if store_item_findings:
+            d_kind = str(dropped.get("kind") or "")
+            d_path = str(dropped.get("path") or "")
+            gap_text = (
+                f"reflection_loop_tick could not process item kind={d_kind} path={d_path}; "
+                "item re-queued for future processing."
+            )
+            if _reflection_store_finding(
+                investigation_id=investigation_id,
+                finding_type="gap",
+                text=gap_text,
+                confidence="low",
+                tags="self-reflection,loop-tick,dropped-item,re-queued",
+            ):
+                added += 1
+    return added
+
+
 @mcp.tool()
 def reflection_loop_tick(
     max_items: int = 3,
@@ -2863,42 +2976,10 @@ def reflection_loop_tick(
             findings_written += 1
 
     if store_item_findings and low_signal_session_events:
-        event_counts: Counter[str] = Counter()
-        tool_counts: Counter[str] = Counter()
-        for entry in low_signal_session_events:
-            event_counts.update(entry.get("events") or {})
-            tool_counts.update(entry.get("tools") or {})
-        sample_paths = [e["path"] for e in low_signal_session_events[:3]]
-        low_signal_text = (
-            f"reflection_loop_tick batched low-signal session_event files count={len(low_signal_session_events)}; "
-            f"total_lines={sum(e['lines_scanned'] for e in low_signal_session_events)} "
-            f"total_bytes={sum(e['bytes_scanned'] for e in low_signal_session_events)}; "
-            f"top_events={dict(event_counts.most_common(8))}; top_tools={dict(tool_counts.most_common(8))}; "
-            f"sample_paths={sample_paths}."
-        )
-        if _reflection_store_finding(
-            investigation_id=investigation_id,
-            finding_type="observed",
-            text=low_signal_text,
-            confidence="low",
-            tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal",
-        ):
-            findings_written += 1
+        findings_written += _reflection_batch_low_signal(investigation_id, low_signal_session_events)
 
     if store_item_findings and batch_error_signatures:
-        sig, count = batch_error_signatures.most_common(1)[0]
-        infer_text = (
-            "Batch dominant error signature suggests reliability hotspot: "
-            f"{sig} (count={count}) in latest processed artifacts."
-        )
-        if _reflection_store_finding(
-            investigation_id=investigation_id,
-            finding_type="inferred",
-            text=infer_text,
-            confidence="medium",
-            tags="self-reflection,error-cluster,inference",
-        ):
-            findings_written += 1
+        findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures)
 
     stats["last_error_signatures"] = [
         {"signature": sig, "count": count}
@@ -2911,23 +2992,9 @@ def reflection_loop_tick(
     stats["error_signature_observations"] = _prune_signature_observations(error_observations)
     stats["warning_signature_observations"] = _prune_signature_observations(warning_observations)
 
-    for dropped in dropped_items:
-        queue.append(dropped)
-        if store_item_findings:
-            d_kind = str(dropped.get("kind") or "")
-            d_path = str(dropped.get("path") or "")
-            gap_text = (
-                f"reflection_loop_tick could not process item kind={d_kind} path={d_path}; "
-                "item re-queued for future processing."
-            )
-            if _reflection_store_finding(
-                investigation_id=investigation_id,
-                finding_type="gap",
-                text=gap_text,
-                confidence="low",
-                tags="self-reflection,loop-tick,dropped-item,re-queued",
-            ):
-                findings_written += 1
+    findings_written += _reflection_requeue_dropped(
+        queue, dropped_items, investigation_id, store_item_findings
+    )
 
     state["stats"] = stats
     state["processed"] = processed
@@ -3049,6 +3116,98 @@ def _search_row_is_retracted(
     return False
 
 
+def _search_normalize_filters(min_confidence: str, resolution: Optional[str]) -> tuple[str, Optional[str]]:
+    """Fail-open normalisation of investigation_search's resolution and
+    min_confidence filters. An unknown value logs a warning and falls back
+    (resolution -> None, min_confidence -> "low") rather than raising.
+    """
+    # Normalise resolution filter (fail-open: an unknown value disables the filter).
+    resolution = str(resolution).lower() if resolution else None
+    if resolution is not None and resolution not in _RESOLUTION_STATES:
+        logger.warning(
+            "investigation_search: unknown resolution %r — ignoring filter; valid "
+            "values: %s", resolution, ", ".join(sorted(_RESOLUTION_STATES))
+        )
+        resolution = None
+
+    # Normalise confidence floor so callers passing "High" or "MEDIUM" are not
+    # silently ignored by the lowercase dict lookup downstream.
+    min_confidence = str(min_confidence or "low").lower()
+    if min_confidence not in _CONFIDENCE_RANK:
+        logger.warning(
+            "investigation_search: unknown min_confidence %r — ignoring filter; "
+            "valid values: low, medium, high", min_confidence
+        )
+        min_confidence = "low"
+
+    return min_confidence, resolution
+
+
+def _search_apply_confidence_floor(rows: list[dict], min_confidence: str) -> list[dict]:
+    """Apply the confidence floor post-hoc so mnemosyne rows — which carry no
+    "confidence" field — don't silently undermine the caller's filter when
+    mnemosyne satisfies the result limit before Qdrant is queried.
+    """
+    if min_confidence and min_confidence in _CONFIDENCE_RANK and min_confidence != "low":
+        floor = _CONFIDENCE_RANK[min_confidence]
+        return [
+            r for r in rows
+            # Normalise stored confidence to lowercase — mnemosyne-sourced rows may
+            # carry mixed-case values; without .lower() "High" maps to rank 0.
+            if _CONFIDENCE_RANK.get(str(r.get("confidence", "low")).lower(), 0) >= floor
+        ]
+    return rows
+
+
+def _search_annotate_rows(rows: list[dict]) -> None:
+    """Surface each row's resolution and staleness in place.
+
+    Rows sourced from mnemosyne carry no resolution, so we build an authoritative
+    finding_id -> resolution map from JSONL — scoped to only the investigations
+    that actually produced rows, so cost is bounded regardless of how many
+    investigations exist. Absent record -> "open". Fail-open (a failed map build
+    just falls back to the per-row payload value, defaulting to "open").
+    """
+    _resolution_map, _coderefs_map = _search_resolution_maps(rows)
+
+    for r in rows:
+        r["resolution"] = _search_row_resolution(r, _resolution_map)
+        # Staleness: rows from mnemo/qdrant don't carry code_refs, so consult the
+        # JSONL-derived map. Only set ``stale`` when the finding has usable refs.
+        _rfid = str(r.get("finding_id") or r.get("id") or "")
+        _refs = _coderefs_map.get(_rfid)
+        if _refs:
+            _st = _finding_is_stale({"code_refs": _refs})
+            if _st is not None:
+                r["stale"] = _st
+
+
+def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
+    """Build the JSON payload for an empty investigation_search result set."""
+    qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
+    # Only use rag_required mode when Qdrant itself is unavailable.
+    # Empty results with Qdrant available is a normal no-match response.
+    if not qdrant_avail or (qdrant.get("reason") == "qdrant_unavailable"):
+        return json.dumps({
+            "mode": "rag_required",
+            "reason": "qdrant_unavailable",
+            "results": [],
+            "qdrant_enabled": qdrant_avail,
+            "error": "RAG_REQUIRED: Qdrant unavailable. Check QDRANT_URL and QDRANT_API_KEY.",
+        }, indent=2)
+    return json.dumps({
+        "mode": "no_matches",
+        "reason": str(qdrant.get("reason") or "no_matches"),
+        "results": [],
+        "qdrant_enabled": qdrant_avail,
+        "mnemo_status": {
+            "enabled": mnemo_enabled,
+            "bank": _mnemo_bank() if mnemo_enabled else None,
+            "match_count": 0,
+        },
+    }, indent=2)
+
+
 @mcp.tool()
 def investigation_search(
     query: str,
@@ -3081,24 +3240,7 @@ def investigation_search(
     Returns:
         JSON list of matching findings with investigation context.
     """
-    # Normalise resolution filter (fail-open: an unknown value disables the filter).
-    resolution = str(resolution).lower() if resolution else None
-    if resolution is not None and resolution not in _RESOLUTION_STATES:
-        logger.warning(
-            "investigation_search: unknown resolution %r — ignoring filter; valid "
-            "values: %s", resolution, ", ".join(sorted(_RESOLUTION_STATES))
-        )
-        resolution = None
-
-    # Normalise confidence floor so callers passing "High" or "MEDIUM" are not
-    # silently ignored by the lowercase dict lookup downstream.
-    min_confidence = str(min_confidence or "low").lower()
-    if min_confidence not in _CONFIDENCE_RANK:
-        logger.warning(
-            "investigation_search: unknown min_confidence %r — ignoring filter; "
-            "valid values: low, medium, high", min_confidence
-        )
-        min_confidence = "low"
+    min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
 
     # Precompute retracted finding ids per investigation in scope. A row is
     # filtered when it names a finding id (or matches text of one) that is
@@ -3149,62 +3291,15 @@ def investigation_search(
                 if len(deduped) >= limit:
                     break
 
-    # Apply confidence floor post-hoc so mnemosyne rows — which carry no
-    # "confidence" field — don't silently undermine the caller's filter when
-    # mnemosyne satisfies the result limit before Qdrant is queried.
-    if min_confidence and min_confidence in _CONFIDENCE_RANK and min_confidence != "low":
-        floor = _CONFIDENCE_RANK[min_confidence]
-        deduped = [
-            r for r in deduped
-            # Normalise stored confidence to lowercase — mnemosyne-sourced rows may
-            # carry mixed-case values; without .lower() "High" maps to rank 0.
-            if _CONFIDENCE_RANK.get(str(r.get("confidence", "low")).lower(), 0) >= floor
-        ]
+    deduped = _search_apply_confidence_floor(deduped, min_confidence)
 
-    # Surface each row's resolution and optionally filter by it. Rows sourced from
-    # mnemosyne carry no resolution, so we build an authoritative finding_id ->
-    # resolution map from JSONL — scoped to only the investigations that actually
-    # produced rows, so cost is bounded regardless of how many investigations exist.
-    # Absent record -> "open". Fail-open (a failed map build just falls back to the
-    # per-row payload value, defaulting to "open").
-    _resolution_map, _coderefs_map = _search_resolution_maps(deduped)
-
-    for r in deduped:
-        r["resolution"] = _search_row_resolution(r, _resolution_map)
-        # Staleness: rows from mnemo/qdrant don't carry code_refs, so consult the
-        # JSONL-derived map. Only set ``stale`` when the finding has usable refs.
-        _rfid = str(r.get("finding_id") or r.get("id") or "")
-        _refs = _coderefs_map.get(_rfid)
-        if _refs:
-            _st = _finding_is_stale({"code_refs": _refs})
-            if _st is not None:
-                r["stale"] = _st
+    # Surface each row's resolution and optionally filter by it.
+    _search_annotate_rows(deduped)
     if resolution is not None:
         deduped = [r for r in deduped if r.get("resolution") == resolution]
 
     if not deduped:
-        qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
-        # Only use rag_required mode when Qdrant itself is unavailable.
-        # Empty results with Qdrant available is a normal no-match response.
-        if not qdrant_avail or (qdrant.get("reason") == "qdrant_unavailable"):
-            return json.dumps({
-                "mode": "rag_required",
-                "reason": "qdrant_unavailable",
-                "results": [],
-                "qdrant_enabled": qdrant_avail,
-                "error": "RAG_REQUIRED: Qdrant unavailable. Check QDRANT_URL and QDRANT_API_KEY.",
-            }, indent=2)
-        return json.dumps({
-            "mode": "no_matches",
-            "reason": str(qdrant.get("reason") or "no_matches"),
-            "results": [],
-            "qdrant_enabled": qdrant_avail,
-            "mnemo_status": {
-                "enabled": mnemo_enabled,
-                "bank": _mnemo_bank() if mnemo_enabled else None,
-                "match_count": 0,
-            },
-        }, indent=2)
+        return _search_empty_response(qdrant, mnemo_enabled)
 
     mode = "mnemo_primary"
     if qdrant.get("ok"):
@@ -3232,6 +3327,31 @@ def investigation_search(
 
 
 # ---- Tool: investigation_pre_answer_check ----
+
+def _pre_answer_lexical_refs(
+    claim_tokens, claim_negated: bool, evidence_pool: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Score a claim's tokens against the evidence pool via lexical matching.
+
+    Returns ``(support_refs, contradiction_refs)`` in the append order produced
+    by iterating ``evidence_pool`` -- callers rely on this order for the
+    downstream ``[:8]`` slice and for reference deduplication.
+    """
+    claim_support_refs: list[dict] = []
+    claim_contradiction_refs: list[dict] = []
+    for evid in evidence_pool:
+        score = _lexical_match_score(claim_tokens, evid.get("tokens", set()))
+        if score < 0.45:
+            continue
+        evidence_negated = bool(_NEGATION_RE.search(str(evid.get("text", ""))))
+        if claim_negated != evidence_negated and score >= 0.5:
+            ref = _make_ref(evid, "contradiction", score=score)
+            claim_contradiction_refs.append(ref)
+        else:
+            ref = _make_ref(evid, "support", score=score)
+            claim_support_refs.append(ref)
+    return claim_support_refs, claim_contradiction_refs
+
 
 def _pre_answer_chain_confidence(
     investigation_id: str, matched_ids: set[str]
@@ -3316,20 +3436,9 @@ def investigation_pre_answer_check(
     for claim in normalized_claims:
         claim_tokens = tokenize(claim)
         claim_negated = bool(_NEGATION_RE.search(claim))
-        claim_support_refs: list[dict] = []
-        claim_contradiction_refs: list[dict] = []
-
-        for evid in evidence_pool:
-            score = _lexical_match_score(claim_tokens, evid.get("tokens", set()))
-            if score < 0.45:
-                continue
-            evidence_negated = bool(_NEGATION_RE.search(str(evid.get("text", ""))))
-            if claim_negated != evidence_negated and score >= 0.5:
-                ref = _make_ref(evid, "contradiction", score=score)
-                claim_contradiction_refs.append(ref)
-            else:
-                ref = _make_ref(evid, "support", score=score)
-                claim_support_refs.append(ref)
+        claim_support_refs, claim_contradiction_refs = _pre_answer_lexical_refs(
+            claim_tokens, claim_negated, evidence_pool
+        )
 
         qdrant_refs, qdrant_status = _search_qdrant_claim_evidence(claim, investigation_id, limit=5)
         qdrant_available = qdrant_available or bool(qdrant_status.get("available"))
@@ -4988,6 +5097,103 @@ def _forget_finding_verdicts(finding: dict) -> int:
         return 0
 
 
+def _retract_cluster(
+    seed_ids: list[str], findings: list[dict], semantic_ids: list[str]
+) -> tuple[list[str], dict, dict, list[dict]]:
+    """Compute the contamination cluster for a retraction and its dry-run items."""
+    cluster = find_contamination(
+        seed_ids,
+        findings,
+        entities_of=_extract_entities,
+        semantic_neighbor_ids=semantic_ids,
+        min_shared_entities=1,
+    )
+    contaminated_ids = cluster["contaminated_ids"]
+    reasons = cluster["reasons"]
+    by_id = {str(f.get("id", "")): f for f in findings}
+
+    items = [
+        {
+            "finding_id": fid,
+            "text_excerpt": redact_excerpt(str(by_id.get(fid, {}).get("text", "") or "")),
+            "reasons": reasons.get(fid, []),
+        }
+        for fid in contaminated_ids
+    ]
+    return contaminated_ids, reasons, by_id, items
+
+
+def _retract_write_tombstones(
+    retractions_path,
+    contaminated_ids: list[str],
+    by_id: dict,
+    reasons: dict,
+    seed_anchor: str,
+    reason: str,
+    ts: str,
+) -> tuple[list[dict], int]:
+    """Append one retraction tombstone per contaminated finding, forgetting verdicts."""
+    retracted_records: list[dict] = []
+    verdicts_forgotten = 0
+    for fid in contaminated_ids:
+        retraction_id = str(uuid.uuid4())
+        entry = {
+            "retraction_id": retraction_id,
+            "finding_id": fid,
+            "seed_id": seed_anchor,
+            "reason": reason or "hallucination retraction",
+            "ts": ts,
+            "active": True,
+        }
+        _append_jsonl(retractions_path, entry)
+        verdicts_forgotten += _forget_finding_verdicts(by_id.get(fid, {}))
+        retracted_records.append({
+            "retraction_id": retraction_id,
+            "finding_id": fid,
+            "reasons": reasons.get(fid, []),
+        })
+    return retracted_records, verdicts_forgotten
+
+
+def _retract_stamp_valid_until(investigation_id: str, contaminated_ids: list[str], ts: str) -> None:
+    """Bi-temporal hook: stamp valid_until on retracted findings so that
+    investigation_as_of queries exclude them from any future as-of view.
+    Fails open — never propagates."""
+    try:
+        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+        _rewrite_jsonl_set_field(
+            findings_path,
+            set(contaminated_ids),
+            "valid_until",
+            ts,
+        )
+    except Exception as exc:  # fail-open
+        logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
+
+
+def _retract_quarantine_verdict(
+    seeds: list[dict], seed_anchor: str, reason: str, contaminated_ids: list[str]
+) -> bool:
+    """Record a quarantine verdict to the store (fail-open) for recall."""
+    try:
+        seed_text = str(seeds[0].get("text", "") or "")
+        quarantine_verdict = new_verdict(
+            subject_kind="memory",
+            subject_signature=make_signature("memory", seed_anchor),
+            subject_excerpt=redact_excerpt(seed_text),
+            verdict_type="retracted",
+            decision="quarantine",
+            confidence=0.9,
+            rationale=reason or "hallucination retracted with contaminated lineage",
+            source="human",
+            refs=list(contaminated_ids),
+        )
+        return _record_verdicts([quarantine_verdict])
+    except Exception as exc:  # fail-open
+        logger.debug("quarantine verdict record failed, degrading: %r", exc)
+        return False
+
+
 @mcp.tool()
 def memory_retract(
     investigation_id: str,
@@ -5051,25 +5257,7 @@ def memory_retract(
     if scope_semantic:
         semantic_ids = _semantic_neighbor_ids(seeds, investigation_id)
 
-    cluster = find_contamination(
-        seed_ids,
-        findings,
-        entities_of=_extract_entities,
-        semantic_neighbor_ids=semantic_ids,
-        min_shared_entities=1,
-    )
-    contaminated_ids = cluster["contaminated_ids"]
-    reasons = cluster["reasons"]
-    by_id = {str(f.get("id", "")): f for f in findings}
-
-    items = [
-        {
-            "finding_id": fid,
-            "text_excerpt": redact_excerpt(str(by_id.get(fid, {}).get("text", "") or "")),
-            "reasons": reasons.get(fid, []),
-        }
-        for fid in contaminated_ids
-    ]
+    contaminated_ids, reasons, by_id, items = _retract_cluster(seed_ids, findings, semantic_ids)
 
     if dry_run:
         return json.dumps({
@@ -5087,47 +5275,19 @@ def memory_retract(
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
     audit_path = _inv_dir(investigation_id) / "retraction_audit.jsonl"
     seed_anchor = seed_ids[0]
-    retracted_records: list[dict] = []
-    verdicts_forgotten = 0
 
     # Acquire a per-investigation lock so that the retractions.jsonl appends
     # and the matching retraction_audit.jsonl append are observed atomically
     # by concurrent readers (no window where a retraction exists without its
     # audit record).
-    with _investigation_locks_lock:
-        inv_lock = _investigation_locks.setdefault(investigation_id, threading.Lock())
+    inv_lock = _investigation_lock(investigation_id)
 
     with inv_lock:
-        for fid in contaminated_ids:
-            retraction_id = str(uuid.uuid4())
-            entry = {
-                "retraction_id": retraction_id,
-                "finding_id": fid,
-                "seed_id": seed_anchor,
-                "reason": reason or "hallucination retraction",
-                "ts": ts,
-                "active": True,
-            }
-            _append_jsonl(retractions_path, entry)
-            verdicts_forgotten += _forget_finding_verdicts(by_id.get(fid, {}))
-            retracted_records.append({
-                "retraction_id": retraction_id,
-                "finding_id": fid,
-                "reasons": reasons.get(fid, []),
-            })
+        retracted_records, verdicts_forgotten = _retract_write_tombstones(
+            retractions_path, contaminated_ids, by_id, reasons, seed_anchor, reason, ts
+        )
 
-        # Bi-temporal hook: stamp valid_until on retracted findings so that
-        # investigation_as_of queries exclude them from any future as-of view.
-        try:
-            findings_path = _inv_dir(investigation_id) / "findings.jsonl"
-            _rewrite_jsonl_set_field(
-                findings_path,
-                set(contaminated_ids),
-                "valid_until",
-                ts,
-            )
-        except Exception as exc:  # fail-open
-            logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
+        _retract_stamp_valid_until(investigation_id, contaminated_ids, ts)
 
         _append_jsonl(audit_path, {
             "action": "retract",
@@ -5141,24 +5301,7 @@ def memory_retract(
             "scope_semantic": scope_semantic,
         })
 
-    # Record a quarantine verdict to the store (fail-open) for recall.
-    try:
-        seed_text = str(seeds[0].get("text", "") or "")
-        quarantine_verdict = new_verdict(
-            subject_kind="memory",
-            subject_signature=make_signature("memory", seed_anchor),
-            subject_excerpt=redact_excerpt(seed_text),
-            verdict_type="retracted",
-            decision="quarantine",
-            confidence=0.9,
-            rationale=reason or "hallucination retracted with contaminated lineage",
-            source="human",
-            refs=list(contaminated_ids),
-        )
-        quarantine_recorded = _record_verdicts([quarantine_verdict])
-    except Exception as exc:  # fail-open
-        logger.debug("quarantine verdict record failed, degrading: %r", exc)
-        quarantine_recorded = False
+    quarantine_recorded = _retract_quarantine_verdict(seeds, seed_anchor, reason, contaminated_ids)
 
     _event_log_append({
         "op": "retract",
@@ -5901,7 +6044,9 @@ def _rag_apply_decay(results: list[dict]) -> None:
                 continue
             # ts may be an ISO string; created_at_ts is always an int epoch
             try:
-                age_days = max(0.0, (now_ts - float(ts_val)) / 86400.0)
+                age_days = (now_ts - float(ts_val)) / 86400.0
+                if age_days < 0:
+                    age_days = 0.0
                 raw_score = float(r.get("score") or 0.0)
                 r["score"] = round(raw_score * math.exp(-_MEMORY_DECAY_LAMBDA * age_days), 4)
                 r["decay_applied"] = True
@@ -6066,6 +6211,77 @@ def rag_context_search(
 # Tool: memory_surface — proactive context surfacing
 # ---------------------------------------------------------------------------
 
+def _surface_query_filter(investigation_id: Optional[str]) -> Optional[object]:
+    """Build an investigation-scoped Qdrant filter for memory_surface.
+
+    Fail-open: on any construction error, logs a warning and returns None so
+    the caller falls back to an unscoped (wider) search rather than erroring.
+    """
+    if not investigation_id:
+        return None
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        return Filter(
+            must=[FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))]
+        )
+    except Exception as exc:
+        logger.warning(
+            "memory_surface: investigation filter construction failed for %s "
+            "- search will NOT be scoped: %r", investigation_id, exc,
+        )
+        return None
+
+
+def _surface_apply_decay(rows: list[dict]) -> None:
+    """Rescore memory_surface rows in place with Ebbinghaus exponential time decay.
+
+    Applies decay only if _MEMORY_DECAY_LAMBDA is defined on this module. Unlike
+    _rag_apply_decay, this defaults created_at_ts to now (no-op decay) rather than
+    skipping rows without a timestamp, and does not restrict to the findings collection.
+    Fail-open — decay is an optional enhancement and never breaks the tool.
+    """
+    _decay_lambda = globals().get("_MEMORY_DECAY_LAMBDA")
+    now_ts = time.time()
+    if _decay_lambda is not None:
+        try:
+            for r in rows:
+                created_ts = float(r.get("created_at_ts") or now_ts)
+                age_days = (now_ts - created_ts) / 86400.0
+                decay = math.exp(-float(_decay_lambda) * age_days)
+                r["score"] = round(float(r.get("score") or 0.0) * decay, 4)
+        except Exception as exc:
+            logger.debug("memory_surface: recency decay scoring failed (fail-open): %r", exc)
+            pass  # decay is optional enhancement; never break the tool
+
+
+def _surface_rows(top_results: list[dict], ctx_prefix: str, investigation_id: Optional[str]) -> list[dict]:
+    """Build the memory_surface 'surfaced' response rows from top_results.
+
+    ctx_prefix is the pre-computed first-8-whitespace-split-words prefix of the
+    original context, used verbatim in the relevance_note fallback label.
+    """
+    surfaced = []
+    for r in top_results:
+        finding_id = r.get("id") or r.get("finding_id") or ""
+        text = str(r.get("text") or r.get("content") or "")
+        source = str(r.get("source") or r.get("origin") or "")
+        inv_id = r.get("investigation_id") or investigation_id or ""
+        score = round(float(r.get("score") or 0.0), 4)
+
+        # Generate relevance_note: simple label based on context prefix
+        relevance_note = f"Related to: {ctx_prefix}"
+
+        surfaced.append({
+            "finding_id": finding_id,
+            "text": text[:300] if len(text) > 300 else text,
+            "source": source,
+            "relevance_note": relevance_note,
+            "score": score,
+            "investigation_id": inv_id,
+        })
+    return surfaced
+
+
 @mcp.tool()
 def memory_surface(
     context: str,
@@ -6090,8 +6306,6 @@ def memory_surface(
         JSON with {surfaced: [{finding_id, text, source, relevance_note, score,
                                investigation_id}], context_used, count}
     """
-    import math as _math
-
     if not context or not context.strip():
         return json.dumps({
             "error": "context must not be empty",
@@ -6111,19 +6325,7 @@ def memory_surface(
             })
 
         # Build investigation filter if requested
-        query_filter = None
-        if investigation_id:
-            try:
-                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                query_filter = Filter(
-                    must=[FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))]
-                )
-            except Exception as exc:
-                logger.warning(
-                    "memory_surface: investigation filter construction failed for %s "
-                    "- search will NOT be scoped: %r", investigation_id, exc,
-                )
-                pass
+        query_filter = _surface_query_filter(investigation_id)
 
         # Fetch top_k * 3 candidates with a lower threshold via _qdrant_search_collection
         fetch_limit = top_k * 3
@@ -6157,18 +6359,7 @@ def memory_surface(
         filtered = [r for r in candidates if float(r.get("score") or 0.0) >= _SURFACE_SCORE_THRESHOLD]
 
         # Apply Ebbinghaus decay if _MEMORY_DECAY_LAMBDA is defined on this module
-        _decay_lambda = globals().get("_MEMORY_DECAY_LAMBDA")
-        now_ts = time.time()
-        if _decay_lambda is not None:
-            try:
-                for r in filtered:
-                    created_ts = float(r.get("created_at_ts") or now_ts)
-                    age_days = (now_ts - created_ts) / 86400.0
-                    decay = _math.exp(-float(_decay_lambda) * age_days)
-                    r["score"] = round(float(r.get("score") or 0.0) * decay, 4)
-            except Exception as exc:
-                logger.debug("memory_surface: recency decay scoring failed (fail-open): %r", exc)
-                pass  # decay is optional enhancement; never break the tool
+        _surface_apply_decay(filtered)
 
         # Re-sort after possible decay adjustment, then take top_k
         filtered.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
@@ -6178,25 +6369,7 @@ def memory_surface(
         _ctx_words = context.strip().split()
         _ctx_prefix = " ".join(_ctx_words[:8])
 
-        surfaced = []
-        for r in top_results:
-            finding_id = r.get("id") or r.get("finding_id") or ""
-            text = str(r.get("text") or r.get("content") or "")
-            source = str(r.get("source") or r.get("origin") or "")
-            inv_id = r.get("investigation_id") or investigation_id or ""
-            score = round(float(r.get("score") or 0.0), 4)
-
-            # Generate relevance_note: simple label based on context prefix
-            relevance_note = f"Related to: {_ctx_prefix}"
-
-            surfaced.append({
-                "finding_id": finding_id,
-                "text": text[:300] if len(text) > 300 else text,
-                "source": source,
-                "relevance_note": relevance_note,
-                "score": score,
-                "investigation_id": inv_id,
-            })
+        surfaced = _surface_rows(top_results, _ctx_prefix, investigation_id)
 
         return json.dumps({
             "surfaced": surfaced,
@@ -6473,48 +6646,24 @@ def causal_edges_list(investigation_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
-def memory_confidence(
-    query: str,
-    top_k: int = 8,
-) -> str:
+def _confidence_retrieve(query: str, top_k: int) -> tuple[list, Optional[str]]:
     """
-    Estimate how reliably hermes_memory knows about a topic (metamemory).
+    Run the retrieval steps for memory_confidence: empty-query guard, Qdrant
+    availability check, embedding, and vector search.
 
-    Combines five evidence cues into a calibrated confidence score:
-      fluency        — cosine similarity of top hit to query (retrieval ease)
-      accessibility  — mean score of top-4 hits (amount of partial info recalled)
-      source_div     — number of distinct sources/investigations in top results
-      corroboration  — max occurrences across top hits (repeated evidence)
-      trust          — mean confidence tier (high/medium/low) of top hits
-
-    Fluency is down-weighted relative to source_div and trust because it tracks
-    retrieval ease, not correctness (Koriat 1993 over-confidence mechanism).
-
-    Use this before asserting a memory-derived claim to get a calibrated estimate
-    of reliability. Low confidence → verify with investigation tools first.
-
-    Args:
-        query: The claim or topic to estimate confidence for.
-        top_k: Number of results to base the estimate on (default 8).
-
-    Returns:
-        JSON with {confidence, basis, cues, top_hit_preview, recommendation}.
+    Returns (results, hard_stop_basis). When hard_stop_basis is not None the
+    caller should short-circuit with a hard-stop payload using that basis
+    string ("empty_query" / "qdrant_unavailable" / "embed_failed") and
+    results is always []. When hard_stop_basis is None, results holds the
+    (possibly empty) search hits — an empty list there means "no_trace",
+    which the caller handles separately.
     """
-    import math as _math
-
     if not query:
-        return json.dumps({
-            "confidence": 0.0, "basis": "empty_query",
-            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
-        })
+        return [], "empty_query"
 
     client, col = _get_qdrant()
     if client is None:
-        return json.dumps({
-            "confidence": 0.0, "basis": "qdrant_unavailable",
-            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
-        })
+        return [], "qdrant_unavailable"
 
     try:
         emb = _embed(query)
@@ -6522,10 +6671,7 @@ def memory_confidence(
         logger.debug("memory_confidence embed failed: %r", exc)
         emb = None
     if not emb:
-        return json.dumps({
-            "confidence": 0.0, "basis": "embed_failed",
-            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
-        })
+        return [], "embed_failed"
 
     try:
         results = client.search(
@@ -6538,15 +6684,18 @@ def memory_confidence(
         logger.debug("memory_confidence search failed: %r", exc)
         results = []
 
-    if not results:
-        return json.dumps({
-            "confidence": 0.0, "basis": "no_trace",
-            "cues": {"fluency": 0.0, "accessibility": 0.0, "source_div": 0,
-                     "corroboration": 0, "trust": 0.0},
-            "top_hit_preview": "",
-            "recommendation": "no memory found — investigate before asserting",
-        })
+    return results, None
 
+
+def _confidence_cues(results: list) -> dict:
+    """
+    Compute the five metamemory cues for memory_confidence from a list of
+    Qdrant search results.
+
+    Returns {fluency, accessibility, source_div, corroboration, trust,
+    top_text}. top_text is the truncated text/content of the first result
+    that has any (not necessarily results[0]) — "" if none do.
+    """
     scores = [float(getattr(r, "score", 0.0) or 0.0) for r in results]
 
     # Cue 1: Fluency — cosine of top hit (retrieval ease proxy)
@@ -6577,10 +6726,31 @@ def memory_confidence(
     source_div = len(sources)
 
     # Cue 4: Corroboration — log-saturated occurrence count
-    corroboration = _math.log1p(max_occurrences) / _math.log1p(20)  # saturates ~20
+    corroboration = math.log1p(max_occurrences) / math.log1p(20)  # saturates ~20
 
     # Cue 5: Trust — mean confidence tier of top hits
     trust = sum(conf_vals) / max(1, len(conf_vals))
+
+    return {
+        "fluency": fluency,
+        "accessibility": accessibility,
+        "source_div": source_div,
+        "corroboration": corroboration,
+        "trust": trust,
+        "top_text": top_text,
+    }
+
+
+def _confidence_verdict(cues: dict) -> tuple[float, str, str]:
+    """
+    Combine the five metamemory cues into a calibrated (confidence, basis,
+    recommendation) verdict for memory_confidence. Pure function of `cues`.
+    """
+    fluency = cues["fluency"]
+    accessibility = cues["accessibility"]
+    source_div = cues["source_div"]
+    corroboration = cues["corroboration"]
+    trust = cues["trust"]
 
     # Weighted combination (weights: source_div and trust dominate fluency;
     # this ordering follows Fleming 2010 — source/recollection > familiarity/fluency).
@@ -6600,7 +6770,7 @@ def memory_confidence(
            + W["corroboration"] * corroboration
            + W["trust"]         * trust)
     # Sigmoid to keep in (0,1); shift so 0.5 raw → ~0.5 output.
-    confidence = 1.0 / (1.0 + _math.exp(-8 * (raw - 0.5)))
+    confidence = 1.0 / (1.0 + math.exp(-8 * (raw - 0.5)))
 
     # Basis: prefer recollection (source_div) over familiarity (fluency).
     if source_div >= 2:
@@ -6620,6 +6790,63 @@ def memory_confidence(
         recommendation = "low — verify with investigation tools before asserting"
     else:
         recommendation = "unreliable — investigate fresh before asserting"
+
+    return confidence, basis, recommendation
+
+
+@mcp.tool()
+def memory_confidence(
+    query: str,
+    top_k: int = 8,
+) -> str:
+    """
+    Estimate how reliably hermes_memory knows about a topic (metamemory).
+
+    Combines five evidence cues into a calibrated confidence score:
+      fluency        — cosine similarity of top hit to query (retrieval ease)
+      accessibility  — mean score of top-4 hits (amount of partial info recalled)
+      source_div     — number of distinct sources/investigations in top results
+      corroboration  — max occurrences across top hits (repeated evidence)
+      trust          — mean confidence tier (high/medium/low) of top hits
+
+    Fluency is down-weighted relative to source_div and trust because it tracks
+    retrieval ease, not correctness (Koriat 1993 over-confidence mechanism).
+
+    Use this before asserting a memory-derived claim to get a calibrated estimate
+    of reliability. Low confidence → verify with investigation tools first.
+
+    Args:
+        query: The claim or topic to estimate confidence for.
+        top_k: Number of results to base the estimate on (default 8).
+
+    Returns:
+        JSON with {confidence, basis, cues, top_hit_preview, recommendation}.
+    """
+    results, hard_stop_basis = _confidence_retrieve(query, top_k)
+    if hard_stop_basis is not None:
+        return json.dumps({
+            "confidence": 0.0, "basis": hard_stop_basis,
+            "cues": {}, "top_hit_preview": "", "recommendation": "verify",
+        })
+
+    if not results:
+        return json.dumps({
+            "confidence": 0.0, "basis": "no_trace",
+            "cues": {"fluency": 0.0, "accessibility": 0.0, "source_div": 0,
+                     "corroboration": 0, "trust": 0.0},
+            "top_hit_preview": "",
+            "recommendation": "no memory found — investigate before asserting",
+        })
+
+    cues = _confidence_cues(results)
+    fluency = cues["fluency"]
+    accessibility = cues["accessibility"]
+    source_div = cues["source_div"]
+    corroboration = cues["corroboration"]
+    trust = cues["trust"]
+    top_text = cues["top_text"]
+
+    confidence, basis, recommendation = _confidence_verdict(cues)
 
     return json.dumps({
         "confidence": round(confidence, 3),
@@ -7234,6 +7461,94 @@ def memory_hints_resource(investigation_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _route_filter_by_agent(hits: list[dict], agent_id: str) -> list[dict]:
+    """
+    Filter memory_route hits down to those authored by `agent_id` or whose
+    investigation ACL includes `agent_id`. Fail-open: ACL lookup errors are
+    logged and treated as "no match" for that hit.
+    """
+    filtered = []
+    for hit in hits:
+        authored_by = hit.get("authored_by", "")
+        if authored_by == agent_id:
+            filtered.append(hit)
+            continue
+        # Check if the investigation ACL includes this agent
+        inv_id = hit.get("investigation_id", "")
+        if inv_id:
+            try:
+                manifest = _load_manifest(inv_id)
+                if manifest:
+                    acl = manifest.get("acl", [])
+                    if isinstance(acl, list) and agent_id in acl:
+                        filtered.append(hit)
+                        continue
+            except Exception as exc:
+                logger.debug("memory_route: ACL check failed for %s: %r", inv_id, exc)
+                pass  # graceful skip
+    return filtered
+
+
+def _route_dedup_by_overlap(hits: list[dict]) -> list[dict]:
+    """
+    Deduplicate memory_route hits by word-overlap (>80% overlap → keep the
+    highest-scoring hit). Assumes `hits` is already sorted by score
+    (descending), so among an overlapping pair the later one in iteration
+    order is always the lower-scoring one to suppress.
+    """
+    kept = []
+    suppressed = set()
+    for i, hit_a in enumerate(hits):
+        if i in suppressed:
+            continue
+        words_a = set(str(hit_a.get("text", "")).lower().split())
+        for j, hit_b in enumerate(hits):
+            if j <= i or j in suppressed:
+                continue
+            words_b = set(str(hit_b.get("text", "")).lower().split())
+            union = words_a | words_b
+            if not union:
+                continue
+            overlap = len(words_a & words_b) / max(len(union), 1)
+            if overlap > 0.80:
+                # Suppress the lower-scoring one (raw_hits already sorted by score)
+                suppressed.add(j)
+        kept.append(hit_a)
+    return kept
+
+
+def _route_rows(hits: list[dict]) -> list[dict]:
+    """
+    Build memory_route response rows from raw Qdrant hits, resolving each
+    hit's investigation title via the manifest. Fail-open: manifest lookup
+    errors are logged and the row keeps an empty title.
+    """
+    routed = []
+    for hit in hits:
+        inv_id = hit.get("investigation_id", "")
+        inv_title = ""
+        if inv_id:
+            try:
+                manifest = _load_manifest(inv_id)
+                if manifest:
+                    inv_title = manifest.get("title", "")
+            except Exception as exc:
+                logger.debug("memory_route: manifest title lookup failed for %s: %r", inv_id, exc)
+                pass
+
+        routed.append({
+            "finding_id": hit.get("finding_id") or hit.get("id", ""),
+            "investigation_id": inv_id,
+            "investigation_title": inv_title,
+            "text": hit.get("text", ""),
+            "source": hit.get("source", ""),
+            "authored_by": hit.get("authored_by", ""),
+            "score": hit.get("score", 0.0),
+            "tier": hit.get("tier") or hit.get("record_type", "finding"),
+        })
+    return routed
+
+
 @mcp.tool()
 def memory_route(
     query: str,
@@ -7298,77 +7613,18 @@ def memory_route(
 
         # Step 3: Filter by agent_id if provided
         if agent_id:
-            filtered = []
-            for hit in raw_hits:
-                authored_by = hit.get("authored_by", "")
-                if authored_by == agent_id:
-                    filtered.append(hit)
-                    continue
-                # Check if the investigation ACL includes this agent
-                inv_id = hit.get("investigation_id", "")
-                if inv_id:
-                    try:
-                        manifest = _load_manifest(inv_id)
-                        if manifest:
-                            acl = manifest.get("acl", [])
-                            if isinstance(acl, list) and agent_id in acl:
-                                filtered.append(hit)
-                                continue
-                    except Exception as exc:
-                        logger.debug("memory_route: ACL check failed for %s: %r", inv_id, exc)
-                        pass  # graceful skip
-            raw_hits = filtered
+            raw_hits = _route_filter_by_agent(raw_hits, agent_id)
 
         # Step 4: Deduplicate by word-overlap (>80% overlap → keep highest score)
         if deduplicate and len(raw_hits) > 1:
-            kept = []
-            suppressed = set()
-            for i, hit_a in enumerate(raw_hits):
-                if i in suppressed:
-                    continue
-                words_a = set(str(hit_a.get("text", "")).lower().split())
-                for j, hit_b in enumerate(raw_hits):
-                    if j <= i or j in suppressed:
-                        continue
-                    words_b = set(str(hit_b.get("text", "")).lower().split())
-                    union = words_a | words_b
-                    if not union:
-                        continue
-                    overlap = len(words_a & words_b) / max(len(union), 1)
-                    if overlap > 0.80:
-                        # Suppress the lower-scoring one (raw_hits already sorted by score)
-                        suppressed.add(j)
-                kept.append(hit_a)
-            raw_hits = kept
+            raw_hits = _route_dedup_by_overlap(raw_hits)
 
         # Step 5: Trim to top_k
         raw_hits = raw_hits[:top_k]
         total_after_dedup = len(raw_hits)
 
         # Step 6: Build response with provenance
-        routed = []
-        for hit in raw_hits:
-            inv_id = hit.get("investigation_id", "")
-            inv_title = ""
-            if inv_id:
-                try:
-                    manifest = _load_manifest(inv_id)
-                    if manifest:
-                        inv_title = manifest.get("title", "")
-                except Exception as exc:
-                    logger.debug("memory_route: manifest title lookup failed for %s: %r", inv_id, exc)
-                    pass
-
-            routed.append({
-                "finding_id": hit.get("finding_id") or hit.get("id", ""),
-                "investigation_id": inv_id,
-                "investigation_title": inv_title,
-                "text": hit.get("text", ""),
-                "source": hit.get("source", ""),
-                "authored_by": hit.get("authored_by", ""),
-                "score": hit.get("score", 0.0),
-                "tier": hit.get("tier") or hit.get("record_type", "finding"),
-            })
+        routed = _route_rows(raw_hits)
 
         return json.dumps({
             "routed": routed,
