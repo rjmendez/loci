@@ -96,7 +96,6 @@ RULES_DIR    = os.environ.get("HOOK_RULES_DIR",
 RECALL_TOP_K      = int(os.environ.get("HOOK_RECALL_TOP_K",          "3"))
 MIN_IMPORTANCE    = float(os.environ.get("HOOK_RECALL_MIN_IMPORTANCE", "0.2"))
 MIN_SCORE         = float(os.environ.get("HOOK_RECALL_MIN_SCORE",      "0.55"))
-MIN_PROMPT_LEN    = int(os.environ.get("HOOK_RECALL_MIN_PROMPT",       "15"))
 MAX_CONTENT_CHARS = int(os.environ.get("HOOK_RECALL_MAX_CHARS",        "200"))
 RULES_MAX_CHARS   = int(os.environ.get("HOOK_RULES_MAX_CHARS",         "1200"))
 EMBED_TIMEOUT     = float(os.environ.get("HOOK_EMBED_TIMEOUT",         "3.0"))

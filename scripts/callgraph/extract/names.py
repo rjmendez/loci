@@ -22,7 +22,6 @@ from ..ingest import SourceFile
 from ..model import Confidence, Edge, GraphStore
 from ..scopes import FunctionInfo, ModuleScope
 from .defs import function_node_id, module_node_id, name_node_id
-from .walk import walk_module
 
 
 def _write(store: GraphStore, src_id: str, rel_path: str, ident: str, via: str, line: int) -> None:
@@ -186,12 +185,3 @@ def make_names_visitor(store: GraphStore, sf: SourceFile, scope: ModuleScope):
 
     return on_node
 
-
-def extract_names(store: GraphStore, sf: SourceFile, scope: ModuleScope) -> None:
-    """Standalone entry point (unit tests, `cg` debug use) — pipeline.py
-    calls emit_non_walk_writes + make_names_visitor directly instead, to
-    share one walk_module pass with extract/calls.py."""
-    if sf.tree is None:
-        return
-    emit_non_walk_writes(store, sf, scope)
-    walk_module(scope, make_names_visitor(store, sf, scope))

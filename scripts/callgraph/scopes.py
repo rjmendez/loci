@@ -56,7 +56,6 @@ class ClassInfo:
     lineno: int
     end_lineno: int
     bases: list[str]                   # verbatim source text per base
-    method_qualnames: list[str] = field(default_factory=list)
     ambiguous_duplicate: bool = False
 
 
@@ -116,8 +115,8 @@ class ModuleAssign:
     target: str
     value_kind: str    # "name" | "attribute" | "other"
     value_name: Optional[str]       # for "name": the RHS identifier
-    value_base: Optional[str] = None   # for "attribute": the base name (mod.X -> "mod")
-    value_attr: Optional[str] = None   # for "attribute": the attr (mod.X -> "X")
+    # No fields for the "attribute" kind: imports.py only resolves value_kind
+    # == "name", so an attribute alias is recorded and then ignored.
 
 
 class ModuleScope:
@@ -370,9 +369,7 @@ class ModuleScope:
                         bases=bases, ambiguous_duplicate=ambiguous)
         self.classes.append(ci)
         new_stack = stack + [("class", qualname)]
-        before = len(self.functions)
         self._walk_body(node.body, new_stack)
-        ci.method_qualnames = [f.qualname for f in self.functions[before:] if not f.is_nested or f.is_method]
         for lam in _find_lambdas_in(node.body):
             self._visit_lambda(lam, new_stack)
 

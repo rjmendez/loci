@@ -160,10 +160,6 @@ def _walk_blocks(stmts: list[ast.stmt], tag: str, assigns: list[_AssignEvent], e
 # -- escape detection ---------------------------------------------------------
 
 
-def _idents_in_expr(expr: ast.expr) -> set[str]:
-    return {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-
-
 def _direct_return_idents(value: ast.expr) -> set[str]:
     return {value.id} if isinstance(value, ast.Name) else set()
 

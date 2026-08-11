@@ -48,14 +48,6 @@ def _run_git(args: list[str]) -> str:
     return result.stdout
 
 
-def list_git_files(rev: str) -> list[str]:
-    """Repo-relative POSIX paths of corpus .py files as they existed at
-    `rev`, per config.in_corpus (test dirs / __pycache__ / this package
-    excluded)."""
-    out = _run_git(["ls-tree", "-r", "--name-only", rev])
-    return sorted(p for p in out.splitlines() if config.in_corpus(p))
-
-
 def read_git_blob(rel_path: str, rev: str) -> str:
     """Single-file read via `git show`. Kept for callers that only need one
     blob; load_corpus below uses the batched path (one subprocess for the
@@ -111,7 +103,7 @@ def _read_git_blobs_batch(shas: list[str]) -> dict[str, bytes]:
         parts = header.split()
         if len(parts) != 3:
             raise RuntimeError(f"git cat-file --batch: unexpected header {header!r} for {sha}")
-        obj_sha, obj_type, size_s = parts
+        obj_sha, _obj_type, size_s = parts
         size = int(size_s)
         start = nl + 1
         result[obj_sha] = out[start:start + size]
@@ -215,6 +207,3 @@ def load_test_sources(rev: Optional[str] = None) -> list[SourceFile]:
         out.append(_parse_one(rel_path, source, origin))
     return out
 
-
-def corpus_wall_time_note() -> str:  # pragma: no cover - human-facing only
-    return "cold build should finish in well under 2s for the full corpus"

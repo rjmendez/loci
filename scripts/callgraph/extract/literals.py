@@ -40,7 +40,6 @@ from ..model import Confidence, Edge, GraphStore, Node
 from ..scopes import FunctionInfo, ModuleScope
 from .calls import _dotted_call_name
 from .defs import function_node_id, module_node_id
-from .walk import walk_module
 
 # -- ids ----------------------------------------------------------------
 
@@ -376,10 +375,3 @@ def make_literals_visitor(store: GraphStore, sf: SourceFile, scope: ModuleScope)
 
     return on_node
 
-
-def extract_literals(store: GraphStore, sf: SourceFile, scope: ModuleScope) -> None:
-    """Standalone entry point (unit tests, `cg` debug use) — pipeline.py
-    folds make_literals_visitor into the shared whole-module walk instead."""
-    if sf.tree is None:
-        return
-    walk_module(scope, make_literals_visitor(store, sf, scope))

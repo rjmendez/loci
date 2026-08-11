@@ -138,11 +138,6 @@ def _is_stale(point: Any, vector_name: Optional[str],
     return False
 
 
-def _chunks(seq: list, size: int):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
 def _make_point(pid, vector, payload: dict, vector_name: Optional[str]):
     """Build an upsert point. Prefer qdrant's PointStruct; fall back to a dict."""
     vec_payload = {vector_name: vector} if vector_name else vector
