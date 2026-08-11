@@ -258,10 +258,6 @@ def cmd_aliases(args: argparse.Namespace) -> int:
 # -- callers ------------------------------------------------------------------
 
 
-def _row_conf_name(conf: Confidence) -> str:
-    return conf.name
-
-
 def cmd_callers(args: argparse.Namespace) -> int:
     result = _build(args)
     store = result.store

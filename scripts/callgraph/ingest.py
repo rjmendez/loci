@@ -11,7 +11,7 @@ module names which source it read.
 A SyntaxError on one file degrades that file to a stub (tree=None,
 error=<message>) and never aborts the rest of the build.
 
-No parse cache: measured cold-parsing all 114 corpus files takes ~0.2s
+No parse cache: measured cold-parsing all 115 corpus files takes ~0.2s
 (ast.parse itself; pickling a tree back out costs about as much as
 re-parsing it), so a cache would add staleness risk for no real speedup at
 this corpus size. `--no-cache` is accepted and is a no-op today; if the
@@ -46,14 +46,6 @@ def _run_git(args: list[str]) -> str:
         capture_output=True, text=True, check=True,
     )
     return result.stdout
-
-
-def list_git_files(rev: str) -> list[str]:
-    """Repo-relative POSIX paths of corpus .py files as they existed at
-    `rev`, per config.in_corpus (test dirs / __pycache__ / this package
-    excluded)."""
-    out = _run_git(["ls-tree", "-r", "--name-only", rev])
-    return sorted(p for p in out.splitlines() if config.in_corpus(p))
 
 
 def read_git_blob(rel_path: str, rev: str) -> str:
@@ -91,7 +83,7 @@ def list_git_files_with_sha(rev: str) -> list[tuple[str, str]]:
 def _read_git_blobs_batch(shas: list[str]) -> dict[str, bytes]:
     """Every blob in `shas`, read via ONE `git cat-file --batch` subprocess
     instead of one `git show`/`git cat-file` per file -- the difference
-    between ~114 process spawns and 1 for a full-corpus `--rev` build.
+    between ~115 process spawns and 1 for a full-corpus `--rev` build.
     `--batch` writes, per requested object in request order: a header line
     `<sha> <type> <size>\\n`, exactly `<size>` bytes of content, then a
     trailing `\\n`."""
@@ -111,7 +103,7 @@ def _read_git_blobs_batch(shas: list[str]) -> dict[str, bytes]:
         parts = header.split()
         if len(parts) != 3:
             raise RuntimeError(f"git cat-file --batch: unexpected header {header!r} for {sha}")
-        obj_sha, obj_type, size_s = parts
+        obj_sha, _obj_type, size_s = parts
         size = int(size_s)
         start = nl + 1
         result[obj_sha] = out[start:start + size]
@@ -215,6 +207,3 @@ def load_test_sources(rev: Optional[str] = None) -> list[SourceFile]:
         out.append(_parse_one(rel_path, source, origin))
     return out
 
-
-def corpus_wall_time_note() -> str:  # pragma: no cover - human-facing only
-    return "cold build should finish in well under 2s for the full corpus"

@@ -124,7 +124,7 @@ state = load_state()
 # ── 1. Health check ──────────────────────────────────────────────────────────
 if not check_health():
     import time
-    restarted = restart_service()
+    restart_service()          # return ignored on purpose: the health re-check below decides
     time.sleep(3)
     back_up = check_health()
     if back_up:
@@ -137,19 +137,26 @@ if not check_health():
 # ── 2. Portproxy IP drift check ──────────────────────────────────────────────
 wsl_ip = get_wsl_ip()
 proxy_ip = get_portproxy_wsl_ip()
-last_known_wsl_ip = state.get("wsl_ip")
 
+# write_portproxy_script returns False when the write failed (read-only FS, bad
+# permissions). Reporting "script written" regardless told the operator to go run a
+# file that is not there, which reads as a broken instruction rather than as the
+# write failure it is.
 if wsl_ip and proxy_ip and wsl_ip != proxy_ip:
     # WSL IP drifted — update the script and alert
-    written = write_portproxy_script(wsl_ip)
     alerts.append(f"WSL IP changed: {proxy_ip} -> {wsl_ip}")
-    alerts.append(f"Portproxy rule is stale. Updated script written to {PORTPROXY_PS1}")
-    alerts.append(f"Run elevated: powershell -ExecutionPolicy Bypass -File {PORTPROXY_PS1}")
+    if write_portproxy_script(wsl_ip):
+        alerts.append(f"Portproxy rule is stale. Updated script written to {PORTPROXY_PS1}")
+        alerts.append(f"Run elevated: powershell -ExecutionPolicy Bypass -File {PORTPROXY_PS1}")
+    else:
+        alerts.append(f"Portproxy rule is stale, and {PORTPROXY_PS1} could NOT be written.")
 elif wsl_ip and not proxy_ip:
     # No portproxy rule at all
-    written = write_portproxy_script(wsl_ip)
     alerts.append(f"No portproxy rule found for port {A2A_PORT}.")
-    alerts.append(f"Script written to {PORTPROXY_PS1} — run elevated to apply.")
+    if write_portproxy_script(wsl_ip):
+        alerts.append(f"Script written to {PORTPROXY_PS1} — run elevated to apply.")
+    else:
+        alerts.append(f"{PORTPROXY_PS1} could NOT be written; fix the path, then re-run.")
 
 if wsl_ip:
     state["wsl_ip"] = wsl_ip

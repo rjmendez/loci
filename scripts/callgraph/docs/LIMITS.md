@@ -4,7 +4,7 @@ The honest failure-mode catalogue for `callgraph`. A new false-positive
 class discovered in use gets appended here in the same commit that finds
 it. Numbers below were measured at HEAD (`rev 989942b5`, 2026-08-10) with
 `PYTHONPATH=scripts python3 -m callgraph.cli <cmd> --rev HEAD`, whole
-corpus (114 files) unless a `--scope` is noted.
+corpus (115 files) unless a `--scope` is noted.
 
 ## `cg writes-dead`
 

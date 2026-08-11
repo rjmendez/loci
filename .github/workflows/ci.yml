@@ -306,6 +306,16 @@ jobs:
       - name: Install vulture
         run: pip install vulture
 
+      # --min-confidence 60 is vulture's default and the only setting at which it
+      # reports unused functions at all; at 80 this job could only ever see unused
+      # variables, which is not what a dead-code gate is for. The exclusions are
+      # trees whose contents are unreferenced by design: callgraph/fixtures are
+      # synthetic corpora its tests assert against, and callgraph/docs/legacy is a
+      # kept-for-reference artefact. Tests stay in scope -- they are where a
+      # registered entry point is referenced, so dropping them invents dead code.
+      #
+      # No `|| true`. This step previously could not fail, which made its green
+      # indistinguishable from a clean run.
       - name: Run vulture
         run: |
           vulture mcp/server.py \
@@ -313,5 +323,8 @@ jobs:
                   scripts/ \
                   a2a_server/server.py \
                   .vulture_whitelist.py \
-                  --min-confidence 80 \
-                  || true
+                  --min-confidence 60 \
+                  --exclude '*/callgraph/fixtures/*,*/callgraph/docs/legacy/*'
+
+      - name: Check for stale whitelist entries
+        run: python3 scripts/check_vulture_whitelist.py
