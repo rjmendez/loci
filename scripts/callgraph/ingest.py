@@ -11,7 +11,7 @@ module names which source it read.
 A SyntaxError on one file degrades that file to a stub (tree=None,
 error=<message>) and never aborts the rest of the build.
 
-No parse cache: measured cold-parsing all 114 corpus files takes ~0.2s
+No parse cache: measured cold-parsing all 115 corpus files takes ~0.2s
 (ast.parse itself; pickling a tree back out costs about as much as
 re-parsing it), so a cache would add staleness risk for no real speedup at
 this corpus size. `--no-cache` is accepted and is a no-op today; if the
@@ -83,7 +83,7 @@ def list_git_files_with_sha(rev: str) -> list[tuple[str, str]]:
 def _read_git_blobs_batch(shas: list[str]) -> dict[str, bytes]:
     """Every blob in `shas`, read via ONE `git cat-file --batch` subprocess
     instead of one `git show`/`git cat-file` per file -- the difference
-    between ~114 process spawns and 1 for a full-corpus `--rev` build.
+    between ~115 process spawns and 1 for a full-corpus `--rev` build.
     `--batch` writes, per requested object in request order: a header line
     `<sha> <type> <size>\\n`, exactly `<size>` bytes of content, then a
     trailing `\\n`."""

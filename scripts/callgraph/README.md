@@ -47,7 +47,7 @@ report prints which source it read.
 ## What's implemented (build_steps 1-13 — the full design, minus `whatchanged`)
 
 - **config.py** — the corpus definition: `mcp/`, `scripts/`, `a2a_server/`,
-  `mlops/`, `eval/`, non-test `.py` files only (114 files at HEAD),
+  `mlops/`, `eval/`, non-test `.py` files only (115 files at HEAD),
   excluding `tests/`, `__pycache__`, `.venv`, `*.egg-info`, and this
   package itself.
 - **ingest.py** — `ast.parse` over the corpus, either the working tree or a
@@ -216,7 +216,7 @@ Run the tests:
 PYTHONPATH=scripts python3 -m pytest scripts/callgraph/tests -q
 ```
 
-227 tests, full corpus (114 files) parsed repeatedly at several different
+249 tests, full corpus (115 files) parsed repeatedly at several different
 `--rev`s along the way — expect roughly two minutes wall time for the
 whole suite (dominated by those repeated real-corpus builds, not by
 `cg selftest`'s own ~3.5s fixture-plus-one-HEAD-build budget).
