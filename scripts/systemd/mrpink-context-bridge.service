@@ -1,0 +1,34 @@
+[Unit]
+Description=MrPink A2A context bridge (push local memories to mesh peers)
+Documentation=https://github.com/rjmendez/loci
+# Mirrors loci-context-bridge.service on hugbot5000-jetson. This is the oxalis->jetson
+# half of the mesh; the jetson has run the other half since 2026-07-27.
+# The bridge relays through THIS node's own A2A server on :8201 (mrpink-a2a.service).
+# Wants, not Requires: a tick that cannot reach it logs a failure, holds its watermark,
+# and retries — it must not take the timer down with it.
+After=network-online.target mrpink-a2a.service
+Wants=network-online.target mrpink-a2a.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/rjmendez/.hermes/profiles/mrpink
+
+# Order is load-bearing: .bridge.env overrides HERMES_A2A_URL from .env. Do NOT reorder,
+# and do NOT move these values into a drop-in — on this box a drop-in Environment= loses
+# to the main unit's EnvironmentFile=, silently.
+EnvironmentFile=/home/rjmendez/.hermes/profiles/mrpink/.env
+EnvironmentFile=/home/rjmendez/.hermes/profiles/mrpink/.bridge.env
+
+ExecStart=/home/rjmendez/.hermes/hermes-agent/venv/bin/python3 \
+    /home/rjmendez/.hermes/profiles/mrpink/scripts/a2a_context_bridge.py
+
+# Nothing here is urgent and this box shares its GPU with k3s workloads.
+Nice=10
+MemoryMax=256M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mrpink-bridge
+
+[Install]
+WantedBy=default.target

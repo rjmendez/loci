@@ -62,6 +62,12 @@ MIN_IMP        = float(os.environ.get("BRIDGE_MIN_IMP", "0.5"))
 MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
 AGENT_ID       = os.environ.get("HERMES_AGENT_ID", "hermes")
 
+# The bridge relays through the LOCAL A2A server, and that server may enforce TOTP on /a2a
+# (oxalis-mrpink does; hugbot5000-jetson does not). Without this the bearer alone gets a
+# flat 401 on every send and the bridge is inert. Empty seed = no header, so a node whose
+# server does not enforce TOTP is unaffected.
+LOCAL_A2A_TOTP_SEED = os.environ.get("HERMES_A2A_TOTP_SEED", "").strip()
+
 _mnem_dir   = os.path.expanduser(os.environ.get("MNEMOSYNE_DATA_DIR", "~/.hermes/mnemosyne/data"))
 MNEMOSYNE_DB= os.path.join(_mnem_dir, "mnemosyne.db")
 
@@ -159,6 +165,26 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
 
 
 # ── A2A call ──────────────────────────────────────────────────────────────────────
+def _totp_now() -> str:
+    """
+    Current TOTP code for the local A2A server, or "" when no seed is configured.
+
+    Fails loud rather than silently sending an unauthenticated request: if a seed IS set
+    but pyotp is missing, every send would 401 and the only symptom would be a fail count
+    in the log, which is the failure mode this helper exists to remove.
+    """
+    if not LOCAL_A2A_TOTP_SEED:
+        return ""
+    try:
+        import pyotp
+    except ImportError:
+        raise SystemExit(
+            "HERMES_A2A_TOTP_SEED is set but pyotp is not installed — the local server "
+            "enforces TOTP and every send would 401. Install pyotp or unset the seed."
+        )
+    return pyotp.TOTP(LOCAL_A2A_TOTP_SEED).now()
+
+
 async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: bool) -> dict:
     if dry_run:
         return {"status": "dry_run", "id": mem["id"], "content_len": len(mem["content"])}
@@ -193,6 +219,11 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
         "Authorization": f"Bearer {LOCAL_A2A_TOKEN}",
         "Content-Type":  "application/json",
     }
+    # Generated per send, not once per run: a run that spans a 30s TOTP step would otherwise
+    # start failing halfway through with a stale code.
+    totp_code = _totp_now()
+    if totp_code:
+        headers["X-TOTP"] = totp_code
     try:
         async with session.post(
             f"{LOCAL_A2A_URL.rstrip('/')}/a2a",
@@ -242,12 +273,23 @@ async def run(dry_run: bool, verbose: bool):
             _save_state(state)
         return
 
-    ok = fail = 0
+    # Ids already delivered, so holding the watermark back to retry a failure does not
+    # re-send everything newer than it. Bounded so the state file cannot grow without end.
+    sent_ids = list(state.get("sent_ids") or [])
+    sent_set = set(sent_ids)
+
+    ok = fail = skipped = 0
     async with aiohttp.ClientSession() as session:
         for mem in mems:
+            if mem["id"] in sent_set:
+                skipped += 1
+                continue
             result = await _broadcast_memory(session, mem, dry_run)
             if result.get("status") in ("ok", "dry_run"):
                 ok += 1
+                if not dry_run:
+                    sent_set.add(mem["id"])
+                    sent_ids.append(mem["id"])
                 if verbose:
                     log.debug("  ok  id=%s peers=%s preview=%r",
                                result["id"], result.get("peers_ok", "?"),
@@ -257,12 +299,24 @@ async def run(dry_run: bool, verbose: bool):
                 log.warning("  FAIL id=%s status=%s err=%s",
                              result["id"], result.get("status"), result.get("error", ""))
 
-    log.info("Bridge complete — ok=%d fail=%d dry_run=%s", ok, fail, dry_run)
+    log.info("Bridge complete — ok=%d fail=%d skipped=%d dry_run=%s", ok, fail, skipped, dry_run)
 
     if not dry_run:
-        state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        state["last_ok"]  = ok
-        state["last_fail"]= fail
+        # Only advance the watermark on a clean run. It used to advance unconditionally, so
+        # anything that failed to send was never looked at again — a peer that was briefly
+        # down or an auth error silently dropped those memories for good. Holding it back
+        # costs a re-fetch next tick; sent_ids stops that becoming a re-send.
+        if fail == 0:
+            state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        else:
+            log.warning(
+                "Holding watermark at %s — %d send(s) failed and would otherwise be "
+                "skipped permanently. They retry next tick.", state.get("last_run", since), fail
+            )
+            state.setdefault("last_run", since)
+        state["last_ok"]   = ok
+        state["last_fail"] = fail
+        state["sent_ids"]  = sent_ids[-1000:]
         _save_state(state)
 
 
