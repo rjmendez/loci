@@ -58,74 +58,75 @@ for bank, path in DBS.items():
     print(f"\n{'='*50}")
     print(f"Processing bank: {bank}")
     db = sqlite3.connect(path)
-    cur = db.cursor()
+    try:
+        cur = db.cursor()
 
-    # --- Step 1: Purge garbage consolidated_facts ---
-    cur.execute("SELECT id, subject, predicate, object, confidence FROM consolidated_facts")
-    rows = cur.fetchall()
-    to_purge = []
-    for row in rows:
-        id_, subject, predicate, obj, confidence = row
-        if is_garbage_fact(subject, predicate, obj, confidence):
-            to_purge.append(id_)
-            print(f"  PURGE cf id={id_} conf={confidence}: {subject} | {predicate} | {repr(str(obj)[:60])}")
+        # --- Step 1: Purge garbage consolidated_facts ---
+        cur.execute("SELECT id, subject, predicate, object, confidence FROM consolidated_facts")
+        rows = cur.fetchall()
+        to_purge = []
+        for row in rows:
+            id_, subject, predicate, obj, confidence = row
+            if is_garbage_fact(subject, predicate, obj, confidence):
+                to_purge.append(id_)
+                print(f"  PURGE cf id={id_} conf={confidence}: {subject} | {predicate} | {repr(str(obj)[:60])}")
 
-    if to_purge and not DRY_RUN:
-        cur.executemany("DELETE FROM consolidated_facts WHERE id = ?", [(id_,) for id_ in to_purge])
-        db.commit()
-        print(f"  Purged {len(to_purge)} garbage facts from {bank}")
-    elif to_purge:
-        print(f"  [DRY RUN] Would purge {len(to_purge)} facts")
-    else:
-        print(f"  No garbage facts to purge")
-    total_purged += len(to_purge)
+        if to_purge and not DRY_RUN:
+            cur.executemany("DELETE FROM consolidated_facts WHERE id = ?", [(id_,) for id_ in to_purge])
+            db.commit()
+            print(f"  Purged {len(to_purge)} garbage facts from {bank}")
+        elif to_purge:
+            print(f"  [DRY RUN] Would purge {len(to_purge)} facts")
+        else:
+            print(f"  No garbage facts to purge")
+        total_purged += len(to_purge)
 
-    # --- Step 2: Re-embed missing working_memory rows ---
-    cur.execute("""
-        SELECT wm.id, wm.content FROM working_memory wm
-        LEFT JOIN memory_embeddings me ON me.memory_id = wm.id
-        WHERE me.memory_id IS NULL
-    """)
-    missing = cur.fetchall()
-    print(f"\n  Missing embeddings: {len(missing)}")
+        # --- Step 2: Re-embed missing working_memory rows ---
+        cur.execute("""
+            SELECT wm.id, wm.content FROM working_memory wm
+            LEFT JOIN memory_embeddings me ON me.memory_id = wm.id
+            WHERE me.memory_id IS NULL
+        """)
+        missing = cur.fetchall()
+        print(f"\n  Missing embeddings: {len(missing)}")
 
-    for mem_id, content in missing:
-        if not content or not content.strip():
-            print(f"    SKIP empty content id={mem_id}")
-            continue
-        print(f"    Embedding id={mem_id}: {repr(content[:60])}")
-        if not DRY_RUN:
-            vec = model.encode(content, normalize_embeddings=True)
-            embedding_json = json.dumps(vec.tolist())
-            cur.execute(
-                "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model, created_at) VALUES (?, ?, ?, datetime('now'))",
-                (mem_id, embedding_json, MODEL_NAME)
-            )
-        total_embedded += 1
+        for mem_id, content in missing:
+            if not content or not content.strip():
+                print(f"    SKIP empty content id={mem_id}")
+                continue
+            print(f"    Embedding id={mem_id}: {repr(content[:60])}")
+            if not DRY_RUN:
+                vec = model.encode(content, normalize_embeddings=True)
+                embedding_json = json.dumps(vec.tolist())
+                cur.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding_json, model, created_at) VALUES (?, ?, ?, datetime('now'))",
+                    (mem_id, embedding_json, MODEL_NAME)
+                )
+            total_embedded += 1
 
-    if not DRY_RUN and missing:
-        db.commit()
-        print(f"  Embedded {len(missing)} rows in {bank}")
+        if not DRY_RUN and missing:
+            db.commit()
+            print(f"  Embedded {len(missing)} rows in {bank}")
 
-    # --- Step 3: Resolve unresolved conflicts ---
-    cur.execute("SELECT id, fact_a_id, fact_b_id, conflict_type FROM conflicts WHERE resolution IS NULL OR resolution = ''")
-    conflicts = cur.fetchall()
-    print(f"\n  Unresolved conflicts: {len(conflicts)}")
-    for conf_id, fa, fb, ctype in conflicts:
-        # Fetch both facts
-        cur.execute("SELECT subject, predicate, object, confidence FROM consolidated_facts WHERE id IN (?, ?)", (fa, fb))
-        facts = cur.fetchall()
-        resolution = f"AUTO: Both facts retained; conflict_type={ctype}. Manual review recommended."
-        print(f"    Conflict id={conf_id} ({ctype}): {fa} vs {fb}")
-        for f in facts:
-            print(f"      fact: {f[0]} | {f[1]} | {f[2]} conf={f[3]}")
-        if not DRY_RUN:
-            cur.execute("UPDATE conflicts SET resolution = ?, resolved_at = datetime('now') WHERE id = ?",
-                        (resolution, conf_id))
-    if not DRY_RUN and conflicts:
-        db.commit()
-
-    db.close()
+        # --- Step 3: Resolve unresolved conflicts ---
+        cur.execute("SELECT id, fact_a_id, fact_b_id, conflict_type FROM conflicts WHERE resolution IS NULL OR resolution = ''")
+        conflicts = cur.fetchall()
+        print(f"\n  Unresolved conflicts: {len(conflicts)}")
+        for conf_id, fa, fb, ctype in conflicts:
+            # Fetch both facts
+            cur.execute("SELECT subject, predicate, object, confidence FROM consolidated_facts WHERE id IN (?, ?)", (fa, fb))
+            facts = cur.fetchall()
+            resolution = f"AUTO: Both facts retained; conflict_type={ctype}. Manual review recommended."
+            print(f"    Conflict id={conf_id} ({ctype}): {fa} vs {fb}")
+            for f in facts:
+                print(f"      fact: {f[0]} | {f[1]} | {f[2]} conf={f[3]}")
+            if not DRY_RUN:
+                cur.execute("UPDATE conflicts SET resolution = ?, resolved_at = datetime('now') WHERE id = ?",
+                            (resolution, conf_id))
+        if not DRY_RUN and conflicts:
+            db.commit()
+    finally:
+        db.close()
 
 print(f"\n{'='*50}")
 print(f"DONE. Total purged={total_purged} re-embedded={total_embedded}")

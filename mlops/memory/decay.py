@@ -50,35 +50,35 @@ def apply_decay(
     now = datetime.now(timezone.utc)
 
     try:
-        rows = conn.execute(
-            "SELECT id, importance, created_at FROM working_memory WHERE importance IS NOT NULL"
-        ).fetchall()
-    except sqlite3.OperationalError as exc:
-        conn.close()
-        return {"error": str(exc), "n_rows": 0, "n_decayed": 0}
-
-    updates = []
-    retentions = []
-    for row in rows:
-        created_raw = row["created_at"] or ""
         try:
-            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-            age_days = (now - created_dt).total_seconds() / 86400.0
-        except Exception:
-            continue
+            rows = conn.execute(
+                "SELECT id, importance, created_at FROM working_memory WHERE importance IS NOT NULL"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            return {"error": str(exc), "n_rows": 0, "n_decayed": 0}
 
-        retention = weibull_retention(age_days, lambda_days, k)
-        retentions.append(retention)
-        current = float(row["importance"] or 0.0)
-        decayed = max(min_importance, current * retention)
-        if abs(decayed - current) > 1e-6:
-            updates.append((decayed, row["id"]))
+        updates = []
+        retentions = []
+        for row in rows:
+            created_raw = row["created_at"] or ""
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                age_days = (now - created_dt).total_seconds() / 86400.0
+            except Exception:
+                continue
 
-    if not dry_run and updates:
-        conn.executemany("UPDATE working_memory SET importance = ? WHERE id = ?", updates)
-        conn.commit()
+            retention = weibull_retention(age_days, lambda_days, k)
+            retentions.append(retention)
+            current = float(row["importance"] or 0.0)
+            decayed = max(min_importance, current * retention)
+            if abs(decayed - current) > 1e-6:
+                updates.append((decayed, row["id"]))
 
-    conn.close()
+        if not dry_run and updates:
+            conn.executemany("UPDATE working_memory SET importance = ? WHERE id = ?", updates)
+            conn.commit()
+    finally:
+        conn.close()
 
     return {
         "n_rows": len(rows),

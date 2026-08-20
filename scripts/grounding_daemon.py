@@ -151,15 +151,18 @@ def main():
     log.info("listening on %s  pid=%d", SOCK_PATH, os.getpid())
     print(f"grounding_daemon ready  sock={SOCK_PATH}  pid={os.getpid()}", flush=True)
 
-    while True:
-        try:
-            conn, _ = srv.accept()
-            _handle(conn, mod)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log.error("accept error: %s", e)
-            time.sleep(0.1)
+    try:
+        while True:
+            try:
+                conn, _ = srv.accept()
+                _handle(conn, mod)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                log.error("accept error: %s", e)
+                time.sleep(0.1)
+    finally:
+        srv.close()
 
     _cleanup(SOCK_PATH, PID_PATH)
 

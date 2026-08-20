@@ -162,13 +162,15 @@ def cache_path(session_id: str) -> str:
 def cached_msg_count(session_id: str) -> int:
     p = cache_path(session_id)
     try:
-        return int(open(p).read().strip())
+        with open(p) as f:
+            return int(f.read().strip())
     except Exception:
         return -1
 
 def write_cache(session_id: str, count: int):
     try:
-        open(cache_path(session_id), "w").write(str(count))
+        with open(cache_path(session_id), "w") as f:
+            f.write(str(count))
     except Exception:
         pass
 

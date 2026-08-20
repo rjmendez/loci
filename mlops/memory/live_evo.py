@@ -107,16 +107,18 @@ def adapt(
     if not failures:
         return {"n_failures": 0, "n_correlated": 0, "n_penalized": 0, "dry_run": dry_run}
     conn = sqlite3.connect(db_path)
-    correlated = _find_correlated_entries(conn, failures)
-    updates = []
-    for mem_id, current_importance, event in correlated:
-        penalized = max(importance_floor, current_importance * (1.0 - penalty))
-        if abs(penalized - current_importance) > 1e-6:
-            updates.append((penalized, mem_id))
-    if not dry_run and updates:
-        conn.executemany("UPDATE working_memory SET importance = ? WHERE id = ?", updates)
-        conn.commit()
-    conn.close()
+    try:
+        correlated = _find_correlated_entries(conn, failures)
+        updates = []
+        for mem_id, current_importance, event in correlated:
+            penalized = max(importance_floor, current_importance * (1.0 - penalty))
+            if abs(penalized - current_importance) > 1e-6:
+                updates.append((penalized, mem_id))
+        if not dry_run and updates:
+            conn.executemany("UPDATE working_memory SET importance = ? WHERE id = ?", updates)
+            conn.commit()
+    finally:
+        conn.close()
     record = {
         "run_at": datetime.now(timezone.utc).isoformat(),
         "n_failures_loaded": len(failures),

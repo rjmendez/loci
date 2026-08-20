@@ -59,20 +59,22 @@ def load_agentHER_from_db(db_path: str) -> list[dict]:
         return results
     try:
         conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(
-            "SELECT content, session_id FROM working_memory WHERE source = 'agentHER'"
-        )
-        for row in cur.fetchall():
-            content = row["content"] or ""
-            session_id = row["session_id"] or ""
-            results.append({
-                "type": "agentHER",
-                "content": content,
-                "source": "mnemosyne",
-                "session_id": session_id,
-            })
-        conn.close()
+        try:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT content, session_id FROM working_memory WHERE source = 'agentHER'"
+            )
+            for row in cur.fetchall():
+                content = row["content"] or ""
+                session_id = row["session_id"] or ""
+                results.append({
+                    "type": "agentHER",
+                    "content": content,
+                    "source": "mnemosyne",
+                    "session_id": session_id,
+                })
+        finally:
+            conn.close()
     except sqlite3.Error as exc:
         print(f"[collect] sqlite error reading agentHER rows: {exc}", file=sys.stderr)
     return results

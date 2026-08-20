@@ -74,27 +74,28 @@ def _try_postgres():
             user=PG_USER, password=PG_PASS,
             dbname=PG_DB, connect_timeout=3
         )
-        cur = conn.cursor()
+        try:
+            cur = conn.cursor()
 
-        rows = []
+            rows = []
 
-        # Try common table schemas
-        for table in ("user_profile", "memory_config", "agent_facts", "facts"):
-            try:
-                cur.execute(f"SELECT * FROM {table} LIMIT 1;")
-                cols = [d[0] for d in cur.description]
-                cur.execute(f"SELECT * FROM {table};")
-                for row in cur.fetchall():
-                    rec = dict(zip(cols, row))
-                    # Guess group/value shape
-                    group = rec.get("group") or rec.get("category") or rec.get("section") or "Key Facts"
-                    value = rec.get("value") or rec.get("content") or str(rec)
-                    rows.append((group, value))
-                break
-            except Exception:
-                continue
-
-        conn.close()
+            # Try common table schemas
+            for table in ("user_profile", "memory_config", "agent_facts", "facts"):
+                try:
+                    cur.execute(f"SELECT * FROM {table} LIMIT 1;")
+                    cols = [d[0] for d in cur.description]
+                    cur.execute(f"SELECT * FROM {table};")
+                    for row in cur.fetchall():
+                        rec = dict(zip(cols, row))
+                        # Guess group/value shape
+                        group = rec.get("group") or rec.get("category") or rec.get("section") or "Key Facts"
+                        value = rec.get("value") or rec.get("content") or str(rec)
+                        rows.append((group, value))
+                    break
+                except Exception:
+                    continue
+        finally:
+            conn.close()
         return rows if rows else None
 
     except Exception as e:

@@ -22,14 +22,16 @@ DAMA_DB = os.path.expanduser(
 
 def _read_state(path: str) -> int:
     try:
-        return int(open(path).read().strip())
+        with open(path) as f:
+            return int(f.read().strip())
     except Exception:
         return 0
 
 
 def _write_state(path: str, count: int) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    open(path, "w").write(str(count))
+    with open(path, "w") as f:
+        f.write(str(count))
 
 
 def get_default_wm_count() -> int:
