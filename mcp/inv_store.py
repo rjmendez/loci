@@ -89,6 +89,7 @@ def _inv_dir(investigation_id: str) -> Path:
 
 
 _manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
+_MANIFEST_CACHE_MAXSIZE = 256
 
 
 def _load_manifest(investigation_id: str) -> dict | None:
@@ -98,6 +99,8 @@ def _load_manifest(investigation_id: str) -> dict | None:
         if not p.exists():
             return None
         raw = p.read_text()
+        if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
+            _manifest_cache.pop(next(iter(_manifest_cache)))
         _manifest_cache[investigation_id] = raw
     manifest = json.loads(raw)
     # Backward compat: initialize ACL fields if missing (old investigations)
@@ -133,6 +136,8 @@ def _save_manifest(manifest: dict) -> None:
     p = _inv_dir(manifest["id"]) / "manifest.json"
     data = json.dumps(manifest, indent=2)
     _atomic_write_text(p, data)
+    if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
+        _manifest_cache.pop(next(iter(_manifest_cache)))
     _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
 
 
