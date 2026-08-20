@@ -19,6 +19,7 @@ logger = logging.getLogger("loci-mcp")
 
 _verdict_backend = None                # QdrantBackend for hermes_verdicts (pre_answer_check)
 _verdict_backend_failed = False        # permanent-failure sentinel — don't retry
+_verdict_backend_lock = threading.Lock()  # guards _verdict_backend lazy-init (#106)
 
 
 def _get_verdict_backend():
@@ -33,25 +34,30 @@ def _get_verdict_backend():
         return None
     if _verdict_backend is not None:
         return _verdict_backend
-    qdrant_url = os.environ.get("QDRANT_URL", "")
-    if not qdrant_url:
-        return None
-    try:
-        from memcheck.qdrant import QdrantBackend
-        from qdrant_client import QdrantClient
-        _vb_api_key = os.environ.get("QDRANT_API_KEY", "") or None
-        client = QdrantClient(url=qdrant_url, api_key=_vb_api_key, timeout=5)
-        _verdict_backend = QdrantBackend(
-            client,
-            collection="hermes_verdicts",
-            embed=_embed,
-            vector_name="dense",
-        )
-        return _verdict_backend
-    except Exception as exc:
-        logger.debug("Verdict backend unavailable: %s", exc)
-        _verdict_backend_failed = True
-        return None
+    with _verdict_backend_lock:
+        if _verdict_backend_failed:
+            return None
+        if _verdict_backend is not None:
+            return _verdict_backend
+        qdrant_url = os.environ.get("QDRANT_URL", "")
+        if not qdrant_url:
+            return None
+        try:
+            from memcheck.qdrant import QdrantBackend
+            from qdrant_client import QdrantClient
+            _vb_api_key = os.environ.get("QDRANT_API_KEY", "") or None
+            client = QdrantClient(url=qdrant_url, api_key=_vb_api_key, timeout=5)
+            _verdict_backend = QdrantBackend(
+                client,
+                collection="hermes_verdicts",
+                embed=_embed,
+                vector_name="dense",
+            )
+            return _verdict_backend
+        except Exception as exc:
+            logger.debug("Verdict backend unavailable: %s", exc)
+            _verdict_backend_failed = True
+            return None
 
 
 def _record_claim_verdicts(

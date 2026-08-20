@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Optional
 
@@ -27,6 +28,7 @@ VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
 
 # --- Lazy singletons / fail-open latches ---
 _sparse_model = None
+_sparse_model_lock = threading.Lock()          # guards _sparse_model lazy-init (#106)
 _qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
 _qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
 _QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
@@ -35,12 +37,14 @@ _QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transie
 def _get_sparse_embedder():
     global _sparse_model
     if _sparse_model is None:
-        try:
-            from fastembed import SparseTextEmbedding
-            _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
-        except Exception as exc:
-            logger.warning("SparseTextEmbedding unavailable: %s", exc)
-            _sparse_model = False
+        with _sparse_model_lock:
+            if _sparse_model is None:
+                try:
+                    from fastembed import SparseTextEmbedding
+                    _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
+                except Exception as exc:
+                    logger.warning("SparseTextEmbedding unavailable: %s", exc)
+                    _sparse_model = False
     return _sparse_model if _sparse_model is not False else None
 
 
@@ -81,9 +85,10 @@ def _embed_sparse(text: str):
         result = list(model.embed([text]))[0]
         indices = result.indices.tolist()
         values = result.values.tolist()
-        if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
-            _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
-        _embed_sparse_cache[text] = (tuple(indices), tuple(values))
+        with _embed_sparse_cache_lock:
+            if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
+                _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
+            _embed_sparse_cache[text] = (tuple(indices), tuple(values))
         return SparseVector(indices=indices, values=values)
     except Exception as exc:
         logger.debug("sparse embed failed: %s", exc)
@@ -264,6 +269,8 @@ _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
 _EMBED_CACHE_MAXSIZE = 512
 _embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
 _embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
+_embed_cache_lock = threading.Lock()              # guards _embed_cache check-evict-insert (#86)
+_embed_sparse_cache_lock = threading.Lock()       # guards _embed_sparse_cache check-evict-insert (#86)
 
 # Startup validation — warn clearly when required backends are not configured.
 # Server runs in degraded mode (keyword-only) rather than refusing to start.
@@ -309,9 +316,10 @@ def _embed(text: str) -> list[float] | None:
         data = r.json().get("data", [])
         result = list(data[0]["embedding"]) if data else None
         if result is not None:
-            if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
-                _embed_cache.pop(next(iter(_embed_cache)))
-            _embed_cache[text] = result
+            with _embed_cache_lock:
+                if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
+                    _embed_cache.pop(next(iter(_embed_cache)))
+                _embed_cache[text] = result
         return result
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
