@@ -187,6 +187,7 @@ REFLECTION_LOG_TAIL_MIN_FILE_BYTES = 1_000_000
 REFLECTION_LOG_TAIL_READ_BYTES = 512_000
 REFLECTION_SIGNATURE_OBSERVE_LIMIT = 3
 REFLECTION_SIGNATURE_MAP_LIMIT = 500
+AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 
 # ---------------------------------------------------------------------------
 # Investigation storage layer (P2b of the Loci self-review split)
@@ -5244,6 +5245,9 @@ def memory_retract(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+    _owner = manifest.get("owner", "")
+    if _owner and _owner != AGENT_ID:
+        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
     if not str(target or "").strip():
         return json.dumps({"error": "target must be a non-empty finding id or claim/entity string"})
 
@@ -5358,6 +5362,9 @@ def memory_restore(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+    _owner = manifest.get("owner", "")
+    if _owner and _owner != AGENT_ID:
+        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
 
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
     existing = _read_jsonl(retractions_path)
