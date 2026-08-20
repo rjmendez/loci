@@ -24,7 +24,6 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("HERMES_ENV_FILE", "/nonexistent-env-file-for-tests")
-os.environ.setdefault("LOCI_A2A_TOKEN", "t")
 os.environ.setdefault("HERMES_A2A_TOKEN", "t")
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parent.parent

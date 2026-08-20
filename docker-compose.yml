@@ -8,7 +8,7 @@
 #   QDRANT_API_KEY          API key if your Qdrant requires one
 #   OLLAMA_BASE_URL         Any OpenAI-compatible /v1/embeddings endpoint
 #   EMBED_MODEL             Must match the model used to build your collections
-#   LOCI_A2A_TOKEN          Bearer token for A2A server (required, no default)
+#   HERMES_A2A_TOKEN          Bearer token for A2A server (required, no default)
 #
 # For local development with Qdrant + Ollama sidecars:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
