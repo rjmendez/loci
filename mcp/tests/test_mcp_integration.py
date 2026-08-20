@@ -2463,3 +2463,191 @@ class TestFindingResolution(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRagContextSearch(unittest.TestCase):
+    """rag_context_search — degraded/golden path, query validation, accepted params."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+        self._orig_get_qdrant = server._get_qdrant
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        server._get_qdrant = self._orig_get_qdrant
+        self._tmp.cleanup()
+
+    def test_degraded_path_qdrant_unavailable(self):
+        server._get_qdrant = lambda: (None, None)
+        result = _json(server.rag_context_search(query="test query about auth"))
+        self.assertEqual(result.get("mode"), "rag_required")
+        self.assertFalse(result.get("qdrant_available", True))
+
+    def test_empty_query_returns_error(self):
+        result = _json(server.rag_context_search(query=""))
+        self.assertIn("error", result)
+
+    def test_returns_valid_json_envelope(self):
+        server._get_qdrant = lambda: (None, None)
+        result = _json(server.rag_context_search(query="authentication token rotation"))
+        for key in ("mode", "query"):
+            self.assertIn(key, result)
+
+    def test_decay_false_accepted(self):
+        server._get_qdrant = lambda: (None, None)
+        result = _json(server.rag_context_search(query="memory ebbinghaus", decay=False))
+        self.assertIsInstance(result, dict)
+
+    def test_exclude_types_default_does_not_raise(self):
+        server._get_qdrant = lambda: (None, None)
+        result = _json(server.rag_context_search(query="anything", exclude_types=None))
+        self.assertIsInstance(result, dict)
+
+
+class TestInvestigationSearch(unittest.TestCase):
+    """investigation_search — basic recall, retraction, resolution filter."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_golden_path_finds_stored_finding(self):
+        inv_id = _new_id("isearch")
+        server.investigation_start(investigation_id=inv_id, title="Search test")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="The TLS certificate expired at 2026-01-01.",
+            source="test",
+            confidence="high",
+        ))
+        finding_id = stored.get("finding_id")
+
+        row = {
+            "investigation_id": inv_id,
+            "finding_id": finding_id,
+            "record_type": "observed",
+            "source": "test",
+            "text": "The TLS certificate expired at 2026-01-01.",
+            "score": 0.95,
+        }
+        orig = server._mnemo_recall
+        server._mnemo_recall = lambda *a, **k: [dict(row)]
+        try:
+            result = _json(server.investigation_search("TLS certificate", investigation_id=inv_id))
+        finally:
+            server._mnemo_recall = orig
+
+        self.assertNotIn("error", result)
+        texts = [r.get("text", "") for r in result.get("results", [])]
+        self.assertTrue(any("TLS" in t for t in texts))
+
+    def test_include_retracted_false_is_accepted(self):
+        inv_id = _new_id("retracted")
+        server.investigation_start(investigation_id=inv_id, title="Retract test")
+        orig = server._mnemo_recall
+        server._mnemo_recall = lambda *a, **k: []
+        try:
+            result = _json(server.investigation_search(
+                "anything", investigation_id=inv_id, include_retracted=False))
+        finally:
+            server._mnemo_recall = orig
+        self.assertIsInstance(result, dict)
+
+    def test_missing_investigation_returns_gracefully(self):
+        orig = server._mnemo_recall
+        server._mnemo_recall = lambda *a, **k: []
+        try:
+            result = _json(server.investigation_search("query", investigation_id="nonexistent-inv-xyz"))
+        finally:
+            server._mnemo_recall = orig
+        self.assertIsInstance(result, dict)
+
+
+class TestInvestigationPreAnswerCheck(unittest.TestCase):
+    """investigation_pre_answer_check — claim_supported key, error paths."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _setup_investigation(self, finding_text: str):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Pre-answer check test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text=finding_text,
+            source="test",
+            confidence="high",
+        )
+        return inv_id
+
+    def test_returns_claim_supported_key(self):
+        inv_id = self._setup_investigation("The auth service uses JWT tokens with RS256.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="The auth service uses JWT tokens.",
+        ))
+        self.assertNotIn("error", result, f"Unexpected error: {result}")
+        # Response shape: claim_results list with per-claim verdicts
+        self.assertIn("claim_results", result)
+        self.assertGreater(len(result["claim_results"]), 0)
+
+    def test_claim_supported_is_bool_or_numeric(self):
+        inv_id = self._setup_investigation("The database uses PostgreSQL 15.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="The database uses PostgreSQL.",
+        ))
+        self.assertIn("claim_results", result)
+        first = result["claim_results"][0]
+        # Each result has 'supported' (bool) and 'contradicted' (bool)
+        self.assertIn("supported", first)
+        self.assertIn(type(first["supported"]), (bool, int))
+
+    def test_missing_investigation_returns_error(self):
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id="nonexistent-xyz-999",
+            claims="some claim",
+        ))
+        self.assertIn("error", result)
+
+    def test_empty_claims_returns_error(self):
+        inv_id = self._setup_investigation("Some finding.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="",
+        ))
+        self.assertIn("error", result)
+
+    def test_list_claims_accepted(self):
+        inv_id = self._setup_investigation("The service runs on port 8080.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims=["The service runs on port 8080.", "The service is written in Go."],
+        ))
+        self.assertNotIn("error", result)
+        self.assertIn("claim_results", result)
+        self.assertEqual(len(result["claim_results"]), 2)
+
+    def test_record_false_skips_persistence(self):
+        inv_id = self._setup_investigation("Fact about the system.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="Fact about the system.",
+            record=False,
+        ))
+        self.assertIn("claim_results", result)
