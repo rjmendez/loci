@@ -138,8 +138,12 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
     out: list[dict] = []
     seen: set = set()
     since_norm = (since or "").replace(" ", "T")
+    _ALLOWED_TABLES = {"memories", "working_memory"}
     try:
         for table in ("memories", "working_memory"):
+            if table not in _ALLOWED_TABLES:
+                log.warning("skipping unknown table %s", table)
+                continue
             try:
                 rows = conn.execute(
                     f"SELECT id, content, importance, created_at, source FROM {table} "
