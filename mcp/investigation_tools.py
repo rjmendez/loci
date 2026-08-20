@@ -337,10 +337,12 @@ def investigation_note(
     elif field == "open_question_remove":
         manifest["open_questions"] = [q for q in manifest["open_questions"] if q != value]
     elif field == "checked_source":
-        parts = value.split(":", 1)
+        parts = value.rsplit(":", 1)
         tool = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else ""
-        manifest["checked_sources"][tool] = {"summary": summary, "ts": _now()}
+        if not summary:
+            return json.dumps({"error": "checked_source summary must not be empty"})
+        manifest["checked_sources"].setdefault(tool, []).append({"summary": summary, "ts": _now()})
     elif field == "closed_summary":
         manifest["closed_summary"] = value
         manifest["status"] = "closed"

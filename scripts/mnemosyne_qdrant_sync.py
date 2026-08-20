@@ -128,7 +128,11 @@ def load_memories(conn, tables=(("memories", "memory"), ("working_memory", "work
     A missing table is skipped rather than fatal -- schemas differ across hosts.
     """
     out, seen = [], set()
+    _ALLOWED_TABLES = {"memories", "working_memory"}
     for table, tier in tables:
+        if table not in _ALLOWED_TABLES:
+            print(f"[mnemosyne->qdrant] skipping unknown table {table}")
+            continue
         try:
             rows = conn.execute(
                 f"SELECT id, content, source, importance, session_id, created_at FROM {table} "

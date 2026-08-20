@@ -684,18 +684,18 @@ async def skill_memory_stats(task: dict) -> dict:
     headers = {'Content-Type': 'application/json', 'api-key': QDRANT_KEY}
     collections = _CORE_RAG_COLLECTIONS + _EXTRA_RAG_COLLECTIONS
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
-            for col in collections:
-                try:
-                    async with sess.get(f'{QDRANT_URL}/collections/{col}',
-                                        headers=headers) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            qdrant_stats[col] = data.get('result', {}).get('points_count', '?')
-                        else:
-                            qdrant_stats[col] = f'HTTP {r.status}'
-                except Exception as e:
-                    qdrant_stats[col] = str(e)
+        sess = _get_http_session()
+        for col in collections:
+            try:
+                async with sess.get(f'{QDRANT_URL}/collections/{col}',
+                                    headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        qdrant_stats[col] = data.get('result', {}).get('points_count', '?')
+                    else:
+                        qdrant_stats[col] = f'HTTP {r.status}'
+            except Exception as e:
+                qdrant_stats[col] = str(e)
     except Exception as e:
         qdrant_stats['error'] = str(e)
 
@@ -753,16 +753,16 @@ async def skill_memory_sleep(task: dict) -> dict:
 
     # Try Mnemosyne dashboard HTTP API (port 8765)
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
-            async with sess.post(
-                'http://127.0.0.1:8765/api/sleep',
-                json={'dry_run': dry_run},
-                headers={'Content-Type': 'application/json'}
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    return {'status': 'consolidated', 'result': data, 'via': 'dashboard_api'}
-                log.warning(f'dashboard /api/sleep returned HTTP {r.status}')
+        sess = _get_http_session()
+        async with sess.post(
+            'http://127.0.0.1:8765/api/sleep',
+            json={'dry_run': dry_run},
+            headers={'Content-Type': 'application/json'}
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                return {'status': 'consolidated', 'result': data, 'via': 'dashboard_api'}
+            log.warning(f'dashboard /api/sleep returned HTTP {r.status}')
     except Exception as e:
         log.warning(f'dashboard sleep call failed: {e}')
 
@@ -807,9 +807,8 @@ async def _rerank(query: str, hits: list) -> bool:
         return False
 
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=float(os.environ.get('RERANK_TIMEOUT_S', 10)))
-        ) as sess, sess.post(url, json={'query': query, 'documents': docs}) as r:
+        sess = _get_http_session()
+        async with sess.post(url, json={'query': query, 'documents': docs}) as r:
             if r.status != 200:
                 log.warning(f'rerank: HTTP {r.status} — keeping cosine order')
                 return False
@@ -1078,9 +1077,8 @@ async def skill_context_broadcast(task: dict) -> dict:
              'importance': importance, 'bank': bank},
         )
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as sess, sess.post(peer_url, json=payload, headers=headers) as r:
+            sess = _get_http_session()
+            async with sess.post(peer_url, json=payload, headers=headers) as r:
                 if r.status == 200:
                     data = await r.json()
                     return {'peer': peer_url, 'status': 'ok',
@@ -1223,10 +1221,10 @@ async def skill_gpu_inference(task: dict) -> dict:
     messages.append({'role': 'user', 'content': prompt})
 
     try:
-        async with aiohttp.ClientSession() as sess, sess.post(
+        sess = _get_http_session()
+        async with sess.post(
             f"{OLLAMA_BASE.rstrip('/').removesuffix('/v1')}/v1/chat/completions",
             json={'model': model, 'messages': messages, 'max_tokens': max_t},
-            timeout=aiohttp.ClientTimeout(total=120)
         ) as r:
             d = await r.json()
             content = d['choices'][0]['message']['content']
@@ -1395,13 +1393,12 @@ async def skill_memory_prime(task: dict) -> dict:
                  'ttl_seconds': ttl_seconds, 'broadcast': False},
             )
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        peer_url, json=payload,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        return {'peer': peer_url, 'status': resp.status}
+                sess = _get_http_session()
+                async with sess.post(
+                    peer_url, json=payload,
+                    headers=headers,
+                ) as resp:
+                    return {'peer': peer_url, 'status': resp.status}
             except Exception as e:
                 return {'peer': peer_url, 'status': 'error', 'error': str(e)}
 
