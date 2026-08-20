@@ -177,7 +177,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading
 from typing import Optional, Any
 from contextlib import contextmanager
 
@@ -206,9 +206,9 @@ A2A_HOST  = os.environ.get('HERMES_A2A_HOST', '0.0.0.0')
 A2A_PORT  = int(os.environ.get('HERMES_A2A_PORT', '8201'))
 A2A_TOKEN = os.environ.get('HERMES_A2A_TOKEN', '')
 if not A2A_TOKEN:
-    print('ERROR: HERMES_A2A_TOKEN is not set. Generate one with: '
-          'python3 -c "import secrets;print(secrets.token_hex(32))"', flush=True)
-    sys.exit(1)
+    print('WARNING: HERMES_A2A_TOKEN is not set. All bearer-token checks will fail. '
+          'Generate one with: python3 -c "import secrets;print(secrets.token_hex(32))"',
+          flush=True)
 TOTP_SEED      = os.environ.get('HERMES_A2A_TOTP_SEED', '')
 BOOTSTRAP_KEY  = os.environ.get('HERMES_A2A_BOOTSTRAP_KEY', '')
 AGENT_ID  = os.environ.get('HERMES_AGENT_ID', 'hermes-agent')
@@ -410,6 +410,7 @@ def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bear
 _TOTP_WINDOW = 60
 _TOTP_MAX_ATTEMPTS = 5
 _totp_attempts: dict = collections.defaultdict(list)
+_totp_attempts_lock = threading.Lock()
 
 
 def _verify_totp(request: Request,
@@ -427,17 +428,27 @@ def _verify_totp(request: Request,
             raise HTTPException(status_code=401, detail='X-TOTP header required (TOTP is enabled)')
         client_ip = request.client.host if request.client else 'unknown'
         now = time.monotonic()
-        attempts = _totp_attempts[client_ip]
-        # Evict timestamps older than the window
-        _totp_attempts[client_ip] = [t for t in attempts if now - t < _TOTP_WINDOW]
-        if len(_totp_attempts[client_ip]) >= _TOTP_MAX_ATTEMPTS:
-            raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
-        _totp_attempts[client_ip].append(now)
+        with _totp_attempts_lock:
+            attempts = _totp_attempts[client_ip]
+            # Evict timestamps older than the window
+            _totp_attempts[client_ip] = [t for t in attempts if now - t < _TOTP_WINDOW]
+            if len(_totp_attempts[client_ip]) >= _TOTP_MAX_ATTEMPTS:
+                raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
+            _totp_attempts[client_ip].append(now)
         if not pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1):
             raise HTTPException(status_code=401, detail='Invalid TOTP code')
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
+
+_http_session: aiohttp.ClientSession | None = None
+
+def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    return _http_session
+
 
 @contextmanager
 def _db():
@@ -468,15 +479,15 @@ async def _embed(text: str) -> Optional[list]:
     """Embed via OpenAI-compat /v1/embeddings. Works with Ollama and cloud providers."""
     url = OLLAMA_BASE.rstrip('/').removesuffix('/v1') + '/v1/embeddings'
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
-            async with sess.post(url, json={'model': EMBED_MODEL, 'input': text[:2000]},
-                                 headers=_embed_auth_headers()) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    vec = (data.get('data') or [{}])[0].get('embedding') or data.get('embedding')
-                    if vec and len(vec) == EMBED_DIM:
-                        return vec
-                    log.warning(f'embed: unexpected shape: {list(data.keys())}')
+        sess = _get_http_session()
+        async with sess.post(url, json={'model': EMBED_MODEL, 'input': text[:2000]},
+                             headers=_embed_auth_headers()) as r:
+            if r.status == 200:
+                data = await r.json()
+                vec = (data.get('data') or [{}])[0].get('embedding') or data.get('embedding')
+                if vec and len(vec) == EMBED_DIM:
+                    return vec
+                log.warning(f'embed: unexpected shape: {list(data.keys())}')
     except Exception as e:
         log.warning(f'embed failed: {e}')
     return None
@@ -499,11 +510,11 @@ async def _qdrant_search(
         body['filter'] = qdrant_filter
     headers = {'Content-Type': 'application/json', 'api-key': QDRANT_KEY}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
-            async with sess.post(url, json=body, headers=headers) as r:
-                if r.status == 200:
-                    return (await r.json()).get('result', [])
-                log.warning(f'qdrant search {collection}: HTTP {r.status}')
+        sess = _get_http_session()
+        async with sess.post(url, json=body, headers=headers) as r:
+            if r.status == 200:
+                return (await r.json()).get('result', [])
+            log.warning(f'qdrant search {collection}: HTTP {r.status}')
     except Exception as e:
         log.warning(f'qdrant search {collection}: {e}')
     return []

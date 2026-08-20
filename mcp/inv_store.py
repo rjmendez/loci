@@ -17,6 +17,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,12 +84,18 @@ def _now() -> str:
 
 
 def _inv_dir(investigation_id: str) -> Path:
-    d = _root() / investigation_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    if not re.match(r'^[A-Za-z0-9_\-]+$', investigation_id):
+        raise ValueError(f'Invalid investigation_id: {investigation_id!r}')
+    root = _root().resolve()
+    candidate = (root / investigation_id).resolve()
+    if not str(candidate).startswith(str(root)):
+        raise ValueError('Path escape detected in investigation_id')
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
 
 
 _manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
+_MANIFEST_CACHE_MAXSIZE = 256
 
 
 def _load_manifest(investigation_id: str) -> dict | None:
@@ -98,6 +105,8 @@ def _load_manifest(investigation_id: str) -> dict | None:
         if not p.exists():
             return None
         raw = p.read_text()
+        if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
+            _manifest_cache.pop(next(iter(_manifest_cache)))
         _manifest_cache[investigation_id] = raw
     manifest = json.loads(raw)
     # Backward compat: initialize ACL fields if missing (old investigations)
@@ -133,6 +142,8 @@ def _save_manifest(manifest: dict) -> None:
     p = _inv_dir(manifest["id"]) / "manifest.json"
     data = json.dumps(manifest, indent=2)
     _atomic_write_text(p, data)
+    if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
+        _manifest_cache.pop(next(iter(_manifest_cache)))
     _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
 
 
