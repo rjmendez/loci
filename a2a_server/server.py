@@ -63,6 +63,11 @@ Optional / tunable:
   EMBED_API_KEY_HEADER      Header carrying EMBED_API_KEY. 'Authorization'
                             sends 'Bearer <key>'; any other name sends the raw
                             key.  Default: Authorization
+  HERMES_A2A_PRIVILEGED_SENDERS  Comma-separated sender IDs allowed to call
+                            DESTRUCTIVE_SKILLS (memory_remember, memory_sleep,
+                            context_broadcast, mnemosyne_triple_add).
+                            Default: '' (no sender is privileged — destructive
+                            skills are effectively disabled when unset).
   PEER_A2A_URLS             Comma-separated peer A2A base URLs for the fan-out
                             skills (memory_broadcast, memory_prime).
                             Default: '' (fan-out returns "not configured")
@@ -177,7 +182,7 @@ JSON-RPC CALL SHAPE
   }
 """
 
-import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading
 from typing import Optional, Any
 from contextlib import contextmanager
 
@@ -240,6 +245,21 @@ _EXTRA_RAG_COLLECTIONS = [
 logging.basicConfig(level=logging.INFO,
                     format=f'%(asctime)s [{AGENT_ID}] %(message)s')
 log = logging.getLogger(__name__)
+
+# ── per-skill privilege tiers ───────────────────────────────────────────────────
+# Skills that mutate or delete data — restricted to explicitly allowlisted senders.
+DESTRUCTIVE_SKILLS: frozenset[str] = frozenset({
+    'memory_remember',
+    'memory_sleep',
+    'context_broadcast',
+    'mnemosyne_triple_add',
+})
+
+# Senders allowed to call destructive skills.
+# Configure via: HERMES_A2A_PRIVILEGED_SENDERS=agent1,agent2
+_PRIVILEGED_SENDERS: frozenset[str] = frozenset(
+    s.strip() for s in os.getenv('HERMES_A2A_PRIVILEGED_SENDERS', '').split(',') if s.strip()
+)
 
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
 AGENT_CARD = {
@@ -370,16 +390,21 @@ AGENT_CARD = {
 }
 
 # ── in-memory task store (Phase 1 — no persistence) ────────────────────────────
-# Bounded at 1000 entries; oldest evicted first to prevent memory growth.
+# Keyed by caller_id (sender) then task_id for per-caller isolation.
+# Bounded at _TASK_CAP entries per caller; oldest evicted first.
 _TASK_CAP = 1000
-_tasks: dict[str, dict] = {}
+_tasks: dict[str, dict[str, dict]] = {}
+_tasks_lock = threading.Lock()
 
 
 def _store_task(task_id: str, task: dict) -> None:
-    if len(_tasks) >= _TASK_CAP:
-        oldest = next(iter(_tasks))
-        del _tasks[oldest]
-    _tasks[task_id] = task
+    caller_id = task.get('sender', 'unknown')
+    with _tasks_lock:
+        bucket = _tasks.setdefault(caller_id, {})
+        if len(bucket) >= _TASK_CAP:
+            oldest = next(iter(bucket))
+            del bucket[oldest]
+        bucket[task_id] = task
 
 # session tokens issued by /bootstrap — token → expiry (UTC)
 _session_tokens: dict[str, datetime.datetime] = {}
@@ -1524,9 +1549,10 @@ async def a2a_endpoint(request: Request):
     if method == 'tasks/get':
         return await _handle_task_get(rpc_id, params)
     if method == 'tasks/list':
+        caller_id = params.get('sender', 'unknown')
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
-            'result': {'tasks': list(_tasks.values())}
+            'result': {'tasks': list(_tasks.get(caller_id, {}).values())}
         })
     return JSONResponse({
         'jsonrpc': '2.0', 'id': rpc_id,
@@ -1535,10 +1561,18 @@ async def a2a_endpoint(request: Request):
 
 
 @app.get('/a2a/tasks/{task_id}', dependencies=[Depends(_verify_bearer), Depends(_verify_totp)])
-async def get_task(task_id: str):
-    if task_id not in _tasks:
+async def get_task(task_id: str, sender: Optional[str] = None):
+    if sender:
+        task = _tasks.get(sender, {}).get(task_id)
+    else:
+        log.warning('GET /a2a/tasks/%s called without ?sender= — searching all buckets (deprecated)', task_id)
+        task = next(
+            (b[task_id] for b in _tasks.values() if task_id in b),
+            None,
+        )
+    if task is None:
         raise HTTPException(status_code=404, detail='Task not found')
-    return JSONResponse(_tasks[task_id])
+    return JSONResponse(task)
 
 
 async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
@@ -1560,6 +1594,14 @@ async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
     _store_task(task_id, task)
     log.info(f'Task [{task_id}] skill={skill_id} sender={sender}')
 
+    if skill_id in DESTRUCTIVE_SKILLS:
+        if sender not in _PRIVILEGED_SENDERS:
+            log.warning(f'Blocked destructive skill {skill_id!r} from unprivileged sender {sender!r}')
+            return JSONResponse({
+                'jsonrpc': '2.0', 'id': rpc_id,
+                'error': {'code': -32600, 'message': f'skill {skill_id!r} requires elevated privilege'}
+            }, status_code=403)
+
     try:
         result = await _dispatch(skill_id, task)
     except Exception as e:
@@ -1577,12 +1619,14 @@ async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
 
 async def _handle_task_get(rpc_id: str, params: dict) -> JSONResponse:
     task_id = params.get('task_id')
-    if not task_id or task_id not in _tasks:
+    caller_id = params.get('sender', 'unknown')
+    task = _tasks.get(caller_id, {}).get(task_id) if task_id else None
+    if not task:
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
             'error': {'code': -32602, 'message': 'Task not found'}
         })
-    return JSONResponse({'jsonrpc': '2.0', 'id': rpc_id, 'result': _tasks[task_id]})
+    return JSONResponse({'jsonrpc': '2.0', 'id': rpc_id, 'result': task})
 
 
 # ── entrypoint ───────────────────────────────────────────────────────────────────
