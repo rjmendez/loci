@@ -55,6 +55,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -213,7 +214,7 @@ from inv_store import (  # noqa: E402,F401
 # Optional Qdrant + fastembed
 # ---------------------------------------------------------------------------
 
-_investigation_locks: dict[str, threading.Lock] = {}  # per-investigation lock for atomic JSONL appends
+_investigation_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()  # per-investigation lock; auto-evicted when caller releases
 _investigation_locks_lock = threading.Lock()          # guards _investigation_locks dict itself
 
 
@@ -221,9 +222,15 @@ def _investigation_lock(investigation_id: str) -> threading.Lock:
     """Return the per-investigation lock, creating it under the dict-guard lock if absent.
 
     Returns the lock UNACQUIRED — callers are responsible for `with` on the result.
+    Uses WeakValueDictionary so entries are evicted automatically once no caller
+    holds a strong reference, preventing unbounded accumulation (#101).
     """
     with _investigation_locks_lock:
-        return _investigation_locks.setdefault(investigation_id, threading.Lock())
+        lock = _investigation_locks.get(investigation_id)
+        if lock is None:
+            lock = threading.Lock()
+            _investigation_locks[investigation_id] = lock
+        return lock
 
 # ---------------------------------------------------------------------------
 # LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
@@ -6598,7 +6605,8 @@ def memory_consolidate(dry_run: bool = False) -> str:
     except Exception as e:
         return _json.dumps({
             "status": "error",
-            "error": str(e),
+            "error": "internal error",
+            "type": type(e).__name__,
             "causal_edges_inferred": causal_edges_inferred,
         })
 
