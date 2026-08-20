@@ -9,7 +9,8 @@ import sqlite3, json, hashlib, sys, time, subprocess, os, base64, urllib.request
 # Load .env before anything else — override path with HERMES_ENV_FILE
 _ENV_FILE = os.path.expanduser(os.environ.get("HERMES_ENV_FILE", "~/.hermes/.env"))
 if os.path.exists(_ENV_FILE):
-    for _line in open(_ENV_FILE):
+    with open(_ENV_FILE) as _env_fh:
+        for _line in _env_fh:
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)

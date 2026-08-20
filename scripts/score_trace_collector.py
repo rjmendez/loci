@@ -219,17 +219,19 @@ def load_agenthr_positives() -> list[dict]:
         return results
     try:
         conn = sqlite3.connect(MNEMOSYNE_DB)
-        conn.row_factory = sqlite3.Row
-        cur = conn.execute(
-            "SELECT content, session_id FROM working_memory WHERE source = 'agentHER'"
-        )
-        for row in cur.fetchall():
-            results.append({
-                "trace_type": "positive_relabeled",
-                "content": row["content"] or "",
-                "session_id": row["session_id"] or "",
-            })
-        conn.close()
+        try:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT content, session_id FROM working_memory WHERE source = 'agentHER'"
+            )
+            for row in cur.fetchall():
+                results.append({
+                    "trace_type": "positive_relabeled",
+                    "content": row["content"] or "",
+                    "session_id": row["session_id"] or "",
+                })
+        finally:
+            conn.close()
     except sqlite3.Error:
         pass
     return results

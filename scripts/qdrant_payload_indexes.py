@@ -28,7 +28,8 @@ QDRANT_KEY = os.environ.get("QDRANT_API_KEY", "")
 if not QDRANT_KEY:
     try:
         import json as _json
-        _cfg = _json.load(open(os.path.join(_HOME, ".claude", "settings.json")))
+        with open(os.path.join(_HOME, ".claude", "settings.json")) as _f:
+            _cfg = _json.load(_f)
         _servers = _cfg["mcpServers"]
         # "loci" is the current registration name; "hermes_memory" is what older
         # settings.json files used. Accept either.
