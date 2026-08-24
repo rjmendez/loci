@@ -4957,7 +4957,8 @@ def _selftest_rollup(rows: list[dict]) -> tuple[str, str]:
 
 
 @mcp.tool()
-def retrieval_selftest(query: str = "system architecture", limit: int = 3) -> str:
+def retrieval_selftest(query: str = "system architecture", limit: int = 3,
+                       collections: Optional[list] = None, scope: str = "queried") -> str:
     """
     Prove every Qdrant collection can actually be retrieved from.
 
@@ -4978,12 +4979,26 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3) -> st
     Read-only. Bypasses the cross-encoder and its relevance floor on purpose:
     the floor is a relevance judgement and this is a question about wiring.
 
+    Scope matters more than it looks. A store accumulates collections this server
+    never queries — feature vectors at their own widths, corpora left over from
+    other tools — and sweeping them rolls a dozen irrelevant width mismatches into
+    the health verdict. A diagnostic that reports `degraded` because of things
+    nobody asks about teaches you to ignore it, which is the exact failure this
+    tool exists to prevent. So the default scope is what the server would actually
+    retrieve from.
+
     Args:
         query: Probe text. Any in-domain phrase works; the point is retrievability.
         limit: Rows to request per collection (default 3).
+        collections: Probe exactly these. Overrides ``scope``.
+        scope: ``queried`` (default) — the collections this server retrieves from:
+               the findings collection plus the configured code-chunks collection.
+               ``all`` — every collection in the store, for an inventory; width
+               mismatches outside the queried set are reported but do NOT count
+               against health, since nothing asks them anything.
 
     Returns:
-        JSON with {status, summary, collections, remediations}.
+        JSON with {status, summary, scope, collections, remediations}.
     """
     client, _col = _get_qdrant()
     if client is None:
@@ -4995,7 +5010,15 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3) -> st
         }, indent=2)
 
     try:
-        names = sorted(c.name for c in client.get_collections().collections)
+        present = sorted(c.name for c in client.get_collections().collections)
+        queried = [QDRANT_COLLECTION_PREFIX] + (
+            [_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
+        if collections:
+            names, in_scope = list(collections), set(collections)
+        elif scope == "all":
+            names, in_scope = present, set(queried)
+        else:
+            names, in_scope = [n for n in queried if n in present], set(queried)
     except Exception as exc:
         return json.dumps({
             "status": "unhealthy",
@@ -5017,17 +5040,24 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3) -> st
         query_vec = None
 
     rows = [probe_collection(query_vec, client, name, limit=limit) for name in names]
-    status, summary = _selftest_rollup(rows)
+    for r in rows:
+        r["queried_by_server"] = r["collection"] in in_scope
+    # Only the collections this server actually retrieves from can make it unhealthy.
+    status, summary = _selftest_rollup([r for r in rows if r["queried_by_server"]] or rows)
 
     remediations: list[str] = []
-    for r in rows:
+    for r in (r for r in rows if r["queried_by_server"]):
         rem = r.get("remediation")
         if rem and rem not in remediations:
             remediations.append(rem)
 
+    out_of_scope = [r["collection"] for r in rows if not r["queried_by_server"]]
     return json.dumps({
         "status": status,
-        "summary": summary,
+        "summary": summary + (
+            f" (+{len(out_of_scope)} not queried by this server, excluded from health)"
+            if out_of_scope else ""),
+        "scope": "explicit" if collections else scope,
         "embedder_dim": len(query_vec) if query_vec else None,
         "collections": rows,
         "remediations": remediations,

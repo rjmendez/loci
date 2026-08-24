@@ -580,6 +580,46 @@ def _qdrant_similarity_search(
     return {"ok": True, "reason": mode, "results": rows}
 
 
+# Cache of collection -> dense vector name. Vector layout does not change under a
+# running process, and the alternative is a get_collection on every query.
+_dense_name_cache: dict = {}
+
+
+def _dense_vector_name(client, collection: str) -> Optional[str]:
+    """Name of the dense vector on ``collection``, or None when it is unnamed.
+
+    ``_qdrant_search_collection`` and ``probe_collection`` take a collection name
+    from the caller, so they run against collections this server did not create and
+    whose vector is not necessarily called ``dense``. Asking for a name that is not
+    there returns ``400 Not existing vector name error`` — which the retrieval path
+    catches per-collection and reports as "no results", indistinguishable from a
+    collection that genuinely had no match.
+
+    Cheap insurance rather than a live fault: every collection currently in the
+    store either uses ``dense`` or is unnamed. Where we create the collection
+    ourselves the name is ours and the call sites keep passing it directly.
+
+    When a collection carries several dense vectors, prefer one whose width matches
+    this server's embedder; a vector we cannot produce is not a candidate.
+    """
+    if collection in _dense_name_cache:
+        return _dense_name_cache[collection]
+    name = None
+    try:
+        vectors = client.get_collection(collection).config.params.vectors
+        if isinstance(vectors, dict) and vectors:
+            if "dense" in vectors:
+                name = "dense"
+            else:
+                same_width = [k for k, v in vectors.items()
+                              if getattr(v, "size", None) == VECTOR_DIM]
+                name = same_width[0] if same_width else sorted(vectors)[0]
+    except Exception as exc:
+        logger.debug("_dense_vector_name(%s): %r", collection, exc)
+    _dense_name_cache[collection] = name
+    return name
+
+
 def _collection_shape(client, name: str) -> dict:
     """Vector layout of one collection: dense width(s), sparse presence, points.
 
@@ -657,8 +697,9 @@ def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
 
     kwargs = {"collection_name": name, "query": query_vec, "limit": limit, "with_payload": False}
     try:
-        if shape["named"]:
-            points = client.query_points(using="dense", **kwargs).points
+        dense_name = _dense_vector_name(client, name) if shape["named"] else None
+        if dense_name:
+            points = client.query_points(using=dense_name, **kwargs).points
         else:
             points = client.query_points(**kwargs).points
     except Exception as exc:
@@ -707,13 +748,18 @@ def _qdrant_search_collection(
         has_named_vectors = False
         has_sparse_index = False
 
+    # The dense vector is not always called "dense" — see _dense_vector_name.
+    dense_name = _dense_vector_name(client, collection_name) if has_named_vectors else None
+    if has_named_vectors and dense_name is None:
+        has_named_vectors = False        # nothing nameable to query; fall through to flat
+
     _qsp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
 
     if has_named_vectors and has_sparse_index and sparse_vec is not None:
         result = client.query_points(
             collection_name=collection_name,
             prefetch=[
-                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2),
+                Prefetch(query=dense_vec, using=dense_name, limit=fetch_limit * 2),
                 Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
             ],
             query=FusionQuery(fusion=Fusion.RRF),
@@ -726,7 +772,7 @@ def _qdrant_search_collection(
         result = client.query_points(
             collection_name=collection_name,
             query=dense_vec,
-            using="dense",
+            using=dense_name,
             limit=fetch_limit,
             with_payload=True,
             query_filter=query_filter,
