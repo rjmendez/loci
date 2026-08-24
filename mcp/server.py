@@ -7722,9 +7722,11 @@ def main() -> None:
         logger.debug("main: fail-open swallow: %r", exc)
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
-        host = os.environ.get("HERMES_MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
-        mcp.run(transport=transport, host=host, port=port)
+        # FastMCP.run() takes only transport and mount_path; the bind address
+        # lives on settings.
+        mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "0.0.0.0")
+        mcp.settings.port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
+        mcp.run(transport=transport)
     else:
         mcp.run(transport="stdio")
 
