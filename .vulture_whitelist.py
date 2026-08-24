@@ -106,3 +106,8 @@ _ = recall_decision
 # `conn.row_factory = sqlite3.Row` is a write the stdlib reads back; there is
 # no root model that makes this resolvable, so it is suppressed by name.
 _ = row_factory
+
+# ── FastMCP settings written by main()
+# `mcp.settings.port` is read inside FastMCP.run() when it builds the uvicorn
+# config; there is no in-repo read, so vulture calls the write dead.
+_ = port
