@@ -25,7 +25,14 @@ QDRANT_URL   = os.environ.get("QDRANT_URL")
 OLLAMA_URL   = os.environ.get("OLLAMA_URL")
 EMBED_MODEL  = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 GEN_MODEL    = os.environ.get("AGENTHER_GEN_MODEL", "llama3.2:latest")
-MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "20"))
+# Batch size. Own name, because the three consolidation scripts each had a
+# different budget under the shared MAX_PER_RUN; setting it for one silently
+# reconfigured the others. MAX_PER_RUN is still honoured as a fallback.
+MAX_PER_RUN = int(
+    os.environ.get("AGENTHER_MAX_PER_RUN")
+    or os.environ.get("MAX_PER_RUN")
+    or 20
+)
 COLLECTION   = "mnemosyne"
 
 # ---------------------------------------------------------------------------

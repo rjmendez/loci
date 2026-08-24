@@ -38,7 +38,14 @@ QDRANT_URL = os.environ.get("QDRANT_URL")
 OLLAMA_URL = os.environ.get("OLLAMA_URL")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 FORGET_THRESH = float(os.environ.get("FORGET_THRESH", "0.3"))
-MAX_PER_RUN = int(os.environ.get("MAX_PER_RUN", "50"))
+# Batch size. Own name, because the three consolidation scripts each had a
+# different budget under the shared MAX_PER_RUN; setting it for one silently
+# reconfigured the others. MAX_PER_RUN is still honoured as a fallback.
+MAX_PER_RUN = int(
+    os.environ.get("EBBINGHAUS_MAX_PER_RUN")
+    or os.environ.get("MAX_PER_RUN")
+    or 50
+)
 QDRANT_COLLECTION = "mnemosyne"
 
 # FSRS-inspired stability model parameters
