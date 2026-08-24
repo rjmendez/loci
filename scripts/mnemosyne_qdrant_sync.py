@@ -11,10 +11,10 @@ _ENV_FILE = os.path.expanduser(os.environ.get("HERMES_ENV_FILE", "~/.hermes/.env
 if os.path.exists(_ENV_FILE):
     with open(_ENV_FILE) as _env_fh:
         for _line in _env_fh:
-        _line = _line.strip()
-        if _line and not _line.startswith("#") and "=" in _line:
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
 
 QDRANT       = os.environ.get("QDRANT_URL")
 EMBED_WORKER = os.environ.get("EMBED_WORKER_URL")
