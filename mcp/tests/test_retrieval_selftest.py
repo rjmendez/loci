@@ -113,3 +113,84 @@ class TestRetrievalSelftest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _NamedVectorParams:
+    def __init__(self, size):
+        self.size = size
+
+
+class _Cfg:
+    def __init__(self, vectors, sparse=None):
+        self.config = type("C", (), {"params": type("P", (), {
+            "vectors": vectors, "sparse_vectors": sparse})()})()
+        self.points_count = 1
+
+
+class TestDenseVectorName(unittest.TestCase):
+    """The call sites that take a collection name from the caller run against
+    collections this server did not create, whose dense vector is not necessarily
+    called `dense`. Asking for a name that is not there is a 400, which the
+    retrieval path reports as 'no results'."""
+
+    def setUp(self):
+        import qdrant_ops
+        qdrant_ops._dense_name_cache.clear()
+
+    def _name(self, vectors):
+        import qdrant_ops
+        client = mock.Mock()
+        client.get_collection.return_value = _Cfg(vectors)
+        return qdrant_ops._dense_vector_name(client, "c")
+
+    def test_dense_is_preferred_when_present(self):
+        self.assertEqual(self._name({"dense": _NamedVectorParams(768),
+                                     "other": _NamedVectorParams(768)}), "dense")
+
+    def test_a_differently_named_vector_is_found(self):
+        self.assertEqual(
+            self._name({"fast-nomic-embed-text-v1.5": _NamedVectorParams(768)}),
+            "fast-nomic-embed-text-v1.5")
+
+    def test_the_one_matching_the_embedder_width_wins(self):
+        import qdrant_ops
+        got = self._name({"small": _NamedVectorParams(384),
+                          "big": _NamedVectorParams(qdrant_ops.VECTOR_DIM)})
+        self.assertEqual(got, "big")
+
+    def test_an_unnamed_flat_collection_returns_none(self):
+        self.assertIsNone(self._name(_NamedVectorParams(768)))
+
+    def test_no_vectors_returns_none(self):
+        self.assertIsNone(self._name({}))
+
+    def test_a_failing_get_collection_returns_none_rather_than_raising(self):
+        import qdrant_ops
+        client = mock.Mock()
+        client.get_collection.side_effect = RuntimeError("gone")
+        self.assertIsNone(qdrant_ops._dense_vector_name(client, "c"))
+
+    def test_the_answer_is_cached_not_refetched(self):
+        import qdrant_ops
+        client = mock.Mock()
+        client.get_collection.return_value = _Cfg({"dense": _NamedVectorParams(768)})
+        for _ in range(3):
+            qdrant_ops._dense_vector_name(client, "c")
+        self.assertEqual(client.get_collection.call_count, 1)
+
+
+class TestProbeUsesTheResolvedName(unittest.TestCase):
+    def test_a_collection_whose_vector_is_not_called_dense_probes_ok(self):
+        import qdrant_ops
+        qdrant_ops._dense_name_cache.clear()
+        c = QdrantClient(location=":memory:")
+        c.create_collection("odd", vectors_config={
+            "fast-nomic-embed-text-v1.5": VectorParams(size=DIM, distance=Distance.COSINE)})
+        c.upsert("odd", points=[PointStruct(
+            id=1, vector={"fast-nomic-embed-text-v1.5": [0.1] * DIM})])
+        with mock.patch.object(server, "_get_qdrant", lambda: (c, "odd")), \
+             mock.patch.object(server, "_embed", lambda _q: [0.1] * DIM):
+            out = json.loads(server.retrieval_selftest("anything"))
+        row = {r["collection"]: r for r in out["collections"]}["odd"]
+        self.assertEqual(row["status"], "ok", row.get("detail"))
+        self.assertEqual(row["hits"], 1)
