@@ -263,80 +263,81 @@ def main() -> None:
         sys.exit(1)
 
     conn = sqlite3.connect(DB_PATH)
+    try:
 
-    print(f"[info] scanning working_memory + episodic_memory in {DB_PATH}")
-    all_rows = fetch_candidates(conn)
-    print(f"[info] {len(all_rows)} rows with content > 20 chars")
+        print(f"[info] scanning working_memory + episodic_memory in {DB_PATH}")
+        all_rows = fetch_candidates(conn)
+        print(f"[info] {len(all_rows)} rows with content > 20 chars")
 
-    decayed = []
-    for (table, row_id, content, recall_count, last_recalled, created_at, importance) in all_rows:
-        r = retention(recall_count or 0, last_recalled, created_at)
-        if r < FORGET_THRESH:
-            decayed.append((r, table, row_id, content, recall_count or 0, last_recalled, created_at, importance))
-
-    # Lowest retention first (most-forgotten first)
-    decayed.sort(key=lambda x: x[0])
-    batch = decayed[:MAX_PER_RUN]
-
-    print(f"[info] {len(decayed)} entries below forget threshold {FORGET_THRESH}, processing {len(batch)}")
-
-    processed = 0
-    errors = 0
-
-    for (r, table, row_id, content, recall_count, last_recalled, created_at, importance) in batch:
-        try:
-            print(f"  [{table}:{row_id}] R={r:.4f}  refreshing …", end=" ", flush=True)
-
-            # FSRS: read existing stability from Qdrant payload if available
-            # (first run: None → computed from recall_count + importance)
-            existing_stability = None  # will be overridden once payloads carry fsrs_stability
-            d_init = _init_difficulty(importance or 5.0)
-            s_current = existing_stability or _stability_from_count(recall_count or 0, d_init)
-
+        decayed = []
+        for (table, row_id, content, recall_count, last_recalled, created_at, importance) in all_rows:
+            r = retention(recall_count or 0, last_recalled, created_at)
             if r < FORGET_THRESH:
-                # Forgotten: penalise stability, increase difficulty
-                new_stability = _update_stability_failure(s_current)
-                grade = _grade_from_retention(r)
-                new_difficulty = _update_difficulty(d_init, grade)
-            else:
-                # Scheduled refresh (not forgotten): stability update on successful recall
-                grade = _grade_from_retention(r)
-                new_stability = _update_stability_success(s_current, r, d_init)
-                new_difficulty = _update_difficulty(d_init, grade)
+                decayed.append((r, table, row_id, content, recall_count or 0, last_recalled, created_at, importance))
 
-            # (a) Embed
-            vec = embed(content)
+        # Lowest retention first (most-forgotten first)
+        decayed.sort(key=lambda x: x[0])
+        batch = decayed[:MAX_PER_RUN]
 
-            # (b) Upsert to Qdrant
-            point_id = stable_id(content)
-            ts = now_iso()
-            qdrant_upsert(
-                point_id=point_id,
-                vector=vec,
-                payload={
-                    "content": content,
-                    "importance": importance,
-                    "last_refreshed": ts,
-                    "decay_score": r,
-                    "fsrs_stability": round(new_stability, 4),
-                    "fsrs_difficulty": round(new_difficulty, 4),
-                    "mnemosyne_id": str(row_id),
-                    "mnemosyne_table": table,
-                },
-                api_key=api_key,
-            )
+        print(f"[info] {len(decayed)} entries below forget threshold {FORGET_THRESH}, processing {len(batch)}")
 
-            # (c) Update SQLite
-            update_recall(conn, table, row_id, recall_count + 1, ts)
+        processed = 0
+        errors = 0
 
-            processed += 1
-            print(f"ok  S={new_stability:.3f} D={new_difficulty:.3f}")
+        for (r, table, row_id, content, recall_count, last_recalled, created_at, importance) in batch:
+            try:
+                print(f"  [{table}:{row_id}] R={r:.4f}  refreshing …", end=" ", flush=True)
 
-        except Exception as exc:  # noqa: BLE001
-            errors += 1
-            print(f"ERROR: {exc}")
+                # FSRS: read existing stability from Qdrant payload if available
+                # (first run: None → computed from recall_count + importance)
+                existing_stability = None  # will be overridden once payloads carry fsrs_stability
+                d_init = _init_difficulty(importance or 5.0)
+                s_current = existing_stability or _stability_from_count(recall_count or 0, d_init)
 
-    conn.close()
+                if r < FORGET_THRESH:
+                    # Forgotten: penalise stability, increase difficulty
+                    new_stability = _update_stability_failure(s_current)
+                    grade = _grade_from_retention(r)
+                    new_difficulty = _update_difficulty(d_init, grade)
+                else:
+                    # Scheduled refresh (not forgotten): stability update on successful recall
+                    grade = _grade_from_retention(r)
+                    new_stability = _update_stability_success(s_current, r, d_init)
+                    new_difficulty = _update_difficulty(d_init, grade)
+
+                # (a) Embed
+                vec = embed(content)
+
+                # (b) Upsert to Qdrant
+                point_id = stable_id(content)
+                ts = now_iso()
+                qdrant_upsert(
+                    point_id=point_id,
+                    vector=vec,
+                    payload={
+                        "content": content,
+                        "importance": importance,
+                        "last_refreshed": ts,
+                        "decay_score": r,
+                        "fsrs_stability": round(new_stability, 4),
+                        "fsrs_difficulty": round(new_difficulty, 4),
+                        "mnemosyne_id": str(row_id),
+                        "mnemosyne_table": table,
+                    },
+                    api_key=api_key,
+                )
+
+                # (c) Update SQLite
+                update_recall(conn, table, row_id, recall_count + 1, ts)
+
+                processed += 1
+                print(f"ok  S={new_stability:.3f} D={new_difficulty:.3f}")
+
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                print(f"ERROR: {exc}")
+    finally:
+        conn.close()
     print(f"[done] processed={processed} errors={errors}")
 
 
