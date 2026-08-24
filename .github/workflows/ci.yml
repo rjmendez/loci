@@ -202,6 +202,15 @@ jobs:
                      --select E9,F401,F811,F821,F841 \
                      --ignore E402
 
+      # A live Qdrant key shipped for two months as an os.environ.get() default
+      # (#79). Anything key-shaped in that position is a secret, not a default.
+      - name: Reject secret-shaped env defaults
+        run: |
+          if git grep -nIE 'os\.(environ\.get|getenv)\([^)]*"[0-9a-fA-F]{32,}"' -- '*.py'; then
+            echo "::error::hardcoded secret as an environment-variable default"
+            exit 1
+          fi
+
   type-check:
     name: Type check (mypy)
     runs-on: ubuntu-latest

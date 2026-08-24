@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 
 # ── Config from env or defaults ────────────────────────────────────────────
 QDRANT_URL  = os.environ.get("QDRANT_URL")
-QDRANT_KEY  = os.environ.get("QDRANT_KEY",  "8324728be0accd776f7450ae9e5e4f8ebd155c48a4cfbc3d3d94e7490aaa60ab")
+QDRANT_KEY  = os.environ.get("QDRANT_KEY", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 COLLECTION  = os.environ.get("UA_COLLECTION", "understand_anything")
@@ -142,6 +142,9 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: ua-ingest.py <project_root>")
         sys.exit(1)
+
+    if not QDRANT_URL:
+        sys.exit("ERROR: QDRANT_URL is required")
 
     project_root = os.path.abspath(sys.argv[1])
     ua_dir       = os.path.join(project_root, ".understand-anything")
