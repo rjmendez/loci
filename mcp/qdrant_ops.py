@@ -414,6 +414,37 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
     return degraded_active, degraded_reason
 
 
+# How much of a passage the cross-encoder is allowed to see, in CHARACTERS.
+#
+# This was a hardcoded 512. The corpus median finding is 1,048 characters and
+# 73.6% of findings are longer than 512, so for three findings in four the
+# reranker was scoring a truncated head against a query drawn from the whole
+# text — and short findings, scored complete, won the comparison on presentation
+# rather than relevance. bge-reranker-v2-m3 accepts 8192 TOKENS; 512 characters
+# is roughly a sixteenth of that.
+#
+# Swept against identity recall (scripts/loci_groom.py recall, n=90 per arm,
+# three seeds), which is what this should be re-tuned against if the corpus shape
+# changes. identity r@1:
+#
+#     passage chars   seed 5   seed 11   seed 12
+#     (no CE)          0.967    0.929     0.933
+#     512              0.744    0.811     0.822   <- the value this replaces
+#     1024             1.000    0.978     0.956
+#     2048             0.944    0.978     0.956
+#
+# Two results replicate across all three seeds: 512 is worse than switching the
+# reranker OFF, and >=1024 is better than both. So the reranker was not the
+# problem — it had never been given enough of a passage to judge, on a corpus
+# whose median finding is 1,048 characters.
+#
+# What did NOT replicate: the first seed showed 1024 beating 2048, which looked
+# like longer passages diluting the signal. Two further seeds show them identical.
+# 1024 stays the default because it is never worse and it is one median finding,
+# but anything >= 1024 is defensible and the 1024-vs-2048 gap was noise.
+RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
+
+
 def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
     """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
 
@@ -425,7 +456,7 @@ def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bo
     ce = _get_cross_encoder()
     if ce is not None and rows:
         try:
-            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
+            pairs = [(query, str(r.get("text", ""))[:RERANK_MAX_CHARS]) for r in rows]
             ce_scores = ce.predict(pairs)
             for row, ce_score in zip(rows, ce_scores):
                 row["ce_score"] = round(float(ce_score), 4)

@@ -3,8 +3,11 @@
 Scores are stubbed via an injected model_fn; NO model is downloaded and no GPU/network
 is touched (mirrors test_embed_ops.py style + the [pattern:injectable] contract).
 """
+import contextlib
 import os
 import sys
+import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -87,3 +90,45 @@ def test_model_id_reads_env(monkeypatch, tmp_path):
     monkeypatch.setenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
     assert R._model_id() == "cross-encoder/ms-marco-MiniLM-L-6-v2"
     B._reset_cache()
+
+
+class TestRerankPassageBudget(unittest.TestCase):
+    """The passage budget was a hardcoded 512 CHARACTERS against a model that
+    accepts 8192 tokens, while 73.6% of this corpus's findings are longer than
+    512 — so for most passages the reranker scored a truncated head and short
+    findings won on presentation rather than relevance."""
+
+    def _pairs_seen(self, text, budget=None):
+        import qdrant_ops
+        seen = {}
+
+        class _CE:
+            def predict(self, pairs):
+                seen["pairs"] = pairs
+                return [0.5] * len(pairs)
+
+        ctx = mock.patch.object(qdrant_ops, "_get_cross_encoder", lambda: _CE())
+        budget_ctx = (mock.patch.object(qdrant_ops, "RERANK_MAX_CHARS", budget)
+                      if budget is not None else contextlib.nullcontext())
+        with ctx, budget_ctx:
+            qdrant_ops._ce_rerank("q", [{"text": text, "id": "a"}], top_k=1)
+        return seen["pairs"]
+
+    def test_a_long_passage_is_no_longer_cut_at_512(self):
+        pairs = self._pairs_seen("x" * 5000)
+        self.assertGreater(len(pairs[0][1]), 512)
+
+    def test_the_budget_is_honoured(self):
+        pairs = self._pairs_seen("x" * 5000, budget=1024)
+        self.assertEqual(len(pairs[0][1]), 1024)
+
+    def test_a_short_passage_is_passed_whole(self):
+        pairs = self._pairs_seen("short finding")
+        self.assertEqual(pairs[0][1], "short finding")
+
+    def test_the_default_clears_the_replicated_floor(self):
+        import qdrant_ops
+        # Across three seeds, 512 scored BELOW no-reranker and >=1024 scored above
+        # both. 1024 vs 2048 did not separate, so the assertion is the floor that
+        # replicated, not the single-seed winner.
+        self.assertGreaterEqual(qdrant_ops.RERANK_MAX_CHARS, 1024)

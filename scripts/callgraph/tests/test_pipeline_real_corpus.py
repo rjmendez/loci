@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 115
+    assert head_build.meta.file_count == 117
     assert head_build.meta.error_count == 0
     # The 2s figure in ingest.py's own docstring is about ast.parse'ing the
     # corpus (steps 1-3's budget). Steps 4-6 (CALLSITE/CALLS resolution over
@@ -43,8 +43,9 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
         n for n in head_build.store.nodes_of_kind("FUNCTION")
         if not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
-    # docs/census.txt estimate: ~890 module-level functions corpus-wide.
-    assert 850 <= len(module_level) <= 930, len(module_level)
+    # docs/census.txt estimate was ~890 corpus-wide; scripts/loci_groom.py and
+    # mcp/openrouter.py moved it to ~951. Band re-centred, same +-5% tolerance.
+    assert 900 <= len(module_level) <= 1000, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
@@ -56,8 +57,8 @@ def test_mcp_top_level_module_level_function_count(head_build):
         if n.path is not None and n.path.startswith("mcp/") and n.path.count("/") == 1
         and not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
-    # docs/census.txt estimate: 297 in mcp/ top-level.
-    assert 265 <= len(module_level) <= 330, len(module_level)
+    # docs/census.txt estimate was 297; mcp/openrouter.py moved it to ~334.
+    assert 300 <= len(module_level) <= 370, len(module_level)
 
 
 def test_every_mcp_tool_decorator_is_classified_registering(head_build):
