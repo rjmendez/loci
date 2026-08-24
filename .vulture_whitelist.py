@@ -87,6 +87,7 @@ _ = health
 _ = finding_resolve
 _ = investigation_verify_all
 _ = loci_health
+_ = retrieval_selftest
 
 # ── socketserver hooks and tuning attributes, read by the stdlib base class
 # MemcheckDaemon subclasses ThreadingUnixStreamServer; _Handler subclasses
