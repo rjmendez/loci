@@ -8,12 +8,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first — layer cache friendly
-COPY requirements.txt pyproject.toml ./
-COPY memcheck/ ./memcheck/
-RUN pip install --no-cache-dir -e .
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .env.example ./
+# Then the source. server.py imports its siblings by module name, so they all
+# have to be here; the editable install goes last, with the packages present.
+COPY pyproject.toml .env.example ./
+COPY *.py ./
+COPY memcheck/ ./memcheck/
+COPY graph/ ./graph/
 COPY tests/ ./tests/
+RUN pip install --no-cache-dir --no-deps -e .
 
 # fastembed downloads ONNX models on first embed; mount a cache volume to
 # avoid re-downloading across restarts.

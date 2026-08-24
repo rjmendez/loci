@@ -145,129 +145,130 @@ def main() -> None:
         gate = None
 
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
 
-    # ------------------------------------------------------------------
-    # Load recent entries
-    # ------------------------------------------------------------------
-    cur.execute(
-        "SELECT id, content, created_at FROM working_memory ORDER BY created_at DESC LIMIT ?",
-        (MAX_PER_RUN,),
-    )
-    rows = cur.fetchall()
+        # ------------------------------------------------------------------
+        # Load recent entries
+        # ------------------------------------------------------------------
+        cur.execute(
+            "SELECT id, content, created_at FROM working_memory ORDER BY created_at DESC LIMIT ?",
+            (MAX_PER_RUN,),
+        )
+        rows = cur.fetchall()
 
-    if len(rows) < 2:
-        print("[amem] not enough entries to compare — skipping")
-        conn.close()
-        return
+        if len(rows) < 2:
+            print("[amem] not enough entries to compare — skipping")
+            return
 
-    # ------------------------------------------------------------------
-    # Phase 1 — Embed all entries
-    # ------------------------------------------------------------------
-    entries: list[tuple[str, str, list[float], str]] = []
-    for row in rows:
-        vec = embed(row["content"])
-        entries.append((row["id"], row["content"], vec, row["created_at"] or ""))
+        # ------------------------------------------------------------------
+        # Phase 1 — Embed all entries
+        # ------------------------------------------------------------------
+        entries: list[tuple[str, str, list[float], str]] = []
+        for row in rows:
+            vec = embed(row["content"])
+            entries.append((row["id"], row["content"], vec, row["created_at"] or ""))
 
-    # ------------------------------------------------------------------
-    # Phase 1 — Pairwise cosine → cross-links
-    # ------------------------------------------------------------------
-    new_links = 0
-    flagged_conflicts = 0
+        # ------------------------------------------------------------------
+        # Phase 1 — Pairwise cosine → cross-links
+        # ------------------------------------------------------------------
+        new_links = 0
+        flagged_conflicts = 0
 
-    n = len(entries)
-    causal_links = 0
-    update_links = 0
+        n = len(entries)
+        causal_links = 0
+        update_links = 0
 
-    for i in range(n):
-        id_a, content_a, vec_a, ts_a = entries[i]
-        for j in range(i + 1, n):
-            id_b, content_b, vec_b, ts_b = entries[j]
+        for i in range(n):
+            id_a, content_a, vec_a, ts_a = entries[i]
+            for j in range(i + 1, n):
+                id_b, content_b, vec_b, ts_b = entries[j]
 
-            sim = cosine(vec_a, vec_b)
+                sim = cosine(vec_a, vec_b)
 
-            if sim > AMEM_LINK_THRESHOLD:
-                cur.execute(
-                    """
-                    INSERT OR IGNORE INTO graph_edges
-                        (source, target, edge_type, weight, timestamp, created_at)
-                    VALUES (?, ?, 'semantic_link', ?, ?, ?)
-                    """,
-                    (id_a, id_b, sim, now, now),
-                )
-                if cur.rowcount:
-                    new_links += 1
-
-                # ------------------------------------------------------
-                # Phase 2 — Conflict detection (subset of linked pairs)
-                # ------------------------------------------------------
-                if sim > AMEM_CONFLICT_THRESHOLD and has_contradiction(content_a, content_b):
-                    cur.execute(
-                        """
-                        INSERT OR IGNORE INTO conflicts
-                            (fact_a_id, fact_b_id, conflict_type, created_at)
-                        VALUES (?, ?, 'near_duplicate_divergent', ?)
-                        """,
-                        (id_a, id_b, now),
-                    )
-                    if cur.rowcount:
-                        flagged_conflicts += 1
-                    # Also add contradicts edge for causal traversal
+                if sim > AMEM_LINK_THRESHOLD:
                     cur.execute(
                         """
                         INSERT OR IGNORE INTO graph_edges
                             (source, target, edge_type, weight, timestamp, created_at)
-                        VALUES (?, ?, 'contradicts', ?, ?, ?)
+                        VALUES (?, ?, 'semantic_link', ?, ?, ?)
                         """,
                         (id_a, id_b, sim, now, now),
                     )
+                    if cur.rowcount:
+                        new_links += 1
 
-                # ------------------------------------------------------
-                # Phase 3 — Causal edge detection (ActMem/GAM pattern)
-                # updated_by: high similarity + B is newer + B has update signal
-                # caused_by: B explicitly references A or uses causal phrasing
-                # ------------------------------------------------------
-                if sim >= AMEM_UPDATE_THRESHOLD:
-                    newer, older = (id_b, id_a) if ts_b > ts_a else (id_a, id_b)
-                    newer_content = content_b if ts_b > ts_a else content_a
-                    if _has_update_signal(newer_content):
+                    # ------------------------------------------------------
+                    # Phase 2 — Conflict detection (subset of linked pairs)
+                    # ------------------------------------------------------
+                    if sim > AMEM_CONFLICT_THRESHOLD and has_contradiction(content_a, content_b):
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO conflicts
+                                (fact_a_id, fact_b_id, conflict_type, created_at)
+                            VALUES (?, ?, 'near_duplicate_divergent', ?)
+                            """,
+                            (id_a, id_b, now),
+                        )
+                        if cur.rowcount:
+                            flagged_conflicts += 1
+                        # Also add contradicts edge for causal traversal
                         cur.execute(
                             """
                             INSERT OR IGNORE INTO graph_edges
                                 (source, target, edge_type, weight, timestamp, created_at)
-                            VALUES (?, ?, 'updated_by', ?, ?, ?)
+                            VALUES (?, ?, 'contradicts', ?, ?, ?)
                             """,
-                            (older, newer, sim, now, now),
+                            (id_a, id_b, sim, now, now),
+                        )
+
+                    # ------------------------------------------------------
+                    # Phase 3 — Causal edge detection (ActMem/GAM pattern)
+                    # updated_by: high similarity + B is newer + B has update signal
+                    # caused_by: B explicitly references A or uses causal phrasing
+                    # ------------------------------------------------------
+                    if sim >= AMEM_UPDATE_THRESHOLD:
+                        newer, older = (id_b, id_a) if ts_b > ts_a else (id_a, id_b)
+                        newer_content = content_b if ts_b > ts_a else content_a
+                        if _has_update_signal(newer_content):
+                            cur.execute(
+                                """
+                                INSERT OR IGNORE INTO graph_edges
+                                    (source, target, edge_type, weight, timestamp, created_at)
+                                VALUES (?, ?, 'updated_by', ?, ?, ?)
+                                """,
+                                (older, newer, sim, now, now),
+                            )
+                            if cur.rowcount:
+                                update_links += 1
+
+                    if _has_causal_signal(content_b, id_a):
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO graph_edges
+                                (source, target, edge_type, weight, timestamp, created_at)
+                            VALUES (?, ?, 'caused_by', ?, ?, ?)
+                            """,
+                            (id_b, id_a, sim, now, now),
                         )
                         if cur.rowcount:
-                            update_links += 1
+                            causal_links += 1
+                    elif _has_causal_signal(content_a, id_b):
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO graph_edges
+                                (source, target, edge_type, weight, timestamp, created_at)
+                            VALUES (?, ?, 'caused_by', ?, ?, ?)
+                            """,
+                            (id_a, id_b, sim, now, now),
+                        )
+                        if cur.rowcount:
+                            causal_links += 1
 
-                if _has_causal_signal(content_b, id_a):
-                    cur.execute(
-                        """
-                        INSERT OR IGNORE INTO graph_edges
-                            (source, target, edge_type, weight, timestamp, created_at)
-                        VALUES (?, ?, 'caused_by', ?, ?, ?)
-                        """,
-                        (id_b, id_a, sim, now, now),
-                    )
-                    if cur.rowcount:
-                        causal_links += 1
-                elif _has_causal_signal(content_a, id_b):
-                    cur.execute(
-                        """
-                        INSERT OR IGNORE INTO graph_edges
-                            (source, target, edge_type, weight, timestamp, created_at)
-                        VALUES (?, ?, 'caused_by', ?, ?, ?)
-                        """,
-                        (id_a, id_b, sim, now, now),
-                    )
-                    if cur.rowcount:
-                        causal_links += 1
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
     print(f"[amem] {new_links} new cross-links created")
     print(f"[amem] {flagged_conflicts} conflicts flagged")

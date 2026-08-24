@@ -217,60 +217,61 @@ def main():
         sys.exit(1)
 
     conn = sqlite3.connect(MNEMOSYNE_DB)
-    rows = load_failures(conn)
-    n_processed = 0
-    n_relabeled = 0
-    n_stored = 0
+    try:
+        rows = load_failures(conn)
+        n_processed = 0
+        n_relabeled = 0
+        n_stored = 0
 
-    for row in rows:
-        row_id, content, importance, created_at, session_id = row
-        n_processed += 1
+        for row in rows:
+            row_id, content, importance, created_at, session_id = row
+            n_processed += 1
 
-        # Step a: generate relabel via Ollama
-        try:
-            relabeled = generate_relabel(content)
-        except Exception as e:
-            print(f"[agentHER] gen error row {row_id}: {e}", file=sys.stderr)
-            continue
+            # Step a: generate relabel via Ollama
+            try:
+                relabeled = generate_relabel(content)
+            except Exception as e:
+                print(f"[agentHER] gen error row {row_id}: {e}", file=sys.stderr)
+                continue
 
-        if relabeled is None:
-            print(f"[agentHER] no response for row {row_id}", file=sys.stderr)
-            continue
+            if relabeled is None:
+                print(f"[agentHER] no response for row {row_id}", file=sys.stderr)
+                continue
 
-        # Step b: validate response
-        if not (relabeled.startswith("This trace") and len(relabeled) > 20):
-            continue
+            # Step b: validate response
+            if not (relabeled.startswith("This trace") and len(relabeled) > 20):
+                continue
 
-        n_relabeled += 1
+            n_relabeled += 1
 
-        synthetic = f"AGENTHER_POSITIVE: {relabeled}\nOriginal: {content[:200]}"
+            synthetic = f"AGENTHER_POSITIVE: {relabeled}\nOriginal: {content[:200]}"
 
-        # Step c: embed
-        vec = embed(synthetic)
-        if vec is None:
-            print(f"[agentHER] embed failed for row {row_id}", file=sys.stderr)
-            continue
+            # Step c: embed
+            vec = embed(synthetic)
+            if vec is None:
+                print(f"[agentHER] embed failed for row {row_id}", file=sys.stderr)
+                continue
 
-        # Step d: upsert to Qdrant
-        point_id = stable_id(synthetic)
-        qdrant_payload = {
-            "content": synthetic,
-            "importance": 6,
-            "source": "agentHER",
-            "original_id": str(row_id),
-        }
-        upserted = qdrant_upsert(point_id, vec, qdrant_payload)
-        if not upserted:
-            print(f"[agentHER] qdrant upsert failed for row {row_id}", file=sys.stderr)
+            # Step d: upsert to Qdrant
+            point_id = stable_id(synthetic)
+            qdrant_payload = {
+                "content": synthetic,
+                "importance": 6,
+                "source": "agentHER",
+                "original_id": str(row_id),
+            }
+            upserted = qdrant_upsert(point_id, vec, qdrant_payload)
+            if not upserted:
+                print(f"[agentHER] qdrant upsert failed for row {row_id}", file=sys.stderr)
 
-        # Step e: store in Mnemosyne DB
-        try:
-            store_synthetic(conn, synthetic)
-            n_stored += 1
-        except Exception as e:
-            print(f"[agentHER] db insert error row {row_id}: {e}", file=sys.stderr)
-
-    conn.close()
+            # Step e: store in Mnemosyne DB
+            try:
+                store_synthetic(conn, synthetic)
+                n_stored += 1
+            except Exception as e:
+                print(f"[agentHER] db insert error row {row_id}: {e}", file=sys.stderr)
+    finally:
+        conn.close()
     print(f"[agentHER] processed {n_processed}, relabeled {n_relabeled}, stored {n_stored}")
 
 
