@@ -7,6 +7,7 @@ is acceptable, search erroring is not -- so most of these assert the fallback.
 """
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import pathlib
@@ -52,6 +53,9 @@ class _Resp:
 
 
 class _Session:
+    # _get_http_session() reuses the module-level session unless it is closed.
+    closed = False
+
     def __init__(self, resp=None, raise_on_post=None):
         self._resp = resp
         self._raise = raise_on_post
@@ -72,8 +76,17 @@ def run(coro):
     return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(coro)
 
 
+@contextlib.contextmanager
 def with_session(sess):
-    return mock.patch.object(a2a.aiohttp, "ClientSession", lambda *a, **kw: sess)
+    """Patch ClientSession and clear the cached one, so _get_http_session()
+    hands out `sess` and does not leak it into the next test."""
+    saved = a2a._http_session
+    a2a._http_session = None
+    try:
+        with mock.patch.object(a2a.aiohttp, "ClientSession", lambda *a, **kw: sess):
+            yield sess
+    finally:
+        a2a._http_session = saved
 
 
 class TestRerankDisabled(unittest.TestCase):
