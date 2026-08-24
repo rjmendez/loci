@@ -176,6 +176,7 @@ from qdrant_ops import (  # noqa: E402,F401
     _get_sparse_embedder, _get_cross_encoder, _embed_sparse, _create_payload_indexes,
     _purge_old_records, _get_qdrant, _embed_auth_headers, _embed, _qdrant_upsert,
     _qdrant_degraded_mode, _ce_rerank, _qdrant_similarity_search, _qdrant_search_collection,
+    probe_collection,
 )
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
 REFLECTION_STATE_FILE = REFLECTION_STATE_DIR / "state.json"
@@ -4933,6 +4934,104 @@ def _health_rollup(checks: list[dict]) -> tuple[str, str]:
         f"{len(checks) - n_fail - n_warn} ok -> {status}"
     )
     return status, summary
+
+
+def _selftest_rollup(rows: list[dict]) -> tuple[str, str]:
+    """ok | degraded | unhealthy, plus a one-line summary.
+
+    An empty collection is not a fault — nothing to retrieve is not the same as
+    unable to retrieve.
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    broken = counts.get("width_mismatch", 0) + counts.get("error", 0)
+    if broken and broken >= len(rows):
+        status = "unhealthy"
+    elif broken:
+        status = "degraded"
+    else:
+        status = "ok"
+    parts = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    return status, f"{len(rows)} collection(s): {parts} -> {status}"
+
+
+@mcp.tool()
+def retrieval_selftest(query: str = "system architecture", limit: int = 3) -> str:
+    """
+    Prove every Qdrant collection can actually be retrieved from.
+
+    memory_health inspects the substrate — is Qdrant up, do the embedders load —
+    but only for the collections it knows by name. A store usually holds more,
+    written by other ingests at other embedding widths, and those fail in a way
+    nothing reports: the query raises on a width mismatch, the caller catches it
+    per-collection, and the collection becomes indistinguishable from one that
+    simply had no match.
+
+    This sweeps the whole store and answers the operational question directly:
+    if I ask this collection something, do rows come back? Per collection it
+    reports points, dense width, sparse presence and hit count, classified as
+    ok | empty | no_results | width_mismatch | error, rolling up to
+    ok | degraded | unhealthy. Remediations are deduplicated — one unmapped
+    width usually explains many collections at once.
+
+    Read-only. Bypasses the cross-encoder and its relevance floor on purpose:
+    the floor is a relevance judgement and this is a question about wiring.
+
+    Args:
+        query: Probe text. Any in-domain phrase works; the point is retrievability.
+        limit: Rows to request per collection (default 3).
+
+    Returns:
+        JSON with {status, summary, collections, remediations}.
+    """
+    client, _col = _get_qdrant()
+    if client is None:
+        return json.dumps({
+            "status": "unhealthy",
+            "summary": "Qdrant unavailable — nothing could be probed",
+            "collections": [],
+            "remediations": ["Check QDRANT_URL and QDRANT_API_KEY."],
+        }, indent=2)
+
+    try:
+        names = sorted(c.name for c in client.get_collections().collections)
+    except Exception as exc:
+        return json.dumps({
+            "status": "unhealthy",
+            "summary": f"could not list collections: {exc}",
+            "collections": [],
+            "remediations": ["Check Qdrant connectivity and API key scope."],
+        }, indent=2)
+
+    if not names:
+        return json.dumps({
+            "status": "ok", "summary": "no collections exist",
+            "collections": [], "remediations": [],
+        }, indent=2)
+
+    try:
+        query_vec = _embed(query)
+    except Exception as exc:
+        logger.warning("retrieval_selftest: embed failed: %r", exc)
+        query_vec = None
+
+    rows = [probe_collection(query_vec, client, name, limit=limit) for name in names]
+    status, summary = _selftest_rollup(rows)
+
+    remediations: list[str] = []
+    for r in rows:
+        rem = r.get("remediation")
+        if rem and rem not in remediations:
+            remediations.append(rem)
+
+    return json.dumps({
+        "status": status,
+        "summary": summary,
+        "embedder_dim": len(query_vec) if query_vec else None,
+        "collections": rows,
+        "remediations": remediations,
+    }, indent=2)
 
 
 @mcp.tool()

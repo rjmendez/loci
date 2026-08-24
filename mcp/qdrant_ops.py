@@ -549,6 +549,98 @@ def _qdrant_similarity_search(
     return {"ok": True, "reason": mode, "results": rows}
 
 
+def _collection_shape(client, name: str) -> dict:
+    """Vector layout of one collection: dense width(s), sparse presence, points.
+
+    Returns {"points", "dense_dims", "named", "sparse"} — dense_dims is a list
+    because a named-vector collection can carry several dense vectors.
+    """
+    info = client.get_collection(name)
+    params = info.config.params
+    vectors = params.vectors
+    named = isinstance(vectors, dict)
+    if named:
+        dims = sorted({int(v.size) for k, v in vectors.items() if getattr(v, "size", None)})
+    elif vectors is not None:
+        dims = [int(vectors.size)]
+    else:
+        dims = []
+    sparse = bool(getattr(params, "sparse_vectors", None))
+    points = int(getattr(info, "points_count", 0) or 0)
+    return {"points": points, "dense_dims": dims, "named": named, "sparse": sparse}
+
+
+def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
+    """Can this collection be retrieved from at all? Never raises.
+
+    Deliberately NOT _qdrant_search_collection: that path cross-encodes and
+    applies a relevance floor, so a collection of terse rows legitimately
+    returns nothing and would look identical to a broken one. This asks about
+    wiring, not relevance.
+
+    status is one of:
+      ok             rows came back
+      empty          the collection holds no points — not a fault
+      width_mismatch this server's embedder is the wrong width for it, so every
+                     query it makes against this collection will fail
+      no_results     queryable, nothing matched
+      error          the probe raised
+    """
+    out = {"collection": name, "hits": 0, "status": "error", "detail": ""}
+    try:
+        shape = _collection_shape(client, name)
+    except Exception as exc:
+        out["detail"] = f"get_collection failed: {exc}"
+        return out
+
+    out.update({
+        "points": shape["points"],
+        "dense_dims": shape["dense_dims"],
+        "sparse": shape["sparse"],
+    })
+
+    if shape["points"] == 0:
+        out["status"] = "empty"
+        out["detail"] = "no points stored"
+        return out
+
+    our_dim = len(query_vec) if query_vec is not None else None
+    if our_dim is None:
+        out["status"] = "error"
+        out["detail"] = "no embedder — dense vector unavailable"
+        out["remediation"] = "Set OLLAMA_BASE_URL or EMBED_API_KEY so the server can embed."
+        return out
+
+    if shape["dense_dims"] and our_dim not in shape["dense_dims"]:
+        out["status"] = "width_mismatch"
+        out["detail"] = (
+            f"collection is {'/'.join(str(d) for d in shape['dense_dims'])}-dim, "
+            f"this server embeds at {our_dim}"
+        )
+        out["remediation"] = (
+            f"Nothing this server asks can match a {shape['dense_dims'][0]}-dim collection "
+            f"while it embeds at {our_dim}. Re-embed the collection, or query it with an "
+            f"embedder of its own width."
+        )
+        return out
+
+    kwargs = {"collection_name": name, "query": query_vec, "limit": limit, "with_payload": False}
+    try:
+        if shape["named"]:
+            points = client.query_points(using="dense", **kwargs).points
+        else:
+            points = client.query_points(**kwargs).points
+    except Exception as exc:
+        out["status"] = "error"
+        out["detail"] = f"query failed: {exc}"
+        return out
+
+    out["hits"] = len(points)
+    out["status"] = "ok" if points else "no_results"
+    out["detail"] = f"{len(points)} row(s)" if points else "queryable, nothing matched"
+    return out
+
+
 def _qdrant_search_collection(
     query: str,
     collection_name: str,
