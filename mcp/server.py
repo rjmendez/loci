@@ -178,6 +178,7 @@ from qdrant_ops import (  # noqa: E402,F401
     _qdrant_degraded_mode, _ce_rerank, _qdrant_similarity_search, _qdrant_search_collection,
     probe_collection,
 )
+from qdrant_ops import RERANK_MAX_CHARS as _RERANK_MAX_CHARS  # noqa: E402
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
 REFLECTION_STATE_FILE = REFLECTION_STATE_DIR / "state.json"
 REFLECTION_DEFAULT_INVESTIGATION = os.environ.get(
@@ -6254,7 +6255,12 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
     if ce is None or len(results) <= 1:
         return
     try:
-        pairs = [(query, str(r.get('text', r.get('content', '')))[:512]) for r in results[:20]]
+        # Same budget as qdrant_ops._ce_rerank — this is the SECOND cross-encoder,
+        # on rag_context_search's final cross-collection re-pass, and it was missed
+        # when the first was fixed. 512 chars against a 1,048-char median finding
+        # scored below using no reranker at all.
+        pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS])
+                 for r in results[:20]]
         for r, sc in zip(results[:20], ce.predict(pairs)):
             r['final_ce_score'] = round(float(sc), 4)
         results[:20] = sorted(results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)

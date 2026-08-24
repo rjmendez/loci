@@ -794,6 +794,11 @@ def _qdrant_search_collection(
         payload = dict(p.payload or {})
         rows.append({
             "score": round(float(p.score), 4),
+            # The point id, BEFORE the payload spread so a payload that carries its
+            # own id still wins. Callers dedup on (origin, id); a row without one
+            # collapses its whole collection to a single hit — measured: a 5-row
+            # result from dama_gotchi_code had 1 distinct id, all None.
+            "id": str(p.id),
             **payload,
             "origin": collection_name,
         })
