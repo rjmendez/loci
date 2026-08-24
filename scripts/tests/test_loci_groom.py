@@ -491,8 +491,8 @@ class TestCodelink(unittest.TestCase):
 
     SYMBOLS = [
         ("_qdrant_upsert", "sym1", "mcp/qdrant_ops.py"),
-        ("handle", "sym2", "a2a_server/server.py"),
-        ("handle", "sym3", "mcp/memcheck/daemon.py"),
+        ("parse_frame", "sym2", "a2a_server/server.py"),
+        ("parse_frame", "sym3", "mcp/memcheck/daemon.py"),
         ("EskfFusion", "sym4", "android/EskfFusion.java"),
     ]
 
@@ -520,24 +520,24 @@ class TestCodelink(unittest.TestCase):
         self.assertIsNone(rows[0]["model"], "no model needed for an unambiguous token")
 
     def test_an_ambiguous_token_is_not_guessed_at_without_a_model(self):
-        report, rows = self._run("the handle path is wrong")
+        report, rows = self._run("the parse_frame path is wrong")
         self.assertEqual(report["ambiguous_tokens"], 1)
         self.assertEqual(report["proposed"], 0)
 
     def test_the_model_resolves_an_ambiguous_token(self):
         gen = lambda prompts: [{"text": "2", "ok": True} for _ in prompts]  # noqa: E731
-        report, rows = self._run("the handle path is wrong", gen=gen)
+        report, rows = self._run("the parse_frame path is wrong", gen=gen)
         self.assertEqual(report["proposed"], 1)
         self.assertEqual(rows[0]["value"][0]["symbol_id"], "sym3")
 
     def test_a_model_answer_of_zero_declines_rather_than_linking(self):
         gen = lambda prompts: [{"text": "0", "ok": True} for _ in prompts]  # noqa: E731
-        report, _ = self._run("the handle path is wrong", gen=gen)
+        report, _ = self._run("the parse_frame path is wrong", gen=gen)
         self.assertEqual(report["proposed"], 0)
 
     def test_an_out_of_range_choice_is_refused(self):
         gen = lambda prompts: [{"text": "99", "ok": True} for _ in prompts]  # noqa: E731
-        report, _ = self._run("the handle path is wrong", gen=gen)
+        report, _ = self._run("the parse_frame path is wrong", gen=gen)
         self.assertEqual(report["proposed"], 0)
 
     def test_prose_words_do_not_become_symbols(self):
@@ -574,3 +574,23 @@ class TestCodelink(unittest.TestCase):
             report = groom.pass_codelink(memory_dir=tmp, groom_dir=tmp / "_groom",
                                          symbols_fn=boom, linked_fn=lambda: [])
         self.assertEqual(report["status"], "degraded")
+
+
+class TestDistinctiveness(unittest.TestCase):
+    """A bare lowercase word that happens to name a symbol is not evidence that
+    the author meant the code. The first live calibration linked `device`, `roll`
+    and `train` to real symbols on exactly that mistake."""
+
+    def test_bare_words_are_rejected(self):
+        for tok in ("device", "position", "confirmed", "roll", "train", "report",
+                    "baseline", "remaining", "consumer", "trigger", "refusal"):
+            self.assertFalse(groom._is_distinctive(tok), tok)
+
+    def test_structured_identifiers_are_accepted(self):
+        for tok in ("_qdrant_upsert", "disarmBeam", "SensorCollectionService",
+                    "schroederRt60Ms", "estimateRt60ApproxMs", "parse_frame"):
+            self.assertTrue(groom._is_distinctive(tok), tok)
+
+    def test_a_long_lowercase_identifier_still_counts(self):
+        self.assertTrue(groom._is_distinctive("triangulationsolver"))
+        self.assertFalse(groom._is_distinctive("triangulate"))

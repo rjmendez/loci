@@ -649,6 +649,24 @@ _IDENT_STOP = frozenset({
 })
 
 
+def _is_distinctive(tok: str) -> bool:
+    """Does this token name a symbol, or is it just a word that happens to be one?
+
+    Measured, not guessed: the first live calibration linked `device`, `roll`,
+    `train`, `report`, `baseline` and `confirmed` to real symbols, because each is
+    genuinely a symbol name *somewhere* in an 11k-symbol graph across three
+    languages. A bare lowercase word carries no evidence that the author meant the
+    code. Structure does — an underscore, an internal case change, or real length.
+    This is the same judgement `code_memory_relink` encodes as "distinctive", and
+    it is why its coverage is conservative rather than broken.
+    """
+    if "_" in tok:
+        return True
+    if any(c.isupper() for c in tok[1:]) and any(c.islower() for c in tok):
+        return True
+    return len(tok) >= 12
+
+
 def _candidate_symbols(text: str, index: dict) -> tuple:
     """(unique_hits, ambiguous_hits) for the identifier-shaped tokens in `text`.
 
@@ -659,7 +677,7 @@ def _candidate_symbols(text: str, index: dict) -> tuple:
     unique, ambiguous = {}, {}
     for raw in set(_IDENT_RE.findall(text or "")):
         tok = raw.split(".")[-1]
-        if len(tok) < 4 or tok.lower() in _IDENT_STOP:
+        if len(tok) < 4 or tok.lower() in _IDENT_STOP or not _is_distinctive(tok):
             continue
         hits = index.get(tok) or []
         if len(hits) == 1:
