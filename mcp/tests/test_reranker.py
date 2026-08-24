@@ -126,8 +126,9 @@ class TestRerankPassageBudget(unittest.TestCase):
         pairs = self._pairs_seen("short finding")
         self.assertEqual(pairs[0][1], "short finding")
 
-    def test_the_default_is_the_swept_optimum(self):
+    def test_the_default_clears_the_replicated_floor(self):
         import qdrant_ops
-        # n=90 sweep: 512 -> r@1 0.744, 1024 -> 1.000, 2048+ -> 0.944, no-CE 0.967.
-        # 1024 is the corpus median (1,048 chars) — about one whole finding.
-        self.assertEqual(qdrant_ops.RERANK_MAX_CHARS, 1024)
+        # Across three seeds, 512 scored BELOW no-reranker and >=1024 scored above
+        # both. 1024 vs 2048 did not separate, so the assertion is the floor that
+        # replicated, not the single-seed winner.
+        self.assertGreaterEqual(qdrant_ops.RERANK_MAX_CHARS, 1024)

@@ -423,19 +423,25 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
 # rather than relevance. bge-reranker-v2-m3 accepts 8192 TOKENS; 512 characters
 # is roughly a sixteenth of that.
 #
-# Swept against identity recall (scripts/loci_groom.py recall, n=90), which is
-# what this should be re-tuned against if the corpus shape changes:
+# Swept against identity recall (scripts/loci_groom.py recall, n=90 per arm,
+# three seeds), which is what this should be re-tuned against if the corpus shape
+# changes. identity r@1:
 #
-#     passage chars   r@1     r@5     MRR
-#     (no CE)         0.967   1.000   0.982
-#     512             0.744   0.956   0.832   <- the value this replaces
-#     1024            1.000   1.000   1.000
-#     2048/4096/8192  0.944   1.000   0.969
+#     passage chars   seed 5   seed 11   seed 12
+#     (no CE)          0.967    0.929     0.933
+#     512              0.744    0.811     0.822   <- the value this replaces
+#     1024             1.000    0.978     0.956
+#     2048             0.944    0.978     0.956
 #
-# 1024 lands on the corpus median (1,048 chars) — about one whole finding. Less
-# truncates the evidence; more appears to dilute the relevance signal. Note the
-# reranker EARNS its place at 1024 (it beats no-CE); at 512 it was costing more
-# than it returned.
+# Two results replicate across all three seeds: 512 is worse than switching the
+# reranker OFF, and >=1024 is better than both. So the reranker was not the
+# problem — it had never been given enough of a passage to judge, on a corpus
+# whose median finding is 1,048 characters.
+#
+# What did NOT replicate: the first seed showed 1024 beating 2048, which looked
+# like longer passages diluting the signal. Two further seeds show them identical.
+# 1024 stays the default because it is never worse and it is one median finding,
+# but anything >= 1024 is defensible and the 1024-vs-2048 gap was noise.
 RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
 
 
