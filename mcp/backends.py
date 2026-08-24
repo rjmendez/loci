@@ -132,6 +132,17 @@ def qdrant() -> tuple[str, str]:
             os.environ.get("QDRANT_API_KEY") or _cfg("qdrant", "api_key", "") or "")
 
 
+def openrouter() -> tuple[str, str]:
+    """(base_url, api_key) for the OpenRouter tier: env -> config -> ('', '').
+
+    The key belongs in ~/.loci/backends.toml, which is outside any git tree —
+    never in the repo. See docs/companion-service.md.
+    """
+    return (os.environ.get("OPENROUTER_BASE_URL")
+            or _cfg("openrouter", "url", "") or "https://openrouter.ai/api/v1",
+            os.environ.get("OPENROUTER_API_KEY") or _cfg("openrouter", "key", "") or "")
+
+
 def memory_dir() -> str:
     """Curated MEMORY.md dir for the grounding memory lane: env -> config -> HERMES_MEMORY_DIR -> ''.
     No machine/user-specific default (the old ~/.claude/.../-home-<user>/memory default is gone)."""

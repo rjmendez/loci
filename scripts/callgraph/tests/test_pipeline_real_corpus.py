@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 116
+    assert head_build.meta.file_count == 117
     assert head_build.meta.error_count == 0
     # The 2s figure in ingest.py's own docstring is about ast.parse'ing the
     # corpus (steps 1-3's budget). Steps 4-6 (CALLSITE/CALLS resolution over

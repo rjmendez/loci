@@ -285,7 +285,7 @@ def build_vocabulary(findings: Iterable[dict], min_uses: int = 5, top_n: int = 6
 
 def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
               memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
-              **_) -> dict:
+              calibrate: bool = False, seed: int = 0, **_) -> dict:
     """Propose vocabulary tags for findings that carry none.
 
     Proposals only — an author's tags are evidence about what they meant, and a 3B
@@ -301,7 +301,15 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
         report.update(status="degraded", detail="no vocabulary could be derived")
         return report
 
-    candidates = [f for f in findings if not (f.get("tags") or []) and f.get("text")]
+    if calibrate:
+        # Hold out findings that DO have vocabulary tags, hide them, and score the
+        # model's pick against what the author actually wrote. Same protocol as
+        # knn_tags --calibrate, so every method lands on one comparable scale.
+        candidates = [f for f in findings
+                      if f.get("text") and set(_tags_of(f)) & set(vocab)]
+        random.Random(seed).shuffle(candidates)
+    else:
+        candidates = [f for f in findings if not (f.get("tags") or []) and f.get("text")]
     report["candidates"] = len(candidates)
     if limit:
         candidates = candidates[:limit]
@@ -323,6 +331,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
     # A zero here has several causes and they are not interchangeable, so each is
     # counted rather than folded into one silent 0.
     rej = collections.Counter()
+    scored: list = []
 
     for i in range(0, len(candidates), GROOM_BATCH):
         chunk = candidates[i:i + GROOM_BATCH]
@@ -352,15 +361,25 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
             if not kept:
                 rej["out_of_vocabulary"] += 1
                 continue
+            if calibrate:
+                truth = set(_tags_of(finding)) & vocab_set
+                scored.append(len(set(kept) & truth) / max(len(kept), 1))
+                continue
             proposals.append(_proposal(
                 "tags", str(finding["id"]), "tags", kept,
                 model=GROOM_MODEL,
                 investigation_id=finding.get("investigation_id"),
             ))
 
+    report["rejected"] = dict(rej)
+    if calibrate:
+        report["checked"] = len(scored)
+        report["mean_precision"] = round(sum(scored) / max(len(scored), 1), 4)
+        report["any_correct_rate"] = round(
+            sum(1 for x in scored if x > 0) / max(len(scored), 1), 4)
+        return report
     report["generated"] = len(proposals)
     report["proposed"] = write_proposals(proposals, groom_dir)
-    report["rejected"] = dict(rej)
     return report
 
 
