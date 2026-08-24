@@ -6211,8 +6211,22 @@ def rag_context_search(
     _rag_record_access(all_results, query)
 
     ctx = context_assemble(all_results, query, budget_chars=budget_chars)
-    ctx["mode"] = "rag_hybrid"
+    # Report retrieval honestly. This used to claim mode="rag_hybrid" no matter
+    # what, so a search where EVERY collection raised was indistinguishable from
+    # a genuine zero-hit search: a misconfigured embedder or a dimension mismatch
+    # read back to the caller as "nothing is known about this topic".
+    # Count distinct collections, not error entries — one broken collection
+    # raises once per expanded query.
+    _failed_cols = {e.split(":", 1)[0] for e in errors}
+    _failed = len(_failed_cols)
+    if _failed and _failed >= len(_collections):
+        ctx["mode"] = "rag_failed"
+    elif _failed:
+        ctx["mode"] = "rag_degraded"
+    else:
+        ctx["mode"] = "rag_hybrid"
     ctx["collections_searched"] = _collections
+    ctx["collections_failed"] = sorted(_failed_cols)
     ctx["qdrant_available"] = True
     if expansion_info is not None:
         ctx["query_expansion"] = expansion_info
