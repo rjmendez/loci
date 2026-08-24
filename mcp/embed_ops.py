@@ -61,7 +61,11 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     """
     texts = [t if isinstance(t, str) else str(t) for t in texts]
     base, model = _resolve()
-    if not texts or not base:
+    if not texts:
+        return []
+    if not base:
+        logger.warning("embed_texts: no embedding endpoint configured "
+                       "(set OLLAMA_BASE_URL or EMBED_API_KEY) — returning no vectors")
         return []
     import requests
     transient = (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
@@ -71,12 +75,19 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
                               json={"model": model, "input": texts}, timeout=timeout)
             r.raise_for_status()
             embs = r.json().get("embeddings") or []
-            return embs if len(embs) == len(texts) else []
-        except transient:
+            if len(embs) == len(texts):
+                return embs
+            logger.warning("embed_texts: %s returned %d vector(s) for %d input(s) — "
+                           "returning no vectors", model, len(embs), len(texts))
+            return []
+        except transient as exc:
             if attempt == 0:
                 continue          # likely cold-load — retry once while the model warms
+            logger.warning("embed_texts: %s unreachable after retry: %r — "
+                           "returning no vectors", base, exc)
             return []             # persistent transient failure -> fail-open
-        except Exception:
+        except Exception as exc:
+            logger.warning("embed_texts: %s failed: %r — returning no vectors", base, exc)
             return []             # non-retryable (HTTP error, bad JSON) -> fail-open
     return []
 

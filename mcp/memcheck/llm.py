@@ -214,10 +214,15 @@ def embed_texts(texts: list[str], *, timeout: float = 60.0, batch: int = 16) -> 
         chunk = [t[:2000] for t in texts[i : i + batch]]
         data = _post_json(url, {"model": _embed_model(), "input": chunk}, {}, timeout)
         if not data or "data" not in data:
-            return []  # fail-open: partial embeds are useless for pairwise cosine
+            # fail-open: partial embeds are useless for pairwise cosine
+            _log.warning("embed_texts: %s returned no data for batch %d — "
+                         "returning no vectors", url, i // batch)
+            return []
         try:
             out.extend(d["embedding"] for d in data["data"])
-        except (KeyError, TypeError):
+        except (KeyError, TypeError) as exc:
+            _log.warning("embed_texts: malformed embedding payload from %s: %r — "
+                         "returning no vectors", url, exc)
             return []
     return out
 
