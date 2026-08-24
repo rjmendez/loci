@@ -808,9 +808,22 @@ def test_mmr_select_empty_content_similarity_is_zero(hook):
     assert [x["_ms_score"] for x in out] == [0.9, 0.8]
 
 
-def test_mmr_select_requires_ms_score(hook):
+def test_mmr_select_requires_ms_score(hook, monkeypatch):
+    # _mmr_select fills its final slot from random.random() < PHERO_EPSILON, and
+    # that branch never reads ms_score — so unseeded this asserts nothing 5% of the
+    # time (measured: 4 failures in 80 runs against PHERO_EPSILON=0.05). Pin the
+    # draw above epsilon so the MMR path, which is the path under test, is taken.
+    monkeypatch.setattr(hook, "PHERO_EPSILON", 0.0)
     with pytest.raises(KeyError):
         hook._mmr_select([{"content": "a"}, {"content": "b"}], 1)
+
+
+def test_mmr_select_epsilon_branch_does_not_need_ms_score(hook, monkeypatch):
+    """The other side of the same coin: with epsilon at 1.0 the random slot is
+    always taken, and that path legitimately never touches ms_score."""
+    monkeypatch.setattr(hook, "PHERO_EPSILON", 1.0)
+    out = hook._mmr_select([{"content": "a"}, {"content": "b"}], 1)
+    assert len(out) == 1
 
 
 # ---------------------------------------------------------------------------
