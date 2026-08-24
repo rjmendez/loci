@@ -28,6 +28,7 @@ import collections
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -513,10 +514,293 @@ def _append_recall(report: dict, groom_dir: Optional[Path] = None) -> None:
         pass
 
 
+# --- pass: knn_tags ---------------------------------------------------------
+
+def _tags_of(row: dict) -> list:
+    """Payload tags, normalised. Some write paths store a comma-joined string."""
+    raw = row.get("tags")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return []
+    return [t for t in (str(x).strip().lower() for x in raw) if t and not t.startswith("dt_")]
+
+
+def _knn_vote(neighbours: list, self_id: str, vocab: set, min_weight: float) -> list:
+    """Similarity-weighted tag vote over retrieved neighbours.
+
+    Weighting by score rather than counting means one very close neighbour can
+    carry a tag that five loose ones cannot — which is the whole reason to use
+    the embedding rather than a bag of words.
+    """
+    weights: dict = {}
+    for row in neighbours:
+        if str(row.get("id") or "") == self_id:
+            continue
+        score = float(row.get("score") or 0.0)
+        if score <= 0:
+            continue
+        for tag in _tags_of(row):
+            if vocab and tag not in vocab:
+                continue
+            weights[tag] = weights.get(tag, 0.0) + score
+    ranked = sorted(weights.items(), key=lambda kv: -kv[1])
+    return [(t, round(w, 4)) for t, w in ranked if w >= min_weight]
+
+
+def pass_knn_tags(limit: Optional[int] = None, k: int = 8, min_weight: float = 1.0,
+                  max_tags: int = 3, calibrate: bool = False, seed: int = 0,
+                  memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
+                  search_fn: Optional[Callable] = None, **_) -> dict:
+    """Transfer tags from a finding's nearest already-tagged neighbours.
+
+    No generation involved. The embeddings are already in the index, the author's
+    own tags are the labels, and the whole thing is deterministic — so unlike a
+    model's guess it can be scored against held-out truth before anyone promotes
+    it. ``calibrate=True`` does exactly that: it hides the tags of findings that
+    have them, re-derives them from neighbours, and reports how often it agrees.
+    """
+    report = {"pass": "knn_tags", "k": k, "min_weight": min_weight,
+              "calibrate": calibrate, "status": "ok"}
+
+    findings = list(iter_findings(memory_dir))
+    vocab = set(build_vocabulary(findings))
+    report["vocabulary"] = len(vocab)
+    if not vocab:
+        report.update(status="degraded", detail="no vocabulary could be derived")
+        return report
+
+    if search_fn is None:
+        try:
+            import qdrant_ops
+            if qdrant_ops._get_qdrant()[0] is None:
+                report.update(status="degraded", detail="qdrant unreachable")
+                return report
+            search_fn = lambda q: qdrant_ops._qdrant_similarity_search(  # noqa: E731
+                q, limit=k + 1, rerank=False)
+        except Exception as exc:
+            report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+            return report
+
+    if calibrate:
+        subjects = [f for f in findings
+                    if f.get("text") and set(_tags_of(f)) & vocab]
+        rnd = random.Random(seed)
+        rnd.shuffle(subjects)
+    else:
+        subjects = [f for f in findings if f.get("text") and not _tags_of(f)]
+    report["candidates"] = len(subjects)
+    if limit:
+        subjects = subjects[:limit]
+
+    proposals, agree, checked = [], [], 0
+    for f in subjects:
+        try:
+            res = search_fn(str(f["text"])[:1000])
+        except Exception:
+            continue
+        if not (res or {}).get("ok"):
+            continue
+        voted = _knn_vote(res.get("results") or [], str(f.get("id") or ""), vocab, min_weight)
+        picked = [t for t, _w in voted[:max_tags]]
+
+        if calibrate:
+            truth = set(_tags_of(f)) & vocab
+            if not truth:
+                continue
+            checked += 1
+            agree.append(len(set(picked) & truth) / max(len(picked), 1) if picked else 0.0)
+            continue
+
+        if picked:
+            proposals.append(_proposal(
+                "knn_tags", str(f["id"]), "tags", picked,
+                model=None, score=voted[0][1],
+                method=f"knn/{k}", investigation_id=f.get("investigation_id"),
+            ))
+
+    if calibrate:
+        report["checked"] = checked
+        report["mean_precision"] = round(sum(agree) / max(checked, 1), 4)
+        report["exact_or_partial_hit_rate"] = round(
+            sum(1 for a in agree if a > 0) / max(checked, 1), 4)
+        return report
+
+    report["generated"] = len(proposals)
+    report["proposed"] = write_proposals(proposals, groom_dir)
+    return report
+
+
+# --- pass: codelink ---------------------------------------------------------
+
+# Identifier-shaped tokens: snake_case, CamelCase, dotted paths, File.ext.
+_IDENT_RE = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]{3,}\b")
+
+# Words that look like identifiers to a regex and like noise to a reader.
+_IDENT_STOP = frozenset({
+    "which", "there", "these", "those", "where", "while", "would", "could",
+    "should", "because", "before", "after", "every", "never", "always", "still",
+    "value", "values", "return", "returns", "error", "errors", "false", "true",
+    "none", "null", "class", "function", "method", "module", "import", "input",
+    "output", "result", "results", "state", "check", "checks", "count", "counts",
+    "under", "above", "below", "about", "against", "without", "within", "into",
+    "test", "tests", "code", "path", "paths", "file", "files", "line", "lines",
+    "data", "type", "types", "name", "names", "call", "calls", "read", "write",
+})
+
+
+def _candidate_symbols(text: str, index: dict) -> tuple:
+    """(unique_hits, ambiguous_hits) for the identifier-shaped tokens in `text`.
+
+    A token that names exactly one symbol in the graph is evidence. A token that
+    names five is a question, and questions go to the model rather than being
+    guessed at — that asymmetry is the whole design.
+    """
+    unique, ambiguous = {}, {}
+    for raw in set(_IDENT_RE.findall(text or "")):
+        tok = raw.split(".")[-1]
+        if len(tok) < 4 or tok.lower() in _IDENT_STOP:
+            continue
+        hits = index.get(tok) or []
+        if len(hits) == 1:
+            unique[tok] = hits[0]
+        elif 1 < len(hits) <= 8:
+            ambiguous[tok] = hits
+    return unique, ambiguous
+
+
+_DISAMBIGUATE_PROMPT = (
+    "A finding mentions the symbol `{token}`. Several symbols share that name.\n\n"
+    "FINDING:\n{text}\n\nCANDIDATES:\n{options}\n\n"
+    "Which candidate does the finding mean? Answer with the number alone, or 0 if "
+    "the finding is not about any of them."
+)
+
+
+def pass_codelink(limit: Optional[int] = None, calibrate: bool = False,
+                  gen_fn: Optional[Callable] = None, symbols_fn: Optional[Callable] = None,
+                  linked_fn: Optional[Callable] = None, memory_dir: Optional[Path] = None,
+                  groom_dir: Optional[Path] = None, **_) -> dict:
+    """Propose Finding -> CodeSymbol links the strict lexical linker will not make.
+
+    ``code_memory_relink`` is precision-first by design and reaches 180 of 2,634
+    findings. This adds the two things it refuses to do: it treats a token that
+    resolves to exactly one symbol as evidence even when that token is not
+    'distinctive' by its rules, and it hands genuinely ambiguous tokens to the
+    local model with the candidate file paths attached. Proposals only — a wrong
+    code link is worse than no code link, because it survives as provenance.
+    """
+    report = {"pass": "codelink", "calibrate": calibrate, "status": "ok"}
+
+    if symbols_fn is None or linked_fn is None:
+        try:
+            from graph.ladybug_store import LadybugStore
+            ks = LadybugStore(str((memory_dir or MEMORY_DIR) / "graph.ladybug"))
+            if not ks.readable_probe():
+                report.update(status="degraded", detail="graph store unreadable")
+                return report
+            symbols_fn = symbols_fn or (lambda: ks._rows(
+                "MATCH (s:CodeSymbol) RETURN s.name, s.id, s.file"))
+            linked_fn = linked_fn or (lambda: ks._rows(
+                "MATCH (f:Finding)-[:REFERENCES]->(s:CodeSymbol) RETURN f.id, s.id"))
+        except Exception as exc:
+            report.update(status="degraded", detail=f"graph unavailable: {exc!r}")
+            return report
+
+    index: dict = {}
+    where: dict = {}
+    try:
+        for name, sid, sfile in symbols_fn():
+            index.setdefault(str(name), []).append(str(sid))
+            where[str(sid)] = str(sfile or "")
+    except Exception as exc:
+        report.update(status="degraded", detail=f"symbol read failed: {exc!r}")
+        return report
+    report["symbols"] = len(where)
+
+    already: dict = {}
+    try:
+        for fid, sid in linked_fn():
+            already.setdefault(str(fid), set()).add(str(sid))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"link read failed: {exc!r}")
+        return report
+    report["already_linked"] = len(already)
+
+    findings = [f for f in iter_findings(memory_dir) if f.get("text") and f.get("id")]
+    if calibrate:
+        subjects = [f for f in findings if str(f["id"]) in already]
+    else:
+        subjects = [f for f in findings if str(f["id"]) not in already]
+    report["candidates"] = len(subjects)
+    if limit:
+        subjects = subjects[:limit]
+
+    proposals, hits, checked, ambiguous_total = [], [], 0, 0
+    for f in subjects:
+        unique, ambiguous = _candidate_symbols(str(f["text"]), index)
+        ambiguous_total += len(ambiguous)
+        picked = dict(unique)
+
+        if ambiguous and gen_fn is not None:
+            toks = list(ambiguous)[:4]
+            prompts = []
+            for tok in toks:
+                opts = "\n".join(
+                    f"{i}. {where.get(sid, '?')}" for i, sid in enumerate(ambiguous[tok], 1))
+                prompts.append(_DISAMBIGUATE_PROMPT.format(
+                    token=tok, text=str(f["text"])[:600], options=opts))
+            try:
+                answers = gen_fn(prompts)
+            except Exception:
+                answers = []
+            for tok, ans in zip(toks, answers or []):
+                if not (ans or {}).get("ok"):
+                    continue
+                digits = "".join(ch for ch in (ans.get("text") or "") if ch.isdigit())
+                if not digits:
+                    continue
+                choice = int(digits[:2])
+                if 1 <= choice <= len(ambiguous[tok]):
+                    picked[tok] = ambiguous[tok][choice - 1]
+
+        if calibrate:
+            truth = already.get(str(f["id"]), set())
+            if not truth:
+                continue
+            checked += 1
+            got = set(picked.values())
+            hits.append(len(got & truth) / max(len(got), 1) if got else 0.0)
+            continue
+
+        if picked:
+            proposals.append(_proposal(
+                "codelink", str(f["id"]), "code_refs",
+                [{"token": t, "symbol_id": sid, "file": where.get(sid, "")}
+                 for t, sid in picked.items()],
+                model=GROOM_MODEL if ambiguous and gen_fn else None,
+                investigation_id=f.get("investigation_id"),
+            ))
+
+    report["ambiguous_tokens"] = ambiguous_total
+    if calibrate:
+        report["checked"] = checked
+        report["mean_precision"] = round(sum(hits) / max(checked, 1), 4)
+        report["any_correct_rate"] = round(
+            sum(1 for h in hits if h > 0) / max(checked, 1), 4)
+        return report
+
+    report["generated"] = len(proposals)
+    report["proposed"] = write_proposals(proposals, groom_dir)
+    return report
+
+
 PASSES = {
     "index": {"fn": pass_index, "applyable": True},
     "tags": {"fn": pass_tags, "applyable": False},
     "recall": {"fn": pass_recall, "applyable": False},
+    "knn_tags": {"fn": pass_knn_tags, "applyable": False},
+    "codelink": {"fn": pass_codelink, "applyable": False},
 }
 
 

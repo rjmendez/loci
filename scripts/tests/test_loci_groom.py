@@ -377,3 +377,200 @@ class TestRecallPass(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
             r = groom.pass_recall()
         self.assertEqual(r["status"], "degraded")
+
+
+class TestKnnTags(unittest.TestCase):
+    """Label transfer over the embeddings. Deterministic, so unlike the generated
+    variant it can be scored against the author's own tags before promotion."""
+
+    def _corpus_and_search(self, tmp, neighbours):
+        rows = [_f(f"t{i}", tags=["mqtt", "acoustic"]) for i in range(6)]
+        rows += [_f("u0", text="the broker dropped the subscription", tags=[])]
+        _corpus(tmp, {"inv": rows})
+
+        def search(_query):
+            return {"ok": True, "results": neighbours}
+        return search
+
+    def test_a_close_neighbour_outweighs_several_loose_ones(self):
+        votes = groom._knn_vote(
+            [{"id": "n1", "score": 0.95, "tags": ["mqtt"]},
+             {"id": "n2", "score": 0.2, "tags": ["acoustic"]},
+             {"id": "n3", "score": 0.2, "tags": ["acoustic"]},
+             {"id": "n4", "score": 0.2, "tags": ["acoustic"]}],
+            self_id="self", vocab={"mqtt", "acoustic"}, min_weight=0.5)
+        self.assertEqual(votes[0][0], "mqtt")
+
+    def test_the_subject_never_votes_for_itself(self):
+        votes = groom._knn_vote(
+            [{"id": "self", "score": 1.0, "tags": ["mqtt"]}],
+            self_id="self", vocab={"mqtt"}, min_weight=0.1)
+        self.assertEqual(votes, [])
+
+    def test_tags_outside_the_vocabulary_do_not_vote(self):
+        votes = groom._knn_vote(
+            [{"id": "n1", "score": 0.9, "tags": ["not-in-vocab"]}],
+            self_id="s", vocab={"mqtt"}, min_weight=0.1)
+        self.assertEqual(votes, [])
+
+    def test_comma_joined_payload_tags_are_understood(self):
+        # one write path stores tags as ",".join(tags)
+        self.assertEqual(groom._tags_of({"tags": "mqtt,acoustic"}), ["mqtt", "acoustic"])
+        self.assertEqual(groom._tags_of({"tags": ["MQTT", "dt_run:x"]}), ["mqtt"])
+
+    def test_it_proposes_for_untagged_findings_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            search = self._corpus_and_search(
+                tmp, [{"id": "t1", "score": 0.9, "tags": ["mqtt"]},
+                      {"id": "t2", "score": 0.8, "tags": ["mqtt"]}])
+            gd = tmp / "_groom"
+            report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=gd,
+                                         search_fn=search, min_weight=1.0)
+            rows = [json.loads(l) for l in open(gd / "proposals.jsonl") if l.strip()]
+        self.assertEqual(report["candidates"], 1)
+        self.assertEqual(report["proposed"], 1)
+        self.assertEqual(rows[0]["subject_id"], "u0")
+        self.assertEqual(rows[0]["value"], ["mqtt"])
+        self.assertIsNone(rows[0]["model"], "no model was involved")
+
+    def test_weak_agreement_proposes_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            search = self._corpus_and_search(
+                tmp, [{"id": "t1", "score": 0.1, "tags": ["mqtt"]}])
+            report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=tmp / "_groom",
+                                         search_fn=search, min_weight=1.0)
+        self.assertEqual(report["proposed"], 0)
+
+    def test_calibrate_scores_against_the_authors_own_tags(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            self._corpus_and_search(tmp, [])
+            # every neighbour says "mqtt"; the held-out findings really are mqtt+acoustic
+            search = lambda _q: {"ok": True, "results": [  # noqa: E731
+                {"id": "other", "score": 0.9, "tags": ["mqtt"]}]}
+            report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=tmp / "_groom",
+                                         search_fn=search, calibrate=True, min_weight=0.5)
+        self.assertEqual(report["checked"], 6)
+        self.assertEqual(report["mean_precision"], 1.0)
+        self.assertEqual(report["exact_or_partial_hit_rate"], 1.0)
+
+    def test_calibrate_reports_a_miss_as_zero_precision(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            self._corpus_and_search(tmp, [])
+            search = lambda _q: {"ok": True, "results": [  # noqa: E731
+                {"id": "other", "score": 0.9, "tags": ["build"]}]}
+            rows = [_f(f"b{i}", tags=["build"]) for i in range(6)]
+            _corpus(tmp, {"inv2": rows})
+            report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=tmp / "_groom",
+                                         search_fn=search, calibrate=True, min_weight=0.5)
+        self.assertGreater(report["checked"], 0)
+
+    def test_calibrate_writes_no_proposals(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            self._corpus_and_search(tmp, [])
+            search = lambda _q: {"ok": True, "results": [  # noqa: E731
+                {"id": "other", "score": 0.9, "tags": ["mqtt"]}]}
+            gd = tmp / "_groom"
+            groom.pass_knn_tags(memory_dir=tmp, groom_dir=gd, search_fn=search,
+                                calibrate=True, min_weight=0.5)
+            self.assertFalse((gd / "proposals.jsonl").exists())
+
+
+class TestCodelink(unittest.TestCase):
+    """Finding -> CodeSymbol proposals. A wrong code link is worse than none —
+    it survives as provenance — so the unique/ambiguous split is the contract."""
+
+    SYMBOLS = [
+        ("_qdrant_upsert", "sym1", "mcp/qdrant_ops.py"),
+        ("handle", "sym2", "a2a_server/server.py"),
+        ("handle", "sym3", "mcp/memcheck/daemon.py"),
+        ("EskfFusion", "sym4", "android/EskfFusion.java"),
+    ]
+
+    def _run(self, text, *, gen=None, calibrate=False, linked=None):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv": [_f("f1", text=text)]})
+            gd = tmp / "_groom"
+            report = groom.pass_codelink(
+                memory_dir=tmp, groom_dir=gd, gen_fn=gen, calibrate=calibrate,
+                symbols_fn=lambda: list(self.SYMBOLS),
+                linked_fn=lambda: list(linked or []),
+            )
+            rows = []
+            if (gd / "proposals.jsonl").exists():
+                rows = [json.loads(l) for l in open(gd / "proposals.jsonl") if l.strip()]
+            return report, rows
+
+    def test_a_token_naming_exactly_one_symbol_is_evidence(self):
+        report, rows = self._run("the _qdrant_upsert path swallows the failure")
+        self.assertEqual(report["proposed"], 1)
+        self.assertEqual(rows[0]["value"][0]["symbol_id"], "sym1")
+        self.assertEqual(rows[0]["value"][0]["file"], "mcp/qdrant_ops.py")
+        self.assertIsNone(rows[0]["model"], "no model needed for an unambiguous token")
+
+    def test_an_ambiguous_token_is_not_guessed_at_without_a_model(self):
+        report, rows = self._run("the handle path is wrong")
+        self.assertEqual(report["ambiguous_tokens"], 1)
+        self.assertEqual(report["proposed"], 0)
+
+    def test_the_model_resolves_an_ambiguous_token(self):
+        gen = lambda prompts: [{"text": "2", "ok": True} for _ in prompts]  # noqa: E731
+        report, rows = self._run("the handle path is wrong", gen=gen)
+        self.assertEqual(report["proposed"], 1)
+        self.assertEqual(rows[0]["value"][0]["symbol_id"], "sym3")
+
+    def test_a_model_answer_of_zero_declines_rather_than_linking(self):
+        gen = lambda prompts: [{"text": "0", "ok": True} for _ in prompts]  # noqa: E731
+        report, _ = self._run("the handle path is wrong", gen=gen)
+        self.assertEqual(report["proposed"], 0)
+
+    def test_an_out_of_range_choice_is_refused(self):
+        gen = lambda prompts: [{"text": "99", "ok": True} for _ in prompts]  # noqa: E731
+        report, _ = self._run("the handle path is wrong", gen=gen)
+        self.assertEqual(report["proposed"], 0)
+
+    def test_prose_words_do_not_become_symbols(self):
+        report, _ = self._run("there should always be a result under these values")
+        self.assertEqual(report["proposed"], 0)
+        self.assertEqual(report["ambiguous_tokens"], 0)
+
+    def test_already_linked_findings_are_skipped(self):
+        report, _ = self._run("the _qdrant_upsert path", linked=[("f1", "sym1")])
+        self.assertEqual(report["candidates"], 0)
+        self.assertEqual(report["proposed"], 0)
+
+    def test_calibrate_scores_against_the_existing_edges(self):
+        report, rows = self._run("the _qdrant_upsert path", calibrate=True,
+                                 linked=[("f1", "sym1")])
+        self.assertEqual(report["checked"], 1)
+        self.assertEqual(report["mean_precision"], 1.0)
+        self.assertEqual(report["any_correct_rate"], 1.0)
+        self.assertEqual(rows, [], "calibration writes no proposals")
+
+    def test_calibrate_counts_a_wrong_link_as_zero(self):
+        report, _ = self._run("the EskfFusion update", calibrate=True,
+                              linked=[("f1", "sym1")])
+        self.assertEqual(report["checked"], 1)
+        self.assertEqual(report["mean_precision"], 0.0)
+
+    def test_an_unreadable_graph_degrades(self):
+        def boom():
+            raise RuntimeError("locked")
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv": [_f("f1", text="x")]})
+            report = groom.pass_codelink(memory_dir=tmp, groom_dir=tmp / "_groom",
+                                         symbols_fn=boom, linked_fn=lambda: [])
+        self.assertEqual(report["status"], "degraded")
