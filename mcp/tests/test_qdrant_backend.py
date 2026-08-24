@@ -22,8 +22,18 @@ import types as _types
 import sys as _sys
 
 def _install_qdrant_stub():
-    """Install a minimal qdrant_client stub so qdrant.py's lazy imports succeed."""
-    if "qdrant_client" in _sys.modules:
+    """Install a minimal qdrant_client stub so qdrant.py's lazy imports succeed.
+
+    Only when the real package is genuinely absent. The guard used to be
+    `if "qdrant_client" in sys.modules` — whether it had been *imported yet*,
+    not whether it was installed — so on a normal run this stub landed first and
+    shadowed the installed client for the rest of the session. Every later test
+    that imported a model this stub does not define (SearchParams,
+    QuantizationSearchParams, ...) then took its except branch instead.
+    """
+    import importlib.util
+
+    if "qdrant_client" in _sys.modules or importlib.util.find_spec("qdrant_client"):
         return
 
     @dataclass
