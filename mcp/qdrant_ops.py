@@ -151,21 +151,59 @@ def _create_payload_indexes(client, col: str) -> None:
             logger.debug("payload index %r creation skipped: %s", field_name, exc)
 
 
-def _purge_old_records(client, col: str, retention_days: int = 30) -> None:
-    """Delete records older than retention_days. Requires created_at_ts payload index."""
-    from qdrant_client.models import Filter, FieldCondition, Range, FilterSelector
-    cutoff = int(time.time()) - (retention_days * 86400)
+def _retention_days() -> int:
+    """Startup purge window, in days. 0 disables the purge entirely.
+
+    Read at call time, not import time, so a test or a caller can set it."""
+    raw = os.environ.get("LOCI_QDRANT_RETENTION_DAYS", "30").strip()
     try:
+        days = int(raw)
+    except ValueError:
+        logger.warning("LOCI_QDRANT_RETENTION_DAYS=%r is not an integer; using 30", raw)
+        return 30
+    return max(0, days)
+
+
+def _purge_old_records(client, col: str, retention_days: Optional[int] = None) -> None:
+    """Delete records older than retention_days. Requires created_at_ts payload index.
+
+    This DESTROYS data: findings carry created_at_ts (server._store_finding), so
+    anything past the window goes on the next process start. Set
+    LOCI_QDRANT_RETENTION_DAYS=0 to keep the store durable.
+    """
+    if retention_days is None:
+        retention_days = _retention_days()
+    if retention_days <= 0:
+        logger.debug("Qdrant TTL purge disabled (LOCI_QDRANT_RETENTION_DAYS=0)")
+        return
+
+    from qdrant_client.models import Filter, FieldCondition, Range, FilterSelector
+
+    cutoff = int(time.time()) - (retention_days * 86400)
+    stale = Filter(must=[FieldCondition(key="created_at_ts", range=Range(lt=cutoff))])
+    try:
+        # Count first: the delete runs with wait=False, so without this the log
+        # line cannot say whether it removed nothing or removed the corpus.
+        try:
+            doomed = int(client.count(collection_name=col, count_filter=stale, exact=True).count)
+        except Exception as exc:
+            logger.debug("Qdrant TTL purge: count failed: %s", exc)
+            doomed = -1
+
+        if doomed == 0:
+            logger.debug("Qdrant TTL purge: nothing older than %d days", retention_days)
+            return
+
         client.delete(
             collection_name=col,
-            points_selector=FilterSelector(
-                filter=Filter(must=[
-                    FieldCondition(key="created_at_ts", range=Range(lt=cutoff))
-                ])
-            ),
+            points_selector=FilterSelector(filter=stale),
             wait=False,
         )
-        logger.info("Qdrant TTL purge: deleted records older than %d days", retention_days)
+        logger.warning(
+            "Qdrant TTL purge: deleting %s point(s) older than %d days from %r "
+            "(set LOCI_QDRANT_RETENTION_DAYS=0 to disable)",
+            doomed if doomed >= 0 else "an unknown number of", retention_days, col,
+        )
     except Exception as exc:
         logger.debug("Qdrant TTL purge failed (non-fatal): %s", exc)
 
@@ -251,8 +289,10 @@ def _get_qdrant():
             # Create payload indexes — idempotent, safe on existing collection
             _create_payload_indexes(client, col)
 
-            # Purge records older than 30 days on startup
-            _purge_old_records(client, col, retention_days=30)
+            # Purge on startup — window from LOCI_QDRANT_RETENTION_DAYS (0 disables).
+            # Passing no literal here: pinning one at the call site is what made the
+            # default unreachable.
+            _purge_old_records(client, col)
 
             _qdrant_client = (client, col)
         except Exception as exc:
