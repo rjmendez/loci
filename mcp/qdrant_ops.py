@@ -414,6 +414,31 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
     return degraded_active, degraded_reason
 
 
+# How much of a passage the cross-encoder is allowed to see, in CHARACTERS.
+#
+# This was a hardcoded 512. The corpus median finding is 1,048 characters and
+# 73.6% of findings are longer than 512, so for three findings in four the
+# reranker was scoring a truncated head against a query drawn from the whole
+# text — and short findings, scored complete, won the comparison on presentation
+# rather than relevance. bge-reranker-v2-m3 accepts 8192 TOKENS; 512 characters
+# is roughly a sixteenth of that.
+#
+# Swept against identity recall (scripts/loci_groom.py recall, n=90), which is
+# what this should be re-tuned against if the corpus shape changes:
+#
+#     passage chars   r@1     r@5     MRR
+#     (no CE)         0.967   1.000   0.982
+#     512             0.744   0.956   0.832   <- the value this replaces
+#     1024            1.000   1.000   1.000
+#     2048/4096/8192  0.944   1.000   0.969
+#
+# 1024 lands on the corpus median (1,048 chars) — about one whole finding. Less
+# truncates the evidence; more appears to dilute the relevance signal. Note the
+# reranker EARNS its place at 1024 (it beats no-CE); at 512 it was costing more
+# than it returned.
+RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
+
+
 def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
     """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
 
@@ -425,7 +450,7 @@ def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bo
     ce = _get_cross_encoder()
     if ce is not None and rows:
         try:
-            pairs = [(query, str(r.get("text", ""))[:512]) for r in rows]
+            pairs = [(query, str(r.get("text", ""))[:RERANK_MAX_CHARS]) for r in rows]
             ce_scores = ce.predict(pairs)
             for row, ce_score in zip(rows, ce_scores):
                 row["ce_score"] = round(float(ce_score), 4)
