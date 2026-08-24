@@ -190,15 +190,12 @@ def test_callers_skill_shows_dispatch_row_as_one_of_thirteen(capsys):
 
 
 def test_explain_dispatch_callsite_lists_all_thirteen_candidates(capsys):
-    code, out = _run(capsys, ["explain", "a2a_server/server.py:1444", "--rev", "HEAD", "--scope", "a2a_server/"])
-    if "no CALLSITE found" in out:
-        # The dispatch callsite's line can drift; fall back to locating it
-        # via the JSON callers output for skill_memory_recall instead of a
-        # hardcoded line number.
-        _, callers_out = _run(capsys, ["callers", "a2a_server/server.py::skill_memory_recall", "--rev", "HEAD", "--format", "json"])
-        rows = json.loads(callers_out)
-        disp = [r for r in rows if r["kind"] == "DISPATCHES"][0]
-        code, out = _run(capsys, ["explain", disp["src"], "--rev", "HEAD"])
+    # Locate the callsite through the graph. A hardcoded line number drifts with
+    # every edit above it, and the miss is reported on stderr, so a fallback
+    # keyed on stdout never fires.
+    _, callers_out = _run(capsys, ["callers", "a2a_server/server.py::skill_memory_recall", "--rev", "HEAD", "--format", "json"])
+    disp = [r for r in json.loads(callers_out) if r["kind"] == "DISPATCHES"][0]
+    code, out = _run(capsys, ["explain", disp["src"], "--rev", "HEAD", "--scope", "a2a_server/"])
     assert code == 0
     assert out.count("DISPATCHES ->") == 13
     assert "1 of 13" in out
