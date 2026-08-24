@@ -1719,6 +1719,50 @@ def _has_negation(text: str) -> bool:
     return any(marker in lower for marker in _NEGATION_MARKERS)
 
 
+_CONFLICT_NEGATION_HEURISTIC = os.environ.get("LOCI_CONFLICT_NEGATION_HEURISTIC", "") == "1"
+
+
+def _query_points_compat(
+    client,
+    collection: str,
+    dense_vec,
+    *,
+    limit: int,
+    query_filter=None,
+    score_threshold: Optional[float] = None,
+    search_params=None,
+) -> list:
+    """Dense vector search over ``collection``, returning the raw point list.
+
+    ``QdrantClient.search()`` was removed in qdrant-client 1.16 — inside this
+    project's own ``>=1.17.0,<1.19.0`` pin — so on every supported client the
+    attribute lookup raised before any request was made. Both callers wrapped
+    that in a bare except, so the removal read as "found nothing" rather than as
+    a fault. ``query_points()`` is the replacement.
+
+    Named-vector collections need ``using="dense"`` and flat ones reject it, so
+    try named first and fall back rather than probing the collection config.
+    """
+    kwargs = {
+        "collection_name": collection,
+        "query": dense_vec,
+        "limit": limit,
+        "with_payload": True,
+    }
+    if query_filter is not None:
+        kwargs["query_filter"] = query_filter
+    if score_threshold is not None:
+        kwargs["score_threshold"] = score_threshold
+    if search_params is not None:
+        kwargs["search_params"] = search_params
+
+    try:
+        return client.query_points(using="dense", **kwargs).points
+    except Exception as exc:
+        logger.debug("_query_points_compat: named-vector query failed (%r); retrying flat", exc)
+        return client.query_points(**kwargs).points
+
+
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
     """
     Search Qdrant for near-neighbors of new_finding (same investigation, cosine
@@ -1751,17 +1795,15 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
         try:
             from qdrant_client.models import SearchParams, QuantizationSearchParams
             _sp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
-            result = client.search(
-                collection_name=col,
-                query_vector=dense_vec,
+            result = _query_points_compat(
+                client, col, dense_vec,
                 query_filter=search_filter,
                 limit=10,
                 score_threshold=0.82,
-                with_payload=True,
                 search_params=_sp,
             )
-        except Exception:
-            # Some collection configurations use named vectors; fall back gracefully.
+        except Exception as exc:
+            logger.warning("_detect_conflicts: neighbour search failed: %r", exc)
             return []
 
         new_id = new_finding.get("id", "")
@@ -1792,8 +1834,14 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             elif neighbor_type == "assumed" and new_type != "assumed":
                 is_conflict = True
 
-            # Heuristic 3: opposing negation markers
-            elif new_neg != neighbor_neg:
+            # Heuristic 3: opposing negation markers. Off by default — this is a
+            # bare token-presence scan, not a polarity comparison, and phrases like
+            # "no adverse records found" or "did not appear" are common enough that
+            # it manufactures conflicts from incidental wording. Measured in the
+            # 2026-08-19 upgrade pack against live hermes_memory: feeding a finding
+            # back verbatim flagged two `observed` neighbours at 0.892 and 0.8679
+            # through this heuristic alone, and an exact duplicate is agreement.
+            elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
                 is_conflict = True
 
             if is_conflict:
@@ -6689,15 +6737,13 @@ def _confidence_retrieve(query: str, top_k: int) -> tuple[list, Optional[str]]:
         return [], "embed_failed"
 
     try:
-        results = client.search(
-            collection_name=col,
-            query_vector={"dense": emb} if isinstance(emb, list) else emb,
-            limit=top_k,
-            with_payload=True,
-        )
+        results = _query_points_compat(client, col, emb, limit=top_k)
     except Exception as exc:
-        logger.debug("memory_confidence search failed: %r", exc)
-        results = []
+        # NOT "no_trace": an empty list from a broken search is a different claim
+        # from an empty list from a healthy one, and the caller has to be able to
+        # tell them apart.
+        logger.warning("memory_confidence search failed: %r", exc)
+        return [], "search_failed"
 
     return results, None
 
