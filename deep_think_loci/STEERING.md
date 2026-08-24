@@ -31,7 +31,7 @@ Nothing here needs new storage. Three things are already in place:
 |---|---|
 | `investigation_note(id, field, value)` | an operator-writable manifest per investigation — `hypothesis`, `next_step`, `open_question_add`, `context`. This *is* a steering surface; deep-think simply never reads it. |
 | `memory_hints(id, since_ts)` | incremental poll of what a run has produced since a timestamp — built for exactly this. |
-| `record_type` | not validated against a fixed vocabulary, so a `directive` record is a convention, not a schema change. |
+| tags on an allowed `finding_type` | directives ride an existing type. `finding_type` **is** a closed set — `mcp/server.py:2044` `_STORE_FINDING_TYPES = {observed, inferred, assumed, gap, procedure}`, enforced by `_store_validate` — and `record_type` is derived from it, never passed. So a directive is a tagged finding, not a new type. |
 
 The investigation is already the run's shared state. Making it the *control plane*
 costs a read.
@@ -44,23 +44,32 @@ An operator (or a supervising model) writes a directive into the same
 investigation the run is writing to:
 
 ```
-investigation_store(investigation_id=RUN, record_type="directive",
+investigation_store(investigation_id=RUN, finding_type="assumed",
                     text="drop target 3, it is out of scope",
-                    tags=["phase:ideate", "priority:high"])
+                    tags=["directive", "phase:ideate", "priority:high"],
+                    source="operator")
 ```
+
+`finding_type="directive"` would be **rejected** — the set is closed at
+`{observed, inferred, assumed, gap, procedure}` and `_store_validate` returns an
+error for anything else. `assumed` is the honest carrier: a directive is a
+working instruction with no evidentiary standing, which is exactly what `assumed`
+means. The `directive` tag is what the steering agent filters on.
 
 Or, for the coarse steer, just `investigation_note(RUN, "next_step", "...")`.
 
 Directives are scoped by tag: `phase:*` targets a stage, untagged applies to all
 remaining stages. They are findings, so they are timestamped, attributable and
-auditable — the run records not just what it concluded but what it was told.
+auditable — the run records not just what it concluded but what it was told. They
+are also `assumed`, so they never contaminate a search for observed evidence.
 
 ### 2. The steering agent
 
 Between phases, one cheap agent — haiku, single purpose:
 
 ```
-read investigation RUN's manifest and every record_type="directive" since <ts>;
+read investigation RUN's manifest, and every finding tagged `directive` since <ts>
+(investigation_search resolution="open", or memory_hints since_ts);
 return {directives: [...], hypothesis, next_step, halt: bool}
 ```
 
@@ -148,6 +157,24 @@ The phases should be **separately invocable**. Then:
 The second mode is worth building first *because it is nearly free*: it is the
 current script split at its existing phase boundaries. The directive channel is
 what makes the first mode as steerable as the second, and it can follow.
+
+## Two dead gates in v3.2, found while designing this
+
+Worth fixing before, or instead of, building on top of that file.
+
+- **`groundBlock` (line 34) is referenced nowhere.** Only the Final phase inlines a
+  gate command, so **ideation is ungated** — contradicting the README's "every tier
+  reasons only over grounding-gated evidence". The gate the project's whole eval
+  discipline is built around is not applied to the phase that generates the ideas.
+- **`advTargets` (line 76) influences nothing.** It is computed from the
+  VerifyIdeate persistence check and logged, but line 84 builds `halves` from
+  `TARGETS`. VerifyIdeate has zero functional effect on Final.
+
+`deep-think-v4.js` wires the equivalent of the second one (`liveTargets` forms the
+synth groups) and its `meta.description` says it *"Replaces v3.2 for dama-gotchi and
+loci-self-audit"*. So the first question is not how to split v3.2 — it is whether
+v3.2 is the file anyone should still be running.
+
 
 ## Order of work
 
