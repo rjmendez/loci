@@ -132,6 +132,42 @@ rejections.
 short question per sampled finding. These have very different remote-cost
 profiles and should not share one switch.
 
+## Measured, 2026-08-24 — which tier is worth using for what
+
+One protocol for every method: hold out findings that carry vocabulary tags, hide
+them, re-derive, score against what the author wrote. Same 60-finding sample.
+
+| method | completed | mean precision | wall time |
+|---|---|---|---|
+| kNN over the embeddings, no model | **60/60** | **0.361** | 6.4s |
+| `mistralai/mistral-nemo` (paid, ~$0.0000145/call) | 36/60 | 0.194 | 63.6s |
+| `nvidia/nemotron-3-super-120b:free` | 2/60 | — | 19.9s |
+| `z-ai/glm-5.2:free` | 1/60 | — | 12.0s |
+| local vLLM Qwen2.5-3B | **0/60** | — | 0.3s |
+
+Three conclusions, and one caveat.
+
+**Tagging does not want a model.** The embedding method beat the only model that
+finished enough of the sample to judge — twice the precision, a tenth of the wall
+time, no tokens. Everything the vectors can already answer should be answered
+that way; generation belongs where embeddings cannot help, which is extraction
+and disambiguation, not classification.
+
+**The free pool cannot carry a bulk pass.** 1/60 and 2/60 completion is not a
+quality signal, it is a quota signal — the shared upstream pool 429s under any
+sustained load. Free models are fine for the low-volume work (`codelink`'s ~1,081
+ambiguous tokens, `recall`'s one short question per sample) and unusable for a
+sweep over thousands. The ladder is what makes that survivable rather than fatal.
+
+**The local tier went down during the benchmark.** `vllm-gpu` restarted mid-run —
+`Running 4 (2m25s ago)`, `0/1` not ready, forwarder returning nothing — which is
+why its column is 0/60. That is this document's argument happening unprompted:
+the local tier is least available exactly when there is bulk work to do.
+
+*Caveat.* The absolute numbers are low for every method because the ground truth
+is itself noisy — 4,267 distinct tags of which 2,809 are used exactly once. What
+is robust here is the ordering and the completion rates, not the third decimal.
+
 ## Fixing the substrate anyway
 
 Independent of where generation runs, three things on the node are worth doing
