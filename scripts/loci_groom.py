@@ -27,6 +27,7 @@ import argparse
 import collections
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -152,6 +153,20 @@ def write_proposals(rows: list[dict], groom_dir: Optional[Path] = None) -> int:
 
 # --- pass: index ------------------------------------------------------------
 
+def indexed_ids(client, col: str) -> set:
+    """Every point id in the collection, paged."""
+    out: set = set()
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=col, limit=1024, offset=offset,
+            with_payload=False, with_vectors=False,
+        )
+        out.update(str(p.id) for p in points)
+        if offset is None:
+            return out
+
+
 def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
     """Reconcile the JSONL corpus against the Qdrant index.
 
@@ -185,17 +200,8 @@ def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
         report.update(status="degraded", detail="qdrant unreachable")
         return report
 
-    indexed = set()
-    offset = None
     try:
-        while True:
-            points, offset = client.scroll(
-                collection_name=col, limit=1024, offset=offset,
-                with_payload=False, with_vectors=False,
-            )
-            indexed.update(str(p.id) for p in points)
-            if offset is None:
-                break
+        indexed = indexed_ids(client, col)
     except Exception as exc:
         report.update(status="degraded", detail=f"scroll failed: {exc!r}")
         return report
@@ -357,9 +363,160 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
     return report
 
 
+# --- pass: recall -----------------------------------------------------------
+
+_QUESTION_PROMPT = (
+    "Below is a finding from an engineering investigation. Write ONE short question "
+    "that this finding answers — the question someone would type if they wanted this "
+    "finding back. Use the finding's own vocabulary. No preamble, no quotes.\n\n"
+    "FINDING:\n{text}\n\nQUESTION:"
+)
+
+
+def _rank_of(finding_id: str, results: list) -> Optional[int]:
+    for i, row in enumerate(results, start=1):
+        if str(row.get("id") or "") == finding_id:
+            return i
+    return None
+
+
+def _score(ranks: list, k: int, attempted: int) -> dict:
+    hits1 = sum(1 for r in ranks if r == 1)
+    hitsk = sum(1 for r in ranks if r is not None and r <= k)
+    mrr = sum(1.0 / r for r in ranks if r) / max(attempted, 1)
+    return {
+        "attempted": attempted,
+        "recall_at_1": round(hits1 / max(attempted, 1), 4),
+        f"recall_at_{k}": round(hitsk / max(attempted, 1), 4),
+        "mrr": round(mrr, 4),
+    }
+
+
+def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
+                gen_fn: Optional[Callable] = None, memory_dir: Optional[Path] = None,
+                groom_dir: Optional[Path] = None, search_fn: Optional[Callable] = None,
+                seed: int = 0, limit: Optional[int] = None, rerank: bool = True,
+                **_) -> dict:
+    """Ask the retriever for findings it already holds, and see if it returns them.
+
+    Two probes, kept apart on purpose, because today they fail identically:
+
+      identity   query = the finding's own text. A miss here is WIRING — wrong
+                 embedder, wrong width, a collection that cannot be queried at all.
+                 No model is involved, so a regression is unambiguous.
+      paraphrase query = a question the local model writes from the finding. A miss
+                 here with identity intact is SEMANTIC reach, not breakage.
+
+    Only findings that are actually indexed are sampled — otherwise this measures
+    the index gap that ``index`` already reports, and reads as a retrieval failure.
+    """
+    sample = limit or sample          # --limit is the CLI's name for the sample size
+    report = {"pass": "recall", "k": k, "sample": sample, "rerank": rerank, "status": "ok"}
+
+    try:
+        import qdrant_ops
+        client, col = qdrant_ops._get_qdrant()
+    except Exception as exc:
+        report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+        return report
+    if client is None:
+        report.update(status="degraded", detail="qdrant unreachable")
+        return report
+
+    by_id = {}
+    for f in iter_findings(memory_dir):
+        fid = f.get("id")
+        if fid and (f.get("text") or "").strip():
+            by_id[str(fid)] = f
+    try:
+        live = sorted(indexed_ids(client, col) & set(by_id))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"scroll failed: {exc!r}")
+        return report
+
+    report["indexed_with_text"] = len(live)
+    if not live:
+        report.update(status="degraded", detail="nothing indexed to probe")
+        return report
+
+    rnd = random.Random(seed)
+    chosen = rnd.sample(live, min(sample, len(live)))
+    search = search_fn or (
+        lambda q: qdrant_ops._qdrant_similarity_search(q, limit=k, rerank=rerank))
+
+    ident_ranks, errors = [], 0
+    for fid in chosen:
+        try:
+            res = search(str(by_id[fid]["text"])[:1000])
+        except Exception:
+            errors += 1
+            continue
+        if not (res or {}).get("ok"):
+            errors += 1
+            continue
+        ident_ranks.append(_rank_of(fid, res.get("results") or []))
+    report["identity"] = _score(ident_ranks, k, len(ident_ranks))
+    report["search_errors"] = errors
+
+    if not paraphrase:
+        _append_recall(report, groom_dir)
+        return report
+
+    if gen_fn is None:
+        try:
+            import batched_gen
+            gen_fn = lambda prompts: batched_gen.generate_batch(  # noqa: E731
+                prompts, model=GROOM_MODEL, max_tokens=64)
+        except Exception as exc:
+            report["paraphrase"] = {"status": "degraded", "detail": f"no generation tier: {exc!r}"}
+            _append_recall(report, groom_dir)
+            return report
+
+    para_ranks, unusable = [], 0
+    for i in range(0, len(chosen), GROOM_BATCH):
+        chunk = chosen[i:i + GROOM_BATCH]
+        prompts = [_QUESTION_PROMPT.format(text=str(by_id[f]["text"])[:1000]) for f in chunk]
+        try:
+            gen = gen_fn(prompts)
+        except Exception:
+            unusable += len(chunk)
+            continue
+        for fid, g in zip(chunk, gen or []):
+            question = (g or {}).get("text", "").strip()
+            if not (g or {}).get("ok") or len(question) < 8:
+                unusable += 1
+                continue
+            try:
+                res = search(question)
+            except Exception:
+                unusable += 1
+                continue
+            if not (res or {}).get("ok"):
+                unusable += 1
+                continue
+            para_ranks.append(_rank_of(fid, res.get("results") or []))
+    report["paraphrase"] = {**_score(para_ranks, k, len(para_ranks)), "unusable": unusable}
+
+    _append_recall(report, groom_dir)
+    return report
+
+
+def _append_recall(report: dict, groom_dir: Optional[Path] = None) -> None:
+    """One row per run. The number matters far less than its trend."""
+    root = groom_dir or GROOM_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / "recall.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                                 **report}) + "\n")
+    except OSError:
+        pass
+
+
 PASSES = {
     "index": {"fn": pass_index, "applyable": True},
     "tags": {"fn": pass_tags, "applyable": False},
+    "recall": {"fn": pass_recall, "applyable": False},
 }
 
 
@@ -371,6 +528,8 @@ def main(argv: Optional[list] = None) -> int:
                     help="promote results for passes that allow it (index only)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-rerank", action="store_true",
+                    help="recall: probe the bi-encoder stage alone, without the cross-encoder")
     args = ap.parse_args(argv)
     load_env()
 
@@ -387,7 +546,8 @@ def main(argv: Optional[list] = None) -> int:
         if args.apply and not spec["applyable"]:
             print(f"[groom] {name}: --apply ignored (proposals only)", file=sys.stderr)
         try:
-            reports.append(spec["fn"](apply=apply, limit=args.limit))
+            reports.append(spec["fn"](apply=apply, limit=args.limit,
+                                      rerank=not args.no_rerank))
         except Exception as exc:      # a pass must never take the cron job down
             reports.append({"pass": name, "status": "error", "detail": repr(exc)})
 

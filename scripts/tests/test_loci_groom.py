@@ -254,3 +254,126 @@ class TestCli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecallPass(unittest.TestCase):
+    """The two probes must stay separable: identity is a wiring test, paraphrase
+    is a semantic one, and collapsing them is what makes an outage look like a
+    quality dip."""
+
+    def _run(self, *, ranks_for_identity=None, ranks_for_paraphrase=None,
+             gen=None, paraphrase=True, sample=3, k=5):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        tmp = pathlib.Path(self._td.name)
+        ids = ["a", "b", "c"]
+        _corpus(tmp, {"inv": [_f(i, text=f"finding text {i}") for i in ids]})
+
+        def search(query):
+            # identity queries carry the finding text; paraphrase queries do not
+            is_identity = query.startswith("finding text ")
+            table = ranks_for_identity if is_identity else ranks_for_paraphrase
+            if table is None:
+                return {"ok": False, "reason": "boom", "results": []}
+            fid = query.split()[-1] if is_identity else query.split(":")[-1].strip()
+            rank = table.get(fid)
+            rows = [{"id": f"filler{n}"} for n in range(k)]
+            if rank:
+                rows[rank - 1] = {"id": fid}
+            return {"ok": True, "reason": "hybrid", "results": rows}
+
+        client = _Client(ids)
+        fake_ops = mock.Mock()
+        fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+        with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
+            return groom.pass_recall(
+                sample=sample, k=k, paraphrase=paraphrase, gen_fn=gen,
+                memory_dir=tmp, groom_dir=tmp / "_groom", search_fn=search,
+            )
+
+    def tearDown(self):
+        if getattr(self, "_td", None):
+            self._td.cleanup()
+
+    def test_perfect_identity_recall(self):
+        r = self._run(ranks_for_identity={"a": 1, "b": 1, "c": 1}, paraphrase=False)
+        self.assertEqual(r["identity"]["recall_at_1"], 1.0)
+        self.assertEqual(r["identity"]["mrr"], 1.0)
+        self.assertEqual(r["identity"]["attempted"], 3)
+
+    def test_a_finding_the_retriever_cannot_return_is_a_miss_not_an_error(self):
+        r = self._run(ranks_for_identity={"a": 1, "b": None, "c": None}, paraphrase=False)
+        self.assertAlmostEqual(r["identity"]["recall_at_1"], 1 / 3, places=3)
+        self.assertAlmostEqual(r["identity"]["recall_at_5"], 1 / 3, places=3)
+        self.assertEqual(r["search_errors"], 0)
+
+    def test_rank_position_shows_up_in_mrr_not_just_recall_at_1(self):
+        r = self._run(ranks_for_identity={"a": 1, "b": 2, "c": 4}, paraphrase=False)
+        self.assertAlmostEqual(r["identity"]["recall_at_1"], 1 / 3, places=3)
+        self.assertEqual(r["identity"]["recall_at_5"], 1.0)
+        self.assertAlmostEqual(r["identity"]["mrr"], (1 + 0.5 + 0.25) / 3, places=4)
+
+    def test_identity_and_paraphrase_are_scored_apart(self):
+        gen = lambda prompts: [{"text": f"question: {p.split('finding text ')[1][0]}", "ok": True}  # noqa: E731
+                               for p in prompts]
+        r = self._run(ranks_for_identity={"a": 1, "b": 1, "c": 1},
+                      ranks_for_paraphrase={"a": 1, "b": None, "c": None}, gen=gen)
+        self.assertEqual(r["identity"]["recall_at_1"], 1.0)
+        self.assertAlmostEqual(r["paraphrase"]["recall_at_1"], 1 / 3, places=3)
+
+    def test_a_search_that_reports_not_ok_is_counted_as_an_error(self):
+        r = self._run(ranks_for_identity=None, paraphrase=False)
+        self.assertEqual(r["search_errors"], 3)
+        self.assertEqual(r["identity"]["attempted"], 0)
+
+    def test_an_empty_generated_question_is_unusable_not_a_miss(self):
+        gen = lambda prompts: [{"text": "  ", "ok": True} for _ in prompts]  # noqa: E731
+        r = self._run(ranks_for_identity={"a": 1, "b": 1, "c": 1},
+                      ranks_for_paraphrase={}, gen=gen)
+        self.assertEqual(r["paraphrase"]["unusable"], 3)
+        self.assertEqual(r["paraphrase"]["attempted"], 0)
+
+    def test_it_only_probes_findings_that_are_actually_indexed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv": [_f(i, text=f"finding text {i}") for i in ["a", "b", "c", "d"]]})
+            client = _Client(["a", "b"])          # only two of the four are indexed
+            fake_ops = mock.Mock()
+            fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+            seen = []
+
+            def search(q):
+                seen.append(q)
+                return {"ok": True, "reason": "hybrid", "results": []}
+
+            with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
+                r = groom.pass_recall(sample=10, paraphrase=False, memory_dir=tmp,
+                                      groom_dir=tmp / "_groom", search_fn=search)
+        self.assertEqual(r["indexed_with_text"], 2)
+        self.assertEqual(len(seen), 2)
+
+    def test_it_appends_one_row_per_run_for_trend(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv": [_f("a", text="finding text a")]})
+            client = _Client(["a"])
+            fake_ops = mock.Mock()
+            fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+            gd = tmp / "_groom"
+            with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
+                for _ in range(2):
+                    groom.pass_recall(sample=1, paraphrase=False, memory_dir=tmp,
+                                      groom_dir=gd,
+                                      search_fn=lambda q: {"ok": True, "results": [{"id": "a"}]})
+            rows = [json.loads(l) for l in open(gd / "recall.jsonl") if l.strip()]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["identity"]["recall_at_1"] == 1.0 for r in rows))
+
+    def test_an_unreachable_qdrant_degrades(self):
+        fake_ops = mock.Mock()
+        fake_ops._get_qdrant.return_value = (None, None)
+        with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
+            r = groom.pass_recall()
+        self.assertEqual(r["status"], "degraded")
