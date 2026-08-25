@@ -67,7 +67,7 @@ def test_every_mcp_tool_decorator_is_classified_registering(head_build):
         if e.attrs["classification"] == "registering" and e.attrs["raw"].startswith("mcp.tool")
         and e.src.startswith("fn:mcp/server.py::")
     ]
-    assert len(registering) == 41
+    assert len(registering) == 42
 
 
 def test_no_unknown_decorators_in_real_corpus(head_build):
@@ -201,11 +201,11 @@ def test_registry_counts_match_the_real_corpus(head_build):
     from collections import Counter
     store = head_build.store
     by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    # 41 @mcp.tool() + 1 @mcp.resource(), both DEC-tool (both make a
+    # 42 @mcp.tool() + 1 @mcp.resource(), both DEC-tool (both make a
     # function externally callable by its own Python name — the specific
     # decorator classification, tool vs resource, isn't the resolution's
     # concern here). Verified independently via `git grep '^@mcp\.tool'`.
-    assert by_rule["DEC-tool"] == 42
+    assert by_rule["DEC-tool"] == 43
     assert by_rule["DEC-route"] == 6         # a2a_server's @app.get/@app.post
     assert by_rule["DEC-mcp-route"] == 1     # mcp/server.py's @mcp.custom_route("/health", ...)
     assert by_rule["MAN-LOOP"] == 31         # graph_tools(11) + investigation_tools(11) + llm_tools(9)
