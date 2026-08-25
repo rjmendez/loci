@@ -38,8 +38,11 @@ printf '{"ts":%d,"pass":"%s","rc":%d,"summary":%s}\n' \
     >> "$STATE/runs.jsonl"
 
 if [ "$rc" -eq 3 ]; then
-    echo "loci-groom: pass '$pass' REFUSED or DEGRADED — corpus not groomed." >&2
-    echo "loci-groom: check loci_health retention_days; a non-zero purge window" >&2
-    echo "loci-groom: makes grooming an index-then-delete loop." >&2
+    # Print the pass's OWN reason. This used to state the retention diagnosis
+    # unconditionally, which is right for `index` and wrong for every other
+    # pass — a fixed explanation for a variable failure is how you get told the
+    # wrong cause with total confidence.
+    echo "loci-groom: pass '$pass' REFUSED or DEGRADED — not groomed." >&2
+    printf '%s\n' "$out" | grep -iE 'refused|degraded|detail=' | tail -2 >&2
 fi
 exit "$rc"

@@ -6106,7 +6106,9 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
 
     Returns:
         JSON: {"investigation_id": ..., "verified": N,
-               "results": [{"finding_id", "verdict", "confidence"}, ...]}
+               "results": [{"finding_id", "verdict", "confidence", "degraded"}, ...]}
+               ``degraded`` is True when no model could be reached, so a caller
+               can tell "the skeptic was uncertain" from "the skeptic never ran".
         On error: {"error": "<message>"}
     """
     manifest = _load_manifest(investigation_id)
@@ -6155,6 +6157,13 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
+        # verify_finding sets degraded=True when it could not reach a model, and
+        # returns uncertain/0.0 in exactly the same shape as a real judgement.
+        # Without carrying the flag, finding_verifications.jsonl cannot tell a
+        # considered "uncertain" from "nothing ran" — the file fills up and says
+        # nothing. Recorded, not suppressed: the note is still evidence that the
+        # finding was reached.
+        degraded = bool(res.get("degraded"))
         # Record as an append-only verification note in a SEPARATE log so these
         # accumulating records never slow the resolution read path — does NOT
         # touch resolution. Guarded per-finding: a single write failure (disk
@@ -6167,6 +6176,7 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
                 "finding_id": fid,
                 "verdict": verdict,
                 "confidence": confidence,
+                "degraded": degraded,
                 "ts": _now(),
             })
         except Exception as exc:  # noqa: BLE001 — never abort the batch on one write
@@ -6176,6 +6186,7 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             "finding_id": fid,
             "verdict": verdict,
             "confidence": confidence,
+            "degraded": degraded,
         })
 
     return json.dumps({

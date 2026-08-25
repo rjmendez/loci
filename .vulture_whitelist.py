@@ -46,8 +46,10 @@ _ = wiring_obligation_declare
 _ = wiring_obligation_list
 _ = wiring_obligation_resolve
 _ = rag_context_search
-_ = reflection_loop_seed
-_ = reflection_loop_tick
+# reflection_loop_seed / reflection_loop_tick / investigation_verify_all were
+# here as tool surface with no local caller. scripts/loci_groom.py now calls
+# all three (#194), so vulture sees real references and the entries would
+# suppress nothing.
 _ = reflection_loop_status
 _ = conflict_list
 _ = conflict_resolve
@@ -85,7 +87,6 @@ _ = get_task
 # is the authority, and mcp/tests asserts its count.
 _ = health
 _ = finding_resolve
-_ = investigation_verify_all
 _ = loci_health
 _ = retrieval_selftest
 
