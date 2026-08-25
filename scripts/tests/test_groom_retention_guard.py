@@ -78,3 +78,54 @@ class TestLoadEnvIsNotSilent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEveryPassRoutesThroughTheGate(unittest.TestCase):
+    """The first version of this guard protected pass_index only, while
+    pass_recall and pass_knn_tags still connected directly — and connecting IS
+    the purge. A guard that has to be remembered at each call site is a guard
+    that gets forgotten, so the check lives in one place and this test asserts
+    nothing bypasses it."""
+
+    def test_no_pass_calls_get_qdrant_directly(self):
+        import re
+        src = (_SCRIPTS / "loci_groom.py").read_text()
+        parts = re.split(r"\ndef (pass_\w+|connect)\(", src)
+        offenders = [parts[i] for i in range(1, len(parts), 2)
+                     if parts[i] != "connect" and "_get_qdrant()" in parts[i + 1]]
+        self.assertEqual(offenders, [], f"these bypass connect(): {offenders}")
+
+    def _refuses(self, fn, **kw):
+        fake = mock.Mock()
+        fake._retention_days.return_value = 30
+        connected = []
+        fake._get_qdrant.side_effect = lambda: connected.append(1) or (None, None)
+        with mock.patch.dict(sys.modules, {"qdrant_ops": fake}):
+            report = fn(**kw)
+        return report, connected
+
+    def test_recall_refuses_too(self):
+        report, connected = self._refuses(groom.pass_recall)
+        self.assertEqual(report["status"], "refused")
+        self.assertEqual(connected, [])
+
+    def test_knn_tags_refuses_too(self):
+        import tempfile, json as _json, pathlib as _pl
+        with tempfile.TemporaryDirectory() as td:
+            tmp = _pl.Path(td); (tmp / "inv").mkdir()
+            with open(tmp / "inv" / "findings.jsonl", "w") as fh:
+                for i in range(6):
+                    fh.write(_json.dumps({"id": f"t{i}", "text": "x", "tags": ["mqtt"],
+                                          "investigation_id": "inv"}) + "\n")
+            report, connected = self._refuses(groom.pass_knn_tags, memory_dir=tmp)
+        self.assertEqual(report["status"], "refused")
+        self.assertEqual(connected, [])
+
+    def test_the_gate_itself_connects_when_safe(self):
+        fake = mock.Mock()
+        fake._retention_days.return_value = 0
+        fake._get_qdrant.return_value = ("client", "col")
+        with mock.patch.dict(sys.modules, {"qdrant_ops": fake}):
+            client, col, refusal = groom.connect()
+        self.assertIsNone(refusal)
+        self.assertEqual((client, col), ("client", "col"))

@@ -175,6 +175,41 @@ def write_proposals(rows: list[dict], groom_dir: Optional[Path] = None) -> int:
 
 # --- pass: index ------------------------------------------------------------
 
+def connect(require_safe_retention: bool = True):
+    """(client, collection, refusal) — the ONLY way this module reaches Qdrant.
+
+    qdrant_ops._get_qdrant() runs _purge_old_records on its first call in a
+    process, so connecting is a destructive act when retention is not 0. Guarding
+    one pass is not enough: pass_index, pass_recall and pass_knn_tags all connect,
+    and a guard copied into each is a guard that will be forgotten by the fourth.
+    Everything goes through here instead.
+
+    Returns a refusal dict when it is not safe to connect, else None in that slot.
+    """
+    try:
+        import qdrant_ops
+    except Exception as exc:
+        return None, None, {"status": "degraded", "detail": f"qdrant_ops unavailable: {exc!r}"}
+
+    if require_safe_retention:
+        retention = qdrant_ops._retention_days()
+        if retention != 0:
+            return None, None, {
+                "status": "refused",
+                "detail": (f"LOCI_QDRANT_RETENTION_DAYS resolves to {retention}, not 0 — connecting "
+                           f"would run the startup purge and delete findings older than {retention} "
+                           f"days. Set it in the environment, the repo .env, or [qdrant].retention_days "
+                           f"in ~/.loci/backends.toml before running this pass."),
+            }
+    try:
+        client, col = qdrant_ops._get_qdrant()
+    except Exception as exc:
+        return None, None, {"status": "degraded", "detail": f"qdrant_ops unavailable: {exc!r}"}
+    if client is None:
+        return None, None, {"status": "degraded", "detail": "qdrant unreachable"}
+    return client, col, None
+
+
 def indexed_ids(client, col: str) -> set:
     """Every point id in the collection, paged."""
     out: set = set()
@@ -212,35 +247,11 @@ def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
         "status": "ok",
     }
 
-    try:
-        import qdrant_ops
-    except Exception as exc:
-        report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+    client, col, refusal = connect()
+    if refusal:
+        report.update(**refusal)
         return report
-
-    # Refuse before touching the client. _get_qdrant() runs _purge_old_records on
-    # its first call in a process, so simply CONNECTING with retention unset
-    # deletes the corpus past the window — and this pass exists to repair exactly
-    # that damage. Loud and non-destructive beats quietly undoing our own work.
-    retention = qdrant_ops._retention_days()
-    if retention != 0:
-        report.update(
-            status="refused",
-            detail=(f"LOCI_QDRANT_RETENTION_DAYS resolves to {retention}, not 0 — connecting "
-                    f"would run the startup purge and delete findings older than {retention} "
-                    f"days. Set it in the environment, the repo .env, or [qdrant].retention_days "
-                    f"in ~/.loci/backends.toml before running this pass."),
-        )
-        return report
-
-    try:
-        client, col = qdrant_ops._get_qdrant()
-    except Exception as exc:
-        report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
-        return report
-    if client is None:
-        report.update(status="degraded", detail="qdrant unreachable")
-        return report
+    import qdrant_ops
 
     try:
         indexed = indexed_ids(client, col)
@@ -474,15 +485,11 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
     sample = limit or sample          # --limit is the CLI's name for the sample size
     report = {"pass": "recall", "k": k, "sample": sample, "rerank": rerank, "status": "ok"}
 
-    try:
-        import qdrant_ops
-        client, col = qdrant_ops._get_qdrant()
-    except Exception as exc:
-        report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+    client, col, refusal = connect()
+    if refusal:
+        report.update(**refusal)
         return report
-    if client is None:
-        report.update(status="degraded", detail="qdrant unreachable")
-        return report
+    import qdrant_ops
 
     by_id = {}
     for f in iter_findings(memory_dir):
@@ -631,16 +638,13 @@ def pass_knn_tags(limit: Optional[int] = None, k: int = 8, min_weight: float = 1
         return report
 
     if search_fn is None:
-        try:
-            import qdrant_ops
-            if qdrant_ops._get_qdrant()[0] is None:
-                report.update(status="degraded", detail="qdrant unreachable")
-                return report
-            search_fn = lambda q: qdrant_ops._qdrant_similarity_search(  # noqa: E731
-                q, limit=k + 1, rerank=False)
-        except Exception as exc:
-            report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+        client, _col, refusal = connect()
+        if refusal:
+            report.update(**refusal)
             return report
+        import qdrant_ops
+        search_fn = lambda q: qdrant_ops._qdrant_similarity_search(  # noqa: E731
+            q, limit=k + 1, rerank=False)
 
     if calibrate:
         subjects = [f for f in findings

@@ -83,6 +83,7 @@ class TestIndexPass(unittest.TestCase):
         _corpus(tmp, {"inv": [_f(i) for i in disk_ids]})
         client = _Client(indexed_ids)
         fake_ops = mock.Mock()
+        fake_ops._retention_days.return_value = 0  # connect() gate
         # pass_index refuses unless retention resolves to 0 — connecting runs the
         # startup purge, which is the damage this pass exists to repair.
         fake_ops._retention_days.return_value = 0
@@ -288,6 +289,7 @@ class TestRecallPass(unittest.TestCase):
 
         client = _Client(ids)
         fake_ops = mock.Mock()
+        fake_ops._retention_days.return_value = 0  # connect() gate
         fake_ops._get_qdrant.return_value = (client, "hermes_memory")
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
             return groom.pass_recall(
@@ -344,6 +346,7 @@ class TestRecallPass(unittest.TestCase):
             _corpus(tmp, {"inv": [_f(i, text=f"finding text {i}") for i in ["a", "b", "c", "d"]]})
             client = _Client(["a", "b"])          # only two of the four are indexed
             fake_ops = mock.Mock()
+            fake_ops._retention_days.return_value = 0  # connect() gate
             fake_ops._get_qdrant.return_value = (client, "hermes_memory")
             seen = []
 
@@ -364,6 +367,7 @@ class TestRecallPass(unittest.TestCase):
             _corpus(tmp, {"inv": [_f("a", text="finding text a")]})
             client = _Client(["a"])
             fake_ops = mock.Mock()
+            fake_ops._retention_days.return_value = 0  # connect() gate
             fake_ops._get_qdrant.return_value = (client, "hermes_memory")
             gd = tmp / "_groom"
             with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
@@ -377,6 +381,7 @@ class TestRecallPass(unittest.TestCase):
 
     def test_an_unreachable_qdrant_degrades(self):
         fake_ops = mock.Mock()
+        fake_ops._retention_days.return_value = 0  # connect() gate
         fake_ops._get_qdrant.return_value = (None, None)
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
             r = groom.pass_recall()
