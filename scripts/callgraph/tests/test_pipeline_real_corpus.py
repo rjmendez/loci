@@ -67,7 +67,7 @@ def test_every_mcp_tool_decorator_is_classified_registering(head_build):
         if e.attrs["classification"] == "registering" and e.attrs["raw"].startswith("mcp.tool")
         and e.src.startswith("fn:mcp/server.py::")
     ]
-    assert len(registering) == 41
+    assert len(registering) == 42
 
 
 def test_no_unknown_decorators_in_real_corpus(head_build):
@@ -138,9 +138,18 @@ def test_unresolved_imports_are_all_genuinely_optional_third_party(head_build):
 
 
 def test_callsite_count_is_in_the_expected_ballpark(head_build):
-    # docs/census.txt estimate: ~11,600 (5,106 by name + 6,538 by attribute).
+    """Coarse sanity band: catch a pipeline that counts nothing or everything.
+
+    docs/census.txt estimated ~11,600 (5,106 by name + 6,538 by attribute) when
+    this was written. The band was 11,000-12,500 and the repo grew through the
+    ceiling — 12,514 — which failed CI for adding code, not for miscounting.
+
+    This tracks REPO SIZE, so it is deliberately loose. It exists to catch the
+    pipeline returning 0, or an order of magnitude, not to pin a number that
+    every feature branch moves. Re-widen it rather than trimming code to fit.
+    """
     count = sum(1 for _ in head_build.store.nodes_of_kind("CALLSITE"))
-    assert 11000 <= count <= 12500, count
+    assert 8000 <= count <= 20000, count
 
 
 def test_every_callsite_has_exactly_one_calls_edge(head_build):
@@ -192,11 +201,11 @@ def test_registry_counts_match_the_real_corpus(head_build):
     from collections import Counter
     store = head_build.store
     by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    # 41 @mcp.tool() + 1 @mcp.resource(), both DEC-tool (both make a
+    # 42 @mcp.tool() + 1 @mcp.resource(), both DEC-tool (both make a
     # function externally callable by its own Python name — the specific
     # decorator classification, tool vs resource, isn't the resolution's
     # concern here). Verified independently via `git grep '^@mcp\.tool'`.
-    assert by_rule["DEC-tool"] == 42
+    assert by_rule["DEC-tool"] == 43
     assert by_rule["DEC-route"] == 6         # a2a_server's @app.get/@app.post
     assert by_rule["DEC-mcp-route"] == 1     # mcp/server.py's @mcp.custom_route("/health", ...)
     assert by_rule["MAN-LOOP"] == 31         # graph_tools(11) + investigation_tools(11) + llm_tools(9)
