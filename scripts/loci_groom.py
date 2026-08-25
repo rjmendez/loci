@@ -110,6 +110,10 @@ GROOM_DIR = MEMORY_DIR / "_groom"
 # tier resolve its own. Set LOCI_GROOM_MODEL only to pin one deliberately.
 GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
 GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
+# Per-run ceilings. These bound a nightly job, not a human sitting in front of it.
+VERIFY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_VERIFY_INVESTIGATIONS", "5"))
+VERIFY_PER_INVESTIGATION = int(os.environ.get("LOCI_GROOM_VERIFY_FINDINGS", "10"))
+REFLECT_MAX_ITEMS = int(os.environ.get("LOCI_GROOM_REFLECT_ITEMS", "3"))
 
 
 # --- corpus access ----------------------------------------------------------
@@ -891,12 +895,138 @@ def pass_codelink(limit: Optional[int] = None, calibrate: bool = False,
     return report
 
 
+def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
+                verify_fn: Optional[Callable] = None,
+                gen_probe: Optional[Callable] = None, **_) -> dict:
+    """Batch adversarial-verify open findings, one investigation at a time.
+
+    investigation_verify_all is a correct, exposed tool that had never been
+    invoked: finding_verifications.jsonl held 0 records across 131
+    investigations (#194). Nothing was broken — nothing had ever called it.
+
+    Safe unattended because it is append-only to a SEPARATE file and explicitly
+    not a lifecycle change: a verdict is recorded as a verification note and does
+    not overwrite a finding's resolution. Bounded per run so a nightly pass
+    cannot turn into an unbounded model spend.
+    """
+    report = {"pass": "verify", "status": "ok"}
+    budget = int(limit or VERIFY_MAX_PER_RUN)
+
+    # Probe generation BEFORE verifying anything. verify_finding is fail-open: an
+    # unreachable model yields verdict='uncertain', confidence=0.0 for every
+    # finding, and investigation_verify_all writes those to
+    # finding_verifications.jsonl. Unattended, that fills an empty lane with
+    # records carrying no information — a file that looks populated and says
+    # nothing, which is the exact failure this tier exists to catch. Measured
+    # here on the first run: 5 records, all uncertain/0.0, because llm_local
+    # returns ok=False with no reason given.
+    if gen_probe is None:
+        def gen_probe():
+            sys.path.insert(0, str(_REPO / "mcp"))
+            from llm_local import generate
+            return bool(generate("Reply with OK.", max_tokens=8).get("ok"))
+    try:
+        if not gen_probe():
+            report.update(status="degraded",
+                          detail="generation backend is not answering; skipping rather "
+                                 "than writing uncertain/0.0 verdicts for every finding")
+            return report
+    except Exception as exc:
+        report.update(status="degraded", detail=f"generation probe failed: {exc!r}")
+        return report
+
+    if verify_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            verify_fn = _server.investigation_verify_all
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import the verifier: {exc!r}")
+            return report
+
+    root = memory_dir or MEMORY_DIR
+    checked = verified = 0
+    errors = 0
+    for inv_dir in sorted(root.glob("*/findings.jsonl")):
+        if checked >= budget:
+            break
+        inv = inv_dir.parent.name
+        # Skip investigations already carrying verdicts, so repeated runs move
+        # through the corpus instead of re-verifying the same head every night.
+        if (inv_dir.parent / "finding_verifications.jsonl").exists():
+            continue
+        try:
+            raw = verify_fn(investigation_id=inv, limit=VERIFY_PER_INVESTIGATION)
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            n = len(payload.get("results") or payload.get("verifications") or [])
+            verified += n
+            checked += 1
+        except Exception as exc:
+            errors += 1
+            logger.debug("verify: %s failed: %r", inv, exc)
+    report.update(investigations_checked=checked, findings_verified=verified,
+                  errors=errors, budget=budget)
+    if errors and not checked:
+        report.update(status="degraded", detail=f"every attempt failed ({errors})")
+    return report
+
+
+def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None,
+                 tick_fn: Optional[Callable] = None, **_) -> dict:
+    """Seed and tick the bounded self-reflection queue.
+
+    The loop had never ticked (#194) and no state file existed, so its queue was
+    never seeded — not because it lacks input: this host carries 25 copilot
+    session-state files, 3 process logs and 15 Claude Code project logs.
+
+    Safe unattended for two reasons that are worth stating, because a cron job
+    that manufactures findings is otherwise exactly what this project spent a
+    session learning not to build. Findings land in ONE dedicated investigation
+    ("Copilot self-reflection loop"), not scattered through the corpus. And the
+    tick is deterministic parsing with no model call, bounded by max_items and
+    max_lines_per_file.
+    """
+    report = {"pass": "reflect", "status": "ok"}
+    if seed_fn is None or tick_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            seed_fn = seed_fn or _server.reflection_loop_seed
+            tick_fn = tick_fn or _server.reflection_loop_tick
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import the reflection loop: {exc!r}")
+            return report
+    try:
+        seeded = json.loads(seed_fn())
+        report["queued"] = seeded.get("queued", seeded.get("queue_size"))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"seed failed: {exc!r}")
+        return report
+    try:
+        ticked = json.loads(tick_fn(max_items=int(limit or REFLECT_MAX_ITEMS)))
+        report["processed_items"] = ticked.get("processed_items", 0)
+        report["findings_written"] = ticked.get("findings_written", 0)
+        # remaining_queue, NOT queue_size. tick only emits queue_size on the
+        # empty-queue early return, so .get("queue_size", 0) reported a backlog
+        # of 0 while 262 items were still queued — a false zero of exactly the
+        # kind this tier exists to catch.
+        if "remaining_queue" in ticked:
+            report["remaining_queue"] = ticked["remaining_queue"]
+    except Exception as exc:
+        report.update(status="degraded", detail=f"tick failed: {exc!r}")
+    return report
+
+
 PASSES = {
     "index": {"fn": pass_index, "applyable": True},
     "tags": {"fn": pass_tags, "applyable": False},
     "recall": {"fn": pass_recall, "applyable": False},
     "knn_tags": {"fn": pass_knn_tags, "applyable": False},
     "codelink": {"fn": pass_codelink, "applyable": False},
+    "verify": {"fn": pass_verify, "applyable": False},
+    "reflect": {"fn": pass_reflect, "applyable": False},
 }
 
 
