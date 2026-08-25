@@ -155,6 +155,38 @@ def get_session_content(session_id: str):
     except Exception:
         return None
 
+# One file per session id, forever. A session that will never be seen again keeps
+# its counter indefinitely, so the directory grows with every session the machine
+# ever runs. The cache only answers "how many messages had this session synced
+# last time", which is meaningless once the session is over.
+CACHE_TTL_DAYS = int(os.environ.get("HERMES_SYNC_CACHE_TTL_DAYS", "7"))
+
+
+def prune_cache(now: float | None = None) -> int:
+    """Delete cache entries older than CACHE_TTL_DAYS. Returns how many went.
+
+    Fail-open per file: an unreadable or already-deleted entry is skipped rather
+    than aborting a hook that runs at the end of every session.
+    """
+    if CACHE_TTL_DAYS <= 0:
+        return 0
+    cutoff = (now if now is not None else time.time()) - CACHE_TTL_DAYS * 86400
+    removed = 0
+    try:
+        entries = os.listdir(CACHE_DIR)
+    except OSError:
+        return 0
+    for name in entries:
+        fp = os.path.join(CACHE_DIR, name)
+        try:
+            if os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                os.unlink(fp)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def cache_path(session_id: str) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     return os.path.join(CACHE_DIR, hashlib.md5(session_id.encode()).hexdigest()[:12])
@@ -260,6 +292,18 @@ def main():
     session_id = read_stdin_session_id()
     if not session_id:
         sys.exit(0)
+
+    # Prune before doing work. This hook is the only thing that writes the cache,
+    # so it is the only place that can retire it, and end-of-session is when the
+    # entries that will never be read again are created.
+    try:
+        gone = prune_cache()
+        if gone:
+            print(f"[session_end_sync] pruned {gone} cache entr"
+                  f"{'y' if gone == 1 else 'ies'} older than {CACHE_TTL_DAYS}d",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[session_end_sync] cache prune skipped: {e}", file=sys.stderr)
 
     sess = get_session_content(session_id)
     if not sess:

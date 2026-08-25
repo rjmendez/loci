@@ -344,6 +344,9 @@ def _emit_embedding_trigger() -> None:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+RUNS_SEEN_MAX = int(os.environ.get("LOCI_RUNS_SEEN_MAX", "1000"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Loci MLOps self-closing loop")
     ap.add_argument("--findings", default=DEFAULT_FINDINGS,
@@ -425,7 +428,11 @@ def main() -> None:
                     print("[loop] canary held back or drift detected — keeping current model")
 
         state["last_dataset_size"] = new_size
-        state["runs_seen"] = state["runs_seen"] + new_runs
+        # Truncate: runs_seen only exists to skip runs already ingested, so the
+        # tail is what matters. It appended forever and was rewritten in full on
+        # every tick, so the state file grew without bound and got slower to
+        # write as it went.
+        state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
 
     # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
     loop_count = state.get("total_loop_runs", 0) + 1

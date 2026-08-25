@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import os
 import math
 from dataclasses import dataclass
 
@@ -103,10 +104,30 @@ class InMemoryBackend(VerdictBackend):
     must mirror.
     """
 
-    def __init__(self) -> None:
+    #: Bound on retained verdicts. The reference backend is documented as the
+    #: canonical semantics for the persistent ones, and those evict; a list that
+    #: only ever grows is not the same semantics. Also stops a long-lived
+    #: in-memory engine from retaining every verdict for the process lifetime.
+    MAX_VERDICTS = int(os.environ.get("LOCI_INMEMORY_MAX_VERDICTS", "10000"))
+
+    def __init__(self, max_verdicts: int | None = None) -> None:
         self._verdicts: list[Verdict] = []
         self._embeddings: dict[str, list[float]] = {}  # verdict.id -> embedding
+        self._max = int(max_verdicts if max_verdicts is not None else self.MAX_VERDICTS)
         self._lock = asyncio.Lock()
+
+    def _evict(self) -> None:
+        """Drop oldest verdicts past the bound, and their orphaned embeddings.
+
+        Called with the lock held. Evicting the list without the embedding dict
+        would swap one unbounded structure for another.
+        """
+        if self._max <= 0 or len(self._verdicts) <= self._max:
+            return
+        drop = self._verdicts[:-self._max]
+        self._verdicts = self._verdicts[-self._max:]
+        for v in drop:
+            self._embeddings.pop(v.id, None)
 
     async def record(self, verdict: Verdict) -> None:
         # The embedding must be supplied for coalescing; pull it from the caller
@@ -141,6 +162,7 @@ class InMemoryBackend(VerdictBackend):
             self._verdicts.append(verdict)
             if embedding:
                 self._embeddings[verdict.id] = embedding
+            self._evict()
 
     async def recall(
         self,

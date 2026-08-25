@@ -30,7 +30,18 @@ def _load_cache() -> dict:
     return {}
 
 
+# Cap the on-disk embedding cache. Every unseen text adds a 768-float entry and
+# nothing ever removed one, so the file grew for the life of the checkout.
+# Bounded rather than rotated: the cache is a pure speedup — a miss costs one
+# re-embed, never a wrong answer — so dropping the oldest entries is free.
+EMB_CACHE_MAX = int(os.environ.get("LOCI_EMB_CACHE_MAX", "50000"))
+
+
 def _save_cache(cache: dict) -> None:
+    if len(cache) > EMB_CACHE_MAX:
+        # dict preserves insertion order, so this keeps the most recent entries
+        keep = list(cache)[-EMB_CACHE_MAX:]
+        cache = {k: cache[k] for k in keep}
     np.savez_compressed(CACHE_PATH, **cache)
 
 

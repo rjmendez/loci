@@ -29,6 +29,7 @@ import logging
 import json
 import os
 import signal
+import socket
 import socketserver
 import stat
 import sys
@@ -53,6 +54,9 @@ DEFAULT_SOCKET = "~/.hermes/memcheck.sock"
 # A request is at most a single PreToolUse payload; bound how much we will read
 # so a runaway/hostile client cannot exhaust memory.
 _MAX_REQUEST_BYTES = 4 * 1024 * 1024
+# Hooks are latency-sensitive and local; a real client sends its payload and
+# half-closes immediately. Anything slower than this is stalled, not slow.
+_REQUEST_TIMEOUT_S = float(os.environ.get("LOCI_MEMCHECK_READ_TIMEOUT_S", "5"))
 
 
 def _resolve(override: Optional[str]) -> Path:
@@ -170,11 +174,32 @@ class _Handler(socketserver.BaseRequestHandler):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("handle: fail-open swallow: %r", exc)
 
+    def setup(self) -> None:
+        # A client that connects, sends nothing and never half-closes would block
+        # this worker in recv() forever. daemon_threads lets the PROCESS exit, but
+        # the thread is still gone for good and request_queue_size is 64 — enough
+        # stalled clients and the daemon stops answering while looking healthy.
+        super().setup()
+        try:
+            self.request.settimeout(_REQUEST_TIMEOUT_S)
+        except OSError as exc:
+            logger.debug("_Handler.setup: settimeout failed: %r", exc)
+
     def _read_all(self) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = self.request.recv(65536)
+            try:
+                chunk = self.request.recv(65536)
+            except socket.timeout:
+                # Return what arrived. Incomplete JSON falls through to the
+                # existing malformed-payload path rather than hanging the worker.
+                logger.debug("_Handler: read timed out after %ss with %d byte(s)",
+                             _REQUEST_TIMEOUT_S, total)
+                break
+            except OSError as exc:
+                logger.debug("_Handler: read failed: %r", exc)
+                break
             if not chunk:
                 break
             chunks.append(chunk)
