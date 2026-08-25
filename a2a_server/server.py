@@ -435,6 +435,9 @@ def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bear
 _TOTP_WINDOW = 60
 _TOTP_MAX_ATTEMPTS = 5
 _totp_attempts: dict = collections.defaultdict(list)
+# Sweep idle client-IP keys once the dict exceeds this. Chosen well above any
+# plausible concurrent-client count so the sweep is rare and its cost amortised.
+_TOTP_SWEEP_AFTER = 1024
 _totp_attempts_lock = threading.Lock()
 
 
@@ -454,12 +457,22 @@ def _verify_totp(request: Request,
         client_ip = request.client.host if request.client else 'unknown'
         now = time.monotonic()
         with _totp_attempts_lock:
-            attempts = _totp_attempts[client_ip]
-            # Evict timestamps older than the window
-            _totp_attempts[client_ip] = [t for t in attempts if now - t < _TOTP_WINDOW]
-            if len(_totp_attempts[client_ip]) >= _TOTP_MAX_ATTEMPTS:
+            # Evict timestamps older than the window, and drop the key when it
+            # empties. Pruning only the lists left one dict entry per client IP
+            # forever — an unauthenticated caller could grow it by rotating
+            # source addresses, and a busy server grew it just by being used.
+            fresh = [t for t in _totp_attempts[client_ip] if now - t < _TOTP_WINDOW]
+            if len(fresh) >= _TOTP_MAX_ATTEMPTS:
+                _totp_attempts[client_ip] = fresh
                 raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
-            _totp_attempts[client_ip].append(now)
+            fresh.append(now)
+            _totp_attempts[client_ip] = fresh
+            # Opportunistic sweep: bounded work, keeps idle keys from accumulating
+            # between requests without needing a background task.
+            if len(_totp_attempts) > _TOTP_SWEEP_AFTER:
+                for ip in [k for k, v in _totp_attempts.items()
+                           if not v or now - v[-1] >= _TOTP_WINDOW]:
+                    del _totp_attempts[ip]
         if not pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1):
             raise HTTPException(status_code=401, detail='Invalid TOTP code')
 
