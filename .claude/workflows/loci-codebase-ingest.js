@@ -4,7 +4,7 @@ export const meta = {
   whenToUse: 'Run on demand after substantial changes, to refresh the loci-codebase investigation. Not CI-triggered: it needs a live Loci MCP server and its Qdrant, which a hosted runner cannot reach.',
   phases: [
     { title: 'Read', detail: 'Read each subsystem in parallel — purpose, key functions, data flows, invariants' },
-    { title: 'Store', detail: 'Write structured module docs to loci-codebase Loci investigation via MCP' },
+    { title: 'Store', detail: 'Retire the prior doc for each module, then write the new one via MCP' },
   ],
 }
 
@@ -185,7 +185,23 @@ LAST COMMIT: ${doc.last_commit || 'unknown'}
 SOURCE FILES: ${doc.files.join(', ')}
 ---
 
-Call mcp__loci__investigation_store with:
+FIRST, supersede the previous doc for this module, if any. This workflow appends
+a fresh full doc every run and has never retired the old one, so the corpus now
+holds four "MODULE: mcp-server-tools" findings from four runs — all finding_type
+"observed", all confidence "high", and the June ones state 25 MCP tools where
+there are now 41. A RAG query gets three answers and nothing marks two of them
+stale.
+
+Steps:
+1. Call mcp__loci__investigation_search with investigation_id "${INV}" and
+   query "module:${doc.module_id}" to find prior findings for THIS module.
+2. For each prior finding whose text starts with "MODULE: ${doc.module_id}" and
+   whose resolution is still "open", call mcp__loci__finding_resolve with
+   resolution "superseded". Match on the module id, not on similarity — a
+   neighbouring module's doc must not be retired by mistake.
+3. If there are none, continue; a first run has nothing to supersede.
+
+THEN call mcp__loci__investigation_store with:
 - investigation_id: "${INV}"
 - finding_type: "observed"
 - text: (the full text above)
@@ -193,7 +209,7 @@ Call mcp__loci__investigation_store with:
 - confidence: "high"
 - tags: ["architecture", "module:${doc.module_id}", "auto-ingested"]
 
-Return the finding_id from the response.`,
+Return JSON: {"finding_id": "<new id>", "superseded": <count of prior docs retired>}.`,
     { label: `store:${doc.module_id}`, phase: 'Store' }
   )
 ))
