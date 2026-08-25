@@ -1363,8 +1363,77 @@ _STOPWORD_MATCH_TOKENS = {
 }
 
 _NON_EVIDENCE_TOKENS = _GENERIC_MATCH_TOKENS | _STOPWORD_MATCH_TOKENS
+# The semantic lane's absolute-score gate. It is a cheap PRE-FILTER, never the
+# adjudicator: a filtered top-k search cannot return "no match" -- query_points
+# with a must-match on investigation_id always returns that investigation's k
+# nearest points, however unrelated the claim -- so its score is a rank-1
+# similarity inside a small pool, not a probability of support. Measured on the
+# live corpus (300 claims copied verbatim OUT of a different investigation):
+# 264/300 = 88.0% were reported supported on this gate alone, and in 264/264 the
+# lexical lane had returned nothing. 96.7% of those negatives scored inside the
+# positive range, so no other constant fixes it -- see _semantic_ref_corroborated.
 _QDRANT_SUPPORT_MIN_SCORE = 0.55
 _QDRANT_PRECHECK_MIN_SCORE = 0.5
+
+# Neighbourhood fetched per claim so a hit's margin over its own pool is
+# measurable. Only the top _SEMANTIC_REF_LIMIT are surfaced as refs, so the
+# response shape is unchanged for existing consumers.
+_SEMANTIC_NEIGHBOURHOOD_K = 25
+_SEMANTIC_REF_LIMIT = 5
+
+# Corroboration thresholds for the semantic lane. Fitted on 600 probes from the
+# live corpus (300 positive: a finding's text checked against its own
+# investigation with its own indexed point excluded; 300 negative: a finding's
+# text checked against a DIFFERENT investigation). Operating point of the
+# conjunction below, replayed offline in tests/fixtures/semantic_gate_probe.json:
+#   false support  88.0% -> 1.7%   (n=300 negatives)
+#   true support  100.0% -> 80.3%  (n=300 positives)
+# Neither half separates the classes alone: best-ref lexical overlap is NEG p95
+# 0.162 vs POS p05 0.070, and best-ref margin over the pool median is NEG p95
+# 0.1013 vs POS p05 0.0528. The conjunction is what carries the measurement.
+_SEMANTIC_SUPPORT_MIN_OVERLAP = 0.15
+_SEMANTIC_SUPPORT_MIN_MARGIN = 0.05
+# 46.3% of the negative probes landed on investigations with fewer than 8 indexed
+# points, where a "margin over the pool median" is not a meaningful statistic.
+#
+# This rule is NEARLY A NO-OP on the headline numbers and should not be read as
+# carrying them: removing it entirely moves false support 1.67% -> 2.00% and true
+# support 80.33% -> 80.67%, about 0.3pt either way. It is kept because it fails
+# CLOSED -- it denies support rather than asserting it -- and because a margin
+# against a 3-point pool is undefined, not merely noisy. pool_size rides on every
+# surfaced ref, so a caller can always see why a candidate was not promoted.
+_SEMANTIC_SUPPORT_MIN_POOL = 8
+
+
+def _semantic_ref_corroborated(ref: dict) -> bool:
+    """Is a dense-similarity hit distinctive enough, and on-topic enough, to count
+    as support on its own?
+
+    Two independent conditions, both measured above:
+      * ``lexical_overlap`` -- does the hit actually mention what the claim
+        mentions, computed against the FULL payload text (not the 260-char
+        snippet, which biases long findings).
+      * ``score - pool_median`` -- is this hit distinctive inside its own
+        neighbourhood, or is the whole pool equally close to the claim?
+
+    A pool smaller than ``_SEMANTIC_SUPPORT_MIN_POOL`` returns False: the margin
+    is undefined there and the tool must not assert support it cannot back.
+    Callers that only want candidates (dedup advice, contamination scope) can
+    reuse this once they have their own measurement.
+    """
+    try:
+        pool_size = int(ref.get("pool_size") or 0)
+        if pool_size < _SEMANTIC_SUPPORT_MIN_POOL:
+            return False
+        overlap = float(ref.get("lexical_overlap") or 0.0)
+        if overlap < _SEMANTIC_SUPPORT_MIN_OVERLAP:
+            return False
+        margin = ref.get("margin")
+        if margin is None:
+            margin = float(ref.get("score") or 0.0) - float(ref.get("pool_median") or 0.0)
+        return float(margin) >= _SEMANTIC_SUPPORT_MIN_MARGIN
+    except (TypeError, ValueError):
+        return False
 
 
 def _normalize_claims(claims: str | list[str]) -> list[str]:
@@ -1495,7 +1564,7 @@ def build_validation_evidence(
 def _search_qdrant_claim_evidence(
     claim: str,
     investigation_id: str,
-    limit: int = 5,
+    limit: int = _SEMANTIC_REF_LIMIT,
 ) -> tuple[list[dict], dict]:
     client, col = _get_qdrant()
     qdrant_url = os.environ.get("QDRANT_URL", "")
@@ -1519,31 +1588,53 @@ def _search_qdrant_claim_evidence(
         search_filter = Filter(must=[
             FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id))
         ])
+        surfaced = max(1, min(limit, _SEMANTIC_NEIGHBOURHOOD_K))
         result = client.query_points(
             collection_name=col,
             query=vector,
             using="dense",
             query_filter=search_filter,
-            limit=max(1, min(limit, 20)),
+            limit=max(surfaced, _SEMANTIC_NEIGHBOURHOOD_K),
             with_payload=True,
         )
+        points = list(result.points)
+        pool_scores = [float(point.score) for point in points]
+        pool_median = _median(pool_scores)
+        claim_tokens = tokenize(claim)
         matches = []
-        for point in result.points:
+        for point in points[:surfaced]:
             payload = point.payload or {}
             text = str(payload.get("text") or payload.get("output") or "")
+            score = round(float(point.score), 4)
             matches.append({
                 "evidence_id": str(payload.get("id") or point.id),
                 "record_type": str(payload.get("record_type") or payload.get("type") or "unknown"),
                 "source": str(payload.get("source") or payload.get("tool") or ""),
                 "ts": payload.get("ts"),
                 "origin": "qdrant",
-                "score": round(float(point.score), 4),
+                "score": score,
+                # Computed here, where the FULL payload text is still in hand --
+                # the ref only carries a 260-char snippet from here on.
+                "lexical_overlap": round(_lexical_match_score(claim_tokens, tokenize(text)), 4),
+                "pool_median": pool_median,
+                "pool_size": len(pool_scores),
+                "margin": round(score - pool_median, 4),
                 "snippet": text.replace("\n", " ").strip()[:260],
             })
         return matches, status
     except Exception as exc:
         status["error"] = str(exc)
         return [], status
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(ordered[mid], 4)
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 4)
 
 
 def _lexical_match_score(claim_tokens: set[str], evidence_tokens: set[str]) -> float:
@@ -3561,6 +3652,13 @@ def investigation_pre_answer_check(
     detection are available on subsequent calls. Each claim result gains three
     fields: ``verdict_type`` (claim_supported / claim_contradicted /
     claim_unsupported), ``prior_occurrences``, and ``verdict_conflict``.
+
+    The dense-similarity lane is a candidate generator, not an adjudicator. A
+    neighbour only enters ``support_refs`` (and the confidence chain) when
+    ``_semantic_ref_corroborated`` holds; the rest are surfaced, labelled, under
+    ``semantic_candidates``. ``support_basis`` reports which lane decided:
+    lexical / semantic_corroborated / semantic_candidate_only / none, and
+    ``supported`` is True only for the first two.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -3602,11 +3700,29 @@ def investigation_pre_answer_check(
         elif qdrant_status.get("query_attempted"):
             qdrant_query_success = True
         qdrant_matches_total += len(qdrant_refs)
+        lexical_support = bool(claim_support_refs)
+        semantic_candidates: list[dict] = []
+        semantic_corroborated = False
         for ref in qdrant_refs:
             score = float(ref.get("score", 0.0))
             if score < _QDRANT_SUPPORT_MIN_SCORE:
                 continue
-            claim_support_refs.append(_make_ref(ref, "support", score=score))
+            made = _make_ref(ref, "support", score=score)
+            if _semantic_ref_corroborated(made):
+                claim_support_refs.append(made)
+                semantic_corroborated = True
+            else:
+                made["match_type"] = "semantic_candidate"
+                semantic_candidates.append(made)
+
+        if lexical_support:
+            support_basis = "lexical"
+        elif semantic_corroborated:
+            support_basis = "semantic_corroborated"
+        elif semantic_candidates:
+            support_basis = "semantic_candidate_only"
+        else:
+            support_basis = "none"
 
         if claim_support_refs:
             support_count += 1
@@ -3638,7 +3754,9 @@ def investigation_pre_answer_check(
             "supported": bool(claim_support_refs),
             "contradicted": bool(claim_contradiction_refs),
             "ambiguous": bool(claim_support_refs and benign_context_refs),
+            "support_basis": support_basis,
             "support_refs": claim_support_refs[:8],
+            "semantic_candidates": semantic_candidates[:8],
             "contradiction_refs": claim_contradiction_refs[:8],
             "benign_context_refs": benign_context_refs,
         })
@@ -3986,6 +4104,18 @@ def investigation_evidence_precheck(
         lexical_matches.append(_make_ref(record, "similar", score=score))
 
     lexical_matches.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    # Shared helper, and the corroboration work for investigation_pre_answer_check
+    # changed it underneath this caller: it now fetches a k=25 neighbourhood (one
+    # larger payload per call, still 5 refs surfaced) and stamps lexical_overlap,
+    # pool_median, pool_size and margin on every ref.
+    #
+    # Those fields are INFORMATIONAL here. This tool is advisory — it answers
+    # "has something like this already been recorded" to avoid a duplicate call —
+    # so a false "similar evidence exists" costs a skipped lookup, not a false
+    # assertion in an answer. _semantic_ref_corroborated is deliberately NOT
+    # applied: its thresholds were fitted on pre-answer-check probes and nobody
+    # has measured this tool's own positive/negative distributions. Gating on an
+    # unmeasured threshold is the failure this whole change exists to remove.
     qdrant_refs, qdrant_status = _search_qdrant_claim_evidence(query, investigation_id, limit=5)
     qdrant_enabled = bool(os.environ.get("QDRANT_URL", ""))
     qdrant_available = bool(qdrant_status.get("available"))

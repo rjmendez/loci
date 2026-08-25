@@ -229,6 +229,12 @@ def _load_retracted_ids(investigation_id: str) -> set[str]:
     return {fid for fid, active in state.items() if active}
 
 
+# Corroboration evidence carried alongside a dense-similarity score. Every lane
+# builds its refs through _make_ref, so the passthrough lives here rather than at
+# the one call site that needs it; lexical records simply carry none of these.
+_REF_EVIDENCE_KEYS = ("lexical_overlap", "pool_median", "pool_size", "margin")
+
+
 def _make_ref(record: dict, match_type: str, score: float | None = None) -> dict:
     ref = {
         "evidence_id": record.get("evidence_id"),
@@ -241,6 +247,14 @@ def _make_ref(record: dict, match_type: str, score: float | None = None) -> dict
     }
     if score is not None:
         ref["score"] = round(score, 4)
+    for key in _REF_EVIDENCE_KEYS:
+        if record.get(key) is not None:
+            ref[key] = record[key]
+    if "margin" not in ref and ref.get("score") is not None and record.get("pool_median") is not None:
+        try:
+            ref["margin"] = round(ref["score"] - float(record["pool_median"]), 4)
+        except (TypeError, ValueError):
+            pass
     return ref
 
 
