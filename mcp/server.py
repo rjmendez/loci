@@ -1616,6 +1616,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         raw_findings = [f for f in raw_findings if str(f.get("id", "")) not in retracted]
     findings = _tag_finding_ids(raw_findings, investigation_id)
     audit_entries = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
+    audit_lane = _audit_lane_status(findings, audit_entries)
 
     try:
         unsupported = run_provenance(
@@ -1658,6 +1659,45 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
         "hallucination_candidates": candidates,
+        "audit_lane": audit_lane,
+    }
+
+
+def _audit_lane_status(findings: list[dict], audit_entries: list[dict]) -> dict:
+    """Whether provenance verdicts on this investigation mean anything.
+
+    run_provenance flags every observed finding without a matching receipt, which
+    is the documented per-finding contract and is correct. But with NO receipts
+    at all it flags every observed finding it is given, and a verdict that fires
+    on 100% of its inputs carries no information.
+
+    Measured on the live corpus: 1 of 140 investigations has an audit.jsonl, and
+    nothing has written a receipt since 2026-06-20. The cause is structural —
+    audit_log is an MCP tool an agent has to remember to call after every
+    invocation, described as a "post-call hook" but not hooked to anything. When
+    whatever workflow was calling it stopped, the lane went silent and nothing
+    said so.
+
+    This does not change any verdict. It reports the lane's state so a caller can
+    say "no receipts exist" instead of "every observed finding is unsupported" —
+    two very different claims that were indistinguishable in the output.
+    """
+    observed = sum(1 for f in findings or []
+                   if (f.get("type") or f.get("record_type")) == "observed"
+                   and str(f.get("text", "") or "").strip())
+    receipts = sum(1 for e in audit_entries or [] if isinstance(e, dict))
+    if receipts:
+        return {"status": "present", "receipts": receipts, "observed_findings": observed}
+    return {
+        "status": "empty",
+        "receipts": 0,
+        "observed_findings": observed,
+        "verdicts_informative": False,
+        "detail": (
+            f"no audit receipts for this investigation, so all {observed} observed "
+            "finding(s) are reported unsupported by construction. This is the "
+            "absence of evidence about provenance, not evidence of bad provenance."
+        ),
     }
 
 
@@ -4242,7 +4282,7 @@ def memory_self_check(
             else []
         )
         all_candidates.extend(inv_candidates)
-        per_investigation.append({
+        entry = {
             "investigation_id": inv_id,
             "counts": {
                 "unsupported_observed": sum(
@@ -4255,7 +4295,15 @@ def memory_self_check(
             },
             "verdicts": [_verdict_view(v) for v in inv_verdicts],
             "hallucination_candidates": inv_candidates,
-        })
+        }
+        # Carry the lane's state next to the count it explains. An
+        # unsupported_observed count computed against zero receipts is the
+        # investigation's observed-finding count wearing a different name, and
+        # reporting it bare invites reading absence of evidence as evidence.
+        lane = computed.get("audit_lane") or {}
+        if "provenance" in requested and lane.get("status") == "empty":
+            entry["audit_lane"] = lane
+        per_investigation.append(entry)
 
     recorded = False
     if record and qdrant_available:
