@@ -284,8 +284,11 @@ def link_findings(ks, finding_rows: list[dict], index=None) -> int:
             if not fid or not text:
                 continue
             fid = str(fid)
-            for sid, _conf in extract_symbol_refs(str(text), index):
-                pairs.append({"f": fid, "s": sid})
+            for sid, conf in extract_symbol_refs(str(text), index):
+                # Carried, not dropped. A consumer that cannot tell a distinctive
+                # type match from a bare-word one has to guess, and every consumer
+                # guesses differently.
+                pairs.append({"f": fid, "s": sid, "c": conf})
 
         if not pairs:
             return 0
@@ -295,7 +298,8 @@ def link_findings(ks, finding_rows: list[dict], index=None) -> int:
             ks._exec(
                 "UNWIND $rows AS r "
                 "MATCH (f:Finding {id:r.f}), (s:CodeSymbol {id:r.s}) "
-                "MERGE (f)-[:REFERENCES]->(s)",
+                "MERGE (f)-[e:REFERENCES]->(s) "
+                "SET e.confidence = r.c",
                 {"rows": chunk},
             )
             created += len(chunk)

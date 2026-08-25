@@ -83,6 +83,9 @@ class TestIndexPass(unittest.TestCase):
         _corpus(tmp, {"inv": [_f(i) for i in disk_ids]})
         client = _Client(indexed_ids)
         fake_ops = mock.Mock()
+        # pass_index refuses unless retention resolves to 0 — connecting runs the
+        # startup purge, which is the damage this pass exists to repair.
+        fake_ops._retention_days.return_value = 0
         fake_ops._get_qdrant.return_value = (client, "hermes_memory")
         fake_ops._qdrant_upsert.side_effect = lambda pid, text, payload: client.upserts.append(pid)
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}), \
@@ -127,6 +130,7 @@ class TestIndexPass(unittest.TestCase):
             tmp = pathlib.Path(td)
             _corpus(tmp, {"inv": [_f("a")]})
             fake_ops = mock.Mock()
+            fake_ops._retention_days.return_value = 0
             fake_ops._get_qdrant.return_value = (None, None)
             with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}), \
                  mock.patch.object(groom, "MEMORY_DIR", tmp):

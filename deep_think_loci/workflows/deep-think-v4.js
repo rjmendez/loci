@@ -67,7 +67,7 @@ const SYNTH_SCHEMA = {
     action_items: {
       type: 'array', items: {
         type: 'object', required: ['title', 'severity', 'file', 'description'],
-        properties: {
+        properties: { finding_ids: { type: 'array', items: { type: 'string' } },
           title:       { type: 'string' },
           severity:    { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
           file:        { type: 'string' },
@@ -131,7 +131,7 @@ log(`Ideate: ${gens.length}/${TARGETS.length} generators, ${allIdeas.length} ide
 // ── Write ──
 phase('Write')
 const wrote = await agent(
-  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}".\n\nFor EACH idea:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type="inferred", text="<target>: <idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<target>")\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
+  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}".\n\nFor EACH idea:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type=<TYPE>, text="<target>: <idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<target>", code_refs=<REFS>, derived_from=<PARENT>)\n\n<TYPE> is NOT always "inferred" — choose per idea, because downstream tools key off it:\n  observed  — stated directly by the file you read\n  inferred  — reasoned from what you read\n  gap       — something that should be checked and has not been\n  assumed   — a working hypothesis with no evidence yet\nConflict detection only fires on gap/assumed, so mislabelling everything "inferred" silently disables it.\n\n<REFS> is a list of "path:line" strings — the COLON form, e.g. ["mcp/graph/linker.py:287"]. Prose like "linker.py line 287" does not match and code grounding will never fire. Omit when the idea names no specific line.\n<PARENT> is a finding_id this idea builds on, when one exists; it is what retraction lineage and aggregate confidence walk. Omit when the idea stands alone.\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
   { label: 'writer', phase: 'Write', model: 'haiku', schema: WROTE_SCHEMA }
 )
 log(`Write: attempted=${wrote?.attempted}, persisted=${(wrote?.finding_ids||[]).length}`)
@@ -169,7 +169,7 @@ const makeSynthPrompt = (group, idx) => {
   const gateNote = RAG_MODE
     ? `Then filter each result set through the grounding gate at ${GATE} (threshold ${THRESH}) to kill cross-target bleed before reasoning.`
     : ''
-  return `Adversarial Opus reviewer for group ${idx+1}: ${names || '(empty — return empty action_items)'}\n\n1. Search: ${queries}\n${gateNote}\n2. For each idea: try to REFUTE it (wrong diagnosis, already handled, impractical). Keep only ideas that survive.\n3. Return domain="${names}", top_findings that survived, red_team_refutals for killed ideas, and action_items with severity+file+description.\n\nIf group is empty, return domain="empty", empty arrays.`
+  return `Adversarial Opus reviewer for group ${idx+1}: ${names || '(empty — return empty action_items)'}\n\n1. Search: ${queries}\n${gateNote}\n2. For each idea: try to REFUTE it (wrong diagnosis, already handled, impractical). Keep only ideas that survive.\n3. Return domain="${names}", top_findings that survived, red_team_refutals for killed ideas, and action_items with severity+file+description.\n4. Every action_item MUST carry finding_ids — the ids returned by the search above that support it. An item you cannot attribute is one the Final integrity check will drop, and the phase after that files to GitHub.\n${NO_FAB}\n\nIf group is empty, return domain="empty", empty arrays.`
 }
 
 const synthResults = (await parallel(
@@ -184,7 +184,7 @@ log(`Synthesize: ${synthResults.length}/3 complete, ${confirmedItems.length} con
 // ── Final ──
 phase('Final')
 const final = await agent(
-  `Final Opus synthesis for "${RUN}".\n\nAll confirmed items from 3 domain reviewers:\n${JSON.stringify(confirmedItems, null, 2)}\n\n1. Merge and deduplicate (same bug from multiple angles = one item)\n2. Rank by (critical > high > medium > low) × impact on core reliability\n3. Write a 3-sentence summary\n4. Return ranked_actions (max 20) each with rank/title/severity/file/description/issue_title\n5. List gaps_identified (areas not covered)\n\nAlso store the summary:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type="observed", text="FINAL SYNTHESIS: <summary>", source="${SRC('final','opus')}", confidence="high", tags="dt_run:${RUN},final-synthesis")`,
+  `Final Opus synthesis for "${RUN}".\n\n0. GROUND FIRST — before reasoning, call mcp__loci__investigation_load(investigation_id="${RUN}", last_n_findings=120) and treat THAT as the record of what was actually persisted. The JSON below is in-process state from the reviewers; it is not evidence that anything was stored.\n\nAll confirmed items from 3 domain reviewers:\n${JSON.stringify(confirmedItems, null, 2)}\n\n1. Merge and deduplicate (same bug from multiple angles = one item)\n2. Rank by (critical > high > medium > low) × impact on core reliability\n3. Write a 3-sentence summary\n4. Return ranked_actions (max 20) each with rank/title/severity/file/description/issue_title\n5. List gaps_identified (areas not covered)\n6. INTEGRITY CHECK — for every action you return, confirm it traces to a finding present in the investigation_load result. DROP any item you cannot trace, and record each dropped item in gaps_identified as "UNGROUNDED (dropped): <title>". The next phase files these to GitHub, so an item that survives this step is a claim you are making publicly.\n${NO_FAB}\n\nAlso store the summary:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type="observed", text="FINAL SYNTHESIS: <summary>", source="${SRC('final','opus')}", confidence="high", tags="dt_run:${RUN},final-synthesis")`,
   { label: 'final', phase: 'Final', model: 'opus', schema: FINAL_SCHEMA }
 )
 log(`Final: ${(final?.ranked_actions||[]).length} ranked actions`)
