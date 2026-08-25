@@ -56,7 +56,16 @@ if os.path.exists(_ENV):
 
 # ── config ───────────────────────────────────────────────────────────────────────
 LOCAL_A2A_URL  = os.environ.get("HERMES_A2A_URL", "http://127.0.0.1:8201")
-LOCAL_A2A_TOKEN = os.environ.get("HERMES_A2A_TOKEN", "changeme")
+# Empty, not "changeme". The A2A server reads the same variable and defaults it
+# to '' precisely so an unset token fails closed; defaulting the client to a
+# guessable literal handed that back. A shared secret with a published value is
+# not a shared secret, and the failure was silent in the direction that matters —
+# authenticating rather than refusing.
+LOCAL_A2A_TOKEN = os.environ.get("HERMES_A2A_TOKEN", "")
+if not LOCAL_A2A_TOKEN:
+    print('WARNING: HERMES_A2A_TOKEN is not set. The bridge will be rejected by any '
+          'server that enforces bearer auth. Generate one with: '
+          'python3 -c "import secrets;print(secrets.token_hex(32))"', flush=True)
 LOOKBACK_MIN   = int(os.environ.get("BRIDGE_LOOKBACK_MIN", "30"))
 MIN_IMP        = float(os.environ.get("BRIDGE_MIN_IMP", "0.5"))
 MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
