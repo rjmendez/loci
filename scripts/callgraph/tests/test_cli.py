@@ -125,7 +125,7 @@ def test_registry_lists_known_surfaces(capsys):
     code, out = _run(capsys, ["registry", "--rev", "HEAD"])
     assert code == 0
     assert "reg:mcp/server.py::mcp.tool" in out
-    assert "members= 41" in out or "members=41" in out
+    assert "members= 42" in out or "members=42" in out
     assert "reg:a2a_server/server.py::_SKILL_MAP" in out
 
 

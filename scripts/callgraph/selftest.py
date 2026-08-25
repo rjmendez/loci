@@ -315,7 +315,7 @@ def _check_real_corpus():
     assert bad == [], [n.id for n in bad]
     from collections import Counter
     by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    assert by_rule["DEC-tool"] == 42, dict(by_rule)
+    assert by_rule["DEC-tool"] == 43, dict(by_rule)
     assert by_rule["DEC-route"] == 6, dict(by_rule)
     assert by_rule["DEC-mcp-route"] == 1, dict(by_rule)
     assert by_rule["MAN-LOOP"] == 31, dict(by_rule)
