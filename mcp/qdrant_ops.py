@@ -474,6 +474,28 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
 # but anything >= 1024 is defensible and the 1024-vs-2048 gap was noise.
 RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
 
+# One definition of the quantized-search parameters, used by every query path.
+# rescore=True re-scores ANN candidates against the original full-precision
+# vectors, recovering the ~0.5-1% recall INT8 costs; oversampling=2.0 gives the
+# rescore twice the candidates to choose from.
+#
+# Built lazily because qdrant_client is an optional import at module scope.
+_QUANT_SEARCH_PARAMS = None
+
+
+def _quant_search_params():
+    """Shared SearchParams. Was hand-built at each call site, and the site that
+    forgot it (retrieval_selftest) was then diagnosing a different search path
+    from the one production runs."""
+    global _QUANT_SEARCH_PARAMS
+    if _QUANT_SEARCH_PARAMS is None:
+        from qdrant_client.models import SearchParams, QuantizationSearchParams
+        _QUANT_SEARCH_PARAMS = SearchParams(
+            quantization=QuantizationSearchParams(rescore=True, oversampling=2.0)
+        )
+    return _QUANT_SEARCH_PARAMS
+
+
 
 def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
     """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
@@ -556,13 +578,7 @@ def _qdrant_similarity_search(
     output_k = min(rerank_top_k, limit) if rerank_top_k is not None else limit
     fetch_limit = output_k * 5 if rerank else limit * 4
 
-    from qdrant_client.models import SearchParams, QuantizationSearchParams
-    # rescore=True: after ANN candidate selection from quantized index, re-score
-    # with original full-precision vectors. Recovers ~0.5-1% recall lost to INT8.
-    # oversampling fetches 2x candidates to give rescore more to work with.
-    _search_params = SearchParams(
-        quantization=QuantizationSearchParams(rescore=True, oversampling=2.0)
-    )
+    _search_params = _quant_search_params()
 
     sparse_vec = _embed_sparse(query)
     if sparse_vec is not None:
@@ -725,7 +741,11 @@ def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
         )
         return out
 
-    kwargs = {"collection_name": name, "query": query_vec, "limit": limit, "with_payload": False}
+    # search_params matters here: without it this probe queries a different path
+    # from the one production uses, so a green selftest would not mean the real
+    # search works.
+    kwargs = {"collection_name": name, "query": query_vec, "limit": limit,
+              "with_payload": False, "search_params": _quant_search_params()}
     try:
         dense_name = _dense_vector_name(client, name) if shape["named"] else None
         if dense_name:
@@ -766,7 +786,7 @@ def _qdrant_search_collection(
     fetch_limit = limit * 5
     sparse_vec = _embed_sparse(query)
 
-    from qdrant_client.models import Prefetch, FusionQuery, Fusion, SearchParams, QuantizationSearchParams
+    from qdrant_client.models import Prefetch, FusionQuery, Fusion
 
     # Detect whether this collection uses named vectors (dense/sparse) or a flat vector.
     try:
@@ -783,7 +803,7 @@ def _qdrant_search_collection(
     if has_named_vectors and dense_name is None:
         has_named_vectors = False        # nothing nameable to query; fall through to flat
 
-    _qsp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
+    _qsp = _quant_search_params()
 
     if has_named_vectors and has_sparse_index and sparse_vec is not None:
         result = client.query_points(
