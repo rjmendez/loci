@@ -125,3 +125,61 @@ class TestTOTPAuth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTOTPAttemptKeyLeak(unittest.TestCase):
+    """The rate-limit dict pruned timestamps but never its keys.
+
+    Each distinct client IP left an entry behind forever — an unauthenticated
+    caller could grow it by rotating source addresses, and a busy server grew it
+    just by being used. Only the per-IP lists were bounded.
+    """
+
+    # Read via getattr with a fallback ON PURPOSE. Referencing the new constant
+    # directly made this test fail on the old code with AttributeError — proving
+    # the constant was absent, not that keys leaked. With a fallback the test
+    # populates the dict, makes a request, and asserts it shrank, which is the
+    # behaviour under test.
+    SWEEP_AFTER = getattr(a2a_server, "_TOTP_SWEEP_AFTER", 1024)
+
+    def setUp(self):
+        a2a_server._totp_attempts.clear()
+
+    def tearDown(self):
+        a2a_server._totp_attempts.clear()
+
+    def _post_one_valid_request(self):
+        """One authenticated request, using this file's mock-pyotp convention."""
+        with patch.object(a2a_server, "TOTP_SEED", _TEST_SEED), \
+             patch.object(a2a_server, "pyotp") as mock_pyotp_mod:
+            mock_pyotp_mod.TOTP.return_value.verify.return_value = True
+            client = TestClient(a2a_server.app, raise_server_exceptions=False)
+            client.post("/a2a", json=_rpc("tasks/list"),
+                        headers={**_HEADERS, "X-TOTP": "000000"})
+
+    def test_expired_keys_are_swept_not_just_emptied(self):
+        stale = time.monotonic() - (a2a_server._TOTP_WINDOW + 60)
+        for i in range(self.SWEEP_AFTER + 5):
+            a2a_server._totp_attempts[f"10.0.{i // 256}.{i % 256}"] = [stale]
+        before = len(a2a_server._totp_attempts)
+        self.assertGreater(before, self.SWEEP_AFTER)
+
+        self._post_one_valid_request()
+
+        after = len(a2a_server._totp_attempts)
+        self.assertLess(after, before,
+                        "stale client-IP keys must be removed, not merely emptied")
+        self.assertLessEqual(after, 2, f"expected a swept dict, got {after} keys")
+
+    def test_a_live_client_is_not_swept(self):
+        """The sweep must only remove keys whose window has fully expired."""
+        now = time.monotonic()
+        a2a_server._totp_attempts["10.1.1.1"] = [now]
+        for i in range(self.SWEEP_AFTER + 5):
+            a2a_server._totp_attempts[f"10.9.{i // 256}.{i % 256}"] = [
+                now - (a2a_server._TOTP_WINDOW + 60)]
+
+        self._post_one_valid_request()
+
+        self.assertIn("10.1.1.1", a2a_server._totp_attempts,
+                      "a client inside its window must survive the sweep")
