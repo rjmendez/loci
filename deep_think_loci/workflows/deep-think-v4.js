@@ -43,9 +43,25 @@ const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
 const floorRank = SEV_RANK[FILE_FLOOR] || 2
 
 // ── Schemas ──
+// Ideas carry their own classification. The generator already reasoned about the
+// file, so it is the cheapest place to know whether a claim was read or inferred
+// and which line it came from — and it keeps the writer single-purpose.
 const IDEA_SCHEMA = {
   type: 'object', required: ['target', 'ideas'],
-  properties: { target: { type: 'string' }, ideas: { type: 'array', items: { type: 'string', minLength: 20 } } },
+  properties: {
+    target: { type: 'string' },
+    ideas: {
+      type: 'array',
+      items: {
+        type: 'object', required: ['text', 'finding_type'],
+        properties: {
+          text: { type: 'string', minLength: 20 },
+          finding_type: { type: 'string', enum: ['observed', 'inferred', 'gap', 'assumed'] },
+          code_refs: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  },
 }
 const WROTE_SCHEMA = {
   type: 'object', required: ['attempted', 'finding_ids'],
@@ -66,7 +82,7 @@ const SYNTH_SCHEMA = {
     red_team_refutals: { type: 'array', items: { type: 'string' } },
     action_items: {
       type: 'array', items: {
-        type: 'object', required: ['title', 'severity', 'file', 'description'],
+        type: 'object', required: ['title', 'severity', 'file', 'description', 'finding_ids'],
         properties: { finding_ids: { type: 'array', items: { type: 'string' } },
           title:       { type: 'string' },
           severity:    { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
@@ -83,8 +99,13 @@ const FINAL_SCHEMA = {
     summary: { type: 'string' },
     ranked_actions: {
       type: 'array', items: {
-        type: 'object', required: ['rank', 'title', 'severity', 'file', 'description', 'issue_title'],
+        // finding_ids is REQUIRED: the integrity check in the Final prompt asks the
+        // agent to drop untraceable items, and a schema that does not carry the
+        // trace makes that instruction unverifiable by construction — the next
+        // phase files these publicly.
+        type: 'object', required: ['rank', 'title', 'severity', 'file', 'description', 'issue_title', 'finding_ids'],
         properties: {
+          finding_ids: { type: 'array', items: { type: 'string' } },
           rank:        { type: 'integer' },
           title:       { type: 'string' },
           severity:    { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
@@ -114,7 +135,7 @@ const gens = (await parallel(TARGETS.map((t, i) => () => {
   let prompt
   if (RAG_MODE) {
     const gateBlock = `GROUNDING GATE (run BEFORE reasoning): after mcp__loci__rag_context_search, write retrieved findings as JSON [{"id","text"}] to /tmp/dt_${RUN}_${t.name}_cand.json, then Bash: python3 ${GATE} --query ${JSON.stringify(t.focus)} --threshold ${THRESH} --in /tmp/dt_${RUN}_${t.name}_cand.json --out /tmp/dt_${RUN}_${t.name}_kept.json — use ONLY kept findings.`
-    prompt = `Ideation generator #${i+1} for TARGET "${t.name}".\nFocus: ${t.focus}\n\n1. Ground: mcp__loci__rag_context_search(query="${t.focus}", collections=${CODE_COLLS}, limit=8)\n2. ${gateBlock}\n3. Return exactly ${N_IDEAS} concrete improvement ideas. DO NOT store anything.`
+    prompt = `Ideation generator #${i+1} for TARGET "${t.name}".\nFocus: ${t.focus}\n\n1. Ground: mcp__loci__rag_context_search(query="${t.focus}", collections=${CODE_COLLS}, limit=8)\n2. ${gateBlock}\n3. Return exactly ${N_IDEAS} ideas. Each is an OBJECT: {text, finding_type, code_refs}.\n   finding_type — observed (the file says it), inferred (you reasoned it), gap (should be checked, has not been), assumed (hypothesis, no evidence yet). Conflict detection only fires on gap/assumed, so do not label everything inferred.\n   code_refs — [\"path:line\"] in COLON form, e.g. [\"mcp/graph/linker.py:287\"]; prose line references never match. Empty list when the idea names no line.\n   DO NOT store anything.`
   } else {
     const fileList = (t.files || []).join(', ')
     const rangeNote = t.read_range
@@ -125,16 +146,40 @@ const gens = (await parallel(TARGETS.map((t, i) => () => {
   return agent(prompt, { label: `gen:${t.name}`, phase: 'Ideate', model: 'haiku', schema: IDEA_SCHEMA })
 }))).filter(Boolean)
 
-const allIdeas = gens.flatMap(g => (g.ideas || []).map(idea => ({ target: g.target, idea })))
+const allIdeas = gens.flatMap(g => (g.ideas || []).map(i => ({
+  target: g.target,
+  idea: typeof i === 'string' ? i : i.text,                 // tolerate the old string shape
+  finding_type: (typeof i === 'object' && i.finding_type) || 'inferred',
+  code_refs: (typeof i === 'object' && i.code_refs) || [],
+})))
 log(`Ideate: ${gens.length}/${TARGETS.length} generators, ${allIdeas.length} ideas`)
 
 // ── Write ──
 phase('Write')
 const wrote = await agent(
-  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}".\n\nFor EACH idea:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type=<TYPE>, text="<target>: <idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<target>", code_refs=<REFS>, derived_from=<PARENT>)\n\n<TYPE> is NOT always "inferred" — choose per idea, because downstream tools key off it:\n  observed  — stated directly by the file you read\n  inferred  — reasoned from what you read\n  gap       — something that should be checked and has not been\n  assumed   — a working hypothesis with no evidence yet\nConflict detection only fires on gap/assumed, so mislabelling everything "inferred" silently disables it.\n\n<REFS> is a list of "path:line" strings — the COLON form, e.g. ["mcp/graph/linker.py:287"]. Prose like "linker.py line 287" does not match and code grounding will never fire. Omit when the idea names no specific line.\n<PARENT> is a finding_id this idea builds on, when one exists; it is what retraction lineage and aggregate confidence walk. Omit when the idea stands alone.\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
+  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}". Do not classify, judge or edit them — every field is already decided and given to you below.\n\nFor EACH entry, one call:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type=<its finding_type>, text="<its target>: <its idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<its target>", code_refs=<its code_refs, omit if empty>)\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
   { label: 'writer', phase: 'Write', model: 'haiku', schema: WROTE_SCHEMA }
 )
 log(`Write: attempted=${wrote?.attempted}, persisted=${(wrote?.finding_ids||[]).length}`)
+
+
+// A run that persisted nothing cannot be synthesized from, and must not reach the
+// phase that files GitHub issues. Yesterday this was caught only because the Final
+// prompt was told to read the investigation first — a prompt instruction is not a
+// precondition. Fail loudly here instead.
+if (!(wrote?.finding_ids || []).length) {
+  log(`ABORT: writer persisted 0 of ${allIdeas.length} ideas — nothing to synthesize.`)
+  return {
+    run_id: RUN, mode: RAG_MODE ? 'rag' : 'direct-read',
+    targets_covered: 0, ideas_generated: allIdeas.length, ideas_persisted: 0,
+    confirmed_items: 0, ranked_count: 0,
+    summary: `ABORTED: ${allIdeas.length} ideas were generated and none persisted. ` +
+             `Synthesis and issue-filing were skipped rather than run against an empty store.`,
+    ranked_actions: [],
+    gaps: ['writer persisted 0 findings — investigate the writer agent before trusting any later phase'],
+    github_repo: GITHUB_REPO, file_floor: FILE_FLOOR,
+  }
+}
 
 // ── Verify ──
 phase('Verify')
