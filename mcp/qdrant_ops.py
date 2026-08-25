@@ -152,15 +152,45 @@ def _create_payload_indexes(client, col: str) -> None:
 
 
 def _retention_days() -> int:
-    """Startup purge window, in days. 0 disables the purge entirely.
+    """Startup purge window, in days. 0 (the default) disables the purge entirely.
+
+    The default is 0 because this window DELETES FINDINGS and the deletion is
+    silent. It used to default to 30, which meant a process that simply forgot to
+    export LOCI_QDRANT_RETENTION_DAYS destroyed every indexed finding older than a
+    month on its next start. Measured on the live store before this change: the
+    index held 912 findings and the corpus held 2,831, and the split was exact —
+    all 912 findings younger than 30 days were indexed, and zero of the 1,919
+    older ones were. The index boundary WAS the retention window. Re-indexing
+    restored coverage and the next server start removed it again.
+
+    Purging is a real option, but it has to be one somebody chose. Nothing in this
+    repo opts in.
+
+    Resolution order: environment, then ~/.loci/backends.toml, then 0. The
+    backends floor exists because the env var only reaches a process whose
+    launcher remembers to set it — and the four live MCP servers did not. A
+    setting that protects the corpus must not depend on being remembered.
 
     Read at call time, not import time, so a test or a caller can set it."""
-    raw = os.environ.get("LOCI_QDRANT_RETENTION_DAYS", "30").strip()
+    raw = os.environ.get("LOCI_QDRANT_RETENTION_DAYS", "").strip()
+    if not raw:
+        try:
+            import backends
+            days = backends._cfg("qdrant", "retention_days", None)
+            if days is not None:
+                raw = str(days).strip()
+        except Exception as exc:
+            logger.debug("retention: backends.toml unreadable (%r); using the safe default", exc)
+    if not raw:
+        return 0
     try:
         days = int(raw)
     except ValueError:
-        logger.warning("LOCI_QDRANT_RETENTION_DAYS=%r is not an integer; using 30", raw)
-        return 30
+        # Falls back to DISABLED, not to a window. Guessing a number here is
+        # guessing how much of the corpus to delete.
+        logger.warning("LOCI_QDRANT_RETENTION_DAYS=%r is not an integer; "
+                       "disabling the purge rather than guessing a window", raw)
+        return 0
     return max(0, days)
 
 
@@ -174,7 +204,7 @@ def _purge_old_records(client, col: str, retention_days: Optional[int] = None) -
     if retention_days is None:
         retention_days = _retention_days()
     if retention_days <= 0:
-        logger.debug("Qdrant TTL purge disabled (LOCI_QDRANT_RETENTION_DAYS=0)")
+        logger.info("Qdrant TTL purge disabled for %r (retention=0) — no findings deleted", col)
         return
 
     from qdrant_client.models import Filter, FieldCondition, Range, FilterSelector

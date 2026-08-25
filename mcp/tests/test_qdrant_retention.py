@@ -39,10 +39,21 @@ def _purge(env, count=5):
 
 
 class TestRetentionWindow(unittest.TestCase):
-    def test_default_is_thirty_days(self):
+    def test_default_is_disabled_not_a_window(self):
+        """An unset variable must not delete anything.
+
+        This defaulted to 30 and the four live MCP servers all ran with the
+        variable unset. Measured consequence: the index held exactly the 912
+        findings younger than 30 days and zero of the 1,919 older ones — the
+        index boundary was the purge window. Re-indexing fixed it until the next
+        process start.
+        """
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("LOCI_QDRANT_RETENTION_DAYS", None)
-            self.assertEqual(qdrant_ops._retention_days(), 30)
+            with mock.patch.object(qdrant_ops, "logger"):
+                # no backends.toml value in the test env -> the floor is 0
+                with mock.patch.dict("sys.modules", {"backends": None}):
+                    self.assertEqual(qdrant_ops._retention_days(), 0)
 
     def test_zero_disables_the_purge(self):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "0"})
@@ -53,9 +64,10 @@ class TestRetentionWindow(unittest.TestCase):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "-1"})
         self.assertEqual(client.deletes, [])
 
-    def test_garbage_falls_back_to_the_default_rather_than_deleting_everything(self):
+    def test_garbage_disables_rather_than_guessing_a_window(self):
+        """Guessing a number here is guessing how much of the corpus to delete."""
         with mock.patch.dict(os.environ, {"LOCI_QDRANT_RETENTION_DAYS": "banana"}):
-            self.assertEqual(qdrant_ops._retention_days(), 30)
+            self.assertEqual(qdrant_ops._retention_days(), 0)
 
     def test_a_custom_window_is_honoured(self):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "90"})
@@ -84,3 +96,35 @@ class TestCallSiteDoesNotPinTheWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRetentionResolutionOrder(unittest.TestCase):
+    """The env var only reaches a process whose launcher sets it.
+
+    All four live MCP servers ran with it unset, which is how the destructive
+    default went unnoticed. backends.toml is the durable floor: stdlib tomllib,
+    no third-party import, readable by anything that can read the file.
+    """
+
+    def test_backends_toml_supplies_the_window_when_env_is_unset(self):
+        fake = mock.Mock()
+        fake._cfg.return_value = 45
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOCI_QDRANT_RETENTION_DAYS", None)
+            with mock.patch.dict("sys.modules", {"backends": fake}):
+                self.assertEqual(qdrant_ops._retention_days(), 45)
+
+    def test_env_wins_over_backends_toml(self):
+        fake = mock.Mock()
+        fake._cfg.return_value = 45
+        with mock.patch.dict(os.environ, {"LOCI_QDRANT_RETENTION_DAYS": "7"}):
+            with mock.patch.dict("sys.modules", {"backends": fake}):
+                self.assertEqual(qdrant_ops._retention_days(), 7)
+
+    def test_an_unreadable_backends_file_disables_rather_than_purges(self):
+        fake = mock.Mock()
+        fake._cfg.side_effect = OSError("no such file")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOCI_QDRANT_RETENTION_DAYS", None)
+            with mock.patch.dict("sys.modules", {"backends": fake}):
+                self.assertEqual(qdrant_ops._retention_days(), 0)
