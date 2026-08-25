@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401  (kept on the module namespace; live users import it function-locally)
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -7980,6 +7981,54 @@ from investigation_tools import (  # noqa: E402,F401
 )
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"})
+
+
+def _is_loopback(host: str) -> bool:
+    return (host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+class _BearerAuthMiddleware:
+    """Shared-secret gate for the HTTP transports.
+
+    Deliberately not the SDK's token_verifier path: that requires AuthSettings
+    with an issuer_url, i.e. the full OAuth resource-server model, and would
+    publish /.well-known/oauth-* discovery describing an authorization server
+    that does not exist. A single secret shared between an operator and their own
+    server is not OAuth, and modelling it as OAuth advertises a fiction.
+
+    /health stays open so liveness probes work without the secret; it returns a
+    fixed {"status": "ok"} and discloses nothing.
+    """
+
+    __slots__ = ("_app", "_token", "_exempt")
+
+    def __init__(self, app, token: str, exempt_paths=frozenset({"/health"})):
+        self._app = app
+        self._token = token
+        self._exempt = exempt_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("path") in self._exempt:
+            await self._app(scope, receive, send)
+            return
+        raw = dict(scope.get("headers") or {}).get(b"authorization", b"")
+        value = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
+        presented = value[7:] if value[:7].lower() == "bearer " else ""
+        # compare_digest on both branches: a plain == would leak the token length
+        # and prefix through timing, and an early return on empty would leak
+        # whether a token was presented at all.
+        if not (presented and hmac.compare_digest(presented, self._token)):
+            body = b'{"error":"unauthorized"}'
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode()),
+                                    (b"www-authenticate", b"Bearer")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self._app(scope, receive, send)
+
+
 def main() -> None:
     # Fire-and-forget embed warm-ping so the FIRST real RAG/dedup call doesn't eat the
     # ~9s nomic cold-load. Non-blocking (daemon thread) and fail-open — never blocks or
@@ -8003,7 +8052,32 @@ def main() -> None:
         # silently exposing an unauthenticated tool server.
         mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
-        mcp.run(transport=transport)
+
+        # This server exposes the whole tool surface. #206 made the bind loopback
+        # by default; a token is what makes a NON-loopback bind defensible, so
+        # without one we refuse rather than serve. Loud beats exposed — the same
+        # trade as the bind default and the retention default.
+        token = os.environ.get("HERMES_MCP_TOKEN", "").strip()
+        if not token and not _is_loopback(mcp.settings.host):
+            raise SystemExit(
+                f"refusing to serve {transport} on {mcp.settings.host} without "
+                "HERMES_MCP_TOKEN: this would expose every tool unauthenticated. "
+                'Generate one with: python3 -c "import secrets;print(secrets.token_hex(32))" '
+                "— or bind 127.0.0.1."
+            )
+
+        app = (mcp.streamable_http_app() if transport == "streamable-http"
+               else mcp.sse_app())
+        if token:
+            app = _BearerAuthMiddleware(app, token)
+        else:
+            logger.warning("HERMES_MCP_TOKEN is not set — serving %s on %s with no "
+                           "authentication. Safe only because the bind is loopback.",
+                           transport, mcp.settings.host)
+
+        import uvicorn
+        uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port,
+                    log_level=str(mcp.settings.log_level).lower())
     else:
         mcp.run(transport="stdio")
 
