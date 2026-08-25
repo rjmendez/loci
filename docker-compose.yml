@@ -32,7 +32,12 @@ services:
     volumes:
       - hermes-mcp-data:/data
     ports:
-      - "0.0.0.0:8000:8000"
+      # Loopback, not 0.0.0.0 — this publishes an UNAUTHENTICATED tool server
+      # (issue #78). Publish-side only: do NOT set HERMES_MCP_HOST=127.0.0.1,
+      # which binds the server to the container's own loopback, makes this
+      # mapping unreachable, and leaves the in-container HEALTHCHECK passing —
+      # a dead service reporting healthy.
+      - "127.0.0.1:8000:8000"
     restart: unless-stopped
 
   hermes-a2a:
@@ -53,7 +58,7 @@ services:
     volumes:
       - hermes-a2a-data:/data
     ports:
-      - "0.0.0.0:8201:8201"
+      - "127.0.0.1:8201:8201"
     restart: unless-stopped
 
 volumes:

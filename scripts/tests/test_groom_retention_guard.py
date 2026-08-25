@@ -129,3 +129,56 @@ class TestEveryPassRoutesThroughTheGate(unittest.TestCase):
             client, col, refusal = groom.connect()
         self.assertIsNone(refusal)
         self.assertEqual((client, col), ("client", "col"))
+
+
+class TestExitCodeReachesTheRunner(unittest.TestCase):
+    """A scheduler only ever sees the exit code. Every failure this tool actually
+    produces used to exit 0, so a cron run in which nothing happened recorded
+    success — the refusal guard was built to be loud and was silent to its only
+    consumer."""
+
+    def _rc(self, statuses):
+        passes = {f"p{i}": {"fn": (lambda st: lambda **kw: {"pass": "p", "status": st})(st),
+                            "applyable": False}
+                  for i, st in enumerate(statuses)}
+        with mock.patch.dict(groom.PASSES, passes, clear=True):
+            return groom.main(list(passes) + ["--json"])
+
+    def test_all_ok_exits_zero(self):
+        self.assertEqual(self._rc(["ok", "ok"]), 0)
+
+    def test_a_refusal_does_not_look_like_success(self):
+        self.assertEqual(self._rc(["ok", "refused"]), 3)
+
+    def test_degraded_does_not_look_like_success(self):
+        self.assertEqual(self._rc(["degraded"]), 3)
+
+    def test_an_error_still_wins(self):
+        self.assertEqual(self._rc(["refused", "error"]), 1)
+
+
+class TestRecallWritesNoFalseZero(unittest.TestCase):
+    def test_all_searches_failing_degrades_instead_of_recording_zero(self):
+        import tempfile, pathlib as _pl, json as _json
+        with tempfile.TemporaryDirectory() as td:
+            tmp = _pl.Path(td); (tmp / "inv").mkdir()
+            with open(tmp / "inv" / "findings.jsonl", "w") as fh:
+                fh.write(_json.dumps({"id": "a", "text": "finding text a",
+                                      "investigation_id": "inv"}) + "\n")
+
+            class _P:
+                id = "a"
+
+            client = mock.Mock()
+            client.scroll.return_value = ([_P()], None)
+            fake = mock.Mock()
+            fake._retention_days.return_value = 0
+            fake._get_qdrant.return_value = (client, "c")
+            gd = tmp / "_groom"
+            with mock.patch.dict(sys.modules, {"qdrant_ops": fake}):
+                r = groom.pass_recall(sample=1, paraphrase=False, memory_dir=tmp, groom_dir=gd,
+                                      search_fn=lambda q: {"ok": False, "results": []})
+        self.assertEqual(r["status"], "degraded")
+        self.assertEqual(r["identity"]["attempted"], 0, "report shape stays stable")
+        self.assertFalse((gd / "recall.jsonl").exists(),
+                         "a missing point is honest; a zero in the trend file is a lie")
