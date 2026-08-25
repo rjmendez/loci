@@ -1661,8 +1661,9 @@ def _hallucination_candidates(
     # provenance check keeps its documented per-finding semantics; this is the
     # consumer declining to read a blanket verdict as evidence about any one
     # finding.
-    _observed_ids = {str(fid) for fid, f in (findings_by_id or {}).items()
-                     if str(f.get("record_type") or f.get("type") or "") == "observed"}
+    _observed_ids = {str(f.get("id", "")) for f in (findings or [])
+                     if str(f.get("record_type") or f.get("type") or "") == "observed"
+                     and f.get("id")}
     _blanket = bool(_observed_ids) and _observed_ids <= unsupported_ids
     if _blanket:
         logger.debug("_hallucination_candidates: every observed finding is unsupported "
