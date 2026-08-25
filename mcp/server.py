@@ -1616,6 +1616,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         raw_findings = [f for f in raw_findings if str(f.get("id", "")) not in retracted]
     findings = _tag_finding_ids(raw_findings, investigation_id)
     audit_entries = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
+    audit_lane = _audit_lane_status(findings, audit_entries)
 
     try:
         unsupported = run_provenance(
@@ -1658,6 +1659,45 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
         "hallucination_candidates": candidates,
+        "audit_lane": audit_lane,
+    }
+
+
+def _audit_lane_status(findings: list[dict], audit_entries: list[dict]) -> dict:
+    """Whether provenance verdicts on this investigation mean anything.
+
+    run_provenance flags every observed finding without a matching receipt, which
+    is the documented per-finding contract and is correct. But with NO receipts
+    at all it flags every observed finding it is given, and a verdict that fires
+    on 100% of its inputs carries no information.
+
+    Measured on the live corpus: 1 of 140 investigations has an audit.jsonl, and
+    nothing has written a receipt since 2026-06-20. The cause is structural —
+    audit_log is an MCP tool an agent has to remember to call after every
+    invocation, described as a "post-call hook" but not hooked to anything. When
+    whatever workflow was calling it stopped, the lane went silent and nothing
+    said so.
+
+    This does not change any verdict. It reports the lane's state so a caller can
+    say "no receipts exist" instead of "every observed finding is unsupported" —
+    two very different claims that were indistinguishable in the output.
+    """
+    observed = sum(1 for f in findings or []
+                   if (f.get("type") or f.get("record_type")) == "observed"
+                   and str(f.get("text", "") or "").strip())
+    receipts = sum(1 for e in audit_entries or [] if isinstance(e, dict))
+    if receipts:
+        return {"status": "present", "receipts": receipts, "observed_findings": observed}
+    return {
+        "status": "empty",
+        "receipts": 0,
+        "observed_findings": observed,
+        "verdicts_informative": False,
+        "detail": (
+            f"no audit receipts for this investigation, so all {observed} observed "
+            "finding(s) are reported unsupported by construction. This is the "
+            "absence of evidence about provenance, not evidence of bad provenance."
+        ),
     }
 
 
@@ -4242,7 +4282,7 @@ def memory_self_check(
             else []
         )
         all_candidates.extend(inv_candidates)
-        per_investigation.append({
+        entry = {
             "investigation_id": inv_id,
             "counts": {
                 "unsupported_observed": sum(
@@ -4255,7 +4295,15 @@ def memory_self_check(
             },
             "verdicts": [_verdict_view(v) for v in inv_verdicts],
             "hallucination_candidates": inv_candidates,
-        })
+        }
+        # Carry the lane's state next to the count it explains. An
+        # unsupported_observed count computed against zero receipts is the
+        # investigation's observed-finding count wearing a different name, and
+        # reporting it bare invites reading absence of evidence as evidence.
+        lane = computed.get("audit_lane") or {}
+        if "provenance" in requested and lane.get("status") == "empty":
+            entry["audit_lane"] = lane
+        per_investigation.append(entry)
 
     recorded = False
     if record and qdrant_available:
@@ -6716,6 +6764,63 @@ def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, No
         return None, None
 
 
+def _declared_causal_edges(findings: list[dict]) -> list[dict]:
+    """Causal edges from author-declared lineage — the derived_from links.
+
+    investigation_store records derived_from so a retraction can follow what was
+    built on a false fact. That is the same relation causal inference tries to
+    guess from text, except stated by whoever wrote the finding rather than
+    inferred from keywords, so it is strictly better evidence and does not need
+    to be re-derived.
+
+    Measured on the live corpus, 136 investigations:
+
+        heuristic         62 edges
+        declared lineage 524 edges   (234 findings carrying 565 links)
+
+    causal_edges.jsonl nevertheless held zero records everywhere, because the
+    producer is only reached from memory_consolidate behind `not dry_run` and
+    `len(findings) >= 3`. The census reading of "zero output" was a statement
+    about invocation, not about either producer — the heuristic is not inert, it
+    had simply never run.
+
+    524 < 565 because derived_from also accepts free-text claim strings, and ids
+    pointing outside the investigation have no node to attach to.
+
+    Direction matches the heuristic's convention: source is the antecedent (the
+    finding depended on), target is the finding that declared the dependency.
+    """
+    known = {str(f.get("id")) for f in findings if f.get("id")}
+    edges: list[dict] = []
+    for f in findings:
+        target = str(f.get("id") or "")
+        if not target:
+            continue
+        raw = f.get("derived_from")
+        if not raw:
+            continue
+        parents = raw if isinstance(raw, (list, tuple)) else [raw]
+        for parent in parents:
+            source = str(parent or "").strip()
+            # derived_from also accepts free-text claim strings, not just ids.
+            # Only ids resolvable within this investigation become edges; a
+            # claim string has no node to point at.
+            if not source or source == target or source not in known:
+                continue
+            edges.append({
+                "id": str(uuid.uuid4()),
+                "source_id": source,
+                "target_id": target,
+                "edge_type": "caused_by",
+                # Declared, not inferred. Higher than the heuristic's 0.5 because
+                # an author saying "this builds on that" is testimony, not a guess.
+                "confidence": 0.9,
+                "inferred_at": _now(),
+                "method": "declared_lineage",
+            })
+    return edges
+
+
 def _heuristic_causal_edges(findings: list[dict]) -> list[dict]:
     """Infer causal edges heuristically from finding texts.
 
@@ -6757,6 +6862,22 @@ def _heuristic_causal_edges(findings: list[dict]) -> list[dict]:
                     "method": "heuristic",
                 })
     return edges
+
+
+def _merge_causal_edges(inferred: list[dict], declared: list[dict]) -> list[dict]:
+    """Union two edge sets; declared lineage wins any (source, target) collision.
+
+    An author's derived_from is testimony about their own reasoning. Anything the
+    text heuristic or the LLM pass concluded about the same pair is a guess at
+    the same fact, so it is replaced rather than kept alongside — two edges for
+    one relation would double-count it downstream.
+    """
+    by_pair: dict[tuple, dict] = {}
+    for edge in inferred:
+        by_pair[(edge.get("source_id"), edge.get("target_id"))] = edge
+    for edge in declared:
+        by_pair[(edge.get("source_id"), edge.get("target_id"))] = edge
+    return list(by_pair.values())
 
 
 def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
@@ -6836,6 +6957,11 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
             edges = _heuristic_causal_edges(findings)
         except Exception:
             edges = []
+
+    try:
+        edges = _merge_causal_edges(edges, _declared_causal_edges(findings))
+    except Exception as exc:
+        logger.debug("_run_causal_inference: declared-lineage pass failed (fail-open): %r", exc)
 
     if not edges:
         return 0
