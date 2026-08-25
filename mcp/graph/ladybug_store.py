@@ -419,7 +419,12 @@ class LadybugStore:
         "CREATE REL TABLE IF NOT EXISTS DEFINES(FROM CodeFile TO CodeSymbol)",
         "CREATE REL TABLE IF NOT EXISTS CALLS(FROM CodeSymbol TO CodeSymbol)",
         "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM CodeFile TO CodeFile)",
-        "CREATE REL TABLE IF NOT EXISTS REFERENCES(FROM Finding TO CodeSymbol)",
+        # `confidence` carries the linker's own verdict — "high" for a distinctive
+        # type/marker match, "medium" for a long mixed-case identifier. It was
+        # computed and discarded, which forced every consumer to re-derive link
+        # quality from the symbol name at query time. With it on the edge,
+        # precision tuning at the read side is a WHERE clause.
+        "CREATE REL TABLE IF NOT EXISTS REFERENCES(FROM Finding TO CodeSymbol, confidence STRING)",
         "CREATE REL TABLE IF NOT EXISTS MENTIONS(FROM Finding TO Entity)",
         "CREATE REL TABLE IF NOT EXISTS DERIVED_FROM(FROM Finding TO Finding)",
         "CREATE REL TABLE IF NOT EXISTS IN_INVESTIGATION(FROM Finding TO Investigation)",
@@ -604,6 +609,21 @@ class LadybugStore:
             return False
 
     @_writes(False)
+    def ensure_reference_confidence(self) -> bool:
+        """Add REFERENCES.confidence to a database created before it existed.
+
+        CREATE ... IF NOT EXISTS does not alter an existing table, so a store built
+        by an earlier version keeps a property-less edge. Fail-open: an older
+        engine without ALTER support simply keeps writing edges with no confidence,
+        and readers already treat a missing value as unknown.
+        """
+        try:
+            self._exec("ALTER TABLE REFERENCES ADD confidence STRING")
+            return True
+        except Exception as exc:
+            logger.debug("ensure_reference_confidence: %s", exc)
+            return False
+
     def link_references(self, finding_id: str, symbol_ids: list) -> bool:
         if not self.ok or not finding_id or not symbol_ids:
             return False

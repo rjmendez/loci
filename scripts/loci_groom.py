@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import logging
 import os
 import random
 import re
@@ -50,8 +51,13 @@ def load_env() -> dict:
         from dotenv import load_dotenv
         load_dotenv(_REPO / ".env")
         load_dotenv(_REPO / "mcp" / ".env", override=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        # NOT silent. python-dotenv is where LOCI_QDRANT_RETENTION_DAYS=0 lives, and
+        # without it _retention_days() falls back to 30 and the next _get_qdrant()
+        # deletes everything past the window. Swallowing this import is how a
+        # scheduled run turns destructive while reporting success.
+        logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
+                       "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
 
     resolved = {}
     if not os.environ.get("QDRANT_URL"):
@@ -63,8 +69,8 @@ def load_env() -> dict:
                 resolved["QDRANT_URL"] = url
                 if key and not os.environ.get("QDRANT_API_KEY"):
                     os.environ["QDRANT_API_KEY"] = key
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Qdrant from backends: %r", exc)
     if not os.environ.get("OLLAMA_BASE_URL"):
         try:
             import backends
@@ -72,10 +78,25 @@ def load_env() -> dict:
             if url:
                 os.environ["OLLAMA_BASE_URL"] = url
                 resolved["OLLAMA_BASE_URL"] = url
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Ollama from backends: %r", exc)
+
+    # Retention through the DURABLE channel. backends.toml is stdlib tomllib and
+    # needs no third-party import, so a setting that protects the corpus does not
+    # depend on one. env wins; .env already applied above; this is the floor.
+    if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
+        try:
+            import backends
+            days = backends._cfg("qdrant", "retention_days", None)
+            if days is not None:
+                os.environ["LOCI_QDRANT_RETENTION_DAYS"] = str(days)
+                resolved["LOCI_QDRANT_RETENTION_DAYS"] = str(days)
+        except Exception as exc:
+            logger.warning("load_env: could not resolve retention from backends: %r", exc)
     return resolved
 
+
+logger = logging.getLogger("loci-groom")
 
 MEMORY_DIR = Path(os.environ.get(
     "HERMES_MEMORY_DIR",
@@ -193,6 +214,26 @@ def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
 
     try:
         import qdrant_ops
+    except Exception as exc:
+        report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
+        return report
+
+    # Refuse before touching the client. _get_qdrant() runs _purge_old_records on
+    # its first call in a process, so simply CONNECTING with retention unset
+    # deletes the corpus past the window — and this pass exists to repair exactly
+    # that damage. Loud and non-destructive beats quietly undoing our own work.
+    retention = qdrant_ops._retention_days()
+    if retention != 0:
+        report.update(
+            status="refused",
+            detail=(f"LOCI_QDRANT_RETENTION_DAYS resolves to {retention}, not 0 — connecting "
+                    f"would run the startup purge and delete findings older than {retention} "
+                    f"days. Set it in the environment, the repo .env, or [qdrant].retention_days "
+                    f"in ~/.loci/backends.toml before running this pass."),
+        )
+        return report
+
+    try:
         client, col = qdrant_ops._get_qdrant()
     except Exception as exc:
         report.update(status="degraded", detail=f"qdrant_ops unavailable: {exc!r}")
