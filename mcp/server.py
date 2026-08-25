@@ -7960,7 +7960,15 @@ def main() -> None:
     if transport in ("sse", "streamable-http"):
         # FastMCP.run() takes only transport and mount_path; the bind address
         # lives on settings.
-        mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "0.0.0.0")
+        # Loopback by default. This server has no authentication, so a wide bind
+        # is a decision, not something you should get by not making one — the
+        # same reasoning that fixed the retention default in #204. Every
+        # legitimate wide bind already sets this explicitly: docker-compose.yml
+        # passes HERMES_MCP_HOST=0.0.0.0 because a container must bind all
+        # interfaces to receive published traffic, and publishes on 127.0.0.1.
+        # Getting this wrong now fails loudly (cannot connect) instead of
+        # silently exposing an unauthenticated tool server.
+        mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
         mcp.run(transport=transport)
     else:

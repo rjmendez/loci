@@ -34,11 +34,25 @@ def test_sse_binds_via_settings():
     assert server.mcp.settings.port == 9001
 
 
-def test_streamable_http_defaults_the_bind():
+def test_streamable_http_defaults_to_loopback():
+    """An unauthenticated server must not reach the network by default.
+
+    This asserted 0.0.0.0 and was describing the behaviour rather than defending
+    it. A wide bind is a decision; not making one should not produce the exposed
+    outcome. docker-compose sets HERMES_MCP_HOST=0.0.0.0 explicitly and publishes
+    on 127.0.0.1, so the containerised path is unaffected.
+    """
     run = _run_main({"HERMES_MCP_TRANSPORT": "streamable-http"})
     run.assert_called_once_with(transport="streamable-http")
-    assert server.mcp.settings.host == "0.0.0.0"
+    assert server.mcp.settings.host == "127.0.0.1"
     assert server.mcp.settings.port == 8000
+
+
+def test_a_wide_bind_is_still_available_explicitly():
+    run = _run_main({"HERMES_MCP_TRANSPORT": "streamable-http",
+                     "HERMES_MCP_HOST": "0.0.0.0"})
+    run.assert_called_once_with(transport="streamable-http")
+    assert server.mcp.settings.host == "0.0.0.0"
 
 
 def test_unknown_transport_falls_back_to_stdio():
