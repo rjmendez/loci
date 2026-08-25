@@ -51,6 +51,7 @@ _ = rag_context_search
 # all three (#194), so vulture sees real references and the entries would
 # suppress nothing.
 _ = reflection_loop_status
+_ = causal_infer
 _ = conflict_list
 _ = conflict_resolve
 

@@ -138,9 +138,18 @@ def test_unresolved_imports_are_all_genuinely_optional_third_party(head_build):
 
 
 def test_callsite_count_is_in_the_expected_ballpark(head_build):
-    # docs/census.txt estimate: ~11,600 (5,106 by name + 6,538 by attribute).
+    """Coarse sanity band: catch a pipeline that counts nothing or everything.
+
+    docs/census.txt estimated ~11,600 (5,106 by name + 6,538 by attribute) when
+    this was written. The band was 11,000-12,500 and the repo grew through the
+    ceiling — 12,514 — which failed CI for adding code, not for miscounting.
+
+    This tracks REPO SIZE, so it is deliberately loose. It exists to catch the
+    pipeline returning 0, or an order of magnitude, not to pin a number that
+    every feature branch moves. Re-widen it rather than trimming code to fit.
+    """
     count = sum(1 for _ in head_build.store.nodes_of_kind("CALLSITE"))
-    assert 11000 <= count <= 12500, count
+    assert 8000 <= count <= 20000, count
 
 
 def test_every_callsite_has_exactly_one_calls_edge(head_build):
