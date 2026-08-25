@@ -1330,11 +1330,38 @@ def _normalize_derived_from(derived_from: str | list[str] | None) -> list[str]:
 
 _NEGATION_RE = re.compile(r"\b(?:no|not|never|none|without|cannot|can't|didn't|isn't|aren't|won't)\b", re.I)
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:/-]{2,}", re.I)
+# Words that carry no evidentiary weight in a lexical match. Two groups, kept
+# separate because they are dropped for different reasons.
+#
+# Domain-generic: true of almost every finding in this corpus, so sharing one
+# says nothing.
 _GENERIC_MATCH_TOKENS = {
     "host", "user", "device", "query", "result", "results", "output", "input", "tool",
     "found", "seen", "shows", "reported", "detected", "contacted", "event", "events",
     "record", "records", "row", "rows",
 }
+
+# Function words. These were NOT dropped, and _lexical_match_score normalises by
+# the claim side only, so a short claim could clear the 0.45 gate on stopword
+# overlap alone. Measured on 400 real findings before this change: 68.8% of
+# generic short claims were reported as supported, e.g. "the server is down"
+# declared supported by a document on cultural-noise characterisation, on the
+# overlap {"down", "the"}. investigation_pre_answer_check is the tool an agent
+# calls BEFORE asserting a claim, so this was a rubber stamp on the one gate
+# meant to catch unsupported assertions.
+_STOPWORD_MATCH_TOKENS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his",
+    "how", "i", "if", "in", "into", "is", "it", "its", "may", "might", "must", "no",
+    "not", "of", "on", "or", "our", "out", "over", "own", "she", "should", "so",
+    "some", "such", "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "to", "too", "under", "up", "was", "we", "were", "what",
+    "when", "where", "which", "while", "who", "why", "will", "with", "would", "you",
+    "your", "am", "being", "both", "each", "few", "more", "most", "only", "other",
+    "same", "very", "just", "also", "any", "all", "about", "after", "before",
+}
+
+_NON_EVIDENCE_TOKENS = _GENERIC_MATCH_TOKENS | _STOPWORD_MATCH_TOKENS
 _QDRANT_SUPPORT_MIN_SCORE = 0.55
 _QDRANT_PRECHECK_MIN_SCORE = 0.5
 
@@ -1369,9 +1396,15 @@ def _confidence_allowed(confidence: str, min_confidence: str) -> bool:
 
 
 def tokenize(text: str) -> set[str]:
+    """Content tokens only — the units a lexical match is allowed to count.
+
+    Shared by every lexical lane (pre-answer check, recall scoring, target match,
+    provenance). None of them want a function word to count as evidence, so the
+    drop set lives here rather than at one call site.
+    """
     return {
         token for token in (m.group(0).lower() for m in _TOKEN_RE.finditer(text or ""))
-        if token not in _GENERIC_MATCH_TOKENS
+        if token not in _NON_EVIDENCE_TOKENS
     }
 
 
