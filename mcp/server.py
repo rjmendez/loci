@@ -6187,6 +6187,24 @@ def loci_health() -> str:
     except Exception as exc:
         logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
+
+    # Corpus durability. A 30-day default purge window silently deleted every
+    # indexed finding older than a month on each process start, and nothing
+    # reported it: coverage looked fine right after a re-index and collapsed at
+    # the next restart. These two fields make that condition answerable from the
+    # tool people already call, instead of from a set-difference against disk.
+    try:
+        import qdrant_ops
+        days = qdrant_ops._retention_days()
+        out["retention_days"] = days
+        out["purge_active"] = days > 0
+        if days > 0:
+            out["purge_warning"] = (
+                f"findings older than {days} days are deleted on every server start"
+            )
+    except Exception as exc:
+        logger.debug("loci_health: retention probe failed: %r", exc)
+        pass
     return json.dumps(out, indent=2)
 
 
