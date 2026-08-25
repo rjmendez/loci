@@ -7009,7 +7009,10 @@ def memory_consolidate(dry_run: bool = False) -> str:
                 inv_id, findings = _find_most_recent_investigation()
                 if inv_id and findings and len(findings) >= 3:
                     causal_edges_inferred = _run_causal_inference(inv_id, findings)
-        except Exception:
+        except Exception as exc:
+            # A feature that produces nothing should be able to say why (#192).
+            logger.warning("causal inference failed during consolidate "
+                           "(fail-open, 0 edges): %r", exc)
             causal_edges_inferred = 0
 
         return _json.dumps({
@@ -7028,11 +7031,67 @@ def memory_consolidate(dry_run: bool = False) -> str:
 
 
 @mcp.tool()
+def causal_infer(investigation_id: str, limit: int = 200) -> str:
+    """
+    Infer causal edges for an investigation and write them to causal_edges.jsonl.
+
+    Producing edges is now something you can do, rather than a side effect you
+    might trigger. Previously the only caller was memory_consolidate, behind
+    `not dry_run` and `len(findings) >= 3`, on whichever investigation happened
+    to be most recent — so causal_edges_list answered "nothing is known" and
+    "this never ran" with the same empty shape.
+
+    Two lanes run and are merged, declared winning any collision:
+      - declared lineage from derived_from links (author-stated, confidence 0.9)
+      - text/keyword heuristic, or the LLM slow path when a model is reachable
+
+    Args:
+        investigation_id: Investigation to infer over.
+        limit: Max findings to consider, newest first (default 200).
+
+    Returns JSON: {investigation_id, findings_considered, edges_written,
+                   status} — or {error} if the investigation does not exist.
+    """
+    # _load_manifest, not _inv_dir(...).exists(): _inv_dir mkdirs, so an
+    # existence check through it is always true and a typo'd id would silently
+    # create an empty investigation. _load_manifest is the read-only check the
+    # other tools use.
+    if not _load_manifest(investigation_id):
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    retracted = _load_retracted_ids(investigation_id)
+    if retracted:
+        findings = [f for f in findings if str(f.get("id", "")) not in retracted]
+    findings = [f for f in findings if str(f.get("text", "") or "").strip()]
+    if limit and limit > 0:
+        findings = findings[-int(limit):]
+
+    if len(findings) < 2:
+        return json.dumps({
+            "investigation_id": investigation_id,
+            "findings_considered": len(findings),
+            "edges_written": 0,
+            "status": "too_few_findings",
+            "detail": "causal inference needs at least two findings to relate.",
+        }, indent=2)
+
+    written = _run_causal_inference(investigation_id, findings)
+    return json.dumps({
+        "investigation_id": investigation_id,
+        "findings_considered": len(findings),
+        "edges_written": written,
+        "status": "ok",
+    }, indent=2)
+
+
+@mcp.tool()
 def causal_edges_list(investigation_id: str) -> str:
     """
     List causal edges inferred for an investigation.
 
-    Edges are written by the causal inference slow path in memory_consolidate.
+    Edges are written by causal_infer, or by the slow path in memory_consolidate.
+    An empty list means no edges have been INFERRED yet — run causal_infer.
     Each edge describes a directional relationship between two findings.
 
     Args:
