@@ -1647,6 +1647,28 @@ def _hallucination_candidates(
     NEVER auto-retracts. Pure over the in-memory findings/verdicts.
     """
     unsupported_ids = {r for v in (unsupported or []) for r in (v.refs or [])}
+
+    # An "unsupported" verdict means two very different things depending on
+    # whether an audit lane exists at all. run_provenance flags every observed
+    # finding that lacks a matching receipt — which, on an investigation with NO
+    # audit.jsonl, is every observed finding it is given. Measured: 1 of 140
+    # investigations on the live corpus has one. The `other in unsupported_ids`
+    # skip below then discards every observed-vs-observed contradiction, so the
+    # strongest hallucination signal available can never produce a candidate.
+    #
+    # When EVERY observed finding is unsupported the signal is uninformative
+    # rather than damning, so it must not gate the contradiction pass. The
+    # provenance check keeps its documented per-finding semantics; this is the
+    # consumer declining to read a blanket verdict as evidence about any one
+    # finding.
+    _observed_ids = {str(fid) for fid, f in (findings_by_id or {}).items()
+                     if str(f.get("record_type") or f.get("type") or "") == "observed"}
+    _blanket = bool(_observed_ids) and _observed_ids <= unsupported_ids
+    if _blanket:
+        logger.debug("_hallucination_candidates: every observed finding is unsupported "
+                     "(%d) — treating provenance as uninformative rather than gating on it",
+                     len(_observed_ids))
+
     if not unsupported_ids or not contradictions:
         return []
 
@@ -1670,7 +1692,7 @@ def _hallucination_candidates(
         for unsup, other in pairs:
             if unsup not in unsupported_ids:
                 continue
-            if other in unsupported_ids:
+            if other in unsupported_ids and not _blanket:
                 continue  # other also unsupported — no receipted counter
             if other not in findings_by_id:
                 continue

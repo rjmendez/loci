@@ -523,8 +523,22 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
             errors += 1
             continue
         ident_ranks.append(_rank_of(fid, res.get("results") or []))
-    report["identity"] = _score(ident_ranks, k, len(ident_ranks))
     report["search_errors"] = errors
+    report["identity"] = _score(ident_ranks, k, len(ident_ranks))
+    if not ident_ranks:
+        # attempted==0 means every search raised — typically the cross-encoder
+        # failing to load. _score would return recall_at_1=0.0 and _append_recall
+        # would publish it into the one longitudinal retrieval metric we keep,
+        # recording a dead GPU as total retrieval collapse. Refuse to write a
+        # point rather than write a false one.
+        # The report still carries identity (attempted=0) so its shape is stable,
+        # but nothing is WRITTEN to the trend: _score returns recall_at_1=0.0 for
+        # an empty sample, and persisting that records a dead GPU as total
+        # retrieval collapse in the one longitudinal metric we keep. A missing
+        # point is honest; a zero is a lie.
+        report.update(status="degraded",
+                      detail=f"all {errors} probe search(es) failed — no measurement taken")
+        return report
 
     if not paraphrase:
         _append_recall(report, groom_dir)
@@ -915,7 +929,10 @@ def main(argv: Optional[list] = None) -> int:
             reports.append(spec["fn"](apply=apply, limit=args.limit,
                                       rerank=not args.no_rerank))
         except Exception as exc:      # a pass must never take the cron job down
-            reports.append({"pass": name, "status": "error", "detail": repr(exc)})
+            import traceback
+            logger.error("pass %s raised:\n%s", name, traceback.format_exc())
+            reports.append({"pass": name, "status": "error", "detail": repr(exc),
+                            "traceback": traceback.format_exc()})
 
     if args.json:
         print(json.dumps(reports, indent=2))
@@ -925,7 +942,16 @@ def main(argv: Optional[list] = None) -> int:
             rest = " ".join(f"{k}={v}" for k, v in r.items()
                             if k not in ("pass", "status") and not isinstance(v, (list, dict)))
             print(f"{head} {rest}".rstrip())
-    return 0 if all(r.get("status") != "error" for r in reports) else 1
+    # Three-way, because a scheduler only ever sees the exit code. Every failure
+    # this tool actually produces — refused (retention not 0), degraded (qdrant
+    # unreachable, scroll failed, no generation tier, graph unreadable) — used to
+    # exit 0, so a cron run in which nothing happened recorded last_status=success.
+    # The refusal guard was built to be loud and was silent to its only consumer.
+    if any(r.get("status") == "error" for r in reports):
+        return 1
+    if any(r.get("status") in ("refused", "degraded") for r in reports):
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
