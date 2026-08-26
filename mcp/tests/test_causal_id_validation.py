@@ -18,13 +18,23 @@ import server
 class CausalLlmIdValidationTest(unittest.TestCase):
 
     def _run(self, llm_reply, findings):
-        with mock.patch.dict("sys.modules", {"memcheck.llm": mock.MagicMock()}):
-            import memcheck.llm as fake
-            fake.llm_available.return_value = True
-            fake.call_llm.return_value = llm_reply
-            with mock.patch.object(server, "_append_jsonl") as appended, \
-                 mock.patch.object(server, "MEMORY_DIR"):
-                server._run_causal_inference("inv", findings)
+        """Patch the ATTRIBUTE on the memcheck package, not sys.modules.
+
+        _run_causal_inference does `from memcheck import llm`, which reads
+        memcheck.llm as an attribute. Patching sys.modules["memcheck.llm"] only
+        takes effect if the package has not been imported yet, so the first
+        version of this test passed alone and failed inside the full suite —
+        order-dependent, which is no test at all.
+        """
+        import memcheck
+        fake = mock.MagicMock()
+        fake.llm_available.return_value = True
+        fake.call_llm.return_value = llm_reply
+        with mock.patch.object(memcheck, "llm", fake, create=True), \
+             mock.patch.dict("sys.modules", {"memcheck.llm": fake}), \
+             mock.patch.object(server, "_append_jsonl") as appended, \
+             mock.patch.object(server, "MEMORY_DIR"):
+            server._run_causal_inference("inv", findings)
         return [c.args[1] for c in appended.call_args_list]
 
     def test_ordinal_ids_are_dropped(self):
