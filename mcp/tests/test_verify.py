@@ -326,7 +326,9 @@ def test_default_reader_size_cap_is_byte_accurate(monkeypatch, tmp_path):
     p = tmp_path / "multibyte.txt"
     p.write_text("é" * 100, encoding="utf-8")  # each 'é' is 2 UTF-8 bytes
     monkeypatch.setattr(V, "_MAX_FILE_BYTES", 10)
-    monkeypatch.setattr(V, "_safe_resolve", lambda path: str(p))
+    # Patch the layer the reader actually calls: _ground_ref picks the checkout, the reader
+    # only caps and decodes.
+    monkeypatch.setattr(V, "_ground_ref", lambda path, want_hash=None: (str(p), ""))
     text = V._lazy_read_file("multibyte.txt")
     # Never decode more than the byte cap allowed (10 bytes -> at most 5 'é' chars).
     assert len(text.encode("utf-8")) <= 10
@@ -400,3 +402,209 @@ def test_default_gen_fn_is_lazy_and_fails_open(monkeypatch):
     r = V.verify_finding("some claim")   # no gen_fn -> lazy import path
     assert r["verdict"] == "uncertain"
     assert r["degraded"] is True
+
+
+# --- MULTI-REPO code grounding: many checkouts of many repos, one right revision ---
+#
+# hermes_memory is a multi-repo corpus. Sandboxing every ref to _repo_root() rejected 100%
+# of its stored code_refs (measured: 62 refs, 0 resolvable) even though the files exist on
+# the host. The hazard in widening is that the host also carries many WORKTREES of the same
+# repo, so the same relative path exists in several of them; picking the first would ground
+# the skeptic on an arbitrary revision. These tests pin the rule that makes it safe:
+# hash-match wins, unanimous content is fine, disagreement is REFUSED.
+
+import hashlib  # noqa: E402
+import pytest   # noqa: E402
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _mk_checkout(parent, name, files):
+    root = parent / name
+    (root / ".git").mkdir(parents=True)
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    return root
+
+
+@pytest.fixture
+def hostlike(tmp_path, monkeypatch):
+    """A fake host: two worktrees that DISAGREE on pkg/mod.py, two that AGREE on pkg/same.py,
+    and a non-git directory that must never become a root."""
+    parent = tmp_path / "home"
+    parent.mkdir()
+    _mk_checkout(parent, "repo-wt-a", {"pkg/mod.py": "A_ONE\nA_TWO\n", "pkg/same.py": "SAME\n"})
+    _mk_checkout(parent, "repo-wt-b", {"pkg/mod.py": "B_ONE\nB_TWO\n", "pkg/same.py": "SAME\n"})
+    _mk_checkout(parent, "repo-wt-c", {"pkg/only.py": "ONLY\n", "pkg/.env": "SECRET=1\n"})
+    plain = parent / "not-a-repo"
+    (plain / "pkg").mkdir(parents=True)
+    (plain / "pkg" / "loose.py").write_text("LOOSE\n")
+    # An empty primary repo root, so these tests never depend on this repo's own contents.
+    empty = tmp_path / "primary"
+    empty.mkdir()
+    monkeypatch.setattr(V, "_repo_root", lambda: str(empty))
+    monkeypatch.setenv("LOCI_CODE_ROOT_PARENTS", str(parent))
+    monkeypatch.delenv("LOCI_CODE_ROOTS", raising=False)
+    V._search_roots.cache_clear()
+    yield parent
+    V._search_roots.cache_clear()
+
+
+def test_stored_hash_selects_the_matching_checkout(hostlike):
+    # The stamped hash is the disambiguator: it names the exact revision, so the worktree
+    # holding those bytes is read and the other is not.
+    full, label = V._ground_ref("pkg/mod.py", _sha("B_ONE\nB_TWO\n"))
+    assert full is not None
+    assert full.startswith(os.path.realpath(str(hostlike / "repo-wt-b")) + os.sep)
+    assert "exact revision" in label
+
+
+def test_disagreeing_worktrees_are_refused_not_guessed(hostlike):
+    # THE CORE SAFETY PROPERTY. Same relative path, two different contents, nothing to
+    # choose between them -> refuse. A confident answer off the wrong revision is worse
+    # than no grounding.
+    assert V._ground_ref("pkg/mod.py") == (None, "")
+    # A hash that matches NEITHER checkout is just as ambiguous.
+    assert V._ground_ref("pkg/mod.py", _sha("something else\n")) == (None, "")
+
+
+def test_unanimous_content_needs_no_hash(hostlike):
+    # When every candidate holds byte-identical content the revision question has one
+    # answer, so there is nothing to guess and the ref grounds.
+    full, label = V._ground_ref("pkg/same.py")
+    assert full is not None
+    with open(full) as fh:
+        assert fh.read() == "SAME\n"
+    assert "identical in 2 checkouts" in label
+
+
+def test_stale_finding_still_grounds_but_says_so(hostlike):
+    # Unanimous content whose hash no longer matches: read it, but label it CHANGED so the
+    # block never presents drifted source as the revision the finding was recorded against.
+    full, label = V._ground_ref("pkg/same.py", _sha("OLD\n"))
+    assert full is not None
+    assert "CHANGED since the finding was recorded" in label
+
+
+def test_non_git_directories_are_not_roots(hostlike):
+    # Requiring a .git marker is what keeps this an allow-list rather than "all of $HOME".
+    assert V._ground_ref("pkg/loose.py") == (None, "")
+
+
+def test_search_roots_are_git_worktrees_only(hostlike):
+    roots = V._search_roots()
+    names = {os.path.basename(r) for r in roots}
+    assert {"repo-wt-a", "repo-wt-b", "repo-wt-c"} <= names
+    assert "not-a-repo" not in names
+
+
+def test_explicit_roots_env_is_honored(tmp_path, monkeypatch):
+    # An operator can name a checkout that is not a child of a scanned parent.
+    root = _mk_checkout(tmp_path, "elsewhere", {"pkg/x.py": "X\n"})
+    empty = tmp_path / "primary2"
+    empty.mkdir()
+    monkeypatch.setattr(V, "_repo_root", lambda: str(empty))
+    monkeypatch.setenv("LOCI_CODE_ROOT_PARENTS", str(tmp_path / "nothing-here"))
+    monkeypatch.setenv("LOCI_CODE_ROOTS", str(root))
+    V._search_roots.cache_clear()
+    try:
+        full, _label = V._ground_ref("pkg/x.py")
+        assert full == os.path.realpath(str(root / "pkg" / "x.py"))
+    finally:
+        V._search_roots.cache_clear()
+
+
+# --- SECURITY: widening the roots must not widen what a ref may name ---
+
+def test_multi_root_search_still_refuses_absolute_and_traversal(hostlike):
+    assert V._ground_ref("/etc/passwd") == (None, "")
+    assert V._ground_ref("../../../../etc/passwd") == (None, "")
+    assert V._ground_ref("pkg/../../repo-wt-b/pkg/mod.py") == (None, "")
+    assert V._lazy_read_file("/etc/passwd") == ""
+    assert V._lazy_read_file("../../../../etc/passwd") == ""
+
+
+def test_dot_prefixed_components_are_refused(hostlike):
+    # 83 checkouts' worth of .env / .ssh / .git must not become readable just because the
+    # search widened. Measured cost on the live corpus: 6 refs of 1836, all CI/config.
+    assert (hostlike / "repo-wt-c" / "pkg" / ".env").is_file()   # it IS there
+    assert V._ground_ref("pkg/.env") == (None, "")               # and still refused
+    assert V._safe_resolve(".git/config") is None
+
+
+def test_symlink_out_of_a_root_is_refused(hostlike, tmp_path):
+    secret = tmp_path / "outside.txt"
+    secret.write_text("TOP SECRET\n")
+    link = hostlike / "repo-wt-c" / "pkg" / "escape.py"
+    os.symlink(str(secret), str(link))
+    V._search_roots.cache_clear()
+    assert V._ground_ref("pkg/escape.py") == (None, "")
+    assert V._lazy_read_file("pkg/escape.py") == ""
+
+
+# --- end to end: a stored {path, hash} ref becomes real source in the skeptic's prompt ---
+
+def test_stored_code_ref_dict_reaches_the_prompt(hostlike):
+    captured = {}
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _REFUTED, "ok": True}
+
+    r = V.verify_finding(
+        "pkg/mod.py starts with B_ONE",
+        code_refs=[{"path": "pkg/mod.py", "hash": _sha("B_ONE\nB_TWO\n")}],
+        gen_fn=_gen,
+    )
+    assert r["verdict"] == "refuted"
+    assert "B_ONE" in captured["prompt"]           # the right worktree's source
+    assert "A_ONE" not in captured["prompt"]       # not the other one's
+    assert "exact revision" in captured["prompt"]  # header names the basis
+
+
+def test_ambiguous_stored_ref_contributes_no_code(hostlike):
+    captured = {}
+
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        captured["prompt"] = prompt
+        return {"text": _REFUTED, "ok": True}
+
+    V.verify_finding("pkg/mod.py does something",
+                     code_refs=[{"path": "pkg/mod.py"}], gen_fn=_gen)
+    assert "A_ONE" not in captured["prompt"]
+    assert "B_ONE" not in captured["prompt"]
+    assert "(none)" in captured["prompt"]
+
+
+def test_coerce_code_ref_hashes_ignores_junk():
+    assert V._coerce_code_ref_hashes([{"path": "a.py", "hash": "h"}]) == {"a.py": "h"}
+    assert V._coerce_code_ref_hashes([{"path": "a.py"}, "b.py:1", 7, None]) == {}
+    assert V._coerce_code_ref_hashes("nope") == {}
+
+
+def test_safe_resolve_rejects_before_containment_not_only_by_it(tmp_path):
+    # Defense-in-depth: the abs / '..' / dot-component rejects must fire on their OWN.
+    # The final containment check happens to catch the OBVIOUS forms (/etc/passwd lands
+    # outside any narrow root), which masks their removal. These forms all resolve back
+    # INSIDE the root, so only the explicit rejects can stop them.
+    root = tmp_path / "root"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "in.py").write_text("IN\n")
+    (root / ".env").write_text("SECRET=1\n")
+
+    # Absolute, but pointing at a file that IS under the root: os.path.join drops the root
+    # prefix entirely, so containment cannot see anything wrong.
+    assert V._safe_resolve(str(root / "sub" / "in.py"), root=str(root)) is None
+    # '..' that walks out and back in again: realpath lands under the root.
+    assert V._safe_resolve("sub/../sub/in.py", root=str(root)) is None
+    # A dot-component file that really is inside the root.
+    assert V._safe_resolve(".env", root=str(root)) is None
+    assert V._safe_resolve("", root=str(root)) is None
+    assert V._safe_resolve(None, root=str(root)) is None
+    # The legitimate ref still resolves, so the rejects are not just "refuse everything".
+    assert V._safe_resolve("sub/in.py", root=str(root)) == os.path.realpath(
+        str(root / "sub" / "in.py"))

@@ -6284,6 +6284,10 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             str(f.get("text") or ""),
             investigation_id=investigation_id,
             gen_fn=_verify_gen_fn,
+            # The finding's stamped {path, hash} refs are the only thing that says
+            # WHICH checkout its source lives in; without them the skeptic reasons
+            # over prose while the file sits on disk.
+            code_refs=f.get("code_refs"),
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
