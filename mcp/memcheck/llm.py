@@ -218,6 +218,8 @@ def call_llm(
     json_mode: bool = False,
     timeout: float = 60.0,
     max_tokens: int = 1024,
+    model: str | None = None,
+    options: dict | None = None,
 ) -> str | None:
     """Single-shot completion against the resolved provider. None on any failure.
 
@@ -252,7 +254,8 @@ def call_llm(
             elif provider == "openrouter":
                 out = _call_openrouter(prompt, json_mode, timeout, max_tokens)
             else:
-                out = _call_ollama(prompt, json_mode, timeout)
+                out = _call_ollama(prompt, json_mode, timeout, model=model,
+                                   options=options)
         except Exception as exc:  # noqa: BLE001 — fail-open, but say which one
             _log.warning("call_llm provider=%s raised, trying next: %r", provider, exc)
             continue
@@ -263,19 +266,66 @@ def call_llm(
     return None
 
 
-def _call_ollama(prompt: str, json_mode: bool, timeout: float) -> str | None:
-    payload: dict = {"model": _llm_model(), "prompt": prompt, "stream": False}
+def _call_ollama(prompt: str, json_mode: bool, timeout: float,
+                 model: str | None = None, options: dict | None = None) -> str | None:
+    model = model or _llm_model()
+    payload: dict = {"model": model, "prompt": prompt, "stream": False}
     if json_mode:
         payload["format"] = "json"
-    model = _llm_model()
     # qwen extended-thinking is noisy for a yes/no judge — disable when present.
     if "qwen" in model.lower():
         payload["think"] = False
+    if options:
+        payload["options"] = options
     data = _post_json(f"{_ollama_gen_base()}/api/generate", payload, {}, timeout)
     if not data:
         return None
+    _warn_if_truncated(prompt, data, model)
     text = (data.get("response") or "").strip()
     return text or None
+
+
+def _warn_if_truncated(prompt: str, data: dict, model: str) -> None:
+    """Say so when the server silently dropped part of the prompt.
+
+    Ollama truncates a prompt that exceeds the LOADED context window and returns
+    done_reason="stop" with no error — the model then answers from whatever
+    survived. Observed: prompt_eval_count=4095 against a 4096 window, and a
+    confidently wrong answer about content that had been cut.
+
+    The window is not ours to fix. It is set at load time by whoever loaded the
+    model, this endpoint is shared, and the same model has been seen loaded at
+    4096 and at 16384 while DECLARING 131072. Pinning num_ctx would force a
+    reload and evict another tenant's model, so this reports rather than imposes.
+
+    Detection is direct: compare the tokens the server says it evaluated against
+    a rough estimate of what we sent. ~4 chars per token is crude, so the margin
+    is generous — this must not cry wolf on ordinary prompts.
+    """
+    try:
+        evaluated = int(data.get("prompt_eval_count") or 0)
+    except (TypeError, ValueError):
+        return
+    if evaluated <= 0:
+        return
+
+    # Thresholding on a chars/4 token estimate does not work — it is off by ±25%
+    # on ordinary text, so any threshold either misses real truncation or fires
+    # on normal prompts. Truncation has a much sharper signature: the server
+    # stops exactly AT the window, and windows are powers of two. Observed
+    # 4095 against a 4096 window.
+    estimated = max(1, len(prompt) // 4)
+    for window in (2048, 4096, 8192, 16384, 32768, 65536):
+        if abs(evaluated - window) <= 2 and estimated > window:
+            _log.warning(
+                "prompt TRUNCATED by the context window: model=%s evaluated %d "
+                "tokens against an apparent %d-token window, for a ~%d-token "
+                "prompt. The answer was formed from a PARTIAL prompt and may be "
+                "confidently wrong. Load the model with a larger num_ctx, or "
+                "shorten the grounding.",
+                model, evaluated, window, estimated,
+            )
+            return
 
 
 def _call_anthropic(prompt: str, timeout: float, max_tokens: int) -> str | None:

@@ -143,6 +143,18 @@ def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
     actually registers (backends.vllm_model()), which is the part llm_local was
     getting wrong. Reusing it keeps one definition of both.
     """
+    # OPT-IN. This fallback was added when Ollama generation was broken; Ollama
+    # works now, and the endpoint backends resolves is NOT Loci's: 127.0.0.1:18000
+    # is /home/rjmendez/dama-vllm/vllm_tailscale_forward.py (pid 378), another
+    # project's service, serving Qwen2.5-3B-Instruct at max_model_len=4096.
+    # Grounded verify prompts exceed that, so firing into it 400s AND borrows
+    # capacity Loci does not own. Measured verify latencies (153s, >300s) also
+    # exceed _TIMEOUT=120s, so the failure path that reaches here is exactly the
+    # one that would hit it hardest.
+    #
+    # Set LOCI_VLLM_FALLBACK=1 when Loci has a vLLM of its own.
+    if os.environ.get("LOCI_VLLM_FALLBACK", "").strip() in ("", "0"):
+        return None
     try:
         import batched_gen
     except Exception:
