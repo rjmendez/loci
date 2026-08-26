@@ -98,7 +98,9 @@ def _qdrant_search_consolidated(collection: str, embedding: list[float], k: int)
     """Fetch existing consolidated points for interleaving."""
     url = f"{QDRANT_URL}/collections/{collection}/points/search"
     body = json.dumps({
-        "vector": {"dense": embedding},
+        # /points/search wants {"name": ..., "vector": ...}; the bare {"dense": v}
+        # form is for upsert and is rejected here with HTTP 400.
+        "vector": {"name": "dense", "vector": embedding},
         "limit": k,
         "with_payload": True,
         "with_vector": False,

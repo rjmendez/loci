@@ -18,8 +18,17 @@ import urllib.request, urllib.error
 STATE_DB    = os.path.expanduser(os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db"))
 QDRANT      = os.environ.get("QDRANT_URL")
 QDRANT_KEY  = os.environ.get("QDRANT_API_KEY", "")
-_OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL")
-OLLAMA      = f"{_OLLAMA_BASE}/v1/embeddings" if _OLLAMA_BASE else None
+def _embeddings_url() -> "str | None":
+    """OLLAMA_BASE_URL is a bare host; MNEMOSYNE_EMBEDDING_API_URL (what the
+    Hermes profile sets) is already a full /v1 endpoint."""
+    base = os.environ.get("OLLAMA_BASE_URL")
+    if base:
+        return f"{base.rstrip('/')}/v1/embeddings"
+    api = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL")
+    return f"{api.rstrip('/')}/embeddings" if api else None
+
+
+OLLAMA      = _embeddings_url()
 EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
@@ -87,16 +96,21 @@ def ensure_collection():
 def stable_id(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest()[:15], 16)
 
-def read_stdin_session_id() -> str:
+def read_stdin_payload() -> dict:
     try:
         raw = sys.stdin.read()
         if not raw.strip():
-            return ""
+            return {}
         data = json.loads(raw)
-        # session_id is top-level in the Hermes hook payload
-        return data.get("session_id") or ""
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return ""
+        return {}
+
+
+def read_stdin_session_id() -> str:
+    # session_id is top-level in both the Hermes and Claude Code payloads.
+    sid = read_stdin_payload().get("session_id")
+    return sid if isinstance(sid, str) else ""
 
 def get_session_content(session_id: str):
     """Return (title, started_at, source, model, content_text, msg_count)."""
@@ -154,6 +168,96 @@ def get_session_content(session_id: str):
         }
     except Exception:
         return None
+
+
+def _transcript_text(message) -> str:
+    """A user message carries a plain string; an assistant message carries a
+    list of content blocks. Only the text blocks are of interest."""
+    content = (message or {}).get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(x for x in parts if x).strip()
+    return ""
+
+
+def transcript_session_content(transcript_path: str, session_id: str):
+    """Same shape as get_session_content, built from a Claude Code transcript.
+
+    STATE_DB is Hermes' session store and holds Hermes-format ids only, so a
+    Claude Code session id never resolves there and the sync did nothing at all.
+    The Stop payload carries transcript_path, which is the record that exists.
+
+    Streams the file: transcripts reach tens of megabytes and only the last
+    MAX_CHARS of text is ever embedded.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    title = model = ""
+    started_at = ""
+    msg_count = 0
+    tail: list[str] = []
+    tail_chars = 0
+    try:
+        with open(transcript_path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                kind = rec.get("type")
+                if kind == "ai-title" and not title:
+                    title = str(rec.get("aiTitle") or "")
+                    continue
+                if kind not in ("user", "assistant"):
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if kind == "assistant" and not model:
+                    model = str(msg.get("model") or "")
+                if not started_at and rec.get("timestamp"):
+                    started_at = str(rec["timestamp"])
+                text = _transcript_text(msg)
+                if len(text) <= 20:
+                    continue
+                msg_count += 1
+                entry = f"{kind.upper()}: {text}"
+                tail.append(entry)
+                tail_chars += len(entry)
+                # Keep a bounded tail so recent context drives the embedding.
+                while tail_chars > MAX_CHARS * 2 and len(tail) > 1:
+                    tail_chars -= len(tail.pop(0))
+    except OSError:
+        return None
+
+    if not msg_count:
+        return None
+
+    buf: list[str] = []
+    total = 0
+    for entry in reversed(tail):
+        if total + len(entry) > MAX_CHARS:
+            buf.append(entry[:MAX_CHARS - total])
+            break
+        buf.append(entry)
+        total += len(entry)
+
+    return {
+        "title":      title,
+        "started_at": started_at,
+        "source":     "claude-code",
+        "model":      model,
+        "content":    "\n\n".join(reversed(buf)),
+        "msg_count":  msg_count,
+    }
 
 # One file per session id, forever. A session that will never be seen again keeps
 # its counter indefinitely, so the directory grows with every session the machine
@@ -289,8 +393,9 @@ def _check_wiring_obligations(investigation_id: str, payload: dict) -> str:
 
 def main():
     t0 = time.monotonic()
-    session_id = read_stdin_session_id()
-    if not session_id:
+    payload = read_stdin_payload()
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
         sys.exit(0)
 
     # Prune before doing work. This hook is the only thing that writes the cache,
@@ -305,7 +410,8 @@ def main():
     except Exception as e:
         print(f"[session_end_sync] cache prune skipped: {e}", file=sys.stderr)
 
-    sess = get_session_content(session_id)
+    sess = get_session_content(session_id) or transcript_session_content(
+        payload.get("transcript_path") or "", session_id)
     if not sess:
         sys.exit(0)
 

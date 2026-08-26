@@ -25,7 +25,9 @@ import json
 import math
 import os
 import pathlib
+import builtins
 import sys
+import urllib.error
 import time
 import types
 from unittest import mock
@@ -285,7 +287,10 @@ def test_search_collection_named_vector_request_shape(hook):
         calls.stop()
     c = calls[0]
     assert c["url"] == "http://qdrant.invalid:6333/collections/mnemosyne/points/search"
-    assert c["body"] == {"vector": {"dense": [1.0, 2.0]}, "limit": 4,
+    # Qdrant's REST contract for a named vector is {"name": ..., "vector": ...}.
+    # This test previously asserted {"dense": [...]}, which the server rejects
+    # with HTTP 400, so it pinned the defect rather than catching it.
+    assert c["body"] == {"vector": {"name": "dense", "vector": [1.0, 2.0]}, "limit": 4,
                          "with_payload": True, "with_vector": False}
     assert c["headers"]["Api-key"] == "test-key"
     assert c["timeout"] == 2.0
@@ -374,10 +379,23 @@ def test_search_collection_non_numeric_importance_raises(hook):
         calls.stop()
 
 
-def test_search_collection_returns_empty_on_transport_error(hook):
+def test_search_collection_raises_on_transport_error(hook):
+    # An empty list is what an unmatched query looks like, so returning [] here
+    # made a failing search indistinguishable from a successful empty one.
     calls = fake_urlopen(hook, OSError("down"))
     try:
-        assert hook._search_collection("c1", [1.0], "text", None, True) == []
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
+    finally:
+        calls.stop()
+
+
+def test_search_collection_raises_on_http_error(hook):
+    calls = fake_urlopen(hook, urllib.error.HTTPError(
+        "u", 400, "Bad Request", {}, io.BytesIO(b'{"status":{"error":"x"}}')))
+    try:
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
     finally:
         calls.stop()
 
@@ -407,10 +425,20 @@ def test_search_collection_missing_result_key_is_empty(hook):
 # ---------------------------------------------------------------------------
 
 def test_beam_fallback_returns_empty_when_mnemosyne_missing(hook):
+    # Clearing sys.modules is not enough: the import re-succeeds from disk on any
+    # host that has mnemosyne installed. Fail the import itself instead.
     saved = list(sys.path)
+    real_import = builtins.__import__
+
+    def no_mnemosyne(name, *a, **kw):
+        if name.startswith("mnemosyne"):
+            raise ImportError(f"no module named {name}")
+        return real_import(name, *a, **kw)
+
     blocked = {m: None for m in list(sys.modules) if m.startswith("mnemosyne")}
     try:
-        with mock.patch.dict(sys.modules, blocked):
+        with mock.patch.dict(sys.modules, blocked), \
+                mock.patch.object(builtins, "__import__", no_mnemosyne):
             for m in blocked:
                 del sys.modules[m]
             assert hook._beam_fallback("some query") == []
@@ -1380,3 +1408,125 @@ def test_output_is_a_single_json_line_on_stdout(hook):
     assert out.endswith("\n") and out.count("\n") == 1
     assert list(json.loads(out)) == ["context"]
     assert isinstance(json.loads(out)["context"], str)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code payload shape
+#
+# The hook was ported from Hermes by adding the Claude Code event names but not
+# its payload shape. Claude Code sends the text as a top-level "prompt";
+# Hermes nested it under extra.user_message. Reading only the latter made the
+# hook emit nothing on every real UserPromptSubmit and SubagentStart.
+# ---------------------------------------------------------------------------
+
+def _dark_hook(hook):
+    hook._embed = lambda t: None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+
+
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "SubagentStart"])
+def test_main_grounds_claude_code_top_level_prompt(hook, event):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": event,
+                                "session_id": "s1",
+                                "prompt": "why did retention delete the index"})
+    assert code is None, "hook exited without emitting on a real Claude Code payload"
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_still_grounds_legacy_hermes_shape(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "pre_llm_call",
+                                "extra": {"user_message": "a real question"}})
+    assert code is None
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_prefers_top_level_prompt_over_extra(hook):
+    seen = []
+    hook._embed = lambda t: seen.append(t) or None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+    run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                    "prompt": "the real prompt",
+                    "extra": {"user_message": "stale hermes text"}})
+    assert seen and "the real prompt" in seen[0]
+
+
+def test_main_still_exits_when_no_text_anywhere(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit"})
+    assert code == 0 and out == ""
+
+
+# ---------------------------------------------------------------------------
+# _embed_base_url
+# ---------------------------------------------------------------------------
+
+def test_embed_base_url_appends_v1_to_bare_ollama_host(hook):
+    with mock.patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://h:11434"}, clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_falls_back_to_mnemosyne_var(hook):
+    # What the Hermes profile actually sets — already a full /v1 endpoint.
+    with mock.patch.dict(os.environ,
+                         {"MNEMOSYNE_EMBEDDING_API_URL": "http://h:11434/v1"},
+                         clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_none_when_unset(hook):
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert hook._embed_base_url() is None
+
+
+# ---------------------------------------------------------------------------
+# fan-out degradation
+#
+# With the wrong named-vector shape every base collection returned HTTP 400 and
+# _search_collection swallowed it into []. The fan-out then reported a clean
+# "no matches" turn after turn. A total failure now degrades to BeamMemory.
+# ---------------------------------------------------------------------------
+
+def test_fanout_falls_back_to_beam_when_every_collection_fails(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam recalled this"}]
+    calls = fake_urlopen(hook, OSError("qdrant down"))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        calls.stop()
+    assert code is None
+    assert "beam recalled this" in context_of(out)
+
+
+def test_fanout_keeps_hits_when_only_some_collections_fail(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam should NOT be used"}]
+    good = {"collection": "hermes_memory", "point_id": None, "score": 0.9,
+            "importance": 0.9, "fused": 0.81, "content": "qdrant recalled this",
+            "payload": {}}
+    real = hook._search_collection
+    hook._search_collection = (
+        lambda col, *a, **k: [good] if col == "hermes_memory" else _raise(hook, col))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        hook._search_collection = real
+    ctx = context_of(out)
+    assert "qdrant recalled this" in ctx
+    assert "beam should NOT be used" not in ctx
+
+
+def _raise(hook, col):
+    raise hook._SearchFailed(col)

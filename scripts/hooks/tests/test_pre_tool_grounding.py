@@ -1230,3 +1230,35 @@ def test_dangerous_command_via_unknown_tool_is_not_scanned(tmp_path):
     rc, out, _ = run_hook(call("shell", {"command": "rm -rf /"}), home, block=True)
     assert (rc, out) == (0, "")
     assert decisions(home) == ["ALLOW"]
+
+
+# =============================================================================
+# Claude Code event name
+#
+# Every other test in this file drives the hook with the Hermes event name
+# "pre_tool_call". Claude Code emits "PreToolUse", so a suite that only used the
+# legacy name passed in full while the hook was inert against the real client.
+# =============================================================================
+
+def test_hook_accepts_claude_code_event_name(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    run_hook({"hook_event_name": "PreToolUse", "tool_name": "Whatever",
+              "tool_input": {}, "session_id": "s"}, home)
+    assert decisions(home), "no audit entry — hook ignored the Claude Code event"
+
+
+def test_hook_still_accepts_hermes_event_name(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    run_hook(call("Whatever"), home)
+    assert decisions(home)
+
+
+def test_hook_ignores_unknown_event_names(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    rc, out, _ = run_hook({"hook_event_name": "SomethingElse", "tool_name": "Whatever",
+                           "tool_input": {}, "session_id": "s"}, home)
+    assert rc == 0 and not out
+    assert not decisions(home)
