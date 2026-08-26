@@ -98,6 +98,39 @@ def ollama_url(probe_timeout: float = 1.0) -> str:
     return _cfg("ollama", "url", "") or ""
 
 
+def ollama_gen_url(probe_timeout: float = 1.0) -> str:
+    """Ollama base URL for GENERATION, which is not always the embedding one.
+
+    Reachability is not capability. An Ollama that answers /api/tags may carry no
+    generation model at all: on this host the in-cluster instance serves only
+    nomic-embed-text, so it satisfies _alive() and then fails every generate()
+    call. ollama_url() resolved to it and llm_local inherited the choice.
+
+    They also want opposite things. Measured here: embeddings 93 ms in-cluster vs
+    5,595 ms over the tailnet, while the generation model only exists over the
+    tailnet (35.7 s cold, 247 ms warm with keep_alive). One URL cannot serve both
+    well, so generation gets its own.
+
+    Resolution: LOCI_OLLAMA_GEN_URL / OLLAMA_GEN_URL -> [ollama].gen_url ->
+    ollama_url() as a last resort, so a host with a single capable Ollama needs no
+    extra config.
+    """
+    env = os.environ.get("LOCI_OLLAMA_GEN_URL") or os.environ.get("OLLAMA_GEN_URL")
+    if env:
+        return env
+    configured = _cfg("ollama", "gen_url", "") or ""
+    if configured:
+        return configured
+    return ollama_url(probe_timeout)
+
+
+def ollama_gen_model() -> str:
+    """Generation model tag. Env -> [ollama].gen_model -> the verified-good default."""
+    return (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
+            or _cfg("ollama", "gen_model", "")
+            or "qwen2.5:3b")
+
+
 @functools.lru_cache(maxsize=8)
 def vllm_url(probe_timeout: float = 1.0) -> str:
     """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).

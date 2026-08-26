@@ -31,9 +31,15 @@ _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or "
 
 
 def _resolve_ollama() -> str:
+    """The GENERATION endpoint, which is not necessarily the embedding one.
+
+    This used to call backends.ollama_url() and inherit whichever Ollama answered
+    a reachability probe first. That instance serves only nomic-embed-text here,
+    so every generate() call failed against a server that was demonstrably up.
+    """
     try:
         import backends
-        return backends.ollama_url()
+        return backends.ollama_gen_url()
     except Exception:
         return ""
 
@@ -43,7 +49,7 @@ _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
 
 
 def generate(prompt: str,
-             model: str = "qwen2.5:3b",
+             model: str = "",
              fmt: Optional[str] = None,
              max_tokens: int = 256,
              temperature: float = 0.2,
@@ -63,10 +69,30 @@ def generate(prompt: str,
     Returns:
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
     """
-    fail = {"text": "", "ok": False, "model": model}
+    if not model:
+        try:
+            import backends
+            model = backends.ollama_gen_model()
+        except Exception:
+            model = "qwen2.5:3b"
+
+    def fail(why: str) -> dict:
+        """Degraded, but never silent.
+
+        This used to be a bare `return fail` that discarded the exception, so a
+        misconfigured backend produced {'text':'','ok':False} with nothing to act
+        on. That cost a live diagnosis: the verify groom pass degraded for a day
+        and the reason -- a model name no server recognised -- was sitting in a
+        swallowed exception the whole time.
+        """
+        return {"text": "", "ok": False, "model": model, "why": why}
+
     base = _OLLAMA or _resolve_ollama()   # env wins; else backends (local probe -> config)
-    if not prompt or not base:
-        return fail
+    if not prompt:
+        return fail("empty prompt")
+    if not base:
+        return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
+                    "returned nothing)")
 
     body = {
         "model": model,
@@ -86,14 +112,61 @@ def generate(prompt: str,
         r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         text = (r.json().get("response") or "")
-    except Exception:
-        return fail
+    except Exception as exc:
+        # Ollama could not serve this. Try the vLLM tier before giving up: on this
+        # host Ollama carries only nomic-embed-text (an EMBEDDING model, no
+        # generation model at all) while vLLM serves the generation model under a
+        # different name -- Qwen/Qwen2.5-3B-Instruct, not the Ollama-style
+        # qwen2.5:3b. Asking one server for the other's name fails on both.
+        fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
+                             temperature=temperature)
+        if fallback is not None:
+            return fallback
+        return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
 
     if fmt == "json":
         # ok=True only if the body actually parses as JSON.
         try:
             json.loads(text)
-        except Exception:
-            return {"text": text, "ok": False, "model": model}
+        except Exception as exc:
+            return {"text": text, "ok": False, "model": model,
+                    "why": f"response was not valid JSON: {exc}"[:200]}
 
     return {"text": text, "ok": True, "model": model}
+
+
+def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
+              temperature: float) -> Optional[dict]:
+    """Second tier. Returns a result dict, or None if vLLM is not usable either.
+
+    batched_gen already resolves the vLLM endpoint AND the model name the server
+    actually registers (backends.vllm_model()), which is the part llm_local was
+    getting wrong. Reusing it keeps one definition of both.
+    """
+    try:
+        import batched_gen
+    except Exception:
+        return None
+    try:
+        out = batched_gen.generate_batch([prompt], max_tokens=max_tokens, fmt=fmt,
+                                         temperature=temperature)
+    except TypeError:
+        # older signature without temperature
+        try:
+            out = batched_gen.generate_batch([prompt], max_tokens=max_tokens, fmt=fmt)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if not out:
+        return None
+    first = out[0] or {}
+    if not first.get("ok"):
+        return None
+    served = first.get("model")
+    if not served:
+        try:
+            served = batched_gen._resolve_vllm_model()
+        except Exception:
+            served = "vllm"
+    return {"text": first.get("text", ""), "ok": True, "model": served, "tier": "vllm"}
