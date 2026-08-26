@@ -243,11 +243,24 @@ def test_read_stdin_session_id(hook, raw, expected):
         assert hook.read_stdin_session_id() == expected
 
 
-def test_read_stdin_session_id_does_not_coerce_non_strings(hook):
-    """BUG-ish: a numeric session_id is returned as an int, not a str."""
+def test_read_stdin_session_id_rejects_non_strings(hook):
+    """A numeric session_id used to be passed through as an int and then used in
+    a SQL lookup and a path join."""
     with mock.patch.object(hook.sys, "stdin", io.StringIO('{"session_id": 123}')):
-        got = hook.read_stdin_session_id()
-    assert got == 123 and isinstance(got, int)
+        assert hook.read_stdin_session_id() == ""
+
+
+def test_read_stdin_payload_returns_whole_object(hook):
+    raw = '{"session_id": "s1", "transcript_path": "/tmp/t.jsonl"}'
+    with mock.patch.object(hook.sys, "stdin", io.StringIO(raw)):
+        got = hook.read_stdin_payload()
+    assert got == {"session_id": "s1", "transcript_path": "/tmp/t.jsonl"}
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "not json", "[1,2]", '"a string"'])
+def test_read_stdin_payload_returns_empty_dict_on_junk(hook, raw):
+    with mock.patch.object(hook.sys, "stdin", io.StringIO(raw)):
+        assert hook.read_stdin_payload() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1193,3 +1206,84 @@ def test_embeddings_url_prefers_ollama_base_url():
 def test_embeddings_url_none_when_neither_set():
     mod = load_hook({"OLLAMA_BASE_URL": None})
     assert mod.OLLAMA is None
+
+
+# ---------------------------------------------------------------------------
+# transcript_session_content
+#
+# STATE_DB is Hermes' session store: 765 rows, all Hermes-format ids, none
+# written since 2026-06-19. A Claude Code session id never resolves there, so
+# get_session_content returned None and the Stop hook exited 0 without ever
+# syncing a single Claude Code session. The Stop payload carries
+# transcript_path, which is the record that actually exists.
+# ---------------------------------------------------------------------------
+
+def _write_transcript(tmp_path, records):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(p)
+
+
+def _msg(kind, text, ts="2026-08-26T12:00:00Z", model=None):
+    if kind == "user":
+        body = {"role": "user", "content": text}
+    else:
+        body = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        if model:
+            body["model"] = model
+    return {"type": kind, "timestamp": ts, "message": body}
+
+
+def test_transcript_content_builds_a_session(hook, tmp_path):
+    path = _write_transcript(tmp_path, [
+        {"type": "ai-title", "aiTitle": "Public Loci code"},
+        _msg("user", "a" * 40, ts="2026-08-24T17:40:37.466Z"),
+        _msg("assistant", "b" * 40, model="claude-opus-5"),
+    ])
+    got = hook.transcript_session_content(path, "sess-uuid")
+    assert got["title"] == "Public Loci code"
+    assert got["model"] == "claude-opus-5"
+    assert got["source"] == "claude-code"
+    assert got["started_at"] == "2026-08-24T17:40:37.466Z"
+    assert got["msg_count"] == 2
+    assert "USER: " + "a" * 40 in got["content"]
+    assert "ASSISTANT: " + "b" * 40 in got["content"]
+
+
+def test_transcript_content_extracts_only_text_blocks(hook, tmp_path):
+    rec = {"type": "assistant", "timestamp": "t", "message": {
+        "role": "assistant", "model": "m", "content": [
+            {"type": "thinking", "thinking": "hidden reasoning here padded out"},
+            {"type": "text", "text": "visible answer padded out to pass length"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        ]}}
+    got = hook.transcript_session_content(_write_transcript(tmp_path, [rec]), "s")
+    assert "visible answer" in got["content"]
+    assert "hidden reasoning" not in got["content"]
+    assert "tool_use" not in got["content"]
+
+
+def test_transcript_content_skips_unparseable_lines(hook, tmp_path):
+    p = tmp_path / "t.jsonl"
+    p.write_text("{not json\n" + json.dumps(_msg("user", "c" * 40)) + "\n\n")
+    got = hook.transcript_session_content(str(p), "s")
+    assert got["msg_count"] == 1
+
+
+def test_transcript_content_caps_at_max_chars(hook, tmp_path):
+    hook.MAX_CHARS = 200
+    records = [_msg("user", str(i) * 120) for i in range(40)]
+    got = hook.transcript_session_content(_write_transcript(tmp_path, records), "s")
+    assert got["msg_count"] == 40
+    assert len(got["content"]) <= 200
+    # The tail is what gets embedded, so the newest message must be present.
+    assert "39" in got["content"]
+
+
+def test_transcript_content_none_for_missing_or_empty(hook, tmp_path):
+    assert hook.transcript_session_content("", "s") is None
+    assert hook.transcript_session_content(str(tmp_path / "nope.jsonl"), "s") is None
+    assert hook.transcript_session_content(_write_transcript(tmp_path, []), "s") is None
+    # Records with no usable text are not a session.
+    short = _write_transcript(tmp_path, [_msg("user", "hi")])
+    assert hook.transcript_session_content(short, "s") is None
