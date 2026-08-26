@@ -31,14 +31,21 @@ def swr():
     return load()
 
 
+class _Resp(io.BytesIO):
+    """urlopen is used as a context manager, which BytesIO does not support."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _capture(mod, bodies, result=None):
     def fake(req, timeout=None):
         bodies.append(json.loads(req.data.decode()))
-        payload = json.dumps({"result": result if result is not None else []})
-        r = io.BytesIO(payload.encode())
-        r.__enter__ = lambda s=r: s
-        r.__exit__ = lambda s, *a: False
-        return r
+        return _Resp(json.dumps(
+            {"result": result if result is not None else []}).encode())
     return mock.patch.object(mod.urllib.request, "urlopen", fake)
 
 
