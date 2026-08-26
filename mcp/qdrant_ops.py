@@ -269,7 +269,14 @@ def _get_qdrant():
             )
 
             qdrant_api_key = os.environ.get("QDRANT_API_KEY", "") or None
-            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=5)
+            # 5s was too short for any collection but this server's own. Measured
+            # against agent_core_chunks (6.06M points, unquantized): 1.31s filtered,
+            # 10.87s unfiltered, 9.01s on a doc_type filter — so every explicit query
+            # to it timed out and came back mode="rag_failed", result_count=0 at
+            # HTTP 200. Raised, and configurable, because the right value depends on
+            # which collections a deployment actually searches.
+            client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key,
+                                  timeout=_QDRANT_TIMEOUT)
             col = QDRANT_COLLECTION_PREFIX
             existing = {c.name for c in client.get_collections().collections}
 
@@ -473,6 +480,9 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
 # 1024 stays the default because it is never worse and it is one median finding,
 # but anything >= 1024 is defensible and the 1024-vs-2048 gap was noise.
 RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
+# Client-wide Qdrant timeout, seconds. Not per-collection: one client serves them
+# all, so this is sized for the slowest collection a deployment searches.
+_QDRANT_TIMEOUT = float(os.environ.get("LOCI_QDRANT_TIMEOUT", "20"))
 
 # One definition of the quantized-search parameters, used by every query path.
 # rescore=True re-scores ANN candidates against the original full-precision

@@ -6573,13 +6573,23 @@ def rag_context_search(
     Hybrid RAG search over Qdrant corpus. Returns prompt-ready context with cited sources.
     ALWAYS uses Qdrant — no keyword fallback. Raises rag_required error if Qdrant unavailable.
 
-    Searches hermes_memory (task findings) and agent_core_chunks (1.84M knowledge base)
-    by default, merges results, reranks with cross-encoder, assembles cited context.
+    Searches QDRANT_COLLECTION_PREFIX (default "hermes_memory", the findings) plus
+    CODE_CHUNKS_COLLECTION when that env var is set, merges, reranks with a
+    cross-encoder and assembles cited context.
+
+    This used to claim it searched "agent_core_chunks (1.84M knowledge base)" by
+    default. It does not, and never did — the defaults are built from those two env
+    vars at :6606. On this deployment the second is dama_gotchi_code, and
+    agent_core_chunks is a 6.06M-point DAMA telemetry lake that is 86% GPS
+    trajectory points and 0.18% code. Naming it here sent callers to override
+    `collections` with it, which is slow and returns telemetry.
 
     Args:
         query: Natural language search query.
         limit: Results per collection (default 10).
-        collections: Override collections list (default: ["hermes_memory", "agent_core_chunks"]).
+        collections: Override the collections list. The DEFAULT is
+                     [QDRANT_COLLECTION_PREFIX] + [CODE_CHUNKS_COLLECTION if set],
+                     NOT agent_core_chunks — see the note above before overriding.
         budget_chars: Max characters in assembled context (default 6000).
         exclude_types: Payload 'type' values to exclude from agent_core_chunks results.
                        Default None → ['gps_trajectory'] to suppress high-volume GPS pings.
