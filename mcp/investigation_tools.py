@@ -203,7 +203,7 @@ def investigation_load(
     # backwards-compatible: findings without these fields read as "open"/not-stale.
     _apply_lifecycle(recent, investigation_id)
 
-    return json.dumps({
+    payload = {
         "manifest": manifest,
         "fidelity": "full",
         "total_findings": len(findings),
@@ -211,7 +211,66 @@ def investigation_load(
         "excluded_retracted": excluded_retracted,
         "total_retracted": total_retracted,
         "include_retracted": include_retracted,
-    }, indent=2)
+    }
+    verifications = _verification_summary(investigation_id)
+    if verifications:
+        payload["verifications"] = verifications
+    return json.dumps(payload, indent=2)
+
+
+def _verification_summary(investigation_id: str) -> Optional[dict]:
+    """Fold finding_verifications.jsonl into something a reader will actually see.
+
+    investigation_verify_all writes adversarial verdicts to a separate log so they
+    never bloat the findings scan (inv_store.py). The side effect was that NOTHING
+    read them: a census of the tool-audit log found the verdicts' only other
+    would-be consumer, memory_self_check, invoked 0 times, while
+    investigation_store ran 299 times. A skeptic refuting a stored finding at 0.95
+    confidence was landing in a file with no reader.
+
+    This surfaces it where someone is already looking. Returns None when there are
+    no verdicts, so the 140 investigations without any are unchanged.
+
+    ``degraded`` verdicts are counted separately and NEVER as refutations: a
+    degraded result means no model was reached, which is not a judgement about
+    the finding.
+    """
+    try:
+        rows = _read_jsonl(_inv_dir(investigation_id) / "finding_verifications.jsonl")
+    except Exception as exc:
+        logger.debug("verification summary unreadable for %s: %r", investigation_id, exc)
+        return None
+    if not rows:
+        return None
+
+    # Append-only: last verdict per finding wins, same rule as finding_updates.
+    latest: dict = {}
+    for r in rows:
+        if isinstance(r, dict) and r.get("finding_id"):
+            latest[str(r["finding_id"])] = r
+
+    counts = {"refuted": 0, "confirmed": 0, "uncertain": 0, "degraded": 0}
+    refuted: list[dict] = []
+    for fid, r in latest.items():
+        if r.get("degraded"):
+            counts["degraded"] += 1
+            continue
+        verdict = str(r.get("verdict") or "uncertain")
+        counts[verdict] = counts.get(verdict, 0) + 1
+        if verdict == "refuted":
+            try:
+                conf = float(r.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            refuted.append({"finding_id": fid, "confidence": conf, "ts": r.get("ts")})
+
+    refuted.sort(key=lambda x: -x["confidence"])
+    out = {"counts": counts, "verified_findings": len(latest)}
+    if refuted:
+        out["refuted"] = refuted
+        out["hint"] = ("adversarial verdicts, advisory only — they do NOT change a "
+                       "finding's resolution. Review, then finding_resolve if warranted.")
+    return out
 
 
 def investigation_as_of(
