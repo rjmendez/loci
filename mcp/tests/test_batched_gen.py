@@ -52,7 +52,17 @@ def _client_fn_for(client):
 # ---- helpers to force VLLM_BASE_URL state ----------------------------------------------
 
 def _set_vllm(monkeypatch, url):
+    """Pin the vLLM endpoint, resolver included.
+
+    Setting B._VLLM alone is not enough: _resolve_vllm() falls through to
+    backends.vllm_url(), which reads ~/.loci/backends.toml and probes. Once that
+    config gained a real [vllm] url, "" stopped meaning "no server" and these
+    tests started reaching the LIVE endpoint — non-deterministically, 2-3
+    failures per run with real model text leaking into assertions. A unit test
+    must not depend on the operator's config.
+    """
     monkeypatch.setattr(B, "_VLLM", url)
+    monkeypatch.setattr(B, "_resolve_vllm", lambda: url)
 
 
 # ---- batched happy path ----------------------------------------------------------------

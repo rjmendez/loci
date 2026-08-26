@@ -44,7 +44,34 @@ _DEFAULT_OLLAMA = "http://localhost:11434"
 
 
 def _ollama_base() -> str:
+    """Embedding endpoint. Generation resolves separately — see _ollama_gen_base."""
     return (os.environ.get("OLLAMA_BASE_URL") or _DEFAULT_OLLAMA).rstrip("/")
+
+
+def _ollama_gen_base() -> str:
+    """Generation endpoint, which is NOT necessarily the embedding one.
+
+    Generation used _ollama_base(), i.e. OLLAMA_BASE_URL. On this host that
+    resolves to an in-cluster Ollama serving ONLY nomic-embed-text, so every
+    call_llm() returned None while llm_available() reported True. Everything
+    gated on it — investigation_reflect's summaries, investigation_reason, the
+    causal-inference LLM path, the contradiction polarity judge — degraded
+    silently. Measured: 3 of 142 investigations had a summary.
+
+    Falls back to _ollama_base() so a host with one capable Ollama needs no
+    extra config.
+    """
+    env = os.environ.get("LOCI_OLLAMA_GEN_URL") or os.environ.get("OLLAMA_GEN_URL")
+    if env:
+        return env.rstrip("/")
+    try:
+        import backends
+        url = backends.ollama_gen_url()
+        if url:
+            return url.rstrip("/")
+    except Exception:
+        pass
+    return _ollama_base()
 
 
 def _embed_model() -> str:
@@ -56,16 +83,38 @@ def _embed_model() -> str:
 
 
 def _llm_model() -> str:
-    return (
-        os.environ.get("MEMCHECK_LLM_MODEL")
-        or os.environ.get("SWR_LLM_MODEL")
-        or "llama3.2:latest"
-    )
+    """Generation model. The old default, llama3.2:latest, is not installed on
+    any endpoint this deployment reaches — so even a correct URL failed."""
+    explicit = os.environ.get("MEMCHECK_LLM_MODEL") or os.environ.get("SWR_LLM_MODEL")
+    if explicit:
+        return explicit
+    try:
+        import backends
+        m = backends.ollama_gen_model()
+        if m:
+            return m
+    except Exception:
+        pass
+    return "llama3.2:latest"
 
 
 def _anthropic_key() -> str:
+    """The key, or "" if it cannot be used as an HTTP header.
+
+    .strip() removes OUTER whitespace only. A key wrapped across two lines in a
+    shell rc file keeps an INTERNAL newline, which urllib rejects with a
+    ValueError the caller then swallows — indistinguishable from "no key". Treat
+    a key containing any whitespace as absent so provider selection falls through
+    to something that works, and say so once.
+    """
     k = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    return k if k and k not in ("not-set",) else ""
+    if not k or k in ("not-set",):
+        return ""
+    if any(c.isspace() for c in k):
+        _log.warning("ANTHROPIC_API_KEY contains whitespace (a wrapped paste?) — "
+                     "unusable as a header, treating as unset")
+        return ""
+    return k
 
 
 def _copilot_token() -> str:
@@ -98,6 +147,57 @@ def embeddings_available() -> bool:
     return bool(_ollama_base())
 
 
+# Findings carry internal addressing — IPs, hostnames, code paths — so leaving the
+# box is a choice, not a default. Local Ollama is free, private and needs no
+# credit, so it goes first; OpenRouter is the fallback that replaces Anthropic,
+# which measured HTTP 400 "credit balance is too low" and cannot transact at all.
+# Set LOCI_MEMCHECK_NO_REMOTE=1 to keep every call on this machine.
+_DEFAULT_PROVIDER_ORDER = ("ollama", "openrouter", "anthropic", "copilot")
+
+
+def _openrouter_enabled() -> bool:
+    if os.environ.get("LOCI_MEMCHECK_NO_REMOTE", "").strip() not in ("", "0"):
+        return False
+    try:
+        import openrouter
+        return bool(openrouter.available())
+    except Exception:
+        return False
+
+
+def _call_openrouter(prompt: str, json_mode: bool, timeout: float,
+                     max_tokens: int) -> str | None:
+    """Free/cheap ladder. Reuses mcp/openrouter.py so the ladder and its
+    HTTP-200-with-error-envelope handling live in one place."""
+    try:
+        import openrouter
+        out = openrouter.generate_batch([prompt], max_tokens=max_tokens,
+                                        fmt="json" if json_mode else None)
+    except Exception as exc:
+        _log.warning("openrouter call raised: %r", exc)
+        return None
+    first = (out or [{}])[0] or {}
+    if not first.get("ok"):
+        _log.warning("openrouter declined: %s", str(first.get("why") or "")[:160])
+        return None
+    return first.get("text") or None
+
+
+def _provider_order() -> list:
+    """Resolution order, with an explicit override first.
+
+    MEMCHECK_LLM_PROVIDER forces one to the front; the rest still follow, because
+    committing to a single provider is what made every call return None while
+    llm_available() reported True.
+    """
+    forced = os.environ.get("MEMCHECK_LLM_PROVIDER", "").strip().lower()
+    order = [forced] if forced else []
+    for p in _DEFAULT_PROVIDER_ORDER:
+        if p not in order:
+            order.append(p)
+    return order
+
+
 def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict | None:
     """POST JSON and parse a JSON response. Returns None on any error (fail-open)."""
     try:
@@ -127,16 +227,40 @@ def call_llm(
     """
     if not prompt or not prompt.strip():
         return None
-    provider = _provider()
-    try:
-        if provider == "anthropic":
-            return _call_anthropic(prompt, timeout, max_tokens)
-        if provider == "copilot":
-            return _call_copilot(prompt, timeout, max_tokens)
-        return _call_ollama(prompt, json_mode, timeout)
-    except Exception as exc:  # noqa: BLE001 — belt-and-suspenders fail-open
-        _log.debug("call_llm provider=%s failed: %r", provider, exc)
-        return None
+    # Try the resolved provider, then FALL THROUGH. Selecting a provider on
+    # key-presence and committing to it is how this starved: ANTHROPIC_API_KEY
+    # was set, so _provider() returned "anthropic" for every call, and the API
+    # answered "Your credit balance is too low" — a 400 the fail-open swallowed.
+    # Everything gated on llm_available() reported ready and produced nothing.
+    #
+    # A configured provider that cannot transact is not an available provider.
+    # Ollama is always last because it is local, free, and needs no credit.
+    order = _provider_order()
+
+    for provider in order:
+        if provider == "anthropic" and not _anthropic_key():
+            continue
+        if provider == "copilot" and not _copilot_token():
+            continue
+        if provider == "openrouter" and not _openrouter_enabled():
+            continue
+        try:
+            if provider == "anthropic":
+                out = _call_anthropic(prompt, timeout, max_tokens)
+            elif provider == "copilot":
+                out = _call_copilot(prompt, timeout, max_tokens)
+            elif provider == "openrouter":
+                out = _call_openrouter(prompt, json_mode, timeout, max_tokens)
+            else:
+                out = _call_ollama(prompt, json_mode, timeout)
+        except Exception as exc:  # noqa: BLE001 — fail-open, but say which one
+            _log.warning("call_llm provider=%s raised, trying next: %r", provider, exc)
+            continue
+        if out:
+            return out
+        _log.warning("call_llm provider=%s returned nothing, trying next", provider)
+    _log.warning("call_llm: every provider failed (tried %s)", ", ".join(order))
+    return None
 
 
 def _call_ollama(prompt: str, json_mode: bool, timeout: float) -> str | None:
@@ -147,7 +271,7 @@ def _call_ollama(prompt: str, json_mode: bool, timeout: float) -> str | None:
     # qwen extended-thinking is noisy for a yes/no judge — disable when present.
     if "qwen" in model.lower():
         payload["think"] = False
-    data = _post_json(f"{_ollama_base()}/api/generate", payload, {}, timeout)
+    data = _post_json(f"{_ollama_gen_base()}/api/generate", payload, {}, timeout)
     if not data:
         return None
     text = (data.get("response") or "").strip()
