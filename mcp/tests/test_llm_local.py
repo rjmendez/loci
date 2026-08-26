@@ -4,6 +4,7 @@ No live Ollama: requests.post is monkeypatched with a fake response object. Cove
 happy path, HTTP-error fail-open, JSON-format validation, and that keep_alive + format
 are actually placed in the posted payload.
 """
+import pytest
 import json
 import os
 import sys
@@ -51,6 +52,25 @@ def _ensure_base(monkeypatch):
     monkeypatch.setattr(L, "_OLLAMA", "http://fake-ollama:11434")
 
 
+@pytest.fixture(autouse=True)
+def _no_vllm_fallback(monkeypatch):
+    """Keep these tests on the Ollama path and off the network.
+
+    generate() now falls through to the vLLM tier when Ollama fails, so every
+    fail-open test below would otherwise attempt a real request to whatever
+    backends resolves. The fallback has its own tests in
+    test_llm_local_fallback.py; here it is disabled so a failure means what the
+    test name says it means.
+    """
+    monkeypatch.setattr(L, "_try_vllm", lambda *a, **k: None)
+    # Pin the model too. generate() now resolves it via backends.ollama_gen_model(),
+    # which reads ~/.loci/backends.toml -- so without this these tests assert
+    # against whatever the OPERATOR has configured, passing locally and failing in
+    # CI (or vice versa). A unit test must not depend on a machine's config.
+    import backends
+    monkeypatch.setattr(backends, "ollama_gen_model", lambda: "qwen2.5:3b")
+
+
 def test_happy_path_ok_true(monkeypatch):
     _ensure_base(monkeypatch)
     _install_post(monkeypatch, resp=_FakeResp({"response": "hello world"}))
@@ -73,7 +93,13 @@ def test_exception_never_raises(monkeypatch):
     _ensure_base(monkeypatch)
     _install_post(monkeypatch, exc=TimeoutError("timed out"))
     r = L.generate("say hi")  # must not raise
-    assert r == {"text": "", "ok": False, "model": "qwen2.5:3b"}
+    assert r["ok"] is False
+    assert r["text"] == ""
+    assert r["model"] == "qwen2.5:3b"
+    # The failure must carry its reason. This asserted the exact dict, which is
+    # why adding `why` broke it -- and the absence of a reason here is exactly
+    # what made a misconfigured endpoint take a live diagnosis to find.
+    assert "timed out" in r["why"]
 
 
 def test_json_fmt_invalid_body_not_ok(monkeypatch):
@@ -116,6 +142,15 @@ def test_payload_omits_format_when_not_json(monkeypatch):
 
 
 def test_no_base_url_fails_open(monkeypatch):
+    """No endpoint at all -- which means stubbing the RESOLVER too.
+
+    This set only _OLLAMA and passed because _resolve_ollama() fell back to an
+    endpoint that happened to be incapable of generating. Once generation was
+    pointed at a host that works, the test failed -- correctly, because it had
+    been asserting "the resolved backend is broken", not "there is no backend".
+    """
     monkeypatch.setattr(L, "_OLLAMA", "")
+    monkeypatch.setattr(L, "_resolve_ollama", lambda: "")
     r = L.generate("say hi")
     assert r["ok"] is False and r["text"] == ""
+    assert "no Ollama endpoint" in r["why"]
