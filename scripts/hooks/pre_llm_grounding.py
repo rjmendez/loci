@@ -106,6 +106,8 @@ RULES_DIR    = os.environ.get("HOOK_RULES_DIR",
 RECALL_TOP_K      = int(os.environ.get("HOOK_RECALL_TOP_K",          "3"))
 MIN_IMPORTANCE    = float(os.environ.get("HOOK_RECALL_MIN_IMPORTANCE", "0.2"))
 MIN_SCORE         = float(os.environ.get("HOOK_RECALL_MIN_SCORE",      "0.55"))
+# Every named collection on this instance uses "dense"; overridable if that changes.
+VECTOR_NAME       = os.environ.get("HOOK_RECALL_VECTOR_NAME",    "dense")
 MAX_CONTENT_CHARS = int(os.environ.get("HOOK_RECALL_MAX_CHARS",        "200"))
 RULES_MAX_CHARS   = int(os.environ.get("HOOK_RULES_MAX_CHARS",         "1200"))
 EMBED_TIMEOUT     = float(os.environ.get("HOOK_EMBED_TIMEOUT",         "3.0"))
@@ -211,6 +213,13 @@ def _embed(text: str) -> Optional[list[float]]:
 
 # ── Qdrant search ─────────────────────────────────────────────────────────────
 
+class _SearchFailed(Exception):
+    """One collection's search did not complete. Raised so the fan-out can tell
+    'nothing matched' apart from 'every request failed' — the wrong named-vector
+    request shape returned an empty list from all three base collections for
+    months, and an empty list is what a genuinely unmatched query looks like."""
+
+
 def _search_collection(
     collection: str,
     vector: list[float],
@@ -221,7 +230,7 @@ def _search_collection(
 ) -> list[dict]:
     """Search one Qdrant collection, return normalised hit dicts."""
     url = f"{QDRANT_URL}/collections/{collection}/points/search"
-    vec_payload = {"dense": vector} if named_vec else vector
+    vec_payload = {"name": VECTOR_NAME, "vector": vector} if named_vec else vector
     body = json.dumps({
         "vector": vec_payload,
         "limit": top_k,
@@ -240,7 +249,7 @@ def _search_collection(
         with urllib.request.urlopen(req, timeout=QDRANT_TIMEOUT) as resp:
             d = json.loads(resp.read())
     except Exception:
-        return []
+        raise _SearchFailed(collection)
 
     hits = []
     for pt in d.get("result", []):
@@ -569,10 +578,13 @@ def main() -> None:
         if QDRANT_URL:
             sub_vec = _embed(intent)
             if sub_vec is not None:
-                sub_hits = _search_collection(
-                    "hermes_memory", sub_vec, "text", "confidence", True,
-                    top_k=min(RECALL_TOP_K, 2),
-                )
+                try:
+                    sub_hits = _search_collection(
+                        "hermes_memory", sub_vec, "text", "confidence", True,
+                        top_k=min(RECALL_TOP_K, 2),
+                    )
+                except _SearchFailed:
+                    sub_hits = _beam_fallback(intent)
                 sub_hits = [h for h in sub_hits if h["importance"] >= MIN_IMPORTANCE]
                 _sub_ts = time.time()
                 for h in sub_hits:
@@ -627,11 +639,18 @@ def main() -> None:
                 ): col
                 for col, cf, impf, named in COLLECTIONS
             }
+            searched = failed = 0
             for f in as_completed(futures):
+                searched += 1
                 try:
                     all_hits.extend(f.result())
+                except _SearchFailed:
+                    failed += 1
                 except Exception:
-                    pass
+                    failed += 1
+        if searched and failed == searched:
+            used_fallback = True
+            all_hits = _beam_fallback(intent)
 
         # Keyword rerank adds overlap bonus to fused before multi-signal scoring.
         hits = _keyword_rerank(all_hits, intent)

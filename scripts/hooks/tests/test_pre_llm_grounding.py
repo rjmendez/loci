@@ -27,6 +27,7 @@ import os
 import pathlib
 import builtins
 import sys
+import urllib.error
 import time
 import types
 from unittest import mock
@@ -286,7 +287,10 @@ def test_search_collection_named_vector_request_shape(hook):
         calls.stop()
     c = calls[0]
     assert c["url"] == "http://qdrant.invalid:6333/collections/mnemosyne/points/search"
-    assert c["body"] == {"vector": {"dense": [1.0, 2.0]}, "limit": 4,
+    # Qdrant's REST contract for a named vector is {"name": ..., "vector": ...}.
+    # This test previously asserted {"dense": [...]}, which the server rejects
+    # with HTTP 400, so it pinned the defect rather than catching it.
+    assert c["body"] == {"vector": {"name": "dense", "vector": [1.0, 2.0]}, "limit": 4,
                          "with_payload": True, "with_vector": False}
     assert c["headers"]["Api-key"] == "test-key"
     assert c["timeout"] == 2.0
@@ -375,10 +379,23 @@ def test_search_collection_non_numeric_importance_raises(hook):
         calls.stop()
 
 
-def test_search_collection_returns_empty_on_transport_error(hook):
+def test_search_collection_raises_on_transport_error(hook):
+    # An empty list is what an unmatched query looks like, so returning [] here
+    # made a failing search indistinguishable from a successful empty one.
     calls = fake_urlopen(hook, OSError("down"))
     try:
-        assert hook._search_collection("c1", [1.0], "text", None, True) == []
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
+    finally:
+        calls.stop()
+
+
+def test_search_collection_raises_on_http_error(hook):
+    calls = fake_urlopen(hook, urllib.error.HTTPError(
+        "u", 400, "Bad Request", {}, io.BytesIO(b'{"status":{"error":"x"}}')))
+    try:
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
     finally:
         calls.stop()
 
@@ -1463,3 +1480,53 @@ def test_embed_base_url_falls_back_to_mnemosyne_var(hook):
 def test_embed_base_url_none_when_unset(hook):
     with mock.patch.dict(os.environ, {}, clear=True):
         assert hook._embed_base_url() is None
+
+
+# ---------------------------------------------------------------------------
+# fan-out degradation
+#
+# With the wrong named-vector shape every base collection returned HTTP 400 and
+# _search_collection swallowed it into []. The fan-out then reported a clean
+# "no matches" turn after turn. A total failure now degrades to BeamMemory.
+# ---------------------------------------------------------------------------
+
+def test_fanout_falls_back_to_beam_when_every_collection_fails(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam recalled this"}]
+    calls = fake_urlopen(hook, OSError("qdrant down"))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        calls.stop()
+    assert code is None
+    assert "beam recalled this" in context_of(out)
+
+
+def test_fanout_keeps_hits_when_only_some_collections_fail(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam should NOT be used"}]
+    good = {"collection": "hermes_memory", "point_id": None, "score": 0.9,
+            "importance": 0.9, "fused": 0.81, "content": "qdrant recalled this",
+            "payload": {}}
+    real = hook._search_collection
+    hook._search_collection = (
+        lambda col, *a, **k: [good] if col == "hermes_memory" else _raise(hook, col))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        hook._search_collection = real
+    ctx = context_of(out)
+    assert "qdrant recalled this" in ctx
+    assert "beam should NOT be used" not in ctx
+
+
+def _raise(hook, col):
+    raise hook._SearchFailed(col)
