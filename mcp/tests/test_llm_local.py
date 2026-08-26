@@ -49,7 +49,7 @@ def _install_post(monkeypatch, resp=None, exc=None, capture=None):
 
 def _ensure_base(monkeypatch):
     # generate() short-circuits when no base URL is configured; give it one.
-    monkeypatch.setattr(L, "_OLLAMA", "http://fake-ollama:11434")
+    monkeypatch.setattr(L, "_gen_env", lambda _v="http://fake-ollama:11434": _v)
 
 
 @pytest.fixture(autouse=True)
@@ -149,7 +149,7 @@ def test_no_base_url_fails_open(monkeypatch):
     pointed at a host that works, the test failed -- correctly, because it had
     been asserting "the resolved backend is broken", not "there is no backend".
     """
-    monkeypatch.setattr(L, "_OLLAMA", "")
+    monkeypatch.setattr(L, "_gen_env", lambda: "")
     monkeypatch.setattr(L, "_resolve_ollama", lambda: "")
     r = L.generate("say hi")
     assert r["ok"] is False and r["text"] == ""

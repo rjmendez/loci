@@ -27,7 +27,31 @@ from typing import Optional
 
 # [substrate] read the base URL from env, same convention as embed_ops.py. When unset, the
 # call-time _resolve_ollama() falls back to backends (local probe -> config) for portability.
-_OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
+# GENERATION-specific vars ONLY. OLLAMA_BASE_URL is the EMBEDDING endpoint, and
+# reading it here re-created the exact conflation #222 set out to fix, one level
+# up: #222 taught the RESOLVER to separate generation from embeddings, then left
+# the embedding variable as the highest-precedence generation override.
+#
+# scripts/loci_groom.load_env() — which every groom pass calls — sets
+# OLLAMA_BASE_URL to backends.ollama_url(), the in-cluster host that serves only
+# nomic-embed-text. Measured in one process: bare import resolves to oxalis and
+# generates; after load_env() it resolves to 10.42.0.1 and 404s. So under cron,
+# 100% of generation went to a host with no generation model, and the vLLM
+# fallback was silently rescuing it — until #224 made that fallback opt-in, which
+# took the groom pass from 9/100 degraded to 100/100.
+#
+# A host with one capable Ollama still works: _resolve_ollama() falls through to
+# backends.ollama_gen_url(), which itself falls back to ollama_url(). This only
+# removes the env var's ability to OUTRANK that resolution.
+# Read at CALL time, not import time. qdrant_ops._retention_days() already
+# established this pattern here for the same reason: scripts/loci_groom.load_env()
+# runs AFTER this module is imported, so an import-time capture reflects the
+# environment before the process configured itself. That ordering is what let a
+# stale value win, and a module-level constant cannot be tested without reload()
+# — which made the test for it order-dependent in the suite.
+def _gen_env() -> str:
+    return (os.environ.get("LOCI_OLLAMA_GEN_URL")
+            or os.environ.get("OLLAMA_GEN_URL") or "")
 
 
 def _resolve_ollama() -> str:
@@ -87,7 +111,7 @@ def generate(prompt: str,
         """
         return {"text": "", "ok": False, "model": model, "why": why}
 
-    base = _OLLAMA or _resolve_ollama()   # env wins; else backends (local probe -> config)
+    base = _gen_env() or _resolve_ollama()   # gen env wins; else backends
     if not prompt:
         return fail("empty prompt")
     if not base:
