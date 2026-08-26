@@ -147,6 +147,57 @@ def embeddings_available() -> bool:
     return bool(_ollama_base())
 
 
+# Findings carry internal addressing — IPs, hostnames, code paths — so leaving the
+# box is a choice, not a default. Local Ollama is free, private and needs no
+# credit, so it goes first; OpenRouter is the fallback that replaces Anthropic,
+# which measured HTTP 400 "credit balance is too low" and cannot transact at all.
+# Set LOCI_MEMCHECK_NO_REMOTE=1 to keep every call on this machine.
+_DEFAULT_PROVIDER_ORDER = ("ollama", "openrouter", "anthropic", "copilot")
+
+
+def _openrouter_enabled() -> bool:
+    if os.environ.get("LOCI_MEMCHECK_NO_REMOTE", "").strip() not in ("", "0"):
+        return False
+    try:
+        import openrouter
+        return bool(openrouter.available())
+    except Exception:
+        return False
+
+
+def _call_openrouter(prompt: str, json_mode: bool, timeout: float,
+                     max_tokens: int) -> str | None:
+    """Free/cheap ladder. Reuses mcp/openrouter.py so the ladder and its
+    HTTP-200-with-error-envelope handling live in one place."""
+    try:
+        import openrouter
+        out = openrouter.generate_batch([prompt], max_tokens=max_tokens,
+                                        fmt="json" if json_mode else None)
+    except Exception as exc:
+        _log.warning("openrouter call raised: %r", exc)
+        return None
+    first = (out or [{}])[0] or {}
+    if not first.get("ok"):
+        _log.warning("openrouter declined: %s", str(first.get("why") or "")[:160])
+        return None
+    return first.get("text") or None
+
+
+def _provider_order() -> list:
+    """Resolution order, with an explicit override first.
+
+    MEMCHECK_LLM_PROVIDER forces one to the front; the rest still follow, because
+    committing to a single provider is what made every call return None while
+    llm_available() reported True.
+    """
+    forced = os.environ.get("MEMCHECK_LLM_PROVIDER", "").strip().lower()
+    order = [forced] if forced else []
+    for p in _DEFAULT_PROVIDER_ORDER:
+        if p not in order:
+            order.append(p)
+    return order
+
+
 def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict | None:
     """POST JSON and parse a JSON response. Returns None on any error (fail-open)."""
     try:
@@ -184,21 +235,22 @@ def call_llm(
     #
     # A configured provider that cannot transact is not an available provider.
     # Ollama is always last because it is local, free, and needs no credit.
-    order = [_provider()]
-    for p in ("anthropic", "copilot", "ollama"):
-        if p not in order:
-            order.append(p)
+    order = _provider_order()
 
     for provider in order:
         if provider == "anthropic" and not _anthropic_key():
             continue
         if provider == "copilot" and not _copilot_token():
             continue
+        if provider == "openrouter" and not _openrouter_enabled():
+            continue
         try:
             if provider == "anthropic":
                 out = _call_anthropic(prompt, timeout, max_tokens)
             elif provider == "copilot":
                 out = _call_copilot(prompt, timeout, max_tokens)
+            elif provider == "openrouter":
+                out = _call_openrouter(prompt, json_mode, timeout, max_tokens)
             else:
                 out = _call_ollama(prompt, json_mode, timeout)
         except Exception as exc:  # noqa: BLE001 — fail-open, but say which one
