@@ -523,10 +523,26 @@ def investigation_reflect(investigation_id: str) -> str:
                     "single sentence under 120 characters. Reply with ONLY a JSON array "
                     "of strings, no other text. Example: [\"First point.\", \"Second point.\"]"
                 )
-                l1_raw = _llm.call_llm(l1_prompt, json_mode=True, timeout=60.0)
+                # json_mode=False on purpose. Ollama's format=json coerces the
+                # reply to an OBJECT, but this prompt asks for a bare ARRAY and
+                # the parse below required a list — so the two were mutually
+                # exclusive and summary_l1 could never be populated. Measured on
+                # the same prompt, 5 trials each: json_mode=True -> 0/5 parsed as
+                # a list (all dicts); json_mode=False -> 5/5 parsed as an array.
+                # Corpus evidence: 0 of 142 manifests carried an LLM-authored
+                # summary; the 3 that had one were the deterministic fallback.
+                l1_raw = _llm.call_llm(l1_prompt, timeout=60.0)
                 if l1_raw:
                     try:
                         parsed = json.loads(l1_raw)
+                        # Accept a bare array, or one wrapped in a single-key
+                        # object — a model that answers {"bullets": [...]} is
+                        # being helpful, not wrong, and this used to discard it.
+                        if isinstance(parsed, dict):
+                            for _v in parsed.values():
+                                if isinstance(_v, list):
+                                    parsed = _v
+                                    break
                         if isinstance(parsed, list):
                             summary_l1 = [str(b) for b in parsed if str(b).strip()][:7]
                     except Exception as _l1_exc:

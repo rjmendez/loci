@@ -7021,6 +7021,7 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
     if not findings:
         return 0
     edges: list[dict] = []
+    known_ids = {str(f.get("id")) for f in findings if f.get("id")}
     try:
         from memcheck import llm as _llm  # type: ignore
         if _llm.llm_available():
@@ -7069,6 +7070,16 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
                     tgt = str(obj.get("target_id") or "")
                     etype = str(obj.get("edge_type") or "")
                     conf = float(obj.get("confidence") or 0.0)
+                    # src/tgt must name findings that EXIST. The prompt renders
+                    # the list as "{idx+1}. [{id}] ..." and the model sometimes
+                    # returns the ORDINAL instead — measured: edges written with
+                    # source_id "1"/"2"/"3". Checking only for a non-empty string
+                    # let those through, and causal_edges_list strips `method`,
+                    # so a consumer cannot tell a dangling edge from a real one.
+                    if src not in known_ids or tgt not in known_ids:
+                        logger.warning("causal LLM edge names unknown finding(s) "
+                                       "%r -> %r; dropping", src[:40], tgt[:40])
+                        continue
                     if src and tgt and etype in valid_types and conf >= 0.6:
                         edges.append({
                             "id": str(uuid.uuid4()),
