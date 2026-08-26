@@ -143,3 +143,47 @@ class GenerationEndpointResolutionTest(unittest.TestCase):
             r = llm_local.generate("hello")
         self.assertEqual(r["model"], "some-model:7b")
         self.assertEqual(post.call_args.kwargs["json"]["model"], "some-model:7b")
+
+
+class VllmFallbackIsOptInTest(unittest.TestCase):
+    """The fallback must not borrow a service Loci does not own.
+
+    backends resolves vLLM to 127.0.0.1:18000, which is
+    /home/rjmendez/dama-vllm/vllm_tailscale_forward.py — another project's
+    process, serving Qwen2.5-3B-Instruct at max_model_len=4096. Grounded verify
+    prompts exceed that, so firing into it both 400s and consumes capacity Loci
+    has no claim on. It was added when Ollama generation was broken; Ollama works
+    now, so the default is off.
+    """
+
+    def test_disabled_by_default(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("LOCI_VLLM_FALLBACK", None)
+            self.assertIsNone(
+                llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0))
+
+    def test_zero_is_also_disabled(self):
+        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": "0"}):
+            self.assertIsNone(
+                llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0))
+
+    def test_opt_in_reaches_batched_gen(self):
+        fake = mock.MagicMock()
+        fake.generate_batch.return_value = [{"text": "OK", "ok": True}]
+        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": "1"}), \
+             mock.patch.dict("sys.modules", {"batched_gen": fake}):
+            out = llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0)
+        self.assertEqual(out["ok"], True)
+        fake.generate_batch.assert_called_once()
+
+    def test_an_ollama_failure_no_longer_silently_reaches_vllm(self):
+        """The whole point: a failed generate must report why, not reroute."""
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("LOCI_VLLM_FALLBACK", None)
+            with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+                 mock.patch("requests.post", side_effect=OSError("refused")):
+                r = llm_local.generate("hello")
+        self.assertFalse(r["ok"])
+        self.assertIn("ollama", r["why"])
