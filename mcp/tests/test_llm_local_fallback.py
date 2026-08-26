@@ -12,6 +12,7 @@ Consequence: verify_finding returned degraded=True with empty reasoning for ever
 finding, and the verify groom pass refused to run (correctly) rather than write
 uncertain/0.0 records. The cause sat in a swallowed exception.
 """
+import os
 import unittest
 from unittest import mock
 
@@ -26,7 +27,7 @@ class FailuresAreExplainedTest(unittest.TestCase):
         self.assertIn("empty prompt", r["why"])
 
     def test_no_endpoint_says_so(self):
-        with mock.patch.object(llm_local, "_OLLAMA", ""), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: ""), \
              mock.patch.object(llm_local, "_resolve_ollama", return_value=""):
             r = llm_local.generate("hello")
         self.assertFalse(r["ok"])
@@ -34,7 +35,7 @@ class FailuresAreExplainedTest(unittest.TestCase):
 
     def test_a_transport_failure_carries_the_exception(self):
         """The regression: this used to return ok=False with no reason at all."""
-        with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch("requests.post", side_effect=OSError("connection refused")):
             r = llm_local.generate("hello")
@@ -45,7 +46,7 @@ class FailuresAreExplainedTest(unittest.TestCase):
     def test_unparseable_json_says_so_rather_than_just_failing(self):
         resp = mock.MagicMock()
         resp.json.return_value = {"response": "not json at all"}
-        with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", return_value=resp):
             r = llm_local.generate("hello", fmt="json")
         self.assertFalse(r["ok"])
@@ -55,7 +56,7 @@ class FailuresAreExplainedTest(unittest.TestCase):
 class VllmFallbackTest(unittest.TestCase):
 
     def test_ollama_failure_falls_through_to_vllm(self):
-        with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
              mock.patch.object(llm_local, "_try_vllm",
                                return_value={"text": "OK", "ok": True,
@@ -68,7 +69,7 @@ class VllmFallbackTest(unittest.TestCase):
     def test_a_successful_ollama_call_does_not_reach_vllm(self):
         resp = mock.MagicMock()
         resp.json.return_value = {"response": "hi"}
-        with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", return_value=resp), \
              mock.patch.object(llm_local, "_try_vllm") as vllm:
             r = llm_local.generate("hello")
@@ -77,7 +78,7 @@ class VllmFallbackTest(unittest.TestCase):
 
     def test_vllm_declining_leaves_the_ollama_reason_intact(self):
         """Both tiers down must not hide WHICH failed or why."""
-        with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
              mock.patch.object(llm_local, "_try_vllm", return_value=None):
             r = llm_local.generate("hello")
@@ -138,7 +139,7 @@ class GenerationEndpointResolutionTest(unittest.TestCase):
         resp = mock.MagicMock()
         resp.json.return_value = {"response": "hi"}
         with mock.patch.object(backends, "ollama_gen_model", return_value="some-model:7b"), \
-             mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", return_value=resp) as post:
             r = llm_local.generate("hello")
         self.assertEqual(r["model"], "some-model:7b")
@@ -182,8 +183,52 @@ class VllmFallbackIsOptInTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop("LOCI_VLLM_FALLBACK", None)
-            with mock.patch.object(llm_local, "_OLLAMA", "http://x"), \
+            with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
                  mock.patch("requests.post", side_effect=OSError("refused")):
                 r = llm_local.generate("hello")
         self.assertFalse(r["ok"])
         self.assertIn("ollama", r["why"])
+
+
+class GenerationEnvPrecedenceTest(unittest.TestCase):
+    """OLLAMA_BASE_URL is the EMBEDDING endpoint and must not outrank generation.
+
+    #222 taught the RESOLVER to separate the two, then left the embedding variable
+    as the highest-precedence generation override. scripts/loci_groom.load_env(),
+    which every groom pass calls, sets OLLAMA_BASE_URL to the in-cluster host that
+    serves only nomic-embed-text — so under cron, 100% of generation went to a
+    host with no generation model. The vLLM fallback was silently rescuing it;
+    once #224 made that opt-in, the groom pass went from 9/100 to 100/100 degraded.
+
+    Read at CALL time so load_env() — which runs after import — is respected, and
+    so these tests need no importlib.reload (which made the first version of them
+    order-dependent inside the full suite).
+    """
+
+    def test_the_embedding_var_does_not_capture_generation(self):
+        with mock.patch.dict("os.environ", {"OLLAMA_BASE_URL": "http://embeddings-only:11434"}):
+            self.assertEqual(llm_local._gen_env(), "",
+                             "OLLAMA_BASE_URL must not become the generation endpoint")
+
+    def test_a_generation_specific_var_still_wins(self):
+        for var in ("LOCI_OLLAMA_GEN_URL", "OLLAMA_GEN_URL"):
+            with self.subTest(var=var):
+                env = {k: v for k, v in os.environ.items()
+                       if k not in ("LOCI_OLLAMA_GEN_URL", "OLLAMA_GEN_URL")}
+                env[var] = "http://gen:1"
+                with mock.patch.dict("os.environ", env, clear=True):
+                    self.assertEqual(llm_local._gen_env(), "http://gen:1")
+
+    def test_env_is_read_at_call_time_not_import_time(self):
+        """load_env() runs AFTER this module is imported; an import-time capture
+        would reflect the environment before the process configured itself."""
+        with mock.patch.dict("os.environ", {"LOCI_OLLAMA_GEN_URL": "http://late:2"}):
+            self.assertEqual(llm_local._gen_env(), "http://late:2")
+        self.assertNotEqual(llm_local._gen_env(), "http://late:2")
+
+    def test_a_single_capable_ollama_still_resolves_via_backends(self):
+        """No regression for a host that only sets OLLAMA_BASE_URL: the resolver
+        falls through ollama_gen_url() -> ollama_url()."""
+        import backends
+        with mock.patch.object(backends, "ollama_gen_url", return_value="http://only:11434"):
+            self.assertEqual(llm_local._resolve_ollama(), "http://only:11434")
