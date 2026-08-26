@@ -1163,3 +1163,33 @@ def test_main_survives_a_missing_state_db_entirely(wired, capsys):
 def test_main_ignores_extra_stdin_keys_and_bad_json(wired):
     assert run_main(wired, "garbage not json") == 0
     assert run_main(wired, {"sessionId": "s1"}) == 0     # camelCase is not read
+
+
+# ---------------------------------------------------------------------------
+# _embeddings_url
+#
+# The module read only OLLAMA_BASE_URL. The Hermes profile sets
+# MNEMOSYNE_EMBEDDING_API_URL (already a full /v1 endpoint), so the sync had no
+# embeddings endpoint at all under the profile's own environment.
+# ---------------------------------------------------------------------------
+
+def test_embeddings_url_from_bare_ollama_host():
+    mod = load_hook({"OLLAMA_BASE_URL": "http://h:11434"})
+    assert mod.OLLAMA == "http://h:11434/v1/embeddings"
+
+
+def test_embeddings_url_falls_back_to_mnemosyne_var():
+    mod = load_hook({"OLLAMA_BASE_URL": None,
+                     "MNEMOSYNE_EMBEDDING_API_URL": "http://h:11434/v1"})
+    assert mod.OLLAMA == "http://h:11434/v1/embeddings"
+
+
+def test_embeddings_url_prefers_ollama_base_url():
+    mod = load_hook({"OLLAMA_BASE_URL": "http://a:1",
+                     "MNEMOSYNE_EMBEDDING_API_URL": "http://b:2/v1"})
+    assert mod.OLLAMA == "http://a:1/v1/embeddings"
+
+
+def test_embeddings_url_none_when_neither_set():
+    mod = load_hook({"OLLAMA_BASE_URL": None})
+    assert mod.OLLAMA is None

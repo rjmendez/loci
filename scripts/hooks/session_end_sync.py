@@ -18,8 +18,17 @@ import urllib.request, urllib.error
 STATE_DB    = os.path.expanduser(os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db"))
 QDRANT      = os.environ.get("QDRANT_URL")
 QDRANT_KEY  = os.environ.get("QDRANT_API_KEY", "")
-_OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL")
-OLLAMA      = f"{_OLLAMA_BASE}/v1/embeddings" if _OLLAMA_BASE else None
+def _embeddings_url() -> "str | None":
+    """OLLAMA_BASE_URL is a bare host; MNEMOSYNE_EMBEDDING_API_URL (what the
+    Hermes profile sets) is already a full /v1 endpoint."""
+    base = os.environ.get("OLLAMA_BASE_URL")
+    if base:
+        return f"{base.rstrip('/')}/v1/embeddings"
+    api = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL")
+    return f"{api.rstrip('/')}/embeddings" if api else None
+
+
+OLLAMA      = _embeddings_url()
 EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
