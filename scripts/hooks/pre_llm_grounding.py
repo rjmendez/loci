@@ -84,8 +84,18 @@ if os.path.exists(_ENV_FILE):
 # ── constants ─────────────────────────────────────────────────────────────────
 QDRANT_URL   = os.environ.get("QDRANT_URL")
 QDRANT_KEY   = os.environ.get("QDRANT_API_KEY", "")
-_OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL")
-OLLAMA_URL   = f"{_OLLAMA_BASE}/v1" if _OLLAMA_BASE else None
+def _embed_base_url() -> Optional[str]:
+    """OpenAI-compatible embeddings base. OLLAMA_BASE_URL is a bare host and needs
+    /v1; MNEMOSYNE_EMBEDDING_API_URL (what the Hermes profile actually sets) is
+    already a full /v1 endpoint."""
+    base = os.environ.get("OLLAMA_BASE_URL")
+    if base:
+        return f"{base.rstrip('/')}/v1"
+    api = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL")
+    return api.rstrip("/") if api else None
+
+
+OLLAMA_URL   = _embed_base_url()
 EMBED_MODEL  = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL",   "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
@@ -527,7 +537,9 @@ def main() -> None:
     task_id = extra.get("task_id") or payload.get("session_id") or ""
     is_subagent = "subagent" in task_id.lower() or bool(os.environ.get("HERMES_SUBAGENT"))
 
-    user_message = extra.get("user_message") or ""
+    # Claude Code (UserPromptSubmit/SubagentStart) puts the text at the top level;
+    # Hermes (pre_llm_call) nested it under extra.user_message.
+    user_message = payload.get("prompt") or extra.get("user_message") or ""
     if not isinstance(user_message, str):
         user_message = ""
     msg_stripped = user_message.strip()

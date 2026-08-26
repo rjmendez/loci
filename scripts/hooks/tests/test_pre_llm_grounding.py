@@ -25,6 +25,7 @@ import json
 import math
 import os
 import pathlib
+import builtins
 import sys
 import time
 import types
@@ -407,10 +408,20 @@ def test_search_collection_missing_result_key_is_empty(hook):
 # ---------------------------------------------------------------------------
 
 def test_beam_fallback_returns_empty_when_mnemosyne_missing(hook):
+    # Clearing sys.modules is not enough: the import re-succeeds from disk on any
+    # host that has mnemosyne installed. Fail the import itself instead.
     saved = list(sys.path)
+    real_import = builtins.__import__
+
+    def no_mnemosyne(name, *a, **kw):
+        if name.startswith("mnemosyne"):
+            raise ImportError(f"no module named {name}")
+        return real_import(name, *a, **kw)
+
     blocked = {m: None for m in list(sys.modules) if m.startswith("mnemosyne")}
     try:
-        with mock.patch.dict(sys.modules, blocked):
+        with mock.patch.dict(sys.modules, blocked), \
+                mock.patch.object(builtins, "__import__", no_mnemosyne):
             for m in blocked:
                 del sys.modules[m]
             assert hook._beam_fallback("some query") == []
@@ -1380,3 +1391,75 @@ def test_output_is_a_single_json_line_on_stdout(hook):
     assert out.endswith("\n") and out.count("\n") == 1
     assert list(json.loads(out)) == ["context"]
     assert isinstance(json.loads(out)["context"], str)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code payload shape
+#
+# The hook was ported from Hermes by adding the Claude Code event names but not
+# its payload shape. Claude Code sends the text as a top-level "prompt";
+# Hermes nested it under extra.user_message. Reading only the latter made the
+# hook emit nothing on every real UserPromptSubmit and SubagentStart.
+# ---------------------------------------------------------------------------
+
+def _dark_hook(hook):
+    hook._embed = lambda t: None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+
+
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "SubagentStart"])
+def test_main_grounds_claude_code_top_level_prompt(hook, event):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": event,
+                                "session_id": "s1",
+                                "prompt": "why did retention delete the index"})
+    assert code is None, "hook exited without emitting on a real Claude Code payload"
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_still_grounds_legacy_hermes_shape(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "pre_llm_call",
+                                "extra": {"user_message": "a real question"}})
+    assert code is None
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_prefers_top_level_prompt_over_extra(hook):
+    seen = []
+    hook._embed = lambda t: seen.append(t) or None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+    run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                    "prompt": "the real prompt",
+                    "extra": {"user_message": "stale hermes text"}})
+    assert seen and "the real prompt" in seen[0]
+
+
+def test_main_still_exits_when_no_text_anywhere(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit"})
+    assert code == 0 and out == ""
+
+
+# ---------------------------------------------------------------------------
+# _embed_base_url
+# ---------------------------------------------------------------------------
+
+def test_embed_base_url_appends_v1_to_bare_ollama_host(hook):
+    with mock.patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://h:11434"}, clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_falls_back_to_mnemosyne_var(hook):
+    # What the Hermes profile actually sets — already a full /v1 endpoint.
+    with mock.patch.dict(os.environ,
+                         {"MNEMOSYNE_EMBEDDING_API_URL": "http://h:11434/v1"},
+                         clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_none_when_unset(hook):
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert hook._embed_base_url() is None

@@ -377,7 +377,7 @@ def main() -> None:
         sys.exit(0)
 
     event = payload.get("hook_event_name", "")
-    if event != "pre_tool_call":
+    if event not in ("pre_tool_call", "PreToolUse"):
         sys.exit(0)
 
     tool_name: str = payload.get("tool_name") or ""
