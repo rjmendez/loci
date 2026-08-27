@@ -98,12 +98,7 @@ def investigation_start(
     return json.dumps({"status": "created", "manifest": manifest}, indent=2)
 
 
-# findings.jsonl is a mixed append log: alongside real findings it carries
-# access-tracking rows written on every read. They hold no text, and because one
-# is appended per access they are also the NEWEST rows, so any findings[-N:]
-# slice fills up with them. Measured across the corpus: 3,681 of 6,610 records
-# (55.7%) are access rows, all text-less — which is why the summary ladder was
-# handing the model twenty empty bullets and getting an invented summary back.
+# Access rows are text-less AND the newest rows, so any findings[-N:] slice fills up with them.
 _NON_FINDING_RECORD_TYPES = frozenset({"access"})
 
 
@@ -192,7 +187,6 @@ def investigation_load(
             "include_retracted": include_retracted,
         }, indent=2)
 
-    # Default: fidelity == "full"
     findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
     all_retracted = _load_retracted_ids(investigation_id)
     total_retracted = len(all_retracted)
@@ -203,7 +197,6 @@ def investigation_load(
         excluded_retracted = len(findings) - len(kept)
         findings = kept
 
-    # ACL filtering: only apply when requesting_agent_id is given AND acl is non-empty
     acl = manifest.get("acl") or []
     if requesting_agent_id and acl:
         acl_set = set(acl)
@@ -214,9 +207,7 @@ def investigation_load(
         ]
 
     recent = findings[-last_n_findings:]
-    # Surface the lifecycle/resolution state (append-log overrides win, else stored/
-    # default "open") and staleness for findings that carry code_refs. Additive +
-    # backwards-compatible: findings without these fields read as "open"/not-stale.
+    # Append-log overrides win, else stored/default "open"; findings without these fields read open and not-stale.
     _apply_lifecycle(recent, investigation_id)
 
     payload = {
@@ -469,9 +460,7 @@ def investigation_reflect(investigation_id: str) -> str:
     for f in findings:
         by_type.setdefault(f.get("type", "observed"), []).append(f)
 
-    # Advisory self-check (additive): surface observed findings with no audit
-    # receipt and findings that appear to contradict. Pure over the JSONL — no
-    # qdrant required. Fail-open: degrades to empty lists, never blocks reflect.
+    # Fail-open: degrades to empty lists, never blocks reflect.
     checks = _compute_self_check(investigation_id)
     self_check = {
         "unsupported_observed": [
@@ -497,9 +486,6 @@ def investigation_reflect(investigation_id: str) -> str:
         "hallucination_candidates": checks.get("hallucination_candidates", []),
     }
 
-    # Entity frequency — count entity mentions across all non-retracted findings.
-    # Surfacing the most-discussed observables gives analysts instant pivot points
-    # and feeds investigation_entity_lookup calls.
     entity_counts: dict[str, dict[str, int]] = {
         "ips": {}, "emails": {}, "hostnames": {}, "hashes": {}, "cves": {}
     }
@@ -516,10 +502,7 @@ def investigation_reflect(investigation_id: str) -> str:
         if freq
     }
 
-    # Progressive summary ladder — compute L1 (bullets) and L2 (paragraph) and
-    # persist them to the manifest so investigation_load can serve them without
-    # re-reading all findings. Fail-open: any failure falls back to a deterministic
-    # non-LLM summary and never blocks the rest of the reflect response.
+    # Persisted to the manifest so investigation_load need not re-read findings; fail-open to the deterministic summary.
     summary_l1: list[str] = []
     summary_l2: str = ""
     try:
@@ -539,21 +522,12 @@ def investigation_reflect(investigation_id: str) -> str:
                     "single sentence under 120 characters. Reply with ONLY a JSON array "
                     "of strings, no other text. Example: [\"First point.\", \"Second point.\"]"
                 )
-                # json_mode=False on purpose. Ollama's format=json coerces the
-                # reply to an OBJECT, but this prompt asks for a bare ARRAY and
-                # the parse below required a list — so the two were mutually
-                # exclusive and summary_l1 could never be populated. Measured on
-                # the same prompt, 5 trials each: json_mode=True -> 0/5 parsed as
-                # a list (all dicts); json_mode=False -> 5/5 parsed as an array.
-                # Corpus evidence: 0 of 142 manifests carried an LLM-authored
-                # summary; the 3 that had one were the deterministic fallback.
+                # json_mode=False on purpose: Ollama's format=json coerces the reply to an OBJECT, and this prompt needs a bare ARRAY.
                 l1_raw = _llm.call_llm(l1_prompt, timeout=60.0)
                 if l1_raw:
                     try:
                         parsed = json.loads(l1_raw)
-                        # Accept a bare array, or one wrapped in a single-key
-                        # object — a model that answers {"bullets": [...]} is
-                        # being helpful, not wrong, and this used to discard it.
+                        # Accept a bare array, or one wrapped in a single-key object.
                         if isinstance(parsed, dict):
                             for _v in parsed.values():
                                 if isinstance(_v, list):
@@ -643,8 +617,7 @@ def investigation_finding_provenance(
         JSON with the chain from the target finding to its root evidence,
         each node annotated with its type, confidence, source, and text.
     """
-    # Join under the memory root directly — _inv_dir() creates the directory,
-    # which would silently create an empty investigation dir for a bad id.
+    # Not _inv_dir(): it creates the directory, so a bad id would silently leave an empty investigation behind.
     inv_path = _root() / investigation_id
     if not inv_path.is_dir():
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -680,9 +653,7 @@ def investigation_finding_provenance(
             "text": str(node.get("text", ""))[:400],
             "derived_from": node.get("derived_from", []),
         })
-        # Only the first parent is followed.  Multi-parent derived_from chains
-        # (a finding citing two or more independent observations) are not fully
-        # traversed — grounded_in_observed reflects the first-listed branch only.
+        # Only the first parent is followed: grounded_in_observed reflects the first-listed branch only.
         parents = node.get("derived_from") or []
         if not parents:
             break
@@ -692,8 +663,7 @@ def investigation_finding_provenance(
     root_type = root.get("record_type") if root else None
     grounded = root_type == "observed"
 
-    # Compute aggregate_confidence: product of numeric_confidence values along the chain.
-    # Findings without numeric_confidence are treated as 1.0 (backward compat).
+    # A finding without numeric_confidence counts as 1.0.
     try:
         aggregate_confidence = 1.0
         for node_entry in chain:
@@ -749,20 +719,12 @@ def investigation_list(
     Returns:
         JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
     """
-    # Coerce limit/offset once up front, BEFORE any early return, so both the
-    # empty-memory-root path and the normal path echo normalized ints. String
-    # JSON tool args must not leak through inconsistently (early return echoing
-    # raw strings while the non-empty path echoes coerced ints).
+    # Coerce BEFORE any early return, so the empty-root path and the normal path echo the same normalized ints.
     try:
         offset = max(0, int(offset))
     except (TypeError, ValueError):
         offset = 0
-    # A string limit (e.g. via JSON tool args) would otherwise raise TypeError
-    # in the `limit <= 0` comparison and `offset + limit` slice below,
-    # contradicting the documented "limit<=0 returns everything" behavior.
-    # Normalize None to 0 so it collapses into the documented limit<=0 no-limit
-    # case; the echoed `limit` is then always an int, matching the signature
-    # (limit: int) and docstring. Garbage falls back to the default.
+    # None collapses into the documented limit<=0 no-limit case; garbage falls back to the default.
     if limit is None:
         limit = 0
     else:
@@ -771,22 +733,7 @@ def investigation_list(
         except (TypeError, ValueError):
             limit = 30
 
-    # Coerce summary like limit/offset: a stringly-typed client (JSON tool args)
-    # passing summary='false' would otherwise be truthy and wrongly select
-    # summary-mode instead of full records. Map common string falsey forms to
-    # False; everything else (including real bools) goes through bool().
-    #
-    # None (JSON null) must PRESERVE the documented default (summary=True):
-    # bool(None) is False, which would force FULL-mode records and reintroduce
-    # the large-output/token-overflow this pagination path exists to prevent.
-    # Only string/real-bool values may select full mode.
-    #
-    # An empty / whitespace-only string is treated as UNSET (not falsey): a
-    # client accidentally passing summary='' is far more likely to have meant
-    # "leave the default" than "give me full/overflow-prone output", so it must
-    # also preserve summary=True. Only the explicit tokens 'false'/'0'/'no'
-    # select full mode. (Empty string is simply absent from the falsey tuple,
-    # so `not in` yields True for it.)
+    # None and '' must preserve summary=True: only 'false'/'0'/'no' may select the overflow-prone full mode.
     if summary is None:
         summary = True
     elif isinstance(summary, str):
@@ -797,10 +744,7 @@ def investigation_list(
     if not _root().exists():
         return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
 
-    # Collect valid investigation dirs (most-recently-updated first) before
-    # doing any per-record work, so pagination is over investigations — not
-    # over stray files/dirs — and the expensive findings scan only runs for
-    # the page actually returned.
+    # Filter to real investigation dirs first: pagination is over investigations, and the findings scan only runs for the page returned.
     entries = []
     for d in sorted(_root().iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if not d.is_dir():
@@ -826,7 +770,6 @@ def investigation_list(
             "finding_counts": manifest["finding_counts"],
         }
         if not summary:
-            # Scan findings.jsonl to build tier counts (only in full mode)
             tier_counts = {"hot": 0, "warm": 0, "cold": 0}
             try:
                 findings_path = d / "findings.jsonl"
@@ -839,8 +782,7 @@ def investigation_list(
             except Exception as exc:
                 logger.debug("investigation_list: tier count scan failed (fail-open): %r", exc)
                 pass  # fail-open
-            # acl is only needed to derive visibility, which is a full-mode-only
-            # field — skip the lookup entirely on the default summary path.
+            # acl only feeds visibility, a full-mode-only field, so the summary path skips the lookup.
             acl = manifest.get("acl") or []
             record.update({
                 "created_at": manifest["created_at"],
@@ -1031,13 +973,10 @@ def investigation_import(
         except Exception as exc:
             return json.dumps({"error": f"Invalid JSON in bundle_json: {exc}"})
 
-        # Support two calling conventions:
-        #   1. The raw bundle dict (schema_version at top level)
-        #   2. The full export response dict (bundle nested under "bundle" key)
+        # Accept either the raw bundle or the whole export response.
         if "bundle" in data and isinstance(data.get("bundle"), dict):
             data = data["bundle"]
 
-        # Validate required keys.
         schema_version = data.get("schema_version")
         if schema_version != "1.0":
             return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
@@ -1053,10 +992,8 @@ def investigation_import(
 
         original_id = src_manifest.get("id", "unknown")
 
-        # Generate a new investigation ID.
         new_id = str(uuid.uuid4())
 
-        # Build a new manifest.
         now = _now()
         new_manifest = dict(src_manifest)
         new_manifest["id"] = new_id
@@ -1066,11 +1003,9 @@ def investigation_import(
         if new_title:
             new_manifest["title"] = new_title
 
-        # Create the investigation directory and write the manifest.
         inv_dir = _inv_dir(new_id)
         _save_manifest(new_manifest)
 
-        # Write findings.jsonl with updated investigation_id.
         findings = data.get("findings") or []
         if not isinstance(findings, list):
             findings = []
@@ -1083,7 +1018,6 @@ def investigation_import(
             f["investigation_id"] = new_id
             _append_jsonl(findings_path, f)
 
-        # Write conflicts.jsonl if present.
         conflicts = data.get("conflicts")
         if conflicts and isinstance(conflicts, list):
             conflicts_path = inv_dir / "conflicts.jsonl"
@@ -1091,7 +1025,6 @@ def investigation_import(
                 if isinstance(entry, dict):
                     _append_jsonl(conflicts_path, entry)
 
-        # Write entities.jsonl if present.
         entities = data.get("entities")
         if entities and isinstance(entities, list):
             entities_path = inv_dir / "entities.jsonl"

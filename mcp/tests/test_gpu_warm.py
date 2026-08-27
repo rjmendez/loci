@@ -12,8 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # gpu_warm lives under scripts/, a sibling of mcp/.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
 
-# gpu_warm reads OLLAMA_BASE_URL at import time; set it before import so the module is
-# "configured" and exercises the real request-building path against our stub.
+# gpu_warm reads OLLAMA_BASE_URL at import time, so it must be set before the import.
 os.environ.setdefault("OLLAMA_BASE_URL", "http://stub-ollama:11434")
 
 import gpu_warm as G  # noqa: E402

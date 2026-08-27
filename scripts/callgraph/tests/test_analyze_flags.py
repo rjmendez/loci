@@ -13,9 +13,7 @@ def test_rank_flags_only_includes_constant_initialized_escaping_locals():
     store = _store()
     rows = rank_flags(store)
     idents = {r.ident for r in rows}
-    # `ok` (constant False init) and `step` (constant 1 init, closure
-    # escape) both qualify; `parts`/`base`/`result`/`total` do not (their
-    # inits are not ast.Constant).
+    # Only ast.Constant-initialised escaping locals qualify.
     assert "ok" in idents
     assert "step" in idents
     assert "parts" not in idents

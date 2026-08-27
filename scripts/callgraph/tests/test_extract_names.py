@@ -33,11 +33,7 @@ def test_def_binding_write():
 
 def test_augmented_write_tagged_separately_from_plain_assign():
     store, _, _ = build_fixture_store(["dangling_global.py"])
-    # `_real_counter += n` inside bump() is a global-stmt AugAssign — via
-    # must say "global-stmt" (it's the global declaration that matters,
-    # scopes.py's own binding_kind already lumps assign+augassign, but
-    # names.py's WRITES_NAME still distinguishes it as an augmented op via
-    # a separate edge instance from the module-level plain assign).
+    # scopes.py lumps assign+augassign; WRITES_NAME must still emit a separate edge.
     nid = "name:dangling_global.py::_real_counter"
     writes = store.in_edges(nid, "WRITES_NAME")
     via_by_src = {w.src: w.attrs["via"] for w in writes}
@@ -55,9 +51,7 @@ def test_reads_name_in_call_position():
 
 
 def test_local_variable_is_not_misreported_as_a_global_read():
-    # `caller_param_call`'s `callback` parameter is a genuine local, not a
-    # module NAME — no NAME node exists for "callback" at all, so this is
-    # really just confirming no spurious READS_NAME edge is created.
+    # A parameter is a genuine local: no NAME node, hence no spurious READS_NAME.
     store, _, _ = build_fixture_store(["calls_shapes.py", "calls_target.py"])
     assert store.get("name:calls_shapes.py::callback") is None
 

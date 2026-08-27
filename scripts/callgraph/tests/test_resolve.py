@@ -144,7 +144,5 @@ def test_real_corpus_import_unresolved_list_is_small_and_only_missing_third_part
             res = table.resolve_dotted(dotted, sf.rel_path)
             if res.status == "unresolved":
                 unresolved.append((sf.rel_path, dotted))
-    # An engineer must be able to read this list in one screen (design's own
-    # bar); a regression that suddenly can't resolve dozens of imports would
-    # blow well past it.
+    # The unresolved list must stay readable in one screen; a resolver regression blows past it.
     assert len(unresolved) < 20, unresolved

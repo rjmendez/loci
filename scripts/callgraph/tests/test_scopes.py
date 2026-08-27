@@ -16,8 +16,7 @@ def test_nesting_qualnames():
     assert "outer.<locals>.inner" in quals
     assert "register" in quals
     assert "Widget.method" in quals
-    # the lambda passed to register(None, lambda: 42) is a real, addressable
-    # Function — defined at module scope (lexically), not inside register().
+    # A lambda argument is lexically at module scope, not inside the callee.
     lambdas = [f for f in s.functions if f.is_lambda]
     assert len(lambdas) == 1
     assert lambdas[0].qualname.startswith("<lambda>@")
@@ -82,10 +81,7 @@ def test_dangling_global_name_slot_detected():
     names = s.names
     assert "global-only" in names["_symbol_index_cache"].binding_kinds
     assert "global-only" in names["_symbol_index_count"].binding_kinds
-    # _real_counter IS bound at module level (the `_real_counter = 0` line),
-    # so even though it's also declared `global` inside bump(), it must NOT
-    # be flagged global-only — that's the whole discriminating test for
-    # BUG C's dangling-global check.
+    # Module-level-bound plus a `global` redeclaration is NOT global-only (BUG C's discriminator).
     assert "global-only" not in names["_real_counter"].binding_kinds
     assert "assign" in names["_real_counter"].binding_kinds
 

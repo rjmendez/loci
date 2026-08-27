@@ -36,8 +36,7 @@ def _json(result: str) -> dict:
         raise AssertionError(f"Tool returned non-JSON: {result!r}") from exc
 
 
-# Counters so each test gets a unique investigation_id (the tool is idempotent
-# on the same ID — it resumes instead of creating — so uniqueness matters).
+# investigation_start is idempotent on an id (it resumes), so each test needs a unique one.
 _counter = [0]
 
 
@@ -217,9 +216,7 @@ class TestInvestigationLifecycle(unittest.TestCase):
         str_two = _json(server.investigation_list(limit="2", offset=0))
         self.assertEqual([i["id"] for i in str_two["investigations"]], ids[:2])
 
-        # limit=None (explicit no-limit) must normalize to the limit<=0 case:
-        # returns everything AND echoes an int, matching the `limit: int`
-        # signature/docstring — never a null in the response.
+        # limit=None must normalize to the limit<=0 case and echo an int, never a null.
         none_limit = _json(server.investigation_list(limit=None))
         self.assertEqual([i["id"] for i in none_limit["investigations"]], ids)
         self.assertIsInstance(none_limit["limit"], int)
@@ -651,8 +648,7 @@ class TestRagContextSearchDecayParam(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_rag_context_search_accepts_decay_param(self):
-        # Without Qdrant available the function should return a valid JSON error dict,
-        # not raise — both decay=True and decay=False must be accepted without error.
+        # With no Qdrant the function must return a JSON error dict, not raise.
         for decay_val in (True, False):
             result = server.rag_context_search(query="authentication token", decay=decay_val)
             try:
@@ -835,7 +831,6 @@ class TestProceduralMemory(unittest.TestCase):
         self.assertIn("finding_id", result)
         self.assertEqual(result.get("type"), "procedure")
 
-        # Verify that procedure_meta was written to the JSONL
         loaded = _json(server.investigation_load(investigation_id=inv_id))
         proc_findings = [
             f for f in loaded.get("recent_findings", [])
@@ -1131,9 +1126,7 @@ class TestInvestigationACL(unittest.TestCase):
         all_loaded = _json(server.investigation_load(investigation_id=inv_id))
         self.assertEqual(all_loaded["total_findings"], 3)
 
-        # Requesting as agent-bob: sees own findings (authored_by == requesting_agent_id)
-        # AND ACL members' findings (alice is in ACL).
-        # "Finding by nobody" has authored_by="" which is neither bob nor in ACL, so filtered.
+        # bob sees his own findings and ACL members'; authored_by="" is filtered out.
         bob_loaded = _json(server.investigation_load(
             investigation_id=inv_id,
             requesting_agent_id="agent-bob",
@@ -1920,8 +1913,7 @@ class TestMemoryHints(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig_dir = server.MEMORY_DIR
         server.MEMORY_DIR = Path(self._tmp.name)
-        # Clear the in-process session hints ring buffer between tests so
-        # findings stored in one test do not bleed into another.
+        # The session hints ring buffer is in-process and bleeds between tests.
         server._session_hints.clear()
 
     def tearDown(self):
@@ -2072,8 +2064,6 @@ class TestEntityNodes(unittest.TestCase):
         self.assertIn("count", result)
         self.assertIsInstance(result["entities"], list)
         self.assertIsInstance(result["count"], int)
-        # At minimum, some entities should have been extracted
-        # (capitalized phrases like "Windows Server", "Azure AD", IP addresses)
         self.assertGreaterEqual(result["count"], 0)
 
     def test_entity_list_missing_investigation_returns_error(self):
@@ -2424,9 +2414,7 @@ class TestFindingResolution(unittest.TestCase):
             text="Fixed the CORS misconfig.", source="test", resolution="fixed",
         ))
 
-        # This test env has no Qdrant/mnemosyne backend, so drive the recall lane with a
-        # synthetic stub that returns rows referencing the two real findings. The
-        # resolution surfacing/filter reads the authoritative state from JSONL.
+        # No backend here: stub the recall lane; resolution state still comes from JSONL.
         rows = [
             {"investigation_id": inv_id, "finding_id": open_stored["finding_id"],
              "record_type": "observed", "source": "test", "text": "Open bug in the retry loop.",

@@ -84,8 +84,7 @@ class TestSemanticContradiction(unittest.TestCase):
         self.assertEqual(sorted(v.refs), ["a", "b"])
 
     def test_rejects_false_positive_via_llm_judge(self):
-        # These pass the embedding subject gate (shared jargon) but the LLM judge
-        # must reject them — they describe different tools, no factual conflict.
+        # Shared jargon passes the embedding subject gate; the LLM judge must still reject these.
         llm = _LLM()
         findings = [_f(CORR_WORKS, "c"), _f(RETRACT_OVERCAPTURES, "d")]
         verdicts = run_contradiction_llm(findings, embed_fn=_embed, llm_fn=llm)

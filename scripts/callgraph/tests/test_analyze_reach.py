@@ -32,11 +32,7 @@ def test_shortest_path_unreachable_returns_none():
 
 
 def test_path_confidence_is_the_minimum_hop_not_the_average():
-    # call_use_thing --[PROVEN name-def-local]--> use_thing
-    #                --[PROBABLE name-via-injected-global]--> real_thing
-    # THE hand-built fixture chain for step 9's acceptance line: a mixed
-    # proven+probable chain must report PROBABLE overall, not PROVEN and
-    # not some blended value — Confidence has no such thing, only min().
+    # A mixed proven+probable chain reports min(), never a blended value.
     store, _, _ = build_fixture_store(["registry_injection.py", "registry_injection_caller.py"])
     hops = shortest_path(
         store, "fn:registry_injection.py::call_use_thing", "fn:registry_injection_caller.py::real_thing",
@@ -45,8 +41,7 @@ def test_path_confidence_is_the_minimum_hop_not_the_average():
     confidences = [h.edge.confidence for h in hops]
     assert confidences == [Confidence.PROVEN, Confidence.PROBABLE]
     assert path_confidence(hops) == Confidence.PROBABLE
-    # One PROVEN hop alone would report PROVEN — confirms this isn't
-    # trivially always PROBABLE for any chain touching this fixture.
+    # A PROVEN-only prefix still reports PROVEN: not trivially always PROBABLE.
     assert path_confidence(hops[:1]) == Confidence.PROVEN
 
 
@@ -83,15 +78,10 @@ def test_entrypoints_reaching_direct_registration():
 
 
 def test_entrypoints_reaching_through_injected_global_is_probable():
-    # register()'s own function is not itself registered anywhere in this
-    # fixture set — the interesting case is a function that calls THROUGH
-    # an injected global reaching whatever entrypoint enters the CALLER.
     store, _, _ = build_fixture_store([
         "registry_injection.py", "registry_injection_caller.py", "registry_manloop.py",
     ])
-    # registry_manloop.py's `register` isn't itself an entrypoint target,
-    # so instead verify the *absence* case: a function reachable from
-    # nothing has an empty entrypoint set — the honest "0 known" answer.
+    # No `register` here is an entrypoint target, so this pins the absence case.
     entries = entrypoints_reaching(store, "fn:registry_injection.py::use_thing")
     assert entries == {}
 

@@ -53,15 +53,11 @@ def _writes(failopen):
         return wrapper
     return deco
 
-# How long a single operation will wait to acquire the cross-process lease before
-# giving up and failing-open. Bounded so a wedged holder can NEVER hang the server
-# (the whole point of per-op leasing vs the old open-once-hold-forever model).
+# Bounded so a wedged lease holder can never hang the server.
 _LEASE_TIMEOUT_S = 6.0
 _LEASE_POLL_S = 0.05
 
 try:  # ladybug (LadybugDB) is optional — the store degrades to unavailable.
-      # Formerly Kuzu, which is unmaintained; LadybugDB is the maintained successor.
-    # the store degrades to unavailable without it.
     import ladybug  # type: ignore
     _HAS_LADYBUG = True
 except Exception:  # pragma: no cover - environment without ladybug
@@ -75,10 +71,7 @@ _WRITE_GUARD_RE = re.compile(
     r"\b(CREATE|DELETE|SET|DROP|COPY|ALTER|MERGE)\b", re.IGNORECASE
 )
 
-# Common stdlib/builtin protocol method names. The Python duck-typing call fallback
-# (resolve by globally-unique app-method name) must NOT fire on these — an app method
-# that merely shares a name with dict.get/list.append/str.split is almost always a
-# stdlib call, not a call to that app method. Keeps the fallback precise.
+# The duck-typing call fallback must NOT fire on these: a shared name is a stdlib call.
 _DUCK_STOPWORDS = frozenset({
     "get", "keys", "values", "items", "setdefault", "update", "copy", "clear", "pop",
     "append", "extend", "insert", "remove", "add", "discard", "index", "count",
@@ -92,16 +85,14 @@ _DUCK_STOPWORDS = frozenset({
 
 
 def _enclosing_class(sym_id: str) -> Optional[str]:
-    # id is "file::Qual"; enclosing simple class = segment before the
-    # method name (e.g. "A.B.m" -> "B"). Top-level func -> None.
+    # "file::A.B.m" -> "B"; top-level func -> None.
     qual = sym_id.split("::", 1)[1] if "::" in sym_id else sym_id
     segs = qual.split(".")
     return segs[-2] if len(segs) >= 2 else None
 
 
 def _enclosing_class_id(sym_id: str) -> Optional[str]:
-    # "file::A.m" -> enclosing class SYMBOL ID "file::A" (fields are
-    # scoped by class id). Top-level func -> None.
+    # "file::A.m" -> class symbol id "file::A"; fields are scoped by class id.
     if "::" not in sym_id:
         return None
     fpref, qual = sym_id.split("::", 1)
@@ -151,8 +142,7 @@ def _resolve_calls(
     by_name_unique: dict[str, str] = {
         nm: name_first[nm] for nm, c in name_count.items() if c == 1
     }
-    # module simple-name (file stem) -> file path, for resolving module-
-    # qualified calls (Python "from . import queries as Q; Q.func()").
+    # module simple-name (file stem) -> file path, for Python "Q.func()" calls.
     module_files: dict[str, str] = {}
     for _fp in files:
         _stem = _fp.rsplit("/", 1)[-1].rsplit(".", 1)[0]
@@ -210,9 +200,7 @@ def _resolve_calls(
                     else:
                         n_unresolved += 1
                 elif fqn_cls in module_files:
-                    # Import points at a repo MODULE (Python module-qualified
-                    # call, e.g. "Q.finding_symbols()") -> resolve the callee
-                    # within that module's file. Unambiguous, so precision-safe.
+                    # Import names a repo MODULE: resolve within that file — unambiguous.
                     tgt = _find_named(file_methods.get(module_files[fqn_cls]), callee)
                     if tgt:
                         call_rows.append({"a": src, "b": tgt})
@@ -223,11 +211,7 @@ def _resolve_calls(
                     # Import points outside the repo (Log, Collections…).
                     n_external += 1
             else:
-                # 2.5: receiver-type inference from captured declarations.
-                # Look up R as a local/param of the calling method first,
-                # then as a field of the enclosing class. Only resolve when
-                # the inferred type is an APP type; external/unknown -> DROP
-                # (never fall back to global by-name).
+                # Resolve only when the inferred type is an APP type; never fall back to global by-name.
                 t = decls_by_scope.get(src, {}).get(recv)
                 if not t:
                     encl_id = _enclosing_class_id(src)
@@ -241,13 +225,7 @@ def _resolve_calls(
                     else:
                         n_unresolved += 1
                 else:
-                    # Unknown / Any-typed receiver. The duck-typing fallback (resolve
-                    # by globally-UNIQUE method name) is sound only for dynamically
-                    # typed Python, where such a receiver is an app object
-                    # (`ks.code_query()` where ks: Any). In statically-typed langs an
-                    # untyped receiver calling a method that merely happens to be
-                    # unique in the repo (someList.isEmpty()) is usually a STDLIB call
-                    # -> we must NOT guess there. Ambiguous names stay dropped anyway.
+                    # Duck fallback is Python-only: elsewhere an untyped receiver is usually a stdlib call.
                     if symbols[src]["lang"] == "python" and callee not in _DUCK_STOPWORDS:
                         tgt = by_name_unique.get(callee)
                     if tgt:
@@ -256,8 +234,7 @@ def _resolve_calls(
                     else:
                         n_unresolved += 1
         else:
-            # rk == "expr" (complex receiver) or a receiver'd call with no
-            # receiver text. v1: drop.
+            # Complex or missing receiver text: drop.
             n_unresolved += 1
     return call_rows, {
         "external": n_external, "unresolved": n_unresolved,
@@ -271,21 +248,13 @@ class LadybugStore:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        # The cross-process lease file. Every Loci server coordinates on this ONE
-        # path (fcntl advisory lock): shared lock for reads, exclusive for writes.
-        # It is NOT the Kuzu data file, so an old server that still holds Kuzu's
-        # internal single-writer lock will still make our RW open fail (fail-open),
-        # but two servers BOTH running this per-op code coordinate cleanly here.
+        # fcntl advisory lease, NOT the data file: a foreign writer lock still fails our RW open.
         self._lease_path = db_path + ".loci-lease"
-        # Serialise in-process access (Kuzu connections are not concurrency-safe);
-        # re-entrant so a write method's nested _exec calls reuse the open session.
+        # Connections are not concurrency-safe; re-entrant so nested _exec reuses the session.
         self._lock = threading.RLock()
         self._active = None           # the currently-open scoped Connection, if any
         self._schema_ready = False    # schema ensured once per process (idempotent)
-        # ok == "worth attempting". We do NOT open the DB here — every operation opens
-        # a short-lived leased connection and fails-open on contention, so the store
-        # SELF-HEALS the instant the lock frees (no process-lifetime hold, no startup
-        # latch that stays dead for the whole session).
+        # "worth attempting" — the DB is opened per-op, so the store self-heals when the lock frees.
         self.ok = bool(_HAS_LADYBUG and db_path)
         if not _HAS_LADYBUG:
             logger.info("ladybug not importable; LadybugStore unavailable")
@@ -324,9 +293,7 @@ class LadybugStore:
             return
         with self._lock:
             if self._active is not None:
-                # Reuse the enclosing scoped session (an outer write already holds a
-                # RW connection + the exclusive lease). Callers never nest a write
-                # inside a read, so the mode is always compatible.
+                # Callers never nest a write inside a read, so the outer session's mode is compatible.
                 yield self._active
                 return
             fd = os.open(self._lease_path, os.O_CREAT | os.O_RDWR, 0o644)
@@ -419,11 +386,7 @@ class LadybugStore:
         "CREATE REL TABLE IF NOT EXISTS DEFINES(FROM CodeFile TO CodeSymbol)",
         "CREATE REL TABLE IF NOT EXISTS CALLS(FROM CodeSymbol TO CodeSymbol)",
         "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM CodeFile TO CodeFile)",
-        # `confidence` carries the linker's own verdict — "high" for a distinctive
-        # type/marker match, "medium" for a long mixed-case identifier. It was
-        # computed and discarded, which forced every consumer to re-derive link
-        # quality from the symbol name at query time. With it on the edge,
-        # precision tuning at the read side is a WHERE clause.
+        # confidence on the edge makes read-side precision tuning a WHERE clause.
         "CREATE REL TABLE IF NOT EXISTS REFERENCES(FROM Finding TO CodeSymbol, confidence STRING)",
         "CREATE REL TABLE IF NOT EXISTS MENTIONS(FROM Finding TO Entity)",
         "CREATE REL TABLE IF NOT EXISTS DERIVED_FROM(FROM Finding TO Finding)",
@@ -438,8 +401,7 @@ class LadybugStore:
             return
         for ddl in self._SCHEMA:
             conn.execute(ddl)
-        # Additive migrations for graphs created before a column existed. ALTER ADD
-        # errors harmlessly if the column is already present -> ignore.
+        # Additive migrations; ALTER ADD errors harmlessly when the column already exists.
         for alt in ("ALTER TABLE CodeSymbol ADD decorators STRING DEFAULT ''",
                     "ALTER TABLE CodeSymbol ADD referenced BOOL DEFAULT false"):
             try:
@@ -594,9 +556,7 @@ class LadybugStore:
             for pid in parent_ids:
                 if not pid:
                     continue
-                # Parent may not have been upserted yet — MERGE a placeholder node
-                # so the derivation edge always has endpoints (mirrors the
-                # reference algorithm, which tracks edges regardless of node data).
+                # MERGE a placeholder so the edge has endpoints even if the parent is not upserted yet.
                 self._exec("MERGE (p:Finding {id:$id})", {"id": str(pid)})
                 self._exec(
                     "MATCH (f:Finding {id:$f}), (p:Finding {id:$p}) "
@@ -787,8 +747,7 @@ class LadybugStore:
         call_edges: list[dict] = []
         # file path -> {simple imported name -> best-effort FQN}
         file_import_map: dict[str, dict] = {}
-        # scope symbol id -> {declared var/field/param name -> declared type simple}
-        # (last decl wins; null types skipped). Powers receiver-type inference.
+        # scope symbol id -> {declared name -> declared type}; last decl wins.
         decls_by_scope: dict[str, dict] = {}
         ident_total: dict[str, int] = {}    # name -> total identifier occurrences (usage signal)
         for pf in parsed_files:
@@ -855,9 +814,7 @@ class LadybugStore:
             for chunk in self._chunks(file_rows):
                 self._exec("UNWIND $rows AS r MERGE (c:CodeFile {path:r.p}) SET c.lang=r.l", {"rows": chunk})
             counts["files"] = len(files)
-            # Symbols + DEFINES. Compute `referenced`: a name that occurs as an
-            # identifier more often than it is defined is USED somewhere (called,
-            # in a registry list, a callback, polymorphic dispatch). Recall-independent.
+            # referenced: a name occurring as an identifier more often than it is defined is used somewhere.
             def_count: dict[str, int] = {}
             for row in symbols.values():
                 def_count[row["name"]] = def_count.get(row["name"], 0) + 1
@@ -886,8 +843,7 @@ class LadybugStore:
                     {"rows": chunk},
                 )
             counts["imports"] = len(imports)
-            # CALLS — resolution runs inside this try so a resolver error keeps
-            # the documented fail-open contract of ingest_code.
+            # Resolution runs inside this try so a resolver error keeps ingest_code fail-open.
             call_rows, _stats = _resolve_calls(
                 call_edges, symbols, files, file_import_map, decls_by_scope,
             )
@@ -932,9 +888,7 @@ class LadybugStore:
         if not prefix or not prefix.strip("/"):
             logger.warning("delete_code_under refused over-broad prefix: %r", path_prefix)
             return out
-        # Match the prefix exactly (single-file ingest) AND everything strictly
-        # beneath it, but never a sibling that merely shares the string prefix
-        # ("/a/b" must not match "/a/bc").
+        # Prefix exactly, plus strictly beneath — "/a/b" must not match "/a/bc".
         sub = prefix.rstrip("/") + "/"
         try:
             srows = self._rows(
@@ -1029,8 +983,7 @@ class LadybugStore:
             ):
                 _bump(r[0], r[1], "derivation_links", r[2])
 
-            # Explicit RELATED links (either direction) count as a shared signal.
-            # NOTE: no writer creates RELATED edges today, so this lane always scores 0.
+            # No writer creates RELATED edges today, so this lane always scores 0.
             for r in self._rows(
                 "MATCH (a:Investigation {id:$id})-[:RELATED]-(b:Investigation) "
                 "RETURN DISTINCT b.id, b.title",
@@ -1139,7 +1092,6 @@ class LadybugStore:
                     bucket.append(reason)
 
             # --- pull graph state ---
-            # all finding ids in scope
             by_id: set[str] = {r[0] for r in self._rows("MATCH (f:Finding) RETURN f.id")}
             # derived edges: child -> set(parents)
             derived_edges: dict[str, set[str]] = {}
@@ -1162,8 +1114,6 @@ class LadybugStore:
                     _add_reason(n, "semantic")
 
             # --- Entity anchor: distinctive entities shared with ANY seed. ---
-            # Cypher yields, per (other-finding, seed), the shared distinctive
-            # entity names. We apply the reference's seed-order "first match wins".
             threshold = max(1, int(min_shared_entities))
             if seeds:
                 shared_by_finding: dict[str, dict[str, set[str]]] = {}
@@ -1185,9 +1135,6 @@ class LadybugStore:
                             break
 
             # --- Derivation: transitive DERIVED_FROM reaching the contaminated set.
-            # Cycle-guarded DFS fixpoint, identical to the reference so the
-            # "derived_from:<reached>" target (first reached in a DFS of the full
-            # ancestor chain) matches exactly.
             def _reaches_contaminated(start: str, targets: set[str]) -> Optional[str]:
                 stack = list(derived_edges.get(start, ()))
                 visited: set[str] = {start}
@@ -1201,9 +1148,7 @@ class LadybugStore:
                     stack.extend(derived_edges.get(parent, ()))
                 return None
 
-            # Iterate in a stable (sorted) order so the DFS-first-reached target
-            # in "derived_from:<reached>" is deterministic; equals the reference
-            # when findings are supplied in id-sorted order.
+            # Sorted iteration keeps the DFS-first-reached target deterministic.
             changed = True
             ordered_ids = sorted(by_id)
             while changed:

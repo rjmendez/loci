@@ -112,8 +112,7 @@ class _FakeQdrantClient:
 
     def query_points(self, *, collection_name, query, query_filter=None,
                      limit=10, with_payload=True, using=None):
-        # Return all stored points (fake scoring = 0.9); filter by subject_kind
-        # if a Filter object with must conditions is present.
+        # Fake scoring is a flat 0.9; only subject_kind filtering is honoured.
         kind_filter = None
         if query_filter is not None:
             for cond in (query_filter.must or []):

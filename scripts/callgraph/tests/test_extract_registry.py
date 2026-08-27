@@ -14,8 +14,7 @@ def test_dec_creates_registry_and_retargets_decorated_by():
     assert reg is not None and reg.kind == "REGISTRY"
     assert reg.attrs["mechanism"] == "decorator"
 
-    # the DECORATED_BY edge on registered_tool must now target the REGISTRY
-    # node, not the placeholder EXTERNAL sink defs.py created.
+    # DECORATED_BY must be retargeted off defs.py's placeholder EXTERNAL sink.
     fid = "fn:decorator_registry.py::registered_tool"
     dbs = store.out_edges(fid, "DECORATED_BY")
     assert len(dbs) == 1
@@ -72,15 +71,11 @@ def test_manloop_emits_references_for_each_element():
 
 
 def test_unrelated_loop_over_bare_names_is_not_manloop():
-    # backends.py's real shape: `for fn in (_config,): fn.cache_clear()` —
-    # calling a method ON the loop var is not registering it anywhere.
+    # `for fn in (_config,): fn.cache_clear()` calls a method ON the loop var; it registers nothing.
     store, _, _ = build_fixture_store(["registry_manloop.py"])
     assert store.get("reg:registry_manloop.py::_reset_cache") is None
     reset_fn_id = "fn:registry_manloop.py::_reset_cache"
-    # `_config` IS referenced by name here (it escapes into the tuple), so
-    # extract/funcrefs.py emits a plain name-escape edge — that is correct and
-    # is what keeps `_config` off `cg dead`. What must NOT appear is a
-    # REGISTRATION form: this loop registers nothing.
+    # A name-escape edge is correct here (it keeps `_config` off `cg dead`); a REGISTRATION form is not.
     forms = {e.attrs.get("form") for e in store.out_edges(reset_fn_id, "REFERENCES")}
     assert forms == {"name-escape"}, forms
     assert not store.edges_of_kind("REGISTERS") or all(
@@ -167,10 +162,7 @@ def test_injection_emits_references_for_function_valued_args():
 
 
 def test_writes_dead_style_fixture_still_bug_c_shaped():
-    # Sanity: the dangling_global.py fixture (used by scopes.py's own tests)
-    # produces WRITES_NAME(via=global-stmt) edges through THIS module too —
-    # confirms extract/names.py and scopes.py agree on what counts as
-    # global-only.
+    # extract/names.py and scopes.py must agree on what counts as global-only.
     store, _, _ = build_fixture_store(["dangling_global.py"])
     nid = "name:dangling_global.py::_symbol_index_cache"
     writes = store.in_edges(nid, "WRITES_NAME")

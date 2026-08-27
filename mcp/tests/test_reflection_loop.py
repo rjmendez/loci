@@ -5,8 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-# Ensure mcp/ is on sys.path (also handled by conftest.py; belt-and-suspenders
-# guard for direct `python test_reflection_loop.py` invocations).
+# Also handled by conftest.py; this covers direct `python test_reflection_loop.py` runs.
 _MCP_DIR = str(Path(__file__).resolve().parent.parent)
 if _MCP_DIR not in sys.path:
     sys.path.insert(0, _MCP_DIR)

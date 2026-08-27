@@ -13,10 +13,7 @@ import pytest
 
 from ..config import REPO_ROOT
 
-# Guard 1: tests that build at a HISTORICAL revision need real git history.
-# A shallow clone (actions/checkout defaults to fetch-depth 1) makes
-# `git rev-parse <sha>^` exit 128. The CI job sets fetch-depth: 0; this guard
-# keeps the suite honest anywhere else that history is truncated.
+# A shallow clone makes `git rev-parse <sha>^` exit 128; CI sets fetch-depth: 0.
 def _has_git_history() -> bool:
     if shutil.which("git") is None:
         return False
@@ -33,11 +30,7 @@ needs_git_history = pytest.mark.skipif(
     reason="shallow clone: no history to build historical revisions from",
 )
 
-# Guard 2: the resolver classifies an import as third-party by IMPORTABILITY,
-# so tests asserting that `numpy` resolves as installed third-party are really
-# asserting something about the environment, not about the tool. Skip them
-# where the corpus's own dependencies are absent (e.g. a stdlib-only CI job)
-# rather than pretending the tool regressed.
+# Third-party classification is by IMPORTABILITY, so these assert about the env, not the tool.
 _CORPUS_DEPS = ("numpy", "fastapi", "qdrant_client")
 
 

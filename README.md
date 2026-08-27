@@ -18,7 +18,8 @@ like a set of notes.
 - **Claim validation** — Verify a proposed answer against stored evidence before asserting it
 - **Accumulated knowledge** — Your project context grows richer with every session
 - **Multi-agent memory** — Multiple AI agents can share a common memory pool via the A2A server
-- **Supply chain security** — Every tool call is scanned for injection attacks and malicious patterns
+- **Supply chain security** — An opt-in Claude Code hook scans file-writing tool calls
+  for prompt-injection and supply-chain IOC patterns
 
 ---
 
@@ -27,7 +28,7 @@ like a set of notes.
 ![Loci architecture](docs/img/loci-overview.svg)
 
 Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
-something, it calls one of Loci's 71 tools — the same way it calls any other tool. Your
+something, it calls one of Loci's 73 tools — the same way it calls any other tool. Your
 data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
 > **New to terms like "vector search", "RAG", or "MCP"?**
@@ -64,6 +65,10 @@ it from anywhere else, add absolute paths to `~/.claude/settings.json`:
 }
 ```
 
+The grounding and injection-scanning hooks are a separate, opt-in install:
+`scripts/hooks/install.sh` copies the three hooks into `~/.claude/hooks`, and
+`install.sh --check` reports drift between the repo copy and the deployed one.
+
 See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide.
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
@@ -82,14 +87,16 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
 ---
 
-## MCP tools (71)
+## MCP tools (73)
 
 ![Tool groups](docs/img/loci-tools.svg)
 
 *This diagram groups an earlier 24-tool snapshot by purpose — the groupings still
-hold, but the surface has since grown to 71 tools: 60 defined in `mcp/server.py`
-plus 11 code-graph tools registered from `mcp/graph_tools.py` at import time. See
-the table below for the current inventory.*
+hold, but the surface has since grown to 73: 42 defined in `mcp/server.py`, plus
+11 investigation tools from `mcp/investigation_tools.py`, 11 code-graph tools from
+`mcp/graph_tools.py` and 9 local-model tools from `mcp/llm_tools.py`, each
+registered onto the shared FastMCP instance at import time. See the table below
+for the current inventory.*
 
 | Tool | Purpose |
 |---|---|
@@ -111,6 +118,7 @@ the table below for the current inventory.*
 | `entity_timeline` | Chronological timeline of every finding mentioning an entity |
 | `investigation_related_cases` | Find related prior investigations |
 | `investigation_finding_provenance` | Trace source provenance for a finding |
+| `causal_infer` | Infer causal edges for an investigation and write them to `causal_edges.jsonl` |
 | `causal_edges_list` | List causal edges inferred for an investigation |
 | `conflict_list` | List detected conflicts for an investigation |
 | `conflict_resolve` | Resolve a detected conflict by recording a verdict |
@@ -124,6 +132,7 @@ the table below for the current inventory.*
 | `code_memory_correlate` | Link a detected code hallucination to the memories it contaminated (advisory, read-only) |
 | `memory_health` | Report memory system health |
 | `loci_health` | Read-only self-diagnosis of the MCP server as a JSON snapshot |
+| `retrieval_selftest` | Query every Qdrant collection in the store and report which ones actually return rows |
 | `memory_retract` | Soft-retract an incorrect or stale memory |
 | `memory_restore` | Restore a previously retracted memory |
 | `memory_promote` | Promote a finding to a higher memory tier |
@@ -196,7 +205,8 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | Resource | Default | Env var(s) |
 |---|---|---|
 | Qdrant | `http://localhost:6333` | `QDRANT_URL`, `QDRANT_API_KEY` |
-| Ollama (MCP server) | `http://localhost:11434` | `OLLAMA_BASE_URL` |
+| Ollama — embeddings (MCP server) | `http://localhost:11434` | `OLLAMA_BASE_URL` |
+| Ollama — generation (MCP server) | resolved by `mcp/backends.py` | `LOCI_OLLAMA_GEN_URL`, `OLLAMA_GEN_URL` |
 | Ollama (standalone scripts) | `http://localhost:11434` | `OLLAMA_URL` |
 | Ollama (A2A server) | `http://localhost:11434/v1` | `MNEMOSYNE_EMBEDDING_API_URL` |
 | Embedding model (MCP) | `nomic-embed-text` | `EMBED_MODEL` |
@@ -204,11 +214,20 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | Embedding dimensions | `768` | `MNEMOSYNE_EMBEDDING_DIM` |
 | Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
 | Memory session dir (MCP) | `~/.hermes/memory-sessions` | `HERMES_MEMORY_DIR` |
+| Code graph store | `$HERMES_MEMORY_DIR/graph.ladybug` | — |
 | Qdrant collection prefix | `hermes_memory` | `QDRANT_COLLECTION_PREFIX` |
+| Backend config file | `~/.loci/backends.toml` | `LOCI_CONFIG` |
 | Hook state | `~/.claude/hook-state/` | — |
 
-`OLLAMA_BASE_URL` and `OLLAMA_URL` serve different components — set both when running
-the full stack. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full env var reference.
+`OLLAMA_BASE_URL` is the **embedding** endpoint only. Generation resolves separately
+(`backends.ollama_gen_url()`, `mcp/backends.py:101`), so an Ollama that serves nothing but
+`nomic-embed-text` cannot silently absorb generation calls. `OLLAMA_URL` is the fallback the
+standalone scripts read. Set all three when the components run against different hosts.
+
+Anything left unset falls through `mcp/backends.py`: explicit env var, then a probe of
+`localhost`, then `~/.loci/backends.toml`, then empty — the offload tiers fail open on
+empty. `backends.toml.example` is the template for that file.
+See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full env var reference.
 
 Two `.env.example` files are provided:
 
@@ -234,14 +253,18 @@ Two `.env.example` files are provided:
 | `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension — must match your model |
 | `CODE_CHUNKS_COLLECTION` | _(unset)_ | Qdrant collection for `code_memory_correlate` |
 | `HERMES_MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable-http` |
-| `HERMES_MCP_HOST` | `0.0.0.0` | Bind host for SSE/HTTP transport |
+| `HERMES_MCP_HOST` | `127.0.0.1` | Bind host for SSE/HTTP transport |
 | `HERMES_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
+| `HERMES_MCP_TOKEN` | `""` | Bearer token for SSE/HTTP. Required for any non-loopback bind — the server exits rather than serve unauthenticated |
+| `LOCI_OLLAMA_GEN_URL` | _(resolved by `backends.py`)_ | Generation endpoint override (`OLLAMA_GEN_URL` also read) |
+| `LOCI_VLLM_FALLBACK` | `0` | Allow generation to fall back to vLLM (`VLLM_BASE_URL`) when Ollama fails |
+| `LOCI_CONFIG` | `~/.loci/backends.toml` | Backend resolution config file |
 
 ### A2A server
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MNEMOSYNE_EMBEDDING_API_URL` | _(required)_ | OpenAI-compat embedding endpoint (e.g. `http://localhost:11434/v1`) |
+| `MNEMOSYNE_EMBEDDING_API_URL` | `http://localhost:11434/v1` | OpenAI-compat embedding endpoint |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model for A2A server |
 | `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Mnemosyne SQLite data directory |
 | `HERMES_A2A_TOKEN` | _(required)_ | Bearer token callers must present |
@@ -270,8 +293,21 @@ By default the MCP server runs over `stdio` for use as a Claude Code subprocess.
 For Docker or remote deployments set `HERMES_MCP_TRANSPORT=sse` (or
 `streamable-http`) and configure `HERMES_MCP_HOST` / `HERMES_MCP_PORT`.
 
+The bind is loopback by default. A wider bind publishes the whole tool surface, so
+it requires `HERMES_MCP_TOKEN`: without one the server exits with a message instead
+of serving (`mcp/server.py:8407`). With a token set, callers present
+`Authorization: Bearer <token>`; `/health` stays open so liveness probes still work.
+`docker-compose.yml` sets `HERMES_MCP_HOST=0.0.0.0` because a container has to bind
+all its interfaces, so a token must be present in `.env` before `docker compose up`.
+
 ```bash
+# loopback — no token needed
+HERMES_MCP_TRANSPORT=sse HERMES_MCP_PORT=8000 \
+  .venv/bin/python server.py
+
+# wide bind — token required, or the server refuses to start
 HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
+  HERMES_MCP_TOKEN="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
   .venv/bin/python server.py
 ```
 
@@ -281,8 +317,9 @@ HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
 
 ```
 loci/
-├── mcp/                   MCP server — 71 tools: investigation memory, RAG, claim validation, code graph
+├── mcp/                   MCP server — 73 tools: investigation memory, RAG, claim validation, code graph
 │   ├── server.py          FastMCP server entry point
+│   ├── backends.py        Endpoint resolution: env var -> localhost probe -> ~/.loci/backends.toml
 │   ├── memcheck/          Standalone claim-validation + code-hallucination module
 │   ├── pyproject.toml     Package definition (pip install -e .)
 │   └── README.md          MCP setup and tool reference
@@ -290,11 +327,15 @@ loci/
 │   ├── CONCEPTS.md        Plain-English guide for beginners
 │   └── img/               SVG diagrams
 ├── scripts/               Python scripts (run standalone or via cron)
-│   └── hooks/             Claude Code / agent hook adapters
-├── eval/                  Longitudinal grounding quality evaluation harness
+│   ├── loci_groom.py      Passive grooming passes: index, knn_tags, codelink, summaries, ...
+│   └── hooks/             Claude Code / agent hook adapters + install.sh
+├── mlops/                 Embedding, routing, grounding and finetune experiments
+├── eval/                  Grounding-gate and skeptic-verification benchmarks
 ├── deep_think_loci/       Multi-tier reasoning engine — Workflow over the Loci corpus (beta)
 ├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
 ├── rules/                 Agent behavioral rules (loaded at session start)
-├── cron/jobs.json         (reference copy — live file in ~/.hermes/cron/)
+├── cron/jobs.json         Reference job list — nothing reads it (issue #205); the live
+│                          schedule is the user crontab, calling scripts/loci_groom_cron.sh
+├── backends.toml.example  Template for ~/.loci/backends.toml
 └── .env.example           Full environment variable reference for all components
 ```

@@ -52,10 +52,6 @@ def load_env() -> dict:
         load_dotenv(_REPO / ".env")
         load_dotenv(_REPO / "mcp" / ".env", override=True)
     except Exception as exc:
-        # NOT silent. python-dotenv is where LOCI_QDRANT_RETENTION_DAYS=0 lives, and
-        # without it _retention_days() falls back to 30 and the next _get_qdrant()
-        # deletes everything past the window. Swallowing this import is how a
-        # scheduled run turns destructive while reporting success.
         logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
                        "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
 
@@ -81,9 +77,7 @@ def load_env() -> dict:
         except Exception as exc:
             logger.warning("load_env: could not resolve Ollama from backends: %r", exc)
 
-    # Retention through the DURABLE channel. backends.toml is stdlib tomllib and
-    # needs no third-party import, so a setting that protects the corpus does not
-    # depend on one. env wins; .env already applied above; this is the floor.
+    # backends.toml is stdlib tomllib, so the setting that protects the corpus needs no import.
     if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
         try:
             import backends
@@ -104,10 +98,7 @@ MEMORY_DIR = Path(os.environ.get(
 ))
 GROOM_DIR = MEMORY_DIR / "_groom"
 
-# Left unset on purpose: the batched (vLLM) and Ollama tiers identify the same
-# model by different names — "Qwen/Qwen2.5-3B-Instruct" vs "qwen2.5:3b" — and a
-# name the serving tier does not recognise is rejected outright. None lets each
-# tier resolve its own. Set LOCI_GROOM_MODEL only to pin one deliberately.
+# Unset on purpose: vLLM and Ollama name the same model differently, so each tier resolves its own.
 GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
 GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
 # Per-run ceilings. These bound a nightly job, not a human sitting in front of it.
@@ -359,9 +350,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
         return report
 
     if calibrate:
-        # Hold out findings that DO have vocabulary tags, hide them, and score the
-        # model's pick against what the author actually wrote. Same protocol as
-        # knn_tags --calibrate, so every method lands on one comparable scale.
+        # Same holdout protocol as knn_tags --calibrate, so every method lands on one scale.
         candidates = [f for f in findings
                       if f.get("text") and set(_tags_of(f)) & set(vocab)]
         random.Random(seed).shuffle(candidates)
@@ -385,8 +374,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
     vocab_block = ", ".join(vocab)
     vocab_set = set(vocab)
     proposals = []
-    # A zero here has several causes and they are not interchangeable, so each is
-    # counted rather than folded into one silent 0.
+    # Counted per cause: a generation error and a declined answer are not the same zero.
     rej = collections.Counter()
     scored: list = []
 
@@ -409,8 +397,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
             if tags is None:
                 rej["unparseable"] += 1
                 continue
-            # A term outside the vocabulary is the model inventing one; drop it
-            # rather than letting the pass widen the vocabulary it was given.
+            # Out-of-vocabulary terms are dropped, not allowed to widen the given vocabulary.
             if not tags:
                 rej["declined"] += 1        # the model saw no fitting term — a real answer
                 continue
@@ -531,16 +518,7 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
     report["search_errors"] = errors
     report["identity"] = _score(ident_ranks, k, len(ident_ranks))
     if not ident_ranks:
-        # attempted==0 means every search raised — typically the cross-encoder
-        # failing to load. _score would return recall_at_1=0.0 and _append_recall
-        # would publish it into the one longitudinal retrieval metric we keep,
-        # recording a dead GPU as total retrieval collapse. Refuse to write a
-        # point rather than write a false one.
-        # The report still carries identity (attempted=0) so its shape is stable,
-        # but nothing is WRITTEN to the trend: _score returns recall_at_1=0.0 for
-        # an empty sample, and persisting that records a dead GPU as total
-        # retrieval collapse in the one longitudinal metric we keep. A missing
-        # point is honest; a zero is a lie.
+        # Every probe raised: writing recall_at_1=0.0 would record a dead GPU as retrieval collapse.
         report.update(status="degraded",
                       detail=f"all {errors} probe search(es) failed — no measurement taken")
         return report
@@ -913,14 +891,7 @@ def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
     report = {"pass": "verify", "status": "ok"}
     budget = int(limit or VERIFY_MAX_PER_RUN)
 
-    # Probe generation BEFORE verifying anything. verify_finding is fail-open: an
-    # unreachable model yields verdict='uncertain', confidence=0.0 for every
-    # finding, and investigation_verify_all writes those to
-    # finding_verifications.jsonl. Unattended, that fills an empty lane with
-    # records carrying no information — a file that looks populated and says
-    # nothing, which is the exact failure this tier exists to catch. Measured
-    # here on the first run: 5 records, all uncertain/0.0, because llm_local
-    # returns ok=False with no reason given.
+    # verify_finding is fail-open: with the model down every finding lands uncertain/0.0 on disk.
     if gen_probe is None:
         def gen_probe():
             sys.path.insert(0, str(_REPO / "mcp"))
@@ -953,8 +924,7 @@ def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
         if checked >= budget:
             break
         inv = inv_dir.parent.name
-        # Skip investigations already carrying verdicts, so repeated runs move
-        # through the corpus instead of re-verifying the same head every night.
+        # Skip investigations already carrying verdicts so repeated runs advance the corpus.
         if (inv_dir.parent / "finding_verifications.jsonl").exists():
             continue
         try:
@@ -1009,10 +979,7 @@ def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None
         ticked = json.loads(tick_fn(max_items=int(limit or REFLECT_MAX_ITEMS)))
         report["processed_items"] = ticked.get("processed_items", 0)
         report["findings_written"] = ticked.get("findings_written", 0)
-        # remaining_queue, NOT queue_size. tick only emits queue_size on the
-        # empty-queue early return, so .get("queue_size", 0) reported a backlog
-        # of 0 while 262 items were still queued — a false zero of exactly the
-        # kind this tier exists to catch.
+        # remaining_queue, NOT queue_size: tick emits queue_size only on the empty-queue return.
         if "remaining_queue" in ticked:
             report["remaining_queue"] = ticked["remaining_queue"]
     except Exception as exc:
@@ -1029,9 +996,7 @@ def _summarisable(inv_dir: Path) -> bool:
     fj = inv_dir / "findings.jsonl"
     if not fj.exists():
         return False
-    # A retracted finding is still in the log but is not something to summarise;
-    # investigation_reflect drops it, so counting it here would keep asking for a
-    # summary of nothing.
+    # investigation_reflect drops retracted findings, so counting them asks for a summary of nothing.
     retracted = set()
     rj = inv_dir / "retractions.jsonl"
     if rj.exists():
@@ -1107,8 +1072,7 @@ def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = Non
     report = {"pass": "summaries", "status": "ok"}
     budget = int(limit or SUMMARY_MAX_PER_RUN)
 
-    # Same guard as pass_verify, for the same reason: with the backend down the
-    # ladder silently writes its deterministic stub for every investigation.
+    # Same guard as pass_verify: with the backend down the ladder writes its deterministic stub.
     if gen_probe is None:
         def gen_probe():
             sys.path.insert(0, str(_REPO / "mcp"))
@@ -1147,10 +1111,7 @@ def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = Non
         if _has_llm_summary(manifest):
             skipped += 1
             continue
-        # An investigation with nothing to summarise is not a failure. Without
-        # this the empty ones error on every run, and once the backlog is clear
-        # that is every run — a pass permanently reporting degraded is a pass
-        # nobody reads when it finally means it.
+        # Nothing to summarise is not a failure; a permanently degraded pass is one nobody reads.
         if not _summarisable(man_path.parent):
             empty += 1
             continue
@@ -1230,11 +1191,7 @@ def main(argv: Optional[list] = None) -> int:
             rest = " ".join(f"{k}={v}" for k, v in r.items()
                             if k not in ("pass", "status") and not isinstance(v, (list, dict)))
             print(f"{head} {rest}".rstrip())
-    # Three-way, because a scheduler only ever sees the exit code. Every failure
-    # this tool actually produces — refused (retention not 0), degraded (qdrant
-    # unreachable, scroll failed, no generation tier, graph unreadable) — used to
-    # exit 0, so a cron run in which nothing happened recorded last_status=success.
-    # The refusal guard was built to be loud and was silent to its only consumer.
+    # Three-way: a scheduler only sees the exit code, and refused/degraded must not read as success.
     if any(r.get("status") == "error" for r in reports):
         return 1
     if any(r.get("status") in ("refused", "degraded") for r in reports):

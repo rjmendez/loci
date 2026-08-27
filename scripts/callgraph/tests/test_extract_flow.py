@@ -68,8 +68,7 @@ def test_tuple_element_escape_form_and_params_excluded():
     assert node is not None
     edges = [e for e in store.out_edges(fn, "ESCAPES") if e.dst == total_id]
     assert edges[0].attrs["escape_form"] == "tuple-element"
-    # `a` and `b` are parameters returned as-is, not locally (re)bound —
-    # must NOT get their own LOCALBINDING (see module docstring).
+    # Parameters returned as-is are not locally re-bound: no LOCALBINDING of their own.
     assert store.get(local_binding_id(fn, "a")) is None
     assert store.get(local_binding_id(fn, "b")) is None
 
@@ -88,8 +87,7 @@ def test_closure_escape_marks_free_variables_of_returned_nested_function():
     assert step_edges[0].attrs["escape_form"] == "closure"
     assert step_node.attrs["init_is_constant"] is True   # `step = 1`
     assert base_node.attrs["init_is_constant"] is False  # `base = n`
-    # the nested function's OWN name, returned by itself, is not a "local"
-    # of make_adder in the sense this module models.
+    # A nested function's own name is not a "local" of its parent here.
     assert store.get(local_binding_id(fn, "add")) is None
 
 

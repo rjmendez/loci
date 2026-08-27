@@ -8,8 +8,7 @@ import grounding as G  # noqa: E402 — must follow the path setup above
 
 
 def test_ground_fail_open_on_raising_source(monkeypatch):
-    # A raising server tool (or malformed finding) must NOT propagate out of ground() —
-    # the fail-open discipline the flagship dogfood found violated in sections 1 & 3.
+    # A raising server tool or malformed finding must never propagate out of ground().
     import types
     fake = types.ModuleType("server")
 
@@ -79,8 +78,7 @@ def test_select_memory_files_relevance_and_cap(tmp_path):
 
 
 def test_select_memory_files_rejects_generic_token_match(tmp_path):
-    # Two incidental English words ("event", "single") must NOT pull an off-topic memory;
-    # a candidate needs a distinctive (len>=7) shared token, not just min_score generic ones.
+    # A candidate needs a distinctive (len>=7) shared token, not two incidental English words.
     (tmp_path / "MEMORY.md").write_text(
         "- [offtopic](offtopic.md) — resilient rover single NEAREST-base early-Aug event mock-GPS\n")
     (tmp_path / "offtopic.md").write_text("BODY: rover stuff")
@@ -102,8 +100,7 @@ def test_ground_fail_open_no_server(monkeypatch):
 
 
 def test_ground_emits_exclusion_block_for_resolved_findings(monkeypatch):
-    # Findings marked fixed/intentional/wontfix on a grounded case must surface as a
-    # compact "do NOT re-report" block so re-audits auto-exclude handled items.
+    # Handled findings must surface as a "do NOT re-report" block so re-audits exclude them.
     import types
     fake = types.ModuleType("server")
     fake.investigation_load = lambda cid, **k: {

@@ -63,8 +63,7 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
 
 
 def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
-    # Even if every backend endpoint resolver raises, the tool still returns a dict
-    # with the full key set (each probe is independent + fail-open).
+    # Every probe is independent and fail-open: the full key set survives any resolver raising.
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "qdrant", lambda: (_ for _ in ()).throw(RuntimeError("x")))
@@ -73,10 +72,7 @@ def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
 
 
 def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
-    # First-call safety (round 4): with backends DOWN and no env override, EVERY
-    # reachability probe loci_health triggers — including the resolvers' OWN internal
-    # local probe — must use a short (<= 0.5s) timeout, so the first call cannot block
-    # on backends._alive's 1.0s default.
+    # Every probe, the resolvers' own included, must be short-timeout so a first call cannot block.
     for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(backends, "_config", lambda: {})
@@ -93,8 +89,7 @@ def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
 
     out = json.loads(server.loci_health())
 
-    # The resolvers' internal probe (localhost:11434 / :8000) ran, proving we didn't
-    # merely short-circuit — and every probe timeout is bounded.
+    # The resolvers' internal probe must actually run, not short-circuit.
     assert seen_timeouts, "expected reachability probes to have run"
     assert all(t <= 0.5 for t in seen_timeouts), (
         f"all loci_health probe timeouts must be <= 0.5s, got {seen_timeouts}")
@@ -109,8 +104,7 @@ def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
 
 
 def test_code_version_first_compute_is_thread_safe(monkeypatch):
-    # Concurrent callers before the cache is filled must spawn `git rev-parse`
-    # exactly ONCE (double-checked locking), and all agree on the result.
+    # Double-checked locking: concurrent cold callers spawn `git rev-parse` exactly once.
     import subprocess as _sp
 
     monkeypatch.setattr(server, "_code_version_cache", None)
@@ -180,8 +174,7 @@ def test_warm_is_best_effort_never_raises_when_endpoint_down():
 
 
 def test_warm_does_not_latch_when_thread_start_fails(monkeypatch):
-    # If the daemon thread cannot be created/started, warm() must NOT latch
-    # _warm_started, so warmed() stays False and a later call can retry.
+    # A thread that fails to start must not latch _warm_started, or no call can retry.
     _reset_warm()
 
     class _BoomThread:

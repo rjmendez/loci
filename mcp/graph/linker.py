@@ -42,18 +42,13 @@ __all__ = [
     "relink_all",
 ]
 
-# Symbol kinds that count as a "distinctive type" — a whole-word match on one of
-# these is strong enough to be a HIGH-confidence reference on its own. Mirrors
-# ingest_code's _TYPE_KINDS.
+# A whole-word match on one of these is HIGH on its own; mirrors ingest_code's _TYPE_KINDS.
 _TYPE_KINDS = {"class", "interface", "enum", "struct", "trait"}
 
-# Minimum length for a bare identifier to be eligible for a MEDIUM match. Short
-# tokens are almost never distinctive enough to be safe.
+# Below this, a bare identifier is not distinctive enough to risk a MEDIUM match.
 _MIN_IDENT_LEN = 8
 
-# Common programming words that are NEVER, on their own, a code reference — even
-# if a symbol happens to share the name. Guards the MEDIUM path (the HIGH paths
-# require a type / explicit marker and so are already safe).
+# Never a reference on their own; guards the MEDIUM path only (HIGH needs a type or marker).
 _COMMON_WORDS = frozenset({
     "get", "set", "run", "put", "add", "new", "old", "map", "key", "val",
     "value", "data", "text", "name", "type", "kind", "size", "list", "item",
@@ -104,7 +99,6 @@ def build_symbol_index(symbols: list[dict]) -> dict:
     by_name: dict[str, list[str]] = {}
     type_names: set[str] = set()
     type_ids: dict[str, list[str]] = {}
-    # track seen (name,id) to collapse duplicate rows
     _seen_name: set[tuple[str, str]] = set()
 
     for s in (symbols or []):
@@ -201,9 +195,7 @@ def extract_symbol_refs(text: str, index: dict) -> list[tuple[str, str]]:
             for cid in by_name.get(raw, []):
                 _add(cid, "high")
 
-    # 2) Source-file mentions ("DeviceMetricsPoller.java") -> the file's PRIMARY TYPE
-    #    (the class named after the file), NOT every symbol defined in that file.
-    #    Linking all members over-links badly (a 251-method file -> 251 spurious refs).
+    # 2) File mention -> the file's primary type only; all members over-links (251 -> 251 refs).
     for m in _FILE_RE.finditer(text):
         base = m.group(1)
         stem = base.rsplit(".", 1)[0]  # "MainActivity.java" -> "MainActivity"
@@ -225,8 +217,7 @@ def extract_symbol_refs(text: str, index: dict) -> list[tuple[str, str]]:
             for cid in type_ids.get(head, []):
                 _add(cid, "high")
 
-    # 4) Whole-word tokens: CamelCase type names (HIGH) and unique distinctive
-    #    identifiers (MEDIUM).
+    # 4) Whole-word tokens: CamelCase type names (HIGH), unique distinctive idents (MEDIUM).
     for m in _WORD_RE.finditer(text):
         tok = m.group(0)
         # HIGH: a type name, whole-word, that looks like a type (Uppercase lead).
@@ -285,9 +276,7 @@ def link_findings(ks, finding_rows: list[dict], index=None) -> int:
                 continue
             fid = str(fid)
             for sid, conf in extract_symbol_refs(str(text), index):
-                # Carried, not dropped. A consumer that cannot tell a distinctive
-                # type match from a bare-word one has to guess, and every consumer
-                # guesses differently.
+                # confidence rides on the edge: consumers cannot re-derive it and each guesses differently.
                 pairs.append({"f": fid, "s": sid, "c": conf})
 
         if not pairs:

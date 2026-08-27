@@ -2,9 +2,10 @@
 """
 on_session_end hook — live-sync the current session into Qdrant hermes_sessions.
 
-Fires at the end of every turn. Reads session_id from stdin JSON, grabs the
-session's current messages from state.db, embeds via Ollama (nomic-embed-text
-768d), and upserts a single point into hermes_sessions.
+Fires at the end of every turn. Reads session_id and transcript_path from stdin
+JSON, takes the session's messages from state.db or, for a Claude Code session
+id that never resolves there, from the transcript, embeds via Ollama
+(nomic-embed-text 768d), and upserts a single point into hermes_sessions.
 
 Fast path: if the session has no new messages since the last upsert (checked
 via a lightweight mtime file), exit 0 immediately.
@@ -52,7 +53,6 @@ def ensure_collection():
     url = f"{QDRANT}/collections/{COLLECTION}"
     headers = {"Content-Type": "application/json", "api-key": QDRANT_KEY}
 
-    # Check existence first
     exists = False
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
@@ -79,8 +79,7 @@ def ensure_collection():
         except Exception as e:
             print(f"[session_end_sync] create collection failed: {e}", file=sys.stderr)
     else:
-        # Apply quantization + HNSW to existing collection. Idempotent: Qdrant
-        # applies changes during next optimizer pass without interrupting writes.
+        # Idempotent: Qdrant applies these on the next optimizer pass, without pausing writes.
         body = json.dumps({
             "hnsw_config": {"m": 32, "ef_construct": 200},
             "quantization_config": _quant,
@@ -139,10 +138,8 @@ def get_session_content(session_id: str):
         if not msgs:
             return None
 
-        # Build content: role-prefixed lines, rolling window (last MAX_CHARS)
-        # Take from the end so recent context drives the embedding
+        # Taken from the end so recent context drives the embedding.
         lines = [f"{m['role'].upper()}: {(m['content'] or '').strip()}" for m in msgs]
-        # Reverse and accumulate up to MAX_CHARS
         buf = []
         total = 0
         for line in reversed(lines):
@@ -259,10 +256,7 @@ def transcript_session_content(transcript_path: str, session_id: str):
         "msg_count":  msg_count,
     }
 
-# One file per session id, forever. A session that will never be seen again keeps
-# its counter indefinitely, so the directory grows with every session the machine
-# ever runs. The cache only answers "how many messages had this session synced
-# last time", which is meaningless once the session is over.
+# One file per session id: without a TTL the directory grows with every session ever run.
 CACHE_TTL_DAYS = int(os.environ.get("HERMES_SYNC_CACHE_TTL_DAYS", "7"))
 
 
@@ -398,9 +392,7 @@ def main():
     if not isinstance(session_id, str) or not session_id:
         sys.exit(0)
 
-    # Prune before doing work. This hook is the only thing that writes the cache,
-    # so it is the only place that can retire it, and end-of-session is when the
-    # entries that will never be read again are created.
+    # This hook is the only writer of the cache, so it is the only place that can retire it.
     try:
         gone = prune_cache()
         if gone:
@@ -415,15 +407,12 @@ def main():
     if not sess:
         sys.exit(0)
 
-    # Ensure collection exists with quantization + HNSW before first upsert.
     ensure_collection()
 
-    # Skip if message count hasn't changed since last sync
     prev_count = cached_msg_count(session_id)
     if sess["msg_count"] == prev_count:
         sys.exit(0)
 
-    # Embed
     try:
         vector = embed(sess["content"])
     except Exception as e:
@@ -434,7 +423,6 @@ def main():
         print(f"[session_end_sync] unexpected vector dim {len(vector)}, expected {EMBED_DIM}", file=sys.stderr)
         sys.exit(0)
 
-    # Upsert
     point_id = stable_id(session_id)
     payload = {
         "session_id":      session_id,
@@ -458,7 +446,6 @@ def main():
         write_cache(session_id, sess["msg_count"])
         elapsed = time.monotonic() - t0
 
-        # Check for unresolved wiring obligations via Loci MCP (best-effort)
         unresolved_note = ""
         if ACTIVE_INV:
             try:

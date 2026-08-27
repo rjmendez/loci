@@ -213,8 +213,7 @@ def _capture_fetch(refs, reader):
 
 
 def test_zero_line_ref_normalizes_to_line_one():
-    # A ref like file.py:0 must not yield an empty block; it clamps to line 1 and the
-    # header reflects the ACTUAL displayed line, not the raw 0.
+    # file.py:0 clamps to line 1 and the header must show the displayed line, not the raw 0.
     def _reader(path):
         return "alpha\nbeta\ngamma\n"
 
@@ -226,8 +225,7 @@ def test_zero_line_ref_normalizes_to_line_one():
 
 
 def test_truncated_ref_header_reflects_displayed_span():
-    # An oversized end (past EOF and past _MAX_LINES_PER_REF) must show the real s..e span
-    # in the header, not the requested 1-999.
+    # An oversized end must report the real clamped span, not the requested one.
     body = "".join(f"line{i}\n" for i in range(1, 201))   # 200 lines
     block = _capture_fetch([("big.py", 1, 999)], lambda p: body)
     cap = V._MAX_LINES_PER_REF
@@ -259,8 +257,7 @@ def test_reasoning_falls_back_to_raw_text_when_absent():
 
 
 def test_degraded_coerces_nonstring_text_to_string():
-    # A not-ok result whose "text" is None must not leak None into reasoning:
-    # _degraded is the single normalization point and keeps the all-strings return shape.
+    # _degraded is the single normalization point that keeps the all-strings return shape.
     def _not_ok_none_text(prompt, *, fmt=None, max_tokens=256):
         return {"ok": False, "text": None}
 
@@ -321,8 +318,7 @@ def test_default_reader_size_cap(monkeypatch):
 
 
 def test_default_reader_size_cap_is_byte_accurate(monkeypatch, tmp_path):
-    # The cap is BYTES, not characters: a multibyte file must not read past the byte cap.
-    # Under the old text-mode f.read(n) this capped characters and could return more bytes.
+    # The cap is BYTES, not characters: text-mode f.read(n) caps characters and overruns.
     p = tmp_path / "multibyte.txt"
     p.write_text("é" * 100, encoding="utf-8")  # each 'é' is 2 UTF-8 bytes
     monkeypatch.setattr(V, "_MAX_FILE_BYTES", 10)
@@ -369,8 +365,7 @@ def test_code_refs_single_string_is_accepted():
 
 
 def test_code_refs_nonlist_type_is_ignored_and_autodetect_survives():
-    # A junk type (e.g. int) must be ignored without raising, and auto-detection from the
-    # context must still work (the broad try must not be killed by list(code_refs)).
+    # A junk code_refs type must be ignored without killing the surrounding auto-detection.
     def _reader(path):
         return "alpha\nbeta\ngamma\n"
 

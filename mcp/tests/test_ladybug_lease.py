@@ -35,9 +35,6 @@ def test_no_lock_held_between_ops_two_instances(tmp_path):
     assert a.upsert_finding({"id": "f1", "investigation": "inv1", "text": "x"}) is True
 
     # Each instance sees the other's committed writes (fresh leased read sessions).
-    # (A previous `... if False else None` stub called related_investigations here
-    # but could never execute and asserted nothing. Cross-instance visibility is
-    # proven by the _rows assertion below, which is the point of this test.)
     rows = a._rows("MATCH (i:Investigation) RETURN i.id ORDER BY i.id")
     assert [r[0] for r in rows] == ["inv1", "inv2"]
 

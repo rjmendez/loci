@@ -54,13 +54,7 @@ def test_reexport_aliases_to_function_node_not_a_disconnected_copy():
 
 def test_bare_module_level_assign_aliases_to_the_same_function():
     store, _ = _build(["reexport.py", "reexport_source.py"])
-    # `runner = symbol_impact` inside reexport.py: `runner` aliases the
-    # `symbol_impact` NAME slot in the SAME module (a one-hop, same-module
-    # alias) — and that slot's own ALIASES edge (built from the from-import)
-    # is what actually reaches the function. A two-hop chain, not a
-    # collapsed shortcut: a reverse closure over ALIASES follows both hops,
-    # and `runner` must never become a second, disconnected identity for
-    # symbol_impact.
+    # Two-hop chain, not a collapsed shortcut: `runner` -> the NAME slot -> the function.
     runner_aliases = store.out_edges("name:reexport.py::runner", "ALIASES")
     assert len(runner_aliases) == 1
     assert runner_aliases[0].dst == "name:reexport.py::symbol_impact"

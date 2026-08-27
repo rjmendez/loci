@@ -118,8 +118,7 @@ def _create_payload_indexes(client, col: str) -> None:
             type=KeywordIndexType.KEYWORD, on_disk=False)),
         ("tags", KeywordIndexParams(
             type=KeywordIndexType.KEYWORD, on_disk=False)),
-        # Multi-tenancy fields (agent_id + operator_id use is_tenant=True for
-        # HNSW partition hints — same pattern as investigation_id)
+        # Multi-tenancy fields — is_tenant=True gives HNSW partition hints.
         ("agent_id",    KeywordIndexParams(
             type=KeywordIndexType.KEYWORD, is_tenant=True, on_disk=False)),
         ("operator_id", KeywordIndexParams(
@@ -130,13 +129,7 @@ def _create_payload_indexes(client, col: str) -> None:
             type=IntegerIndexType.INTEGER, lookup=False, range=True, on_disk=False)),
         ("promoted_from", KeywordIndexParams(
             type=KeywordIndexType.KEYWORD, on_disk=False)),
-        # Entity fields — enable O(log N) indexed lookup vs. full collection scan.
-        # Qdrant indexes array elements individually so MatchValue on a list field
-        # matches any element in the array (standard inverted-index behaviour).
-        # Note: dot-notation indexing of arrays inside nested JSON objects
-        # (entities.ips is an array inside the "entities" dict) is an implicit
-        # behaviour of qdrant-client 1.17.x — not formally documented in the API
-        # spec.  Works at this version but should be re-verified on upgrade.
+        # Entity fields — nested-array dot-notation indexing is undocumented qdrant-client 1.17.x behaviour; re-verify on upgrade.
         ("entities.ips",       KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
         ("entities.emails",    KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
         ("entities.hostnames", KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=False)),
@@ -186,8 +179,7 @@ def _retention_days() -> int:
     try:
         days = int(raw)
     except ValueError:
-        # Falls back to DISABLED, not to a window. Guessing a number here is
-        # guessing how much of the corpus to delete.
+        # Falls back to DISABLED, not to a window: a guessed number guesses how much corpus to delete.
         logger.warning("LOCI_QDRANT_RETENTION_DAYS=%r is not an integer; "
                        "disabling the purge rather than guessing a window", raw)
         return 0
@@ -212,8 +204,7 @@ def _purge_old_records(client, col: str, retention_days: Optional[int] = None) -
     cutoff = int(time.time()) - (retention_days * 86400)
     stale = Filter(must=[FieldCondition(key="created_at_ts", range=Range(lt=cutoff))])
     try:
-        # Count first: the delete runs with wait=False, so without this the log
-        # line cannot say whether it removed nothing or removed the corpus.
+        # Count first: the delete is wait=False, so the log otherwise cannot say what it removed.
         try:
             doomed = int(client.count(collection_name=col, count_filter=stale, exact=True).count)
         except Exception as exc:
@@ -269,12 +260,6 @@ def _get_qdrant():
             )
 
             qdrant_api_key = os.environ.get("QDRANT_API_KEY", "") or None
-            # 5s was too short for any collection but this server's own. Measured
-            # against agent_core_chunks (6.06M points, unquantized): 1.31s filtered,
-            # 10.87s unfiltered, 9.01s on a doc_type filter — so every explicit query
-            # to it timed out and came back mode="rag_failed", result_count=0 at
-            # HTTP 200. Raised, and configurable, because the right value depends on
-            # which collections a deployment actually searches.
             client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key,
                                   timeout=_QDRANT_TIMEOUT)
             col = QDRANT_COLLECTION_PREFIX
@@ -299,20 +284,16 @@ def _get_qdrant():
                             modifier=Modifier.IDF,
                         )
                     },
-                    # Stronger HNSW graph: m=32 doubles recall at high similarity
-                    # thresholds; ef_construct=200 improves index quality at build time.
+                    # m=32 doubles recall at high similarity thresholds; ef_construct=200 buys index quality at build time.
                     hnsw_config=_hnsw,
-                    # INT8 scalar quantization: ~4x memory reduction, <1% recall loss.
-                    # always_ram keeps quantized vectors hot; originals rescored on search.
+                    # INT8: ~4x less memory for <1% recall; always_ram keeps them hot, originals rescored on search.
                     quantization_config=_quant,
                 )
                 logger.info(
                     "Created Qdrant collection '%s' (named-vector + sparse + INT8 quant)", col
                 )
             else:
-                # Upgrade existing collection: apply quantization + HNSW if not configured.
-                # update_collection is idempotent; the optimizer applies changes in the
-                # background without interrupting reads or writes.
+                # update_collection is idempotent; the optimizer applies changes in the background.
                 try:
                     client.update_collection(
                         col,
@@ -323,12 +304,9 @@ def _get_qdrant():
                 except Exception as upd_exc:
                     logger.debug("Collection config update skipped: %s", upd_exc)
 
-            # Create payload indexes — idempotent, safe on existing collection
             _create_payload_indexes(client, col)
 
-            # Purge on startup — window from LOCI_QDRANT_RETENTION_DAYS (0 disables).
-            # Passing no literal here: pinning one at the call site is what made the
-            # default unreachable.
+            # No literal window here: pinning one at the call site is what made the default unreachable.
             _purge_old_records(client, col)
 
             _qdrant_client = (client, col)
@@ -349,8 +327,7 @@ _embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, val
 _embed_cache_lock = threading.Lock()              # guards _embed_cache check-evict-insert (#86)
 _embed_sparse_cache_lock = threading.Lock()       # guards _embed_sparse_cache check-evict-insert (#86)
 
-# Startup validation — warn clearly when required backends are not configured.
-# Server runs in degraded mode (keyword-only) rather than refusing to start.
+# Degraded mode (keyword-only) rather than refusing to start.
 if not os.environ.get("QDRANT_URL"):
     logger.warning(
         "QDRANT_URL is not set — Qdrant semantic search disabled. "
@@ -451,45 +428,12 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
     return degraded_active, degraded_reason
 
 
-# How much of a passage the cross-encoder is allowed to see, in CHARACTERS.
-#
-# This was a hardcoded 512. The corpus median finding is 1,048 characters and
-# 73.6% of findings are longer than 512, so for three findings in four the
-# reranker was scoring a truncated head against a query drawn from the whole
-# text — and short findings, scored complete, won the comparison on presentation
-# rather than relevance. bge-reranker-v2-m3 accepts 8192 TOKENS; 512 characters
-# is roughly a sixteenth of that.
-#
-# Swept against identity recall (scripts/loci_groom.py recall, n=90 per arm,
-# three seeds), which is what this should be re-tuned against if the corpus shape
-# changes. identity r@1:
-#
-#     passage chars   seed 5   seed 11   seed 12
-#     (no CE)          0.967    0.929     0.933
-#     512              0.744    0.811     0.822   <- the value this replaces
-#     1024             1.000    0.978     0.956
-#     2048             0.944    0.978     0.956
-#
-# Two results replicate across all three seeds: 512 is worse than switching the
-# reranker OFF, and >=1024 is better than both. So the reranker was not the
-# problem — it had never been given enough of a passage to judge, on a corpus
-# whose median finding is 1,048 characters.
-#
-# What did NOT replicate: the first seed showed 1024 beating 2048, which looked
-# like longer passages diluting the signal. Two further seeds show them identical.
-# 1024 stays the default because it is never worse and it is one median finding,
-# but anything >= 1024 is defensible and the 1024-vs-2048 gap was noise.
+# Passage chars the cross-encoder sees: 1024 swept against identity recall over three seeds; 512 scored worse than no CE at all.
 RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
-# Client-wide Qdrant timeout, seconds. Not per-collection: one client serves them
-# all, so this is sized for the slowest collection a deployment searches.
+# Client-wide, not per-collection: sized for the slowest collection searched (5s timed out agent_core_chunks entirely).
 _QDRANT_TIMEOUT = float(os.environ.get("LOCI_QDRANT_TIMEOUT", "20"))
 
-# One definition of the quantized-search parameters, used by every query path.
-# rescore=True re-scores ANN candidates against the original full-precision
-# vectors, recovering the ~0.5-1% recall INT8 costs; oversampling=2.0 gives the
-# rescore twice the candidates to choose from.
-#
-# Built lazily because qdrant_client is an optional import at module scope.
+# rescore=True recovers the ~0.5-1% recall INT8 costs, oversampling=2.0 feeds it 2x candidates; lazy because qdrant_client is optional.
 _QUANT_SEARCH_PARAMS = None
 
 
@@ -525,9 +469,7 @@ def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bo
             return sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:top_k], True
         except Exception as exc:
             logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
-            # Strip any partial ce_score annotations written before the exception
-            # so downstream consumers see a consistent payload (all rows scored,
-            # or none — never a mix).
+            # All rows scored or none: strip partial ce_score annotations written before the exception.
             for row in rows:
                 row.pop("ce_score", None)
     return rows[:top_k], False
@@ -566,7 +508,6 @@ def _qdrant_similarity_search(
     # Normalise confidence floor; callers may pass mixed-case ("High", "MEDIUM").
     if min_confidence:
         min_confidence = min_confidence.lower()
-    # Build filter: investigation scope + optional confidence floor.
     must_conditions = []
     if investigation_id:
         must_conditions.append(FieldCondition(key="investigation_id", match=MatchValue(value=investigation_id)))
@@ -580,11 +521,7 @@ def _qdrant_similarity_search(
     if dense_vec is None:
         return {"ok": False, "reason": "embedding_unavailable", "results": []}
 
-    # rerank_top_k separates "how many CE-ranked results to return" from "how
-    # many candidates to fetch for dedup".  investigation_search inflates limit
-    # to compensate for dedup losses; without rerank_top_k that inflation would
-    # multiply the CE batch size (limit*3 caller → limit*15 CE pairs).
-    # Clamp to limit so the function never returns more rows than requested.
+    # rerank_top_k caps the CE batch: investigation_search inflates limit for dedup, which would otherwise mean limit*15 CE pairs.
     output_k = min(rerank_top_k, limit) if rerank_top_k is not None else limit
     fetch_limit = output_k * 5 if rerank else limit * 4
 
@@ -621,23 +558,18 @@ def _qdrant_similarity_search(
         payload = dict(p.payload or {})
         rows.append({"score": round(float(p.score), 4), **payload, "origin": payload.get("origin", "qdrant")})
 
-    # Stage 2: cross-encoder reranking — full query-passage joint scoring.
     if rerank:
         rows, reranked = _ce_rerank(query, rows, output_k)
         if reranked:
             mode = mode + "+reranked"
     else:
-        # Reranking disabled — honour output_k so the function's return count is
-        # consistent whether CE runs or not.  investigation_search still gets
-        # enough dedup candidates from mnemosyne (up to limit*4 rows) so capping
-        # here at output_k does not starve the dedup loop.
+        # Honour output_k so the return count matches whether or not CE ran; mnemosyne still feeds the dedup loop.
         rows = rows[:output_k]
 
     return {"ok": True, "reason": mode, "results": rows}
 
 
-# Cache of collection -> dense vector name. Vector layout does not change under a
-# running process, and the alternative is a get_collection on every query.
+# Vector layout is fixed under a running process; the alternative is a get_collection per query.
 _dense_name_cache: dict = {}
 
 
@@ -751,9 +683,7 @@ def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
         )
         return out
 
-    # search_params matters here: without it this probe queries a different path
-    # from the one production uses, so a green selftest would not mean the real
-    # search works.
+    # search_params: without it the probe queries a different path from production, so green would mean nothing.
     kwargs = {"collection_name": name, "query": query_vec, "limit": limit,
               "with_payload": False, "search_params": _quant_search_params()}
     try:
@@ -854,16 +784,12 @@ def _qdrant_search_collection(
         payload = dict(p.payload or {})
         rows.append({
             "score": round(float(p.score), 4),
-            # The point id, BEFORE the payload spread so a payload that carries its
-            # own id still wins. Callers dedup on (origin, id); a row without one
-            # collapses its whole collection to a single hit — measured: a 5-row
-            # result from dama_gotchi_code had 1 distinct id, all None.
+            # Before the payload spread so a payload's own id wins; callers dedup on (origin, id).
             "id": str(p.id),
             **payload,
             "origin": collection_name,
         })
 
-    # Cross-encoder rerank if available
     rows, _ = _ce_rerank(query, rows, limit)
 
     return rows

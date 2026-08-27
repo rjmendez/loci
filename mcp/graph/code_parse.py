@@ -73,9 +73,7 @@ def detect_lang(path: str) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # Per-language configuration
 # --------------------------------------------------------------------------- #
-# Definition node types -> default symbol kind. Used both to (a) enumerate the
-# definition captures from the query and (b) walk parents to build dotted
-# qualnames and locate the enclosing symbol of a call.
+# Definition node type -> default symbol kind; also walked to build dotted qualnames.
 KINDS: Dict[str, Dict[str, str]] = {
     "python": {
         "function_definition": "function",
@@ -132,10 +130,7 @@ CLASS_LIKE: Dict[str, set] = {
     "rust": {"impl_item", "trait_item"},
 }
 
-# Tree-sitter queries. Definition captures are named ``d.<kind>`` so the kind is
-# recovered from the capture-name suffix. Call captures are ``call``; import
-# captures are ``import``. Callee names and import module strings are extracted
-# from the captured nodes in Python (grammar-specific but robust).
+# Definition captures are named ``d.<kind>``; the kind is recovered from the suffix.
 QUERIES: Dict[str, str] = {
     "python": """
         (function_definition) @d.function
@@ -506,16 +501,14 @@ def _import_map_entries(node, lang: str):
                         al = c.child_by_field_name("alias")
                         base = _text(nm) if nm is not None else ""
                         key = _text(al) if al is not None else base.split(".")[-1]
-                        # Relative imports ("from . import queries") bind the module
-                        # by its simple name — don't prefix the dotted package path.
+                        # Relative imports bind by simple name — don't prefix the package path.
                         fqn = base if (not mod_txt or set(mod_txt) <= {"."}) else f"{mod_txt}.{base}"
                         if key:
                             out.append((key, fqn))
                     elif c.type in ("dotted_name", "identifier"):
                         base = _text(c)
                         key = base.split(".")[-1]
-                        # Relative imports ("from . import queries") bind the module
-                        # by its simple name — don't prefix the dotted package path.
+                        # Relative imports bind by simple name — don't prefix the package path.
                         fqn = base if (not mod_txt or set(mod_txt) <= {"."}) else f"{mod_txt}.{base}"
                         if key:
                             out.append((key, fqn))
@@ -541,8 +534,7 @@ def _import_map_entries(node, lang: str):
 # --------------------------------------------------------------------------- #
 # Query capture normalisation
 # --------------------------------------------------------------------------- #
-# Warn-once keys for _run_query total failures: (lang, tier). A whole-repo index
-# must log once per language, not once per file.
+# Warn-once keys (lang, tier): a whole-repo index must log per language, not per file.
 _WARNED: set = set()
 
 # Languages already warned about for "grammar present but no query defined".
@@ -868,8 +860,7 @@ def parse_source(file: str, source: bytes, lang: Optional[str] = None) -> Dict[s
 
         query_str = QUERIES.get(lang)
         if not query_str:
-            # Grammar available but no query defined: file node only. Keyed on LANG,
-            # not file — a large C checkout must not emit one warning per file.
+            # Keyed on lang, not file — a large C checkout must not warn once per file.
             if lang not in _WARNED_NO_QUERY:
                 _WARNED_NO_QUERY.add(lang)
                 logger.warning(
@@ -1066,8 +1057,7 @@ def parse_path(
                 if data is not None:
                     results.append(data)
     except Exception as exc:
-        # The walk stopped early: `results` is a SHORT list that otherwise reads
-        # as a complete index of the tree. Warn, not debug.
+        # A short result list otherwise reads as a complete index of the tree.
         logger.warning(
             "code_parse: directory walk of %s aborted after %d files: %s",
             root, len(results), exc,

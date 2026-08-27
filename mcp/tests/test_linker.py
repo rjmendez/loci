@@ -78,8 +78,7 @@ def test_extract_type_name_high():
 
 
 def test_extract_common_words_link_nothing():
-    # "get" is a real method fragment but a common word; "getInstance" is not
-    # present as a token here, so nothing distinctive matches.
+    # "get" is a real method fragment but too common to be a distinctive match.
     assert extract_symbol_refs("we should get the value", _index()) == []
 
 
