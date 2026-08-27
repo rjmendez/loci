@@ -34,3 +34,31 @@ loci-mcp = "server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["memcheck*", "graph*"]
+
+# server.py's import chain (direct + lazy sibling imports) pulls in every
+# top-level module below; packages.find only covers memcheck/graph.
+[tool.setuptools]
+py-modules = [
+    "backends",
+    "batched_gen",
+    "embed_ops",
+    "graph_tools",
+    "grounding",
+    "inv_store",
+    "investigation_tools",
+    "ladybug_ops",
+    "legacy_env",
+    "llm_local",
+    "llm_tools",
+    "mnemo_ops",
+    "model_json",
+    "openrouter",
+    "qdrant_ops",
+    "query_expand",
+    "reranker",
+    "retrieval_eval",
+    "server",
+    "text_ops",
+    "verdict_ops",
+    "verify",
+]

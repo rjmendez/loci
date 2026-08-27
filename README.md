@@ -295,7 +295,7 @@ For Docker or remote deployments set `LOCI_MCP_TRANSPORT=sse` (or
 
 The bind is loopback by default. A wider bind publishes the whole tool surface, so
 it requires `LOCI_MCP_TOKEN`: without one the server exits with a message instead
-of serving (`mcp/server.py:8407`). With a token set, callers present
+of serving (`mcp/server.py:8144`). With a token set, callers present
 `Authorization: Bearer <token>`; `/health` stays open so liveness probes still work.
 `docker-compose.yml` sets `LOCI_MCP_HOST=0.0.0.0` because a container has to bind
 all its interfaces, so a token must be present in `.env` before `docker compose up`.

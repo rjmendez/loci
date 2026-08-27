@@ -13,8 +13,6 @@ import os
 import threading
 from typing import Optional
 
-from qdrant_ops import _embed
-
 logger = logging.getLogger("loci-mcp")
 
 _verdict_backend = None                # QdrantBackend for loci_verdicts (pre_answer_check)
@@ -44,14 +42,16 @@ def _get_verdict_backend():
             return None
         try:
             from memcheck.qdrant import QdrantBackend
+            from memcheck.vectors import COLLECTION, VECTOR_NAME, ensure_collection, hash_embed
             from qdrant_client import QdrantClient
             _vb_api_key = os.environ.get("QDRANT_API_KEY", "") or None
             client = QdrantClient(url=qdrant_url, api_key=_vb_api_key, timeout=5)
+            ensure_collection(client, COLLECTION)
             _verdict_backend = QdrantBackend(
                 client,
-                collection="loci_verdicts",
-                embed=_embed,
-                vector_name="dense",
+                collection=COLLECTION,
+                embed=hash_embed,
+                vector_name=VECTOR_NAME,
             )
             return _verdict_backend
         except Exception as exc:
@@ -86,6 +86,7 @@ def _record_claim_verdicts(
             cr.update({"verdict_type": None, "prior_occurrences": 0, "verdict_conflict": False})
         return {"recorded": 0, "qdrant": "unavailable"}
 
+    from memcheck.vectors import COLLECTION
     from memcheck.verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
     _VERDICT_MAP = {
@@ -138,7 +139,7 @@ def _record_claim_verdicts(
                     pid = pid_fn(sig)
                     hits = await asyncio.to_thread(
                         retrieve_fn,
-                        collection_name="loci_verdicts",
+                        collection_name=COLLECTION,
                         ids=[pid],
                         with_payload=True,
                     )

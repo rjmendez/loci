@@ -62,8 +62,11 @@ finish the move:
 4. **Hooks.** `scripts/hooks/install.sh` deploys `legacy_env.py` alongside them,
    so a hook wrapper exporting the old names still works. `--check` reports drift.
 
-## Still open
+## Resolved since
 
-`loci_verdicts` does not exist on the live instance, and `mcp/memcheck/cli.py`
-creates it 384-dim via `hash_embed` while `mcp/verdict_ops.py` writes 768-dim
-vectors and never creates it. That is a defect, not a naming problem.
+`loci_verdicts` still does not exist on the live instance, but the dimension
+conflict behind that is fixed: `mcp/memcheck/vectors.py` now owns the name,
+dimension, vector name, embedder and creation, and every writer goes through its
+`ensure_collection`. The collection is 384-dim because nothing reads the vector —
+every read is an exact uuid5 point-id lookup or a payload scroll — and because
+the PreToolUse hook that writes it may not load a model.
