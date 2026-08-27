@@ -46,9 +46,9 @@ def test_stdio_is_the_default():
 
 def test_sse_binds_via_settings():
     urun = _run_http({
-        "HERMES_MCP_TRANSPORT": "sse",
-        "HERMES_MCP_HOST": "127.0.0.1",
-        "HERMES_MCP_PORT": "9001",
+        "LOCI_MCP_TRANSPORT": "sse",
+        "LOCI_MCP_HOST": "127.0.0.1",
+        "LOCI_MCP_PORT": "9001",
     })
     assert server.mcp.settings.host == "127.0.0.1"
     assert server.mcp.settings.port == 9001
@@ -61,10 +61,10 @@ def test_streamable_http_defaults_to_loopback():
 
     This asserted 0.0.0.0 and was describing the behaviour rather than defending
     it. A wide bind is a decision; not making one should not produce the exposed
-    outcome. docker-compose sets HERMES_MCP_HOST=0.0.0.0 explicitly and publishes
+    outcome. docker-compose sets LOCI_MCP_HOST=0.0.0.0 explicitly and publishes
     on 127.0.0.1, so the containerised path is unaffected.
     """
-    urun = _run_http({"HERMES_MCP_TRANSPORT": "streamable-http"})
+    urun = _run_http({"LOCI_MCP_TRANSPORT": "streamable-http"})
     assert server.mcp.settings.host == "127.0.0.1"
     assert server.mcp.settings.port == 8000
     assert urun.call_args.kwargs["host"] == "127.0.0.1"
@@ -72,15 +72,15 @@ def test_streamable_http_defaults_to_loopback():
 
 def test_a_wide_bind_is_still_available_explicitly():
     """…but only with a token. See TestHttpTokenAuth for the refusal."""
-    urun = _run_http({"HERMES_MCP_TRANSPORT": "streamable-http",
-                      "HERMES_MCP_HOST": "0.0.0.0",
-                      "HERMES_MCP_TOKEN": "s3cret"})
+    urun = _run_http({"LOCI_MCP_TRANSPORT": "streamable-http",
+                      "LOCI_MCP_HOST": "0.0.0.0",
+                      "LOCI_MCP_TOKEN": "s3cret"})
     assert server.mcp.settings.host == "0.0.0.0"
     assert urun.call_args.kwargs["host"] == "0.0.0.0"
 
 
 def test_unknown_transport_falls_back_to_stdio():
-    run = _run_main({"HERMES_MCP_TRANSPORT": "carrier-pigeon"})
+    run = _run_main({"LOCI_MCP_TRANSPORT": "carrier-pigeon"})
     run.assert_called_once_with(transport="stdio")
 
 
@@ -90,28 +90,28 @@ class TestHttpTokenAuth(unittest.TestCase):
     def test_wide_bind_without_a_token_refuses_to_start(self):
         """The property that matters: it must not serve, not merely warn."""
         with self.assertRaises(SystemExit) as ctx:
-            _run_http({"HERMES_MCP_TRANSPORT": "streamable-http",
-                       "HERMES_MCP_HOST": "0.0.0.0"})
+            _run_http({"LOCI_MCP_TRANSPORT": "streamable-http",
+                       "LOCI_MCP_HOST": "0.0.0.0"})
         msg = str(ctx.exception)
-        self.assertIn("HERMES_MCP_TOKEN", msg)
+        self.assertIn("LOCI_MCP_TOKEN", msg)
         self.assertIn("0.0.0.0", msg)
 
     def test_loopback_without_a_token_still_serves(self):
         """Local development must not need a secret."""
-        urun = _run_http({"HERMES_MCP_TRANSPORT": "streamable-http"})
+        urun = _run_http({"LOCI_MCP_TRANSPORT": "streamable-http"})
         self.assertEqual(urun.call_args.kwargs["host"], "127.0.0.1")
 
     def test_a_token_wraps_the_app_in_the_auth_gate(self):
-        urun = _run_http({"HERMES_MCP_TRANSPORT": "streamable-http",
-                          "HERMES_MCP_TOKEN": "s3cret"})
+        urun = _run_http({"LOCI_MCP_TRANSPORT": "streamable-http",
+                          "LOCI_MCP_TOKEN": "s3cret"})
         self.assertIsInstance(urun.call_args.args[0], server._BearerAuthMiddleware)
 
     def test_no_token_leaves_the_app_unwrapped(self):
-        urun = _run_http({"HERMES_MCP_TRANSPORT": "streamable-http"})
+        urun = _run_http({"LOCI_MCP_TRANSPORT": "streamable-http"})
         self.assertIs(urun.call_args.args[0], mock.sentinel.http_app)
 
     def test_ipv6_loopback_is_recognised(self):
-        urun = _run_http({"HERMES_MCP_TRANSPORT": "sse", "HERMES_MCP_HOST": "::1"})
+        urun = _run_http({"LOCI_MCP_TRANSPORT": "sse", "LOCI_MCP_HOST": "::1"})
         self.assertEqual(urun.call_args.kwargs["host"], "::1")
 
 

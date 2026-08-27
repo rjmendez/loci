@@ -13,7 +13,7 @@ Wants=network-online.target mrpink-a2a.service
 Type=oneshot
 WorkingDirectory=/home/rjmendez/.hermes/profiles/mrpink
 
-# Order is load-bearing: .bridge.env overrides HERMES_A2A_URL from .env. Do NOT reorder,
+# Order is load-bearing: .bridge.env overrides LOCI_A2A_URL from .env. Do NOT reorder,
 # and do NOT move these values into a drop-in — on this box a drop-in Environment= loses
 # to the main unit's EnvironmentFile=, silently.
 EnvironmentFile=/home/rjmendez/.hermes/profiles/mrpink/.env

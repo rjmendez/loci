@@ -45,6 +45,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
+# next to legacy_env.py; the repo copy finds it as a sibling too.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from legacy_env import apply as _apply_legacy_env
+    _apply_legacy_env()
+except Exception:
+    pass
+
 # Spreading activation enrichment (SA-RAG, arxiv 2512.15922).
 _SA_MODULE = None
 try:

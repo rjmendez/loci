@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-HOOKS=(pre_llm_grounding.py pre_tool_grounding.py session_end_sync.py)
+HOOKS=(pre_llm_grounding.py pre_tool_grounding.py session_end_sync.py legacy_env.py)
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${CLAUDE_HOOKS_DIR:-$HOME/.claude/hooks}"
 

@@ -41,7 +41,7 @@ before and after.
 
 - `aiohttp` — the script `sys.exit()`s at import without it, so a missing dependency looks
   like a unit that fails instantly rather than one that quietly does nothing.
-- `HERMES_A2A_TOKEN` reachable via `EnvironmentFile`. The script's own loader checks
+- `LOCI_A2A_TOKEN` reachable via `EnvironmentFile`. The script's own loader checks
   `~/.hermes/.env`, which does not exist on every host; where the A2A server runs as a
   container the token usually lives in the checkout's `.env` instead.
 
@@ -54,7 +54,7 @@ before and after.
 | `BRIDGE_MAX_ITEMS` | 20 | per run |
 | `BRIDGE_EXCLUDE_SOURCES` | `bridge:,broadcast:,context_broadcast` | echo suppression — do not narrow without reading #144 |
 | `BRIDGE_STATE_FILE` | `~/.hermes/bridge_state.json` | last clean-run timestamp, plus the bounded `sent_ids` delivered-set |
-| `HERMES_A2A_TOTP_SEED` | unset | required where the LOCAL server enforces TOTP; unset = no header sent |
+| `LOCI_A2A_TOTP_SEED` | unset | required where the LOCAL server enforces TOTP; unset = no header sent |
 
 ## mrpink-context-bridge (the oxalis-mrpink half)
 
@@ -67,7 +67,7 @@ that matter, and each of them cost debugging time:
   is one too. That only survives a reboot with `loginctl enable-linger rjmendez` — without
   lingering the whole user manager exits at logout and the timer goes with it.
 - **Two `EnvironmentFile=` lines, and the order is load-bearing.** `.bridge.env` comes second
-  so it can override `HERMES_A2A_URL` from `.env`, which points at that box's WSL `eth0`
+  so it can override `LOCI_A2A_URL` from `.env`, which points at that box's WSL `eth0`
   address — reassigned on reboot. Loopback is stable and the server binds `0.0.0.0`.
   Do **not** move these into a drop-in: on that host a drop-in `Environment=` silently loses
   to the main unit's `EnvironmentFile=`, which is the opposite of what the docs imply.
@@ -76,7 +76,7 @@ that matter, and each of them cost debugging time:
 ### Before enabling it on a second node, part 2: TOTP
 
 If the local A2A server enforces TOTP on `/a2a` (oxalis-mrpink does, hugbot5000-jetson does
-not — check `"totp_enabled"` in `/health`), the bridge needs `HERMES_A2A_TOTP_SEED` in its
+not — check `"totp_enabled"` in `/health`), the bridge needs `LOCI_A2A_TOTP_SEED` in its
 environment. Without it the bearer alone returns a flat `401` on every send, and the symptom
 is a bridge that runs cleanly on a timer forever while moving nothing:
 

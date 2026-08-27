@@ -290,7 +290,7 @@
           "file": "mcp/graph/ladybug_store.py",
           "line": 1,
           "context": "docstring with path references",
-          "value": "$HERMES_MEMORY_DIR/<investigation_id>/manifest.json"
+          "value": "$LOCI_MEMORY_DIR/<investigation_id>/manifest.json"
         }
       ]
     }

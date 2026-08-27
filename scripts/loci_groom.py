@@ -93,7 +93,7 @@ def load_env() -> dict:
 logger = logging.getLogger("loci-groom")
 
 MEMORY_DIR = Path(os.environ.get(
-    "HERMES_MEMORY_DIR",
+    "LOCI_MEMORY_DIR",
     os.path.expanduser("~/.hermes/memory-sessions"),
 ))
 GROOM_DIR = MEMORY_DIR / "_groom"

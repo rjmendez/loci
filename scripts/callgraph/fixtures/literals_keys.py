@@ -4,11 +4,11 @@ import os
 
 
 def read_port():
-    return os.environ.get("HERMES_PORT")
+    return os.environ.get("LOCI_PORT")
 
 
 def set_port(v):
-    os.environ["HERMES_PORT"] = v
+    os.environ["LOCI_PORT"] = v
 
 
 def read_config_key(cfg: dict):

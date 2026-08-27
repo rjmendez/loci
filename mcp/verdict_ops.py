@@ -104,8 +104,8 @@ def _record_claim_verdicts(
         "claim_supported": 1, "claim_ambiguous": 2,
         "claim_unsupported": 3, "claim_contradicted": 4,
     }
-    _PE_HIGH_THRESH = float(os.environ.get("HERMES_PE_HIGH_THRESH", "0.5"))
-    _PE_PROTECTION_MIN_OCC = int(os.environ.get("HERMES_PE_PROTECTION_MIN_OCC", "3"))
+    _PE_HIGH_THRESH = float(os.environ.get("LOCI_PE_HIGH_THRESH", "0.5"))
+    _PE_PROTECTION_MIN_OCC = int(os.environ.get("LOCI_PE_PROTECTION_MIN_OCC", "3"))
 
     recorded = 0
     qdrant_ok = True

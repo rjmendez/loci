@@ -8,7 +8,7 @@
 #   QDRANT_API_KEY          API key if your Qdrant requires one
 #   OLLAMA_BASE_URL         Any OpenAI-compatible /v1/embeddings endpoint
 #   EMBED_MODEL             Must match the model used to build your collections
-#   HERMES_A2A_TOKEN          Bearer token for A2A server (required, no default)
+#   LOCI_A2A_TOKEN          Bearer token for A2A server (required, no default)
 #
 # For local development with Qdrant + Ollama sidecars:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
@@ -22,9 +22,9 @@ services:
       - path: .env
         required: false
     environment:
-      HERMES_MCP_TRANSPORT: ${HERMES_MCP_TRANSPORT:-sse}
-      HERMES_MCP_HOST: "0.0.0.0"
-      HERMES_MCP_PORT: "8000"
+      LOCI_MCP_TRANSPORT: ${LOCI_MCP_TRANSPORT:-sse}
+      LOCI_MCP_HOST: "0.0.0.0"
+      LOCI_MCP_PORT: "8000"
       QDRANT_URL: ${QDRANT_URL:-http://localhost:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://localhost:11434}
@@ -33,7 +33,7 @@ services:
       - hermes-mcp-data:/data
     ports:
       # Loopback, not 0.0.0.0 — this publishes an UNAUTHENTICATED tool server
-      # (issue #78). Publish-side only: do NOT set HERMES_MCP_HOST=127.0.0.1,
+      # (issue #78). Publish-side only: do NOT set LOCI_MCP_HOST=127.0.0.1,
       # which binds the server to the container's own loopback, makes this
       # mapping unreachable, and leaves the in-container HEALTHCHECK passing —
       # a dead service reporting healthy.
@@ -48,8 +48,8 @@ services:
       - path: .env
         required: false
     environment:
-      HERMES_A2A_TOKEN: ${HERMES_A2A_TOKEN:?HERMES_A2A_TOKEN is required}
-      HERMES_A2A_URL: ${HERMES_A2A_URL:-http://localhost:8201}
+      LOCI_A2A_TOKEN: ${LOCI_A2A_TOKEN:?LOCI_A2A_TOKEN is required}
+      LOCI_A2A_URL: ${LOCI_A2A_URL:-http://localhost:8201}
       HERMES_AGENT_ID: ${HERMES_AGENT_ID:-loci}
       QDRANT_URL: ${QDRANT_URL:-http://localhost:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}

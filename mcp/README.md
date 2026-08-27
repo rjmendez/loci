@@ -56,9 +56,9 @@ With optional Mnemosyne:
 | `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Name of the shared findings collection (used verbatim, nothing is appended) |
 | `OLLAMA_BASE_URL` | _(unset — falls back to 384-dim fastembed, which mismatches the 768-dim collection unless `EMBED_DIM=384`)_ | Ollama instance URL, e.g. `http://localhost:11434` |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
-| `HERMES_MEMORY_DIR` | `~/.hermes/memory-sessions` | Local JSONL storage root |
-| `HERMES_MNEMO_BANK` | `default` | Mnemosyne bank name (optional) |
-| `HERMES_REFLECTION_INVESTIGATION` | `copilot-self-reflection-loop` | Default investigation for reflection loop |
+| `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | Local JSONL storage root |
+| `LOCI_MNEMO_BANK` | `default` | Mnemosyne bank name (optional) |
+| `LOCI_REFLECTION_INVESTIGATION` | `copilot-self-reflection-loop` | Default investigation for reflection loop |
 
 ## Claude Code / MCP wiring
 
@@ -100,7 +100,7 @@ server twice under two names publishes every tool twice:
         "QDRANT_URL": "http://localhost:6333",
         "QDRANT_API_KEY": "",
         "OLLAMA_BASE_URL": "http://localhost:11434",
-        "HERMES_MEMORY_DIR": "~/.hermes/memory-sessions"
+        "LOCI_MEMORY_DIR": "~/.hermes/memory-sessions"
       }
     }
   }

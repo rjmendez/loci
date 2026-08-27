@@ -46,7 +46,7 @@ def test_empty_when_nothing_configured(monkeypatch):
 
 def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL",
-              "QDRANT_API_KEY", "LOCI_MEMORY_MD_DIR", "HERMES_MEMORY_DIR"):
+              "QDRANT_API_KEY", "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
     cfg = tmp_path / "b.toml"
     cfg.write_text('[embed]\nmodel="e"\n[vllm]\nmodel="v"\n[rerank]\nmodel="r"\n'
@@ -82,7 +82,7 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
 
 _ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "EMBED_MODEL",
                     "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
-                    "LOCI_MEMORY_MD_DIR", "HERMES_MEMORY_DIR")
+                    "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR")
 
 
 def _fresh_install(mp, config_path):

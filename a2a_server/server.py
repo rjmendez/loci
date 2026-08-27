@@ -25,22 +25,22 @@ ENVIRONMENT VARIABLES  (loaded from ~/.hermes/.env at startup)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Required:
-  HERMES_A2A_TOKEN          Bearer token callers must supply.
+  LOCI_A2A_TOKEN          Bearer token callers must supply.
                             REQUIRED — server exits at startup if unset.
                             Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
 
 Optional / tunable:
-  HERMES_A2A_BOOTSTRAP_KEY  Pre-shared key for POST /bootstrap. Callers
+  LOCI_A2A_BOOTSTRAP_KEY  Pre-shared key for POST /bootstrap. Callers
                             present this to receive a 24h session token
                             usable as a bearer without TOTP. Eliminates
-                            the need to distribute HERMES_A2A_TOKEN+TOTP
+                            the need to distribute LOCI_A2A_TOKEN+TOTP
                             to every new session. If unset, /bootstrap 501s.
                             Generate: python3 -c "import secrets;print(secrets.token_hex(24))"
-  HERMES_A2A_HOST           Bind address.  Default: 0.0.0.0
-  HERMES_A2A_PORT           Bind port.     Default: 8201
-  HERMES_A2A_URL            Public base URL injected into the agent card.
+  LOCI_A2A_HOST           Bind address.  Default: 0.0.0.0
+  LOCI_A2A_PORT           Bind port.     Default: 8201
+  LOCI_A2A_URL            Public base URL injected into the agent card.
                             Default: http://127.0.0.1:8201
-  HERMES_A2A_TOTP_SEED      Base32 TOTP seed (RFC 6238).  If set, callers
+  LOCI_A2A_TOTP_SEED      Base32 TOTP seed (RFC 6238).  If set, callers
                             must include a valid X-TOTP header.
                             Default: '' (TOTP disabled)
   HERMES_AGENT_ID           Agent identity tag written into memory metadata.
@@ -53,7 +53,7 @@ Optional / tunable:
                             dependency here. Unset = cosine order (previous behaviour).
                             Fails open on any error.
   RERANK_TIMEOUT_S          Rerank request timeout. Default: 10
-  HERMES_ENV_FILE           Path to the .env file loaded at import time.
+  LOCI_ENV_FILE           Path to the .env file loaded at import time.
                             Default: ~/.hermes/.env
   EXTRA_RAG_COLLECTIONS     Comma-separated extra Qdrant collections appended to
                             the core three for rag_search / memory_stats.
@@ -63,7 +63,7 @@ Optional / tunable:
   EMBED_API_KEY_HEADER      Header carrying EMBED_API_KEY. 'Authorization'
                             sends 'Bearer <key>'; any other name sends the raw
                             key.  Default: Authorization
-  HERMES_A2A_PRIVILEGED_SENDERS  Comma-separated sender IDs allowed to call
+  LOCI_A2A_PRIVILEGED_SENDERS  Comma-separated sender IDs allowed to call
                             DESTRUCTIVE_SKILLS (memory_remember, memory_sleep,
                             context_broadcast, mnemosyne_triple_add).
                             Default: '' (no sender is privileged — destructive
@@ -155,8 +155,8 @@ JSON-RPC CALL SHAPE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   POST /a2a
-  Authorization: Bearer <HERMES_A2A_TOKEN>
-  X-TOTP: <6-digit code>   (only if HERMES_A2A_TOTP_SEED is set)
+  Authorization: Bearer <LOCI_A2A_TOKEN>
+  X-TOTP: <6-digit code>   (only if LOCI_A2A_TOTP_SEED is set)
 
   {
     "jsonrpc": "2.0",
@@ -186,11 +186,20 @@ import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, col
 from typing import Optional, Any
 from contextlib import contextmanager
 
+# Accept the legacy HERMES_* spelling of Loci's own variables. The A2A server is
+# deployed standalone, so it reaches the map by path rather than by package.
+try:
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "mcp"))
+    from legacy_env import apply as _apply_legacy_env
+    _apply_legacy_env()
+except Exception:
+    pass
+
 # ── load .env before anything else ─────────────────────────────────────────────
-# Override with HERMES_ENV_FILE env var. Default searches ~/.hermes/.env then
+# Override with LOCI_ENV_FILE env var. Default searches ~/.hermes/.env then
 # the legacy per-profile path for backward compatibility.
 _ENV_FILE = os.path.expanduser(
-    os.environ.get('HERMES_ENV_FILE', '~/.hermes/.env')
+    os.environ.get('LOCI_ENV_FILE', '~/.hermes/.env')
 )
 if os.path.exists(_ENV_FILE):
     for _line in open(_ENV_FILE):
@@ -207,17 +216,17 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import uvicorn
 
 # ── config ──────────────────────────────────────────────────────────────────────
-A2A_HOST  = os.environ.get('HERMES_A2A_HOST', '0.0.0.0')
-A2A_PORT  = int(os.environ.get('HERMES_A2A_PORT', '8201'))
-A2A_TOKEN = os.environ.get('HERMES_A2A_TOKEN', '')
+A2A_HOST  = os.environ.get('LOCI_A2A_HOST', '0.0.0.0')
+A2A_PORT  = int(os.environ.get('LOCI_A2A_PORT', '8201'))
+A2A_TOKEN = os.environ.get('LOCI_A2A_TOKEN', '')
 if not A2A_TOKEN:
-    print('WARNING: HERMES_A2A_TOKEN is not set. All bearer-token checks will fail. '
+    print('WARNING: LOCI_A2A_TOKEN is not set. All bearer-token checks will fail. '
           'Generate one with: python3 -c "import secrets;print(secrets.token_hex(32))"',
           flush=True)
-TOTP_SEED      = os.environ.get('HERMES_A2A_TOTP_SEED', '')
-BOOTSTRAP_KEY  = os.environ.get('HERMES_A2A_BOOTSTRAP_KEY', '')
+TOTP_SEED      = os.environ.get('LOCI_A2A_TOTP_SEED', '')
+BOOTSTRAP_KEY  = os.environ.get('LOCI_A2A_BOOTSTRAP_KEY', '')
 AGENT_ID  = os.environ.get('HERMES_AGENT_ID', 'hermes-agent')
-AGENT_URL = os.environ.get('HERMES_A2A_URL', 'http://127.0.0.1:8201')
+AGENT_URL = os.environ.get('LOCI_A2A_URL', 'http://127.0.0.1:8201')
 
 # Mnemosyne SQLite — path built from MNEMOSYNE_DATA_DIR (set in .env)
 _mnem_data_dir = os.path.expanduser(os.environ.get('MNEMOSYNE_DATA_DIR', '~/.hermes/mnemosyne/data'))
@@ -256,9 +265,9 @@ DESTRUCTIVE_SKILLS: frozenset[str] = frozenset({
 })
 
 # Senders allowed to call destructive skills.
-# Configure via: HERMES_A2A_PRIVILEGED_SENDERS=agent1,agent2
+# Configure via: LOCI_A2A_PRIVILEGED_SENDERS=agent1,agent2
 _PRIVILEGED_SENDERS: frozenset[str] = frozenset(
-    s.strip() for s in os.getenv('HERMES_A2A_PRIVILEGED_SENDERS', '').split(',') if s.strip()
+    s.strip() for s in os.getenv('LOCI_A2A_PRIVILEGED_SENDERS', '').split(',') if s.strip()
 )
 
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
@@ -1013,7 +1022,7 @@ def _peer_headers(peer_url: str, token_map: dict, default_token: str,
     Build outbound headers for a peer.
 
     Returns (headers, None) on success or (None, reason) if the peer is not
-    callable. A peer that sets HERMES_A2A_TOTP_SEED rejects bearer-only
+    callable. A peer that sets LOCI_A2A_TOTP_SEED rejects bearer-only
     requests with 401, so X-TOTP is attached whenever a seed is configured
     for that peer.
     """
@@ -1523,7 +1532,7 @@ async def health():
 async def bootstrap(request: Request):
     """Exchange a bootstrap key for a 24h session token (no TOTP required on session token)."""
     if not BOOTSTRAP_KEY:
-        raise HTTPException(status_code=501, detail='Bootstrap not configured — set HERMES_A2A_BOOTSTRAP_KEY')
+        raise HTTPException(status_code=501, detail='Bootstrap not configured — set LOCI_A2A_BOOTSTRAP_KEY')
     try:
         body = await request.json()
     except Exception:
@@ -1657,8 +1666,8 @@ def main() -> None:
     log.info(f'Mnemosyne DB:  {MNEMOSYNE_DB}  ({"found" if os.path.exists(MNEMOSYNE_DB) else "MISSING"})')
     log.info(f'Qdrant:        {QDRANT_URL}')
     log.info(f'Ollama embed:  {OLLAMA_BASE}  model={EMBED_MODEL}')
-    log.info(f'TOTP:          {"enabled" if TOTP_SEED else "disabled (set HERMES_A2A_TOTP_SEED to enable)"}')
-    log.info(f'Bootstrap:     {"enabled (POST /bootstrap)" if BOOTSTRAP_KEY else "disabled (set HERMES_A2A_BOOTSTRAP_KEY to enable)"}')
+    log.info(f'TOTP:          {"enabled" if TOTP_SEED else "disabled (set LOCI_A2A_TOTP_SEED to enable)"}')
+    log.info(f'Bootstrap:     {"enabled (POST /bootstrap)" if BOOTSTRAP_KEY else "disabled (set LOCI_A2A_BOOTSTRAP_KEY to enable)"}')
     log.info(f'Skills:        {", ".join(_SKILL_MAP.keys())}')
     uvicorn.run(app, host=A2A_HOST, port=A2A_PORT, log_level='info', timeout_graceful_shutdown=5)
 

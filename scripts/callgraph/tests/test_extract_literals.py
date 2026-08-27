@@ -10,12 +10,12 @@ def test_looks_path_like():
     assert looks_path_like("~/.hermes/**/graph.kuzu")
     assert looks_path_like("mcp/server.py")
     assert looks_path_like("graph.ladybug")
-    assert not looks_path_like("HERMES_PORT")
+    assert not looks_path_like("LOCI_PORT")
     assert not looks_path_like("")
 
 
 def test_looks_key_like():
-    assert looks_key_like("HERMES_PORT")
+    assert looks_key_like("LOCI_PORT")
     assert looks_key_like("cfg_lookup_only")
     assert not looks_key_like("~/.hermes/**/graph.kuzu")
     assert not looks_key_like("has a space")
@@ -32,7 +32,7 @@ def test_tail_segment_last_path_component():
 
 def test_classify_flavour():
     assert classify_flavour("mcp/server.py") == "path"
-    assert classify_flavour("HERMES_PORT") == "key"
+    assert classify_flavour("LOCI_PORT") == "key"
     assert classify_flavour("has a space and/slash") is None or classify_flavour("has a space and/slash") == "path"
 
 
@@ -93,7 +93,7 @@ def test_open_default_mode_consumes_composed_path():
 
 def test_environ_get_and_subscript_share_one_literal_both_directions():
     store, _, _ = build_fixture_store(["literals_keys.py"])
-    lid = literal_node_id(normalize_literal("HERMES_PORT"))
+    lid = literal_node_id(normalize_literal("LOCI_PORT"))
     node = store.get(lid)
     assert node is not None and node.attrs["flavour"] == "key"
     consumes = store.in_edges(lid, "CONSUMES_LITERAL")

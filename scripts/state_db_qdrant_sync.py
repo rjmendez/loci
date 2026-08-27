@@ -15,7 +15,7 @@ Run standalone or from cron (no_agent=True).
 """
 import sqlite3, json, hashlib, sys, os, time, subprocess, datetime
 
-STATE_DB     = os.environ.get("HERMES_STATE_DB", os.path.expanduser("~/.hermes/state.db"))
+STATE_DB     = os.environ.get("LOCI_STATE_DB", os.path.expanduser("~/.hermes/state.db"))
 QDRANT       = os.environ.get("QDRANT_URL")
 EMBED_WORKER = os.environ.get("EMBED_WORKER_URL")
 COLLECTION   = "hermes_sessions"

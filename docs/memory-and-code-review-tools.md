@@ -174,7 +174,7 @@ queries; Qdrant hermes_sessions is better for semantic/topical recall.
 ### 2d. loci-mcp / hermes_memory — investigation and memory layer
 
 **Server name:** `loci` (FastMCP name in `mcp/server.py`)
-**Storage:** `$HERMES_MEMORY_DIR/<investigation_id>/` (default: `~/.hermes/memory-sessions/`)
+**Storage:** `$LOCI_MEMORY_DIR/<investigation_id>/` (default: `~/.hermes/memory-sessions/`)
 **Qdrant collection:** `hermes_memory` (or value of `QDRANT_COLLECTION_PREFIX`)
 
 **What it is:** A manifest-first investigation and memory layer. Tracks
@@ -186,7 +186,7 @@ Qdrant MCP server writing directly.
 
 **Storage layout:**
 ```
-$HERMES_MEMORY_DIR/
+$LOCI_MEMORY_DIR/
   <investigation_id>/
     manifest.json        — structured investigation state
     findings.jsonl       — append-only finding log
@@ -690,7 +690,7 @@ state_db_qdrant_sync.py (background cron, every 5 min)
        Safety net for: Ollama down, hook timeout, pre-hook sessions
 ```
 
-**Cache location:** set via `HERMES_SYNC_CACHE` env var in the on_session_end
+**Cache location:** set via `LOCI_SYNC_CACHE` env var in the on_session_end
 hook config stanza.
 
 **Debugging sync issues:**
@@ -700,7 +700,7 @@ sqlite3 ~/.hermes/state.db "SELECT COUNT(*) FROM sessions"
 # Compare to Qdrant hermes_sessions collection count (use curl above)
 
 # Clear sync cache to force full re-sync
-rm -rf ~/.hermes/.session_sync_cache  # or wherever HERMES_SYNC_CACHE points
+rm -rf ~/.hermes/.session_sync_cache  # or wherever LOCI_SYNC_CACHE points
 python3 ~/.hermes/scripts/state_db_qdrant_sync.py
 ```
 
@@ -1012,7 +1012,7 @@ collections — cosine similarity breaks.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `HERMES_MEMORY_DIR` | Root for investigation sessions | `~/.hermes/memory-sessions` |
+| `LOCI_MEMORY_DIR` | Root for investigation sessions | `~/.hermes/memory-sessions` |
 | `QDRANT_COLLECTION_PREFIX` | Main Qdrant collection name | `hermes_memory` |
 | `MNEMOSYNE_EMBEDDING_DIM` | Dense vector dimension | `768` |
 | `EMBED_MODEL` | Ollama model name for embeddings | `nomic-embed-text` |
@@ -1021,14 +1021,14 @@ collections — cosine similarity breaks.
 | `EMBED_API_KEY_HEADER` | Header name for the above key | `Authorization` |
 | `QDRANT_URL` | Qdrant server URL | unset (disables vector search) |
 | `QDRANT_API_KEY` | Qdrant API key | unset |
-| `HERMES_MNEMO_BANK` | Mnemosyne bank for mirroring | `default` |
+| `LOCI_MNEMO_BANK` | Mnemosyne bank for mirroring | `default` |
 | `CODE_CHUNKS_COLLECTION` | Qdrant collection for code-chunk correlation | unset |
 | `HERMES_AGENT_ID` | Agent identity stamp on Qdrant points | unset |
 | `LOCI_NAMESPACE` | Namespace stamp on Qdrant points | unset |
-| `HERMES_REFLECTION_INVESTIGATION` | Default investigation id for reflection loop | `copilot-self-reflection-loop` |
-| `HERMES_MCP_TRANSPORT` | Server transport: `stdio`, `sse`, `streamable-http` | `stdio` |
-| `HERMES_MCP_HOST` | Bind host for HTTP transports | `0.0.0.0` |
-| `HERMES_MCP_PORT` | Port for HTTP transports | `8000` |
+| `LOCI_REFLECTION_INVESTIGATION` | Default investigation id for reflection loop | `copilot-self-reflection-loop` |
+| `LOCI_MCP_TRANSPORT` | Server transport: `stdio`, `sse`, `streamable-http` | `stdio` |
+| `LOCI_MCP_HOST` | Bind host for HTTP transports | `0.0.0.0` |
+| `LOCI_MCP_PORT` | Port for HTTP transports | `8000` |
 
 **Warning:** There is no dense-embedding fallback. Dense vectors come from Ollama
 only (`OLLAMA_BASE_URL` + `EMBED_MODEL`). If Ollama is unavailable, `_embed()`

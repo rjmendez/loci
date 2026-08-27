@@ -14,9 +14,9 @@ WorkingDirectory=%h/.hermes/loci/a2a_server
 EnvironmentFile=-%h/.hermes/loci/.env
 
 # Required — server exits at startup if unset.
-# Environment=HERMES_A2A_TOKEN=<generate with: python3 -c "import secrets;print(secrets.token_hex(32))">
-Environment=HERMES_A2A_PORT=8201
-Environment=HERMES_A2A_HOST=0.0.0.0
+# Environment=LOCI_A2A_TOKEN=<generate with: python3 -c "import secrets;print(secrets.token_hex(32))">
+Environment=LOCI_A2A_PORT=8201
+Environment=LOCI_A2A_HOST=0.0.0.0
 
 ExecStart=%h/.hermes/loci/venv/bin/python3 \
     %h/.hermes/loci/a2a_server/server.py

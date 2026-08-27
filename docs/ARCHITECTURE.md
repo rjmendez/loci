@@ -19,9 +19,9 @@ Four of them, and the split matters:
 
 | Store | Role | Path |
 |---|---|---|
-| Investigation JSONL | Source of truth for findings | `$HERMES_MEMORY_DIR/<investigation>/` |
+| Investigation JSONL | Source of truth for findings | `$LOCI_MEMORY_DIR/<investigation>/` |
 | Qdrant | Search index over those findings, plus session and Mnemosyne mirrors | `QDRANT_URL` |
-| LadybugDB graph | Code graph overlaid on the investigation graph | `$HERMES_MEMORY_DIR/graph.ladybug` |
+| LadybugDB graph | Code graph overlaid on the investigation graph | `$LOCI_MEMORY_DIR/graph.ladybug` |
 | Mnemosyne SQLite | Structured/FTS substrate for the consolidation scripts and A2A | `~/.hermes/mnemosyne/data/mnemosyne.db` |
 
 A finding reaches Qdrant only on write (`_qdrant_upsert` at store time), so anything
@@ -30,7 +30,7 @@ disk and simply invisible to search. `loci_groom.py index` is the reconciliation
 on the live corpus `on_disk=2922`, `indexed=2769`, `missing=153`, `coverage=0.9476`.
 `index --apply` re-embeds and re-upserts the missing ones.
 
-### Investigation store (`HERMES_MEMORY_DIR`, default `~/.hermes/memory-sessions`)
+### Investigation store (`LOCI_MEMORY_DIR`, default `~/.hermes/memory-sessions`)
 
 One directory per investigation — 146 on the live host, including the two
 underscore-prefixed internal ones (`_groom`, `_reflection-loop`). Each holds:
@@ -56,7 +56,7 @@ records (55.7%) are access rows. `investigation_tools._only_findings()`
 that opens the file directly gets the mixed log; `loci_groom._summarisable()`
 re-derives the same filter for that reason.
 
-### Code graph (`$HERMES_MEMORY_DIR/graph.ladybug`)
+### Code graph (`$LOCI_MEMORY_DIR/graph.ladybug`)
 
 `mcp/graph/ladybug_store.py` — `LadybugStore`, an embedded LadybugDB (Kuzu engine)
 database holding two overlaid graphs in one file (40 MB on the live host):
@@ -296,12 +296,12 @@ names — Hermes' `pre_llm_call` and Claude Code's `UserPromptSubmit` /
 `SubagentStart` — and treats a run as subagent context when the task id says so or
 `HERMES_SUBAGENT` is set.
 
-`session_end_sync.py` prefers the session's messages from `HERMES_STATE_DB`
+`session_end_sync.py` prefers the session's messages from `LOCI_STATE_DB`
 (`~/.hermes/state.db`) and falls back to the Stop payload's `transcript_path`
 (`session_end_sync.py:186-204`). The fallback is the one that fires under Claude
 Code: Claude Code session UUIDs are not rows in a Hermes `state.db`, so the
 state.db-only version had never synced a session. A per-session mtime cache
-(`HERMES_SYNC_CACHE`) makes an unchanged session exit immediately.
+(`LOCI_SYNC_CACHE`) makes an unchanged session exit immediately.
 
 `pre_tool_grounding.py` **audits by default**. `HOOK_BLOCK_MODE` is `0` unless set,
 so detections are logged, not refused. The one unconditional block is an injection
@@ -317,8 +317,8 @@ allowlisted out of the audit entirely to keep the log signal-bearing.
 | `OLLAMA_BASE_URL` | _(none)_ | Embedding base URL |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model |
 | `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension |
-| `HERMES_STATE_DB` | `~/.hermes/state.db` | Hermes session database; unused under Claude Code, which takes the `transcript_path` fallback |
-| `HERMES_SYNC_CACHE` | `~/.hermes/.session_sync_cache` | Per-session mtime cache |
+| `LOCI_STATE_DB` | `~/.hermes/state.db` | Hermes session database; unused under Claude Code, which takes the `transcript_path` fallback |
+| `LOCI_SYNC_CACHE` | `~/.hermes/.session_sync_cache` | Per-session mtime cache |
 | `HERMES_AGENT_ID` | `""` | Agent identity tag stamped on payloads |
 
 ---
@@ -353,8 +353,8 @@ steer the helpers. Key env vars:
 | `OLLAMA_BASE_URL` | _(none)_ | Embedding base URL |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model |
 | `EMBED_API_KEY` | `""` | Cloud embedding provider key |
-| `HERMES_MEMORY_DIR` | `~/.hermes/memory-sessions` | JSONL session storage root |
-| `HERMES_MNEMO_BANK` | `default` | Active Mnemosyne bank |
+| `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | JSONL session storage root |
+| `LOCI_MNEMO_BANK` | `default` | Active Mnemosyne bank |
 
 > `mcp/server.py` uses `OLLAMA_BASE_URL` and `EMBED_MODEL` for embedding.
 > `a2a_server/server.py` uses `MNEMOSYNE_EMBEDDING_API_URL` and `MNEMOSYNE_EMBEDDING_MODEL`.
@@ -377,18 +377,18 @@ The vLLM fallback is opt-in: `LOCI_VLLM_FALLBACK` must be set to something other
 
 ### Transports and auth
 
-`HERMES_MCP_TRANSPORT` defaults to `stdio`. For `sse` / `streamable-http`:
+`LOCI_MCP_TRANSPORT` defaults to `stdio`. For `sse` / `streamable-http`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HERMES_MCP_HOST` | `127.0.0.1` | Bind address |
-| `HERMES_MCP_PORT` | `8000` | Bind port |
-| `HERMES_MCP_TOKEN` | _(none)_ | Bearer token; **required** for a non-loopback bind |
+| `LOCI_MCP_HOST` | `127.0.0.1` | Bind address |
+| `LOCI_MCP_PORT` | `8000` | Bind port |
+| `LOCI_MCP_TOKEN` | _(none)_ | Bearer token; **required** for a non-loopback bind |
 
 The bind is loopback by default (#206) and a non-loopback bind without a token is a
 `SystemExit`, not a warning (#211) — this server exposes the whole tool surface, so
 a wide open bind has to be a decision somebody made rather than one they got by not
-making it. `docker-compose.yml` sets `HERMES_MCP_HOST=0.0.0.0` explicitly, because a
+making it. `docker-compose.yml` sets `LOCI_MCP_HOST=0.0.0.0` explicitly, because a
 container must bind all interfaces to receive published traffic, and publishes on
 127.0.0.1.
 
@@ -606,12 +606,12 @@ credentials.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HERMES_A2A_TOKEN` | `""` | Bearer token for callers |
-| `HERMES_A2A_BOOTSTRAP_KEY` | `""` | Enrollment key for the bootstrap path |
-| `HERMES_A2A_HOST` | `0.0.0.0` | Bind address |
-| `HERMES_A2A_PORT` | `8201` | Bind port |
-| `HERMES_A2A_URL` | `http://127.0.0.1:8201` | Public base URL in agent card |
-| `HERMES_A2A_TOTP_SEED` | `""` | Base32 TOTP seed (RFC 6238); disabled when empty |
+| `LOCI_A2A_TOKEN` | `""` | Bearer token for callers |
+| `LOCI_A2A_BOOTSTRAP_KEY` | `""` | Enrollment key for the bootstrap path |
+| `LOCI_A2A_HOST` | `0.0.0.0` | Bind address |
+| `LOCI_A2A_PORT` | `8201` | Bind port |
+| `LOCI_A2A_URL` | `http://127.0.0.1:8201` | Public base URL in agent card |
+| `LOCI_A2A_TOTP_SEED` | `""` | Base32 TOTP seed (RFC 6238); disabled when empty |
 | `HERMES_AGENT_ID` | `hermes-agent` | Agent identity tag |
 | `QDRANT_URL` | _(none)_ | Qdrant instance URL |
 | `QDRANT_API_KEY` | `""` | Qdrant API key |
@@ -624,7 +624,7 @@ credentials.
 | `PEER_A2A_TOKEN` | `""` | Shared bearer token for all peers |
 
 Unlike the MCP server, the A2A server **binds `0.0.0.0` by default and only warns**
-when `HERMES_A2A_TOKEN` is unset (`a2a_server/server.py:210-216`) — every
+when `LOCI_A2A_TOKEN` is unset (`a2a_server/server.py:210-216`) — every
 bearer check then fails, so callers are refused, but the port is still open on all
 interfaces. Set a token, or bind loopback, before running it anywhere reachable.
 

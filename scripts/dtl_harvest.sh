@@ -6,7 +6,7 @@
 #
 # Resolves the package harvest.sh from the runtime install first, then the repo.
 set -euo pipefail
-export HERMES_PY="${HERMES_PY:-$HOME/.hermes/hermes-agent/venv/bin/python3}"
+export LOCI_PY="${LOCI_PY:-$HOME/.hermes/hermes-agent/venv/bin/python3}"
 for H in \
   "$HOME/.hermes/specialists/grounding/harvest.sh" \
   "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../deep_think_loci/grounding/harvest.sh" \

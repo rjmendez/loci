@@ -11,11 +11,11 @@ Two jobs in one:
 Silent on healthy (no output = no cron delivery). Prints only on problems.
 
 Env vars:
-  HERMES_A2A_HEALTH_URL  Health check URL (default: http://127.0.0.1:8201/health)
-  HERMES_A2A_SERVICE     systemd user service name (default: hermes-a2a.service)
-  HERMES_TAILSCALE_IP    Tailscale IP for portproxy rule (required if using portproxy check)
-  HERMES_A2A_PORT        A2A server port (default: 8201)
-  HERMES_PORTPROXY_PS1   Output path for the portproxy script (default: /mnt/c/tmp/hermes-a2a-portproxy.ps1)
+  LOCI_A2A_HEALTH_URL  Health check URL (default: http://127.0.0.1:8201/health)
+  LOCI_A2A_SERVICE     systemd user service name (default: hermes-a2a.service)
+  LOCI_TAILSCALE_IP    Tailscale IP for portproxy rule (required if using portproxy check)
+  LOCI_A2A_PORT        A2A server port (default: 8201)
+  LOCI_PORTPROXY_PS1   Output path for the portproxy script (default: /mnt/c/tmp/hermes-a2a-portproxy.ps1)
 """
 import subprocess
 import json
@@ -25,11 +25,11 @@ import os
 import re
 from pathlib import Path
 
-HEALTH_URL    = os.environ.get("HERMES_A2A_HEALTH_URL", "http://127.0.0.1:8201/health")
-SERVICE       = os.environ.get("HERMES_A2A_SERVICE", "hermes-a2a.service")
-TAILSCALE_IP  = os.environ.get("HERMES_TAILSCALE_IP", "<your-tailscale-ip>")
-A2A_PORT      = int(os.environ.get("HERMES_A2A_PORT", "8201"))
-PORTPROXY_PS1 = os.environ.get("HERMES_PORTPROXY_PS1", "/mnt/c/tmp/hermes-a2a-portproxy.ps1")
+HEALTH_URL    = os.environ.get("LOCI_A2A_HEALTH_URL", "http://127.0.0.1:8201/health")
+SERVICE       = os.environ.get("LOCI_A2A_SERVICE", "hermes-a2a.service")
+TAILSCALE_IP  = os.environ.get("LOCI_TAILSCALE_IP", "<your-tailscale-ip>")
+A2A_PORT      = int(os.environ.get("LOCI_A2A_PORT", "8201"))
+PORTPROXY_PS1 = os.environ.get("LOCI_PORTPROXY_PS1", "/mnt/c/tmp/hermes-a2a-portproxy.ps1")
 STATE_FILE    = Path.home() / ".hermes-a2a-watchdog-state.json"
 
 

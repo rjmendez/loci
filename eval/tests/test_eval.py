@@ -389,7 +389,7 @@ def test_call_grounding_happy_path_payload_and_argv(monkeypatch, capsys):
         seen.update(argv=argv, input=input, capture_output=capture_output, timeout=timeout)
         return FakeProc(0, json.dumps({"context": "CTX", "other": 1}).encode())
 
-    monkeypatch.setenv("HERMES_PY", "/opt/py")
+    monkeypatch.setenv("LOCI_PY", "/opt/py")
     monkeypatch.setattr(harness.subprocess, "run", _run)
 
     assert harness.call_grounding("find X") == "CTX"
@@ -405,7 +405,7 @@ def test_call_grounding_happy_path_payload_and_argv(monkeypatch, capsys):
 
 def test_call_grounding_default_interpreter_is_the_hermes_venv(monkeypatch):
     seen = {}
-    monkeypatch.delenv("HERMES_PY", raising=False)
+    monkeypatch.delenv("LOCI_PY", raising=False)
     monkeypatch.setattr(
         harness.subprocess, "run",
         lambda argv, **kw: seen.update(argv=argv) or FakeProc(0, b'{"context":""}'),
@@ -449,7 +449,7 @@ def test_call_grounding_timeout_is_fail_open(monkeypatch, capsys):
 
 def test_call_grounding_missing_interpreter_is_fail_open(monkeypatch, capsys):
     """The real degraded path on CI: the hermes venv does not exist."""
-    monkeypatch.setenv("HERMES_PY", "/nonexistent/python-does-not-exist")
+    monkeypatch.setenv("LOCI_PY", "/nonexistent/python-does-not-exist")
     assert harness.call_grounding("anything") == ""
     assert "grounding call failed" in capsys.readouterr().err
 
