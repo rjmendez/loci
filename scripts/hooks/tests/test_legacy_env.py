@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
-import sys
 from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
