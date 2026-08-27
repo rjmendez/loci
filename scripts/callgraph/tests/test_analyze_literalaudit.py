@@ -38,8 +38,8 @@ def test_orphans_key_finds_dict_get_set_shape():
     c_texts = {g.match_text for g in consumer_only}
     assert "cfg_write_only" in p_texts
     assert "cfg_lookup_only" in c_texts
-    assert "HERMES_PORT" not in p_texts
-    assert "HERMES_PORT" not in c_texts
+    assert "LOCI_PORT" not in p_texts
+    assert "LOCI_PORT" not in c_texts
 
 
 def test_near_miss_pairs_graph_ladybug_and_graph_kuzu():

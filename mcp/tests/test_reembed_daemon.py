@@ -95,7 +95,7 @@ def test_dry_run_mutates_nothing():
         called["n"] += 1
         raise AssertionError("embed_fn called during dry-run")
 
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_boom_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_boom_embed,
                   apply=False)
 
     assert r["dry_run"] is True and r["applied"] is False
@@ -119,7 +119,7 @@ def test_apply_upserts_only_stale_and_missing():
     ]]
     client = FakeQdrant(pages)
 
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_stub_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_stub_embed,
                   apply=True, batch_size=64)
 
     assert r["applied"] is True and r["dry_run"] is False
@@ -139,7 +139,7 @@ def test_idempotent_second_run_targets_nothing():
     # All points already fresh -> nothing targeted, nothing written.
     pages = [[_fresh("a"), _fresh("b"), _fresh("c")]]
     client = FakeQdrant(pages)
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_stub_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_stub_embed,
                   apply=True)
     assert r["targeted"] == 0 and r["reembedded"] == 0
     assert client.upserts == []
@@ -153,7 +153,7 @@ def test_batching_chunks_correctly():
     pages = [stale[:6], stale[6:]]         # paged
     client = FakeQdrant(pages)
 
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_stub_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_stub_embed,
                   apply=True, batch_size=bs, page_limit=6)
 
     assert r["targeted"] == n and r["reembedded"] == n
@@ -178,7 +178,7 @@ def test_fail_open_on_embed_error():
             raise RuntimeError("gpu hiccup")
         return _stub_embed(texts)
 
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_flaky_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_flaky_embed,
                   apply=True, batch_size=3)
 
     # 2 batches attempted; first failed (no upsert), second succeeded.
@@ -196,7 +196,7 @@ def test_fail_open_on_embed_count_mismatch():
     def _short_embed(texts):
         return [[0.0, 1.0]]                        # wrong count (1 for 2 texts)
 
-    r = R.reembed("hermes_memory", qdrant_client=client, embed_fn=_short_embed,
+    r = R.reembed("loci_memory", qdrant_client=client, embed_fn=_short_embed,
                   apply=True, batch_size=64)
     assert client.upserts == []                   # nothing written on a bad batch
     assert r["reembedded"] == 0
@@ -208,7 +208,7 @@ def test_scroll_error_is_fail_open_degraded():
         def scroll(self, **kw):
             raise RuntimeError("qdrant down")
 
-    r = R.reembed("hermes_memory", qdrant_client=Boom([]), embed_fn=_stub_embed,
+    r = R.reembed("loci_memory", qdrant_client=Boom([]), embed_fn=_stub_embed,
                   apply=True)
     assert r["degraded"] is True
     assert r["reembedded"] == 0

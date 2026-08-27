@@ -22,7 +22,7 @@ logger = logging.getLogger("loci-mcp")
 
 
 # --- Configuration (public: re-exported by server.py) ---
-QDRANT_COLLECTION_PREFIX = os.environ.get("QDRANT_COLLECTION_PREFIX", "hermes_memory")
+QDRANT_COLLECTION_PREFIX = os.environ.get("QDRANT_COLLECTION_PREFIX", "loci_memory")
 VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
 
 

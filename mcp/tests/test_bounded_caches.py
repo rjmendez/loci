@@ -3,7 +3,7 @@
 The audit listed seven items. Three of the target artifacts do not exist on this
 host yet (`.emb_cache.npz`, the mlops loop state, and the *default* sync-cache
 dir), so those bounds are preventive. Two are live: the session-sync cache the
-Stop hook actually writes (`HERMES_SYNC_CACHE`, 7 files), and the daemon's
+Stop hook actually writes (`LOCI_SYNC_CACHE`, 7 files), and the daemon's
 unbounded recv().
 """
 import asyncio

@@ -1,83 +1,69 @@
 # The "hermes" name in Loci
 
-Audited 2026-08-27 at `400c3e2`. 1,013 occurrences across 138 tracked files.
+Audited and migrated 2026-08-27. Loci was configured and stored under `HERMES_*`
+names because it started life inside a Hermes installation. The names are now
+`LOCI_*`, with the old spellings still accepted so an existing deployment keeps
+working.
 
-The short version: **most of it is not stale branding.** It is either the name of
-a live system Loci runs alongside, or a storage and configuration contract that
-renaming would break. Six occurrences were genuinely stale and are fixed; the
-rest are catalogued here so a future rename is a decision rather than a sweep.
+Hermes itself is not gone and is not a former name for Loci: `~/.hermes/hermes-agent`
+is a 6.8 GB codebase with processes running, and Loci runs inside it. Names that
+refer to Hermes are unchanged.
 
-## What is actually there
+## What moved
 
-| what | hits | files | what renaming costs |
-|---|---:|---:|---|
-| Qdrant collection names | 332 | 49 | live data migration — 3,086 points |
-| Environment variable names | 284 | 64 | redeploying every consumer |
-| Filesystem paths under `~/.hermes/` | 222 | 81 | moving 182 MB + 1.6 GB of live data |
-| References to the real Hermes | 71 | 22 | nothing — they are correct |
-| Prose and other | 70 | 25 | nothing |
-| Docker image / volume / entrypoint | 34 | 5 | breaks existing deployments |
+| | from | to | how an existing install keeps working |
+|---|---|---|---|
+| Environment (29 vars, 322 sites) | `HERMES_*` | `LOCI_*` | `mcp/legacy_env.py` maps the old spelling onto the new one at startup; the new name wins if both are set |
+| Qdrant collections | `hermes_memory`, `hermes_sessions`, `hermes_verdicts` | `loci_*` | Qdrant aliases point the new names at the existing collections |
+| Memory directory | `~/.hermes/memory-sessions` | `~/.loci/memory-sessions` | resolved at runtime: the new path if it exists, else the old one. Nothing is moved implicitly |
 
-## Hermes is a running system, not a former name
+## What deliberately did not move
 
-`~/.hermes/hermes-agent` is a 6.8 GB codebase with its own README, Dockerfile and
-licence, and three processes were running during this audit:
+**Names that refer to the Hermes installation Loci runs inside.** Renaming these
+breaks that integration:
 
-    hermes_cli.main --profile mrpink gateway run
-    profiles/mrpink/scripts/grounding_daemon.py
-    profiles/mrpink/a2a_server/server.py
+`HERMES_PROFILE`, `HERMES_HOME`, `HERMES_VENV_SITE`, `HERMES_SUBAGENT`,
+`HERMES_AGENT_ID`, `~/.hermes/profiles/`, `hermes-agent`, the `pre_llm_call`
+event name, and every description of "the Hermes shape" of a hook payload.
 
-The third is Loci's own code (`Loci A2A Server v0.1.0`) deployed into a Hermes
-profile directory. That is the shape of the whole relationship: Loci is a tenant
-of a Hermes installation, sharing its home directory, its profile `.env`, and its
-Mnemosyne database.
+**Docker image, volume and container names** — `hermes-mcp`, `hermes-a2a`,
+`hermes-memory-ollama-1`. Renaming orphans existing volumes and containers.
+`docs/DEPLOYMENT.md` records that they kept the old name.
 
-So every mention of `HERMES_PROFILE`, `~/.hermes/profiles/`, `hermes-agent`, the
-`pre_llm_call` event name or "the Hermes shape" of a hook payload is **correct**
-and must not be renamed. 71 occurrences are in this category.
+**The legacy MCP registration name.** `scripts/ebbinghaus_consolidation.py`,
+`scripts/reembed_daemon.py` and `scripts/qdrant_payload_indexes.py` read the
+Qdrant key from `~/.claude/settings.json` under `loci`, falling back to
+`hermes_memory`. That fallback is a fact about settings files that already exist
+and must keep the old spelling.
 
-## What is Loci's, wearing the old name
+**Verbatim regression fixtures** under `scripts/callgraph/fixtures/regress/`.
+They are snapshots of historical code and their tests assert they are unchanged.
 
-The Qdrant collections and the memory directory are Loci's own data. The
-hermes-agent codebase references none of `hermes_memory`, `hermes_sessions`,
-`hermes_verdicts` or `memory-sessions` — only `mnemosyne`, which is genuinely
-shared. These are stale names on live storage:
+## Migrating a deployment
 
-| name | holds | rename path |
-|---|---|---|
-| `hermes_memory` | 2,769 points | Qdrant alias, then dual-read, then migrate |
-| `hermes_sessions` | 317 points | same |
-| `hermes_verdicts` | does not exist on the live instance | rename freely |
-| `~/.hermes/memory-sessions` | 142 investigations + a 40 MB code graph | move with a compatibility symlink |
+Nothing is required — the compatibility paths cover an in-place upgrade. To
+finish the move:
 
-`hermes_verdicts` is worth noting separately: `memcheck/cli.py` creates it 384-dim
-via `hash_embed` while `verdict_ops.py` writes 768-dim vectors and never creates
-it. It is absent from the live instance. That is a defect, not just a name.
+1. **Collections.** Create the aliases, or rename the collections and drop them:
 
-The 23 `HERMES_*` environment variables are read at roughly 62 sites. They can be
-renamed behind a resolver that reads `LOCI_*` first and falls back, but the
-consumers include the deployed Claude Code hooks in `~/.claude/hooks`, so the
-rename is a redeploy as well as an edit — see `scripts/hooks/install.sh --check`.
+       POST /collections/aliases
+       {"actions":[{"create_alias":{"collection_name":"hermes_memory","alias_name":"loci_memory"}}]}
 
-## Fixed in this change
+   Done on the reference host for `loci_memory` (2,771 points) and
+   `loci_sessions` (318 points).
 
-Six occurrences described Loci's own components as Hermes':
+2. **Environment.** Rename `HERMES_*` to `LOCI_*` in `.env`, systemd units and
+   any hook wrappers. `mcp/legacy_env.py` lists every pair.
 
-- `a2a_server/README.md` — "the Hermes MCP stack" is Loci's MCP stack.
-- `a2a_server/client.py` — client for "the Hermes Memory server", which is
-  `Loci A2A Server v0.1.0`.
-- `scripts/a2a_watchdog.py` — docstring, Windows firewall rule name, and rule
-  description, all naming the Loci A2A server as Hermes'.
-- `mcp/server.py` — a user-facing health message reading "hermes runs on keyword
-  fallback only".
+3. **Memory directory.** `mv ~/.hermes/memory-sessions ~/.loci/memory-sessions`.
+   The resolver prefers the new path once it exists. 182 MB on the reference
+   host, including a 40 MB code graph — stop the MCP server first.
 
-The firewall rule needed more than a rename. The watchdog deletes and re-adds the
-rule by name each run, so changing the constant alone would have left the old
-`Hermes A2A Server (port)` rule in place forever while adding a second one. The
-generated script now deletes the legacy name too.
+4. **Hooks.** `scripts/hooks/install.sh` deploys `legacy_env.py` alongside them,
+   so a hook wrapper exporting the old names still works. `--check` reports drift.
 
-## Deliberately not renamed
+## Still open
 
-`hermes-mcp` and `hermes-a2a` are Docker image, volume and console-entrypoint
-names. `docs/DEPLOYMENT.md` already records that they kept the old name.
-Renaming them orphans existing volumes.
+`loci_verdicts` does not exist on the live instance, and `mcp/memcheck/cli.py`
+creates it 384-dim via `hash_embed` while `mcp/verdict_ops.py` writes 768-dim
+vectors and never creates it. That is a defect, not a naming problem.

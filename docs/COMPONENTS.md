@@ -21,7 +21,7 @@ Three schedulers are declared in this repo and only two of them fire:
 
 ### `scripts/hooks/pre_llm_grounding.py`
 **Purpose:** Per-turn grounding. Embeds user message intent, fans out to 3 base Qdrant
-collections (`mnemosyne`, `hermes_sessions`, `hermes_memory`) plus any named in
+collections (`mnemosyne`, `loci_sessions`, `loci_memory`) plus any named in
 `GROUNDING_EXTRA_COLLECTIONS`, in parallel; ranks by a four-term weighted score
 (relevance / recency / trust / type) with MMR diversification and stigmergic
 pheromone reinforcement, then injects MEMORY MATCH context.
@@ -99,7 +99,7 @@ eliminating Python startup cost (~80ms) from grounding latency.
 ---
 
 ### `scripts/hooks/session_end_sync.py`
-**Purpose:** Live-syncs the current session **into Qdrant** `hermes_sessions` — it
+**Purpose:** Live-syncs the current session **into Qdrant** `loci_sessions` — it
 reads Hermes state, it does not write it. Fires at the end of every turn, not only
 at session end. Resolves session content from `state.db` first and falls back to
 the `transcript_path` the Claude Code Stop payload carries; before #228 only the
@@ -107,9 +107,9 @@ the `transcript_path` the Claude Code Stop payload carries; before #228 only the
 so the hook had never synced a session.
 
 Fast path: a session with no new messages since the last upsert (mtime cache under
-`$HERMES_SYNC_CACHE`, default `~/.hermes/.session_sync_cache`) exits 0 immediately.
+`$LOCI_SYNC_CACHE`, default `~/.hermes/.session_sync_cache`) exits 0 immediately.
 
-**Key env vars:** `HERMES_STATE_DB` (default `~/.hermes/state.db`), `QDRANT_URL`,
+**Key env vars:** `LOCI_STATE_DB` (default `~/.hermes/state.db`), `QDRANT_URL`,
 `QDRANT_API_KEY`, `OLLAMA_BASE_URL` or `MNEMOSYNE_EMBEDDING_API_URL`,
 `MNEMOSYNE_EMBEDDING_MODEL` (default `nomic-embed-text`),
 `MNEMOSYNE_EMBEDDING_DIM` (default `768`)
@@ -125,14 +125,14 @@ Fast path: a session with no new messages since the last upsert (mtime cache und
 registered by the submodules below, for **73 tools total** (counted by calling
 `server.mcp.list_tools()`).
 
-**Transport:** `HERMES_MCP_TRANSPORT` — `stdio` (default), `sse`, or
+**Transport:** `LOCI_MCP_TRANSPORT` — `stdio` (default), `sse`, or
 `streamable-http`. For the HTTP transports:
-- `HERMES_MCP_HOST` defaults to `127.0.0.1` (#206). A non-loopback bind without
-  `HERMES_MCP_TOKEN` is refused with a `SystemExit`, because it would expose every
+- `LOCI_MCP_HOST` defaults to `127.0.0.1` (#206). A non-loopback bind without
+  `LOCI_MCP_TOKEN` is refused with a `SystemExit`, because it would expose every
   tool unauthenticated. `docker-compose.yml` sets `0.0.0.0` deliberately and
   publishes on loopback.
-- `HERMES_MCP_TOKEN` enables `_BearerAuthMiddleware` (#211).
-- `HERMES_MCP_PORT` defaults to `8000`.
+- `LOCI_MCP_TOKEN` enables `_BearerAuthMiddleware` (#211).
+- `LOCI_MCP_PORT` defaults to `8000`.
 
 **Startup:** fires a non-blocking `embed_ops.warm()` ping so the first RAG call
 does not eat the ~9s nomic cold-load.
@@ -269,7 +269,7 @@ via Ollama only)
 ---
 
 ### `scripts/state_db_qdrant_sync.py`
-**Purpose:** Syncs Hermes `state.db` sessions to the Qdrant `hermes_sessions` collection.
+**Purpose:** Syncs Hermes `state.db` sessions to the Qdrant `loci_sessions` collection.
 Incremental (tracks already-synced session_ids in payload). Chunks per-session messages
 to 4000 chars before embedding. Unlike the Mnemosyne sync, this one does use
 `EMBED_WORKER_URL` — it POSTs to `$EMBED_WORKER/embed`.
@@ -277,7 +277,7 @@ to 4000 chars before embedding. Unlike the Mnemosyne sync, this one does use
 **Cron:** declared as `state-db-qdrant-sync` (every 5m) in `cron/jobs.json`, which
 has never run. No live schedule.
 
-**Key env vars:** `HERMES_STATE_DB` (default: `~/.hermes/state.db`),
+**Key env vars:** `LOCI_STATE_DB` (default: `~/.hermes/state.db`),
 `QDRANT_URL`, `QDRANT_API_KEY`, `EMBED_WORKER_URL`, `MNEMOSYNE_EMBEDDING_DIM`
 (default `768`)
 
@@ -515,7 +515,7 @@ hook still accepts. It therefore does not exercise the Claude Code
 **Baseline (2026-06-17):** `mean_score=0.167` — low expected; keyword matching is strict.
 Track the trend, not the absolute value.
 
-**Environment:** `HERMES_PY` selects the interpreter (default
+**Environment:** `LOCI_PY` selects the interpreter (default
 `~/.hermes/hermes-agent/venv/bin/python3`); `HARNESS_DRY_RUN=1` makes the gate
 evals CI-safe by using stored cosines instead of Qdrant/Ollama.
 
@@ -570,8 +570,8 @@ A2A server's `context_broadcast` skill, so local storage and peer fanout happen
 atomically server-side. It reads Mnemosyne SQLite, not the Hermes event stream,
 and keeps its own watermark in `BRIDGE_STATE_FILE` so a skipped tick loses nothing.
 
-**Key env vars:** `HERMES_A2A_URL` (default `http://127.0.0.1:8201`),
-`HERMES_A2A_TOKEN`, `BRIDGE_LOOKBACK_MIN` (default `30`), `BRIDGE_MIN_IMP`
+**Key env vars:** `LOCI_A2A_URL` (default `http://127.0.0.1:8201`),
+`LOCI_A2A_TOKEN`, `BRIDGE_LOOKBACK_MIN` (default `30`), `BRIDGE_MIN_IMP`
 (default `0.5`), `BRIDGE_MAX_ITEMS` (default `20`), `MNEMOSYNE_DATA_DIR`,
 `BRIDGE_STATE_FILE` (default `~/.hermes/bridge_state.json`), `PEER_A2A_URLS`,
 `PEER_A2A_TOKEN`. Flags: `--dry-run`, `--verbose`.

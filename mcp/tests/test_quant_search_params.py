@@ -5,7 +5,7 @@ probe_collection, which backs retrieval_selftest. A diagnostic that queries
 without rescore/oversampling is measuring a different search path from the one
 production runs, so a green selftest would not mean the real search works.
 
-hermes_memory is INT8-quantized (quantile=0.99, always_ram=True); it is the only
+loci_memory is INT8-quantized (quantile=0.99, always_ram=True); it is the only
 collection on the instance that is. rescore re-scores ANN candidates against the
 original full-precision vectors, so omitting it changes what comes back.
 """
@@ -38,7 +38,7 @@ class SharedSearchParamsTest(unittest.TestCase):
                                return_value={"named": True, "dense_dims": [768],
                                              "points": 10, "sparse": False}), \
              mock.patch.object(qdrant_ops, "_dense_vector_name", return_value="dense"):
-            qdrant_ops.probe_collection([0.0] * 768, client, "hermes_memory", 3)
+            qdrant_ops.probe_collection([0.0] * 768, client, "loci_memory", 3)
         kw = client.query_points.call_args.kwargs
         self.assertIn("search_params", kw,
                       "probe_collection must query the same path production does")

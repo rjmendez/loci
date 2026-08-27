@@ -9,12 +9,12 @@ installed. Qdrant is optional and used as a secondary semantic/hybrid index.
 JSONL files remain the durable local storage and final fallback path.
 
 Storage layout:
-    $HERMES_MEMORY_DIR/<investigation_id>/
+    $LOCI_MEMORY_DIR/<investigation_id>/
         manifest.json     — structured investigation state
         findings.jsonl    — append-only finding log
         audit.jsonl       — tool call/response audit log
 
-    $HERMES_MEMORY_DIR/../audit/
+    $LOCI_MEMORY_DIR/../audit/
         YYYY-MM-DD.jsonl  — global cross-investigation audit log
 
 Tools:
@@ -78,6 +78,17 @@ from memcheck.checks import (  # noqa: E402
     run_provenance,
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
+
+# Accept the legacy HERMES_* spelling of Loci's own variables.
+try:
+    from legacy_env import apply as _apply_legacy_env, memory_dir as _legacy_memory_dir
+except ImportError:  # not on sys.path in every entrypoint
+    try:
+        from mcp.legacy_env import apply as _apply_legacy_env, memory_dir as _legacy_memory_dir
+    except ImportError:
+        _apply_legacy_env = _legacy_memory_dir = None
+if _apply_legacy_env is not None:
+    _apply_legacy_env()
 
 # ---------------------------------------------------------------------------
 # Optional IOC extraction helpers
@@ -158,9 +169,9 @@ logger = logging.getLogger("loci-mcp")
 # Configuration
 # ---------------------------------------------------------------------------
 
-MEMORY_DIR = Path(os.environ.get(
-    "HERMES_MEMORY_DIR",
-    Path.home() / ".hermes" / "memory-sessions",
+MEMORY_DIR = Path(_legacy_memory_dir()) if _legacy_memory_dir else Path(os.environ.get(
+    "LOCI_MEMORY_DIR",
+    Path.home() / ".loci" / "memory-sessions",
 ))
 # Imported after load_dotenv so its import-time os.environ reads see the same env; re-exported so tests can patch server._get_qdrant.
 import qdrant_ops  # noqa: E402,F401
@@ -175,7 +186,7 @@ from qdrant_ops import RERANK_MAX_CHARS as _RERANK_MAX_CHARS  # noqa: E402
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
 REFLECTION_STATE_FILE = REFLECTION_STATE_DIR / "state.json"
 REFLECTION_DEFAULT_INVESTIGATION = os.environ.get(
-    "HERMES_REFLECTION_INVESTIGATION",
+    "LOCI_REFLECTION_INVESTIGATION",
     "copilot-self-reflection-loop",
 )
 REFLECTION_LOG_TAIL_MIN_FILE_BYTES = 1_000_000
@@ -417,7 +428,7 @@ def context_assemble(
             or f"result-{i}"
         )
         score = float(r.get("score") or r.get("relevance_score") or 0.0)
-        origin = r.get("origin") or r.get("collection") or "hermes_memory"
+        origin = r.get("origin") or r.get("collection") or "loci_memory"
         mem_id = str(r.get("memory_id") or r.get("finding_id") or r.get("id") or "")
 
         meta = f"  [score={score:.3f}, origin={origin}]" if include_metadata else ""
@@ -2694,7 +2705,7 @@ def reflection_loop_seed(
     """
     Seed the bounded self-reflection queue from Copilot local artifacts.
 
-    The queue is persisted under ``$HERMES_MEMORY_DIR/_reflection-loop/state.json``.
+    The queue is persisted under ``$LOCI_MEMORY_DIR/_reflection-loop/state.json``.
     This call only enqueues file targets — it does not parse files or write findings.
     Use ``reflection_loop_tick`` to process queued items in small batches.
     """
@@ -3515,7 +3526,7 @@ def investigation_pre_answer_check(
     audit receipts. Works in degraded JSONL-only mode when Qdrant is disabled.
 
     When ``record=True`` (default) each claim verdict is persisted to the
-    ``hermes_verdicts`` Qdrant collection so prior-check history and conflict
+    ``loci_verdicts`` Qdrant collection so prior-check history and conflict
     detection are available on subsequent calls. Each claim result gains three
     fields: ``verdict_type`` (claim_supported / claim_contradicted /
     claim_unsupported), ``prior_occurrences``, and ``verdict_conflict``.
@@ -4127,7 +4138,7 @@ def _verdict_view(v) -> dict:
 
 
 def _record_verdicts(verdicts: list) -> bool:
-    """Record verdicts into the hermes_verdicts qdrant collection. Fail-open.
+    """Record verdicts into the loci_verdicts qdrant collection. Fail-open.
 
     Builds a ``VerdictEngine`` over a ``QdrantBackend`` wired to the server's real
     ``_embed`` (so memory verdicts get genuine dense vectors). Any failure —
@@ -4146,7 +4157,7 @@ def _record_verdicts(verdicts: list) -> bool:
 
         backend = QdrantBackend(
             client=client,
-            collection="hermes_verdicts",
+            collection="loci_verdicts",
             embed=_embed,
             vector_name="dense",
         )
@@ -4206,7 +4217,7 @@ def memory_self_check(
     This is **advisory only**: verdicts annotate and surface. Nothing is hidden,
     deleted, or mutated — findings.jsonl stays append-only. Verdicts are computed
     purely over the JSONL, so the check still works when qdrant is unavailable;
-    recording into the shared ``hermes_verdicts`` collection is best-effort.
+    recording into the shared ``loci_verdicts`` collection is best-effort.
 
     Args:
         investigation_id: Investigation to check, or omit to check all.
@@ -4796,18 +4807,18 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
     report: dict = {}
     main = main_col or QDRANT_COLLECTION_PREFIX
     main_present = main in existing
-    verdicts_present = "hermes_verdicts" in existing
+    verdicts_present = "loci_verdicts" in existing
     if main_present:
         info = _health_qdrant_collection_info(client, main)
         report[main] = info
         collection_dims[main] = _health_collection_dim(info)
     if verdicts_present:
-        info = _health_qdrant_collection_info(client, "hermes_verdicts")
-        report["hermes_verdicts"] = info
-        collection_dims["hermes_verdicts"] = _health_collection_dim(info)
+        info = _health_qdrant_collection_info(client, "loci_verdicts")
+        report["loci_verdicts"] = info
+        collection_dims["loci_verdicts"] = _health_collection_dim(info)
     report["expected_main_collection"] = main
     report["main_present"] = main_present
-    report["hermes_verdicts_present"] = verdicts_present
+    report["loci_verdicts_present"] = verdicts_present
     if not main_present:
         return (
             "fail",
@@ -4820,7 +4831,7 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
         return (
             "warn",
             report,
-            "'hermes_verdicts' not yet created — it appears on first "
+            "'loci_verdicts' not yet created — it appears on first "
             "memory_self_check(record=True); benign until then",
         )
     return ("ok", report, None)
@@ -5301,7 +5312,7 @@ def _forget_finding_verdicts(finding: dict) -> int:
         from memcheck import QdrantBackend, VerdictEngine
 
         backend = QdrantBackend(
-            client=client, collection="hermes_verdicts", embed=_embed, vector_name="dense",
+            client=client, collection="loci_verdicts", embed=_embed, vector_name="dense",
         )
         engine = VerdictEngine(backend)
 
@@ -6361,7 +6372,7 @@ def rag_context_search(
     Hybrid RAG search over Qdrant corpus. Returns prompt-ready context with cited sources.
     ALWAYS uses Qdrant — no keyword fallback. Raises rag_required error if Qdrant unavailable.
 
-    Searches QDRANT_COLLECTION_PREFIX (default "hermes_memory", the findings) plus
+    Searches QDRANT_COLLECTION_PREFIX (default "loci_memory", the findings) plus
     CODE_CHUNKS_COLLECTION when that env var is set, merges, reranks with a
     cross-encoder and assembles cited context.
 
@@ -7193,7 +7204,7 @@ def memory_confidence(
     top_k: int = 8,
 ) -> str:
     """
-    Estimate how reliably hermes_memory knows about a topic (metamemory).
+    Estimate how reliably loci_memory knows about a topic (metamemory).
 
     Combines five evidence cues into a calibrated confidence score:
       fluency        — cosine similarity of top hit to query (retrieval ease)
@@ -8121,18 +8132,18 @@ def main() -> None:
         embed_ops.warm()
     except Exception as exc:
         logger.debug("main: fail-open swallow: %r", exc)
-    transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
+    transport = os.environ.get("LOCI_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
-        # Loopback default: no authentication here, so a wide bind must be an explicit decision (docker-compose sets HERMES_MCP_HOST=0.0.0.0).
-        mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
-        mcp.settings.port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
+        # Loopback default: no authentication here, so a wide bind must be an explicit decision (docker-compose sets LOCI_MCP_HOST=0.0.0.0).
+        mcp.settings.host = os.environ.get("LOCI_MCP_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.environ.get("LOCI_MCP_PORT", "8000"))
 
         # A token is what makes a NON-loopback bind defensible; without one we refuse rather than serve.
-        token = os.environ.get("HERMES_MCP_TOKEN", "").strip()
+        token = os.environ.get("LOCI_MCP_TOKEN", "").strip()
         if not token and not _is_loopback(mcp.settings.host):
             raise SystemExit(
                 f"refusing to serve {transport} on {mcp.settings.host} without "
-                "HERMES_MCP_TOKEN: this would expose every tool unauthenticated. "
+                "LOCI_MCP_TOKEN: this would expose every tool unauthenticated. "
                 'Generate one with: python3 -c "import secrets;print(secrets.token_hex(32))" '
                 "— or bind 127.0.0.1."
             )
@@ -8142,7 +8153,7 @@ def main() -> None:
         if token:
             app = _BearerAuthMiddleware(app, token)
         else:
-            logger.warning("HERMES_MCP_TOKEN is not set — serving %s on %s with no "
+            logger.warning("LOCI_MCP_TOKEN is not set — serving %s on %s with no "
                            "authentication. Safe only because the bind is loopback.",
                            transport, mcp.settings.host)
 

@@ -39,10 +39,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _DEFAULT_LOG = os.path.expanduser(
-    os.environ.get("HERMES_EVENT_LOG", "~/.hermes/event_log.jsonl")
+    os.environ.get("LOCI_EVENT_LOG", "~/.hermes/event_log.jsonl")
 )
 _DEFAULT_ARCHIVE_DIR = os.path.expanduser(
-    os.environ.get("HERMES_EVENT_ARCHIVE", "~/.hermes/event_archive/")
+    os.environ.get("LOCI_EVENT_ARCHIVE", "~/.hermes/event_archive/")
 )
 
 

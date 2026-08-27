@@ -52,7 +52,7 @@ Written from the actual running config and source code, not assumed behavior.
                         │    └─ audit log write                          │
                         │                                                 │
   Session ends ──────►  │  on_session_end hook                           │
-                        │    └─ embed session → hermes_sessions Qdrant   │
+                        │    └─ embed session → loci_sessions Qdrant   │
                         │    └─ ~140ms, Ollama nomic-embed-text          │
                         └─────────────────────────────────────────────────┘
 
@@ -67,7 +67,7 @@ Written from the actual running config and source code, not assumed behavior.
     hermes-grounding            — systemd --user — grounding daemon (UNIX socket)
 
   Interactive tools (in-session):
-    loci-mcp (hermes_memory)  — investigation/memory/code-graph layer, 71 tools (see Section 2d)
+    loci-mcp (loci_memory)  — investigation/memory/code-graph layer, 71 tools (see Section 2d)
     Mnemosyne MCP             — episodic facts, store/recall with semantic search
     Serena MCP                — LSP-powered code navigation (symbols, refs, diagnostics)
     CocoIndex MCP             — semantic code search (ccc) across indexed repos
@@ -144,7 +144,7 @@ project data — not the Mnemosyne store.
   - `mcp_mnemosyne_mnemosyne_sleep(bank)` — consolidation pass (merge working memories into episodic)
 
 These tools belong to the **Mnemosyne MCP server**, which is distinct from the
-hermes_memory server (loci-mcp) described in Section 2d. The loci-mcp server
+loci_memory server (loci-mcp) described in Section 2d. The loci-mcp server
 also writes to Mnemosyne internally via `_mnemo_remember()`, but is a separate
 server providing different tools.
 
@@ -155,9 +155,9 @@ fts_weight params.
 **Also synced to Qdrant** `mnemosyne` collection (by the 30-min cron) so the
 pre_llm_call hook can include it in the fan-out without going through MCP.
 
-### 2c. Qdrant hermes_sessions (session history, vector search)
+### 2c. Qdrant loci_sessions (session history, vector search)
 
-**Where:** Qdrant on `<your-host>`, collection `hermes_sessions`
+**Where:** Qdrant on `<your-host>`, collection `loci_sessions`
 
 **What it is:** Every completed session embedded as a single 768-dim vector
 (nomic-embed-text). Used by the grounding hook to surface relevant past sessions
@@ -169,24 +169,24 @@ cron `state_db_qdrant_sync.py` runs every 5 min as catch-all for any missed.
 
 **Also queryable via:** `session_search` tool — FTS5 search over `state.db`
 (the local SQLite session store). session_search is faster for keyword/phrase
-queries; Qdrant hermes_sessions is better for semantic/topical recall.
+queries; Qdrant loci_sessions is better for semantic/topical recall.
 
-### 2d. loci-mcp / hermes_memory — investigation and memory layer
+### 2d. loci-mcp / loci_memory — investigation and memory layer
 
 **Server name:** `loci` (FastMCP name in `mcp/server.py`)
-**Storage:** `$HERMES_MEMORY_DIR/<investigation_id>/` (default: `~/.hermes/memory-sessions/`)
-**Qdrant collection:** `hermes_memory` (or value of `QDRANT_COLLECTION_PREFIX`)
+**Storage:** `$LOCI_MEMORY_DIR/<investigation_id>/` (default: `~/.hermes/memory-sessions/`)
+**Qdrant collection:** `loci_memory` (or value of `QDRANT_COLLECTION_PREFIX`)
 
 **What it is:** A manifest-first investigation and memory layer. Tracks
 findings, observations, inferences, audit logs, and hallucination retractions
 across investigation sessions. This is the primary writer to the
-`hermes_memory` Qdrant collection and the Mnemosyne `default` bank via
+`loci_memory` Qdrant collection and the Mnemosyne `default` bank via
 `investigation_store`, `audit_log`, and `reflection_loop_tick` — not the
 Qdrant MCP server writing directly.
 
 **Storage layout:**
 ```
-$HERMES_MEMORY_DIR/
+$LOCI_MEMORY_DIR/
   <investigation_id>/
     manifest.json        — structured investigation state
     findings.jsonl       — append-only finding log
@@ -240,7 +240,7 @@ The tables below cover the 24 most-used ones. The rest are:
 | Tool | Purpose |
 |------|---------|
 | `investigation_search(query, investigation_id?, limit?, include_retracted?, min_confidence?)` | Hybrid Mnemosyne+Qdrant search. Resolution order: Mnemosyne recall → Qdrant RRF (dense+sparse) → cross-encoder reranking. Retracted findings excluded by default. |
-| `investigation_pre_answer_check(investigation_id, claims, min_confidence?, record?)` | Validate proposed response claims against stored findings and audit receipts. Implements CIBER dual-retrieval: also retrieves benign baseline context from other investigations. Verdicts recorded to `hermes_verdicts` Qdrant collection when `record=True`. A dense-similarity neighbour counts as support only when corroborated (lexical overlap with the claim plus a margin over its own retrieved neighbourhood); uncorroborated neighbours are surfaced under `semantic_candidates` and never enter `support_refs` or the confidence chain. `support_basis` names the deciding lane: `lexical` / `semantic_corroborated` / `semantic_candidate_only` / `none`. |
+| `investigation_pre_answer_check(investigation_id, claims, min_confidence?, record?)` | Validate proposed response claims against stored findings and audit receipts. Implements CIBER dual-retrieval: also retrieves benign baseline context from other investigations. Verdicts recorded to `loci_verdicts` Qdrant collection when `record=True`. A dense-similarity neighbour counts as support only when corroborated (lexical overlap with the claim plus a margin over its own retrieved neighbourhood); uncorroborated neighbours are surfaced under `semantic_candidates` and never enter `support_refs` or the confidence chain. `support_basis` names the deciding lane: `lexical` / `semantic_corroborated` / `semantic_candidate_only` / `none`. |
 | `investigation_evidence_precheck(investigation_id, proposed_query, min_similarity?)` | Lightweight duplicate-call avoidance. Checks if similar evidence already exists before running a new tool call. |
 | `investigation_entity_lookup(entity, entity_type?, investigation_id?, limit?)` | Find every finding mentioning a specific IP, email, hostname, hash, or CVE. Uses Qdrant payload indexes for O(1) lookup; falls back to JSONL scan. `entity_type="auto"` infers from value. |
 | `investigation_related_cases(entities, entity_type?, limit_per_entity?)` | Find prior investigations that dealt with the same entities. Call before opening a new investigation to check for prior resolutions. |
@@ -265,7 +265,7 @@ The tables below cover the 24 most-used ones. The rest are:
 
 | Tool | Purpose |
 |------|---------|
-| `rag_context_search(query, limit?, collections?, budget_chars?, exclude_types?)` | Hybrid Qdrant RAG with cross-encoder reranking. Searches `hermes_memory` and any code-chunks collection by default. Returns prompt-ready context with `[SOURCE N]` citations. Requires Qdrant — no keyword fallback. |
+| `rag_context_search(query, limit?, collections?, budget_chars?, exclude_types?)` | Hybrid Qdrant RAG with cross-encoder reranking. Searches `loci_memory` and any code-chunks collection by default. Returns prompt-ready context with `[SOURCE N]` citations. Requires Qdrant — no keyword fallback. |
 | `memory_confidence(query, top_k?)` | Metamemory: 5-cue calibrated confidence score (fluency, accessibility, source_diversity, corroboration, trust). Use before asserting a memory-derived claim. |
 #### Memory Maintenance
 
@@ -287,11 +287,11 @@ The tables below cover the 24 most-used ones. The rest are:
 investigation_store(...)
   → append to findings.jsonl (durable, always)
   → _mnemo_remember(text, importance, metadata) → Mnemosyne SQLite
-  → _qdrant_upsert(finding_id, text, payload) → hermes_memory collection
+  → _qdrant_upsert(finding_id, text, payload) → loci_memory collection
     (dense + sparse RRF, INT8 quantized, HNSW m=32)
 ```
 
-**`hermes_verdicts` Qdrant collection:** Used by `investigation_pre_answer_check`
+**`loci_verdicts` Qdrant collection:** Used by `investigation_pre_answer_check`
 to record per-claim verdict history and detect conflicts. Verdict types:
 `claim_supported`, `claim_contradicted`, `claim_unsupported`, `claim_ambiguous`.
 Implements PE-gated reconsolidation: high prediction-error verdict changes are
@@ -339,8 +339,8 @@ The daemon must be running for the fast path. See Section 4.
 2. Embed via nomic-embed-text on <your-host> Ollama → 768-dim vector
 3. Fan out to the 3 base Qdrant collections in parallel (ThreadPoolExecutor, 8 workers):
    - mnemosyne          — personal facts, preferences
-   - hermes_sessions    — past conversation history
-   - hermes_memory      — investigation notes, findings (written by loci-mcp)
+   - loci_sessions    — past conversation history
+   - loci_memory      — investigation notes, findings (written by loci-mcp)
    - plus any collections named in GROUNDING_EXTRA_COLLECTIONS (empty by default) — e.g.
      ecc_skills (skill library), agent_core_chunks (infra/code/research KB)
 4. Rank: multi-signal score = 0.50 × relevance (Qdrant cosine × importance_weight)
@@ -364,7 +364,7 @@ The daemon must be running for the fast path. See Section 4.
   requires mnemosyne library importable)
 
 **Subagent sessions are not skipped.** They take a lightweight path instead of the
-full fan-out: a single `hermes_memory` search capped at top 2, plus the rules
+full fan-out: a single `loci_memory` search capped at top 2, plus the rules
 summary. Skipping them (the pre-v4 behaviour) left workflow subagents ungrounded,
 which is where wrong import names and renamed fields crept in.
 
@@ -372,8 +372,8 @@ which is where wrong import names and renamed fields crept in.
 ```
 MEMORY MATCH (3 results from 3 Qdrant collections) for "why is auth failing":
 [mnemosyne|0.87] User prefers direct commands over explanations...
-[hermes-sessions|0.82] ...investigated proxy.ts dead middleware June 13...
-[hermes-memory|0.79] ...auth guard short-circuits when the header is absent...
+[loci-sessions|0.82] ...investigated proxy.ts dead middleware June 13...
+[loci-memory|0.79] ...auth guard short-circuits when the header is absent...
 Use mcp_mnemosyne_mnemosyne_recall for full content if relevant. Disclose recalled context to the user if it changes your answer.
 ```
 
@@ -454,7 +454,7 @@ Five cron jobs run continuously. All defined in `cron/jobs.json`.
 **Script:** `scripts/state_db_qdrant_sync.py` | **Type:** no_agent (script only)
 
 Reads sessions from `state.db`, embeds via Ollama, upserts into Qdrant
-`hermes_sessions`. Incremental — tracks synced sessions in a cache file.
+`loci_sessions`. Incremental — tracks synced sessions in a cache file.
 
 This is the catch-all safety net for sessions that the on_session_end hook
 missed (Ollama down, hook timeout, sessions from before hook was wired).
@@ -467,7 +467,7 @@ ls ~/.hermes/cron/output/ | grep state-db | tail -5
 # Manually run
 python3 ~/.hermes/scripts/state_db_qdrant_sync.py
 
-# Compare state.db session count vs Qdrant hermes_sessions
+# Compare state.db session count vs Qdrant loci_sessions
 sqlite3 ~/.hermes/state.db "SELECT COUNT(*) FROM sessions"
 ```
 
@@ -632,7 +632,7 @@ Every conversation is stored. FTS5-backed with BM25 ranking.
 3. **Read** — `session_search(session_id)` — dump entire session.
 4. **Browse** — `session_search()` — recent sessions by time.
 
-**vs Qdrant hermes_sessions:** session_search = keyword/phrase/boolean (fast,
+**vs Qdrant loci_sessions:** session_search = keyword/phrase/boolean (fast,
 exact, has live in-progress sessions). Qdrant = semantic/topical (finds what
 sessions are *about*, synced after session ends). Use session_search first.
 
@@ -647,9 +647,9 @@ them as orders of magnitude.
 | Collection | Approx size | Content | Updated by |
 |------------|-------------|---------|------------|
 | `mnemosyne` | hundreds | Personal facts, preferences, project notes | Mnemosyne MCP + 30-min cron |
-| `hermes_sessions` | hundreds | Past conversation sessions | on_session_end hook + 5-min cron |
-| `hermes_memory` | tens–hundreds | Investigation notes, findings (dense+sparse, INT8 quant) | loci-mcp via investigation_store, audit_log, reflection_loop_tick |
-| `hermes_verdicts` | varies | Claim check verdict history (pre_answer_check results) | loci-mcp via investigation_pre_answer_check |
+| `loci_sessions` | hundreds | Past conversation sessions | on_session_end hook + 5-min cron |
+| `loci_memory` | tens–hundreds | Investigation notes, findings (dense+sparse, INT8 quant) | loci-mcp via investigation_store, audit_log, reflection_loop_tick |
+| `loci_verdicts` | varies | Claim check verdict history (pre_answer_check results) | loci-mcp via investigation_pre_answer_check |
 | `ecc_skills` | hundreds | Skill library knowledge | ECC skill indexing pipeline |
 | `agent_core_chunks` | hundreds of thousands | Knowledge base: infra, code, research, telemetry | ingestion pipeline |
 | _(your collections)_ | varies | Any extra collections wired via `GROUNDING_EXTRA_COLLECTIONS` | your indexing pipeline |
@@ -679,28 +679,28 @@ on_session_end hook fires
     ├─ Concatenates user+assistant messages, cap at 4000 chars
     ├─ Fast path: skip if no new messages since last upsert (cache file check)
     ├─ Embeds via nomic-embed-text on <your-host> Ollama
-    ├─ Upserts point into Qdrant hermes_sessions collection
+    ├─ Upserts point into Qdrant loci_sessions collection
     └─ Updates sync cache to track synced sessions
     │
     ▼
 state_db_qdrant_sync.py (background cron, every 5 min)
     │
     └─ Finds sessions in state.db NOT in sync cache
-       Embeds and upserts them into hermes_sessions
+       Embeds and upserts them into loci_sessions
        Safety net for: Ollama down, hook timeout, pre-hook sessions
 ```
 
-**Cache location:** set via `HERMES_SYNC_CACHE` env var in the on_session_end
+**Cache location:** set via `LOCI_SYNC_CACHE` env var in the on_session_end
 hook config stanza.
 
 **Debugging sync issues:**
 ```bash
 # Check Qdrant point count vs local session count
 sqlite3 ~/.hermes/state.db "SELECT COUNT(*) FROM sessions"
-# Compare to Qdrant hermes_sessions collection count (use curl above)
+# Compare to Qdrant loci_sessions collection count (use curl above)
 
 # Clear sync cache to force full re-sync
-rm -rf ~/.hermes/.session_sync_cache  # or wherever HERMES_SYNC_CACHE points
+rm -rf ~/.hermes/.session_sync_cache  # or wherever LOCI_SYNC_CACHE points
 python3 ~/.hermes/scripts/state_db_qdrant_sync.py
 ```
 
@@ -747,7 +747,7 @@ You type: "audit this codebase for dead code"
 
 ~105ms Parallel Qdrant fan-out (8 workers) completes:
          mnemosyne       → "project is at ~/development/..."
-         hermes_sessions → "prior dead code session..."
+         loci_sessions → "prior dead code session..."
          ecc_skills      → "dead-code-audit skill"
          agent_core_chunks → "rg --glob '*.ts' orphan file pattern"
          (others below score threshold, filtered)
@@ -771,7 +771,7 @@ You type: "audit this codebase for dead code"
 
 [Session ends]
          → on_session_end hook fires (~140ms)
-         → session embedded → hermes_sessions Qdrant
+         → session embedded → loci_sessions Qdrant
          → available for future session_search queries within minutes
          → mnemosyne-session-summarizer (next 20-min tick) may archive findings
 ```
@@ -792,7 +792,7 @@ You type: "audit this codebase for dead code"
 
 "I need to store a research finding or investigation result"
   → investigation_store(investigation_id, 'observed'|'inferred', text, source, confidence)
-  → Automatically writes to JSONL + Mnemosyne + Qdrant hermes_memory
+  → Automatically writes to JSONL + Mnemosyne + Qdrant loci_memory
 
 "I need to check if a proposed claim is supported by stored evidence"
   → investigation_pre_answer_check(investigation_id, claims)
@@ -815,9 +815,9 @@ You type: "audit this codebase for dead code"
   → investigation_related_cases(entities=["198.51.100.5"])
 
 "I need broad RAG context for a query (not scoped to one investigation)"
-  → rag_context_search(query, collections=["hermes_memory", "agent_core_chunks"])
+  → rag_context_search(query, collections=["loci_memory", "agent_core_chunks"])
 
-"I want to know how confident hermes_memory is about a topic"
+"I want to know how confident loci_memory is about a topic"
   → memory_confidence(query)
 
 "I need to check the memory substrate health"
@@ -873,7 +873,7 @@ curl -s http://<your-host>:<qdrant-port>/health
 Signs the hook is working: MEMORY MATCH blocks appear at the top of sessions.
 Signs it's not: no memory block in context, or hook takes >5s (timeout).
 
-### Is the loci-mcp (hermes_memory) server healthy?
+### Is the loci-mcp (loci_memory) server healthy?
 
 ```
 investigation_id=None → memory_health()
@@ -917,15 +917,15 @@ python3 ~/.hermes/scripts/mnemosyne_qdrant_sync.py
 curl -s http://<your-host>:<qdrant-port>/collections \
   -H "api-key: <key>" | python3 -m json.tool
 
-# Rebuild hermes_sessions: clear cache and re-run sync
+# Rebuild loci_sessions: clear cache and re-run sync
 rm -rf ~/.hermes/.session_sync_cache
 python3 ~/.hermes/scripts/state_db_qdrant_sync.py
 
 # Rebuild mnemosyne collection:
 python3 ~/.hermes/scripts/mnemosyne_qdrant_sync.py
 
-# Rebuild hermes_memory: re-run loci backfill if available
-# (hermes_memory is created lazily on first investigation_store call)
+# Rebuild loci_memory: re-run loci backfill if available
+# (loci_memory is created lazily on first investigation_store call)
 ```
 
 ### Open Design MCP not working
@@ -971,7 +971,7 @@ rules/quality.md               — verification and correctness rules
 rules/infra.md                 — infrastructure and security rules
 rules/knowledge.md             — skill/knowledge management rules
 skills/                        — 186 skill files across 26 categories
-mcp/server.py                  — loci-mcp server (hermes_memory MCP, 60 tools)
+mcp/server.py                  — loci-mcp server (loci_memory MCP, 60 tools)
 mcp/graph_tools.py             — 11 code-graph tools registered onto the same
                                  server (71 tools total at runtime)
 scripts/grounding_client.py    — pre_llm_call hook entry (UNIX socket client)
@@ -1012,8 +1012,8 @@ collections — cosine similarity breaks.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `HERMES_MEMORY_DIR` | Root for investigation sessions | `~/.hermes/memory-sessions` |
-| `QDRANT_COLLECTION_PREFIX` | Main Qdrant collection name | `hermes_memory` |
+| `LOCI_MEMORY_DIR` | Root for investigation sessions | `~/.hermes/memory-sessions` |
+| `QDRANT_COLLECTION_PREFIX` | Main Qdrant collection name | `loci_memory` |
 | `MNEMOSYNE_EMBEDDING_DIM` | Dense vector dimension | `768` |
 | `EMBED_MODEL` | Ollama model name for embeddings | `nomic-embed-text` |
 | `OLLAMA_BASE_URL` | Ollama endpoint (OpenAI-compat `/v1/embeddings`) | unset |
@@ -1021,14 +1021,14 @@ collections — cosine similarity breaks.
 | `EMBED_API_KEY_HEADER` | Header name for the above key | `Authorization` |
 | `QDRANT_URL` | Qdrant server URL | unset (disables vector search) |
 | `QDRANT_API_KEY` | Qdrant API key | unset |
-| `HERMES_MNEMO_BANK` | Mnemosyne bank for mirroring | `default` |
+| `LOCI_MNEMO_BANK` | Mnemosyne bank for mirroring | `default` |
 | `CODE_CHUNKS_COLLECTION` | Qdrant collection for code-chunk correlation | unset |
 | `HERMES_AGENT_ID` | Agent identity stamp on Qdrant points | unset |
 | `LOCI_NAMESPACE` | Namespace stamp on Qdrant points | unset |
-| `HERMES_REFLECTION_INVESTIGATION` | Default investigation id for reflection loop | `copilot-self-reflection-loop` |
-| `HERMES_MCP_TRANSPORT` | Server transport: `stdio`, `sse`, `streamable-http` | `stdio` |
-| `HERMES_MCP_HOST` | Bind host for HTTP transports | `0.0.0.0` |
-| `HERMES_MCP_PORT` | Port for HTTP transports | `8000` |
+| `LOCI_REFLECTION_INVESTIGATION` | Default investigation id for reflection loop | `copilot-self-reflection-loop` |
+| `LOCI_MCP_TRANSPORT` | Server transport: `stdio`, `sse`, `streamable-http` | `stdio` |
+| `LOCI_MCP_HOST` | Bind host for HTTP transports | `0.0.0.0` |
+| `LOCI_MCP_PORT` | Port for HTTP transports | `8000` |
 
 **Warning:** There is no dense-embedding fallback. Dense vectors come from Ollama
 only (`OLLAMA_BASE_URL` + `EMBED_MODEL`). If Ollama is unavailable, `_embed()`
@@ -1045,11 +1045,11 @@ investigation/memory tools are indexed below):**
 |------|------------------|
 | `investigation_start` | Create or resume an investigation by ID. Idempotent — resuming returns the current manifest without overwriting. |
 | `investigation_load` | Retrieve manifest and recent findings for context recovery at session start. Retracted findings excluded by default. |
-| `investigation_store` | Record a finding (observed/inferred/assumed/gap/procedure). Writes to JSONL, Mnemosyne, and Qdrant `hermes_memory`. |
+| `investigation_store` | Record a finding (observed/inferred/assumed/gap/procedure). Writes to JSONL, Mnemosyne, and Qdrant `loci_memory`. |
 | `investigation_note` | Update manifest fields: context, hypothesis, next_step, open questions, checked sources, or close the investigation. |
 | `investigation_reflect` | Synthesize current investigation state — finding breakdown, open questions, gaps, and advisory self-check. |
 | `investigation_search` | Hybrid Mnemosyne+Qdrant search over findings with cross-encoder reranking. Retracted findings excluded by default. |
-| `investigation_pre_answer_check` | Validate proposed response claims against stored findings and audit receipts. Records verdicts to `hermes_verdicts`. |
+| `investigation_pre_answer_check` | Validate proposed response claims against stored findings and audit receipts. Records verdicts to `loci_verdicts`. |
 | `investigation_evidence_precheck` | Lightweight duplicate-call avoidance — checks if similar evidence already exists before running a new tool call. |
 | `investigation_entity_lookup` | Find every finding mentioning a specific IP, email, hostname, hash, or CVE. O(1) via Qdrant payload indexes. |
 | `investigation_related_cases` | Find prior investigations that dealt with the same entities. Call before opening a new investigation. |
@@ -1130,8 +1130,8 @@ to an earlier file or compress the files ahead of it.
 Point counts change continuously. Use the health check curl command in
 Section 12 for live counts.
 
-### 10. hermes_memory is not populated by direct Qdrant MCP writes
-The `hermes_memory` Qdrant collection is written by loci-mcp (`mcp/server.py`)
+### 10. loci_memory is not populated by direct Qdrant MCP writes
+The `loci_memory` Qdrant collection is written by loci-mcp (`mcp/server.py`)
 via `investigation_store`, `audit_log`, and `reflection_loop_tick`. Do not
 use Qdrant MCP tools to write directly to it — the payload schema and payload
 indexes (entities, investigation_id, confidence, etc.) will be missing.

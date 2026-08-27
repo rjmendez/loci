@@ -27,10 +27,10 @@ targets nothing — **safe to re-run**.
 
 ```bash
 # 1) dry-run: how many points WOULD be re-embedded? (writes nothing)
-python3 scripts/reembed_daemon.py --collection hermes_memory
+python3 scripts/reembed_daemon.py --collection loci_memory
 
 # 2) apply: actually re-embed the stale/missing points
-python3 scripts/reembed_daemon.py --collection hermes_memory --apply
+python3 scripts/reembed_daemon.py --collection loci_memory --apply
 
 # named-vector collection, custom batch, new version marker
 python3 scripts/reembed_daemon.py --collection agent_core_chunks \
@@ -44,7 +44,7 @@ Always run the dry-run first, eyeball `targeted`, then re-run with `--apply`.
 | var | purpose | default |
 |-----|---------|---------|
 | `QDRANT_URL` | Qdrant endpoint (separate k3s host, CPU) | — (required) |
-| `QDRANT_API_KEY` | Qdrant key; falls back to `~/.claude/settings.json` `mcpServers.loci.env` (or the legacy `mcpServers.hermes_memory.env`) | "" |
+| `QDRANT_API_KEY` | Qdrant key; falls back to `~/.claude/settings.json` `mcpServers.loci.env` (or the legacy `mcpServers.loci_memory.env`) | "" |
 | `OLLAMA_BASE_URL` / `OLLAMA_URL` | Ollama for the warm-GPU nomic embed path | — |
 | `EMBED_MODEL` | current embed model tag | `nomic-embed-text` |
 | `EMBED_VERSION` | current embed version marker | `1` |
@@ -71,7 +71,7 @@ GPU work here is **embedding, not generation**.
   from env), so `import reembed_daemon` hard-requires nothing and tests stub both.
 - **Grounding gap:** the exact payload key names (`embed_model`, `embed_version`) and the
   document text field are conventions chosen here, not verified against the live
-  hermes_memory / agent_core_chunks schema. Confirm the real payload keys before
+  loci_memory / agent_core_chunks schema. Confirm the real payload keys before
   `--apply` on production data, and override `--vector-name` if those collections use
   named vectors. Central integration wires this into the server later.
 ```

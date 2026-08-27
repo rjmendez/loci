@@ -68,8 +68,8 @@ def paths(tmp_path):
 def hook(paths):
     """Fresh module wired to tmp paths; tests mutate its globals freely."""
     return load_hook({
-        "HERMES_STATE_DB": paths["db"],
-        "HERMES_SYNC_CACHE": paths["cache"],
+        "LOCI_STATE_DB": paths["db"],
+        "LOCI_SYNC_CACHE": paths["cache"],
         "LOCI_INVESTIGATIONS_DIR": paths["loci"],
     })
 
@@ -180,7 +180,7 @@ def test_qdrant_is_none_when_unset_but_key_defaults_to_empty_string():
 
 def test_fixed_constants():
     h = load_hook()
-    assert h.COLLECTION == "hermes_sessions"
+    assert h.COLLECTION == "loci_sessions"
     assert h.MAX_CHARS == 4000
     assert h.EMBED_DIM == 4          # from MNEMOSYNE_EMBEDDING_DIM in BASE_ENV
     assert load_hook({"MNEMOSYNE_EMBEDDING_DIM": None}).EMBED_DIM == 768
@@ -188,7 +188,7 @@ def test_fixed_constants():
 
 
 def test_state_db_and_cache_are_user_expanded():
-    h = load_hook({"HERMES_STATE_DB": None, "HERMES_SYNC_CACHE": None})
+    h = load_hook({"LOCI_STATE_DB": None, "LOCI_SYNC_CACHE": None})
     assert h.STATE_DB == "/nonexistent-home-for-session-end-sync-tests/.hermes/state.db"
     assert h.CACHE_DIR == (
         "/nonexistent-home-for-session-end-sync-tests/.hermes/.session_sync_cache"
@@ -197,7 +197,7 @@ def test_state_db_and_cache_are_user_expanded():
 
 def test_agent_identity_constants_default_to_empty():
     h = load_hook({"HERMES_AGENT_ID": None, "HERMES_PROFILE": None,
-                   "HERMES_ACTIVE_INVESTIGATION": None})
+                   "LOCI_ACTIVE_INVESTIGATION": None})
     assert (h.AGENT_ID, h.PROFILE, h.ACTIVE_INV) == ("", "", "")
 
 
@@ -500,7 +500,7 @@ def test_write_cache_swallows_an_unusable_cache_dir(hook, tmp_path):
 
 def test_cached_msg_count_raises_when_the_cache_dir_cannot_be_created(hook, tmp_path):
     """BUG: cache_path() is called *outside* cached_msg_count()'s try block, so
-    an unusable HERMES_SYNC_CACHE turns the "return -1 on anything" contract
+    an unusable LOCI_SYNC_CACHE turns the "return -1 on anything" contract
     into an uncaught exception."""
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file")
@@ -591,7 +591,7 @@ def test_embed_propagates_malformed_response(hook):
 
 def test_embed_raises_when_ollama_base_url_is_unset(paths):
     """With OLLAMA None the Request constructor blows up -- main() catches it."""
-    h = load_hook({"OLLAMA_BASE_URL": None, "HERMES_STATE_DB": paths["db"]})
+    h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"]})
     with pytest.raises(Exception):
         h.embed("hi")
 
@@ -607,7 +607,7 @@ def test_qdrant_upsert_request_shape(hook):
     finally:
         p.stop()
     c = calls[0]
-    assert c["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions/points"
+    assert c["url"] == "http://qdrant.invalid:6333/collections/loci_sessions/points"
     assert c["method"] == "PUT"
     assert c["timeout"] == 5
     assert c["body"] == {"points": [
@@ -650,7 +650,7 @@ def http_error(code):
 
 
 def test_ensure_collection_noop_without_qdrant_url(paths):
-    h = load_hook({"QDRANT_URL": None, "HERMES_STATE_DB": paths["db"]})
+    h = load_hook({"QDRANT_URL": None, "LOCI_STATE_DB": paths["db"]})
     calls, p = patch_urlopen(h, Resp({}))
     try:
         assert h.ensure_collection() is None
@@ -669,7 +669,7 @@ def test_ensure_collection_creates_on_404(hook):
     finally:
         p.stop()
     assert [c["method"] for c in calls] == ["GET", "PUT"]
-    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions"
+    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/loci_sessions"
     assert calls[0]["timeout"] == 5
     assert calls[1]["timeout"] == 10
     assert calls[1]["body"] == {
@@ -1006,7 +1006,7 @@ def test_fast_path_still_calls_ensure_collection_first(wired):
 
 def test_main_crashes_if_the_cache_dir_is_unusable(wired, tmp_path):
     """BUG (fail-open violated): every other degraded path exits 0, but an
-    unusable HERMES_SYNC_CACHE lets cache_path()'s makedirs error escape
+    unusable LOCI_SYNC_CACHE lets cache_path()'s makedirs error escape
     main(), so the hook dies with a traceback and a non-zero status."""
     seed_session(wired)
     blocker = tmp_path / "not-a-dir"
@@ -1139,9 +1139,9 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
         url, method = req.full_url, req.get_method()
         if url.endswith("/v1/embeddings"):
             return Resp({"data": [{"embedding": [0.0, 1.0, 2.0, 3.0]}]})
-        if url.endswith("/collections/hermes_sessions") and method == "GET":
+        if url.endswith("/collections/loci_sessions") and method == "GET":
             raise http_error(404)
-        if url.endswith("/collections/hermes_sessions") and method == "PUT":
+        if url.endswith("/collections/loci_sessions") and method == "PUT":
             return Resp({"result": True, "status": "ok"})
         if url.endswith("/points"):
             return Resp({"result": {}, "status": "ok"})
@@ -1155,10 +1155,10 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
 
     urls = [(c["method"], c["url"]) for c in calls]
     assert urls == [
-        ("GET", "http://qdrant.invalid:6333/collections/hermes_sessions"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions"),
+        ("GET", "http://qdrant.invalid:6333/collections/loci_sessions"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions"),
         ("POST", "http://ollama.invalid:11434/v1/embeddings"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions/points"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions/points"),
     ]
     assert calls[-1]["body"]["points"][0]["id"] == hook.stable_id("s1")
     assert calls[-1]["body"]["points"][0]["vector"] == {"dense": [0.0, 1.0, 2.0, 3.0]}

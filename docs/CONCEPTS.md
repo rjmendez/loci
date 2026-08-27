@@ -170,7 +170,7 @@ agent can store a finding; another can retrieve it without any message-passing b
 them. They coordinate through shared memory.
 
 It is a separate process you start yourself, and unlike the MCP server it binds all
-interfaces by default. Set `HERMES_A2A_TOKEN` before running it anywhere reachable —
+interfaces by default. Set `LOCI_A2A_TOKEN` before running it anywhere reachable —
 without one it still starts, and only warns.
 
 ### Supply chain security

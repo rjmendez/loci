@@ -42,8 +42,8 @@ from datetime import datetime
 
 QDRANT_URL   = os.environ.get("QDRANT_URL")
 QDRANT_KEY   = os.environ.get("QDRANT_API_KEY",  "")
-VERDICTS_COL = os.environ.get("VERDICTS_COL",    "hermes_verdicts")
-MEMORY_COL   = os.environ.get("MEMORY_COL",      "hermes_memory")
+VERDICTS_COL = os.environ.get("VERDICTS_COL",    "loci_verdicts")
+MEMORY_COL   = os.environ.get("MEMORY_COL",      "loci_memory")
 DB_PATH      = os.environ.get("MNEMOSYNE_DB",
     os.path.expanduser("~/.hermes/mnemosyne/data/mnemosyne.db"))
 MUTEX_FLAG   = os.environ.get("GLYMPHATIC_MUTEX",
@@ -263,7 +263,7 @@ def sweep_edges(dry_run: bool) -> int:
 
 def sweep_duplicates(dry_run: bool) -> int:
     """WTA dedup: for cosine-near-1.0 pairs, keep higher importance point."""
-    print("[glym/duplicates] loading hermes_memory with vectors …")
+    print("[glym/duplicates] loading loci_memory with vectors …")
     pts = _scroll_all(MEMORY_COL, with_vectors=True)
     if not pts:
         print("[glym/duplicates] collection empty or unreachable")

@@ -11,8 +11,8 @@ import pathlib
 import unittest
 
 # Set required env vars before importing server (server exits at load if unset)
-os.environ.setdefault("HERMES_A2A_TOKEN", "test-token-abc123")
-os.environ.setdefault("HERMES_A2A_URL", "http://localhost:8201")
+os.environ.setdefault("LOCI_A2A_TOKEN", "test-token-abc123")
+os.environ.setdefault("LOCI_A2A_URL", "http://localhost:8201")
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("MNEMOSYNE_EMBEDDING_API_URL", "http://localhost:11434/v1")
 

@@ -11,7 +11,7 @@ from unittest import mock
 import server
 
 
-def _run(failing: set, collections=("hermes_memory", "agent_core_chunks")):
+def _run(failing: set, collections=("loci_memory", "agent_core_chunks")):
     """Search `collections`, raising for any name in `failing`."""
     def _fake(sq, collection_name=None, limit=None, query_filter=None):
         if collection_name in failing:
@@ -19,7 +19,7 @@ def _run(failing: set, collections=("hermes_memory", "agent_core_chunks")):
         return [{"origin": collection_name, "id": "p1", "score": 0.7, "text": "a finding"}]
 
     with mock.patch.object(server, "_qdrant_search_collection", _fake), \
-         mock.patch.object(server, "_get_qdrant", lambda: (object(), "hermes_memory")), \
+         mock.patch.object(server, "_get_qdrant", lambda: (object(), "loci_memory")), \
          mock.patch.object(server, "_rag_cross_encode", lambda *a, **k: None), \
          mock.patch.object(server, "_rag_record_access", lambda *a, **k: None):
         raw = server.rag_context_search(
@@ -30,9 +30,9 @@ def _run(failing: set, collections=("hermes_memory", "agent_core_chunks")):
 
 class TestRagFailureMode(unittest.TestCase):
     def test_all_collections_failing_is_not_reported_as_a_successful_search(self):
-        out = _run({"hermes_memory", "agent_core_chunks"})
+        out = _run({"loci_memory", "agent_core_chunks"})
         self.assertEqual(out["mode"], "rag_failed")
-        self.assertEqual(out["collections_failed"], ["agent_core_chunks", "hermes_memory"])
+        self.assertEqual(out["collections_failed"], ["agent_core_chunks", "loci_memory"])
 
     def test_one_collection_failing_is_degraded(self):
         out = _run({"agent_core_chunks"})

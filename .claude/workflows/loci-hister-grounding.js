@@ -146,7 +146,7 @@ Report exact counts and how you obtained them.`,
 that costs.
 
 In ${REPO}, read mcp/server.py's rag_context_search (collections default
-["hermes_memory","agent_core_chunks"]), the _rag_* helper chain, and
+["loci_memory","agent_core_chunks"]), the _rag_* helper chain, and
 mcp/verify.py's _lazy_rag. Establish:
   - the exact seam where a THIRD source could be merged, and whether the
     cross-encoder re-pass would rank across heterogeneous sources sensibly.

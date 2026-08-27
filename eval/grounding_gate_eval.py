@@ -13,7 +13,7 @@ and trend alongside the grounding-pipeline scores.
   Qdrant/Ollama, CI-safe — and prints the metrics without persisting.
 
 Run via eval/run_eval.sh (which invokes both harness.py and this), or directly
-with HERMES_PY. Threshold from $DTL_GROUND_THRESHOLD (default 0.59).
+with LOCI_PY. Threshold from $DTL_GROUND_THRESHOLD (default 0.59).
 """
 import json
 import math

@@ -148,7 +148,7 @@ def call_grounding(prompt: str) -> str:
     ).encode()
 
     python_exe = os.environ.get(
-        "HERMES_PY",
+        "LOCI_PY",
         str(Path.home() / ".hermes/hermes-agent/venv/bin/python3"),
     )
 

@@ -2,15 +2,15 @@
 """
 generate_memory_md.py
 ─────────────────────
-Regenerates ~/hermes_memory/memories/MEMORY.md from a PostgreSQL database
+Regenerates ~/loci_memory/memories/MEMORY.md from a PostgreSQL database
 (optional, configure via LOCI_DB_* env vars) or, if unavailable,
 from the local Mnemosyne SQLite DB + static identity block.
 
 Usage:
-    python3 ~/hermes_memory/scripts/generate_memory_md.py
-    python3 ~/hermes_memory/scripts/generate_memory_md.py --dry-run   (print to stdout, no write)
-    python3 ~/hermes_memory/scripts/generate_memory_md.py --source sqlite  (force SQLite mode)
-    python3 ~/hermes_memory/scripts/generate_memory_md.py --source postgres  (force Postgres mode)
+    python3 ~/loci_memory/scripts/generate_memory_md.py
+    python3 ~/loci_memory/scripts/generate_memory_md.py --dry-run   (print to stdout, no write)
+    python3 ~/loci_memory/scripts/generate_memory_md.py --source sqlite  (force SQLite mode)
+    python3 ~/loci_memory/scripts/generate_memory_md.py --source postgres  (force Postgres mode)
 
 Output format: § separators, GROUP: VALUE lines (same as existing MEMORY.md)
 """
@@ -22,7 +22,7 @@ import sqlite3
 import sys
 
 # ── paths ─────────────────────────────────────────────────────────────────────
-OUTPUT_PATH = os.path.expanduser("~/hermes_memory/memories/MEMORY.md")
+OUTPUT_PATH = os.path.expanduser("~/loci_memory/memories/MEMORY.md")
 SQLITE_DB   = os.path.expanduser(
     os.environ.get("MNEMOSYNE_DATA_DIR", "~/.hermes/mnemosyne/data")
 ).replace("~", os.path.expanduser("~")) + "/mnemosyne.db"

@@ -170,7 +170,7 @@ mcp/server.py, and any configuration it names against what the code reads.` },
 
 The storage story moved: the code graph is now graph.ladybug (LadybugStore, not
 Kuzu naming), findings.jsonl is a mixed append log whose access rows are not
-findings, and hermes_memory/mnemosyne/hermes_sessions all use a NAMED "dense"
+findings, and loci_memory/mnemosyne/loci_sessions all use a NAMED "dense"
 vector while agent_core_chunks is unnamed. Check every diagram and every claim
 about what is stored where against mcp/qdrant_ops.py, mcp/inv_store.py and
 mcp/graph/ladybug_store.py.` },

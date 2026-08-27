@@ -3,7 +3,7 @@
 A ``Verdict`` is an accumulated judgment about a *subject* — a CLI action, an
 LLM output, or a hermes memory/finding. The dataclass is wire-compatible with
 the Rust ``EnforcementMemory`` struct so the same qdrant collection
-(``hermes_verdicts``) can be shared between the Python and Rust layers.
+(``loci_verdicts``) can be shared between the Python and Rust layers.
 
 Pure stdlib — no third-party imports. The qdrant/mnemosyne backends layer on
 top of this without changing the schema.

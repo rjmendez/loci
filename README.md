@@ -213,9 +213,9 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | Embedding model (A2A) | `nomic-embed-text` | `MNEMOSYNE_EMBEDDING_MODEL` |
 | Embedding dimensions | `768` | `MNEMOSYNE_EMBEDDING_DIM` |
 | Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
-| Memory session dir (MCP) | `~/.hermes/memory-sessions` | `HERMES_MEMORY_DIR` |
-| Code graph store | `$HERMES_MEMORY_DIR/graph.ladybug` | — |
-| Qdrant collection prefix | `hermes_memory` | `QDRANT_COLLECTION_PREFIX` |
+| Memory session dir (MCP) | `~/.hermes/memory-sessions` | `LOCI_MEMORY_DIR` |
+| Code graph store | `$LOCI_MEMORY_DIR/graph.ladybug` | — |
+| Qdrant collection prefix | `loci_memory` | `QDRANT_COLLECTION_PREFIX` |
 | Backend config file | `~/.loci/backends.toml` | `LOCI_CONFIG` |
 | Hook state | `~/.claude/hook-state/` | — |
 
@@ -244,18 +244,18 @@ Two `.env.example` files are provided:
 |---|---|---|
 | `QDRANT_URL` | _(required)_ | Qdrant instance URL |
 | `QDRANT_API_KEY` | `""` | Qdrant auth key (blank for no-auth) |
-| `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Main Qdrant collection name |
+| `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Main Qdrant collection name |
 | `OLLAMA_BASE_URL` | _(required for embeddings)_ | Ollama base URL (no trailing `/v1`) |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model for MCP server |
 | `EMBED_API_KEY` | `""` | Cloud embedding provider API key |
 | `EMBED_API_KEY_HEADER` | `Authorization` | Auth header name for cloud embeddings |
-| `HERMES_MEMORY_DIR` | `~/.hermes/memory-sessions` | Investigation session storage root |
+| `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | Investigation session storage root |
 | `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension — must match your model |
 | `CODE_CHUNKS_COLLECTION` | _(unset)_ | Qdrant collection for `code_memory_correlate` |
-| `HERMES_MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable-http` |
-| `HERMES_MCP_HOST` | `127.0.0.1` | Bind host for SSE/HTTP transport |
-| `HERMES_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
-| `HERMES_MCP_TOKEN` | `""` | Bearer token for SSE/HTTP. Required for any non-loopback bind — the server exits rather than serve unauthenticated |
+| `LOCI_MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable-http` |
+| `LOCI_MCP_HOST` | `127.0.0.1` | Bind host for SSE/HTTP transport |
+| `LOCI_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
+| `LOCI_MCP_TOKEN` | `""` | Bearer token for SSE/HTTP. Required for any non-loopback bind — the server exits rather than serve unauthenticated |
 | `LOCI_OLLAMA_GEN_URL` | _(resolved by `backends.py`)_ | Generation endpoint override (`OLLAMA_GEN_URL` also read) |
 | `LOCI_VLLM_FALLBACK` | `0` | Allow generation to fall back to vLLM (`VLLM_BASE_URL`) when Ollama fails |
 | `LOCI_CONFIG` | `~/.loci/backends.toml` | Backend resolution config file |
@@ -267,9 +267,9 @@ Two `.env.example` files are provided:
 | `MNEMOSYNE_EMBEDDING_API_URL` | `http://localhost:11434/v1` | OpenAI-compat embedding endpoint |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model for A2A server |
 | `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Mnemosyne SQLite data directory |
-| `HERMES_A2A_TOKEN` | _(required)_ | Bearer token callers must present |
-| `HERMES_A2A_TOTP_SEED` | `""` | TOTP base32 seed (blank to disable) |
-| `HERMES_A2A_URL` | `http://127.0.0.1:8201` | Public URL injected into the agent card |
+| `LOCI_A2A_TOKEN` | _(required)_ | Bearer token callers must present |
+| `LOCI_A2A_TOTP_SEED` | `""` | TOTP base32 seed (blank to disable) |
+| `LOCI_A2A_URL` | `http://127.0.0.1:8201` | Public URL injected into the agent card |
 | `HERMES_AGENT_ID` | `hermes-agent` | Agent identity stamped on all writes |
 | `EXTRA_RAG_COLLECTIONS` | `""` | Comma-separated extra Qdrant collections for fan-out RAG |
 | `PEER_A2A_URLS` | `""` | Comma-separated peer A2A endpoints for context broadcast |
@@ -280,9 +280,9 @@ Two `.env.example` files are provided:
 
 | Collection | Purpose |
 |---|---|
-| `hermes_memory` (configurable via `QDRANT_COLLECTION_PREFIX`) | Primary long-term memory store |
-| `hermes_sessions` | Session history embeddings |
-| `hermes_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
+| `loci_memory` (configurable via `QDRANT_COLLECTION_PREFIX`) | Primary long-term memory store |
+| `loci_sessions` | Session history embeddings |
+| `loci_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
 | `mnemosyne` | Synced Mnemosyne SQLite vectors |
 
 ---
@@ -290,24 +290,24 @@ Two `.env.example` files are provided:
 ## MCP transport modes
 
 By default the MCP server runs over `stdio` for use as a Claude Code subprocess.
-For Docker or remote deployments set `HERMES_MCP_TRANSPORT=sse` (or
-`streamable-http`) and configure `HERMES_MCP_HOST` / `HERMES_MCP_PORT`.
+For Docker or remote deployments set `LOCI_MCP_TRANSPORT=sse` (or
+`streamable-http`) and configure `LOCI_MCP_HOST` / `LOCI_MCP_PORT`.
 
 The bind is loopback by default. A wider bind publishes the whole tool surface, so
-it requires `HERMES_MCP_TOKEN`: without one the server exits with a message instead
+it requires `LOCI_MCP_TOKEN`: without one the server exits with a message instead
 of serving (`mcp/server.py:8407`). With a token set, callers present
 `Authorization: Bearer <token>`; `/health` stays open so liveness probes still work.
-`docker-compose.yml` sets `HERMES_MCP_HOST=0.0.0.0` because a container has to bind
+`docker-compose.yml` sets `LOCI_MCP_HOST=0.0.0.0` because a container has to bind
 all its interfaces, so a token must be present in `.env` before `docker compose up`.
 
 ```bash
 # loopback — no token needed
-HERMES_MCP_TRANSPORT=sse HERMES_MCP_PORT=8000 \
+LOCI_MCP_TRANSPORT=sse LOCI_MCP_PORT=8000 \
   .venv/bin/python server.py
 
 # wide bind — token required, or the server refuses to start
-HERMES_MCP_TRANSPORT=sse HERMES_MCP_HOST=0.0.0.0 HERMES_MCP_PORT=8000 \
-  HERMES_MCP_TOKEN="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
+LOCI_MCP_TRANSPORT=sse LOCI_MCP_HOST=0.0.0.0 LOCI_MCP_PORT=8000 \
+  LOCI_MCP_TOKEN="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
   .venv/bin/python server.py
 ```
 

@@ -449,10 +449,10 @@ Examples of module-level names that are read by other modules:
     mcp/ladybug_ops.py:     _get_ladybug, _get_memory_dir
 
   File: mcp/server.py (module-level constants):
-    HERMES_MEMORY_DIR = os.environ.get('HERMES_MEMORY_DIR', '~/.hermes/findings')
+    LOCI_MEMORY_DIR = os.environ.get('LOCI_MEMORY_DIR', '~/.hermes/findings')
     MNEMOSYNE_DB = os.path.join(_mnem_data_dir, 'mnemosyne.db')
 
-  These are read by tools and dependencies via `from server import HERMES_MEMORY_DIR`.
+  These are read by tools and dependencies via `from server import LOCI_MEMORY_DIR`.
 
 Call-graph implication:
   - A complete call-graph must track which names are assigned at module level
@@ -500,7 +500,7 @@ Collection names and other literals used by Cypher/database queries:
 File paths mentioned in docstrings:
   File: mcp/graph/ladybug_store.py:1
     'Embedded LadybugDB graph store...'
-    References layout: '$HERMES_MEMORY_DIR/<investigation_id>/manifest.json'
+    References layout: '$LOCI_MEMORY_DIR/<investigation_id>/manifest.json'
 
 Call-graph implication:
   - String patterns may encode node types, collection names, or runtime configs

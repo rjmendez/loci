@@ -7,8 +7,8 @@ Uses the Loci A2A server's context_broadcast skill so local storage
 and peer fanout happen atomically server-side.
 
 Env vars (from ~/.hermes/.env or ~/.hermes/profiles/{HERMES_PROFILE}/.env):
-  HERMES_A2A_URL      Local A2A server endpoint (default: http://127.0.0.1:8201)
-  HERMES_A2A_TOKEN    Bearer token for the local server
+  LOCI_A2A_URL      Local A2A server endpoint (default: http://127.0.0.1:8201)
+  LOCI_A2A_TOKEN    Bearer token for the local server
   BRIDGE_LOOKBACK_MIN How many minutes back to look for new memories (default: 30)
   BRIDGE_MIN_IMP      Minimum importance to bridge (default: 0.5)
   BRIDGE_MAX_ITEMS    Max memories to push per run (default: 20)
@@ -55,11 +55,11 @@ if os.path.exists(_ENV):
             os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── config ───────────────────────────────────────────────────────────────────────
-LOCAL_A2A_URL  = os.environ.get("HERMES_A2A_URL", "http://127.0.0.1:8201")
+LOCAL_A2A_URL  = os.environ.get("LOCI_A2A_URL", "http://127.0.0.1:8201")
 # Empty, not "changeme": the server defaults the same variable to '' so an unset token fails closed.
-LOCAL_A2A_TOKEN = os.environ.get("HERMES_A2A_TOKEN", "")
+LOCAL_A2A_TOKEN = os.environ.get("LOCI_A2A_TOKEN", "")
 if not LOCAL_A2A_TOKEN:
-    print('WARNING: HERMES_A2A_TOKEN is not set. The bridge will be rejected by any '
+    print('WARNING: LOCI_A2A_TOKEN is not set. The bridge will be rejected by any '
           'server that enforces bearer auth. Generate one with: '
           'python3 -c "import secrets;print(secrets.token_hex(32))"', flush=True)
 LOOKBACK_MIN   = int(os.environ.get("BRIDGE_LOOKBACK_MIN", "30"))
@@ -68,7 +68,7 @@ MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
 AGENT_ID       = os.environ.get("HERMES_AGENT_ID", "hermes")
 
 # The local server may enforce TOTP on /a2a, where the bearer alone 401s; empty seed sends no header.
-LOCAL_A2A_TOTP_SEED = os.environ.get("HERMES_A2A_TOTP_SEED", "").strip()
+LOCAL_A2A_TOTP_SEED = os.environ.get("LOCI_A2A_TOTP_SEED", "").strip()
 
 _mnem_dir   = os.path.expanduser(os.environ.get("MNEMOSYNE_DATA_DIR", "~/.hermes/mnemosyne/data"))
 MNEMOSYNE_DB= os.path.join(_mnem_dir, "mnemosyne.db")
@@ -180,7 +180,7 @@ def _totp_now() -> str:
         import pyotp
     except ImportError:
         raise SystemExit(
-            "HERMES_A2A_TOTP_SEED is set but pyotp is not installed — the local server "
+            "LOCI_A2A_TOTP_SEED is set but pyotp is not installed — the local server "
             "enforces TOTP and every send would 401. Install pyotp or unset the seed."
         )
     return pyotp.TOTP(LOCAL_A2A_TOTP_SEED).now()

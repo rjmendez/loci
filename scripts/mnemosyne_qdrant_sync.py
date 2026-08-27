@@ -6,8 +6,8 @@ Run standalone or from cron.
 """
 import sqlite3, json, hashlib, sys, time, subprocess, os, base64, urllib.request
 
-# Load .env before anything else — override path with HERMES_ENV_FILE
-_ENV_FILE = os.path.expanduser(os.environ.get("HERMES_ENV_FILE", "~/.hermes/.env"))
+# Load .env before anything else — override path with LOCI_ENV_FILE
+_ENV_FILE = os.path.expanduser(os.environ.get("LOCI_ENV_FILE", "~/.hermes/.env"))
 if os.path.exists(_ENV_FILE):
     with open(_ENV_FILE) as _env_fh:
         for _line in _env_fh:
@@ -92,7 +92,7 @@ def ensure_collection(name=None, dim=None):
     Nothing in this repo ever created one -- every sync path only upserts points, and
     a2a_server's _qdrant_search swallows a 404 and returns [], so a missing collection
     surfaces as "0 results" rather than an error. That is how `mnemosyne` and
-    `hermes_sessions` sat absent on a host while every consumer reported success.
+    `loci_sessions` sat absent on a host while every consumer reported success.
 
     Schema matches what the consumers require: a NAMED "dense" vector, Cosine.
     """

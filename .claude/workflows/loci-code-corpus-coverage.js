@@ -79,7 +79,7 @@ const AUDITS = [
 Measured already, re-verify: 12,000 sampled points, only 298 carried a file_path
 (2.5%), zero contained "hugbot", and the top path roots were a2a, deployment,
 scouts, dispatch, mas-research — i.e. agent-mesh, not the repos Loci findings
-cite. The collection holds ~6M points and is NOT quantized (hermes_memory is the
+cite. The collection holds ~6M points and is NOT quantized (loci_memory is the
 only quantized collection on the instance).
 
 Answer, with evidence:
@@ -105,7 +105,7 @@ Two candidate mechanisms already exist — evaluate BOTH before recommending:
   a) .claude/workflows/loci-codebase-ingest.js — recovered today, takes args.repo,
      reads source and stores structured module docs into a Loci investigation via
      investigation_store. Verified working: 8 modules, idempotent (supersedes the
-     prior doc per module). But it writes FINDINGS, which land in hermes_memory —
+     prior doc per module). But it writes FINDINGS, which land in loci_memory —
      consider whether flooding the findings corpus with generated module docs is
      acceptable, and what it does to retrieval for real findings.
   b) whatever populates agent_core_chunks (find it in the audit) — if it is a
@@ -165,12 +165,12 @@ Constraints that decide the shape:
     are the ones with measured demand.
   - NO NEAR-DUPLICATES. The host carries many hugbot5000-wt-* worktrees of the
     same files. Index one canonical revision, not several.
-  - DO NOT POLLUTE hermes_memory with generated content unless the audit shows
+  - DO NOT POLLUTE loci_memory with generated content unless the audit shows
     that is genuinely fine. Retrieval quality for real findings is the thing being
     protected here.
   - The result must have a READER. Establish which retrieval path will actually
     surface it before writing anything — rag_context_search's collections list is
-    hardcoded to ["hermes_memory","agent_core_chunks"], so a new collection that
+    hardcoded to ["loci_memory","agent_core_chunks"], so a new collection that
     nothing queries is another dead lane.
 
 Report a BEFORE and AFTER: run a grounded query about a hugbot subsystem and show
@@ -220,7 +220,7 @@ Attack specifically:
   - Is the measured effect real, or an artefact? A retrieval improvement measured
     without QDRANT_URL set is measuring nothing. A count taken with a filter on an
     unindexed field is measuring nothing.
-  - Does it write generated content into hermes_memory, and what does that do to
+  - Does it write generated content into loci_memory, and what does that do to
     retrieval for REAL findings? Dilution is the risk nobody notices until later.
   - Could it index several worktree revisions of the same file?
   - Does the new content have a reader, or is rag_context_search's hardcoded

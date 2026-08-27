@@ -1,4 +1,4 @@
-# hermes_memory — local development override
+# loci_memory — local development override
 #
 # Adds Qdrant and Ollama sidecars so you can run everything locally.
 # This is for development and smoke-testing only — NOT a production topology.

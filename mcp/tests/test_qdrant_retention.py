@@ -34,7 +34,7 @@ class _Client:
 def _purge(env, count=5):
     client = _Client(count)
     with mock.patch.dict(os.environ, env, clear=False):
-        qdrant_ops._purge_old_records(client, "hermes_memory")
+        qdrant_ops._purge_old_records(client, "loci_memory")
     return client
 
 

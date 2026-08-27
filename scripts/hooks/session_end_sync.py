@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-on_session_end hook — live-sync the current session into Qdrant hermes_sessions.
+on_session_end hook — live-sync the current session into Qdrant loci_sessions.
 
 Fires at the end of every turn. Reads session_id and transcript_path from stdin
 JSON, takes the session's messages from state.db or, for a Claude Code session
 id that never resolves there, from the transcript, embeds via Ollama
-(nomic-embed-text 768d), and upserts a single point into hermes_sessions.
+(nomic-embed-text 768d), and upserts a single point into loci_sessions.
 
 Fast path: if the session has no new messages since the last upsert (checked
 via a lightweight mtime file), exit 0 immediately.
@@ -15,8 +15,17 @@ Target latency budget: <500ms (Ollama ~70ms warm + Qdrant ~15ms + overhead).
 import json, sys, os, sqlite3, hashlib, datetime, time
 import urllib.request, urllib.error
 
+# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
+# next to legacy_env.py; the repo copy finds it as a sibling too.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from legacy_env import apply as _apply_legacy_env
+    _apply_legacy_env()
+except Exception:
+    pass
+
 # ── Config ─────────────────────────────────────────────────────────────────
-STATE_DB    = os.path.expanduser(os.environ.get("HERMES_STATE_DB", "~/.hermes/state.db"))
+STATE_DB    = os.path.expanduser(os.environ.get("LOCI_STATE_DB", "~/.hermes/state.db"))
 QDRANT      = os.environ.get("QDRANT_URL")
 QDRANT_KEY  = os.environ.get("QDRANT_API_KEY", "")
 def _embeddings_url() -> "str | None":
@@ -33,17 +42,17 @@ OLLAMA      = _embeddings_url()
 EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
-COLLECTION  = "hermes_sessions"
+COLLECTION  = "loci_sessions"
 EMBED_DIM   = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", "768"))
 MAX_CHARS   = 4000   # chars of session content to embed
-CACHE_DIR   = os.path.expanduser(os.environ.get("HERMES_SYNC_CACHE", "~/.hermes/.session_sync_cache"))
+CACHE_DIR   = os.path.expanduser(os.environ.get("LOCI_SYNC_CACHE", "~/.hermes/.session_sync_cache"))
 AGENT_ID    = os.environ.get("HERMES_AGENT_ID", "")
 PROFILE     = os.environ.get("HERMES_PROFILE", "")
-ACTIVE_INV  = os.environ.get("HERMES_ACTIVE_INVESTIGATION", "")
+ACTIVE_INV  = os.environ.get("LOCI_ACTIVE_INVESTIGATION", "")
 # ───────────────────────────────────────────────────────────────────────────
 
 def ensure_collection():
-    """Create hermes_sessions with quantization + HNSW if it doesn't exist.
+    """Create loci_sessions with quantization + HNSW if it doesn't exist.
 
     Uses the raw REST API (no qdrant-client dep) so the hook stays zero-dep.
     Non-fatal: any error here is logged but does not abort the sync.
@@ -257,7 +266,7 @@ def transcript_session_content(transcript_path: str, session_id: str):
     }
 
 # One file per session id: without a TTL the directory grows with every session ever run.
-CACHE_TTL_DAYS = int(os.environ.get("HERMES_SYNC_CACHE_TTL_DAYS", "7"))
+CACHE_TTL_DAYS = int(os.environ.get("LOCI_SYNC_CACHE_TTL_DAYS", "7"))
 
 
 def prune_cache(now: float | None = None) -> int:

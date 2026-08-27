@@ -43,7 +43,7 @@ themselves. The older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py
 | `MNEMOSYNE_DB` | `~/.hermes/mnemosyne/data/mnemosyne.db` | ebbinghaus, amem, agentHER, memgas, score_trace |
 | `STATE_DIR` | `~/.claude/hook-state` | all hooks, skill_annotation_updater, score_trace, exif |
 | `SKILLS_DIR` | `~/.claude/skills` | skill_annotation_updater, skillops_maintenance, exif |
-| `HERMES_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
+| `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
 
 ### Tuning parameters
 
@@ -95,7 +95,7 @@ runs consolidation across all configured banks without spawning an LLM agent.
 
 `scripts/loci_groom.py` holds eight passes: `index`, `tags`, `recall`, `knn_tags`,
 `codelink`, `verify`, `reflect`, `summaries`. Only `index` is `applyable` — every
-other pass writes proposals under `$HERMES_MEMORY_DIR/_groom/` and never touches
+other pass writes proposals under `$LOCI_MEMORY_DIR/_groom/` and never touches
 `findings.jsonl`.
 
 Four are scheduled, from the user crontab, through `scripts/loci_groom_cron.sh`:
@@ -143,16 +143,16 @@ The repo is `loci` (github.com/rjmendez/loci). The commands below assume:
 
 ```bash
 LOCI=~/development/loci                              # your checkout
-HERMES_PY=~/.hermes/hermes-agent/venv/bin/python3    # interpreter with the deps
+LOCI_PY=~/.hermes/hermes-agent/venv/bin/python3    # interpreter with the deps
 ```
 
 `scripts/loci_groom_cron.sh` uses `$LOCI/mcp/.venv/bin/python` instead, and
-`eval/run_eval.sh` reads `$HERMES_PY` with the same default as above.
+`eval/run_eval.sh` reads `$LOCI_PY` with the same default as above.
 
 ### Rebuild MemGAS 3-level index
 
 ```bash
-$HERMES_PY $LOCI/scripts/memgas_hierarchy.py --index
+$LOCI_PY $LOCI/scripts/memgas_hierarchy.py --index
 ```
 
 Run after major Mnemosyne consolidation, or when memgas_l1/l2/l3 collections get stale.
@@ -160,14 +160,14 @@ Run after major Mnemosyne consolidation, or when memgas_l1/l2/l3 collections get
 ### Run MemGAS search
 
 ```bash
-$HERMES_PY $LOCI/scripts/memgas_hierarchy.py --search "your query here"
+$LOCI_PY $LOCI/scripts/memgas_hierarchy.py --search "your query here"
 ```
 
 ### Detect skill shadows
 
 ```bash
 OLLAMA_URL=http://localhost:11434 \
-$HERMES_PY $LOCI/scripts/skillops_maintenance.py
+$LOCI_PY $LOCI/scripts/skillops_maintenance.py
 ```
 
 Review SHADOW_RISK pairs. For sim=1.000 pairs: one is usually a duplicate install or
@@ -177,7 +177,7 @@ has an empty description — populate a distinctive description.
 
 ```bash
 STATE_DIR=~/.claude/hook-state \
-$HERMES_PY $LOCI/scripts/exif_skill_discovery.py
+$LOCI_PY $LOCI/scripts/exif_skill_discovery.py
 ```
 
 Review `~/.claude/hook-state/exif_discoveries.jsonl` for candidates. Promote manually:
@@ -188,7 +188,7 @@ cp -r ~/.claude/hook-state/candidate_skills/SKILLNAME ~/.claude/skills/SKILLNAME
 ### Build SCoRe fine-tuning dataset
 
 ```bash
-$HERMES_PY $LOCI/scripts/score_trace_collector.py
+$LOCI_PY $LOCI/scripts/score_trace_collector.py
 cat ~/.hermes/mnemosyne/data/score_traces/manifest.json
 ```
 
@@ -217,7 +217,7 @@ curl -s -X POST $QDRANT_URL/collections/eval_scores/points/scroll \
 
 ```bash
 QDRANT_API_KEY=$QDRANT_API_KEY \
-$HERMES_PY $LOCI/scripts/mnemosyne_qdrant_sync.py
+$LOCI_PY $LOCI/scripts/mnemosyne_qdrant_sync.py
 ```
 
 ### Run a groom pass by hand
@@ -252,7 +252,7 @@ stdin and exits 0 on any event name it does not recognise.
 |---|---|---|
 | `pre_llm_grounding.py` | `UserPromptSubmit`, `SubagentStart` (and legacy `pre_llm_call` / `PreLlmCall`) | per-turn Qdrant grounding injected into the prompt |
 | `pre_tool_grounding.py` | `PreToolUse` (and legacy `pre_tool_call`) | tool-call audit |
-| `session_end_sync.py` | `Stop` — reads `transcript_path` from the payload | session → `hermes_sessions` |
+| `session_end_sync.py` | `Stop` — reads `transcript_path` from the payload | session → `loci_sessions` |
 
 Install and drift-check them with `scripts/hooks/install.sh`:
 

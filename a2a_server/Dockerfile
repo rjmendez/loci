@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir \
 
 COPY server.py client.py ./
 
-# HERMES_A2A_TOKEN is required — server exits at startup if unset.
+# LOCI_A2A_TOKEN is required — server exits at startup if unset.
 # Provide it via .env file or environment injection.
 # Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
 
