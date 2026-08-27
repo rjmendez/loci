@@ -41,7 +41,7 @@ except ImportError:
 
 class LociClient:
     """
-    Async A2A client for the Hermes Memory server.
+    Async A2A client for the Loci A2A memory server.
 
     Auth conventions:
       - Bearer token in Authorization header

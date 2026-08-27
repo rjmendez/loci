@@ -5,7 +5,7 @@ Default port: **8201**
 ## What this does
 
 Exposes Mnemosyne memory operations over the A2A JSON-RPC protocol so other
-mesh agents can read and write memory without going through the Hermes MCP stack.
+mesh agents can read and write memory without going through the Loci MCP stack.
 
 Protocol: JSON-RPC 2.0 over HTTP POST to `/a2a`
 Auth: Bearer token (`HERMES_A2A_TOKEN`) + optional TOTP (`HERMES_A2A_TOTP_SEED`)
