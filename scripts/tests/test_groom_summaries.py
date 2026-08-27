@@ -59,10 +59,14 @@ class PassSummariesGateTest(unittest.TestCase):
 
 
 class PassSummariesWorkTest(unittest.TestCase):
-    def _inv(self, tmp, name, manifest):
+    def _inv(self, tmp, name, manifest, findings=None):
         d = tmp / name
         d.mkdir(parents=True)
         (d / "manifest.json").write_text(json.dumps(manifest))
+        recs = findings if findings is not None else [
+            {"record_type": "observed", "text": "a real finding to summarise"}]
+        (d / "findings.jsonl").write_text(
+            "".join(json.dumps(x) + "\n" for x in recs))
         return d
 
     def setUp(self):
@@ -132,3 +136,102 @@ class PassSummariesWorkTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmptyInvestigationTest(unittest.TestCase):
+    """Once the backlog is clear the only ones left are those with nothing to
+    summarise. Counting them as errors made the pass report degraded on every
+    single run, which is how a real failure goes unnoticed."""
+
+    def setUp(self):
+        import tempfile, pathlib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _inv(self, name, lines):
+        d = self.root / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"investigation_id": name}))
+        (d / "findings.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return d
+
+    def test_no_findings_file_is_not_an_error(self):
+        d = self.root / "bare"
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"investigation_id": "bare"}))
+        seen = []
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=lambda **kw: seen.append(kw))
+        self.assertEqual(seen, [], "must not reflect an investigation with no findings")
+        self.assertEqual(rep["nothing_to_say"], 1)
+        self.assertEqual(rep["errors"], 0)
+        self.assertEqual(rep["status"], "ok")
+
+    def test_access_rows_alone_are_not_summarisable(self):
+        self._inv("acc", [{"record_type": "access", "query": "q"}] * 5)
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=lambda **kw: None)
+        self.assertEqual(rep["nothing_to_say"], 1)
+        self.assertEqual(rep["errors"], 0)
+
+    def test_one_real_finding_is_summarisable(self):
+        d = self._inv("real", [{"record_type": "access"},
+                               {"record_type": "observed", "text": "a real one"}])
+
+        def reflect(investigation_id):
+            p = d / "manifest.json"
+            m = json.loads(p.read_text())
+            m["summary_l1"] = ["p"]
+            m["summary_l2"] = "Real."
+            p.write_text(json.dumps(m))
+
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=reflect)
+        self.assertEqual(rep["summarised"], 1)
+        self.assertEqual(rep["nothing_to_say"], 0)
+
+    def test_a_cleared_backlog_reports_ok_not_degraded(self):
+        self._inv("empty", [{"record_type": "access"}])
+        d = self.root / "done"
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps(
+            {"investigation_id": "done", "summary_l1": ["p"], "summary_l2": "Real."}))
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=lambda **kw: None)
+        self.assertEqual(rep["status"], "ok")
+        self.assertEqual(rep["summarised"], 0)
+
+    def test_a_retracted_only_investigation_has_nothing_to_say(self):
+        """investigation_reflect drops retracted findings, so an investigation
+        whose only finding is retracted reports 'Investigation with 0 findings'
+        forever. dtl-mnemo-probe is exactly this case."""
+        d = self._inv("retracted", [{"id": "f1", "record_type": "observed",
+                                     "text": "a finding that was retracted"}])
+        (d / "retractions.jsonl").write_text(
+            json.dumps({"finding_id": "f1", "active": True}) + "\n")
+        seen = []
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=lambda **kw: seen.append(kw))
+        self.assertEqual(seen, [])
+        self.assertEqual(rep["nothing_to_say"], 1)
+        self.assertEqual(rep["errors"], 0)
+        self.assertEqual(rep["status"], "ok")
+
+    def test_an_inactive_retraction_does_not_hide_a_finding(self):
+        d = self._inv("unretracted", [{"id": "f1", "record_type": "observed",
+                                       "text": "still a live finding"}])
+        (d / "retractions.jsonl").write_text(
+            json.dumps({"finding_id": "f1", "active": False}) + "\n")
+
+        def reflect(investigation_id):
+            p = d / "manifest.json"
+            m = json.loads(p.read_text())
+            m["summary_l1"] = ["p"]; m["summary_l2"] = "Real."
+            p.write_text(json.dumps(m))
+
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=reflect)
+        self.assertEqual(rep["summarised"], 1)
