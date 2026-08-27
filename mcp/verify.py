@@ -196,7 +196,7 @@ def _root_parents() -> list:
 def _search_roots() -> tuple:
     """The vetted checkout roots a ref may resolve under, primary repo root FIRST.
 
-    hermes_memory is a MULTI-REPO corpus: findings cite ``perception/depth.py`` recorded
+    loci_memory is a MULTI-REPO corpus: findings cite ``perception/depth.py`` recorded
     against a hugbot5000 checkout, not against this repo, so sandboxing every ref to
     _repo_root() rejected 100% of them (measured: 62 stored code_refs, 0 resolvable).
 
