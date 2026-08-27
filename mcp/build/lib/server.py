@@ -4154,20 +4154,19 @@ def _record_verdicts(verdicts: list) -> bool:
         import asyncio
 
         from memcheck import EmlConfig, QdrantBackend, VerdictEngine
-        from memcheck.vectors import COLLECTION, VECTOR_NAME, ensure_collection, hash_embed
 
-        ensure_collection(client, COLLECTION)
         backend = QdrantBackend(
             client=client,
-            collection=COLLECTION,
-            embed=hash_embed,
-            vector_name=VECTOR_NAME,
+            collection="loci_verdicts",
+            embed=_embed,
+            vector_name="dense",
         )
         engine = VerdictEngine(backend, EmlConfig())
 
         async def _record_all() -> None:
             for v in verdicts:
-                await engine.record(v, hash_embed(v.subject_excerpt))
+                # Embed here so a real dense vector is stored, not the backend's fallback.
+                await engine.record(v, _embed(v.subject_excerpt))
 
         # FastMCP dispatches sync tools inline on a running loop, where asyncio.run() raises.
         try:
@@ -4804,26 +4803,19 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
     """
     if client is None:
         return ("warn", "skipped — qdrant not reachable", None)
-    from memcheck.vectors import COLLECTION as VERDICTS_COLLECTION
-    from memcheck.vectors import EMBED_DIM as VERDICTS_DIM
-
     existing = {c.name for c in client.get_collections().collections}
     report: dict = {}
     main = main_col or QDRANT_COLLECTION_PREFIX
     main_present = main in existing
-    verdicts_present = VERDICTS_COLLECTION in existing
-    verdicts_dim = None
+    verdicts_present = "loci_verdicts" in existing
     if main_present:
         info = _health_qdrant_collection_info(client, main)
         report[main] = info
         collection_dims[main] = _health_collection_dim(info)
     if verdicts_present:
-        info = _health_qdrant_collection_info(client, VERDICTS_COLLECTION)
-        report[VERDICTS_COLLECTION] = info
-        # Deliberately NOT added to collection_dims: probe 6 compares that dict
-        # against the 768-dim embedder, and this collection is 384-dim by design.
-        verdicts_dim = _health_collection_dim(info)
-        report["expected_verdicts_dim"] = VERDICTS_DIM
+        info = _health_qdrant_collection_info(client, "loci_verdicts")
+        report["loci_verdicts"] = info
+        collection_dims["loci_verdicts"] = _health_collection_dim(info)
     report["expected_main_collection"] = main
     report["main_present"] = main_present
     report["loci_verdicts_present"] = verdicts_present
@@ -4839,16 +4831,8 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
         return (
             "warn",
             report,
-            f"'{VERDICTS_COLLECTION}' not yet created — it appears on first "
+            "'loci_verdicts' not yet created — it appears on first "
             "memory_self_check(record=True); benign until then",
-        )
-    if verdicts_dim is not None and verdicts_dim != VERDICTS_DIM:
-        return (
-            "fail",
-            report,
-            f"'{VERDICTS_COLLECTION}' has dim {verdicts_dim} but every writer "
-            f"produces {VERDICTS_DIM}-dim hash vectors — every verdict upsert "
-            "fails; recreate the collection at the expected dim",
         )
     return ("ok", report, None)
 
@@ -5326,11 +5310,9 @@ def _forget_finding_verdicts(finding: dict) -> int:
         import asyncio
 
         from memcheck import QdrantBackend, VerdictEngine
-        from memcheck.vectors import COLLECTION, VECTOR_NAME, hash_embed
 
-        # No ensure_collection: forgetting must never create the collection.
         backend = QdrantBackend(
-            client=client, collection=COLLECTION, embed=hash_embed, vector_name=VECTOR_NAME,
+            client=client, collection="loci_verdicts", embed=_embed, vector_name="dense",
         )
         engine = VerdictEngine(backend)
 

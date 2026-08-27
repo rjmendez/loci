@@ -182,6 +182,12 @@ def test_collections_extra_names_are_stripped_and_mapped():
     ]
 
 
+def test_grounding_extra_collections_does_not_inherit_extra_rag_collections():
+    """.env.example claimed a fallback that does not exist."""
+    h = load_hook({"EXTRA_RAG_COLLECTIONS": "my_codebase,my_docs"})
+    assert [c[0] for c in h.COLLECTIONS] == ["mnemosyne", "loci_sessions", "loci_memory"]
+
+
 def test_env_file_is_loaded_with_setdefault_semantics(tmp_path):
     home = tmp_path / "home"
     (home / ".hermes").mkdir(parents=True)

@@ -23,7 +23,7 @@ query
 
 Collections:
 - `loci_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
-- `loci_verdicts` — pre-answer claim check verdicts; created lazily on the first verdict write
+- `loci_verdicts` — pre-answer claim check verdicts; 384-dim hash vectors, schema owned by `memcheck/vectors.py`, created lazily on the first verdict write
 
 ## Requirements
 
