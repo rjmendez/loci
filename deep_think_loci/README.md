@@ -85,6 +85,6 @@ Each run mints more labeled pairs as a byproduct; run `harvest.sh` to fold them 
 
 ## Known limits
 
-- `mnemo_mirror` is **active** — findings persist to both qdrant `hermes_memory` (RAG) and mnemosyne (3.4.0 in Loci's MCP venv).
+- `mnemo_mirror` is **active** — findings persist to both qdrant `loci_memory` (RAG) and mnemosyne (3.4.0 in Loci's MCP venv).
 - The grounding gate **defaults to the cosine threshold (0.59)**. The trained classifier wins *in-sample* (pair CV acc 0.965; qf F1 0.94 vs 0.82) but **does not generalize yet**: leave-one-run-out validation (`eval/grounding_gate_oos_eval.py`) gives model F1 0.79 vs cosine 0.81 — it overfits on small/varied held-out runs (the in-sample numbers were the mirage the OOS eval exists to catch). The model is opt-in (`--model`); re-check OOS as the corpus grows and swap only when it actually generalizes.
 - Entailment-grounding (lineage/hallucination signals) is too sparse to train — accumulate deliberately.

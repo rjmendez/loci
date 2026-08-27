@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HERMES_ENV_FILE", "/nonexistent-env-file-for-tests")
+os.environ.setdefault("LOCI_ENV_FILE", "/nonexistent-env-file-for-tests")
 os.environ.setdefault("QDRANT_URL", "http://qdrant.invalid:6333")
 
 _SCRIPTS = pathlib.Path(__file__).resolve().parent.parent
@@ -93,13 +93,13 @@ class TestStateDbEnsureCollection(unittest.TestCase):
     def test_creates_when_absent(self):
         rec = _Recorder()
         with mock.patch.object(sd, "curl_json", rec):
-            self.assertTrue(sd.ensure_collection("k", "hermes_sessions"))
+            self.assertTrue(sd.ensure_collection("k", "loci_sessions"))
         self.assertEqual(len(rec.puts()), 1)
 
     def test_noop_when_already_present(self):
         rec = _Recorder(present_initially=True)
         with mock.patch.object(sd, "curl_json", rec):
-            self.assertFalse(sd.ensure_collection("k", "hermes_sessions"))
+            self.assertFalse(sd.ensure_collection("k", "loci_sessions"))
         self.assertEqual(rec.puts(), [])
 
 

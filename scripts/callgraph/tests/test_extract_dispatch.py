@@ -47,11 +47,7 @@ def test_multi_value_injection_leaves_calls_unresolved_and_dispatches_fan_out():
 
 
 def test_proven_rungs_1_3_are_never_revisited_by_the_probable_tier():
-    # register()'s own body calls _get_thing/_helper_a nowhere by bare name,
-    # but the module DOES have proven-rung calls (real_thing() inside
-    # registry_injection_caller.py's own module body is a def, not a call);
-    # use the calls_shapes fixture instead, which is dense with proven rungs,
-    # and assert none of them got touched by a second pass.
+    # calls_shapes is dense with proven rungs; none may be touched by a second pass.
     store, _, _ = build_fixture_store(["calls_shapes.py", "calls_target.py"])
     fn_id = "fn:calls_shapes.py::caller_name_def_local"
     sites = [n for n in store.nodes_of_kind("CALLSITE") if n.attrs.get("enclosing_fn") == fn_id]
@@ -89,9 +85,7 @@ def test_dict_subscript_dispatch_same_as_dict_get():
 
 
 def test_config_dict_is_not_a_dispatch_source():
-    # _CONFIG_MAP's values are literals, not bare-callable Names, so
-    # extract/registry.py never creates a REGISTRY for it — a local var
-    # assigned from it must not spuriously get a DISPATCHES fan-out either.
+    # Literal values make no REGISTRY, so no local assigned from it may fan out.
     store, _, _ = build_fixture_store(["registry_mandict.py"])
     assert store.get("reg:registry_mandict.py::_CONFIG_MAP") is None
 

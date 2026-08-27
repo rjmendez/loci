@@ -5,10 +5,10 @@ Default port: **8201**
 ## What this does
 
 Exposes Mnemosyne memory operations over the A2A JSON-RPC protocol so other
-mesh agents can read and write memory without going through the Hermes MCP stack.
+mesh agents can read and write memory without going through the Loci MCP stack.
 
 Protocol: JSON-RPC 2.0 over HTTP POST to `/a2a`
-Auth: Bearer token (`HERMES_A2A_TOKEN`) + optional TOTP (`HERMES_A2A_TOTP_SEED`)
+Auth: Bearer token (`LOCI_A2A_TOKEN`) + optional TOTP (`LOCI_A2A_TOTP_SEED`)
 Agent card: `GET /.well-known/agent.json`
 
 ## Skills
@@ -18,7 +18,7 @@ Agent card: `GET /.well-known/agent.json`
 | `memory_recall`     | FTS5 + Qdrant semantic search across working_memory, episodic_memory, mnemosyne collection |
 | `memory_remember`   | Write a memory tagged with caller's sender/agent_id |
 | `memory_stats`      | SQLite row counts + Qdrant collection sizes |
-| `session_search`    | Semantic search over `hermes_sessions` Qdrant collection |
+| `session_search`    | Semantic search over `loci_sessions` Qdrant collection |
 | `memory_sleep`      | Trigger Mnemosyne consolidation via dashboard API |
 | `rag_search`        | RAG-style retrieval: hybrid search + context assembly for grounding LLM prompts |
 | `context_broadcast` | Broadcast a context update to all subscribed mesh agents |
@@ -28,9 +28,9 @@ Agent card: `GET /.well-known/agent.json`
 ### 1. Add secrets to .env
 
 ```
-HERMES_A2A_TOKEN=<generate a strong token>
-HERMES_A2A_TOTP_SEED=<base32 seed — optional, omit to disable TOTP>
-HERMES_A2A_URL=http://<your-host>:8201
+LOCI_A2A_TOKEN=<generate a strong token>
+LOCI_A2A_TOTP_SEED=<base32 seed — optional, omit to disable TOTP>
+LOCI_A2A_URL=http://<your-host>:8201
 HERMES_AGENT_ID=<your-agent-id>
 ```
 
@@ -61,7 +61,7 @@ curl -s http://localhost:8201/health | python3 -m json.tool
 # Agent card
 curl -s http://localhost:8201/.well-known/agent.json | python3 -m json.tool
 
-# Call a skill (requires HERMES_A2A_TOKEN)
+# Call a skill (requires LOCI_A2A_TOKEN)
 TOKEN="<your-token>"
 curl -s -X POST http://localhost:8201/a2a \
   -H "Authorization: Bearer $TOKEN" \
@@ -84,8 +84,8 @@ python3 client.py remember "Test memory from CLI" --sender my-agent
 import aiohttp, pyotp, uuid
 
 LOCI_ENDPOINT = "http://<your-host>:8201/a2a"
-LOCI_TOKEN    = os.environ["HERMES_A2A_TOKEN"]
-LOCI_TOTP     = pyotp.TOTP(os.environ["HERMES_A2A_TOTP_SEED"])  # if TOTP enabled
+LOCI_TOKEN    = os.environ["LOCI_A2A_TOKEN"]
+LOCI_TOTP     = pyotp.TOTP(os.environ["LOCI_A2A_TOTP_SEED"])  # if TOTP enabled
 
 payload = {
     "jsonrpc": "2.0",
@@ -120,7 +120,7 @@ memories = await c.memory_recall("search query")
 
 ## Design notes
 
-- Auth: Bearer token + optional TOTP. Set `HERMES_A2A_TOKEN` in your `.env`.
+- Auth: Bearer token + optional TOTP. Set `LOCI_A2A_TOKEN` in your `.env`.
   Token is read at startup; restart the server after rotating.
 - Memory writes are tagged with `sender` (caller's agent_id) in `metadata_json`
   so cross-agent provenance is preserved.

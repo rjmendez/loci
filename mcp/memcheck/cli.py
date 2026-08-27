@@ -26,7 +26,6 @@ not on the hook path).
 from __future__ import annotations
 
 import logging
-import hashlib
 import json
 import os
 import sys
@@ -38,6 +37,13 @@ from typing import Any, Optional
 # (qdrant_client) is imported lazily inside check_action so the hot path pays
 # for it only when qdrant is actually reachable.
 from .backend import VerdictBackend
+from .vectors import (
+    COLLECTION,
+    EMBED_DIM,
+    VECTOR_NAME,
+    ensure_collection,
+    hash_embed,
+)
 from .verdict import make_signature, new_verdict, redact_excerpt
 
 logger = logging.getLogger("loci-mcp.cli")
@@ -58,9 +64,6 @@ __all__ = [
     "main",
 ]
 
-EMBED_DIM = 384
-COLLECTION = "hermes_verdicts"
-VECTOR_NAME = "dense"
 QDRANT_TIMEOUT_S = 1.0
 PROMOTE_AFTER = 3  # mirrors EmlConfig.promote_after; a block-class verdict at
 # this many occurrences is what enforce-mode WOULD act on.
@@ -85,36 +88,6 @@ _SECRET_KEY_HINTS = (
 _SECRET_REDACTION = "[REDACTED]"
 # Bound on any single stringified value before it enters the descriptor/log.
 _VALUE_MAX_CHARS = 256
-
-
-# --------------------------------------------------------------------------- #
-# Deterministic hash embedder (NO model load — must stay cheap)
-# --------------------------------------------------------------------------- #
-def hash_embed(text: str) -> list[float]:
-    """Deterministic text -> ``EMBED_DIM``-float vector in [-1, 1].
-
-    Seeds a byte stream from ``sha256(text)`` and tiles its bytes to
-    ``EMBED_DIM`` floats. No model, no network — identical text always yields an
-    identical vector, which is all the EXACT-match recall path needs (recall is
-    keyed on the stable point id, not on vector proximity). Returning a real
-    384-dim vector keeps the qdrant collection's named ``dense`` vector valid.
-    """
-    if text is None:
-        text = ""
-    # Expand the 32-byte digest deterministically to >= EMBED_DIM bytes by
-    # hashing (digest || counter) repeatedly.
-    out: list[float] = []
-    counter = 0
-    seed = text.encode("utf-8")
-    while len(out) < EMBED_DIM:
-        block = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
-        for b in block:
-            if len(out) >= EMBED_DIM:
-                break
-            # byte 0..255 -> float in [-1, 1]
-            out.append((b / 127.5) - 1.0)
-        counter += 1
-    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +175,7 @@ def _build_qdrant_backend() -> Optional[VerdictBackend]:
     """Construct a QdrantBackend against the configured URL, or None on failure.
 
     Imports ``qdrant_client`` lazily, connects with a short timeout, ensures the
-    ``hermes_verdicts`` collection exists (creating it with a 384-dim cosine
+    ``loci_verdicts`` collection exists (creating it with a 384-dim cosine
     ``dense`` vector if missing), and wires the deterministic ``hash_embed`` so
     no embedding model is ever loaded. Any failure (import error, connection
     refused, timeout) returns None so the caller logs ``qdrant_unavailable`` and
@@ -211,23 +184,13 @@ def _build_qdrant_backend() -> Optional[VerdictBackend]:
     from .qdrant import QdrantBackend  # local import keeps package import cheap
 
     from qdrant_client import QdrantClient
-    from qdrant_client import models as qmodels
 
     url = os.environ.get("QDRANT_URL")
     client = QdrantClient(url=url, timeout=QDRANT_TIMEOUT_S)
 
-    # Ensure the collection exists. collection_exists is a single fast call; if
-    # it raises (qdrant down), we propagate so the caller treats qdrant as
-    # unavailable.
-    if not client.collection_exists(COLLECTION):
-        client.create_collection(
-            collection_name=COLLECTION,
-            vectors_config={
-                VECTOR_NAME: qmodels.VectorParams(
-                    size=EMBED_DIM, distance=qmodels.Distance.COSINE
-                )
-            },
-        )
+    # Raises if qdrant is down or the collection is at another dimension; the
+    # caller treats either as unavailable and exits 0.
+    ensure_collection(client, COLLECTION)
 
     return QdrantBackend(
         client,

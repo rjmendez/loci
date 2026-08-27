@@ -50,7 +50,7 @@ class _RaisingClient(_Client):
 
 def _patch(client, embed=(0.1, 0.2, 0.3)):
     return (
-        mock.patch.object(server, "_get_qdrant", lambda: (client, "hermes_memory")),
+        mock.patch.object(server, "_get_qdrant", lambda: (client, "loci_memory")),
         mock.patch.object(server, "_embed", lambda _t: list(embed)),
     )
 

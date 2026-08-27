@@ -21,7 +21,7 @@ _mnemo_recall_fn = None
 
 
 def _mnemo_bank() -> str:
-    return os.environ.get("HERMES_MNEMO_BANK", "default")
+    return os.environ.get("LOCI_MNEMO_BANK", "default")
 
 
 def _get_mnemo_funcs() -> tuple[Any | None, Any | None]:

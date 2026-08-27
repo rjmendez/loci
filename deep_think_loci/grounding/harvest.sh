@@ -7,11 +7,11 @@
 # of runs, or on a schedule (cron). When the trained model's CV accuracy beats the
 # cosine baseline, swap it in as the gate default (ground_gate.py --model ...).
 #
-# Env: HERMES_PY (python with numpy/scikit-learn), DTL_CORPUS_GLOB, OLLAMA_BASE_URL.
+# Env: LOCI_PY (python with numpy/scikit-learn), DTL_CORPUS_GLOB, OLLAMA_BASE_URL.
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # deep_think_loci/grounding
 REPO="$(cd "$SRC/../.." && pwd)"
-PY="${HERMES_PY:-python3}"
+PY="${LOCI_PY:-python3}"
 CORPUS="${DTL_CORPUS_GLOB:-$HOME/.hermes/memory-sessions/dt-loci-*/findings.jsonl}"
 
 shopt -s nullglob

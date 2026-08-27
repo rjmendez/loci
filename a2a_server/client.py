@@ -41,7 +41,7 @@ except ImportError:
 
 class LociClient:
     """
-    Async A2A client for the Hermes Memory server.
+    Async A2A client for the Loci A2A memory server.
 
     Auth conventions:
       - Bearer token in Authorization header
@@ -55,10 +55,10 @@ class LociClient:
         totp_seed: str = None,
         sender: str = None
     ):
-        self.endpoint  = (endpoint or os.environ.get('HERMES_A2A_URL',
+        self.endpoint  = (endpoint or os.environ.get('LOCI_A2A_URL',
                           'http://127.0.0.1:8201')).rstrip('/')
-        self.token     = token or os.environ.get('HERMES_A2A_TOKEN', '')
-        self.totp_seed = totp_seed or os.environ.get('HERMES_A2A_TOTP_SEED', '')
+        self.token     = token or os.environ.get('LOCI_A2A_TOKEN', '')
+        self.totp_seed = totp_seed or os.environ.get('LOCI_A2A_TOTP_SEED', '')
         self.sender    = sender or os.environ.get('HERMES_AGENT_ID', 'unknown')
 
     def _headers(self) -> dict:

@@ -2,7 +2,7 @@
 
 Verifies:
   - Destructive skill called by unprivileged sender → 403
-  - Destructive skill called by privileged sender (via HERMES_A2A_PRIVILEGED_SENDERS) → dispatched
+  - Destructive skill called by privileged sender (via LOCI_A2A_PRIVILEGED_SENDERS) → dispatched
   - Non-destructive skill callable by any authenticated sender
 """
 
@@ -13,8 +13,8 @@ import pathlib
 import unittest
 from unittest import mock
 
-os.environ.setdefault("HERMES_A2A_TOKEN", "test-token-abc123")
-os.environ.setdefault("HERMES_A2A_URL", "http://localhost:8201")
+os.environ.setdefault("LOCI_A2A_TOKEN", "test-token-abc123")
+os.environ.setdefault("LOCI_A2A_URL", "http://localhost:8201")
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("MNEMOSYNE_EMBEDDING_API_URL", "http://localhost:11434/v1")
 

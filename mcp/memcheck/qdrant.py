@@ -1,6 +1,6 @@
 """Qdrant-backed VerdictBackend (increment 1).
 
-Persists verdicts in a dedicated qdrant collection (``hermes_verdicts`` by
+Persists verdicts in a dedicated qdrant collection (``loci_verdicts`` by
 default), separate from ``ironclaw_enforcement`` per the locked design decision
 but with the same schema so the collections are interchangeable.
 
@@ -55,15 +55,15 @@ import uuid
 from typing import Callable, Optional
 
 from .backend import ScoredVerdict, VerdictBackend
+from .vectors import COLLECTION
 from .verdict import Verdict, make_signature
 
-__all__ = ["QdrantBackend"]
+__all__ = ["QdrantBackend", "COLLECTION"]
 
 _log = logging.getLogger("memcheck")
 
 # Stable namespace for uuid5(subject_signature) point ids.
 VERDICT_NAMESPACE = uuid.UUID("6d656d63-6865-636b-0000-646f6e757400")
-COLLECTION = "hermes_verdicts"
 
 # Decisions that count as a recurring "block" for stats.
 _BLOCKING = ("flag", "warn", "quarantine")
@@ -85,7 +85,7 @@ class QdrantBackend(VerdictBackend):
         are used; each is run via ``asyncio.to_thread`` so the async contract
         holds without blocking the event loop.
     collection:
-        Target collection name (defaults to ``hermes_verdicts``).
+        Target collection name (defaults to ``loci_verdicts``).
     embed:
         Callable ``str -> list[float] | None`` producing the dense vector for a
         text (``server.py``'s ``_embed``).

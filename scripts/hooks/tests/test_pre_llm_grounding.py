@@ -25,7 +25,9 @@ import json
 import math
 import os
 import pathlib
+import builtins
 import sys
+import urllib.error
 import time
 import types
 from unittest import mock
@@ -34,8 +36,7 @@ import pytest
 
 HOOK_PATH = pathlib.Path(__file__).resolve().parent.parent / "pre_llm_grounding.py"
 
-# A neutral, fully-specified environment. HOME points at a directory that does
-# not exist so the module's .env loading and ~/.hermes defaults are inert.
+# HOME points at a nonexistent directory so .env loading and ~/.hermes defaults stay inert.
 BASE_ENV = {
     "HOME": "/nonexistent-home-for-pre-llm-grounding-tests",
     "HERMES_HOME": "/nonexistent-home-for-pre-llm-grounding-tests/.hermes",
@@ -166,8 +167,8 @@ def test_collections_base_set_and_field_mapping():
     h = load_hook({"GROUNDING_EXTRA_COLLECTIONS": ""})
     assert h.COLLECTIONS == [
         ("mnemosyne", "content", "importance", True),
-        ("hermes_sessions", "content_preview", None, True),
-        ("hermes_memory", "text", "confidence", True),
+        ("loci_sessions", "content_preview", None, True),
+        ("loci_memory", "text", "confidence", True),
     ]
 
 
@@ -179,6 +180,12 @@ def test_collections_extra_names_are_stripped_and_mapped():
         ("agent_core_chunks", "text", None, False),   # note: unnamed vector
         ("brand_new_col", "text", None, True),        # unknown -> default fields
     ]
+
+
+def test_grounding_extra_collections_does_not_inherit_extra_rag_collections():
+    """.env.example claimed a fallback that does not exist."""
+    h = load_hook({"EXTRA_RAG_COLLECTIONS": "my_codebase,my_docs"})
+    assert [c[0] for c in h.COLLECTIONS] == ["mnemosyne", "loci_sessions", "loci_memory"]
 
 
 def test_env_file_is_loaded_with_setdefault_semantics(tmp_path):
@@ -285,7 +292,8 @@ def test_search_collection_named_vector_request_shape(hook):
         calls.stop()
     c = calls[0]
     assert c["url"] == "http://qdrant.invalid:6333/collections/mnemosyne/points/search"
-    assert c["body"] == {"vector": {"dense": [1.0, 2.0]}, "limit": 4,
+    # A named vector is {"name": ..., "vector": ...}; {"dense": [...]} is a 400.
+    assert c["body"] == {"vector": {"name": "dense", "vector": [1.0, 2.0]}, "limit": 4,
                          "with_payload": True, "with_vector": False}
     assert c["headers"]["Api-key"] == "test-key"
     assert c["timeout"] == 2.0
@@ -369,15 +377,27 @@ def test_search_collection_non_numeric_importance_raises(hook):
     calls = fake_urlopen(hook, _hit_response(pts))
     try:
         with pytest.raises(ValueError):
-            hook._search_collection("hermes_memory", [1.0], "text", "confidence", True)
+            hook._search_collection("loci_memory", [1.0], "text", "confidence", True)
     finally:
         calls.stop()
 
 
-def test_search_collection_returns_empty_on_transport_error(hook):
+def test_search_collection_raises_on_transport_error(hook):
+    # Returning [] would make a failed search indistinguishable from an empty one.
     calls = fake_urlopen(hook, OSError("down"))
     try:
-        assert hook._search_collection("c1", [1.0], "text", None, True) == []
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
+    finally:
+        calls.stop()
+
+
+def test_search_collection_raises_on_http_error(hook):
+    calls = fake_urlopen(hook, urllib.error.HTTPError(
+        "u", 400, "Bad Request", {}, io.BytesIO(b'{"status":{"error":"x"}}')))
+    try:
+        with pytest.raises(hook._SearchFailed):
+            hook._search_collection("c1", [1.0], "text", None, True)
     finally:
         calls.stop()
 
@@ -407,10 +427,19 @@ def test_search_collection_missing_result_key_is_empty(hook):
 # ---------------------------------------------------------------------------
 
 def test_beam_fallback_returns_empty_when_mnemosyne_missing(hook):
+    # Clearing sys.modules is not enough: the import re-succeeds from disk.
     saved = list(sys.path)
+    real_import = builtins.__import__
+
+    def no_mnemosyne(name, *a, **kw):
+        if name.startswith("mnemosyne"):
+            raise ImportError(f"no module named {name}")
+        return real_import(name, *a, **kw)
+
     blocked = {m: None for m in list(sys.modules) if m.startswith("mnemosyne")}
     try:
-        with mock.patch.dict(sys.modules, blocked):
+        with mock.patch.dict(sys.modules, blocked), \
+                mock.patch.object(builtins, "__import__", no_mnemosyne):
             for m in blocked:
                 del sys.modules[m]
             assert hook._beam_fallback("some query") == []
@@ -666,11 +695,11 @@ def test_effective_pheromone_evaporates_by_halflife(hook):
 def test_pheromone_deposit_request_shape(hook):
     calls = fake_urlopen(hook, Resp({"result": True}))
     try:
-        hook._pheromone_deposit("hermes_memory", "pt-1", 2.0, 1_700_000_000.0)
+        hook._pheromone_deposit("loci_memory", "pt-1", 2.0, 1_700_000_000.0)
     finally:
         calls.stop()
     c = calls[0]
-    assert c["url"] == "http://qdrant.invalid:6333/collections/hermes_memory/points/payload"
+    assert c["url"] == "http://qdrant.invalid:6333/collections/loci_memory/points/payload"
     assert c["body"] == {"points": ["pt-1"],
                          "payload": {"pheromone": 3.0,
                                      "pheromone_reinforced_ts": 1_700_000_000.0}}
@@ -809,10 +838,7 @@ def test_mmr_select_empty_content_similarity_is_zero(hook):
 
 
 def test_mmr_select_requires_ms_score(hook, monkeypatch):
-    # _mmr_select fills its final slot from random.random() < PHERO_EPSILON, and
-    # that branch never reads ms_score — so unseeded this asserts nothing 5% of the
-    # time (measured: 4 failures in 80 runs against PHERO_EPSILON=0.05). Pin the
-    # draw above epsilon so the MMR path, which is the path under test, is taken.
+    # Pin epsilon to 0: the random slot never reads ms_score, so unseeded this is flaky.
     monkeypatch.setattr(hook, "PHERO_EPSILON", 0.0)
     with pytest.raises(KeyError):
         hook._mmr_select([{"content": "a"}, {"content": "b"}], 1)
@@ -831,10 +857,10 @@ def test_mmr_select_epsilon_branch_does_not_need_ms_score(hook, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_format_results_line_shape_and_collection_dashes(hook):
-    hits = [{"collection": "hermes_memory", "score": 0.876, "content": "a finding"}]
+    hits = [{"collection": "loci_memory", "score": 0.876, "content": "a finding"}]
     out = hook._format_results(hits, "why", False)
     assert out.splitlines()[0] == 'MEMORY MATCH (1 results from 3 Qdrant collections) for "why":'
-    assert out.splitlines()[1] == "[hermes-memory|0.88] a finding"
+    assert out.splitlines()[1] == "[loci-memory|0.88] a finding"
     assert out.splitlines()[2].startswith("Use mcp_mnemosyne_mnemosyne_recall")
 
 
@@ -846,7 +872,7 @@ def test_format_results_fallback_source_label(hook):
 def test_format_results_source_label_counts_all_collections_even_when_unused(hook):
     """Note: the label reports len(COLLECTIONS), not how many were searched --
     the subagent path searches one collection but still claims three."""
-    hits = [{"collection": "hermes_memory", "score": 0.5, "content": "x"}]
+    hits = [{"collection": "loci_memory", "score": 0.5, "content": "x"}]
     hook.COLLECTIONS = hook.COLLECTIONS + [("extra", "text", None, True)]
     assert "from 4 Qdrant collections" in hook._format_results(hits, "q", False)
 
@@ -1061,8 +1087,8 @@ def test_main_fans_out_over_every_configured_collection(hook):
     run_main(hook, _prompt())
     assert sorted(calls) == sorted([
         ("mnemosyne", (0.25,), "content", "importance", True, 3),
-        ("hermes_sessions", (0.25,), "content_preview", None, True, 3),
-        ("hermes_memory", (0.25,), "text", "confidence", True, 3),
+        ("loci_sessions", (0.25,), "content_preview", None, True, 3),
+        ("loci_memory", (0.25,), "text", "confidence", True, 3),
     ])
 
 
@@ -1078,33 +1104,33 @@ def test_main_one_collection_blowing_up_does_not_sink_the_turn(hook):
     hook._load_rules_summary = lambda: ""
     _, out = run_main(hook, _prompt())
     ctx = context_of(out)
-    assert "from hermes_sessions" in ctx and "from hermes_memory" in ctx
+    assert "from loci_sessions" in ctx and "from loci_memory" in ctx
     assert "from mnemosyne" not in ctx
     assert "(2 results" in ctx
 
 
 def test_main_filters_hits_below_min_importance(hook):
-    hits = [{"collection": "hermes_memory", "point_id": None, "score": 0.9,
+    hits = [{"collection": "loci_memory", "point_id": None, "score": 0.9,
              "importance": 0.19, "fused": 0.17, "content": "too unimportant", "payload": {}},
-            {"collection": "hermes_memory", "point_id": None, "score": 0.9,
+            {"collection": "loci_memory", "point_id": None, "score": 0.9,
              "importance": 0.2, "fused": 0.18, "content": "exactly at the floor",
              "payload": {}}]
     hook._embed = lambda t: [0.1]
-    hook._search_collection = lambda col, *a, **k: hits if col == "hermes_memory" else []
+    hook._search_collection = lambda col, *a, **k: hits if col == "loci_memory" else []
     hook._load_rules_summary = lambda: ""
     _, out = run_main(hook, _prompt())
     ctx = context_of(out)
     assert "exactly at the floor" in ctx and "too unimportant" not in ctx
 
 
-def test_main_deposits_pheromone_only_on_hermes_memory_hits(hook):
+def test_main_deposits_pheromone_only_on_loci_memory_hits(hook):
     deposits = []
     hook._embed = lambda t: [0.1]
     hook._pheromone_deposit = lambda *a: deposits.append(a)
     hook._load_rules_summary = lambda: ""
 
     def _search(col, *a, **k):
-        if col == "hermes_memory":
+        if col == "loci_memory":
             return [{"collection": col, "point_id": "hm-1", "score": 0.9, "importance": 0.9,
                      "fused": 0.81, "content": "finding one",
                      "payload": {"pheromone": 4.0}},
@@ -1119,7 +1145,7 @@ def test_main_deposits_pheromone_only_on_hermes_memory_hits(hook):
     run_main(hook, _prompt())
     assert len(deposits) == 1
     col, pid, current, ts = deposits[0]
-    assert (col, pid, current) == ("hermes_memory", "hm-1", 4.0)
+    assert (col, pid, current) == ("loci_memory", "hm-1", 4.0)
     assert abs(ts - time.time()) < 30
 
 
@@ -1130,19 +1156,19 @@ def test_main_orders_output_by_multi_signal_score_not_raw_score(hook):
     hook._pheromone_deposit = lambda *a: None
     hook._search_collection = lambda col, *a, **k: ([
         # higher cosine, stale + low confidence
-        {"collection": "hermes_memory", "point_id": None, "score": 0.95, "importance": 0.9,
+        {"collection": "loci_memory", "point_id": None, "score": 0.95, "importance": 0.9,
          "fused": 0.855, "content": "stale but similar",
          "payload": {"created_at_ts": now - 400 * 86400, "confidence": "low",
                      "record_type": "gap"}},
         # lower cosine, fresh + trusted + observed
-        {"collection": "hermes_memory", "point_id": None, "score": 0.70, "importance": 0.9,
+        {"collection": "loci_memory", "point_id": None, "score": 0.70, "importance": 0.9,
          "fused": 0.63, "content": "fresh and trusted",
          "payload": {"created_at_ts": now, "confidence": "high",
                      "record_type": "observed"}},
-    ] if col == "hermes_memory" else [])
+    ] if col == "loci_memory" else [])
     with mock.patch("random.random", return_value=1.0):
         _, out = run_main(hook, _prompt())
-    lines = [ln for ln in context_of(out).splitlines() if ln.startswith("[hermes-memory")]
+    lines = [ln for ln in context_of(out).splitlines() if ln.startswith("[loci-memory")]
     assert lines[0].endswith("fresh and trusted")
     assert lines[1].endswith("stale but similar")
 
@@ -1274,7 +1300,7 @@ def test_subagent_detection_sources(hook, payload_extra, session_id, env):
     _, out = run_main(hook, p, env=env)
     # lightweight path: exactly one collection, capped at 2 results
     assert len(seen) == 1
-    assert seen[0][0][0] == "hermes_memory"
+    assert seen[0][0][0] == "loci_memory"
     assert seen[0][0][2:] == ("text", "confidence", True)
     assert seen[0][1] == {"top_k": 2}
     assert "grounding unavailable in subagent context" in context_of(out)
@@ -1288,7 +1314,7 @@ def test_main_session_path_when_task_id_is_not_a_subagent(hook):
     run_main(hook, {"hook_event_name": "UserPromptSubmit",
                     "session_id": "abc-123",
                     "extra": {"user_message": "what happened", "task_id": "task-1"}})
-    assert sorted(seen) == ["hermes_memory", "hermes_sessions", "mnemosyne"]
+    assert sorted(seen) == ["loci_memory", "loci_sessions", "mnemosyne"]
 
 
 def test_subagent_warning_when_qdrant_url_unset_skips_embedding(hook):
@@ -1329,10 +1355,10 @@ def test_subagent_falls_back_to_beam_when_embedding_fails(hook):
 
 
 def test_subagent_filters_importance_and_caps_at_two(hook):
-    hits = [{"collection": "hermes_memory", "point_id": None, "score": 0.9 - i / 100,
+    hits = [{"collection": "loci_memory", "point_id": None, "score": 0.9 - i / 100,
              "importance": 0.9, "fused": 0.8 - i / 100, "content": f"finding {i}",
              "payload": {}} for i in range(4)]
-    hits.append({"collection": "hermes_memory", "point_id": None, "score": 0.99,
+    hits.append({"collection": "loci_memory", "point_id": None, "score": 0.99,
                  "importance": 0.1, "fused": 0.099, "content": "unimportant",
                  "payload": {}})
     hook._embed = lambda t: [0.1]
@@ -1341,7 +1367,7 @@ def test_subagent_filters_importance_and_caps_at_two(hook):
     _, out = run_main(hook, _prompt(task_id="subagent-1"))
     ctx = context_of(out)
     assert "unimportant" not in ctx
-    assert ctx.count("[hermes-memory|") == 2
+    assert ctx.count("[loci-memory|") == 2
     assert "finding 0" in ctx and "finding 1" in ctx
 
 
@@ -1361,7 +1387,7 @@ def test_subagent_does_not_deposit_pheromone_or_run_sa(hook):
         run_spreading_activation=lambda **kw: sa_calls.append(kw) or [])
     hook._embed = lambda t: [0.1]
     hook._search_collection = lambda *a, **k: [
-        {"collection": "hermes_memory", "point_id": "p1", "score": 0.9, "importance": 0.9,
+        {"collection": "loci_memory", "point_id": "p1", "score": 0.9, "importance": 0.9,
          "fused": 0.81, "content": "x", "payload": {"mnemosyne_id": "m1"}}]
     hook._load_rules_summary = lambda: ""
     run_main(hook, _prompt(task_id="subagent-1"))
@@ -1380,3 +1406,118 @@ def test_output_is_a_single_json_line_on_stdout(hook):
     assert out.endswith("\n") and out.count("\n") == 1
     assert list(json.loads(out)) == ["context"]
     assert isinstance(json.loads(out)["context"], str)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code payload shape
+# Claude Code sends a top-level "prompt"; Hermes nested it under extra.user_message.
+# ---------------------------------------------------------------------------
+
+def _dark_hook(hook):
+    hook._embed = lambda t: None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+
+
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "SubagentStart"])
+def test_main_grounds_claude_code_top_level_prompt(hook, event):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": event,
+                                "session_id": "s1",
+                                "prompt": "why did retention delete the index"})
+    assert code is None, "hook exited without emitting on a real Claude Code payload"
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_still_grounds_legacy_hermes_shape(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "pre_llm_call",
+                                "extra": {"user_message": "a real question"}})
+    assert code is None
+    assert "WARNING: memory grounding UNAVAILABLE" in context_of(out)
+
+
+def test_main_prefers_top_level_prompt_over_extra(hook):
+    seen = []
+    hook._embed = lambda t: seen.append(t) or None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+    run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                    "prompt": "the real prompt",
+                    "extra": {"user_message": "stale hermes text"}})
+    assert seen and "the real prompt" in seen[0]
+
+
+def test_main_still_exits_when_no_text_anywhere(hook):
+    _dark_hook(hook)
+    code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit"})
+    assert code == 0 and out == ""
+
+
+# ---------------------------------------------------------------------------
+# _embed_base_url
+# ---------------------------------------------------------------------------
+
+def test_embed_base_url_appends_v1_to_bare_ollama_host(hook):
+    with mock.patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://h:11434"}, clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_falls_back_to_mnemosyne_var(hook):
+    # What the Hermes profile actually sets — already a full /v1 endpoint.
+    with mock.patch.dict(os.environ,
+                         {"MNEMOSYNE_EMBEDDING_API_URL": "http://h:11434/v1"},
+                         clear=True):
+        assert hook._embed_base_url() == "http://h:11434/v1"
+
+
+def test_embed_base_url_none_when_unset(hook):
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert hook._embed_base_url() is None
+
+
+# ---------------------------------------------------------------------------
+# fan-out degradation
+# Swallowed per-collection failures report a clean "no matches"; total failure must degrade to Beam.
+# ---------------------------------------------------------------------------
+
+def test_fanout_falls_back_to_beam_when_every_collection_fails(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam recalled this"}]
+    calls = fake_urlopen(hook, OSError("qdrant down"))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        calls.stop()
+    assert code is None
+    assert "beam recalled this" in context_of(out)
+
+
+def test_fanout_keeps_hits_when_only_some_collections_fail(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.9,
+                                      "importance": 0.9, "fused": 0.81,
+                                      "content": "beam should NOT be used"}]
+    good = {"collection": "loci_memory", "point_id": None, "score": 0.9,
+            "importance": 0.9, "fused": 0.81, "content": "qdrant recalled this",
+            "payload": {}}
+    real = hook._search_collection
+    hook._search_collection = (
+        lambda col, *a, **k: [good] if col == "loci_memory" else _raise(hook, col))
+    try:
+        code, out = run_main(hook, {"hook_event_name": "UserPromptSubmit",
+                                    "prompt": "a real question about the index"})
+    finally:
+        hook._search_collection = real
+    ctx = context_of(out)
+    assert "qdrant recalled this" in ctx
+    assert "beam should NOT be used" not in ctx
+
+
+def _raise(hook, col):
+    raise hook._SearchFailed(col)

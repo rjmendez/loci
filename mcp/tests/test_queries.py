@@ -80,8 +80,7 @@ def test_subgraph_returns_anchor_and_neighbors(tmp_path):
     keys = {n["key"] for n in sg["nodes"]}
     # anchor present
     assert SG in keys
-    # 1-hop neighbours over all rel types: caller f (CALLS), callee h (CALLS),
-    # defining file a.py (DEFINES), referencing finding fB (REFERENCES).
+    # 1-hop neighbours must span all rel types: CALLS both ways, DEFINES, REFERENCES.
     assert SF in keys and SH in keys
     assert "a.py" in keys and "fB" in keys
     # every node carries a label + props, and there is at least one edge

@@ -7,7 +7,7 @@ recent episodes in time-compressed form, biased toward salient/reward-associated
 memories. Replay drives hippocampus-to-neocortex systems consolidation.
 
 This script:
-  1. Fetches recent hermes_memory Qdrant points (configurable look-back window).
+  1. Fetches recent loci_memory Qdrant points (configurable look-back window).
   2. Scores each by replay priority: recency × salience × reward.
      - recency: exponential decay from created_at_ts (bias toward recent)
      - salience: importance field (novel + high-confidence findings score higher)
@@ -16,7 +16,7 @@ This script:
   4. Interleaves with existing consolidated findings (prevents catastrophic
      interference — CLS McClelland 1995).
   5. Calls Ollama to generate a compressed abstraction from the batch.
-  6. Stores the abstraction back to hermes_memory with record_type=consolidated.
+  6. Stores the abstraction back to loci_memory with record_type=consolidated.
 
 Run from cron or the hermes sleep scheduler. Idempotent and fail-safe.
 
@@ -45,7 +45,7 @@ EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
 LLM_MODEL    = os.environ.get("SWR_LLM_MODEL",   "llama3.2:latest")
-COLLECTION   = os.environ.get("SWR_COLLECTION",  "hermes_memory")
+COLLECTION   = os.environ.get("SWR_COLLECTION",  "loci_memory")
 
 LOOKBACK_HOURS = float(os.environ.get("SWR_LOOKBACK_HOURS", "6"))
 REPLAY_K       = int(os.environ.get("SWR_REPLAY_K",        "7"))    # theta-gamma bound
@@ -98,7 +98,9 @@ def _qdrant_search_consolidated(collection: str, embedding: list[float], k: int)
     """Fetch existing consolidated points for interleaving."""
     url = f"{QDRANT_URL}/collections/{collection}/points/search"
     body = json.dumps({
-        "vector": {"dense": embedding},
+        # /points/search wants {"name": ..., "vector": ...}; the bare {"dense": v}
+        # form is for upsert and is rejected here with HTTP 400.
+        "vector": {"name": "dense", "vector": embedding},
         "limit": k,
         "with_payload": True,
         "with_vector": False,

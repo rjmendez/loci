@@ -52,10 +52,6 @@ def load_env() -> dict:
         load_dotenv(_REPO / ".env")
         load_dotenv(_REPO / "mcp" / ".env", override=True)
     except Exception as exc:
-        # NOT silent. python-dotenv is where LOCI_QDRANT_RETENTION_DAYS=0 lives, and
-        # without it _retention_days() falls back to 30 and the next _get_qdrant()
-        # deletes everything past the window. Swallowing this import is how a
-        # scheduled run turns destructive while reporting success.
         logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
                        "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
 
@@ -81,9 +77,7 @@ def load_env() -> dict:
         except Exception as exc:
             logger.warning("load_env: could not resolve Ollama from backends: %r", exc)
 
-    # Retention through the DURABLE channel. backends.toml is stdlib tomllib and
-    # needs no third-party import, so a setting that protects the corpus does not
-    # depend on one. env wins; .env already applied above; this is the floor.
+    # backends.toml is stdlib tomllib, so the setting that protects the corpus needs no import.
     if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
         try:
             import backends
@@ -99,20 +93,18 @@ def load_env() -> dict:
 logger = logging.getLogger("loci-groom")
 
 MEMORY_DIR = Path(os.environ.get(
-    "HERMES_MEMORY_DIR",
+    "LOCI_MEMORY_DIR",
     os.path.expanduser("~/.hermes/memory-sessions"),
 ))
 GROOM_DIR = MEMORY_DIR / "_groom"
 
-# Left unset on purpose: the batched (vLLM) and Ollama tiers identify the same
-# model by different names — "Qwen/Qwen2.5-3B-Instruct" vs "qwen2.5:3b" — and a
-# name the serving tier does not recognise is rejected outright. None lets each
-# tier resolve its own. Set LOCI_GROOM_MODEL only to pin one deliberately.
+# Unset on purpose: vLLM and Ollama name the same model differently, so each tier resolves its own.
 GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
 GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
 # Per-run ceilings. These bound a nightly job, not a human sitting in front of it.
 VERIFY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_VERIFY_INVESTIGATIONS", "5"))
 VERIFY_PER_INVESTIGATION = int(os.environ.get("LOCI_GROOM_VERIFY_FINDINGS", "10"))
+SUMMARY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_SUMMARY_INVESTIGATIONS", "12"))
 REFLECT_MAX_ITEMS = int(os.environ.get("LOCI_GROOM_REFLECT_ITEMS", "3"))
 
 
@@ -358,9 +350,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
         return report
 
     if calibrate:
-        # Hold out findings that DO have vocabulary tags, hide them, and score the
-        # model's pick against what the author actually wrote. Same protocol as
-        # knn_tags --calibrate, so every method lands on one comparable scale.
+        # Same holdout protocol as knn_tags --calibrate, so every method lands on one scale.
         candidates = [f for f in findings
                       if f.get("text") and set(_tags_of(f)) & set(vocab)]
         random.Random(seed).shuffle(candidates)
@@ -384,8 +374,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
     vocab_block = ", ".join(vocab)
     vocab_set = set(vocab)
     proposals = []
-    # A zero here has several causes and they are not interchangeable, so each is
-    # counted rather than folded into one silent 0.
+    # Counted per cause: a generation error and a declined answer are not the same zero.
     rej = collections.Counter()
     scored: list = []
 
@@ -408,8 +397,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
             if tags is None:
                 rej["unparseable"] += 1
                 continue
-            # A term outside the vocabulary is the model inventing one; drop it
-            # rather than letting the pass widen the vocabulary it was given.
+            # Out-of-vocabulary terms are dropped, not allowed to widen the given vocabulary.
             if not tags:
                 rej["declined"] += 1        # the model saw no fitting term — a real answer
                 continue
@@ -530,16 +518,7 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
     report["search_errors"] = errors
     report["identity"] = _score(ident_ranks, k, len(ident_ranks))
     if not ident_ranks:
-        # attempted==0 means every search raised — typically the cross-encoder
-        # failing to load. _score would return recall_at_1=0.0 and _append_recall
-        # would publish it into the one longitudinal retrieval metric we keep,
-        # recording a dead GPU as total retrieval collapse. Refuse to write a
-        # point rather than write a false one.
-        # The report still carries identity (attempted=0) so its shape is stable,
-        # but nothing is WRITTEN to the trend: _score returns recall_at_1=0.0 for
-        # an empty sample, and persisting that records a dead GPU as total
-        # retrieval collapse in the one longitudinal metric we keep. A missing
-        # point is honest; a zero is a lie.
+        # Every probe raised: writing recall_at_1=0.0 would record a dead GPU as retrieval collapse.
         report.update(status="degraded",
                       detail=f"all {errors} probe search(es) failed — no measurement taken")
         return report
@@ -912,14 +891,7 @@ def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
     report = {"pass": "verify", "status": "ok"}
     budget = int(limit or VERIFY_MAX_PER_RUN)
 
-    # Probe generation BEFORE verifying anything. verify_finding is fail-open: an
-    # unreachable model yields verdict='uncertain', confidence=0.0 for every
-    # finding, and investigation_verify_all writes those to
-    # finding_verifications.jsonl. Unattended, that fills an empty lane with
-    # records carrying no information — a file that looks populated and says
-    # nothing, which is the exact failure this tier exists to catch. Measured
-    # here on the first run: 5 records, all uncertain/0.0, because llm_local
-    # returns ok=False with no reason given.
+    # verify_finding is fail-open: with the model down every finding lands uncertain/0.0 on disk.
     if gen_probe is None:
         def gen_probe():
             sys.path.insert(0, str(_REPO / "mcp"))
@@ -952,8 +924,7 @@ def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
         if checked >= budget:
             break
         inv = inv_dir.parent.name
-        # Skip investigations already carrying verdicts, so repeated runs move
-        # through the corpus instead of re-verifying the same head every night.
+        # Skip investigations already carrying verdicts so repeated runs advance the corpus.
         if (inv_dir.parent / "finding_verifications.jsonl").exists():
             continue
         try:
@@ -1008,14 +979,161 @@ def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None
         ticked = json.loads(tick_fn(max_items=int(limit or REFLECT_MAX_ITEMS)))
         report["processed_items"] = ticked.get("processed_items", 0)
         report["findings_written"] = ticked.get("findings_written", 0)
-        # remaining_queue, NOT queue_size. tick only emits queue_size on the
-        # empty-queue early return, so .get("queue_size", 0) reported a backlog
-        # of 0 while 262 items were still queued — a false zero of exactly the
-        # kind this tier exists to catch.
+        # remaining_queue, NOT queue_size: tick emits queue_size only on the empty-queue return.
         if "remaining_queue" in ticked:
             report["remaining_queue"] = ticked["remaining_queue"]
     except Exception as exc:
         report.update(status="degraded", detail=f"tick failed: {exc!r}")
+    return report
+
+
+def _summarisable(inv_dir: Path) -> bool:
+    """True if the investigation holds at least one record worth summarising.
+
+    findings.jsonl also carries text-less access rows, so a file that is not
+    empty is not the same as an investigation with findings.
+    """
+    fj = inv_dir / "findings.jsonl"
+    if not fj.exists():
+        return False
+    # investigation_reflect drops retracted findings, so counting them asks for a summary of nothing.
+    retracted = set()
+    rj = inv_dir / "retractions.jsonl"
+    if rj.exists():
+        try:
+            with rj.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("active") and rec.get("finding_id"):
+                        retracted.add(str(rec["finding_id"]))
+        except OSError:
+            pass
+    try:
+        with fj.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if (rec.get("record_type") or rec.get("type") or "") == "access":
+                    continue
+                if str(rec.get("id", "")) in retracted:
+                    continue
+                if str(rec.get("text", "")).strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _has_llm_summary(manifest: dict) -> bool:
+    """True only for a MODEL-authored summary.
+
+    investigation_reflect always persists something: when the model is
+    unavailable it falls back to a deterministic stub built from the last few
+    findings. Treating that stub as "done" would let one run with the backend
+    down permanently mark every investigation as summarised, which is the shape
+    of failure this tier exists to catch. The stub's paragraph is recognisable.
+    """
+    if not manifest.get("summary_l1"):
+        return False
+    l2 = str(manifest.get("summary_l2") or "").strip()
+    if not l2 or re.match(r"^Investigation with \d+ finding", l2):
+        return False
+    return True
+
+
+def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
+                   reflect_fn: Optional[Callable] = None,
+                   gen_probe: Optional[Callable] = None, **_) -> dict:
+    """Fill in the per-investigation summaries that investigation_load asks for.
+
+    The summary ladder lives inside investigation_reflect, and that tool had
+    never been called: 6 of 142 manifests carried a summary while 7 of 15 real
+    investigation_load calls asked for fidelity=summary or brief. The generator
+    exists and works; nothing drove it.
+
+    Safe unattended: it writes only summary_l1/summary_l2 on the manifest, never
+    findings, and it is bounded per run. Investigations that already carry a
+    model-authored summary are skipped, so repeated runs advance the backlog
+    instead of re-spending on the same ones.
+    """
+    report = {"pass": "summaries", "status": "ok"}
+    budget = int(limit or SUMMARY_MAX_PER_RUN)
+
+    # Same guard as pass_verify: with the backend down the ladder writes its deterministic stub.
+    if gen_probe is None:
+        def gen_probe():
+            sys.path.insert(0, str(_REPO / "mcp"))
+            from llm_local import generate
+            return bool(generate("Reply with OK.", max_tokens=8).get("ok"))
+    try:
+        if not gen_probe():
+            report.update(status="degraded",
+                          detail="generation backend is not answering; skipping rather "
+                                 "than stamping a deterministic stub on every manifest")
+            return report
+    except Exception as exc:
+        report.update(status="degraded", detail=f"generation probe failed: {exc!r}")
+        return report
+
+    if reflect_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            reflect_fn = _server.investigation_reflect
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import investigation_reflect: {exc!r}")
+            return report
+
+    root = Path(memory_dir or MEMORY_DIR)
+    done = skipped = errors = empty = 0
+    for man_path in sorted(root.glob("*/manifest.json")):
+        if done >= budget:
+            break
+        try:
+            manifest = json.loads(man_path.read_text())
+        except Exception:
+            errors += 1
+            continue
+        if _has_llm_summary(manifest):
+            skipped += 1
+            continue
+        # Nothing to summarise is not a failure; a permanently degraded pass is one nobody reads.
+        if not _summarisable(man_path.parent):
+            empty += 1
+            continue
+        inv = manifest.get("investigation_id") or man_path.parent.name
+        try:
+            reflect_fn(investigation_id=inv)
+        except Exception:
+            errors += 1
+            continue
+        # Confirm the model actually authored one; a stub means it did not.
+        try:
+            if _has_llm_summary(json.loads(man_path.read_text())):
+                done += 1
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+    report.update(summarised=done, already_had=skipped, nothing_to_say=empty,
+                  errors=errors, budget=budget)
+    if errors and not done:
+        report.update(status="degraded",
+                      detail=f"{errors} investigations errored and none were summarised")
     return report
 
 
@@ -1027,6 +1145,7 @@ PASSES = {
     "codelink": {"fn": pass_codelink, "applyable": False},
     "verify": {"fn": pass_verify, "applyable": False},
     "reflect": {"fn": pass_reflect, "applyable": False},
+    "summaries": {"fn": pass_summaries, "applyable": False},
 }
 
 
@@ -1072,11 +1191,7 @@ def main(argv: Optional[list] = None) -> int:
             rest = " ".join(f"{k}={v}" for k, v in r.items()
                             if k not in ("pass", "status") and not isinstance(v, (list, dict)))
             print(f"{head} {rest}".rstrip())
-    # Three-way, because a scheduler only ever sees the exit code. Every failure
-    # this tool actually produces — refused (retention not 0), degraded (qdrant
-    # unreachable, scroll failed, no generation tier, graph unreadable) — used to
-    # exit 0, so a cron run in which nothing happened recorded last_status=success.
-    # The refusal guard was built to be loud and was silent to its only consumer.
+    # Three-way: a scheduler only sees the exit code, and refused/degraded must not read as success.
     if any(r.get("status") == "error" for r in reports):
         return 1
     if any(r.get("status") in ("refused", "degraded") for r in reports):

@@ -87,7 +87,7 @@ class TestIndexPass(unittest.TestCase):
         # pass_index refuses unless retention resolves to 0 — connecting runs the
         # startup purge, which is the damage this pass exists to repair.
         fake_ops._retention_days.return_value = 0
-        fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+        fake_ops._get_qdrant.return_value = (client, "loci_memory")
         fake_ops._qdrant_upsert.side_effect = lambda pid, text, payload: client.upserts.append(pid)
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}), \
              mock.patch.object(groom, "MEMORY_DIR", tmp):
@@ -290,7 +290,7 @@ class TestRecallPass(unittest.TestCase):
         client = _Client(ids)
         fake_ops = mock.Mock()
         fake_ops._retention_days.return_value = 0  # connect() gate
-        fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+        fake_ops._get_qdrant.return_value = (client, "loci_memory")
         with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
             return groom.pass_recall(
                 sample=sample, k=k, paraphrase=paraphrase, gen_fn=gen,
@@ -347,7 +347,7 @@ class TestRecallPass(unittest.TestCase):
             client = _Client(["a", "b"])          # only two of the four are indexed
             fake_ops = mock.Mock()
             fake_ops._retention_days.return_value = 0  # connect() gate
-            fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+            fake_ops._get_qdrant.return_value = (client, "loci_memory")
             seen = []
 
             def search(q):
@@ -368,7 +368,7 @@ class TestRecallPass(unittest.TestCase):
             client = _Client(["a"])
             fake_ops = mock.Mock()
             fake_ops._retention_days.return_value = 0  # connect() gate
-            fake_ops._get_qdrant.return_value = (client, "hermes_memory")
+            fake_ops._get_qdrant.return_value = (client, "loci_memory")
             gd = tmp / "_groom"
             with mock.patch.dict(sys.modules, {"qdrant_ops": fake_ops}):
                 for _ in range(2):

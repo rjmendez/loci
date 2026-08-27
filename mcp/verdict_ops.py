@@ -13,17 +13,15 @@ import os
 import threading
 from typing import Optional
 
-from qdrant_ops import _embed
-
 logger = logging.getLogger("loci-mcp")
 
-_verdict_backend = None                # QdrantBackend for hermes_verdicts (pre_answer_check)
+_verdict_backend = None                # QdrantBackend for loci_verdicts (pre_answer_check)
 _verdict_backend_failed = False        # permanent-failure sentinel — don't retry
 _verdict_backend_lock = threading.Lock()  # guards _verdict_backend lazy-init (#106)
 
 
 def _get_verdict_backend():
-    """Lazy QdrantBackend for the hermes_verdicts collection (pre_answer_check verdicts).
+    """Lazy QdrantBackend for the loci_verdicts collection (pre_answer_check verdicts).
 
     Reuses the same Qdrant instance as investigations but in a separate collection
     so claim-check history never pollutes finding storage. Fail-open: returns None
@@ -44,14 +42,16 @@ def _get_verdict_backend():
             return None
         try:
             from memcheck.qdrant import QdrantBackend
+            from memcheck.vectors import COLLECTION, VECTOR_NAME, ensure_collection, hash_embed
             from qdrant_client import QdrantClient
             _vb_api_key = os.environ.get("QDRANT_API_KEY", "") or None
             client = QdrantClient(url=qdrant_url, api_key=_vb_api_key, timeout=5)
+            ensure_collection(client, COLLECTION)
             _verdict_backend = QdrantBackend(
                 client,
-                collection="hermes_verdicts",
-                embed=_embed,
-                vector_name="dense",
+                collection=COLLECTION,
+                embed=hash_embed,
+                vector_name=VECTOR_NAME,
             )
             return _verdict_backend
         except Exception as exc:
@@ -66,7 +66,7 @@ def _record_claim_verdicts(
     *,
     record: bool,
 ) -> dict:
-    """Record a verdict per claim to hermes_verdicts and annotate claim_results in-place.
+    """Record a verdict per claim to loci_verdicts and annotate claim_results in-place.
 
     Each claim result gains three fields: ``verdict_type`` (claim_supported /
     claim_contradicted / claim_unsupported), ``prior_occurrences`` (how many
@@ -86,6 +86,7 @@ def _record_claim_verdicts(
             cr.update({"verdict_type": None, "prior_occurrences": 0, "verdict_conflict": False})
         return {"recorded": 0, "qdrant": "unavailable"}
 
+    from memcheck.vectors import COLLECTION
     from memcheck.verdict import Verdict, make_signature, new_verdict, redact_excerpt
 
     _VERDICT_MAP = {
@@ -104,8 +105,8 @@ def _record_claim_verdicts(
         "claim_supported": 1, "claim_ambiguous": 2,
         "claim_unsupported": 3, "claim_contradicted": 4,
     }
-    _PE_HIGH_THRESH = float(os.environ.get("HERMES_PE_HIGH_THRESH", "0.5"))
-    _PE_PROTECTION_MIN_OCC = int(os.environ.get("HERMES_PE_PROTECTION_MIN_OCC", "3"))
+    _PE_HIGH_THRESH = float(os.environ.get("LOCI_PE_HIGH_THRESH", "0.5"))
+    _PE_PROTECTION_MIN_OCC = int(os.environ.get("LOCI_PE_PROTECTION_MIN_OCC", "3"))
 
     recorded = 0
     qdrant_ok = True
@@ -138,7 +139,7 @@ def _record_claim_verdicts(
                     pid = pid_fn(sig)
                     hits = await asyncio.to_thread(
                         retrieve_fn,
-                        collection_name="hermes_verdicts",
+                        collection_name=COLLECTION,
                         ids=[pid],
                         with_payload=True,
                     )

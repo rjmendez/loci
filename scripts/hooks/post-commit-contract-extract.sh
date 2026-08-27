@@ -16,7 +16,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # Need both claude and an active investigation to proceed
 command -v claude >/dev/null 2>&1 || exit 0
 
-INV="${HERMES_ACTIVE_INVESTIGATION:-}"
+INV="${LOCI_ACTIVE_INVESTIGATION:-}"
 if [ -z "$INV" ]; then
   # Try reading from the Loci active investigation file if present
   LOCI_ACTIVE="$HOME/.loci/active_investigation"

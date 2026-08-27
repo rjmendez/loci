@@ -128,7 +128,5 @@ class TestRerankPassageBudget(unittest.TestCase):
 
     def test_the_default_clears_the_replicated_floor(self):
         import qdrant_ops
-        # Across three seeds, 512 scored BELOW no-reranker and >=1024 scored above
-        # both. 1024 vs 2048 did not separate, so the assertion is the floor that
-        # replicated, not the single-seed winner.
+        # 1024 is the floor that replicated across three seeds, not a single-seed winner.
         self.assertGreaterEqual(qdrant_ops.RERANK_MAX_CHARS, 1024)

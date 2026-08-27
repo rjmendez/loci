@@ -13,9 +13,7 @@ def test_dangling_global_flags_global_only_slot():
 
 
 def test_dangling_global_excludes_module_level_bound_ident():
-    # `_real_counter` IS bound at module level in dangling_global.py itself
-    # -> must never be reported dangling, even though bump() also declares
-    # it `global` and reassigns it.
+    # Module-level-bound beats a `global` redeclaration: never dangling.
     store, _, _ = build_fixture_store(["dangling_global.py"])
     findings = dangling_globals(store)
     slots = {f.slot.id for f in findings}
@@ -42,8 +40,7 @@ def test_dangling_global_write_sites_recorded():
 
 
 def test_dangling_global_no_real_slot_found_leaves_list_empty():
-    # Without dangling_global_real_slot.py in the build, there is no
-    # module-level-bound `_symbol_index_cache` anywhere in the corpus.
+    # Without the real-slot fixture nothing in the corpus binds `_symbol_index_cache`.
     store, _, _ = build_fixture_store(["dangling_global.py"])
     findings = {f.slot.id: f for f in dangling_globals(store)}
     assert findings["name:dangling_global.py::_symbol_index_cache"].real_slots == []
@@ -56,19 +53,14 @@ def test_dangling_global_scope_filter():
 
 
 def test_write_no_read_flags_write_only_slot():
-    # reexport_source.py's `_INTERNAL_STATE` is module-level-bound (a
-    # WRITES_NAME via module-level-assign) but nothing in the fixture set
-    # ever reads it.
+    # `_INTERNAL_STATE` is module-level-bound and read by nothing in this fixture set.
     store, _, _ = build_fixture_store(["reexport.py", "reexport_source.py"])
     findings = {f.slot.id for f in write_no_read(store)}
     assert "name:reexport_source.py::_INTERNAL_STATE" in findings
 
 
 def test_write_no_read_excludes_slot_with_a_read():
-    # dangling_global.py's `invalidate_cache` def-binding IS read nowhere
-    # in THIS fixture set either — but calls_shapes.py::helper (used
-    # elsewhere) has both a write (def-binding) and a read; confirm a
-    # write+read pair never appears in write_no_read.
+    # calls_shapes.py::helper has both a write (def-binding) and a read: never write-only.
     store, _, _ = build_fixture_store(["calls_shapes.py", "calls_target.py"])
     findings = {f.slot.id for f in write_no_read(store)}
     assert "name:calls_shapes.py::helper" not in findings

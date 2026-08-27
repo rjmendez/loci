@@ -26,6 +26,15 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
+# next to legacy_env.py; the repo copy finds it as a sibling too.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from legacy_env import apply as _apply_legacy_env
+    _apply_legacy_env()
+except Exception:
+    pass
+
 BLOCK_MODE: bool = os.environ.get("HOOK_BLOCK_MODE", "0").strip() in ("1", "true", "yes")
 MAX_AUDIT_BYTES: int = 5 * 1024 * 1024  # 5 MB — matches Hermes logging.max_size_mb
 
@@ -377,7 +386,7 @@ def main() -> None:
         sys.exit(0)
 
     event = payload.get("hook_event_name", "")
-    if event != "pre_tool_call":
+    if event not in ("pre_tool_call", "PreToolUse"):
         sys.exit(0)
 
     tool_name: str = payload.get("tool_name") or ""

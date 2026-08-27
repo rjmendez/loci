@@ -389,7 +389,7 @@ def test_call_grounding_happy_path_payload_and_argv(monkeypatch, capsys):
         seen.update(argv=argv, input=input, capture_output=capture_output, timeout=timeout)
         return FakeProc(0, json.dumps({"context": "CTX", "other": 1}).encode())
 
-    monkeypatch.setenv("HERMES_PY", "/opt/py")
+    monkeypatch.setenv("LOCI_PY", "/opt/py")
     monkeypatch.setattr(harness.subprocess, "run", _run)
 
     assert harness.call_grounding("find X") == "CTX"
@@ -405,7 +405,7 @@ def test_call_grounding_happy_path_payload_and_argv(monkeypatch, capsys):
 
 def test_call_grounding_default_interpreter_is_the_hermes_venv(monkeypatch):
     seen = {}
-    monkeypatch.delenv("HERMES_PY", raising=False)
+    monkeypatch.delenv("LOCI_PY", raising=False)
     monkeypatch.setattr(
         harness.subprocess, "run",
         lambda argv, **kw: seen.update(argv=argv) or FakeProc(0, b'{"context":""}'),
@@ -449,7 +449,7 @@ def test_call_grounding_timeout_is_fail_open(monkeypatch, capsys):
 
 def test_call_grounding_missing_interpreter_is_fail_open(monkeypatch, capsys):
     """The real degraded path on CI: the hermes venv does not exist."""
-    monkeypatch.setenv("HERMES_PY", "/nonexistent/python-does-not-exist")
+    monkeypatch.setenv("LOCI_PY", "/nonexistent/python-does-not-exist")
     assert harness.call_grounding("anything") == ""
     assert "grounding call failed" in capsys.readouterr().err
 
@@ -898,9 +898,7 @@ def test_focus_map_falls_back_to_defaults_on_bad_input(monkeypatch):
 # grounding_gate_qf_eval.run
 # ---------------------------------------------------------------------------
 
-# 2-d vectors chosen so every cosine is an exact float:
-#   alpha=[1,0] beta=[0,1]; a1=[1,0] a2=[4,3]->[.8,.6] b1=[0,1] b2=[3,4]->[.6,.8]
-# labels = [1,1,0,0, 0,0,1,1]; cos = [1,.8,0,.6, 0,.6,1,.8]
+# 2-d vectors chosen so every cosine is an exact float.
 QF_VECTORS = {
     "alpha": [1.0, 0.0], "beta": [0.0, 1.0],
     "a1": [1.0, 0.0], "a2": [4.0, 3.0], "b1": [0.0, 1.0], "b2": [3.0, 4.0],
@@ -1051,8 +1049,7 @@ def test_qf_run_with_model_persists_cosine_and_model_scores(tmp_path, monkeypatc
          for tag in ("cosine", "model")
          for m in ("recall", "bleed_rejection", "f1", "accuracy", "auc")]
     )
-    # persisted values are the FIXED-threshold ones (cosine@0.59 / model@0.50),
-    # never the best-F1 sweep results
+    # Persisted values are the fixed-threshold ones, never the best-F1 sweep results.
     by_id = {u["task_id"]: u["score"] for u in upserts}
     assert by_id["dtl.gate_qf.cosine.f1"] == pytest.approx(0.8)
     assert by_id["dtl.gate_qf.model.f1"] == pytest.approx(0.8)

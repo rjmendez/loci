@@ -11,8 +11,8 @@ Architecture:
 
 Collections searched per turn:
   mnemosyne         (198 pts)   — personal facts, preferences, project notes
-  hermes_sessions   (126 pts)   — past conversation history
-  hermes_memory     (89 pts)    — investigation notes, research findings
+  loci_sessions   (126 pts)   — past conversation history
+  loci_memory     (89 pts)    — investigation notes, research findings
   ecc_skills        (262 pts)   — skill library knowledge
   agent_core_chunks (3.09M pts) — great-library KB (DAMA, infra, code, telemetry)
   dama_gotchi_code  (24.9k pts) — DAMA codebase search
@@ -31,11 +31,6 @@ v3 changes vs v2:
   - Rules index injection preserved from v2
   - Subagent skip, min-length guard preserved from v2
 """
-# v4 hardening:
-#   - Subagent skip replaced with lightweight single-collection path (hermes_memory only)
-#   - Slash-command skip narrowed to navigation-only commands; code-affecting commands grounded
-#   - Short-message length guard removed entirely
-#   - Ollama + BeamMemory dual failure now injects explicit WARNING instead of silently proceeding
 from __future__ import annotations
 
 import json
@@ -50,8 +45,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-# Optional spreading activation enrichment (SA-RAG, arxiv 2512.15922).
-# Only loaded when mnemosyne collection results carry mnemosyne_id payloads.
+# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
+# next to legacy_env.py; the repo copy finds it as a sibling too.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from legacy_env import apply as _apply_legacy_env
+    _apply_legacy_env()
+except Exception:
+    pass
+
+# Spreading activation enrichment (SA-RAG, arxiv 2512.15922).
 _SA_MODULE = None
 try:
     import importlib.util as _ilu
@@ -84,8 +87,18 @@ if os.path.exists(_ENV_FILE):
 # ── constants ─────────────────────────────────────────────────────────────────
 QDRANT_URL   = os.environ.get("QDRANT_URL")
 QDRANT_KEY   = os.environ.get("QDRANT_API_KEY", "")
-_OLLAMA_BASE = os.environ.get("OLLAMA_BASE_URL")
-OLLAMA_URL   = f"{_OLLAMA_BASE}/v1" if _OLLAMA_BASE else None
+def _embed_base_url() -> Optional[str]:
+    """OpenAI-compatible embeddings base. OLLAMA_BASE_URL is a bare host and needs
+    /v1; MNEMOSYNE_EMBEDDING_API_URL (what the Hermes profile actually sets) is
+    already a full /v1 endpoint."""
+    base = os.environ.get("OLLAMA_BASE_URL")
+    if base:
+        return f"{base.rstrip('/')}/v1"
+    api = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL")
+    return api.rstrip("/") if api else None
+
+
+OLLAMA_URL   = _embed_base_url()
 EMBED_MODEL  = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL",   "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
@@ -96,15 +109,15 @@ RULES_DIR    = os.environ.get("HOOK_RULES_DIR",
 RECALL_TOP_K      = int(os.environ.get("HOOK_RECALL_TOP_K",          "3"))
 MIN_IMPORTANCE    = float(os.environ.get("HOOK_RECALL_MIN_IMPORTANCE", "0.2"))
 MIN_SCORE         = float(os.environ.get("HOOK_RECALL_MIN_SCORE",      "0.55"))
+# Every named collection on this instance uses "dense"; overridable if that changes.
+VECTOR_NAME       = os.environ.get("HOOK_RECALL_VECTOR_NAME",    "dense")
 MAX_CONTENT_CHARS = int(os.environ.get("HOOK_RECALL_MAX_CHARS",        "200"))
 RULES_MAX_CHARS   = int(os.environ.get("HOOK_RULES_MAX_CHARS",         "1200"))
 EMBED_TIMEOUT     = float(os.environ.get("HOOK_EMBED_TIMEOUT",         "3.0"))
 QDRANT_TIMEOUT    = float(os.environ.get("HOOK_QDRANT_TIMEOUT",        "2.0"))
 WORKERS           = int(os.environ.get("HOOK_QDRANT_WORKERS",          "8"))
 
-# Multi-signal ranker weights (must sum to 1.0).
-# relevance = semantic cosine × importance; recency = exponential decay by age;
-# trust = confidence-tier proxy; type_w = observed > inferred > assumed > gap.
+# Must sum to 1.0.
 RANKER_W_RELEVANCE = float(os.environ.get("HOOK_RANKER_W_RELEVANCE", "0.50"))
 RANKER_W_RECENCY   = float(os.environ.get("HOOK_RANKER_W_RECENCY",   "0.20"))
 RANKER_W_TRUST     = float(os.environ.get("HOOK_RANKER_W_TRUST",     "0.15"))
@@ -114,19 +127,13 @@ RECENCY_HALFLIFE_DAYS = float(os.environ.get("HOOK_RECENCY_HALFLIFE_DAYS", "7"))
 # MMR lambda: 1.0 = pure relevance, 0.0 = pure diversity.
 MMR_LAMBDA = float(os.environ.get("HOOK_MMR_LAMBDA", "0.75"))
 
-# Stigmergic recall (ant colony / Physarum — pheromone reinforcement + evaporation).
-# Retrieved memories deposit pheromone; subsequent queries boost them proportionally.
-# Evaporation via timestamp decay prevents monoculture lock-in.
+# Stigmergic recall: retrieval deposits pheromone, timestamp decay prevents monoculture lock-in.
 PHERO_BETA         = float(os.environ.get("HOOK_PHERO_BETA",        "0.08"))  # score boost coefficient
 PHERO_HALFLIFE_H   = float(os.environ.get("HOOK_PHERO_HALFLIFE_H",  "24"))    # pheromone half-life in hours
 PHERO_DEPOSIT      = float(os.environ.get("HOOK_PHERO_DEPOSIT",     "1.0"))   # amount deposited per retrieval
 PHERO_EPSILON      = float(os.environ.get("HOOK_PHERO_EPSILON",     "0.05"))  # ε-exploration probability
 
-# Collections to search, with their field names for content and optional importance.
-# Core collections always searched. Extra collections are project-specific:
-# set GROUNDING_EXTRA_COLLECTIONS=name1,name2 to add them.
-#
-# Known extra-collection field mappings (name -> (content_field, importance_field, named_vec)):
+# Project-specific collections are added via GROUNDING_EXTRA_COLLECTIONS=name1,name2.
 _EXTRA_FIELD_MAP: dict[str, tuple] = {
     "ecc_skills":        ("content_preview", None, True),
     "agent_core_chunks": ("text",            None, False),
@@ -137,8 +144,8 @@ _DEFAULT_EXTRA_FIELDS = ("text", None, True)
 # fmt: (collection, content_field, importance_field_or_None, use_named_vector)
 _BASE_COLLECTIONS = [
     ("mnemosyne",       "content",         "importance", True),
-    ("hermes_sessions", "content_preview", None,         True),
-    ("hermes_memory",   "text",            "confidence", True),
+    ("loci_sessions", "content_preview", None,         True),
+    ("loci_memory",   "text",            "confidence", True),
 ]
 _extra_names = [
     c.strip() for c in os.environ.get("GROUNDING_EXTRA_COLLECTIONS", "").split(",")
@@ -149,7 +156,6 @@ COLLECTIONS = _BASE_COLLECTIONS + [
     for name in _extra_names
 ]
 
-# Override the full directive via env var, or use the generic default.
 GROUNDING_DIRECTIVE = os.environ.get("GROUNDING_DIRECTIVE") or (
     "[GROUNDING DIRECTIVE — active every turn]\n"
     "Before answering from parametric knowledge:\n"
@@ -160,9 +166,7 @@ GROUNDING_DIRECTIVE = os.environ.get("GROUNDING_DIRECTIVE") or (
     "Skip recall only when the answer comes directly from tool output in this turn."
 )
 
-# Slash commands that are pure navigation — no code or memory work involved.
-# Every other slash command (including /fix, /review, /code-review, /remember,
-# /ultrareview, /schedule) gets full grounding because it may touch code.
+# Navigation only; every other slash command is grounded because it may touch code.
 NAVIGATION_SLASH_COMMANDS: frozenset[str] = frozenset({
     "/help", "/clear", "/compact", "/cost", "/status",
     "/history", "/ide", "/doctor", "/login", "/logout",
@@ -201,6 +205,13 @@ def _embed(text: str) -> Optional[list[float]]:
 
 # ── Qdrant search ─────────────────────────────────────────────────────────────
 
+class _SearchFailed(Exception):
+    """One collection's search did not complete. Raised so the fan-out can tell
+    'nothing matched' apart from 'every request failed' — the wrong named-vector
+    request shape returned an empty list from all three base collections for
+    months, and an empty list is what a genuinely unmatched query looks like."""
+
+
 def _search_collection(
     collection: str,
     vector: list[float],
@@ -211,7 +222,7 @@ def _search_collection(
 ) -> list[dict]:
     """Search one Qdrant collection, return normalised hit dicts."""
     url = f"{QDRANT_URL}/collections/{collection}/points/search"
-    vec_payload = {"dense": vector} if named_vec else vector
+    vec_payload = {"name": VECTOR_NAME, "vector": vector} if named_vec else vector
     body = json.dumps({
         "vector": vec_payload,
         "limit": top_k,
@@ -230,7 +241,7 @@ def _search_collection(
         with urllib.request.urlopen(req, timeout=QDRANT_TIMEOUT) as resp:
             d = json.loads(resp.read())
     except Exception:
-        return []
+        raise _SearchFailed(collection)
 
     hits = []
     for pt in d.get("result", []):
@@ -240,7 +251,6 @@ def _search_collection(
         payload = pt.get("payload") or {}
         content = payload.get(content_field, "")
         if not content:
-            # fallback to any text-ish field
             for f in ("text", "content", "content_preview", "description"):
                 content = payload.get(f, "")
                 if content:
@@ -355,8 +365,7 @@ def _multi_signal_score(hit: dict, now_ts: float) -> float:
             + RANKER_W_TRUST   * trust
             + RANKER_W_TYPE    * type_w)
 
-    # Stigmergic boost: paths used before get a mild reinforcement advantage.
-    # Evaporation ensures cold paths are not permanently suppressed.
+    # Prior use is a mild advantage; evaporation keeps cold paths from permanent suppression.
     phero = _effective_pheromone(payload, now_ts)
     return base + PHERO_BETA * math.log1p(phero)
 
@@ -388,7 +397,6 @@ def _mmr_select(hits: list[dict], top_k: int) -> list[dict]:
         if (len(selected) == top_k - 1
                 and len(remaining) > 1
                 and _random.random() < PHERO_EPSILON):
-            # Pick a random hit NOT by score — diversify the recall pool.
             best = _random.choice(remaining)
         elif not selected:
             best = max(remaining, key=lambda h: h["_ms_score"])
@@ -521,46 +529,41 @@ def main() -> None:
 
     extra = payload.get("extra") or {}
 
-    # Detect subagent context — triggers lightweight path, NOT a skip.
-    # Previous behaviour (sys.exit) left all workflow subagents ungrounded;
-    # that is where cross-file mistakes (wrong import names, renamed fields) occur.
+    # Lightweight path, NOT a skip: exiting here leaves every workflow subagent ungrounded.
     task_id = extra.get("task_id") or payload.get("session_id") or ""
     is_subagent = "subagent" in task_id.lower() or bool(os.environ.get("HERMES_SUBAGENT"))
 
-    user_message = extra.get("user_message") or ""
+    # Claude Code puts the text at the top level; Hermes nested it under extra.user_message.
+    user_message = payload.get("prompt") or extra.get("user_message") or ""
     if not isinstance(user_message, str):
         user_message = ""
     msg_stripped = user_message.strip()
 
-    # Skip only for truly empty messages.
     if not msg_stripped:
         sys.exit(0)
 
-    # Narrow slash-command skip: navigation-only commands need no grounding.
-    # Code-affecting commands (/fix, /review, /remember, /code-review, etc.) get grounded.
     if msg_stripped.startswith("/"):
         cmd = msg_stripped.split()[0].lower()
         if cmd in NAVIGATION_SLASH_COMMANDS:
             sys.exit(0)
-        # Fall through: non-navigation slash command → continue to grounding.
 
-    # Short-message length guard removed: "fix the bug" is 13 chars but needs grounding.
-
+    # No length guard: "fix the bug" is 13 chars and still needs grounding.
     intent = _extract_intent(msg_stripped)
 
     # ── Lightweight subagent path ─────────────────────────────────────────────
-    # Skips the 7-collection fan-out, session history, SA enrichment.
-    # Still grounds on hermes_memory (investigation findings) — the collection
-    # most relevant to code-generation tasks in an active investigation.
+    # loci_memory only: the collection most relevant to code generation mid-investigation.
     if is_subagent:
         sub_hits: list[dict] = []
         if QDRANT_URL:
             sub_vec = _embed(intent)
             if sub_vec is not None:
-                sub_hits = _search_collection(
-                    "hermes_memory", sub_vec, "text", "confidence", True,
-                    top_k=min(RECALL_TOP_K, 2),
-                )
+                try:
+                    sub_hits = _search_collection(
+                        "loci_memory", sub_vec, "text", "confidence", True,
+                        top_k=min(RECALL_TOP_K, 2),
+                    )
+                except _SearchFailed:
+                    sub_hits = _beam_fallback(intent)
                 sub_hits = [h for h in sub_hits if h["importance"] >= MIN_IMPORTANCE]
                 _sub_ts = time.time()
                 for h in sub_hits:
@@ -588,12 +591,10 @@ def main() -> None:
     used_fallback = False
 
     if vector is None:
-        # Ollama unavailable — fall back to BeamMemory (v2 path)
         hits = _beam_fallback(intent)
         used_fallback = True
         if not hits:
-            # Both Ollama and BeamMemory failed — memory is dark this turn.
-            # Inject a visible warning rather than silently proceeding.
+            # Memory is dark this turn: warn visibly rather than proceeding ungrounded.
             warning = (
                 "[WARNING: memory grounding UNAVAILABLE this turn — Ollama unreachable "
                 "and BeamMemory fallback also failed. Do NOT rely on parametric memory "
@@ -615,34 +616,35 @@ def main() -> None:
                 ): col
                 for col, cf, impf, named in COLLECTIONS
             }
+            searched = failed = 0
             for f in as_completed(futures):
+                searched += 1
                 try:
                     all_hits.extend(f.result())
+                except _SearchFailed:
+                    failed += 1
                 except Exception:
-                    pass
+                    failed += 1
+        if searched and failed == searched:
+            used_fallback = True
+            all_hits = _beam_fallback(intent)
 
-        # Keyword rerank adds overlap bonus to fused before multi-signal scoring.
         hits = _keyword_rerank(all_hits, intent)
-        # Filter by min importance before scoring.
         hits = [h for h in hits if h["importance"] >= MIN_IMPORTANCE]
-        # Multi-signal score: relevance + recency + source trust + record type.
         _now_ts = time.time()
         for h in hits:
             h["_ms_score"] = _multi_signal_score(h, _now_ts)
-        # MMR selection: top RECALL_TOP_K with diversity balancing.
         hits = sorted(hits, key=lambda h: h["_ms_score"], reverse=True)
         hits = _mmr_select(hits, RECALL_TOP_K)
 
-        # Pheromone deposit on selected hits (fire-and-forget, 0.5s timeout).
-        # Only hermes_memory collection points have mutable payloads we own.
+        # Only loci_memory points have mutable payloads we own; fire-and-forget.
         for _h in hits:
-            if _h.get("collection") in ("hermes_memory",) and _h.get("point_id"):
+            if _h.get("collection") in ("loci_memory",) and _h.get("point_id"):
                 _phero_now = _now_ts
                 _current   = _effective_pheromone(_h.get("payload") or {}, _phero_now)
                 _pheromone_deposit(_h["collection"], _h["point_id"], _current, _phero_now)
 
         # ── Optional spreading activation enrichment ──────────────────────
-        # Seeds: mnemosyne collection hits that carry mnemosyne_id in payload.
         # SA discovers associatively-linked memories that vector search missed.
         if SA_ENABLED and _SA_MODULE is not None:
             try:

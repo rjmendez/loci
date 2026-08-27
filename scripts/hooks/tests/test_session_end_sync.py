@@ -33,8 +33,7 @@ import pytest
 
 HOOK_PATH = pathlib.Path(__file__).resolve().parent.parent / "session_end_sync.py"
 
-# HOME points somewhere that does not exist so any ~ default the module falls
-# back to is inert rather than touching the real user's dotfiles.
+# HOME points somewhere nonexistent so ~ defaults never touch the real dotfiles.
 BASE_ENV = {
     "HOME": "/nonexistent-home-for-session-end-sync-tests",
     "QDRANT_URL": "http://qdrant.invalid:6333",
@@ -69,8 +68,8 @@ def paths(tmp_path):
 def hook(paths):
     """Fresh module wired to tmp paths; tests mutate its globals freely."""
     return load_hook({
-        "HERMES_STATE_DB": paths["db"],
-        "HERMES_SYNC_CACHE": paths["cache"],
+        "LOCI_STATE_DB": paths["db"],
+        "LOCI_SYNC_CACHE": paths["cache"],
         "LOCI_INVESTIGATIONS_DIR": paths["loci"],
     })
 
@@ -181,7 +180,7 @@ def test_qdrant_is_none_when_unset_but_key_defaults_to_empty_string():
 
 def test_fixed_constants():
     h = load_hook()
-    assert h.COLLECTION == "hermes_sessions"
+    assert h.COLLECTION == "loci_sessions"
     assert h.MAX_CHARS == 4000
     assert h.EMBED_DIM == 4          # from MNEMOSYNE_EMBEDDING_DIM in BASE_ENV
     assert load_hook({"MNEMOSYNE_EMBEDDING_DIM": None}).EMBED_DIM == 768
@@ -189,7 +188,7 @@ def test_fixed_constants():
 
 
 def test_state_db_and_cache_are_user_expanded():
-    h = load_hook({"HERMES_STATE_DB": None, "HERMES_SYNC_CACHE": None})
+    h = load_hook({"LOCI_STATE_DB": None, "LOCI_SYNC_CACHE": None})
     assert h.STATE_DB == "/nonexistent-home-for-session-end-sync-tests/.hermes/state.db"
     assert h.CACHE_DIR == (
         "/nonexistent-home-for-session-end-sync-tests/.hermes/.session_sync_cache"
@@ -198,7 +197,7 @@ def test_state_db_and_cache_are_user_expanded():
 
 def test_agent_identity_constants_default_to_empty():
     h = load_hook({"HERMES_AGENT_ID": None, "HERMES_PROFILE": None,
-                   "HERMES_ACTIVE_INVESTIGATION": None})
+                   "LOCI_ACTIVE_INVESTIGATION": None})
     assert (h.AGENT_ID, h.PROFILE, h.ACTIVE_INV) == ("", "", "")
 
 
@@ -243,11 +242,24 @@ def test_read_stdin_session_id(hook, raw, expected):
         assert hook.read_stdin_session_id() == expected
 
 
-def test_read_stdin_session_id_does_not_coerce_non_strings(hook):
-    """BUG-ish: a numeric session_id is returned as an int, not a str."""
+def test_read_stdin_session_id_rejects_non_strings(hook):
+    """A numeric session_id used to be passed through as an int and then used in
+    a SQL lookup and a path join."""
     with mock.patch.object(hook.sys, "stdin", io.StringIO('{"session_id": 123}')):
-        got = hook.read_stdin_session_id()
-    assert got == 123 and isinstance(got, int)
+        assert hook.read_stdin_session_id() == ""
+
+
+def test_read_stdin_payload_returns_whole_object(hook):
+    raw = '{"session_id": "s1", "transcript_path": "/tmp/t.jsonl"}'
+    with mock.patch.object(hook.sys, "stdin", io.StringIO(raw)):
+        got = hook.read_stdin_payload()
+    assert got == {"session_id": "s1", "transcript_path": "/tmp/t.jsonl"}
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "not json", "[1,2]", '"a string"'])
+def test_read_stdin_payload_returns_empty_dict_on_junk(hook, raw):
+    with mock.patch.object(hook.sys, "stdin", io.StringIO(raw)):
+        assert hook.read_stdin_payload() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +500,7 @@ def test_write_cache_swallows_an_unusable_cache_dir(hook, tmp_path):
 
 def test_cached_msg_count_raises_when_the_cache_dir_cannot_be_created(hook, tmp_path):
     """BUG: cache_path() is called *outside* cached_msg_count()'s try block, so
-    an unusable HERMES_SYNC_CACHE turns the "return -1 on anything" contract
+    an unusable LOCI_SYNC_CACHE turns the "return -1 on anything" contract
     into an uncaught exception."""
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file")
@@ -579,7 +591,7 @@ def test_embed_propagates_malformed_response(hook):
 
 def test_embed_raises_when_ollama_base_url_is_unset(paths):
     """With OLLAMA None the Request constructor blows up -- main() catches it."""
-    h = load_hook({"OLLAMA_BASE_URL": None, "HERMES_STATE_DB": paths["db"]})
+    h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"]})
     with pytest.raises(Exception):
         h.embed("hi")
 
@@ -595,7 +607,7 @@ def test_qdrant_upsert_request_shape(hook):
     finally:
         p.stop()
     c = calls[0]
-    assert c["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions/points"
+    assert c["url"] == "http://qdrant.invalid:6333/collections/loci_sessions/points"
     assert c["method"] == "PUT"
     assert c["timeout"] == 5
     assert c["body"] == {"points": [
@@ -638,7 +650,7 @@ def http_error(code):
 
 
 def test_ensure_collection_noop_without_qdrant_url(paths):
-    h = load_hook({"QDRANT_URL": None, "HERMES_STATE_DB": paths["db"]})
+    h = load_hook({"QDRANT_URL": None, "LOCI_STATE_DB": paths["db"]})
     calls, p = patch_urlopen(h, Resp({}))
     try:
         assert h.ensure_collection() is None
@@ -657,7 +669,7 @@ def test_ensure_collection_creates_on_404(hook):
     finally:
         p.stop()
     assert [c["method"] for c in calls] == ["GET", "PUT"]
-    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions"
+    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/loci_sessions"
     assert calls[0]["timeout"] == 5
     assert calls[1]["timeout"] == 10
     assert calls[1]["body"] == {
@@ -994,7 +1006,7 @@ def test_fast_path_still_calls_ensure_collection_first(wired):
 
 def test_main_crashes_if_the_cache_dir_is_unusable(wired, tmp_path):
     """BUG (fail-open violated): every other degraded path exits 0, but an
-    unusable HERMES_SYNC_CACHE lets cache_path()'s makedirs error escape
+    unusable LOCI_SYNC_CACHE lets cache_path()'s makedirs error escape
     main(), so the hook dies with a traceback and a non-zero status."""
     seed_session(wired)
     blocker = tmp_path / "not-a-dir"
@@ -1127,9 +1139,9 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
         url, method = req.full_url, req.get_method()
         if url.endswith("/v1/embeddings"):
             return Resp({"data": [{"embedding": [0.0, 1.0, 2.0, 3.0]}]})
-        if url.endswith("/collections/hermes_sessions") and method == "GET":
+        if url.endswith("/collections/loci_sessions") and method == "GET":
             raise http_error(404)
-        if url.endswith("/collections/hermes_sessions") and method == "PUT":
+        if url.endswith("/collections/loci_sessions") and method == "PUT":
             return Resp({"result": True, "status": "ok"})
         if url.endswith("/points"):
             return Resp({"result": {}, "status": "ok"})
@@ -1143,10 +1155,10 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
 
     urls = [(c["method"], c["url"]) for c in calls]
     assert urls == [
-        ("GET", "http://qdrant.invalid:6333/collections/hermes_sessions"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions"),
+        ("GET", "http://qdrant.invalid:6333/collections/loci_sessions"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions"),
         ("POST", "http://ollama.invalid:11434/v1/embeddings"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions/points"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions/points"),
     ]
     assert calls[-1]["body"]["points"][0]["id"] == hook.stable_id("s1")
     assert calls[-1]["body"]["points"][0]["vector"] == {"dense": [0.0, 1.0, 2.0, 3.0]}
@@ -1163,3 +1175,106 @@ def test_main_survives_a_missing_state_db_entirely(wired, capsys):
 def test_main_ignores_extra_stdin_keys_and_bad_json(wired):
     assert run_main(wired, "garbage not json") == 0
     assert run_main(wired, {"sessionId": "s1"}) == 0     # camelCase is not read
+
+
+# ---------------------------------------------------------------------------
+# _embeddings_url
+# The Hermes profile sets MNEMOSYNE_EMBEDDING_API_URL, not OLLAMA_BASE_URL.
+# ---------------------------------------------------------------------------
+
+def test_embeddings_url_from_bare_ollama_host():
+    mod = load_hook({"OLLAMA_BASE_URL": "http://h:11434"})
+    assert mod.OLLAMA == "http://h:11434/v1/embeddings"
+
+
+def test_embeddings_url_falls_back_to_mnemosyne_var():
+    mod = load_hook({"OLLAMA_BASE_URL": None,
+                     "MNEMOSYNE_EMBEDDING_API_URL": "http://h:11434/v1"})
+    assert mod.OLLAMA == "http://h:11434/v1/embeddings"
+
+
+def test_embeddings_url_prefers_ollama_base_url():
+    mod = load_hook({"OLLAMA_BASE_URL": "http://a:1",
+                     "MNEMOSYNE_EMBEDDING_API_URL": "http://b:2/v1"})
+    assert mod.OLLAMA == "http://a:1/v1/embeddings"
+
+
+def test_embeddings_url_none_when_neither_set():
+    mod = load_hook({"OLLAMA_BASE_URL": None})
+    assert mod.OLLAMA is None
+
+
+# ---------------------------------------------------------------------------
+# transcript_session_content
+# A Claude Code session id never resolves in Hermes' STATE_DB; transcript_path does.
+# ---------------------------------------------------------------------------
+
+def _write_transcript(tmp_path, records):
+    p = tmp_path / "t.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(p)
+
+
+def _msg(kind, text, ts="2026-08-26T12:00:00Z", model=None):
+    if kind == "user":
+        body = {"role": "user", "content": text}
+    else:
+        body = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        if model:
+            body["model"] = model
+    return {"type": kind, "timestamp": ts, "message": body}
+
+
+def test_transcript_content_builds_a_session(hook, tmp_path):
+    path = _write_transcript(tmp_path, [
+        {"type": "ai-title", "aiTitle": "Public Loci code"},
+        _msg("user", "a" * 40, ts="2026-08-24T17:40:37.466Z"),
+        _msg("assistant", "b" * 40, model="claude-opus-5"),
+    ])
+    got = hook.transcript_session_content(path, "sess-uuid")
+    assert got["title"] == "Public Loci code"
+    assert got["model"] == "claude-opus-5"
+    assert got["source"] == "claude-code"
+    assert got["started_at"] == "2026-08-24T17:40:37.466Z"
+    assert got["msg_count"] == 2
+    assert "USER: " + "a" * 40 in got["content"]
+    assert "ASSISTANT: " + "b" * 40 in got["content"]
+
+
+def test_transcript_content_extracts_only_text_blocks(hook, tmp_path):
+    rec = {"type": "assistant", "timestamp": "t", "message": {
+        "role": "assistant", "model": "m", "content": [
+            {"type": "thinking", "thinking": "hidden reasoning here padded out"},
+            {"type": "text", "text": "visible answer padded out to pass length"},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+        ]}}
+    got = hook.transcript_session_content(_write_transcript(tmp_path, [rec]), "s")
+    assert "visible answer" in got["content"]
+    assert "hidden reasoning" not in got["content"]
+    assert "tool_use" not in got["content"]
+
+
+def test_transcript_content_skips_unparseable_lines(hook, tmp_path):
+    p = tmp_path / "t.jsonl"
+    p.write_text("{not json\n" + json.dumps(_msg("user", "c" * 40)) + "\n\n")
+    got = hook.transcript_session_content(str(p), "s")
+    assert got["msg_count"] == 1
+
+
+def test_transcript_content_caps_at_max_chars(hook, tmp_path):
+    hook.MAX_CHARS = 200
+    records = [_msg("user", str(i) * 120) for i in range(40)]
+    got = hook.transcript_session_content(_write_transcript(tmp_path, records), "s")
+    assert got["msg_count"] == 40
+    assert len(got["content"]) <= 200
+    # The tail is what gets embedded, so the newest message must be present.
+    assert "39" in got["content"]
+
+
+def test_transcript_content_none_for_missing_or_empty(hook, tmp_path):
+    assert hook.transcript_session_content("", "s") is None
+    assert hook.transcript_session_content(str(tmp_path / "nope.jsonl"), "s") is None
+    assert hook.transcript_session_content(_write_transcript(tmp_path, []), "s") is None
+    # Records with no usable text are not a session.
+    short = _write_transcript(tmp_path, [_msg("user", "hi")])
+    assert hook.transcript_session_content(short, "s") is None

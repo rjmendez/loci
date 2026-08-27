@@ -125,8 +125,7 @@ class _FakeLLMLocal:
 
 
 def _install_fake_llm_local(monkeypatch, fake):
-    # batched_gen does `import llm_local` lazily; put our fake on sys.modules so that
-    # import resolves to it without any real Ollama call.
+    # batched_gen imports llm_local lazily, so the fake must sit on sys.modules.
     monkeypatch.setitem(sys.modules, "llm_local", fake)
 
 

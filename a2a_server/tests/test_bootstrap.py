@@ -16,11 +16,11 @@ import pyotp
 
 TOTP_SEED = pyotp.random_base32()
 
-os.environ["HERMES_ENV_FILE"] = "/nonexistent-env-file-for-tests"
-os.environ["HERMES_A2A_TOKEN"] = "test-token-abc123"
-os.environ["HERMES_A2A_TOTP_SEED"] = TOTP_SEED
-os.environ["HERMES_A2A_BOOTSTRAP_KEY"] = "test-bootstrap-key"
-os.environ.setdefault("HERMES_A2A_URL", "http://localhost:8201")
+os.environ["LOCI_ENV_FILE"] = "/nonexistent-env-file-for-tests"
+os.environ["LOCI_A2A_TOKEN"] = "test-token-abc123"
+os.environ["LOCI_A2A_TOTP_SEED"] = TOTP_SEED
+os.environ["LOCI_A2A_BOOTSTRAP_KEY"] = "test-bootstrap-key"
+os.environ.setdefault("LOCI_A2A_URL", "http://localhost:8201")
 os.environ.setdefault("QDRANT_URL", "http://localhost:6333")
 os.environ.setdefault("MNEMOSYNE_EMBEDDING_API_URL", "http://localhost:11434/v1")
 
@@ -33,8 +33,8 @@ _spec.loader.exec_module(a2a_server)
 # drop them from the shared environment now. Otherwise the next test module to
 # load its own copy of server.py in the same pytest session inherits TOTP and
 # every one of its unauthenticated-by-design requests starts 401ing.
-os.environ.pop("HERMES_A2A_TOTP_SEED", None)
-os.environ.pop("HERMES_A2A_BOOTSTRAP_KEY", None)
+os.environ.pop("LOCI_A2A_TOTP_SEED", None)
+os.environ.pop("LOCI_A2A_BOOTSTRAP_KEY", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 

@@ -23,11 +23,7 @@ def test_load_corpus_rev_head_reads_git_blobs():
 
 
 def test_load_corpus_rev_head_differs_from_worktree_when_mcp_server_dirty():
-    # mcp/server.py is the file another workflow is mid-editing per the task
-    # brief; --rev HEAD must read the committed blob, not whatever is
-    # sitting in the working tree at the moment this test runs. We only
-    # assert both are *readable* and non-empty, since the working tree copy
-    # is explicitly allowed to be mid-edit / different right now.
+    # --rev HEAD reads the committed blob; the working tree may legitimately differ.
     worktree_sources, _ = ingest.load_corpus(rev=None)
     rev_sources, _ = ingest.load_corpus(rev="HEAD")
     wt = {sf.rel_path for sf in worktree_sources}

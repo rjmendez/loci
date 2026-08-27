@@ -4,7 +4,7 @@ Two defects that shipped together and hid each other. `_rag_search_collections`
 dedups on `(origin, id)`; when `_qdrant_search_collection` returned rows without
 an `id`, every row of a collection keyed to `(origin, None)` and the whole
 collection folded to one hit. Measured on the live store before the fix:
-`dama_gotchi_code` returned 5 rows with 1 distinct id, all None. `hermes_memory`
+`dama_gotchi_code` returned 5 rows with 1 distinct id, all None. `loci_memory`
 escaped only because a finding stores its own id in the payload.
 """
 import unittest

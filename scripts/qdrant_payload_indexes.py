@@ -33,7 +33,7 @@ if not QDRANT_KEY:
         _servers = _cfg["mcpServers"]
         # "loci" is the current registration name; "hermes_memory" is what older
         # settings.json files used. Accept either.
-        _entry = _servers.get("loci") or _servers["hermes_memory"]
+        _entry = _servers.get("loci") or _servers["loci_memory"]
         QDRANT_KEY = _entry["env"]["QDRANT_API_KEY"]
     except Exception:
         pass
@@ -43,10 +43,10 @@ if not QDRANT_KEY:
 INDEXES = [
     ("mnemosyne",       "project"),
     ("mnemosyne",       "session_id"),
-    ("hermes_sessions", "project"),
-    ("hermes_sessions", "session_id"),
-    ("hermes_sessions", "cwd"),
-    ("hermes_memory",   "project"),
+    ("loci_sessions", "project"),
+    ("loci_sessions", "session_id"),
+    ("loci_sessions", "cwd"),
+    ("loci_memory",   "project"),
 ]
 
 

@@ -8,7 +8,7 @@ then evaluate cosine vs that model on R (which the model never saw). Reports
 per-fold and mean model-vs-cosine F1/accuracy — whether the model GENERALIZES.
 
 On-demand, live-only (needs embeddings + OLLAMA_URL). Print-only (no persist).
-Run: OLLAMA_URL=... HERMES_PY ... eval/grounding_gate_oos_eval.py
+Run: OLLAMA_URL=... LOCI_PY ... eval/grounding_gate_oos_eval.py
 """
 import glob
 import itertools

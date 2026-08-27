@@ -20,7 +20,7 @@ WorkingDirectory=/home/rjmendez/loci
 
 # a2a_context_bridge.py looks for ~/.hermes/.env (or ~/.hermes/profiles/$HERMES_PROFILE/.env)
 # and loads it with os.environ.setdefault, so whatever systemd supplies here WINS. Point this
-# at wherever HERMES_A2A_TOKEN actually lives on this host — on a node where the A2A server
+# at wherever LOCI_A2A_TOKEN actually lives on this host — on a node where the A2A server
 # runs as a container that is usually the checkout's own .env, not ~/.hermes/.env.
 EnvironmentFile=/home/rjmendez/loci/.env
 

@@ -2,9 +2,17 @@
 
 ## Environment variables
 
-All scripts use `os.environ.get(VAR, default)` — no value is hardcoded.
-Override any default by exporting the variable before running, or by editing
-`~/.claude/hooks/env.sh` for persistent overrides.
+Nothing is hardcoded. Settings resolve through a chain (`mcp/backends.py`):
+
+1. the environment variable
+2. a local probe — `http://localhost:11434` for Ollama, `:8000` for vLLM
+3. `~/.loci/backends.toml`, or `$LOCI_CONFIG` — gitignored, machine-specific
+4. the code default
+
+`scripts/loci_groom.py:load_env()` inserts the repo `.env` and `mcp/.env` between
+steps 1 and 3, because a cron job does not inherit the MCP launcher's environment.
+Copy `backends.toml.example` to `~/.loci/backends.toml` for endpoints and keys
+that must not live in the repo.
 
 ### Core infrastructure
 
@@ -13,12 +21,20 @@ Override any default by exporting the variable before running, or by editing
 | `QDRANT_URL` | _(none — required; unset means Qdrant steps are skipped or the script errors out, never a localhost fallback)_ | all Qdrant-touching scripts |
 | `QDRANT_API_KEY` | _(none)_ | all Qdrant-touching scripts |
 | `OLLAMA_URL` | _(none, required)_ | most embedding + generation scripts (memgas_hierarchy.py, ebbinghaus_consolidation.py, amem_consolidation.py, agentHER_relabeler.py, skillops_maintenance.py, exif_skill_discovery.py, score_trace_collector.py, eval/harness.py) |
-| `OLLAMA_BASE_URL` | _(none)_ | hook scripts only: hooks/pre_llm_grounding.py, hooks/session_end_sync.py, swr_replay.py |
+| `OLLAMA_BASE_URL` | _(none in code; `backends.ollama_url()` probes `http://localhost:11434`)_ | the **embedding** endpoint for 16 non-test files: `mcp/{qdrant_ops,embed_ops,backends,memcheck/llm}.py`, `scripts/hooks/{pre_llm_grounding,session_end_sync}.py`, `scripts/{loci_groom,glymphatic_sweep,gpu_warm}.py`, all of `mlops/`, `deep_think_loci/grounding/` |
+| `LOCI_OLLAMA_GEN_URL` / `OLLAMA_GEN_URL` | _(none; falls back to `backends.ollama_gen_url()` → `ollama_url()`)_ | the **generation** endpoint, resolved separately from embeddings (`mcp/llm_local.py`). `OLLAMA_BASE_URL` deliberately does **not** feed it |
+| `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`) |
+| `LOCI_QDRANT_RETENTION_DAYS` | `0` — purge **disabled** | `mcp/qdrant_ops.py:_retention_days`. Any value > 0 makes the first Qdrant call of every process delete findings older than that window. Also readable as `[qdrant].retention_days` in `~/.loci/backends.toml` |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | all embedding operations |
 
-Note: `OLLAMA_URL` and `OLLAMA_BASE_URL` are distinct variables used by different script groups.
-Most standalone scripts read `OLLAMA_URL` (full base URL, e.g. `http://localhost:11434`).
-Hook scripts read `OLLAMA_BASE_URL` and append `/v1` internally.
+Note: `OLLAMA_URL` and `OLLAMA_BASE_URL` are distinct variables read by different
+files, and the split is not hooks-vs-standalone. The MCP server, the grooming tier
+and both Claude Code hooks read `OLLAMA_BASE_URL` (a bare host) and append `/v1`
+themselves. The older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py`,
+`ebbinghaus_consolidation.py`, `amem_consolidation.py`, `agentHER_relabeler.py`,
+`skillops_maintenance.py`, `exif_skill_discovery.py`, `score_trace_collector.py`,
+`swr_replay.py`, `ua-ingest.py`, `gpu_warm.py`, and `eval/harness.py`.
+`mcp/embed_ops.py` and `mcp/backends.py` read both.
 
 ### Memory store paths
 
@@ -27,7 +43,7 @@ Hook scripts read `OLLAMA_BASE_URL` and append `/v1` internally.
 | `MNEMOSYNE_DB` | `~/.hermes/mnemosyne/data/mnemosyne.db` | ebbinghaus, amem, agentHER, memgas, score_trace |
 | `STATE_DIR` | `~/.claude/hook-state` | all hooks, skill_annotation_updater, score_trace, exif |
 | `SKILLS_DIR` | `~/.claude/skills` | skill_annotation_updater, skillops_maintenance, exif |
-| `HERMES_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
+| `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
 
 ### Tuning parameters
 
@@ -36,7 +52,7 @@ Hook scripts read `OLLAMA_BASE_URL` and append `/v1` internally.
 | `HOOK_RECALL_TOP_K` | `3` (code default; `.env.example` sets `5`) | Max grounding results injected per turn |
 | `HOOK_RECALL_MIN_SCORE` | `0.55` | Qdrant cosine threshold; lower = more noise |
 | `FORGET_THRESH` | `0.3` | Entries with retention probability below this are re-embedded (0 = never, 1 = always); used by ebbinghaus_consolidation.py |
-| `MAX_PER_RUN` | `50` (ebbinghaus), `20` (agentHER) | Max entries processed per cron tick; read by both ebbinghaus_consolidation.py and agentHER_relabeler.py |
+| `EBBINGHAUS_MAX_PER_RUN` / `AGENTHER_MAX_PER_RUN` / `AMEM_MAX_PER_RUN` | `50` / `20` / `100` | Max entries per tick, one name per script. `MAX_PER_RUN` is still honoured as a fallback for all three |
 | `AMEM_LINK_THRESHOLD` | `0.88` | Cosine threshold for cross-link creation |
 | `AMEM_CONFLICT_THRESHOLD` | `0.96` | Cosine threshold for conflict flagging |
 | `SHADOW_THRESHOLD` | `0.92` | Cosine threshold for SHADOW_RISK pairs; used by skillops_maintenance.py |
@@ -48,7 +64,14 @@ Hook scripts read `OLLAMA_BASE_URL` and append `/v1` internally.
 
 ## Cron jobs
 
-Live cron config: `cron/jobs.json` (in repo root; deployed path depends on your cron runner setup). Six jobs are defined; the five enabled ones are below. `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled and is omitted from the table.
+`cron/jobs.json` defines six jobs; the five enabled ones are below.
+`deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled
+and is omitted from the table.
+
+These jobs need an agent runner that reads `cron/jobs.json`. Nothing in this repo
+does, and on the reference host every one of the five has `last_run_at: null`
+(issue #205) — check that before assuming they fire. The grooming tier below runs
+from the user crontab instead, and does fire.
 
 | ID | Name | Interval | Script |
 |---|---|---|---|
@@ -68,13 +91,68 @@ runs consolidation across all configured banks without spawning an LLM agent.
 
 ---
 
+## Passive grooming tier
+
+`scripts/loci_groom.py` holds eight passes: `index`, `tags`, `recall`, `knn_tags`,
+`codelink`, `verify`, `reflect`, `summaries`. Only `index` is `applyable` — every
+other pass writes proposals under `$LOCI_MEMORY_DIR/_groom/` and never touches
+`findings.jsonl`.
+
+Four are scheduled, from the user crontab, through `scripts/loci_groom_cron.sh`:
+
+| When | Pass | What it does | Last measured |
+|---|---|---|---|
+| `17 */6 * * *` | `index --apply` | upserts findings present on disk but missing from Qdrant; upsert-only, never deletes | on_disk 2922, indexed 2769, coverage 0.9476 |
+| `20 3 * * *` | `knn_tags` | proposes tags from k-NN neighbours | vocabulary 60, generated 18, proposed 0 |
+| `40 3 * * *` | `codelink` | proposes finding→symbol links | 11,273 symbols, 718 links generated |
+| `50 4 * * *` | `summaries` | fills the investigation summary ladder | already_had 137, nothing_to_say 5, errors 0 |
+
+`tags` is deliberately unscheduled: `knn_tags` measured better at a fraction of
+the cost. `verify` is **not scheduled and is not fit to schedule** — the fixed
+benchmark in `eval/verify_skeptic_eval.py` measured 22% false refutation on main,
+and five prompt/guard variants were all neutral or worse (#231). A false
+"refuted" on a true finding is what a later reader acts on.
+
+The wrapper's exit code is the point of it:
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | a pass raised |
+| 3 | a pass **refused** or **degraded** |
+
+The refusal that matters: `connect()` reads `_retention_days()` before touching
+Qdrant and refuses when it is not 0, because `_get_qdrant()` runs the startup
+purge on its first call in a process. Grooming re-indexes findings; against a
+non-zero retention window that is an index-then-delete loop that reports success.
+The wrapper prints the pass's own reason on stderr and appends one line per run
+to `$LOCI_GROOM_STATE/runs.jsonl` (default `~/.loci/groom/runs.jsonl`), so
+"did this ever actually run" has an answer.
+
+Per-run ceilings: `LOCI_GROOM_VERIFY_INVESTIGATIONS` (5),
+`LOCI_GROOM_VERIFY_FINDINGS` (10), `LOCI_GROOM_SUMMARY_INVESTIGATIONS` (12),
+`LOCI_GROOM_REFLECT_ITEMS` (3), `LOCI_GROOM_BATCH` (16). `LOCI_GROOM_MODEL` is
+unset on purpose — the vLLM and Ollama tiers name the same model differently, so
+each tier resolves its own.
+
+---
+
 ## Manual operations
+
+The repo is `loci` (github.com/rjmendez/loci). The commands below assume:
+
+```bash
+LOCI=~/development/loci                              # your checkout
+LOCI_PY=~/.hermes/hermes-agent/venv/bin/python3    # interpreter with the deps
+```
+
+`scripts/loci_groom_cron.sh` uses `$LOCI/mcp/.venv/bin/python` instead, and
+`eval/run_eval.sh` reads `$LOCI_PY` with the same default as above.
 
 ### Rebuild MemGAS 3-level index
 
 ```bash
-HERMES_PY=~/.hermes/hermes-agent/venv/bin/python3
-$HERMES_PY ~/development/hermes_memory/scripts/memgas_hierarchy.py --index
+$LOCI_PY $LOCI/scripts/memgas_hierarchy.py --index
 ```
 
 Run after major Mnemosyne consolidation, or when memgas_l1/l2/l3 collections get stale.
@@ -82,14 +160,14 @@ Run after major Mnemosyne consolidation, or when memgas_l1/l2/l3 collections get
 ### Run MemGAS search
 
 ```bash
-$HERMES_PY ~/development/hermes_memory/scripts/memgas_hierarchy.py --search "your query here"
+$LOCI_PY $LOCI/scripts/memgas_hierarchy.py --search "your query here"
 ```
 
 ### Detect skill shadows
 
 ```bash
 OLLAMA_URL=http://localhost:11434 \
-$HERMES_PY ~/development/hermes_memory/scripts/skillops_maintenance.py
+$LOCI_PY $LOCI/scripts/skillops_maintenance.py
 ```
 
 Review SHADOW_RISK pairs. For sim=1.000 pairs: one is usually a duplicate install or
@@ -99,7 +177,7 @@ has an empty description — populate a distinctive description.
 
 ```bash
 STATE_DIR=~/.claude/hook-state \
-$HERMES_PY ~/development/hermes_memory/scripts/exif_skill_discovery.py
+$LOCI_PY $LOCI/scripts/exif_skill_discovery.py
 ```
 
 Review `~/.claude/hook-state/exif_discoveries.jsonl` for candidates. Promote manually:
@@ -110,7 +188,7 @@ cp -r ~/.claude/hook-state/candidate_skills/SKILLNAME ~/.claude/skills/SKILLNAME
 ### Build SCoRe fine-tuning dataset
 
 ```bash
-$HERMES_PY ~/development/hermes_memory/scripts/score_trace_collector.py
+$LOCI_PY $LOCI/scripts/score_trace_collector.py
 cat ~/.hermes/mnemosyne/data/score_traces/manifest.json
 ```
 
@@ -119,10 +197,12 @@ When `ready_for_sft: true` (≥ 10 correction pairs), the dataset is usable for 
 ### Run eval harness
 
 ```bash
-~/development/hermes_memory/eval/run_eval.sh
+$LOCI/eval/run_eval.sh
 ```
 
-Scores are upserted to Qdrant `eval_scores` collection with run_date in payload.
+Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`,
+`grounding_gate_qf_eval.py` — and passes its arguments through to each. Scores are
+upserted to the Qdrant `eval_scores` collection with `run_date` in the payload.
 Query longitudinal scores:
 
 ```bash
@@ -137,47 +217,88 @@ curl -s -X POST $QDRANT_URL/collections/eval_scores/points/scroll \
 
 ```bash
 QDRANT_API_KEY=$QDRANT_API_KEY \
-$HERMES_PY ~/development/hermes_memory/scripts/mnemosyne_qdrant_sync.py
+$LOCI_PY $LOCI/scripts/mnemosyne_qdrant_sync.py
 ```
+
+### Run a groom pass by hand
+
+```bash
+$LOCI/scripts/loci_groom_cron.sh index          # dry run: reports coverage, writes nothing
+$LOCI/scripts/loci_groom_cron.sh index --apply  # upsert the missing findings
+```
+
+Exit 3 means the pass refused or degraded; the reason is on stderr. See
+[Passive grooming tier](#passive-grooming-tier).
+
+### Check the adversarial skeptic
+
+```bash
+$LOCI/mcp/.venv/bin/python $LOCI/eval/verify_skeptic_eval.py [trials] [votes]
+```
+
+A fixed, self-contained case set — every case carries its own context, so no
+commit to this repo can falsify a label. The headline number is FALSE REFUTATION,
+not accuracy: "uncertain" leaves a finding unverified and is harmless, "refuted"
+on a true claim is the damage.
 
 ---
 
-## Claude Code hook registry
+## Claude Code hooks
 
-Hooks registered in `~/.claude/settings.json`:
+This repo ships three hooks, in `scripts/hooks/`. Each reads a JSON payload on
+stdin and exits 0 on any event name it does not recognise.
 
-| Event | Matcher | Script | Purpose |
-|---|---|---|---|
-| SessionStart | * | `session_start_guard.sh` | Project detect, MCP probe, rules inject |
-| UserPromptSubmit | * | `user_prompt_grounding.sh` | Per-turn Qdrant grounding |
-| PreToolUse | Bash | `pre_bash_guard.sh` | Guard protocol (ACK_REMOTE_WRITE etc.) |
-| PreToolUse | * | `hermes_pre_tool_grounding.sh` | Hermes tool audit |
-| PostToolUse | Bash | `post_bash_success_memory.sh` | Success event logging |
-| PostToolUseFailure | Bash | `post_bash_failure_memory.sh` | Repeated failure → Mnemosyne |
-| PostToolUseFailure | * | `post_tool_failure_reflection.sh` | Reflexion trace for all tools |
-| PreCompact | — | `pre_compact_guard.sh` | Checkpoint before compaction |
-| Stop | — | `session_end_evaluate_guard.sh` | AgentRR trace → hermes_sessions |
-| SessionEnd | * | `session_end_evaluate_guard.sh` | Same as Stop |
+| Script | Events accepted | Purpose |
+|---|---|---|
+| `pre_llm_grounding.py` | `UserPromptSubmit`, `SubagentStart` (and legacy `pre_llm_call` / `PreLlmCall`) | per-turn Qdrant grounding injected into the prompt |
+| `pre_tool_grounding.py` | `PreToolUse` (and legacy `pre_tool_call`) | tool-call audit |
+| `session_end_sync.py` | `Stop` — reads `transcript_path` from the payload | session → `loci_sessions` |
+
+Install and drift-check them with `scripts/hooks/install.sh`:
+
+```bash
+scripts/hooks/install.sh          # copy repo -> ~/.claude/hooks, backing up what is there
+scripts/hooks/install.sh --check  # report drift, exit 1 if any, change nothing
+```
+
+Run `--check` before trusting a hook. The deployed and repo copies have diverged
+silently before — a hand-edited `pre_tool_grounding.py` accepting `PreToolUse`
+against a repo copy that only accepted the Hermes name, where a fresh install
+would have disabled the hook.
+
+Two payload shapes to get right when writing a new hook; both were wrong until
+#228, and all three hooks ran, exited 0, and did nothing:
+
+- Claude Code puts the prompt text at the **top level** as `prompt`.
+  `extra.user_message` is the Hermes shape and is empty under Claude Code.
+- A named-vector Qdrant **search** takes `{"name": "dense", "vector": [...]}`.
+  `{"dense": [...]}` is the **upsert** shape and returns HTTP 400.
+
+`scripts/install_hooks.sh` is unrelated — it symlinks the git `post-commit` hook
+into `.git/hooks`.
 
 ---
 
 ## Portability (new machine setup)
 
-All hook paths and infra addresses are driven by env vars. To stand up on a new machine:
+No infra address or path is hardcoded. To stand up on a new machine:
 
-1. Copy `~/.claude/hooks/` directory
-2. Set overrides in `~/.claude/hooks/env.sh`:
-   ```bash
-   export OLLAMA_URL=<ollama-base-url>
-   export OLLAMA_BASE_URL=<ollama-base-url>
-   export MNEMOSYNE_AUTHOR_ID=<your-id>
-   export HERMES_PY=/path/to/python3
-   # etc.
-   ```
-3. Update `~/.claude/settings.json` hook paths (currently hardcoded — no env expansion in JSON)
-4. Create `~/.claude/hook-state/` directory
-5. Ensure Qdrant API key is in `~/.claude/settings.json` at
-   `mcpServers.loci.env.QDRANT_API_KEY` (or the legacy `mcpServers.hermes_memory.env.QDRANT_API_KEY`)
+1. `cp backends.toml.example ~/.loci/backends.toml` and fill in the endpoints and
+   keys for this machine — Ollama, vLLM, Qdrant, embed/rerank models, memory dir.
+   This is the durable channel: it needs no third-party import and no launcher
+   that remembers to export anything. Leave a section blank on a laptop that
+   runs its own Ollama; the local probe finds it.
+2. `scripts/hooks/install.sh` to place the three hooks in `~/.claude/hooks`.
+3. Register them in `~/.claude/settings.json`. Hook paths there are absolute —
+   JSON does no `$HOME` expansion.
+4. `mkdir -p ~/.claude/hook-state`
+5. Qdrant credentials go in `~/.loci/backends.toml` under `[qdrant]`, or in
+   `~/.claude/settings.json` at `mcpServers.loci.env.QDRANT_API_KEY`.
+
+The one setting worth checking by hand on a new machine is
+`LOCI_QDRANT_RETENTION_DAYS`. The code default is 0 and 0 is safe, so a fresh
+install needs nothing — but a stray non-zero value anywhere in the chain makes
+the first Qdrant call of every process delete findings.
 
 ---
 
@@ -190,4 +311,7 @@ All hook paths and infra addresses are driven by env vars. To stand up on a new 
 | `eval/harness.py` mean_score=0.167 baseline is low | INFO | Keyword matching is strict; trend matters more than absolute value |
 | MemGAS index takes ~5min for 500+ entries (sequential embed) | MED | Run `--index` in off-hours; add batch embedding |
 | agentHER requires a generative Ollama model to be available | MED | Set `AGENTHER_GEN_MODEL` to your installed model (default: `llama3.2:latest`) |
+| The `verify` groom pass false-refutes 22% of true claims | HIGH | Do not schedule it. Measured by `eval/verify_skeptic_eval.py`; five prompt/guard variants were neutral or worse (#231) |
+| `cron/jobs.json` is not read by anything in this repo | MED | The five enabled jobs there have never run on the reference host (#205). Schedule from the user crontab, as the grooming tier does |
+| `backends.toml.example` has no `[qdrant] retention_days` key | LOW | The key is read (`qdrant_ops._retention_days`) but not shown in the example; the code default of 0 applies |
 | SCoRe `corrections=0` until sessions accumulate overlap | INFO | Corrections require same-session failure→success pairs; grow naturally |

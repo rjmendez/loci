@@ -25,30 +25,7 @@ import json
 import os
 from typing import Optional
 
-# [substrate] read the base URL from env, same convention as embed_ops.py. When unset, the
-# call-time _resolve_ollama() falls back to backends (local probe -> config) for portability.
-# GENERATION-specific vars ONLY. OLLAMA_BASE_URL is the EMBEDDING endpoint, and
-# reading it here re-created the exact conflation #222 set out to fix, one level
-# up: #222 taught the RESOLVER to separate generation from embeddings, then left
-# the embedding variable as the highest-precedence generation override.
-#
-# scripts/loci_groom.load_env() — which every groom pass calls — sets
-# OLLAMA_BASE_URL to backends.ollama_url(), the in-cluster host that serves only
-# nomic-embed-text. Measured in one process: bare import resolves to oxalis and
-# generates; after load_env() it resolves to 10.42.0.1 and 404s. So under cron,
-# 100% of generation went to a host with no generation model, and the vLLM
-# fallback was silently rescuing it — until #224 made that fallback opt-in, which
-# took the groom pass from 9/100 degraded to 100/100.
-#
-# A host with one capable Ollama still works: _resolve_ollama() falls through to
-# backends.ollama_gen_url(), which itself falls back to ollama_url(). This only
-# removes the env var's ability to OUTRANK that resolution.
-# Read at CALL time, not import time. qdrant_ops._retention_days() already
-# established this pattern here for the same reason: scripts/loci_groom.load_env()
-# runs AFTER this module is imported, so an import-time capture reflects the
-# environment before the process configured itself. That ordering is what let a
-# stale value win, and a module-level constant cannot be tested without reload()
-# — which made the test for it order-dependent in the suite.
+# GENERATION vars only, read at CALL time: OLLAMA_BASE_URL is the EMBEDDING endpoint, and loci_groom.load_env() rewrites it after import.
 def _gen_env() -> str:
     return (os.environ.get("LOCI_OLLAMA_GEN_URL")
             or os.environ.get("OLLAMA_GEN_URL") or "")
@@ -67,8 +44,7 @@ def _resolve_ollama() -> str:
     except Exception:
         return ""
 
-# Timeout is generous because a cold model load can take ~70s even when we pin with
-# keep_alive (grounding is silent on an exact value; 120s covers a cold load plus generation).
+# A cold model load is ~70s even with keep_alive, so 120s covers a cold load plus generation.
 _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
 
 
@@ -137,11 +113,6 @@ def generate(prompt: str,
         r.raise_for_status()
         text = (r.json().get("response") or "")
     except Exception as exc:
-        # Ollama could not serve this. Try the vLLM tier before giving up: on this
-        # host Ollama carries only nomic-embed-text (an EMBEDDING model, no
-        # generation model at all) while vLLM serves the generation model under a
-        # different name -- Qwen/Qwen2.5-3B-Instruct, not the Ollama-style
-        # qwen2.5:3b. Asking one server for the other's name fails on both.
         fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
                              temperature=temperature)
         if fallback is not None:
@@ -167,16 +138,7 @@ def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
     actually registers (backends.vllm_model()), which is the part llm_local was
     getting wrong. Reusing it keeps one definition of both.
     """
-    # OPT-IN. This fallback was added when Ollama generation was broken; Ollama
-    # works now, and the endpoint backends resolves is NOT Loci's: 127.0.0.1:18000
-    # is /home/rjmendez/dama-vllm/vllm_tailscale_forward.py (pid 378), another
-    # project's service, serving Qwen2.5-3B-Instruct at max_model_len=4096.
-    # Grounded verify prompts exceed that, so firing into it 400s AND borrows
-    # capacity Loci does not own. Measured verify latencies (153s, >300s) also
-    # exceed _TIMEOUT=120s, so the failure path that reaches here is exactly the
-    # one that would hit it hardest.
-    #
-    # Set LOCI_VLLM_FALLBACK=1 when Loci has a vLLM of its own.
+    # OPT-IN: the vLLM backends resolves is another project's service, not Loci's. Set LOCI_VLLM_FALLBACK=1 when Loci has its own.
     if os.environ.get("LOCI_VLLM_FALLBACK", "").strip() in ("", "0"):
         return None
     try:

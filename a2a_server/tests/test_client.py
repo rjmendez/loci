@@ -21,8 +21,8 @@ if str(_A2A_DIR) not in sys.path:
     sys.path.insert(0, str(_A2A_DIR))
 
 # Set required env vars before importing the client module
-os.environ.setdefault("HERMES_A2A_TOKEN", "test-token-abc")
-os.environ.setdefault("HERMES_A2A_URL", "http://localhost:8201")
+os.environ.setdefault("LOCI_A2A_TOKEN", "test-token-abc")
+os.environ.setdefault("LOCI_A2A_URL", "http://localhost:8201")
 
 _client_path = pathlib.Path(__file__).parent.parent / "client.py"
 _spec = importlib.util.spec_from_file_location("loci_client_module", _client_path)
