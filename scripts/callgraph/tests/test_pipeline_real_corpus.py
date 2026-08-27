@@ -29,8 +29,9 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
         n for n in head_build.store.nodes_of_kind("FUNCTION")
         if not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
-    # Band is the ~951 measured count +-5%; docs/census.txt's ~890 predates two modules.
-    assert 900 <= len(module_level) <= 1000, len(module_level)
+    # Band is the 1002 measured count +-5%; the LOCI_* rename and the grounding
+    # helpers moved it from ~951.
+    assert 950 <= len(module_level) <= 1055, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):

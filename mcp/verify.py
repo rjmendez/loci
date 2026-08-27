@@ -27,6 +27,10 @@ Design mirrors mcp/query_expand.py:
   path just contributes no code). We also surface the model's RAW `reasoning` alongside the
   verdict so a caller can still judge when the verdict is the cautious 'uncertain'.
 
+  The corpus is MULTI-REPO, so a ref names a file in some checkout on the host, not
+  necessarily this one — see _search_roots for the allow-list and _ground_ref for the rule
+  that decides WHICH checkout, refusing rather than guessing when worktrees disagree.
+
 - Fail-open + skeptical default: on not-ok / timeout / parse failure / any error we return a
   well-formed {"verdict": "uncertain"} result rather than raising. We also default to the
   cautious verdict when the model is unsure — a claim is only 'confirmed' when the skeptic
@@ -38,6 +42,7 @@ copy and the JSON schema {verdict,refutation,confidence} are this task's design.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -63,6 +68,12 @@ _MAX_REFS = 8
 _MAX_LINES_PER_REF = 60
 # Size cap on a single file read so an oversized/binary file can't blow up memory/prompt.
 _MAX_FILE_BYTES = 1_000_000
+# Size cap on a file we will HASH for revision matching (must cover whole-file bytes, so it
+# is larger than the display cap). Mirrors server._hash_file_bytes' own cap.
+_MAX_HASH_BYTES = 8 * 1024 * 1024
+# Bound on how many checkouts we will search, so a home directory full of repos can't turn
+# one ref into thousands of stat calls.
+_MAX_SEARCH_ROOTS = 256
 
 # "file:line" or "file:start-end". Require the path to contain a '.' or '/' so bare
 # "10:30"-style tokens don't get mistaken for refs; anything that still slips through
@@ -132,49 +143,214 @@ def _repo_root() -> str:
         return os.path.realpath(os.getcwd())
 
 
-def _safe_resolve(path: str) -> Optional[str]:
-    """Resolve a repo-relative ref path to an absolute path UNDER the repo root.
+def _safe_resolve(path: str, root: Optional[str] = None) -> Optional[str]:
+    """Resolve a relative ref path to an absolute path UNDER ``root`` (default: repo root).
 
     SECURITY: file refs are parsed from free-form (attacker-influenceable) claim/context
-    text, so the default reader must never read arbitrary files. Rejects absolute paths and
-    any ``..`` traversal segment, resolves relative to the repo root, and returns None for
-    anything that still lands outside the root (e.g. via a symlink). Returns None on reject
-    (caller fails open by contributing no code). Never raises.
+    text, so the default reader must never read arbitrary files. Rejects absolute paths,
+    any ``..`` traversal segment, and any DOT-PREFIXED path component (``.ssh/id_rsa``,
+    ``.env``, ``.git/config`` — credential stores that are not the source we ground on),
+    resolves relative to the root, and returns None for anything that still lands outside
+    that root (e.g. via a symlink). Returns None on reject (caller fails open by
+    contributing no code). Never raises.
+
+    ``root`` is chosen by the caller from the vetted set in _search_roots(); it is never
+    taken from the ref itself, so widening the search does not widen what a ref may name.
     """
     if not isinstance(path, str) or not path:
         return None
     if os.path.isabs(path):
         return None
-    if ".." in path.replace("\\", "/").split("/"):
+    parts = path.replace("\\", "/").split("/")
+    if ".." in parts:
+        return None
+    if any(p.startswith(".") for p in parts if p):
         return None
     try:
-        root = _repo_root()
-        full = os.path.realpath(os.path.join(root, path))
+        base = os.path.realpath(root) if root else _repo_root()
+        full = os.path.realpath(os.path.join(base, path))
         # realpath collapses symlinks/traversal; require the result to stay under the root.
-        if full == root or full.startswith(root + os.sep):
+        if full == base or full.startswith(base + os.sep):
             return full
     except Exception:
         return None
     return None
 
 
-def _lazy_read_file(path: str) -> str:
-    """Default reader: read a repo-relative source file, SANDBOXED under the repo root.
+def _root_parents() -> list:
+    """Directories scanned for sibling checkouts. LOCI_CODE_ROOT_PARENTS (os.pathsep-
+    separated) overrides; default is $HOME plus the repo root's parent. Never raises."""
+    try:
+        raw = os.environ.get("LOCI_CODE_ROOT_PARENTS")
+        if raw:
+            return [p for p in raw.split(os.pathsep) if p]
+        out = []
+        for cand in (os.path.expanduser("~"), os.path.dirname(_repo_root())):
+            if cand and cand not in out:
+                out.append(cand)
+        return out
+    except Exception:
+        return []
 
-    Rejects absolute paths, ``..`` traversal, and anything resolving outside the repo, and
-    caps the read at ``_MAX_FILE_BYTES``. Fail-open to "" on any rejection or error.
+
+def _search_roots() -> tuple:
+    """The vetted checkout roots a ref may resolve under, primary repo root FIRST.
+
+    loci_memory is a MULTI-REPO corpus: findings cite ``perception/depth.py`` recorded
+    against a hugbot5000 checkout, not against this repo, so sandboxing every ref to
+    _repo_root() rejected 100% of them (measured: 62 stored code_refs, 0 resolvable).
+
+    The set is the repo root, any root named explicitly in LOCI_CODE_ROOTS, and the git
+    WORKING TREES that are immediate children of _root_parents(). Requiring a ``.git``
+    marker is what keeps this an allow-list rather than "$HOME": ``~/.ssh`` and friends are
+    never roots, and _safe_resolve still refuses absolute paths, ``..`` and dot-components
+    under every one of them. Cached; call ``_search_roots.cache_clear()`` after changing
+    the env. Never raises.
+    """
+    roots = []
+    seen = set()
+
+    def _add(d):
+        try:
+            real = os.path.realpath(d)
+        except Exception:
+            return
+        if real in seen or not os.path.isdir(real):
+            return
+        seen.add(real)
+        roots.append(real)
+
+    try:
+        _add(_repo_root())
+        for d in (os.environ.get("LOCI_CODE_ROOTS") or "").split(os.pathsep):
+            if d:
+                _add(d)
+        for parent in _root_parents():
+            try:
+                entries = sorted(os.scandir(parent), key=lambda e: e.name)
+            except Exception:
+                continue
+            for e in entries:
+                if len(roots) >= _MAX_SEARCH_ROOTS:
+                    break
+                try:
+                    if e.name.startswith(".") or not e.is_dir(follow_symlinks=False):
+                        continue
+                    if os.path.exists(os.path.join(e.path, ".git")):
+                        _add(e.path)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return tuple(roots[:_MAX_SEARCH_ROOTS])
+
+
+_search_roots = lru_cache(maxsize=1)(_search_roots)
+
+
+def _file_sha256(full: str) -> Optional[str]:
+    """sha256 of a file's whole bytes, or None (too large / unreadable). Never raises.
+
+    Must hash the WHOLE file to be comparable with the ``hash`` server.py stamped into a
+    finding's code_refs; the display cap (_MAX_FILE_BYTES) is a separate, smaller budget.
     """
     try:
-        full = _safe_resolve(path)
-        if not full or not os.path.isfile(full):
-            return ""
-        # Read raw BYTES so the cap is byte-accurate (text-mode f.read(n) caps CHARACTERS and
-        # can pull in more bytes for multibyte text). Read exactly the cap, then decode.
+        if os.path.getsize(full) > _MAX_HASH_BYTES:
+            return None
+        h = hashlib.sha256()
         with open(full, "rb") as f:
-            raw = f.read(_MAX_FILE_BYTES)
-        return raw.decode("utf-8", errors="replace")
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
     except Exception:
-        return ""
+        return None
+
+
+def _ground_ref(path: str, want_hash: Optional[str] = None):
+    """Pick the ONE checkout a ref may be read from. Returns (abs_path, label) or (None, "").
+
+    The host carries many worktrees of the same repo, so "first root that has the file"
+    would ground the skeptic on an arbitrary revision — a confident answer from the wrong
+    source, worse than no grounding. This refuses rather than guesses:
+
+      1. a candidate whose sha256 equals the finding's stamped ``hash`` wins outright — that
+         is the exact revision the finding was recorded against;
+      2. otherwise the primary repo root wins if it has the file (this is the checkout we
+         are running in, and it preserves the previous in-repo behaviour unchanged);
+      3. otherwise, only if EVERY candidate holds byte-identical content is it read — the
+         revision question has a single answer, so there is nothing to guess;
+      4. otherwise -> refused (None). Ambiguity is reported, never resolved by position.
+
+    ``label`` names the checkout and the basis, so the fetched block can say which revision
+    it is and whether the finding has drifted from it. Never raises.
+    """
+    try:
+        roots = _search_roots()
+        cands = []
+        chosen = set()
+        for root in roots:
+            full = _safe_resolve(path, root)
+            if full and full not in chosen and os.path.isfile(full):
+                chosen.add(full)
+                cands.append((root, full))
+        if not cands:
+            return None, ""
+        digests = {}
+        for root, full in cands:
+            d = _file_sha256(full)
+            if d is not None:
+                digests.setdefault(d, (root, full))
+        if not digests:
+            return None, ""
+        if want_hash and want_hash in digests:
+            root, full = digests[want_hash]
+            return full, f"{os.path.basename(root)}, exact revision"
+        primary = _safe_resolve(path)
+        if primary and any(full == primary for _r, full in cands):
+            return primary, f"{os.path.basename(roots[0]) if roots else 'repo'}, this checkout"
+        if len(digests) == 1:
+            root, full = next(iter(digests.values()))
+            note = f"{os.path.basename(root)}, identical in {len(cands)} checkouts"
+            if want_hash:
+                note += "; CHANGED since the finding was recorded"
+            return full, note
+        return None, ""
+    except Exception:
+        return None, ""
+
+
+def _make_reader(hashes: Optional[dict] = None, provenance: Optional[dict] = None) -> ReaderFn:
+    """Build the default reader, closing over a ``path -> stamped sha256`` map.
+
+    The reader contract stays ``reader(path) -> text`` so injected test readers are
+    unaffected; the hash a finding stamped on the ref rides along in the closure instead of
+    the signature. ``provenance``, when given, collects ``path -> label`` for the chosen
+    checkout so _fetch_code can name the revision in the block header.
+    """
+    h = hashes or {}
+
+    def _read(path: str) -> str:
+        try:
+            full, label = _ground_ref(path, h.get(path))
+            if not full:
+                return ""
+            # Read raw BYTES so the cap is byte-accurate (text-mode f.read(n) caps CHARACTERS
+            # and can pull in more bytes for multibyte text). Read the cap, then decode.
+            with open(full, "rb") as f:
+                raw = f.read(_MAX_FILE_BYTES)
+            if provenance is not None and label:
+                provenance[path] = label
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    return _read
+
+
+def _lazy_read_file(path: str) -> str:
+    """Default reader with no stamped hashes: read a ref's source from the one checkout
+    _ground_ref will commit to. Fail-open to "" on any rejection or error."""
+    return _make_reader()(path)
 
 
 def _parse_refs(*texts: str):
@@ -206,10 +382,12 @@ def _parse_refs(*texts: str):
     return refs
 
 
-def _fetch_code(refs, reader: ReaderFn) -> str:
+def _fetch_code(refs, reader: ReaderFn, provenance: Optional[dict] = None) -> str:
     """Read the cited line ranges via `reader` and format them (line-numbered) for the prompt.
 
     Fail-open per ref: an unreadable/missing file or out-of-range span just contributes nothing.
+    ``provenance`` (populated by the default reader) names the checkout each block came from,
+    so a multi-repo ref never presents itself as if it were this repo's source.
     """
     blocks = []
     for path, start, end in refs:
@@ -236,7 +414,9 @@ def _fetch_code(refs, reader: ReaderFn) -> str:
         if e - s + 1 > _MAX_LINES_PER_REF:
             e = s + _MAX_LINES_PER_REF - 1
         numbered = "\n".join(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
-        header = f"--- {path}:{s}" + (f"-{e}" if e != s else "") + " ---"
+        label = (provenance or {}).get(path)
+        header = f"--- {path}:{s}" + (f"-{e}" if e != s else "")
+        header += (f" [{label}]" if label else "") + " ---"
         blocks.append(header + "\n" + numbered)
     return "\n\n".join(blocks)
 
@@ -247,14 +427,46 @@ def _coerce_code_refs(code_refs) -> list:
     Documented as a list, but a caller may pass a single ``file:line`` string; ``list(str)``
     would split it into characters. Accept a list/tuple (keeping only its string items) or a
     lone string; anything else yields []. Never raises.
+
+    A stored finding's code_refs are ``{"path": .., "hash": ..}`` dicts with no line number,
+    so a dict becomes a whole-file ref (``path:1-<_MAX_LINES_PER_REF>``); its hash is picked
+    up separately by _coerce_code_ref_hashes.
     """
     if code_refs is None:
         return []
     if isinstance(code_refs, str):
         return [code_refs]
-    if isinstance(code_refs, (list, tuple)):
-        return [x for x in code_refs if isinstance(x, str)]
-    return []
+    if not isinstance(code_refs, (list, tuple)):
+        return []
+    out = []
+    for x in code_refs:
+        if isinstance(x, str):
+            out.append(x)
+        elif isinstance(x, dict):
+            p = x.get("path")
+            if isinstance(p, str) and p.strip():
+                p = p.strip()
+                out.append(p if ":" in p else f"{p}:1-{_MAX_LINES_PER_REF}")
+    return out
+
+
+def _coerce_code_ref_hashes(code_refs) -> dict:
+    """``path -> sha256`` for any ``{"path": .., "hash": ..}`` refs. {} otherwise.
+
+    This is what makes multi-repo grounding safe: the stamped hash identifies WHICH checkout
+    holds the revision the finding was recorded against, so _ground_ref can pick that one
+    instead of guessing between worktrees. Never raises.
+    """
+    out: dict = {}
+    if not isinstance(code_refs, (list, tuple)):
+        return out
+    for x in code_refs:
+        if not isinstance(x, dict):
+            continue
+        p, h = x.get("path"), x.get("hash")
+        if isinstance(p, str) and p.strip() and isinstance(h, str) and h.strip():
+            out[p.strip().split(":")[0]] = h.strip()
+    return out
 
 
 def _coerce_verdict(raw) -> str:
@@ -306,9 +518,11 @@ def verify_finding(claim: str,
             (fail-open) to give the skeptic something to attack with.
         gen_fn: injectable generation fn (shared contract). None -> lazy llm_local.generate.
         rag_fn: injectable grounding fn. None -> lazy rag_context_search.
-        code_refs: optional list of ``file:line`` / ``file:start-end`` strings whose source
-            should be fetched into the prompt. ``file:line`` refs found in the claim/context
-            are also picked up automatically. Fail-open: unreadable refs contribute nothing.
+        code_refs: optional list of ``file:line`` / ``file:start-end`` strings, or stored
+            ``{"path": .., "hash": ..}`` refs, whose source should be fetched into the
+            prompt. ``file:line`` refs found in the claim/context are also picked up
+            automatically. A stamped hash selects the exact checkout to read from.
+            Fail-open: unreadable and AMBIGUOUS refs alike contribute nothing.
         reader: injectable file reader ``reader(path) -> text``. None -> lazy FS read.
 
     Returns:
@@ -338,7 +552,13 @@ def verify_finding(claim: str,
     try:
         refs = _parse_refs(*_coerce_code_refs(code_refs), c, ctx)
         if refs:
-            code_block = _fetch_code(refs, reader or _lazy_read_file)
+            provenance: dict = {}
+            rd = reader
+            if rd is None:
+                # Default reader: carry the stamped per-path hashes so a ref that exists in
+                # several checkouts is resolved to the exact revision, not the first hit.
+                rd = _make_reader(_coerce_code_ref_hashes(code_refs), provenance)
+            code_block = _fetch_code(refs, rd, provenance)
     except Exception:
         code_block = ""
 
