@@ -78,9 +78,7 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     assert B.ollama_url() == ""
 
 
-# --- Fresh-install end-to-end: no env overrides, no local Ollama/vLLM, config resolved from
-# a file (or absent). The in-process equivalent of the env -i simulation, exercising ALL
-# backends together so the resolution chain + the bge default flip are guarded as one unit. ---
+# --- Fresh install: all backends together, so the resolution chain is guarded as one unit ---
 
 _ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "EMBED_MODEL",
                     "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",

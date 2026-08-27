@@ -66,9 +66,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-# memcheck (the shared verdict core) lives alongside this file. Ensure its
-# parent dir is importable whether server.py is run as __main__ (spawned by
-# path) or loaded via importlib in tests under a synthetic module name.
+# memcheck sits alongside this file; importable as __main__ (spawned by path) or under a test's synthetic module name.
 _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
@@ -101,8 +99,6 @@ except ImportError:
 _EMAIL_RE = re.compile(r'\b[\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,}\b', re.I)
 
 # ── Immutable event log (fail-open) ───────────────────────────────────────────
-# Appends a record before every memory mutation so the full operation history
-# is preserved independent of the live SQLite/Qdrant store (SSGM + AgentCore pattern).
 def _event_log_append(event: dict) -> None:
     """Write one event to the immutable append-only event log. Fail-open."""
     try:
@@ -131,8 +127,7 @@ def _extract_entities(text: str) -> dict:
         try:
             ioc = _cy_ioc.IOCEXtract(text).extract_ioc()
             out["ips"] = ioc.get("IP", [])
-            # Normalise to lowercase so Qdrant keyword index lookups (which query
-            # with .lower()) never miss a mixed-case value from the IOC extractor.
+            # Lowercase: Qdrant keyword-index lookups query with .lower().
             out["hashes"] = [h.lower() for h in (ioc.get("SHA256") or [])]
             out["cves"]   = [c.lower() for c in (ioc.get("CVE") or [])]
         except Exception as exc:
@@ -167,10 +162,7 @@ MEMORY_DIR = Path(os.environ.get(
     "HERMES_MEMORY_DIR",
     Path.home() / ".hermes" / "memory-sessions",
 ))
-# Embedding + Qdrant cluster lives in qdrant_ops.py. Imported here (after
-# load_dotenv above) so its import-time os.environ reads see the same env.
-# Re-exported so `server.<helper>()` keeps working for the rest of this module,
-# for in-process callers, and for tests (which patch e.g. server._get_qdrant).
+# Imported after load_dotenv so its import-time os.environ reads see the same env; re-exported so tests can patch server._get_qdrant.
 import qdrant_ops  # noqa: E402,F401
 from qdrant_ops import (  # noqa: E402,F401
     QDRANT_COLLECTION_PREFIX, VECTOR_DIM,
@@ -193,18 +185,13 @@ REFLECTION_SIGNATURE_MAP_LIMIT = 500
 AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 
 # ---------------------------------------------------------------------------
-# Investigation storage layer (P2b of the Loci self-review split)
-#
-# The store lives in inv_store.py. Its memory root is injected as a LAMBDA closing
-# over MEMORY_DIR above — not the Path value — so that rebinding server.MEMORY_DIR
-# (which ~10 tests do, to a tmpdir) still redirects every store write. Registered
-# here, immediately after MEMORY_DIR, so the helpers are bound before first use.
+# Investigation storage layer
 # ---------------------------------------------------------------------------
 
 import inv_store  # noqa: E402
+# Lambda, not the Path value: tests rebind server.MEMORY_DIR to a tmpdir.
 inv_store.register(lambda: MEMORY_DIR)
-# Re-exported so `server.<helper>()` keeps working for the rest of this module,
-# for in-process callers, and for tests (which patch e.g. server._append_jsonl).
+# Re-exported so server.<helper>() keeps resolving for callers and test patches.
 from inv_store import (  # noqa: E402,F401
     _now, _inv_dir, _manifest_cache, _load_manifest, _save_manifest,
     _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
@@ -238,9 +225,6 @@ def _investigation_lock(investigation_id: str) -> threading.Lock:
 
 # ---------------------------------------------------------------------------
 # LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
-# Mirrors findings/entities/derivation into an embedded graph and backs the
-# entity-lookup / related-cases / contamination / code-symbol paths. If ladybug or
-# the module is unavailable, every consumer degrades to the pre-existing path.
 # ---------------------------------------------------------------------------
 _ladybug_store = None                     # LadybugStore singleton once initialized
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
@@ -281,8 +265,7 @@ def _get_ladybug():
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
             ks = _kz.LadybugStore(str(MEMORY_DIR / "graph.ladybug"))
             if not ks.available():
-                # Import worked but open failed — almost always another process holds
-                # the single-writer lock. Treat as TRANSIENT: retry after the backoff.
+                # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
                 logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
                                "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
@@ -375,26 +358,16 @@ def _code_version() -> str:
         return result
 
 
-# Leaf LadybugDB helpers live in ladybug_ops.py (P2c of the split). Only the leaves
-# moved: the singleton above (_ladybug_store / _ladybug_failed / _ladybug_last_attempt
-# / _LADYBUG_RETRY_SECONDS) and _get_ladybug stay HERE, because tests monkeypatch those
-# latches on this module and assert on server._get_ladybug(). Deps are injected on the
-# same contract as inv_store/graph_tools: _get_ladybug by reference (so the helpers
-# reach the store through these same patchable globals) and the memory root as a lambda
-# over MEMORY_DIR (not the Path) so tmpdir rebinds still steer the backfill scan.
+# The singleton latches and _get_ladybug stay here: tests monkeypatch them on this module.
 import ladybug_ops  # noqa: E402
 ladybug_ops.register(_get_ladybug, lambda: MEMORY_DIR)
-# Re-exported so `server.<helper>()` keeps working for the rest of this module, for
-# in-process callers, and for tests.
+# Re-exported so server.<helper>() keeps resolving for callers and test patches.
 from ladybug_ops import (  # noqa: E402,F401
     _ladybug_upsert_investigation, _coerce_ts, _mirror_finding_to_ladybug,
     _get_symbol_index,
     _autolink_finding_to_ladybug, _ladybug_backfill_if_empty, _entity_lookup_ladybug,
 )
-# NOTE: ladybug_ops._symbol_index_cache / _symbol_index_count are deliberately NOT
-# re-exported. `from x import y` binds by VALUE, so re-exporting mutable module state
-# would pin server.<name> to a None/-1 snapshot while the real cache moves on --
-# a name that looks live and is permanently stale. Read them via ladybug_ops.
+# _symbol_index_cache/_count are NOT re-exported: `from x import y` binds by value, pinning a stale snapshot.
 
 
 import mnemo_ops  # noqa: E402,F401
@@ -406,8 +379,7 @@ from mnemo_ops import (  # noqa: E402,F401
 _MEMORY_DECAY_LAMBDA  = float(os.environ.get("MEMORY_DECAY_LAMBDA", "0.007"))  # Ebbinghaus decay; half-life ~100 days
 
 
-# Optional extra collection for code-chunk correlation (set CODE_CHUNKS_COLLECTION
-# to the name of a Qdrant collection that holds code embeddings).
+# Qdrant collection holding code embeddings; empty disables code-chunk correlation.
 _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 
 
@@ -531,9 +503,7 @@ def _search_benign_context_qdrant(
             if not val:
                 continue
             try:
-                # Query across ALL investigations for this entity, excluding current.
-                # MatchExcept filters out the current investigation_id so we only
-                # get cross-investigation baseline findings.
+                # MatchExcept: cross-investigation baseline only, current investigation excluded.
                 hits, _ = client.scroll(
                     col,
                     scroll_filter=Filter(must=[
@@ -562,8 +532,7 @@ def _search_benign_context_qdrant(
 # Entity lookup helpers
 # ---------------------------------------------------------------------------
 
-# Explicit map avoids "hash" + "s" = "hashs" (should be "hashes").
-# Order is observable: rendered into the entity_type error message below.
+# Explicit plurals (not name + "s"); order is observable — rendered into the entity_type error.
 _ENTITY_TYPES = (
     ("ip", "ips"),
     ("email", "emails"),
@@ -576,8 +545,7 @@ _ENTITY_FIELD_MAP = {s: f"entities.{p}" for s, p in _ENTITY_TYPES}
 _PLURAL = dict(_ENTITY_TYPES)
 
 _IP_RE   = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
-# IPv6: all chars are hex digits or colons, at least two colons (covers ::1,
-# fe80::1, 2001:db8::8a2e:370:7334, etc.).  Colons distinguish IPv6 from hashes.
+# Colons are what distinguish IPv6 from a hex hash.
 _IPV6_RE = re.compile(r'^[0-9a-f:]+$', re.I)
 _HASH_RE = re.compile(r'^[0-9a-f]{32,64}$', re.I)
 _CVE_RE  = re.compile(r'^CVE-\d{4}-\d+$', re.I)
@@ -664,9 +632,7 @@ def _entity_lookup_jsonl(
             if entity_lower in stored_vals:
                 results.append(finding)
                 continue
-            # Fallback for older findings without stored entities.
-            # Use word-boundary search so "10.0.0.1" doesn't match "10.0.0.10",
-            # and short hashes don't match every occurrence of their hex prefix.
+            # Word boundaries: "10.0.0.1" must not match "10.0.0.10", nor a short hash its own hex prefix.
             if re.search(r'(?<![.\w])' + re.escape(entity_lower) + r'(?![.\w])',
                          str(finding.get("text", "")).lower()):
                 results.append(finding)
@@ -759,22 +725,12 @@ def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> 
 
 # ---------------------------------------------------------------------------
 # Finding lifecycle: append-only updates log + staleness (code-ref hashing).
-#
-# findings.jsonl stays pure (only real finding records) so every existing reader
-# is untouched. In-place resolutions are recorded as APPEND-ONLY update records in
-# a sibling ``finding_updates.jsonl`` and folded in last-write-wins by the read
-# path. verify-all verdicts are written to a SEPARATE ``finding_verifications.jsonl``
-# (round-3 scaling fix) so the resolution read path never scans the high-churn
-# verification log. Both features are additive + fail-open.
 # ---------------------------------------------------------------------------
 
-# Injectable generation fn for investigation_verify_all — None means "use the
-# shipped verify.py default" (lazy llm_local). Tests set this to a stub.
+# None = use the shipped verify.py default; tests set a stub.
 _verify_gen_fn = None
 
-# Known source/config/doc file extensions a code ref may end in. Requiring the
-# extension to be from THIS set (not merely "some letters after a dot") is what
-# keeps ordinary prose out: "e.g." would otherwise parse as file "e" ext "g".
+# Closed extension set, not "letters after a dot": keeps prose like "e.g." from parsing as a file.
 _CODE_REF_EXTS = (
     "pyi|pyx|py|ipynb|"
     "tsx|ts|jsx|js|mjs|cjs|vue|svelte|"
@@ -788,11 +744,7 @@ _CODE_REF_EXTS = (
     "md|rst|txt|"
     "tf|hcl|dockerfile|mk|cmake|bzl"
 )
-# A file-path-with-optional-line reference in finding text, e.g. "mcp/server.py:3204"
-# or "verify.py". The path segment ends in a KNOWN code/config/doc extension (see
-# _CODE_REF_EXTS, case-insensitive), so ordinary prose such as "e.g." — which would
-# parse as file "e" with extension "g" — does not match. A trailing lookahead keeps
-# "file.pyc"-style longer suffixes from matching only the "py" prefix.
+# Trailing lookahead stops "file.pyc" from matching on the "py" prefix.
 _FILE_REF_RE = re.compile(
     r"\b((?:[\w.\-]+/)*[\w.\-]+\.(?:" + _CODE_REF_EXTS + r"))(?![\w.\-])(?::(\d+))?",
     re.IGNORECASE,
@@ -810,8 +762,7 @@ def _finding_verifications_path(investigation_id: str) -> Path:
 
 
 
-# Files larger than this are never hashed — a code ref points at source, not
-# blobs, and this caps how much a rogue ref can make the server read. Overridable.
+# Caps how much a rogue code ref can make the server read.
 _HASH_FILE_MAX_BYTES_DEFAULT = 8 * 1024 * 1024
 
 
@@ -980,10 +931,7 @@ def _apply_lifecycle(findings: list[dict], investigation_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Session hints — module-level ring buffer updated by investigation_store so
-# that memory_hints (and the MCP resource) can surface "what changed recently"
-# without re-scanning JSONL.  Each key is an investigation_id; the value is a
-# list of hint dicts (most-recent-last) capped at _SESSION_HINTS_MAX_PER_INV.
+# Session hints — ring buffer so memory_hints can answer without re-scanning JSONL.
 # ---------------------------------------------------------------------------
 _session_hints: dict[str, list[dict]] = {}
 _SESSION_HINTS_MAX_PER_INV = 20  # ring-buffer cap per investigation
@@ -1331,25 +1279,14 @@ def _normalize_derived_from(derived_from: str | list[str] | None) -> list[str]:
 
 _NEGATION_RE = re.compile(r"\b(?:no|not|never|none|without|cannot|can't|didn't|isn't|aren't|won't)\b", re.I)
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:/-]{2,}", re.I)
-# Words that carry no evidentiary weight in a lexical match. Two groups, kept
-# separate because they are dropped for different reasons.
-#
-# Domain-generic: true of almost every finding in this corpus, so sharing one
-# says nothing.
+# Domain-generic: true of almost every finding in this corpus, so sharing one says nothing.
 _GENERIC_MATCH_TOKENS = {
     "host", "user", "device", "query", "result", "results", "output", "input", "tool",
     "found", "seen", "shows", "reported", "detected", "contacted", "event", "events",
     "record", "records", "row", "rows",
 }
 
-# Function words. These were NOT dropped, and _lexical_match_score normalises by
-# the claim side only, so a short claim could clear the 0.45 gate on stopword
-# overlap alone. Measured on 400 real findings before this change: 68.8% of
-# generic short claims were reported as supported, e.g. "the server is down"
-# declared supported by a document on cultural-noise characterisation, on the
-# overlap {"down", "the"}. investigation_pre_answer_check is the tool an agent
-# calls BEFORE asserting a claim, so this was a rubber stamp on the one gate
-# meant to catch unsupported assertions.
+# Stopwords, dropped for a different reason: with them in, 68.8% of generic short claims cleared the 0.45 gate.
 _STOPWORD_MATCH_TOKENS = {
     "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
     "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his",
@@ -1363,45 +1300,18 @@ _STOPWORD_MATCH_TOKENS = {
 }
 
 _NON_EVIDENCE_TOKENS = _GENERIC_MATCH_TOKENS | _STOPWORD_MATCH_TOKENS
-# The semantic lane's absolute-score gate. It is a cheap PRE-FILTER, never the
-# adjudicator: a filtered top-k search cannot return "no match" -- query_points
-# with a must-match on investigation_id always returns that investigation's k
-# nearest points, however unrelated the claim -- so its score is a rank-1
-# similarity inside a small pool, not a probability of support. Measured on the
-# live corpus (300 claims copied verbatim OUT of a different investigation):
-# 264/300 = 88.0% were reported supported on this gate alone, and in 264/264 the
-# lexical lane had returned nothing. 96.7% of those negatives scored inside the
-# positive range, so no other constant fixes it -- see _semantic_ref_corroborated.
+# Cheap PRE-FILTER, never the adjudicator: a filtered top-k search cannot return "no match".
 _QDRANT_SUPPORT_MIN_SCORE = 0.55
 _QDRANT_PRECHECK_MIN_SCORE = 0.5
 
-# Neighbourhood fetched per claim so a hit's margin over its own pool is
-# measurable. Only the top _SEMANTIC_REF_LIMIT are surfaced as refs, so the
-# response shape is unchanged for existing consumers.
+# The wider pool is what makes a hit's margin measurable; only _SEMANTIC_REF_LIMIT are surfaced, so the response shape is unchanged.
 _SEMANTIC_NEIGHBOURHOOD_K = 25
 _SEMANTIC_REF_LIMIT = 5
 
-# Corroboration thresholds for the semantic lane. Fitted on 600 probes from the
-# live corpus (300 positive: a finding's text checked against its own
-# investigation with its own indexed point excluded; 300 negative: a finding's
-# text checked against a DIFFERENT investigation). Operating point of the
-# conjunction below, replayed offline in tests/fixtures/semantic_gate_probe.json:
-#   false support  88.0% -> 1.7%   (n=300 negatives)
-#   true support  100.0% -> 80.3%  (n=300 positives)
-# Neither half separates the classes alone: best-ref lexical overlap is NEG p95
-# 0.162 vs POS p05 0.070, and best-ref margin over the pool median is NEG p95
-# 0.1013 vs POS p05 0.0528. The conjunction is what carries the measurement.
+# Fitted on 600 live probes: false support 88.0% -> 1.7%, true support 100% -> 80.3%; neither half separates the classes alone.
 _SEMANTIC_SUPPORT_MIN_OVERLAP = 0.15
 _SEMANTIC_SUPPORT_MIN_MARGIN = 0.05
-# 46.3% of the negative probes landed on investigations with fewer than 8 indexed
-# points, where a "margin over the pool median" is not a meaningful statistic.
-#
-# This rule is NEARLY A NO-OP on the headline numbers and should not be read as
-# carrying them: removing it entirely moves false support 1.67% -> 2.00% and true
-# support 80.33% -> 80.67%, about 0.3pt either way. It is kept because it fails
-# CLOSED -- it denies support rather than asserting it -- and because a margin
-# against a 3-point pool is undefined, not merely noisy. pool_size rides on every
-# surfaced ref, so a caller can always see why a candidate was not promoted.
+# Near no-op on the headline numbers; kept because it fails CLOSED and a margin against a 3-point pool is undefined.
 _SEMANTIC_SUPPORT_MIN_POOL = 8
 
 
@@ -1613,8 +1523,7 @@ def _search_qdrant_claim_evidence(
                 "ts": payload.get("ts"),
                 "origin": "qdrant",
                 "score": score,
-                # Computed here, where the FULL payload text is still in hand --
-                # the ref only carries a 260-char snippet from here on.
+                # Computed here while the FULL payload text is in hand; the ref carries only a 260-char snippet.
                 "lexical_overlap": round(_lexical_match_score(claim_tokens, tokenize(text)), 4),
                 "pool_median": pool_median,
                 "pool_size": len(pool_scores),
@@ -1813,19 +1722,7 @@ def _hallucination_candidates(
     """
     unsupported_ids = {r for v in (unsupported or []) for r in (v.refs or [])}
 
-    # An "unsupported" verdict means two very different things depending on
-    # whether an audit lane exists at all. run_provenance flags every observed
-    # finding that lacks a matching receipt — which, on an investigation with NO
-    # audit.jsonl, is every observed finding it is given. Measured: 1 of 140
-    # investigations on the live corpus has one. The `other in unsupported_ids`
-    # skip below then discards every observed-vs-observed contradiction, so the
-    # strongest hallucination signal available can never produce a candidate.
-    #
-    # When EVERY observed finding is unsupported the signal is uninformative
-    # rather than damning, so it must not gate the contradiction pass. The
-    # provenance check keeps its documented per-finding semantics; this is the
-    # consumer declining to read a blanket verdict as evidence about any one
-    # finding.
+    # A blanket unsupported verdict means no audit lane exists (1 of 140 investigations has one), so it must not gate this pass.
     _observed_ids = {str(f.get("id", "")) for f in (findings or [])
                      if str(f.get("record_type") or f.get("type") or "") == "observed"
                      and f.get("id")}
@@ -1838,11 +1735,7 @@ def _hallucination_candidates(
     if not unsupported_ids or not contradictions:
         return []
 
-    # Which findings have an audit receipt? A finding is "receipted" iff it is
-    # NOT flagged unsupported by provenance (provenance only flags observed
-    # findings; treat inferred/assumed as receipted-by-default only when they
-    # are not themselves unsupported). We approximate "has a receipt" as
-    # "not in unsupported_ids".
+    # Approximates "has a receipt" as "not in unsupported_ids"; provenance only flags observed findings.
     findings_by_id = {str(f.get("id", "")): f for f in findings}
 
     candidates: list[dict] = []
@@ -1852,8 +1745,6 @@ def _hallucination_candidates(
         if len(refs) != 2:
             continue
         a, b = str(refs[0]), str(refs[1])
-        # Identify which side is the unsupported positive and which is the
-        # receipted counter-finding.
         pairs = [(a, b), (b, a)]
         for unsup, other in pairs:
             if unsup not in unsupported_ids:
@@ -2005,8 +1896,6 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
         for hit in result:
             payload = dict(hit.payload or {})
             neighbor_id = str(payload.get("id", hit.id))
-            # Skip the finding itself (shouldn't appear since it may not yet be
-            # in the index, but guard anyway).
             if neighbor_id == new_id:
                 continue
 
@@ -2024,13 +1913,7 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             elif neighbor_type == "assumed" and new_type != "assumed":
                 is_conflict = True
 
-            # Heuristic 3: opposing negation markers. Off by default — this is a
-            # bare token-presence scan, not a polarity comparison, and phrases like
-            # "no adverse records found" or "did not appear" are common enough that
-            # it manufactures conflicts from incidental wording. Measured in the
-            # 2026-08-19 upgrade pack against live hermes_memory: feeding a finding
-            # back verbatim flagged two `observed` neighbours at 0.892 and 0.8679
-            # through this heuristic alone, and an exact duplicate is agreement.
+            # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
             elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
                 is_conflict = True
 
@@ -2224,11 +2107,7 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 # ---- Tool: investigation_store ----
 
 # --------------------------------------------------------------------------- #
-# investigation_store internals
-#
-# Split out of the tool body so each stage is separately readable and testable.
-# Every helper preserves the tool's original behaviour exactly, including the
-# verbatim error strings, which are part of the tool's response contract.
+# investigation_store internals — error strings are verbatim, part of the tool's response contract.
 # --------------------------------------------------------------------------- #
 _STORE_FINDING_TYPES = {"observed", "inferred", "assumed", "gap", "procedure"}
 _STORE_CONFIDENCES = {"high", "medium", "low"}
@@ -2300,9 +2179,7 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
 
     finding["entities"] = _extract_entities(text)
 
-    # Staleness: stamp sha256 of any referenced code file so a later re-hash can flag
-    # the finding stale once that file changes. Best-effort + fail-open (no refs / an
-    # unreadable file -> omit; never error).
+    # Stamp sha256 of any referenced code file so a later re-hash can flag the finding stale; fail-open.
     try:
         refs = _compute_code_refs(text, code_refs)
         if refs:
@@ -2503,8 +2380,6 @@ def investigation_store(
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
-    # Update the in-process session hints ring buffer so memory_hints can
-    # surface this finding immediately without re-scanning JSONL.
     _session_hints_push(investigation_id, {
         "finding_id": finding["id"],
         "text": text,
@@ -2566,8 +2441,6 @@ def finding_resolve(
         return json.dumps({"error": "resolution must be one of: open, fixed, intentional, wontfix, superseded"})
 
     # Confirm the finding exists so we don't record an orphan resolution.
-    # Uses the codebase-wide _read_jsonl (whole-file read, tolerant of a
-    # partial last line) — same semantics as every other findings.jsonl reader.
     findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
     if not any(isinstance(f, dict) and str(f.get("id", "")) == str(finding_id) for f in findings):
         return json.dumps({"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
@@ -3376,8 +3249,7 @@ def _search_normalize_filters(min_confidence: str, resolution: Optional[str]) ->
         )
         resolution = None
 
-    # Normalise confidence floor so callers passing "High" or "MEDIUM" are not
-    # silently ignored by the lowercase dict lookup downstream.
+    # Lowercase so "High"/"MEDIUM" are not silently ignored by the lookup below.
     min_confidence = str(min_confidence or "low").lower()
     if min_confidence not in _CONFIDENCE_RANK:
         logger.warning(
@@ -3398,8 +3270,7 @@ def _search_apply_confidence_floor(rows: list[dict], min_confidence: str) -> lis
         floor = _CONFIDENCE_RANK[min_confidence]
         return [
             r for r in rows
-            # Normalise stored confidence to lowercase — mnemosyne-sourced rows may
-            # carry mixed-case values; without .lower() "High" maps to rank 0.
+            # mnemosyne rows may be mixed-case; without .lower() "High" maps to rank 0.
             if _CONFIDENCE_RANK.get(str(r.get("confidence", "low")).lower(), 0) >= floor
         ]
     return rows
@@ -3418,8 +3289,7 @@ def _search_annotate_rows(rows: list[dict]) -> None:
 
     for r in rows:
         r["resolution"] = _search_row_resolution(r, _resolution_map)
-        # Staleness: rows from mnemo/qdrant don't carry code_refs, so consult the
-        # JSONL-derived map. Only set ``stale`` when the finding has usable refs.
+        # mnemo/qdrant rows carry no code_refs; consult the JSONL-derived map.
         _rfid = str(r.get("finding_id") or r.get("id") or "")
         _refs = _coderefs_map.get(_rfid)
         if _refs:
@@ -3431,8 +3301,7 @@ def _search_annotate_rows(rows: list[dict]) -> None:
 def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
     """Build the JSON payload for an empty investigation_search result set."""
     qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
-    # Only use rag_required mode when Qdrant itself is unavailable.
-    # Empty results with Qdrant available is a normal no-match response.
+    # rag_required only when Qdrant is down; empty results with Qdrant up is a normal no-match.
     if not qdrant_avail or (qdrant.get("reason") == "qdrant_unavailable"):
         return json.dumps({
             "mode": "rag_required",
@@ -3488,9 +3357,7 @@ def investigation_search(
     """
     min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
 
-    # Precompute retracted finding ids per investigation in scope. A row is
-    # filtered when it names a finding id (or matches text of one) that is
-    # retracted. Fail-safe: an empty map means nothing is filtered.
+    # Fail-safe: an empty retracted map filters nothing.
     _retracted_by_inv, _retracted_text_by_inv = (
         _search_retraction_scope(investigation_id) if not include_retracted else ({}, {})
     )
@@ -3740,10 +3607,7 @@ def investigation_pre_answer_check(
             matched_ids.add(ev_id)
             matched_refs.append(ref)
 
-        # Dual retrieval — benign baseline search (CIBER / CHR pattern).
-        # Only run when there IS supporting evidence; benign context can never
-        # make an already-unsupported claim ambiguous, so the Qdrant queries
-        # would be pure waste for those claims.
+        # Benign baseline only where there IS support: it cannot make an already-unsupported claim ambiguous.
         benign_context_refs = (
             _search_benign_context_qdrant(claim, investigation_id)
             if claim_support_refs else []
@@ -4104,18 +3968,7 @@ def investigation_evidence_precheck(
         lexical_matches.append(_make_ref(record, "similar", score=score))
 
     lexical_matches.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-    # Shared helper, and the corroboration work for investigation_pre_answer_check
-    # changed it underneath this caller: it now fetches a k=25 neighbourhood (one
-    # larger payload per call, still 5 refs surfaced) and stamps lexical_overlap,
-    # pool_median, pool_size and margin on every ref.
-    #
-    # Those fields are INFORMATIONAL here. This tool is advisory — it answers
-    # "has something like this already been recorded" to avoid a duplicate call —
-    # so a false "similar evidence exists" costs a skipped lookup, not a false
-    # assertion in an answer. _semantic_ref_corroborated is deliberately NOT
-    # applied: its thresholds were fitted on pre-answer-check probes and nobody
-    # has measured this tool's own positive/negative distributions. Gating on an
-    # unmeasured threshold is the failure this whole change exists to remove.
+    # Advisory tool, so the ref fields are informational: _semantic_ref_corroborated is NOT applied — its thresholds were fitted on other probes.
     qdrant_refs, qdrant_status = _search_qdrant_claim_evidence(query, investigation_id, limit=5)
     qdrant_enabled = bool(os.environ.get("QDRANT_URL", ""))
     qdrant_available = bool(qdrant_status.get("available"))
@@ -4301,12 +4154,10 @@ def _record_verdicts(verdicts: list) -> bool:
 
         async def _record_all() -> None:
             for v in verdicts:
-                # Engine.record is itself fail-open; embed here so a real dense
-                # vector is stored rather than the backend's fallback.
+                # Embed here so a real dense vector is stored, not the backend's fallback.
                 await engine.record(v, _embed(v.subject_excerpt))
 
-        # FastMCP dispatches sync tools inline on a running event loop — asyncio.run()
-        # raises RuntimeError in that context. Delegate to a daemon thread when needed.
+        # FastMCP dispatches sync tools inline on a running loop, where asyncio.run() raises.
         try:
             asyncio.get_running_loop()
             _exc: list[Exception] = []
@@ -4405,8 +4256,7 @@ def memory_self_check(
         if "contradiction" in requested:
             inv_verdicts.extend(computed["contradictions"])
         all_verdicts.extend(inv_verdicts)
-        # Hallucination candidates require both provenance + contradiction
-        # signals; only surface when both checks ran.
+        # Only surface when both the provenance and contradiction checks ran.
         inv_candidates = (
             computed.get("hallucination_candidates", [])
             if {"provenance", "contradiction"} <= requested
@@ -4427,10 +4277,7 @@ def memory_self_check(
             "verdicts": [_verdict_view(v) for v in inv_verdicts],
             "hallucination_candidates": inv_candidates,
         }
-        # Carry the lane's state next to the count it explains. An
-        # unsupported_observed count computed against zero receipts is the
-        # investigation's observed-finding count wearing a different name, and
-        # reporting it bare invites reading absence of evidence as evidence.
+        # Carry the lane's state next to the count: an unsupported count computed against zero receipts is not evidence.
         lane = computed.get("audit_lane") or {}
         if "provenance" in requested and lane.get("status") == "empty":
             entry["audit_lane"] = lane
@@ -4472,9 +4319,7 @@ def memory_self_check(
 
 # ---- Tool: code_memory_correlate (code -> memory loop) ----
 
-# Code-hallucination rule codes that count as a "real" LH issue on a file. A
-# parse failure surfaces as LH000; the LH001/LH003/LH007/LH009 family are the
-# AST-detected smells.
+# LH000 is a parse failure; LH001/LH003/LH007/LH009 are the AST-detected smells.
 _CODE_HALLUCINATION_CODES = {"LH000", "LH001", "LH003", "LH007", "LH009"}
 
 
@@ -4549,9 +4394,7 @@ def _correlate_memories(
     expands the cluster over entity-anchor + semantic + ``derived_from`` links.
     Returns ``{contaminated_ids, reasons, seed_ids, semantic_neighbors}``.
     """
-    # Seeds: findings whose distinctive entities intersect the suspected set, or
-    # whose lowercased text literally contains a suspected token (catches entities
-    # the typed extractor doesn't bucket, e.g. fabricated module names / localhost).
+    # Raw-text match too: catches entities the typed extractor doesn't bucket (fabricated module names, localhost).
     seeds: list[dict] = []
     seed_ids: list[str] = []
     for f in findings:
@@ -4573,8 +4416,7 @@ def _correlate_memories(
         logger.debug("semantic neighbor lookup failed in correlate, skipping: %r", exc)
         semantic_ids = []
 
-    # Primary: the LadybugDB graph traversal (semantics identical to find_contamination).
-    # Fallback: the in-memory traversal if the graph is unavailable or errors.
+    # Graph traversal is primary; the in-memory traversal is the fail-open fallback.
     cluster = None
     ks = _get_ladybug()
     if ks:
@@ -4633,10 +4475,7 @@ def _correlate_scan_target_file(target_file: str):
 
     suspected = _suspected_entities_from_text(content)
 
-    # tree-sitter: ingest the file's AST into the code graph (fail-open) so its
-    # symbols/calls are queryable via code_graph_query and linkable to the memory
-    # graph. Targeted symbol suspicion still comes from the code checker's flagged
-    # identifiers below, not every symbol.
+    # Ingest the AST (fail-open) so symbols/calls are queryable; suspicion still comes from the checker's flagged identifiers.
     try:
         from graph.code_parse import parse_source, detect_lang
         lang = detect_lang(tf)
@@ -4772,8 +4611,7 @@ def code_memory_correlate(
         else:
             contaminated_memories.append(item)
 
-    # Suggest the most-targeted retraction handle: the entity arg if given,
-    # else a seed finding id (so the analyst can review the exact lineage).
+    # Most-targeted handle: the entity if given, else a seed finding id.
     if source.get("entity"):
         retract_target = source["entity"]
     elif correlation["seed_ids"]:
@@ -4807,8 +4645,7 @@ def code_memory_correlate(
 
 # ---- Tool: memory_health (substrate self-check) ----
 
-# Worst-status precedence used to roll per-check results up into the overall
-# status. "fail" -> unhealthy/degraded, "warn" -> degraded, all "ok" -> ok.
+# Worst status wins when rolling per-check results up.
 _HEALTH_SEVERITY = {"ok": 0, "warn": 1, "fail": 2}
 
 
@@ -4876,11 +4713,7 @@ def _health_collection_dim(info: dict) -> int | None:
     return None
 
 
-# The two memory_health probes below are STATELESS — they read no enclosing local,
-# only module globals (_embed_sparse; _get_mnemo_funcs/_mnemo_bank), which is why they
-# live out here rather than as closures inside memory_health. Each returns the same
-# (status, detail, remediation) 3-tuple _health_check expects, and _health_check still
-# wraps them, so a raising probe still degrades to a "fail" entry (fail-open).
+# Stateless: these read only module globals, which is why they are not closures inside memory_health.
 def _health_probe_embeddings_sparse():
     """memory_health probe 4: optional sparse (fastembed BM25) embedder."""
     sparse = _embed_sparse("memory_health probe")  # transient, never stored
@@ -4922,13 +4755,7 @@ def _health_probe_mnemo_mirror():
     return ("ok", {"target_bank": bank, "resolved": resolved}, None)
 
 
-# The next three probes are the *stateful* trio: probe 1 discovers the qdrant
-# client and main collection, probe 2 reads them and records per-collection
-# dims, and probe 3 records the embedder dimension probe 6 compares against.
-# What used to be ``nonlocal`` writes into memory_health's frame are now writes
-# into an explicit ``sink`` dict the tool body owns, which is what lets these
-# live at module level. Their call sites wrap them in lambdas, so the reads are
-# still deferred to probe-execution time exactly as the closures were.
+# Stateful trio: probe 1 discovers client + collection, 2 records per-collection dims, 3 records the embedder dim, all through the caller's `sink`.
 def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
     """memory_health probe 1: is QDRANT_URL set and the server answering?
 
@@ -5017,10 +4844,7 @@ def _health_probe_embeddings_dense(sink: dict) -> tuple:
     return ("ok", f"dense embedder active; dimension={sink['embed_dim']}", None)
 
 
-# The next three probes are pure functions of their arguments: what used to be
-# read from memory_health's enclosing scope is now passed in explicitly.
-# ``collection_dims`` is handed over by reference, so the dimension probe still
-# observes whatever the qdrant_collections probe wrote into that same dict.
+# collection_dims is passed by reference, so the dimension probe sees what the collections probe wrote.
 def _health_probe_dimension_consistency(
     embed_dim: int | None, collection_dims: dict[str, int | None]
 ) -> tuple:
@@ -5330,9 +5154,7 @@ def memory_health(investigation_id: Optional[str] = None) -> str:
         usable), any warn -> degraded, all ok -> ok.
     """
     checks: list[dict] = []
-    # State shared between the first three probes and the dimension check. The
-    # probes are module-level functions now, so what they used to reach via
-    # ``nonlocal`` they write into this explicit holder instead.
+    # Explicit holder shared by the first three probes and the dimension check.
     qd: dict = {"client": None, "main_col": None, "embed_dim": None}
 
     # 1. qdrant_reachable — is QDRANT_URL set and the server answering?
@@ -5342,8 +5164,7 @@ def memory_health(investigation_id: Optional[str] = None) -> str:
         lambda: _health_probe_qdrant_reachable(qdrant_url, qd),
     ))
 
-    # 2. qdrant_collections — expected collections present + their layout.
-    # The lambda defers reading ``qd`` until after probe 1 has populated it.
+    # 2. qdrant_collections — the lambda defers reading `qd` until probe 1 has populated it.
     collection_dims: dict[str, int | None] = {}
     checks.append(_health_check(
         "qdrant_collections",
@@ -5364,16 +5185,13 @@ def memory_health(investigation_id: Optional[str] = None) -> str:
     # 5. mnemo_mirror — mnemosyne importable in THIS venv (the silent-flag bug).
     checks.append(_health_check("mnemo_mirror", _health_probe_mnemo_mirror))
 
-    # 6. dimension_consistency — embedder dim vs configured collection dim(s).
-    # The lambda defers the read of ``qd["embed_dim"]`` to probe-execution time,
-    # exactly as the closure this replaced did — by then probe 3 has run.
+    # 6. dimension_consistency — the lambda defers reading qd["embed_dim"] until probe 3 has run.
     checks.append(_health_check(
         "dimension_consistency",
         lambda: _health_probe_dimension_consistency(qd["embed_dim"], collection_dims),
     ))
 
-    # Resolve target investigations for the store-scoped checks (read-only:
-    # never use _inv_dir here, which would mkdir).
+    # Read-only: _inv_dir would mkdir.
     inv_targets, inv_missing = _health_resolve_inv_scope(investigation_id)
 
     # 7. retraction_integrity — parse cleanly + flag orphaned retractions.
@@ -5492,8 +5310,7 @@ def _forget_finding_verdicts(finding: dict) -> int:
             removed += await engine.forget(redact_excerpt(text), "memory")
             return removed
 
-        # Same loop-detection guard as _record_claim_verdicts — asyncio.run() raises
-        # RuntimeError when FastMCP is dispatching inline on a running event loop.
+        # asyncio.run() raises when FastMCP dispatches inline on a running event loop.
         try:
             asyncio.get_running_loop()
             _result: list[int] = []
@@ -5700,10 +5517,7 @@ def memory_retract(
     audit_path = _inv_dir(investigation_id) / "retraction_audit.jsonl"
     seed_anchor = seed_ids[0]
 
-    # Acquire a per-investigation lock so that the retractions.jsonl appends
-    # and the matching retraction_audit.jsonl append are observed atomically
-    # by concurrent readers (no window where a retraction exists without its
-    # audit record).
+    # Per-investigation lock: no window where a retraction exists without its audit record.
     inv_lock = _investigation_lock(investigation_id)
 
     with inv_lock:
@@ -6262,9 +6076,7 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     except (TypeError, ValueError):
         _limit = 20
 
-    # Apply the limit WHILE iterating so we stop after collecting `_limit` open
-    # findings instead of materializing every open finding and then slicing
-    # (Copilot round 7): cheaper on large findings sets.
+    # Limit while iterating instead of materializing every open finding and slicing.
     open_findings = []
     for f in findings:
         if len(open_findings) >= _limit:
@@ -6287,18 +6099,9 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
-        # verify_finding sets degraded=True when it could not reach a model, and
-        # returns uncertain/0.0 in exactly the same shape as a real judgement.
-        # Without carrying the flag, finding_verifications.jsonl cannot tell a
-        # considered "uncertain" from "nothing ran" — the file fills up and says
-        # nothing. Recorded, not suppressed: the note is still evidence that the
-        # finding was reached.
+        # Carry degraded: without it a considered "uncertain" is indistinguishable from "nothing ran".
         degraded = bool(res.get("degraded"))
-        # Record as an append-only verification note in a SEPARATE log so these
-        # accumulating records never slow the resolution read path — does NOT
-        # touch resolution. Guarded per-finding: a single write failure (disk
-        # full, permission) is logged and skipped so the rest of the run
-        # continues rather than aborting the whole verification batch.
+        # Separate log so these never slow the resolution read path; per-finding guard keeps one failed write from aborting the batch.
         try:
             _append_jsonl(_finding_verifications_path(investigation_id), {
                 "record_type": "verification",
@@ -6374,12 +6177,7 @@ def loci_health() -> str:
         pass
     try:
         import backends
-        # Bounded, fast even on the FIRST call with backends down: resolve each
-        # endpoint URL ONCE (the resolvers are memoized) and pass a SHORT probe
-        # timeout so the resolvers' own internal local probe cannot block for the
-        # 1.0s default. Then run loci_health's own reachability check with the same
-        # short timeout. Each probe is independent + fail-open: one raising /
-        # unreachable backend must not mask the others.
+        # Resolve each endpoint once and probe with a SHORT timeout so one dead backend cannot block or mask the others.
         _PROBE_T = 0.5
         for key, resolver in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
@@ -6411,11 +6209,7 @@ def loci_health() -> str:
         logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
 
-    # Corpus durability. A 30-day default purge window silently deleted every
-    # indexed finding older than a month on each process start, and nothing
-    # reported it: coverage looked fine right after a re-index and collapsed at
-    # the next restart. These two fields make that condition answerable from the
-    # tool people already call, instead of from a set-difference against disk.
+    # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
         import qdrant_ops
         days = qdrant_ops._retention_days()
@@ -6432,10 +6226,7 @@ def loci_health() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# rag_context_search internals
-#
-# Each stage is independently fail-open, matching the tool's contract: a dead
-# expander, collection, decay pass or access-log write never aborts the search.
+# rag_context_search internals — each stage independently fail-open, matching the tool's contract.
 # --------------------------------------------------------------------------- #
 def _rag_expand_queries(query: str) -> tuple[list[str], dict]:
     """Widen the recall pool with HyDE-lite expansion.
@@ -6519,10 +6310,7 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
     if ce is None or len(results) <= 1:
         return
     try:
-        # Same budget as qdrant_ops._ce_rerank — this is the SECOND cross-encoder,
-        # on rag_context_search's final cross-collection re-pass, and it was missed
-        # when the first was fixed. 512 chars against a 1,048-char median finding
-        # scored below using no reranker at all.
+        # Same budget as qdrant_ops._ce_rerank: 512 chars scored below using no reranker at all on a 1,048-char median finding.
         pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS])
                  for r in results[:20]]
         for r, sc in zip(results[:20], ce.predict(pairs)):
@@ -6631,9 +6419,7 @@ def rag_context_search(
     errors: list[str] = []
     expansion_info: Optional[dict] = None
 
-    # Optional query expansion: fan retrieval out over LLM paraphrases + keywords for recall.
-    # Gate: expand_query arg wins; else env LOCI_RAG_EXPAND (default ON). Fail-open — if the
-    # generator is down, `expand` returns just the original query, so retrieval is unaffected.
+    # Gate: expand_query arg wins, else LOCI_RAG_EXPAND (default ON); fail-open to the original query.
     _do_expand = expand_query
     if _do_expand is None:
         _do_expand = os.environ.get("LOCI_RAG_EXPAND", "1").strip().lower() not in ("0", "false", "no", "off", "")
@@ -6647,13 +6433,10 @@ def rag_context_search(
         from qdrant_client.models import Filter, FieldCondition, MatchAny
         _agent_filter = Filter(must_not=[FieldCondition(key="type", match=MatchAny(any=exclude_types))])
 
-    # Retrieve per (collection x expanded query), unioning hits deduped by (origin, id) keeping
-    # the best bi-encoder score. The cross-encoder re-pass below re-ranks against the ORIGINAL
-    # query, so expansion only widens the candidate pool (recall) without diluting precision.
+    # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
     all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
-    # Apply Ebbinghaus exponential time-decay rescoring to findings from the main
-    # investigation collection only (agent_core_chunks is static knowledge, not time-sensitive).
+    # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
     if decay:
         _rag_apply_decay(all_results)
 
@@ -6663,17 +6446,11 @@ def rag_context_search(
     # Final cross-encoder re-pass for consistent cross-collection ranking
     _rag_cross_encode(all_results, query)
 
-    # Best-effort access tracking: append last_accessed timestamp to each returned finding's JSONL.
-    # Failures are silently ignored — this must never block the response.
+    # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
 
     ctx = context_assemble(all_results, query, budget_chars=budget_chars)
-    # Report retrieval honestly. This used to claim mode="rag_hybrid" no matter
-    # what, so a search where EVERY collection raised was indistinguishable from
-    # a genuine zero-hit search: a misconfigured embedder or a dimension mismatch
-    # read back to the caller as "nothing is known about this topic".
-    # Count distinct collections, not error entries — one broken collection
-    # raises once per expanded query.
+    # Count distinct failed collections: an all-errors search must not read back as a genuine zero-hit search.
     _failed_cols = {e.split(":", 1)[0] for e in errors}
     _failed = len(_failed_cols)
     if _failed and _failed >= len(_collections):
@@ -6943,9 +6720,7 @@ def _declared_causal_edges(findings: list[dict]) -> list[dict]:
         parents = raw if isinstance(raw, (list, tuple)) else [raw]
         for parent in parents:
             source = str(parent or "").strip()
-            # derived_from also accepts free-text claim strings, not just ids.
-            # Only ids resolvable within this investigation become edges; a
-            # claim string has no node to point at.
+            # derived_from also accepts free-text claims; only ids resolvable here become edges.
             if not source or source == target or source not in known:
                 continue
             edges.append({
@@ -6953,8 +6728,7 @@ def _declared_causal_edges(findings: list[dict]) -> list[dict]:
                 "source_id": source,
                 "target_id": target,
                 "edge_type": "caused_by",
-                # Declared, not inferred. Higher than the heuristic's 0.5 because
-                # an author saying "this builds on that" is testimony, not a guess.
+                # Declared, not inferred — above the heuristic's 0.5.
                 "confidence": 0.9,
                 "inferred_at": _now(),
                 "method": "declared_lineage",
@@ -6986,8 +6760,6 @@ def _heuristic_causal_edges(findings: list[dict]) -> list[dict]:
             a_text = str(a.get("text") or "")
             if not a_id or not a_text:
                 continue
-            # Cross-reference: B mentions A's id, or B contains causal phrasing
-            # and A's text appears as a substring in B's text.
             id_ref = a_id in b_text
             snippet = a_text[:60].strip().lower()
             snippet_ref = len(snippet) > 10 and snippet in b_text.lower()
@@ -7080,12 +6852,7 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
                     tgt = str(obj.get("target_id") or "")
                     etype = str(obj.get("edge_type") or "")
                     conf = float(obj.get("confidence") or 0.0)
-                    # src/tgt must name findings that EXIST. The prompt renders
-                    # the list as "{idx+1}. [{id}] ..." and the model sometimes
-                    # returns the ORDINAL instead — measured: edges written with
-                    # source_id "1"/"2"/"3". Checking only for a non-empty string
-                    # let those through, and causal_edges_list strips `method`,
-                    # so a consumer cannot tell a dangling edge from a real one.
+                    # The model sometimes returns the prompt ORDINAL instead of the id; a non-empty check let those dangling edges through.
                     if src not in known_ids or tgt not in known_ids:
                         logger.warning("causal LLM edge names unknown finding(s) "
                                        "%r -> %r; dropping", src[:40], tgt[:40])
@@ -7161,7 +6928,7 @@ def memory_consolidate(dry_run: bool = False) -> str:
                 if inv_id and findings and len(findings) >= 3:
                     causal_edges_inferred = _run_causal_inference(inv_id, findings)
         except Exception as exc:
-            # A feature that produces nothing should be able to say why (#192).
+            # A feature that produces nothing should be able to say why.
             logger.warning("causal inference failed during consolidate "
                            "(fail-open, 0 edges): %r", exc)
             causal_edges_inferred = 0
@@ -7203,10 +6970,7 @@ def causal_infer(investigation_id: str, limit: int = 200) -> str:
     Returns JSON: {investigation_id, findings_considered, edges_written,
                    status} — or {error} if the investigation does not exist.
     """
-    # _load_manifest, not _inv_dir(...).exists(): _inv_dir mkdirs, so an
-    # existence check through it is always true and a typo'd id would silently
-    # create an empty investigation. _load_manifest is the read-only check the
-    # other tools use.
+    # _load_manifest, not _inv_dir: _inv_dir mkdirs, so a typo'd id would silently create an empty investigation.
     if not _load_manifest(investigation_id):
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
@@ -7310,9 +7074,7 @@ def _confidence_retrieve(query: str, top_k: int) -> tuple[list, Optional[str]]:
     try:
         results = _query_points_compat(client, col, emb, limit=top_k)
     except Exception as exc:
-        # NOT "no_trace": an empty list from a broken search is a different claim
-        # from an empty list from a healthy one, and the caller has to be able to
-        # tell them apart.
+        # Not "no_trace": an empty list from a broken search is a different claim from an empty one from a healthy search.
         logger.warning("memory_confidence search failed: %r", exc)
         return [], "search_failed"
 
@@ -7384,8 +7146,7 @@ def _confidence_verdict(cues: dict) -> tuple[float, str, str]:
     corroboration = cues["corroboration"]
     trust = cues["trust"]
 
-    # Weighted combination (weights: source_div and trust dominate fluency;
-    # this ordering follows Fleming 2010 — source/recollection > familiarity/fluency).
+    # Weights follow Fleming 2010: source/recollection > familiarity/fluency.
     W = {
         "fluency":       0.10,
         "accessibility": 0.20,
@@ -7656,8 +7417,7 @@ def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
 # Tool: investigation_reason  (deep_think -> loci in-server reasoning surface)
 # ---------------------------------------------------------------------------
 
-# General-purpose adversarial mandates (ported from deep_think PERSPECTIVE_MANDATES).
-# Width clips from the front, so the first N are the most load-bearing.
+# Width clips from the front: the first N are the most load-bearing.
 _REASON_MANDATES: list[tuple[str, str]] = [
     ("primary", "Provide a thorough, balanced analysis from first principles. Cover the major angles."),
     ("adversarial", "Challenge the primary framing. Find every assumption, logical gap, and place the obvious conclusion is overstated or wrong."),
@@ -8039,14 +7799,7 @@ def memory_hints(
 
 
 # ---- MCP resource: memory://hints/{investigation_id} ----
-# FastMCP supports @mcp.resource() with URI template parameters.
-# The resource exposes the same hint payload as the polling tool so MCP
-# clients that support resource subscriptions can receive proactive push
-# updates when the resource changes.
-#
-# Note: FastMCP resource subscriptions (real-time push) require the client to
-# support MCP resource change notifications over SSE/streamable-http transport.
-# The resource is readable over all transports; push is transport-dependent.
+# Push updates are transport-dependent; the resource is readable over all transports.
 
 @mcp.resource(
     "memory://hints/{investigation_id}",
@@ -8280,12 +8033,9 @@ def memory_route(
 # ---------------------------------------------------------------------------
 
 
-# Code<->memory graph tools are defined in graph_tools.py; register them on the
-# shared FastMCP instance here (P1 of the Loci self-review split).
 import graph_tools  # noqa: E402
 graph_tools.register(mcp, _get_ladybug)
-# Re-export the graph tool callables so `server.<tool>()` keeps working for
-# in-process callers and tests (they use graph_tools' injected _get_ladybug).
+# Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from graph_tools import (  # noqa: E402,F401
     code_graph_ingest, code_graph_query, code_memory_relink, code_memory_map,
     symbol_impact, impact_report, finding_code_context, investigation_code_briefing,
@@ -8295,17 +8045,13 @@ from graph_tools import (  # noqa: E402,F401
 # Local-model / embedding passthrough tools live in llm_tools.py (P2a of the split).
 import llm_tools  # noqa: E402
 llm_tools.register(mcp)
-# Re-exported so `server.<tool>()` keeps working for in-process callers and tests
-# (e.g. tests/test_ground_tool.py calls server.ground and patches grounding.ground).
+# Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from llm_tools import (  # noqa: E402,F401
     llm_local, generate_batch, query_expand, verify_finding, classify_text,
     compress_text, semantic_dedup, semantic_relevance, ground,
 )
 
-# Investigation lifecycle tools live in investigation_tools.py (P2b of the split).
-# The memory root is injected as a lambda over MEMORY_DIR (same contract as
-# inv_store); the collaborators below stayed in server.py and are passed in
-# explicitly so investigation_tools never has to import server.
+# Memory root injected as a lambda over MEMORY_DIR; collaborators are passed in so investigation_tools never imports server.
 import investigation_tools  # noqa: E402
 investigation_tools.register(mcp, lambda: MEMORY_DIR, {
     "_apply_lifecycle": _apply_lifecycle,
@@ -8313,13 +8059,7 @@ investigation_tools.register(mcp, lambda: MEMORY_DIR, {
     "_event_log_append": _event_log_append,
     "_qdrant_upsert": _qdrant_upsert,
 })
-# Re-exported so `server.<tool>()` keeps working for in-process callers and tests.
-# NOTE: these tools now resolve their storage helpers in investigation_tools' own
-# namespace. A test that needs to intercept one (e.g. force _append_jsonl to fail)
-# must patch `investigation_tools.<helper>` — patching `server.<helper>` no longer
-# reaches them. No current test does; the two mock.patch.object(server,
-# "_append_jsonl") sites target finding_resolve and investigation_verify_all,
-# both of which stayed in this module.
+# These resolve their helpers in investigation_tools' namespace: patch investigation_tools.<helper>, not server.<helper>.
 from investigation_tools import (  # noqa: E402,F401
     investigation_start, investigation_load, investigation_as_of,
     investigation_note, investigation_reflect, investigation_finding_provenance,
@@ -8362,9 +8102,7 @@ class _BearerAuthMiddleware:
         raw = dict(scope.get("headers") or {}).get(b"authorization", b"")
         value = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
         presented = value[7:] if value[:7].lower() == "bearer " else ""
-        # compare_digest on both branches: a plain == would leak the token length
-        # and prefix through timing, and an early return on empty would leak
-        # whether a token was presented at all.
+        # compare_digest on both branches: == leaks token length/prefix, and an early return leaks whether a token was presented.
         if not (presented and hmac.compare_digest(presented, self._token)):
             body = b'{"error":"unauthorized"}'
             await send({"type": "http.response.start", "status": 401,
@@ -8377,9 +8115,7 @@ class _BearerAuthMiddleware:
 
 
 def main() -> None:
-    # Fire-and-forget embed warm-ping so the FIRST real RAG/dedup call doesn't eat the
-    # ~9s nomic cold-load. Non-blocking (daemon thread) and fail-open — never blocks or
-    # breaks startup.
+    # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:
         import embed_ops
         embed_ops.warm()
@@ -8387,23 +8123,11 @@ def main() -> None:
         logger.debug("main: fail-open swallow: %r", exc)
     transport = os.environ.get("HERMES_MCP_TRANSPORT", "stdio")
     if transport in ("sse", "streamable-http"):
-        # FastMCP.run() takes only transport and mount_path; the bind address
-        # lives on settings.
-        # Loopback by default. This server has no authentication, so a wide bind
-        # is a decision, not something you should get by not making one — the
-        # same reasoning that fixed the retention default in #204. Every
-        # legitimate wide bind already sets this explicitly: docker-compose.yml
-        # passes HERMES_MCP_HOST=0.0.0.0 because a container must bind all
-        # interfaces to receive published traffic, and publishes on 127.0.0.1.
-        # Getting this wrong now fails loudly (cannot connect) instead of
-        # silently exposing an unauthenticated tool server.
+        # Loopback default: no authentication here, so a wide bind must be an explicit decision (docker-compose sets HERMES_MCP_HOST=0.0.0.0).
         mcp.settings.host = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("HERMES_MCP_PORT", "8000"))
 
-        # This server exposes the whole tool surface. #206 made the bind loopback
-        # by default; a token is what makes a NON-loopback bind defensible, so
-        # without one we refuse rather than serve. Loud beats exposed — the same
-        # trade as the bind default and the retention default.
+        # A token is what makes a NON-loopback bind defensible; without one we refuse rather than serve.
         token = os.environ.get("HERMES_MCP_TOKEN", "").strip()
         if not token and not _is_loopback(mcp.settings.host):
             raise SystemExit(

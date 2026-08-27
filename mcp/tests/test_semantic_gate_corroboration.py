@@ -45,8 +45,7 @@ import server
 
 FIXTURE = Path(__file__).parent / "fixtures" / "semantic_gate_probe.json"
 
-# The real false support measured on the live corpus: this text was reported as
-# supporting the M5Cardputer claim below, at score 0.63.
+# Real false support from the live corpus: reported as supporting the claim below at 0.63.
 UNRELATED_FINDING_TEXT = (
     "GTSAM FIXED + VERIFIED HEALTHY: the dama-gtsam-fusion configMap was patched "
     "and the pose graph now converges on every window."

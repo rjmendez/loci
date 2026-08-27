@@ -43,8 +43,7 @@ class FindingLifecycleTest(unittest.TestCase):
         self._orig = server.MEMORY_DIR
         server.MEMORY_DIR = Path(self._tmp.name)
         self._orig_gen = server._verify_gen_fn
-        # Code refs are scoped UNDER the code root; point it at a temp repo so
-        # relative refs resolve there (and absolute / traversal refs are rejected).
+        # Code refs are scoped under the code root, so point it at a temp repo.
         self._code_root = tempfile.TemporaryDirectory()
         self._orig_code_root = os.environ.get("LOCI_CODE_ROOT")
         os.environ["LOCI_CODE_ROOT"] = self._code_root.name
@@ -136,9 +135,7 @@ class FindingLifecycleTest(unittest.TestCase):
         self.assertFalse(loaded[fid_stable].get("stale"))
 
     def test_search_surfaces_staleness_after_file_change(self):
-        # Staleness is surfaced on investigation_search() too (via the JSONL
-        # code_refs map), not just investigation_load(). Stub _mnemo_recall so the
-        # search returns our finding row without needing Mnemosyne/Qdrant.
+        # Staleness must surface on investigation_search() too, not just investigation_load().
         inv_id = self._start()
         root = Path(self._code_root.name)
         (root / "searched.py").write_text("value = 1\n")
@@ -185,9 +182,7 @@ class FindingLifecycleTest(unittest.TestCase):
         self.assertEqual(self._load_findings(inv_id)[fid].get("stale"), False)
 
     def test_code_refs_empty_is_authoritative_no_refs(self):
-        # PROVIDED-BUT-EMPTY ('' or []) is authoritative "no refs": text-parsing
-        # must be SKIPPED even though the text contains a parseable ref token.
-        # Contrast: omitting code_refs entirely (None) falls back to text parsing.
+        # Provided-but-empty is authoritative "no refs"; only None falls back to text parsing.
         (Path(self._code_root.name) / "parsed.py").write_text("q = 1\n")
         text = "the bug lives in parsed.py:12"
 
@@ -198,15 +193,12 @@ class FindingLifecycleTest(unittest.TestCase):
         # '' (provided-but-empty) -> authoritative no refs.
         self.assertEqual(server._compute_code_refs(text, ""), [])
 
-        # End-to-end through investigation_store: code_refs=[] leaves no code_refs
-        # on the stored finding despite the parseable token in the text.
         inv_id = self._start()
         fid = self._store(inv_id, text, code_refs=[])
         self.assertNotIn("code_refs", self._load_findings(inv_id)[fid])
 
     def test_code_ref_path_scoping_rejects_escapes(self):
-        # SECURITY: absolute paths and '..' traversal must be refused outright,
-        # and a rogue ref must never let the server hash a file outside the root.
+        # SECURITY: a rogue ref must never let the server hash a file outside the code root.
         outside = Path(self._tmp.name) / "secret.txt"  # under MEMORY_DIR, NOT code root
         outside.write_text("top secret\n")
 
@@ -235,8 +227,7 @@ class FindingLifecycleTest(unittest.TestCase):
             server._HASH_FILE_MAX_BYTES = orig
 
     def test_hash_file_max_bytes_env_parse_fails_open(self):
-        # A bad LOCI_HASH_FILE_MAX_BYTES must fall back to the default cap and
-        # NEVER raise (an import-time ValueError would block server startup).
+        # A bad LOCI_HASH_FILE_MAX_BYTES must never raise: an import-time ValueError blocks startup.
         default = server._HASH_FILE_MAX_BYTES_DEFAULT
         orig = os.environ.get("LOCI_HASH_FILE_MAX_BYTES")
         try:
@@ -311,8 +302,7 @@ class FindingLifecycleTest(unittest.TestCase):
     # -- fail-open write guards (Copilot round 5) ----------------------------
 
     def test_resolve_append_failure_fails_open(self):
-        # An I/O error while recording the resolution must return a fail-open
-        # error result, NOT raise out of the tool.
+        # An I/O error while recording must fail open, not raise out of the tool.
         inv_id = self._start()
         fid = self._store(inv_id, "the bug is here")
         with mock.patch.object(server, "_append_jsonl", side_effect=OSError("disk full")):
@@ -323,8 +313,7 @@ class FindingLifecycleTest(unittest.TestCase):
         self.assertEqual(self._load_findings(inv_id)[fid]["resolution"], "open")
 
     def test_verify_all_continues_when_a_note_write_fails(self):
-        # A single verification-note write failure must be skipped so the rest of
-        # the batch still runs (and every finding still gets a verdict result).
+        # One note-write failure must be skipped so the rest of the batch still runs.
         inv_id = self._start()
         fids = [self._store(inv_id, f"claim {i}") for i in range(3)]
 

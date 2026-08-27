@@ -35,19 +35,11 @@ PG_PASS = os.environ.get("LOCI_DB_PASS", "")
 PG_DB   = os.environ.get("LOCI_DB_NAME", "")
 
 # ── static identity block — customize for your deployment ────────────────────
-# Add tuples of (group_name, value_string) to seed MEMORY.md with
-# static facts about your agent, team, or infrastructure.
-# Do NOT hardcode credentials here — use env vars.
-# Example:
-#   ("Who I Am", "**Name:** my-agent"),
-#   ("Who I Am", "**A2A:** http://your-host:8201/a2a"),
+# (group, value) tuples seeded into MEMORY.md; no credentials — reference env var names.
 STATIC_IDENTITY: list[tuple[str, str]] = []
 
 # ── static key facts (optional: seed known agents / infra) ───────────────────
-# Populate via env vars or leave empty. Never hardcode tokens here.
-# Example format:
-#   ("Key Facts", "`agent:<name>:host:a2a` (text): <host>:<port>")
-#   ("Key Facts", "`agent:<name>:token:a2a` (text): ${AGENT_TOKEN_ENV_VAR}")
+# (group, value) tuples for known agents/infra; reference tokens by env var name, never inline.
 STATIC_KEY_FACTS: list[tuple[str, str]] = []
 
 # Optional static infra notes (no credentials).
@@ -79,7 +71,6 @@ def _try_postgres():
 
             rows = []
 
-            # Try common table schemas
             for table in ("user_profile", "memory_config", "agent_facts", "facts"):
                 try:
                     cur.execute(f"SELECT * FROM {table} LIMIT 1;")
@@ -87,7 +78,6 @@ def _try_postgres():
                     cur.execute(f"SELECT * FROM {table};")
                     for row in cur.fetchall():
                         rec = dict(zip(cols, row))
-                        # Guess group/value shape
                         group = rec.get("group") or rec.get("category") or rec.get("section") or "Key Facts"
                         value = rec.get("value") or rec.get("content") or str(rec)
                         rows.append((group, value))
@@ -121,7 +111,6 @@ def _load_sqlite_key_facts():
         conn = sqlite3.connect(SQLITE_DB, timeout=5)
         conn.row_factory = sqlite3.Row
 
-        # High-importance memories (importance >= 0.85) sorted by created_at desc
         try:
             mem_rows = conn.execute(
                 "SELECT content, importance, created_at FROM memories "
@@ -132,7 +121,6 @@ def _load_sqlite_key_facts():
         except Exception as e:
             print(f"[generate_memory_md] memories query: {e}", file=sys.stderr)
 
-        # Recent triples
         try:
             triple_rows = conn.execute(
                 "SELECT subject, predicate, object, valid_from FROM triples "
@@ -176,7 +164,6 @@ def _render(all_rows: list[tuple]) -> str:
         else:
             lines.append(value)
 
-    # Final § to terminate
     lines.append("§")
     return "\n".join(lines) + "\n"
 
@@ -210,12 +197,10 @@ def main():
             print("[generate_memory_md] PostgreSQL unavailable — falling back to SQLite", file=sys.stderr)
 
     if not dynamic_rows:
-        # SQLite mode: combine static identity + dynamic sqlite facts
         sqlite_rows = _load_sqlite_key_facts()
         print(f"[generate_memory_md] SQLite mode: {len(sqlite_rows)} dynamic rows", file=sys.stderr)
         dynamic_rows = sqlite_rows
 
-    # Build full row list: static identity + static key facts + dynamic + infra
     all_rows: list[tuple] = []
     all_rows.extend(STATIC_IDENTITY)
     all_rows.extend(STATIC_KEY_FACTS)

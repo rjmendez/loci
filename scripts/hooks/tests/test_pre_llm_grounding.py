@@ -36,8 +36,7 @@ import pytest
 
 HOOK_PATH = pathlib.Path(__file__).resolve().parent.parent / "pre_llm_grounding.py"
 
-# A neutral, fully-specified environment. HOME points at a directory that does
-# not exist so the module's .env loading and ~/.hermes defaults are inert.
+# HOME points at a nonexistent directory so .env loading and ~/.hermes defaults stay inert.
 BASE_ENV = {
     "HOME": "/nonexistent-home-for-pre-llm-grounding-tests",
     "HERMES_HOME": "/nonexistent-home-for-pre-llm-grounding-tests/.hermes",
@@ -287,9 +286,7 @@ def test_search_collection_named_vector_request_shape(hook):
         calls.stop()
     c = calls[0]
     assert c["url"] == "http://qdrant.invalid:6333/collections/mnemosyne/points/search"
-    # Qdrant's REST contract for a named vector is {"name": ..., "vector": ...}.
-    # This test previously asserted {"dense": [...]}, which the server rejects
-    # with HTTP 400, so it pinned the defect rather than catching it.
+    # A named vector is {"name": ..., "vector": ...}; {"dense": [...]} is a 400.
     assert c["body"] == {"vector": {"name": "dense", "vector": [1.0, 2.0]}, "limit": 4,
                          "with_payload": True, "with_vector": False}
     assert c["headers"]["Api-key"] == "test-key"
@@ -380,8 +377,7 @@ def test_search_collection_non_numeric_importance_raises(hook):
 
 
 def test_search_collection_raises_on_transport_error(hook):
-    # An empty list is what an unmatched query looks like, so returning [] here
-    # made a failing search indistinguishable from a successful empty one.
+    # Returning [] would make a failed search indistinguishable from an empty one.
     calls = fake_urlopen(hook, OSError("down"))
     try:
         with pytest.raises(hook._SearchFailed):
@@ -425,8 +421,7 @@ def test_search_collection_missing_result_key_is_empty(hook):
 # ---------------------------------------------------------------------------
 
 def test_beam_fallback_returns_empty_when_mnemosyne_missing(hook):
-    # Clearing sys.modules is not enough: the import re-succeeds from disk on any
-    # host that has mnemosyne installed. Fail the import itself instead.
+    # Clearing sys.modules is not enough: the import re-succeeds from disk.
     saved = list(sys.path)
     real_import = builtins.__import__
 
@@ -837,10 +832,7 @@ def test_mmr_select_empty_content_similarity_is_zero(hook):
 
 
 def test_mmr_select_requires_ms_score(hook, monkeypatch):
-    # _mmr_select fills its final slot from random.random() < PHERO_EPSILON, and
-    # that branch never reads ms_score — so unseeded this asserts nothing 5% of the
-    # time (measured: 4 failures in 80 runs against PHERO_EPSILON=0.05). Pin the
-    # draw above epsilon so the MMR path, which is the path under test, is taken.
+    # Pin epsilon to 0: the random slot never reads ms_score, so unseeded this is flaky.
     monkeypatch.setattr(hook, "PHERO_EPSILON", 0.0)
     with pytest.raises(KeyError):
         hook._mmr_select([{"content": "a"}, {"content": "b"}], 1)
@@ -1412,11 +1404,7 @@ def test_output_is_a_single_json_line_on_stdout(hook):
 
 # ---------------------------------------------------------------------------
 # Claude Code payload shape
-#
-# The hook was ported from Hermes by adding the Claude Code event names but not
-# its payload shape. Claude Code sends the text as a top-level "prompt";
-# Hermes nested it under extra.user_message. Reading only the latter made the
-# hook emit nothing on every real UserPromptSubmit and SubagentStart.
+# Claude Code sends a top-level "prompt"; Hermes nested it under extra.user_message.
 # ---------------------------------------------------------------------------
 
 def _dark_hook(hook):
@@ -1484,10 +1472,7 @@ def test_embed_base_url_none_when_unset(hook):
 
 # ---------------------------------------------------------------------------
 # fan-out degradation
-#
-# With the wrong named-vector shape every base collection returned HTTP 400 and
-# _search_collection swallowed it into []. The fan-out then reported a clean
-# "no matches" turn after turn. A total failure now degrades to BeamMemory.
+# Swallowed per-collection failures report a clean "no matches"; total failure must degrade to Beam.
 # ---------------------------------------------------------------------------
 
 def test_fanout_falls_back_to_beam_when_every_collection_fails(hook):

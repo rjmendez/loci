@@ -898,9 +898,7 @@ def test_focus_map_falls_back_to_defaults_on_bad_input(monkeypatch):
 # grounding_gate_qf_eval.run
 # ---------------------------------------------------------------------------
 
-# 2-d vectors chosen so every cosine is an exact float:
-#   alpha=[1,0] beta=[0,1]; a1=[1,0] a2=[4,3]->[.8,.6] b1=[0,1] b2=[3,4]->[.6,.8]
-# labels = [1,1,0,0, 0,0,1,1]; cos = [1,.8,0,.6, 0,.6,1,.8]
+# 2-d vectors chosen so every cosine is an exact float.
 QF_VECTORS = {
     "alpha": [1.0, 0.0], "beta": [0.0, 1.0],
     "a1": [1.0, 0.0], "a2": [4.0, 3.0], "b1": [0.0, 1.0], "b2": [3.0, 4.0],
@@ -1051,8 +1049,7 @@ def test_qf_run_with_model_persists_cosine_and_model_scores(tmp_path, monkeypatc
          for tag in ("cosine", "model")
          for m in ("recall", "bleed_rejection", "f1", "accuracy", "auc")]
     )
-    # persisted values are the FIXED-threshold ones (cosine@0.59 / model@0.50),
-    # never the best-F1 sweep results
+    # Persisted values are the fixed-threshold ones, never the best-F1 sweep results.
     by_id = {u["task_id"]: u["score"] for u in upserts}
     assert by_id["dtl.gate_qf.cosine.f1"] == pytest.approx(0.8)
     assert by_id["dtl.gate_qf.model.f1"] == pytest.approx(0.8)

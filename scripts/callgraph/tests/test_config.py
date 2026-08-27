@@ -48,7 +48,5 @@ def test_stdlib_module_names_contains_known_stdlib():
 
 @needs_corpus_deps
 def test_third_party_names_finds_installed_packages():
-    # The venv is fully provisioned per the task brief; fastmcp's dependency
-    # stack (dotenv, starlette, ...) should be discoverable.
     names = config.third_party_top_level_names()
     assert "dotenv" in names or "starlette" in names

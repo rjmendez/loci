@@ -27,9 +27,7 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 AMEM_LINK_THRESHOLD = float(os.environ.get("AMEM_LINK_THRESHOLD", "0.88"))
 AMEM_CONFLICT_THRESHOLD = float(os.environ.get("AMEM_CONFLICT_THRESHOLD", "0.96"))
 AMEM_UPDATE_THRESHOLD = float(os.environ.get("AMEM_UPDATE_THRESHOLD", "0.92"))  # near-copy with temporal ordering → updated_by
-# Batch size. Own name, because the three consolidation scripts each had a
-# different budget under the shared MAX_PER_RUN; setting it for one silently
-# reconfigured the others. MAX_PER_RUN is still honoured as a fallback.
+# Own name: under the shared MAX_PER_RUN, setting a budget for one script reconfigured all three.
 MAX_PER_RUN = int(
     os.environ.get("AMEM_MAX_PER_RUN")
     or os.environ.get("MAX_PER_RUN")
@@ -125,17 +123,14 @@ def _load_quorum_gate():
         return None
 
 
-# One new edge or conflict found → deposit 1.0 to the amem_consolidation topic.
-# Set QUORUM_AMEM_THRESHOLD to require N accumulated signals before running the
-# expensive embedding pass again. 0 (default) disables the gate.
+# N accumulated signals (one per new edge or conflict) before the embedding pass reruns; 0 disables.
 QUORUM_AMEM_THRESHOLD = float(os.environ.get("QUORUM_AMEM_THRESHOLD", "0"))
 
 
 def main() -> None:
     now = datetime.now(timezone.utc).isoformat()
 
-    # Quorum gate: skip if not enough signal has accumulated since last run.
-    # Deposit happens at the end when we actually did work.
+    # Deposit happens at the end, once we have actually done work.
     if QUORUM_AMEM_THRESHOLD > 0:
         QuorumGate = _load_quorum_gate()
         if QuorumGate is not None:

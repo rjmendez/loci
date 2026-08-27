@@ -4,8 +4,7 @@ import sys
 import os
 import unittest
 
-# Run from mcp/ directory; this path resolves whether pytest is launched from
-# mcp/ or from the repo root with --rootdir.
+# Resolves whether pytest is launched from mcp/ or from the repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from memcheck.verdict import Verdict, make_signature, new_verdict, redact_excerpt

@@ -16,9 +16,7 @@ def test_selftest_all_checks_pass():
 
 
 def test_selftest_covers_every_dispatch_shape_and_the_hard_gate():
-    # A regression here (someone silently deleting a check) is exactly the
-    # failure mode this test exists to catch — pin the count and a handful
-    # of the load-bearing names.
+    # Guards against a check being silently deleted from the selftest.
     report = run_selftest()
     names = {c.name for c in report.checks}
     assert len(report.checks) == 15
@@ -29,11 +27,7 @@ def test_selftest_covers_every_dispatch_shape_and_the_hard_gate():
 
 
 def test_selftest_finishes_well_under_the_five_second_budget():
-    # build_steps step 13's own acceptance line: "total wall time for a
-    # full cold build plus all fixture assertions under 5s." Timed here
-    # independently of run_selftest()'s own self-reported elapsed_s, and
-    # given a little headroom over the hard 5s design ceiling since this
-    # runs on shared/variable CI hardware, not a dedicated benchmark box.
+    # Design budget is 5s cold; bounded at 8s here because CI hardware is shared and variable.
     t0 = time.time()
     report = run_selftest()
     wall = time.time() - t0
@@ -63,9 +57,7 @@ def test_cli_selftest_json_shape(capsys):
 
 
 def test_cli_selftest_reports_a_broken_check_with_nonzero_exit(monkeypatch):
-    # Prove the CLI actually surfaces a failure rather than always printing
-    # green — flip one check to fail and confirm both the exit code and the
-    # FAIL line show up.
+    # Prove the CLI surfaces a failure rather than always printing green.
     from .. import cli as cli_mod
     from ..selftest import Check, SelftestReport
 

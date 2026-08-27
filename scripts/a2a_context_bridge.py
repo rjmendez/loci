@@ -56,11 +56,7 @@ if os.path.exists(_ENV):
 
 # ── config ───────────────────────────────────────────────────────────────────────
 LOCAL_A2A_URL  = os.environ.get("HERMES_A2A_URL", "http://127.0.0.1:8201")
-# Empty, not "changeme". The A2A server reads the same variable and defaults it
-# to '' precisely so an unset token fails closed; defaulting the client to a
-# guessable literal handed that back. A shared secret with a published value is
-# not a shared secret, and the failure was silent in the direction that matters —
-# authenticating rather than refusing.
+# Empty, not "changeme": the server defaults the same variable to '' so an unset token fails closed.
 LOCAL_A2A_TOKEN = os.environ.get("HERMES_A2A_TOKEN", "")
 if not LOCAL_A2A_TOKEN:
     print('WARNING: HERMES_A2A_TOKEN is not set. The bridge will be rejected by any '
@@ -71,10 +67,7 @@ MIN_IMP        = float(os.environ.get("BRIDGE_MIN_IMP", "0.5"))
 MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
 AGENT_ID       = os.environ.get("HERMES_AGENT_ID", "hermes")
 
-# The bridge relays through the LOCAL A2A server, and that server may enforce TOTP on /a2a
-# (oxalis-mrpink does; hugbot5000-jetson does not). Without this the bearer alone gets a
-# flat 401 on every send and the bridge is inert. Empty seed = no header, so a node whose
-# server does not enforce TOTP is unaffected.
+# The local server may enforce TOTP on /a2a, where the bearer alone 401s; empty seed sends no header.
 LOCAL_A2A_TOTP_SEED = os.environ.get("HERMES_A2A_TOTP_SEED", "").strip()
 
 _mnem_dir   = os.path.expanduser(os.environ.get("MNEMOSYNE_DATA_DIR", "~/.hermes/mnemosyne/data"))
@@ -100,12 +93,7 @@ def _save_state(state: dict):
 
 
 # ── Mnemosyne query ───────────────────────────────────────────────────────────────
-# Sources that must never be re-bridged. Anything already in flight through the mesh will
-# come back with one of these stamps, and re-sending it is what turns two nodes into an
-# infinite loop. `bridge:` is what THIS script stamps on what it sends (see
-# _broadcast_memory), `broadcast:` is what a peer's context_broadcast stamps on what it
-# receives, and `context_broadcast` marks a memory the local server has already fanned out
-# to every peer itself.
+# Re-bridging a memory already in flight through the mesh is what turns two nodes into a loop.
 ECHO_SOURCE_PREFIXES = [
     p.strip() for p in os.environ.get(
         "BRIDGE_EXCLUDE_SOURCES", "bridge:,broadcast:,context_broadcast"
@@ -211,18 +199,11 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
             "message":  mem["content"],
             "input": {
                 "content":    mem["content"],
-                # Stamp what WE send so both ends can recognise it as mesh traffic and refuse
-                # to bridge it onward. Passing the original source through (the old behaviour)
-                # meant a bridged memory arrived at the peer looking locally-authored, so the
-                # peer's own filter could not identify it and bridged it straight back.
+                # Unstamped, a bridged memory looks locally-authored at the peer and bounces back.
                 "source":     f"bridge:{AGENT_ID}",
                 "importance": float(mem.get("importance") or 0.5),
                 "bank":       "default",
-                # We are relaying through our OWN server, and context_broadcast stores before
-                # it fans out. Without this the bridge re-inserts a fresh copy of each memory
-                # into the database it just read from -- with a new id and a new created_at,
-                # so the copy is "new" next run and gets bridged again. That is unbounded
-                # growth on a SINGLE node, no peer required.
+                # context_broadcast stores before it fans out, and we relay through our OWN server.
                 "store_local": False,
             },
             "sender": AGENT_ID,
@@ -232,8 +213,7 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
         "Authorization": f"Bearer {LOCAL_A2A_TOKEN}",
         "Content-Type":  "application/json",
     }
-    # Generated per send, not once per run: a run that spans a 30s TOTP step would otherwise
-    # start failing halfway through with a stale code.
+    # Per send, not per run: a run spanning a 30s TOTP step would start failing halfway through.
     totp_code = _totp_now()
     if totp_code:
         headers["X-TOTP"] = totp_code
@@ -270,7 +250,6 @@ async def run(dry_run: bool, verbose: bool):
         since = last_run
         log.info("Fetching memories since last run: %s", since)
     else:
-        # First run: look back LOOKBACK_MIN minutes
         since = (
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=LOOKBACK_MIN)
         ).isoformat()
@@ -286,8 +265,7 @@ async def run(dry_run: bool, verbose: bool):
             _save_state(state)
         return
 
-    # Ids already delivered, so holding the watermark back to retry a failure does not
-    # re-send everything newer than it. Bounded so the state file cannot grow without end.
+    # Ids already delivered, so holding the watermark back to retry does not re-send.
     sent_ids = list(state.get("sent_ids") or [])
     sent_set = set(sent_ids)
 
@@ -315,10 +293,7 @@ async def run(dry_run: bool, verbose: bool):
     log.info("Bridge complete — ok=%d fail=%d skipped=%d dry_run=%s", ok, fail, skipped, dry_run)
 
     if not dry_run:
-        # Only advance the watermark on a clean run. It used to advance unconditionally, so
-        # anything that failed to send was never looked at again — a peer that was briefly
-        # down or an auth error silently dropped those memories for good. Holding it back
-        # costs a re-fetch next tick; sent_ids stops that becoming a re-send.
+        # Clean runs only: advancing past a failed send drops those memories for good.
         if fail == 0:
             state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         else:

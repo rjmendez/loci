@@ -33,8 +33,7 @@ import pytest
 
 HOOK_PATH = pathlib.Path(__file__).resolve().parent.parent / "session_end_sync.py"
 
-# HOME points somewhere that does not exist so any ~ default the module falls
-# back to is inert rather than touching the real user's dotfiles.
+# HOME points somewhere nonexistent so ~ defaults never touch the real dotfiles.
 BASE_ENV = {
     "HOME": "/nonexistent-home-for-session-end-sync-tests",
     "QDRANT_URL": "http://qdrant.invalid:6333",
@@ -1180,10 +1179,7 @@ def test_main_ignores_extra_stdin_keys_and_bad_json(wired):
 
 # ---------------------------------------------------------------------------
 # _embeddings_url
-#
-# The module read only OLLAMA_BASE_URL. The Hermes profile sets
-# MNEMOSYNE_EMBEDDING_API_URL (already a full /v1 endpoint), so the sync had no
-# embeddings endpoint at all under the profile's own environment.
+# The Hermes profile sets MNEMOSYNE_EMBEDDING_API_URL, not OLLAMA_BASE_URL.
 # ---------------------------------------------------------------------------
 
 def test_embeddings_url_from_bare_ollama_host():
@@ -1210,12 +1206,7 @@ def test_embeddings_url_none_when_neither_set():
 
 # ---------------------------------------------------------------------------
 # transcript_session_content
-#
-# STATE_DB is Hermes' session store: 765 rows, all Hermes-format ids, none
-# written since 2026-06-19. A Claude Code session id never resolves there, so
-# get_session_content returned None and the Stop hook exited 0 without ever
-# syncing a single Claude Code session. The Stop payload carries
-# transcript_path, which is the record that actually exists.
+# A Claude Code session id never resolves in Hermes' STATE_DB; transcript_path does.
 # ---------------------------------------------------------------------------
 
 def _write_transcript(tmp_path, records):

@@ -63,10 +63,7 @@ def _no_vllm_fallback(monkeypatch):
     test name says it means.
     """
     monkeypatch.setattr(L, "_try_vllm", lambda *a, **k: None)
-    # Pin the model too. generate() now resolves it via backends.ollama_gen_model(),
-    # which reads ~/.loci/backends.toml -- so without this these tests assert
-    # against whatever the OPERATOR has configured, passing locally and failing in
-    # CI (or vice versa). A unit test must not depend on a machine's config.
+    # Pin the model: generate() otherwise resolves it from ~/.loci/backends.toml.
     import backends
     monkeypatch.setattr(backends, "ollama_gen_model", lambda: "qwen2.5:3b")
 
@@ -96,9 +93,7 @@ def test_exception_never_raises(monkeypatch):
     assert r["ok"] is False
     assert r["text"] == ""
     assert r["model"] == "qwen2.5:3b"
-    # The failure must carry its reason. This asserted the exact dict, which is
-    # why adding `why` broke it -- and the absence of a reason here is exactly
-    # what made a misconfigured endpoint take a live diagnosis to find.
+    # The failure must carry its reason; without one a misconfigured endpoint needs a live diagnosis.
     assert "timed out" in r["why"]
 
 

@@ -95,11 +95,7 @@ def test_callers_ambiguous_bare_name_lists_candidates(capsys):
 
 
 def test_callers_json_format(capsys):
-    # Default --conf is "probable", so this now also picks up the 15 rung-4
-    # (name-via-injected-global) PROBABLE calls inside graph_tools.py that
-    # only resolve once extract/dispatch.py's probable tier has run — on
-    # top of the 2 PROVEN in-server calls + 2 passed-by-ref REFERENCES rows
-    # step 4/step 5 slices already covered.
+    # Default --conf is "probable": 2 PROVEN + 15 rung-4 PROBABLE + 2 REFERENCES.
     code, out = _run(capsys, ["callers", "_get_ladybug", "--rev", "HEAD", "--format", "json"])
     assert code == 0
     rows = json.loads(out)
@@ -176,9 +172,7 @@ def test_callers_get_ladybug_shows_probable_injected_rows_with_why(capsys):
     code, out = _run(capsys, ["callers", "_get_ladybug", "--rev", "HEAD", "--scope", "mcp/", "--why"])
     assert code == 0
     assert "-- PROBABLE" in out
-    # 11 from mcp/graph_tools.py's own injected NAME slot + 4 from
-    # mcp/ladybug_ops.py's separately-injected slot pointing at the same
-    # target function (see test_pipeline_real_corpus.py for the split).
+    # 11 from graph_tools.py's injected slot + 4 from ladybug_ops.py's, same target.
     assert out.count("call[name-via-injected-global]") == 15
     assert "-- why: rule=name-via-injected-global  because=injected at mcp/server.py:" in out
 
@@ -190,9 +184,7 @@ def test_callers_skill_shows_dispatch_row_as_one_of_thirteen(capsys):
 
 
 def test_explain_dispatch_callsite_lists_all_thirteen_candidates(capsys):
-    # Locate the callsite through the graph. A hardcoded line number drifts with
-    # every edit above it, and the miss is reported on stderr, so a fallback
-    # keyed on stdout never fires.
+    # Locate the callsite through the graph: a hardcoded line number drifts.
     _, callers_out = _run(capsys, ["callers", "a2a_server/server.py::skill_memory_recall", "--rev", "HEAD", "--format", "json"])
     disp = [r for r in json.loads(callers_out) if r["kind"] == "DISPATCHES"][0]
     code, out = _run(capsys, ["explain", disp["src"], "--rev", "HEAD", "--scope", "a2a_server/"])
@@ -255,10 +247,6 @@ def test_paths_dot_renders_the_hop_chain(capsys):
 
 def test_entrypoints_names_code_memory_relink_tool(capsys):
     code, out = _run(capsys, ["entrypoints", "mcp/graph_tools.py:1", "--rev", "HEAD", "--scope", "mcp/"])
-    # line 1 of graph_tools.py is the module docstring: falls back to the
-    # MODULE id, which has no direct ENTRYPOINT of its own (modules are
-    # only trivial roots for reachable_functions' forward closure, not a
-    # registered entrypoint themselves) — just confirms the command runs
-    # cleanly end to end and prints the honest "0 known" verdict.
+    # Line 1 is the module docstring: falls back to the MODULE id, which has no ENTRYPOINT.
     assert code == 0
     assert "mcp/graph_tools.py:1" in out

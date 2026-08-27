@@ -54,9 +54,7 @@ def test_near_miss_pairs_graph_ladybug_and_graph_kuzu():
 
 
 def test_near_miss_requires_cross_module():
-    # Two producer-only / consumer-only literals sharing a stem but BOTH
-    # sited only in the SAME module must not pair — the design's own
-    # "module boundary" requirement.
+    # Producer and consumer sited in the SAME module must not pair (module-boundary rule).
     from ..model import Confidence, Edge, GraphStore, Node
 
     store = GraphStore()

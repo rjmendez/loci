@@ -33,8 +33,7 @@ def _entities_of(text: str) -> dict:
     return out
 
 
-# In-memory findings for the reference algorithm. Supplied in id-sorted order so
-# the reference's dict-insertion iteration matches the store's sorted iteration.
+# Id-sorted so the reference's dict-insertion order matches the store's sorted iteration.
 MEM_FINDINGS = [
     {"id": "f1", "text": f"seed references {URL}"},
     {"id": "f2", "text": f"another mention of {URL} here"},
@@ -82,7 +81,6 @@ def test_contamination_matches_reference(tmp_path):
     assert graph_res["contaminated_ids"] == ref_res["contaminated_ids"]
     assert graph_res["reasons"] == ref_res["reasons"]
 
-    # Sanity: the expected shape.
     assert graph_res["contaminated_ids"] == ["f1", "f2", "f3", "f4", "f5"]
     assert graph_res["reasons"]["f1"] == ["seed"]
     assert graph_res["reasons"]["f5"] == ["semantic"]
@@ -132,8 +130,7 @@ def test_ingest_code_and_reads(tmp_path):
                 {"id": "app/main.py::helper", "name": "helper", "kind": "function",
                  "line": 2, "lang": "python", "file": "app/main.py"},
             ],
-            # DEFINES + IMPORTS also appear in edges (as real code_parse emits);
-            # ingest ignores them here (DEFINES from symbols, IMPORTS from list).
+            # Real code_parse emits DEFINES + IMPORTS in edges too; ingest takes them elsewhere.
             "edges": [
                 {"src": "app/main.py", "dst": "app/main.py::main", "type": "DEFINES"},
                 {"src": "app/main.py::main", "dst": "helper", "type": "CALLS"},
@@ -336,8 +333,7 @@ def test_ingest_code_receiver_type_inference(tmp_path):
                  "kind": "method", "line": 4, "lang": "java",
                  "file": "app/FooService.java"},
             ],
-            # svc is a field of class A typed to the app type FooService;
-            # ext is a local of A.run typed to an imported non-app class.
+            # svc is an app-typed field; ext is a local typed to an imported non-app class.
             "decls": [
                 {"name": "svc", "type": "FooService", "scope": "app/A.java::A",
                  "scope_kind": "field"},

@@ -146,10 +146,7 @@ class _FoldEnv:
                 return _join(base, rest)
             if fname in ("Path", "pathlib.Path") and len(node.args) == 1:
                 return self.fold(node.args[0])
-            # `<expr>.resolve()` / `<expr>.absolute()` as a *call* (the
-            # common `Path(__file__).resolve()` shape) — fname is None here
-            # because _dotted_call_name gives up on a non-Name base, so this
-            # has to be checked explicitly rather than falling through.
+            # fname is None for a non-Name base, so Path(__file__).resolve() needs its own check.
             if isinstance(func, ast.Attribute) and func.attr in ("resolve", "absolute") and not node.args:
                 return self.fold(func.value)
             return UNRESOLVABLE
@@ -237,12 +234,9 @@ def find_sys_path_inserts(sf: SourceFile) -> list[SysPathInsert]:
             return None  # above repo root: cannot be modelled, not a corpus dir
         return folded.rel
 
-    # Module level (direct statements + inside simple if/try wrappers, which
-    # is how every real insert in this corpus is written).
+    # Module level, including simple if/try wrappers — how every real insert here is written.
     scan(sf.tree.body, module_env)
 
-    # Function-local (any nesting depth): each function gets its own env
-    # seeded from the module env plus its own top-of-body simple assigns.
     for node in ast.walk(sf.tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             fn_env = _FoldEnv(sf.rel_path, parent=module_env)
@@ -344,22 +338,13 @@ class ResolutionTable:
         for sf in sources:
             self.inserts.extend(find_sys_path_inserts(sf))
 
-        # roots: root_dir -> list of RootProvenance (one per distinct insert
-        # site producing that dir; repo root is always present, implicit).
+        # One RootProvenance per distinct insert site; repo root is always present, implicit.
         self.roots: dict[str, list[RootProvenance]] = {"": [RootProvenance("", "implicit: repo root", "implicit")]}
         for ins in self.inserts:
             self.roots.setdefault(ins.target_dir, []).append(
                 RootProvenance(ins.target_dir, f"{ins.inserting_file}:{ins.lineno}", ins.scope, ins.inserting_file)
             )
-        # A directory that contains at least one `if __name__ == "__main__":`
-        # entry point is *also* a usable root for every sibling in that same
-        # directory: when Python runs a script directly (`python
-        # eval/harness.py`), it auto-adds that script's own directory to
-        # sys.path[0] — no explicit insert required. This is exactly how
-        # `import harness` / `from tasks import TASKS` resolve from
-        # eval/grounding_gate_eval.py: eval/harness.py's own __main__ guard
-        # is what puts eval/ on sys.path for every file that runs alongside
-        # it, not anything grounding_gate_eval.py itself does.
+        # Running a script directly puts its own dir on sys.path[0], making it a root for siblings.
         main_dirs: dict[str, str] = {}
         for sf in sources:
             if sf.tree is not None and _has_main_guard(sf.tree):
@@ -394,16 +379,7 @@ class ResolutionTable:
 
         matches = self.by_dotted.get(dotted, [])
         if matches:
-            # Preference order for which provenance to cite when several
-            # roots answer to the same dotted name:
-            #   1. a root THIS FILE ITSELF established (its own literal
-            #      sys.path.insert, or its own __main__ guard) — guaranteed
-            #      to have executed immediately before this import runs;
-            #   2. same-dir (root_dir == importer's own directory) — always
-            #      trivially available;
-            #   3. first found — a flat import that only resolves because
-            #      of an insert written in a DIFFERENT file, surfaced via
-            #      cross_file_root below.
+            # own_file first: a root the importer established is guaranteed to have already run.
             own_file = [m for m in matches if m[1].source_file == importer_rel_path]
             same_dir = [m for m in matches if m[1].root_dir == importer_dir]
             chosen_path, chosen_prov = (own_file or same_dir or matches)[0]
@@ -451,8 +427,7 @@ class ResolutionTable:
         if not dotted:
             return ResolveResult(status="unresolved", target_path=None, resolved_via="unresolved",
                                   evidence="", ambiguous=False, candidates=[], cross_file_root=False)
-        # Relative imports resolve directly against the filesystem, not
-        # through the sys.path root table.
+        # Relative imports resolve against the filesystem, not the sys.path root table.
         candidate_pkg = f"{dotted.replace('.', '/')}/__init__.py"
         candidate_mod = f"{dotted.replace('.', '/')}.py"
         for candidate in (candidate_mod, candidate_pkg):

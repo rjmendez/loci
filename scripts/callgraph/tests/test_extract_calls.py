@@ -120,9 +120,7 @@ def test_unresolved_sink_node_exists_and_is_kind_unresolved():
 
 
 def test_chained_call_gets_two_distinct_callsite_ids():
-    # `pyotp.TOTP(x).now()` shape: outer and inner Call share (line, col)
-    # but must be two distinct CALLSITE nodes, not one merged/overwritten
-    # node with two CALLS edges hanging off it.
+    # `pyotp.TOTP(x).now()`: outer and inner Call share (line, col) and must not merge.
     from ..tests.helpers import source_file
     from ..model import GraphStore
     from ..resolve import ResolutionTable

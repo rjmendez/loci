@@ -30,19 +30,14 @@ def test_rebuilding_the_same_rev_is_byte_identical():
 
 @needs_git_history
 def test_switching_revs_does_not_leak_content_between_builds():
-    # mcp/grounding.py genuinely differs between 69adfa4^ (BUG B present)
-    # and 69adfa4 (the fix commit) — see docs/LIMITS.md's BUG B section and
-    # tests/test_cli_step10_12.py's flags regression, which depend on this
-    # same pair of revisions actually differing.
+    # mcp/grounding.py genuinely differs across this pair (69adfa4 is the BUG B fix).
     before, _ = load_corpus(rev="69adfa4^")
     after, _ = load_corpus(rev="69adfa4")
     src_before = _source_for(before, "mcp/grounding.py").source
     src_after = _source_for(after, "mcp/grounding.py").source
     assert src_before != src_after
 
-    # Read the OLDER rev again, interleaved after the newer one, and prove
-    # the result is exactly what it was the first time — nothing from the
-    # `69adfa4` build (nor any other in-process state) contaminated it.
+    # Re-read the older rev interleaved: no in-process state from the newer build may leak in.
     before_again, _ = load_corpus(rev="69adfa4^")
     assert _source_for(before_again, "mcp/grounding.py").source == src_before
 
@@ -56,15 +51,7 @@ def test_no_cache_flag_is_accepted_and_does_not_change_the_result():
 
 
 def test_rev_head_is_immune_to_a_concurrently_mid_edited_working_tree(tmp_path, monkeypatch):
-    # Simulate "another workflow is mid-editing mcp/server.py" by writing a
-    # syntactically broken decoy directly into a scratch copy of the repo
-    # root's mcp/server.py path resolution — without touching the real
-    # working tree file (this package must never write under mcp/). Instead
-    # we assert the CONTRACT directly: load_corpus(rev="HEAD") never reads
-    # config.REPO_ROOT / rel_path from disk at all when rev is not None —
-    # it goes through git plumbing exclusively. Verified by monkeypatching
-    # Path.read_text to explode if anything tries a direct filesystem read
-    # while a rev is requested.
+    # Assert the contract directly: with rev set, load_corpus goes through git plumbing and never reads disk.
     from pathlib import Path
 
     original_read_text = Path.read_text
