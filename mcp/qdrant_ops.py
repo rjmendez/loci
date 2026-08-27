@@ -264,6 +264,13 @@ def _get_qdrant():
                                   timeout=_QDRANT_TIMEOUT)
             col = QDRANT_COLLECTION_PREFIX
             existing = {c.name for c in client.get_collections().collections}
+            # An alias is an addressable name: creating a collection over one
+            # fails with 400, so a name that resolves must count as existing.
+            # The rename migration points loci_* at the old collections this way.
+            try:
+                existing |= {a.alias_name for a in client.get_aliases().aliases}
+            except Exception:  # older server, or aliases unsupported — ignore
+                pass
 
             _hnsw   = HnswConfigDiff(m=32, ef_construct=200, on_disk=False)
             _quant  = ScalarQuantization(
