@@ -98,6 +98,22 @@ def investigation_start(
     return json.dumps({"status": "created", "manifest": manifest}, indent=2)
 
 
+# findings.jsonl is a mixed append log: alongside real findings it carries
+# access-tracking rows written on every read. They hold no text, and because one
+# is appended per access they are also the NEWEST rows, so any findings[-N:]
+# slice fills up with them. Measured across the corpus: 3,681 of 6,610 records
+# (55.7%) are access rows, all text-less — which is why the summary ladder was
+# handing the model twenty empty bullets and getting an invented summary back.
+_NON_FINDING_RECORD_TYPES = frozenset({"access"})
+
+
+def _only_findings(records: list) -> list:
+    """Drop the non-finding rows from a raw findings.jsonl read."""
+    return [r for r in records
+            if isinstance(r, dict)
+            and (r.get("record_type") or r.get("type") or "") not in _NON_FINDING_RECORD_TYPES]
+
+
 def investigation_load(
     investigation_id: str,
     last_n_findings: int = 20,
@@ -156,7 +172,7 @@ def investigation_load(
         }, indent=2)
 
     if fidelity == "summary":
-        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+        findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
         all_retracted = _load_retracted_ids(investigation_id)
         total_retracted = len(all_retracted)
         retracted = set() if include_retracted else all_retracted
@@ -177,7 +193,7 @@ def investigation_load(
         }, indent=2)
 
     # Default: fidelity == "full"
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
     all_retracted = _load_retracted_ids(investigation_id)
     total_retracted = len(all_retracted)
     retracted = set() if include_retracted else all_retracted
@@ -441,7 +457,7 @@ def investigation_reflect(investigation_id: str) -> str:
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
     retracted = _load_retracted_ids(investigation_id)
     excluded_retracted = 0
     if retracted:

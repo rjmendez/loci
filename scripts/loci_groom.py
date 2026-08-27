@@ -113,6 +113,7 @@ GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
 # Per-run ceilings. These bound a nightly job, not a human sitting in front of it.
 VERIFY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_VERIFY_INVESTIGATIONS", "5"))
 VERIFY_PER_INVESTIGATION = int(os.environ.get("LOCI_GROOM_VERIFY_FINDINGS", "10"))
+SUMMARY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_SUMMARY_INVESTIGATIONS", "12"))
 REFLECT_MAX_ITEMS = int(os.environ.get("LOCI_GROOM_REFLECT_ITEMS", "3"))
 
 
@@ -1019,6 +1020,102 @@ def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None
     return report
 
 
+def _has_llm_summary(manifest: dict) -> bool:
+    """True only for a MODEL-authored summary.
+
+    investigation_reflect always persists something: when the model is
+    unavailable it falls back to a deterministic stub built from the last few
+    findings. Treating that stub as "done" would let one run with the backend
+    down permanently mark every investigation as summarised, which is the shape
+    of failure this tier exists to catch. The stub's paragraph is recognisable.
+    """
+    if not manifest.get("summary_l1"):
+        return False
+    l2 = str(manifest.get("summary_l2") or "").strip()
+    if not l2 or re.match(r"^Investigation with \d+ finding", l2):
+        return False
+    return True
+
+
+def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
+                   reflect_fn: Optional[Callable] = None,
+                   gen_probe: Optional[Callable] = None, **_) -> dict:
+    """Fill in the per-investigation summaries that investigation_load asks for.
+
+    The summary ladder lives inside investigation_reflect, and that tool had
+    never been called: 6 of 142 manifests carried a summary while 7 of 15 real
+    investigation_load calls asked for fidelity=summary or brief. The generator
+    exists and works; nothing drove it.
+
+    Safe unattended: it writes only summary_l1/summary_l2 on the manifest, never
+    findings, and it is bounded per run. Investigations that already carry a
+    model-authored summary are skipped, so repeated runs advance the backlog
+    instead of re-spending on the same ones.
+    """
+    report = {"pass": "summaries", "status": "ok"}
+    budget = int(limit or SUMMARY_MAX_PER_RUN)
+
+    # Same guard as pass_verify, for the same reason: with the backend down the
+    # ladder silently writes its deterministic stub for every investigation.
+    if gen_probe is None:
+        def gen_probe():
+            sys.path.insert(0, str(_REPO / "mcp"))
+            from llm_local import generate
+            return bool(generate("Reply with OK.", max_tokens=8).get("ok"))
+    try:
+        if not gen_probe():
+            report.update(status="degraded",
+                          detail="generation backend is not answering; skipping rather "
+                                 "than stamping a deterministic stub on every manifest")
+            return report
+    except Exception as exc:
+        report.update(status="degraded", detail=f"generation probe failed: {exc!r}")
+        return report
+
+    if reflect_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            reflect_fn = _server.investigation_reflect
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import investigation_reflect: {exc!r}")
+            return report
+
+    root = Path(memory_dir or MEMORY_DIR)
+    done = skipped = errors = 0
+    for man_path in sorted(root.glob("*/manifest.json")):
+        if done >= budget:
+            break
+        try:
+            manifest = json.loads(man_path.read_text())
+        except Exception:
+            errors += 1
+            continue
+        if _has_llm_summary(manifest):
+            skipped += 1
+            continue
+        inv = manifest.get("investigation_id") or man_path.parent.name
+        try:
+            reflect_fn(investigation_id=inv)
+        except Exception:
+            errors += 1
+            continue
+        # Confirm the model actually authored one; a stub means it did not.
+        try:
+            if _has_llm_summary(json.loads(man_path.read_text())):
+                done += 1
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+    report.update(summarised=done, already_had=skipped, errors=errors, budget=budget)
+    if errors and not done:
+        report.update(status="degraded",
+                      detail=f"{errors} investigations errored and none were summarised")
+    return report
+
+
 PASSES = {
     "index": {"fn": pass_index, "applyable": True},
     "tags": {"fn": pass_tags, "applyable": False},
@@ -1027,6 +1124,7 @@ PASSES = {
     "codelink": {"fn": pass_codelink, "applyable": False},
     "verify": {"fn": pass_verify, "applyable": False},
     "reflect": {"fn": pass_reflect, "applyable": False},
+    "summaries": {"fn": pass_summaries, "applyable": False},
 }
 
 
