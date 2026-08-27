@@ -4836,7 +4836,7 @@ def _health_probe_embeddings_dense(sink: dict) -> tuple:
         return (
             "fail",
             "dense embedder (Ollama) unavailable — semantic/hybrid search "
-            "is disabled; hermes runs on keyword fallback only.",
+            "is disabled; the server runs on keyword fallback only.",
             "ensure Ollama is running and the nomic-embed-text model is available "
             "(OLLAMA_BASE_URL and EMBED_MODEL env vars can override defaults).",
         )
