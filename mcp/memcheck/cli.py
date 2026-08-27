@@ -59,7 +59,7 @@ __all__ = [
 ]
 
 EMBED_DIM = 384
-COLLECTION = "hermes_verdicts"
+COLLECTION = "loci_verdicts"
 VECTOR_NAME = "dense"
 QDRANT_TIMEOUT_S = 1.0
 PROMOTE_AFTER = 3  # mirrors EmlConfig.promote_after; a block-class verdict at
@@ -202,7 +202,7 @@ def _build_qdrant_backend() -> Optional[VerdictBackend]:
     """Construct a QdrantBackend against the configured URL, or None on failure.
 
     Imports ``qdrant_client`` lazily, connects with a short timeout, ensures the
-    ``hermes_verdicts`` collection exists (creating it with a 384-dim cosine
+    ``loci_verdicts`` collection exists (creating it with a 384-dim cosine
     ``dense`` vector if missing), and wires the deterministic ``hash_embed`` so
     no embedding model is ever loaded. Any failure (import error, connection
     refused, timeout) returns None so the caller logs ``qdrant_unavailable`` and

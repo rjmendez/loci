@@ -106,8 +106,8 @@ EXTERNAL SERVICE DEPENDENCIES
 Qdrant  http://localhost:6333
   Collections used:
     mnemosyne        768d/Cosine  named-vector "dense"
-    hermes_sessions  768d/Cosine  named-vector "dense"
-    hermes_memory    768d/Cosine  named-vector "dense"
+    loci_sessions  768d/Cosine  named-vector "dense"
+    loci_memory    768d/Cosine  named-vector "dense"
   Auth: api-key header from QDRANT_API_KEY
   Used by: memory_recall (semantic), session_search, memory_stats
   NOTE: search payload must include "vector": {"name": "dense", "vector": [...]}
@@ -245,7 +245,7 @@ _EMBED_API_KEY        = os.environ.get('EMBED_API_KEY', '')
 _EMBED_API_KEY_HEADER = os.environ.get('EMBED_API_KEY_HEADER', 'Authorization')
 
 # Core collections always available; extra collections are project-specific and opt-in.
-_CORE_RAG_COLLECTIONS = ['mnemosyne', 'hermes_sessions', 'hermes_memory']
+_CORE_RAG_COLLECTIONS = ['mnemosyne', 'loci_sessions', 'loci_memory']
 _EXTRA_RAG_COLLECTIONS = [
     c.strip() for c in os.environ.get('EXTRA_RAG_COLLECTIONS', '').split(',')
     if c.strip()
@@ -277,7 +277,7 @@ AGENT_CARD = {
         'Persistent memory and knowledge node for the Hermes agent mesh. '
         'FTS + semantic search over session history, episodic memory, and working memory. '
         'Write new memories with cross-agent author tagging. '
-        'Backend: Mnemosyne SQLite + Qdrant hermes_sessions/mnemosyne/hermes_memory collections.'
+        'Backend: Mnemosyne SQLite + Qdrant loci_sessions/mnemosyne/loci_memory collections.'
     ),
     'url': AGENT_URL,
     'protocol_version': '0.3.0',
@@ -328,7 +328,7 @@ AGENT_CARD = {
             'name': 'Shared RAG Search',
             'description': (
                 'Fan-out semantic search across Qdrant collections without requiring '
-                'direct Qdrant credentials. Core: hermes_memory, hermes_sessions, mnemosyne. '
+                'direct Qdrant credentials. Core: loci_memory, loci_sessions, mnemosyne. '
                 'Additional collections: set EXTRA_RAG_COLLECTIONS env var (comma-separated). '
                 'Cross-encoder reranking when RERANK_HTTP_URL is set (fails open to cosine order). '
                 'Input: {query: str, top_k?: int=5, collections?: [str]}'
@@ -785,7 +785,7 @@ async def skill_session_search(task: dict) -> dict:
     if agent_filter:
         qdrant_filter = {'must': [{'key': 'agent_id', 'match': {'value': agent_filter}}]}
 
-    hits = await _qdrant_search('hermes_sessions', vec, top_k=top_k,
+    hits = await _qdrant_search('loci_sessions', vec, top_k=top_k,
                                  qdrant_filter=qdrant_filter)
     sessions = []
     for h in hits:

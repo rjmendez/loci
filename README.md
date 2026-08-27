@@ -215,7 +215,7 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
 | Memory session dir (MCP) | `~/.hermes/memory-sessions` | `LOCI_MEMORY_DIR` |
 | Code graph store | `$LOCI_MEMORY_DIR/graph.ladybug` | — |
-| Qdrant collection prefix | `hermes_memory` | `QDRANT_COLLECTION_PREFIX` |
+| Qdrant collection prefix | `loci_memory` | `QDRANT_COLLECTION_PREFIX` |
 | Backend config file | `~/.loci/backends.toml` | `LOCI_CONFIG` |
 | Hook state | `~/.claude/hook-state/` | — |
 
@@ -244,7 +244,7 @@ Two `.env.example` files are provided:
 |---|---|---|
 | `QDRANT_URL` | _(required)_ | Qdrant instance URL |
 | `QDRANT_API_KEY` | `""` | Qdrant auth key (blank for no-auth) |
-| `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Main Qdrant collection name |
+| `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Main Qdrant collection name |
 | `OLLAMA_BASE_URL` | _(required for embeddings)_ | Ollama base URL (no trailing `/v1`) |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model for MCP server |
 | `EMBED_API_KEY` | `""` | Cloud embedding provider API key |
@@ -280,9 +280,9 @@ Two `.env.example` files are provided:
 
 | Collection | Purpose |
 |---|---|
-| `hermes_memory` (configurable via `QDRANT_COLLECTION_PREFIX`) | Primary long-term memory store |
-| `hermes_sessions` | Session history embeddings |
-| `hermes_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
+| `loci_memory` (configurable via `QDRANT_COLLECTION_PREFIX`) | Primary long-term memory store |
+| `loci_sessions` | Session history embeddings |
+| `loci_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
 | `mnemosyne` | Synced Mnemosyne SQLite vectors |
 
 ---

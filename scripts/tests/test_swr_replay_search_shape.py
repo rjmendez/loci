@@ -52,7 +52,7 @@ def _capture(mod, bodies, result=None):
 def test_search_uses_named_vector_search_shape(swr):
     bodies = []
     with _capture(swr, bodies):
-        swr._qdrant_search_consolidated("hermes_memory", [1.0, 2.0], 3)
+        swr._qdrant_search_consolidated("loci_memory", [1.0, 2.0], 3)
     assert bodies, "no request issued"
     assert bodies[0]["vector"] == {"name": "dense", "vector": [1.0, 2.0]}, (
         "sent the upsert form; Qdrant answers 400 and the result is swallowed"
@@ -62,7 +62,7 @@ def test_search_uses_named_vector_search_shape(swr):
 def test_search_keeps_its_consolidated_filter(swr):
     bodies = []
     with _capture(swr, bodies):
-        swr._qdrant_search_consolidated("hermes_memory", [1.0], 3)
+        swr._qdrant_search_consolidated("loci_memory", [1.0], 3)
     assert bodies[0]["filter"]["must"][0]["match"]["value"] == "consolidated"
 
 
@@ -70,5 +70,5 @@ def test_upsert_still_uses_the_bare_named_vector_form(swr):
     # Upsert genuinely takes {"dense": vec}; fixing search must not touch it.
     bodies = []
     with _capture(swr, bodies):
-        swr._qdrant_upsert("hermes_memory", "p1", [1.0], {"a": 1})
+        swr._qdrant_upsert("loci_memory", "p1", [1.0], {"a": 1})
     assert bodies[0]["points"][0]["vector"] == {"dense": [1.0]}

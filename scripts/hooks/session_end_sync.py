@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-on_session_end hook — live-sync the current session into Qdrant hermes_sessions.
+on_session_end hook — live-sync the current session into Qdrant loci_sessions.
 
 Fires at the end of every turn. Reads session_id and transcript_path from stdin
 JSON, takes the session's messages from state.db or, for a Claude Code session
 id that never resolves there, from the transcript, embeds via Ollama
-(nomic-embed-text 768d), and upserts a single point into hermes_sessions.
+(nomic-embed-text 768d), and upserts a single point into loci_sessions.
 
 Fast path: if the session has no new messages since the last upsert (checked
 via a lightweight mtime file), exit 0 immediately.
@@ -42,7 +42,7 @@ OLLAMA      = _embeddings_url()
 EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
-COLLECTION  = "hermes_sessions"
+COLLECTION  = "loci_sessions"
 EMBED_DIM   = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", "768"))
 MAX_CHARS   = 4000   # chars of session content to embed
 CACHE_DIR   = os.path.expanduser(os.environ.get("LOCI_SYNC_CACHE", "~/.hermes/.session_sync_cache"))
@@ -52,7 +52,7 @@ ACTIVE_INV  = os.environ.get("LOCI_ACTIVE_INVESTIGATION", "")
 # ───────────────────────────────────────────────────────────────────────────
 
 def ensure_collection():
-    """Create hermes_sessions with quantization + HNSW if it doesn't exist.
+    """Create loci_sessions with quantization + HNSW if it doesn't exist.
 
     Uses the raw REST API (no qdrant-client dep) so the hook stays zero-dep.
     Non-fatal: any error here is logged but does not abort the sync.

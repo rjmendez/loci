@@ -7,7 +7,7 @@ missing a vector. This is the batch counterpart to the online embed tier.
 
 Substrate this is built against (session grounding — verify against live code):
   - [retrieval] Qdrant is a SEPARATE k3s host (CPU, no GPU); collections include
-    hermes_memory + agent_core_chunks (~1.84M points). It stores the vectors; we only
+    loci_memory + agent_core_chunks (~1.84M points). It stores the vectors; we only
     read/rewrite them. QDRANT_URL / QDRANT_API_KEY come from env (same convention as
     scripts/qdrant_payload_indexes.py and scripts/mnemosyne_qdrant_sync.py).
   - [gen]/[rerank note] The GPU work here is EMBEDDING, not generation. Embeddings come
@@ -30,9 +30,9 @@ Incremental / idempotent:
 
 Usage:
     # dry-run: report how many points WOULD be re-embedded, write nothing
-    python3 scripts/reembed_daemon.py --collection hermes_memory
+    python3 scripts/reembed_daemon.py --collection loci_memory
     # actually re-embed the stale/missing points
-    python3 scripts/reembed_daemon.py --collection hermes_memory --apply
+    python3 scripts/reembed_daemon.py --collection loci_memory --apply
 
 Env:
     QDRANT_URL, QDRANT_API_KEY   — Qdrant endpoint (key falls back to ~/.claude settings)

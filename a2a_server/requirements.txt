@@ -30,8 +30,8 @@ pyotp==2.9.0              # TOTP (RFC 6238) — X-TOTP header verification
 
 # ── External services (not pip-installed; configured via .env) ─────────────────
 # Qdrant        http://localhost:6333   api-key: QDRANT_API_KEY
-#   collections: mnemosyne (198 pts/768d), hermes_sessions (151 pts/768d),
-#                hermes_memory (89 pts/768d)
+#   collections: mnemosyne (198 pts/768d), loci_sessions (151 pts/768d),
+#                loci_memory (89 pts/768d)
 #   vector name: "dense" (named-vector format — required in search payload)
 #
 # Ollama        http://localhost:11434/v1

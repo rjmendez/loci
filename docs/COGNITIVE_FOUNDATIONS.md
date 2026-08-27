@@ -1,6 +1,6 @@
 # Cognitive Foundations
 
-The hermes_memory architecture is grounded in cognitive science research on human memory.
+The loci_memory architecture is grounded in cognitive science research on human memory.
 This document maps each design decision to its empirical basis and notes where the
 research implies future improvements.
 
@@ -175,7 +175,7 @@ evaporation boosts the hit's multi-signal score by `PHERO_BETA * log1p(phero)`.
 | `HOOK_PHERO_DEPOSIT` | `1.0` | Amount deposited per retrieval event |
 | `HOOK_PHERO_EPSILON` | `0.05` | ε-exploration probability for MMR's final slot |
 
-Pheromone deposit is currently applied only to the `hermes_memory` collection, whose points
+Pheromone deposit is currently applied only to the `loci_memory` collection, whose points
 have mutable payloads owned by this system.
 
 ---
@@ -310,10 +310,10 @@ the same database.
 
 AgentRR implements session-level reinforcement logging. At session end, a guard script
 (`session_end_evaluate_guard.sh`) collects the session trace and stores it to the
-`hermes_sessions` Qdrant collection. This provides a long-lived episodic record of
+`loci_sessions` Qdrant collection. This provides a long-lived episodic record of
 past sessions that the grounding hook can retrieve during future turns.
 
-The `hermes_sessions` collection is included in the base collection list searched by
+The `loci_sessions` collection is included in the base collection list searched by
 `pre_llm_grounding.py` on every turn.
 
 ---

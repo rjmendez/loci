@@ -22,8 +22,8 @@ query
 ```
 
 Collections:
-- `hermes_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
-- `hermes_verdicts` — pre-answer claim check verdicts; created lazily on the first verdict write
+- `loci_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
+- `loci_verdicts` — pre-answer claim check verdicts; created lazily on the first verdict write
 
 ## Requirements
 
@@ -53,7 +53,7 @@ With optional Mnemosyne:
 |---|---|---|
 | `QDRANT_URL` | _(unset — Qdrant search disabled)_ | Qdrant instance URL, e.g. `http://localhost:6333` |
 | `QDRANT_API_KEY` | _(none)_ | Qdrant API key if required |
-| `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Name of the shared findings collection (used verbatim, nothing is appended) |
+| `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Name of the shared findings collection (used verbatim, nothing is appended) |
 | `OLLAMA_BASE_URL` | _(unset — falls back to 384-dim fastembed, which mismatches the 768-dim collection unless `EMBED_DIM=384`)_ | Ollama instance URL, e.g. `http://localhost:11434` |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | Local JSONL storage root |
@@ -240,7 +240,7 @@ The same inventory is listed in the [top-level README](../README.md#mcp-tools-71
 - Named vectors `dense`+`sparse` in same Qdrant point — hybrid RRF without extra collections
 - Payload indexes on `investigation_id`, `confidence`, `record_type`, `tags` — O(log N) filter at scale
 - BM25 kept in RAM (`SparseVectorParams(index=SparseIndexParams(on_disk=False), modifier=Modifier.IDF)`)
-- 30-day TTL purge on `hermes_memory` applied at startup
+- 30-day TTL purge on `loci_memory` applied at startup
 
 ## memcheck module
 

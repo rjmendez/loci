@@ -92,7 +92,7 @@ def ensure_collection(name=None, dim=None):
     Nothing in this repo ever created one -- every sync path only upserts points, and
     a2a_server's _qdrant_search swallows a 404 and returns [], so a missing collection
     surfaces as "0 results" rather than an error. That is how `mnemosyne` and
-    `hermes_sessions` sat absent on a host while every consumer reported success.
+    `loci_sessions` sat absent on a host while every consumer reported success.
 
     Schema matches what the consumers require: a NAMED "dense" vector, Cosine.
     """

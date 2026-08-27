@@ -18,7 +18,7 @@ Agent card: `GET /.well-known/agent.json`
 | `memory_recall`     | FTS5 + Qdrant semantic search across working_memory, episodic_memory, mnemosyne collection |
 | `memory_remember`   | Write a memory tagged with caller's sender/agent_id |
 | `memory_stats`      | SQLite row counts + Qdrant collection sizes |
-| `session_search`    | Semantic search over `hermes_sessions` Qdrant collection |
+| `session_search`    | Semantic search over `loci_sessions` Qdrant collection |
 | `memory_sleep`      | Trigger Mnemosyne consolidation via dashboard API |
 | `rag_search`        | RAG-style retrieval: hybrid search + context assembly for grounding LLM prompts |
 | `context_broadcast` | Broadcast a context update to all subscribed mesh agents |

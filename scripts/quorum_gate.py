@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quorum-sensing trigger gate for hermes_memory.
+Quorum-sensing trigger gate for loci_memory.
 
 Biological analog: bacterial quorum sensing — actions only fire when enough
 correlated signal accumulates above a threshold, preventing per-event chatter

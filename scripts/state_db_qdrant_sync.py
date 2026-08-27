@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sync Hermes state.db sessions -> Qdrant `hermes_sessions` collection.
+Sync Hermes state.db sessions -> Qdrant `loci_sessions` collection.
 
 Each Qdrant point = one session (unit of search), containing a
 concatenation of its user+assistant messages as the embedded text.
@@ -8,7 +8,7 @@ Chunked at 4000 chars to keep embedding quality high and avoid
 Ollama stall on huge inputs.
 
 Uses embedding-worker (NodePort 30888) -> agent_core_chunks -> copy
-vector -> hermes_sessions (named vector "dense", 768-dim Cosine).
+vector -> loci_sessions (named vector "dense", 768-dim Cosine).
 
 Incremental: tracks synced sessions by session_id in payload.
 Run standalone or from cron (no_agent=True).
@@ -18,7 +18,7 @@ import sqlite3, json, hashlib, sys, os, time, subprocess, datetime
 STATE_DB     = os.environ.get("LOCI_STATE_DB", os.path.expanduser("~/.hermes/state.db"))
 QDRANT       = os.environ.get("QDRANT_URL")
 EMBED_WORKER = os.environ.get("EMBED_WORKER_URL")
-COLLECTION   = "hermes_sessions"
+COLLECTION   = "loci_sessions"
 SRC_COLL     = "agent_core_chunks"
 MAX_CHARS    = 4000   # per-session content cap before embedding
 BATCH_SIZE   = 4      # sessions per embed round-trip (keep under 32-chunk Ollama limit)
@@ -50,7 +50,7 @@ def ensure_collection(key, name=None, dim=None):
     """Create the collection if it does not exist.
 
     Same gap as mnemosyne_qdrant_sync: this script only ever upserts points, and
-    a2a_server's _qdrant_search turns a 404 into [], so a `hermes_sessions` collection that
+    a2a_server's _qdrant_search turns a 404 into [], so a `loci_sessions` collection that
     was never created reads as "session_search found nothing" on every call.
 
     curl_json returns {} rather than raising, so probe by response shape.
@@ -117,7 +117,7 @@ def load_sessions_with_messages(conn):
     return results
 
 def get_synced_ids(key):
-    """Return set of session_ids already in hermes_sessions."""
+    """Return set of session_ids already in loci_sessions."""
     synced = set()
     offset = None
     while True:
@@ -192,7 +192,7 @@ def embed_batch(chunks, key):
     return id_to_vec, dropped
 
 def upsert_points(points, key):
-    """Upsert a batch of points into hermes_sessions."""
+    """Upsert a batch of points into loci_sessions."""
     r = curl_json("PUT", f"{QDRANT}/collections/{COLLECTION}/points",
                   {"points": points}, key)
     return r.get("status") == "ok"

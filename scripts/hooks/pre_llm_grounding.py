@@ -11,8 +11,8 @@ Architecture:
 
 Collections searched per turn:
   mnemosyne         (198 pts)   — personal facts, preferences, project notes
-  hermes_sessions   (126 pts)   — past conversation history
-  hermes_memory     (89 pts)    — investigation notes, research findings
+  loci_sessions   (126 pts)   — past conversation history
+  loci_memory     (89 pts)    — investigation notes, research findings
   ecc_skills        (262 pts)   — skill library knowledge
   agent_core_chunks (3.09M pts) — great-library KB (DAMA, infra, code, telemetry)
   dama_gotchi_code  (24.9k pts) — DAMA codebase search
@@ -144,8 +144,8 @@ _DEFAULT_EXTRA_FIELDS = ("text", None, True)
 # fmt: (collection, content_field, importance_field_or_None, use_named_vector)
 _BASE_COLLECTIONS = [
     ("mnemosyne",       "content",         "importance", True),
-    ("hermes_sessions", "content_preview", None,         True),
-    ("hermes_memory",   "text",            "confidence", True),
+    ("loci_sessions", "content_preview", None,         True),
+    ("loci_memory",   "text",            "confidence", True),
 ]
 _extra_names = [
     c.strip() for c in os.environ.get("GROUNDING_EXTRA_COLLECTIONS", "").split(",")
@@ -551,7 +551,7 @@ def main() -> None:
     intent = _extract_intent(msg_stripped)
 
     # ── Lightweight subagent path ─────────────────────────────────────────────
-    # hermes_memory only: the collection most relevant to code generation mid-investigation.
+    # loci_memory only: the collection most relevant to code generation mid-investigation.
     if is_subagent:
         sub_hits: list[dict] = []
         if QDRANT_URL:
@@ -559,7 +559,7 @@ def main() -> None:
             if sub_vec is not None:
                 try:
                     sub_hits = _search_collection(
-                        "hermes_memory", sub_vec, "text", "confidence", True,
+                        "loci_memory", sub_vec, "text", "confidence", True,
                         top_k=min(RECALL_TOP_K, 2),
                     )
                 except _SearchFailed:
@@ -637,9 +637,9 @@ def main() -> None:
         hits = sorted(hits, key=lambda h: h["_ms_score"], reverse=True)
         hits = _mmr_select(hits, RECALL_TOP_K)
 
-        # Only hermes_memory points have mutable payloads we own; fire-and-forget.
+        # Only loci_memory points have mutable payloads we own; fire-and-forget.
         for _h in hits:
-            if _h.get("collection") in ("hermes_memory",) and _h.get("point_id"):
+            if _h.get("collection") in ("loci_memory",) and _h.get("point_id"):
                 _phero_now = _now_ts
                 _current   = _effective_pheromone(_h.get("payload") or {}, _phero_now)
                 _pheromone_deposit(_h["collection"], _h["point_id"], _current, _phero_now)

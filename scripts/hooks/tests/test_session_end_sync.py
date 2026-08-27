@@ -180,7 +180,7 @@ def test_qdrant_is_none_when_unset_but_key_defaults_to_empty_string():
 
 def test_fixed_constants():
     h = load_hook()
-    assert h.COLLECTION == "hermes_sessions"
+    assert h.COLLECTION == "loci_sessions"
     assert h.MAX_CHARS == 4000
     assert h.EMBED_DIM == 4          # from MNEMOSYNE_EMBEDDING_DIM in BASE_ENV
     assert load_hook({"MNEMOSYNE_EMBEDDING_DIM": None}).EMBED_DIM == 768
@@ -607,7 +607,7 @@ def test_qdrant_upsert_request_shape(hook):
     finally:
         p.stop()
     c = calls[0]
-    assert c["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions/points"
+    assert c["url"] == "http://qdrant.invalid:6333/collections/loci_sessions/points"
     assert c["method"] == "PUT"
     assert c["timeout"] == 5
     assert c["body"] == {"points": [
@@ -669,7 +669,7 @@ def test_ensure_collection_creates_on_404(hook):
     finally:
         p.stop()
     assert [c["method"] for c in calls] == ["GET", "PUT"]
-    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/hermes_sessions"
+    assert calls[0]["url"] == "http://qdrant.invalid:6333/collections/loci_sessions"
     assert calls[0]["timeout"] == 5
     assert calls[1]["timeout"] == 10
     assert calls[1]["body"] == {
@@ -1139,9 +1139,9 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
         url, method = req.full_url, req.get_method()
         if url.endswith("/v1/embeddings"):
             return Resp({"data": [{"embedding": [0.0, 1.0, 2.0, 3.0]}]})
-        if url.endswith("/collections/hermes_sessions") and method == "GET":
+        if url.endswith("/collections/loci_sessions") and method == "GET":
             raise http_error(404)
-        if url.endswith("/collections/hermes_sessions") and method == "PUT":
+        if url.endswith("/collections/loci_sessions") and method == "PUT":
             return Resp({"result": True, "status": "ok"})
         if url.endswith("/points"):
             return Resp({"result": {}, "status": "ok"})
@@ -1155,10 +1155,10 @@ def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):
 
     urls = [(c["method"], c["url"]) for c in calls]
     assert urls == [
-        ("GET", "http://qdrant.invalid:6333/collections/hermes_sessions"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions"),
+        ("GET", "http://qdrant.invalid:6333/collections/loci_sessions"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions"),
         ("POST", "http://ollama.invalid:11434/v1/embeddings"),
-        ("PUT", "http://qdrant.invalid:6333/collections/hermes_sessions/points"),
+        ("PUT", "http://qdrant.invalid:6333/collections/loci_sessions/points"),
     ]
     assert calls[-1]["body"]["points"][0]["id"] == hook.stable_id("s1")
     assert calls[-1]["body"]["points"][0]["vector"] == {"dense": [0.0, 1.0, 2.0, 3.0]}

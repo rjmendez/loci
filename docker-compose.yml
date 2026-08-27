@@ -1,4 +1,4 @@
-# hermes_memory — production compose
+# loci_memory — production compose
 #
 # Runs only the custom-built services (MCP server + A2A server).
 # Qdrant and the embedding API are EXTERNAL — configure via .env or environment.

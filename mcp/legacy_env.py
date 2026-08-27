@@ -61,3 +61,23 @@ def apply(environ: dict | None = None) -> list[str]:
             env[new] = env[old]
             mapped.append(old)
     return mapped
+
+
+def memory_dir() -> "os.PathLike | str":
+    """Where investigations and the code graph live.
+
+    Fresh installs get ~/.loci/memory-sessions. An existing deployment keeps
+    using ~/.hermes/memory-sessions until someone moves it — 182 MB of
+    investigations and a 40 MB code graph are not worth relocating implicitly
+    on an upgrade. LOCI_MEMORY_DIR overrides both.
+    """
+    from pathlib import Path
+
+    explicit = os.environ.get("LOCI_MEMORY_DIR") or os.environ.get("HERMES_MEMORY_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    new = Path.home() / ".loci" / "memory-sessions"
+    if new.is_dir():
+        return new
+    legacy = Path.home() / ".hermes" / "memory-sessions"
+    return legacy if legacy.is_dir() else new

@@ -252,7 +252,7 @@ stdin and exits 0 on any event name it does not recognise.
 |---|---|---|
 | `pre_llm_grounding.py` | `UserPromptSubmit`, `SubagentStart` (and legacy `pre_llm_call` / `PreLlmCall`) | per-turn Qdrant grounding injected into the prompt |
 | `pre_tool_grounding.py` | `PreToolUse` (and legacy `pre_tool_call`) | tool-call audit |
-| `session_end_sync.py` | `Stop` — reads `transcript_path` from the payload | session → `hermes_sessions` |
+| `session_end_sync.py` | `Stop` — reads `transcript_path` from the payload | session → `loci_sessions` |
 
 Install and drift-check them with `scripts/hooks/install.sh`:
 

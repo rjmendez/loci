@@ -23,13 +23,13 @@ DIM = 8
 def _store():
     """Three collections: our width, a foreign width, and an empty one."""
     c = QdrantClient(location=":memory:")
-    c.create_collection("hermes_memory",
+    c.create_collection("loci_memory",
                         vectors_config={"dense": VectorParams(size=DIM, distance=Distance.COSINE)})
     c.create_collection("legacy_chunks",
                         vectors_config=VectorParams(size=DIM * 2, distance=Distance.COSINE))
     c.create_collection("empty_shelf",
                         vectors_config={"dense": VectorParams(size=DIM, distance=Distance.COSINE)})
-    c.upsert("hermes_memory", points=[
+    c.upsert("loci_memory", points=[
         PointStruct(id=1, vector={"dense": [0.1] * DIM}, payload={"text": "a finding"}),
     ])
     c.upsert("legacy_chunks", points=[
@@ -50,7 +50,7 @@ def _run(client, vec=_UNSET):
     """
     embedding = [0.1] * DIM if vec is _UNSET else vec
     names = sorted(c.name for c in client.get_collections().collections)
-    with mock.patch.object(server, "_get_qdrant", lambda: (client, "hermes_memory")), \
+    with mock.patch.object(server, "_get_qdrant", lambda: (client, "loci_memory")), \
          mock.patch.object(server, "_embed", lambda _q: embedding):
         return json.loads(server.retrieval_selftest("anything", collections=names))
 
@@ -70,8 +70,8 @@ class TestRetrievalSelftest(unittest.TestCase):
 
     def test_a_healthy_collection_reports_hits(self):
         rows = _by_name(_run(_store()))
-        self.assertEqual(rows["hermes_memory"]["status"], "ok")
-        self.assertEqual(rows["hermes_memory"]["hits"], 1)
+        self.assertEqual(rows["loci_memory"]["status"], "ok")
+        self.assertEqual(rows["loci_memory"]["hits"], 1)
 
     def test_an_empty_collection_is_not_a_fault(self):
         out = _run(_store())
@@ -107,7 +107,7 @@ class TestRetrievalSelftest(unittest.TestCase):
     def test_no_embedder_is_reported_rather_than_read_as_empty(self):
         out = _run(_store(), vec=None)
         statuses = {r["collection"]: r["status"] for r in out["collections"]}
-        self.assertEqual(statuses["hermes_memory"], "error")
+        self.assertEqual(statuses["loci_memory"], "error")
         self.assertEqual(statuses["empty_shelf"], "empty")
         self.assertTrue(any("OLLAMA_BASE_URL" in r for r in out["remediations"]))
 
@@ -210,9 +210,9 @@ class TestScope(unittest.TestCase):
 
     def _store(self):
         c = QdrantClient(location=":memory:")
-        c.create_collection("hermes_memory", vectors_config={
+        c.create_collection("loci_memory", vectors_config={
             "dense": VectorParams(size=DIM, distance=Distance.COSINE)})
-        c.upsert("hermes_memory", points=[
+        c.upsert("loci_memory", points=[
             PointStruct(id=1, vector={"dense": [0.1] * DIM})])
         # junk at a foreign width — feature vectors, leftovers, someone else's corpus
         for name, w in (("old_junk", DIM * 2), ("ant_features", DIM * 4)):
@@ -225,16 +225,16 @@ class TestScope(unittest.TestCase):
         import qdrant_ops
         qdrant_ops._dense_name_cache.clear()
         c = self._store()
-        with mock.patch.object(server, "_get_qdrant", lambda: (c, "hermes_memory")), \
+        with mock.patch.object(server, "_get_qdrant", lambda: (c, "loci_memory")), \
              mock.patch.object(server, "_embed", lambda _q: [0.1] * DIM), \
-             mock.patch.object(server, "QDRANT_COLLECTION_PREFIX", "hermes_memory"), \
+             mock.patch.object(server, "QDRANT_COLLECTION_PREFIX", "loci_memory"), \
              mock.patch.object(server, "_CODE_CHUNKS_COLLECTION", ""):
             return json.loads(server.retrieval_selftest("anything", **kw))
 
     def test_default_scope_ignores_collections_the_server_never_queries(self):
         out = self._run()
         self.assertEqual(out["status"], "ok")
-        self.assertEqual([r["collection"] for r in out["collections"]], ["hermes_memory"])
+        self.assertEqual([r["collection"] for r in out["collections"]], ["loci_memory"])
 
     def test_scope_all_inventories_everything_but_health_stays_ok(self):
         out = self._run(scope="all")
@@ -247,7 +247,7 @@ class TestScope(unittest.TestCase):
         by = {r["collection"]: r for r in out["collections"]}
         self.assertEqual(by["old_junk"]["status"], "width_mismatch")
         self.assertFalse(by["old_junk"]["queried_by_server"])
-        self.assertTrue(by["hermes_memory"]["queried_by_server"])
+        self.assertTrue(by["loci_memory"]["queried_by_server"])
 
     def test_remediations_only_cover_collections_that_are_queried(self):
         out = self._run(scope="all")

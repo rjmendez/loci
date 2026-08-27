@@ -65,7 +65,7 @@ class RagDocstringTest(unittest.TestCase):
         import server
         doc = server.rag_context_search.__doc__ or ""
         self.assertIn("CODE_CHUNKS_COLLECTION", doc)
-        self.assertNotIn('default: ["hermes_memory", "agent_core_chunks"]', doc)
+        self.assertNotIn('default: ["loci_memory", "agent_core_chunks"]', doc)
 
 
 if __name__ == "__main__":

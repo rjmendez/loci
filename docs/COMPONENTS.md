@@ -21,7 +21,7 @@ Three schedulers are declared in this repo and only two of them fire:
 
 ### `scripts/hooks/pre_llm_grounding.py`
 **Purpose:** Per-turn grounding. Embeds user message intent, fans out to 3 base Qdrant
-collections (`mnemosyne`, `hermes_sessions`, `hermes_memory`) plus any named in
+collections (`mnemosyne`, `loci_sessions`, `loci_memory`) plus any named in
 `GROUNDING_EXTRA_COLLECTIONS`, in parallel; ranks by a four-term weighted score
 (relevance / recency / trust / type) with MMR diversification and stigmergic
 pheromone reinforcement, then injects MEMORY MATCH context.
@@ -99,7 +99,7 @@ eliminating Python startup cost (~80ms) from grounding latency.
 ---
 
 ### `scripts/hooks/session_end_sync.py`
-**Purpose:** Live-syncs the current session **into Qdrant** `hermes_sessions` — it
+**Purpose:** Live-syncs the current session **into Qdrant** `loci_sessions` — it
 reads Hermes state, it does not write it. Fires at the end of every turn, not only
 at session end. Resolves session content from `state.db` first and falls back to
 the `transcript_path` the Claude Code Stop payload carries; before #228 only the
@@ -269,7 +269,7 @@ via Ollama only)
 ---
 
 ### `scripts/state_db_qdrant_sync.py`
-**Purpose:** Syncs Hermes `state.db` sessions to the Qdrant `hermes_sessions` collection.
+**Purpose:** Syncs Hermes `state.db` sessions to the Qdrant `loci_sessions` collection.
 Incremental (tracks already-synced session_ids in payload). Chunks per-session messages
 to 4000 chars before embedding. Unlike the Mnemosyne sync, this one does use
 `EMBED_WORKER_URL` — it POSTs to `$EMBED_WORKER/embed`.

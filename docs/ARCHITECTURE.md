@@ -2,7 +2,7 @@
 
 ## Overview
 
-hermes_memory provides multi-layer persistent memory for LLM agents running in
+loci_memory provides multi-layer persistent memory for LLM agents running in
 Claude Code and compatible agent frameworks. It handles three time horizons:
 
 | Horizon | Mechanism | Location |
@@ -111,9 +111,9 @@ default in its inline comments.
 | Collection | Contents | Vector layout |
 |---|---|---|
 | `mnemosyne` | Mirror of Mnemosyne working+episodic memory | named `dense` |
-| `hermes_sessions` | Session-level traces synced by `session_end_sync.py` | named `dense` |
-| `hermes_memory` | Investigation findings (MCP server primary collection) | named `dense` + `sparse` |
-| `hermes_verdicts` | Claim-check verdicts for `investigation_pre_answer_check` | named `dense` |
+| `loci_sessions` | Session-level traces synced by `session_end_sync.py` | named `dense` |
+| `loci_memory` | Investigation findings (MCP server primary collection) | named `dense` + `sparse` |
+| `loci_verdicts` | Claim-check verdicts for `investigation_pre_answer_check` | named `dense` |
 | `<custom>` | Domain-specific collections via `GROUNDING_EXTRA_COLLECTIONS` | per-collection, see below |
 | `memgas_l1` | MemGAS L1 utterance layer | named `dense` |
 | `memgas_l2` | MemGAS L2 summary layer | named `dense` |
@@ -122,7 +122,7 @@ default in its inline comments.
 | `score_traces` | SCoRe correction pairs for fine-tuning | named `dense` |
 
 The MCP server (`mcp/server.py`) uses the collection name set by
-`QDRANT_COLLECTION_PREFIX` (default: `hermes_memory`) as its primary
+`QDRANT_COLLECTION_PREFIX` (default: `loci_memory`) as its primary
 investigation findings store.
 
 **Named vs unnamed is not uniform, and getting it wrong fails silently.** A
@@ -141,7 +141,7 @@ months (#228). Two mitigations exist:
   named `dense`. `_SearchFailed` is raised per collection so the fan-out can tell
   "nothing matched" from "every request failed".
 
-`hermes_memory` is created (`mcp/qdrant_ops.py:293-310`) with a BM25 sparse vector
+`loci_memory` is created (`mcp/qdrant_ops.py:293-310`) with a BM25 sparse vector
 (IDF modifier), HNSW `m=32` / `ef_construct=200`, and INT8 scalar quantization
 (`quantile=0.99`, `always_ram`). `rag_context_search` is therefore not plain cosine:
 stage 1 fuses dense and sparse prefetches with RRF, stage 2 reranks the candidates
@@ -188,7 +188,7 @@ pre_llm_grounding.py (v3)
     │       Ollama down → BeamMemory (v2/SQLite path)
     │       Both down → inject an explicit "grounding UNAVAILABLE" warning, stop
     ├── 3. Fan-out parallel Qdrant search over HOOK_QDRANT_WORKERS threads (~30ms)
-    │       mnemosyne, hermes_sessions, hermes_memory
+    │       mnemosyne, loci_sessions, loci_memory
     │       + GROUNDING_EXTRA_COLLECTIONS (grounding hook env var)
     │       Per-collection request shape from the named/unnamed map; a raised
     │       _SearchFailed is counted, so "all collections failed" falls back to
@@ -204,7 +204,7 @@ pre_llm_grounding.py (v3)
     ├── 8. MMR diversity selection down to HOOK_RECALL_TOP_K, with ε-exploration
     │       (HOOK_MMR_LAMBDA controls relevance-vs-diversity trade-off;
     │        HOOK_PHERO_EPSILON controls random exploration probability)
-    ├── 9. Stigmergic pheromone deposit on the selected hermes_memory points
+    ├── 9. Stigmergic pheromone deposit on the selected loci_memory points
     │       (fire-and-forget; only that collection has payloads we own)
     ├── 10. Optional spreading activation enrichment (SA-RAG, arxiv 2512.15922)
     │       Seeds from mnemosyne hits carrying mnemosyne_id;
@@ -285,7 +285,7 @@ PreToolUse        → pre_tool_grounding.py
                     detection, audit log
 
 Stop              → session_end_sync.py
-                    Embeds the session and upserts one point into hermes_sessions
+                    Embeds the session and upserts one point into loci_sessions
 ```
 
 `pre_llm_grounding.py` reads the user message from the payload's **top-level
@@ -349,7 +349,7 @@ steer the helpers. Key env vars:
 |---|---|---|
 | `QDRANT_URL` | _(none — Qdrant disabled if unset)_ | Qdrant instance URL |
 | `QDRANT_API_KEY` | `""` | Qdrant API key |
-| `QDRANT_COLLECTION_PREFIX` | `hermes_memory` | Primary investigation findings collection |
+| `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Primary investigation findings collection |
 | `OLLAMA_BASE_URL` | _(none)_ | Embedding base URL |
 | `EMBED_MODEL` | `nomic-embed-text` | Embedding model |
 | `EMBED_API_KEY` | `""` | Cloud embedding provider key |
@@ -406,7 +406,7 @@ return on empty leaks whether a token was presented at all.
 
 A proposed answer is split into claims and each claim is checked against stored
 evidence on two lanes: a lexical lane and a semantic (dense) lane. Verdicts are
-written to the `hermes_verdicts` collection (`mcp/verdict_ops.py`).
+written to the `loci_verdicts` collection (`mcp/verdict_ops.py`).
 
 **A cosine score alone does not establish support.** Measured on the live corpus
 with 300 claims copied verbatim *out of a different investigation*, a bare
@@ -591,7 +591,7 @@ credentials.
 | `memory_recall` | FTS5 (fts_working + fts_episodes) + optional Qdrant semantic search |
 | `memory_remember` | Write to the SQLite `memories` table with cross-agent author tagging |
 | `memory_stats` | Row counts for all monitored SQLite tables + Qdrant collection sizes |
-| `session_search` | Semantic search over hermes_sessions Qdrant collection |
+| `session_search` | Semantic search over loci_sessions Qdrant collection |
 | `memory_sleep` | Trigger Mnemosyne sleep consolidation via dashboard API |
 | `rag_search` | Fan-out semantic search across all configured Qdrant collections |
 | `context_broadcast` | Store locally and push to all peer A2A endpoints (PEER_A2A_URLS) |

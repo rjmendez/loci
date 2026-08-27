@@ -68,7 +68,7 @@ refs parsed, 59/59 rejected by _safe_resolve, 0/100 had any source fetched. And
 source — this is the largest measured grounding gap.
 
 Cause: _safe_resolve sandboxes to _repo_root(), the LOCI checkout, but
-hermes_memory is a multi-repo corpus. Measured on the live corpus: 62 code_refs,
+loci_memory is a multi-repo corpus. Measured on the live corpus: 62 code_refs,
 33 unique, 0 resolvable — yet ALL 33 basenames exist on this host, under
 /home/rjmendez/hugbot5000, /home/rjmendez/hb-mountfix-v2 and similar. They are in
 $HOME, NOT under ~/development.
