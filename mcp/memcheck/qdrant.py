@@ -55,15 +55,15 @@ import uuid
 from typing import Callable, Optional
 
 from .backend import ScoredVerdict, VerdictBackend
+from .vectors import COLLECTION
 from .verdict import Verdict, make_signature
 
-__all__ = ["QdrantBackend"]
+__all__ = ["QdrantBackend", "COLLECTION"]
 
 _log = logging.getLogger("memcheck")
 
 # Stable namespace for uuid5(subject_signature) point ids.
 VERDICT_NAMESPACE = uuid.UUID("6d656d63-6865-636b-0000-646f6e757400")
-COLLECTION = "loci_verdicts"
 
 # Decisions that count as a recurring "block" for stats.
 _BLOCKING = ("flag", "warn", "quarantine")

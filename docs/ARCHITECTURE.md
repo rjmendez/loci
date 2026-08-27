@@ -113,7 +113,7 @@ default in its inline comments.
 | `mnemosyne` | Mirror of Mnemosyne working+episodic memory | named `dense` |
 | `loci_sessions` | Session-level traces synced by `session_end_sync.py` | named `dense` |
 | `loci_memory` | Investigation findings (MCP server primary collection) | named `dense` + `sparse` |
-| `loci_verdicts` | Claim-check verdicts for `investigation_pre_answer_check` | named `dense` |
+| `loci_verdicts` | Claim-check verdicts for `investigation_pre_answer_check` | named `dense`, 384-dim hash (`memcheck/vectors.py`) |
 | `<custom>` | Domain-specific collections via `GROUNDING_EXTRA_COLLECTIONS` | per-collection, see below |
 | `memgas_l1` | MemGAS L1 utterance layer | named `dense` |
 | `memgas_l2` | MemGAS L2 summary layer | named `dense` |
@@ -257,10 +257,9 @@ and writes the tool audit log.
 
 > `GROUNDING_EXTRA_COLLECTIONS` is read independently by the grounding hook.
 > `EXTRA_RAG_COLLECTIONS` is a separate variable read by `a2a_server/server.py`
-> for its `rag_search` skill. **Set both** if you want the same extra collections in
-> both paths — `.env.example:90` claims the grounding variable "defaults to
-> `EXTRA_RAG_COLLECTIONS` if not set independently", and it does not:
-> `pre_llm_grounding.py:156` reads only its own name and falls back to `""`.
+> for its `rag_search` skill. **Set both** if you want the same extra collections
+> in both paths: `pre_llm_grounding.py` reads only its own name and falls back
+> to `""`.
 
 ---
 

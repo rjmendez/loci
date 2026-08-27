@@ -71,3 +71,7 @@ backends.toml
 
 # Claude Code agent worktrees (transient; created by workflow isolation)
 .claude/worktrees/
+
+# setuptools build output (pip wheel / pip install -e)
+build/
+*.egg-info/
