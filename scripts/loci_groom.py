@@ -1020,6 +1020,58 @@ def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None
     return report
 
 
+def _summarisable(inv_dir: Path) -> bool:
+    """True if the investigation holds at least one record worth summarising.
+
+    findings.jsonl also carries text-less access rows, so a file that is not
+    empty is not the same as an investigation with findings.
+    """
+    fj = inv_dir / "findings.jsonl"
+    if not fj.exists():
+        return False
+    # A retracted finding is still in the log but is not something to summarise;
+    # investigation_reflect drops it, so counting it here would keep asking for a
+    # summary of nothing.
+    retracted = set()
+    rj = inv_dir / "retractions.jsonl"
+    if rj.exists():
+        try:
+            with rj.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("active") and rec.get("finding_id"):
+                        retracted.add(str(rec["finding_id"]))
+        except OSError:
+            pass
+    try:
+        with fj.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if (rec.get("record_type") or rec.get("type") or "") == "access":
+                    continue
+                if str(rec.get("id", "")) in retracted:
+                    continue
+                if str(rec.get("text", "")).strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _has_llm_summary(manifest: dict) -> bool:
     """True only for a MODEL-authored summary.
 
@@ -1083,7 +1135,7 @@ def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = Non
             return report
 
     root = Path(memory_dir or MEMORY_DIR)
-    done = skipped = errors = 0
+    done = skipped = errors = empty = 0
     for man_path in sorted(root.glob("*/manifest.json")):
         if done >= budget:
             break
@@ -1094,6 +1146,13 @@ def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = Non
             continue
         if _has_llm_summary(manifest):
             skipped += 1
+            continue
+        # An investigation with nothing to summarise is not a failure. Without
+        # this the empty ones error on every run, and once the backlog is clear
+        # that is every run — a pass permanently reporting degraded is a pass
+        # nobody reads when it finally means it.
+        if not _summarisable(man_path.parent):
+            empty += 1
             continue
         inv = manifest.get("investigation_id") or man_path.parent.name
         try:
@@ -1109,7 +1168,8 @@ def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = Non
                 errors += 1
         except Exception:
             errors += 1
-    report.update(summarised=done, already_had=skipped, errors=errors, budget=budget)
+    report.update(summarised=done, already_had=skipped, nothing_to_say=empty,
+                  errors=errors, budget=budget)
     if errors and not done:
         report.update(status="degraded",
                       detail=f"{errors} investigations errored and none were summarised")
