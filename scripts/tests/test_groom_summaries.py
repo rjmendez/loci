@@ -1,0 +1,134 @@
+"""The summaries pass, and the access-record filter it depends on.
+
+The summary ladder inside investigation_reflect was correct code that nothing
+called: 6 of 142 manifests carried a summary while 7 of 15 real
+investigation_load calls asked for fidelity=summary or brief.
+
+It also could not have produced a good one. findings.jsonl is a mixed append log
+and 3,681 of its 6,610 records (55.7%) are text-less access rows written on every
+read. Being the newest rows, they filled findings[-20:] completely for some
+investigations, so the model was handed twenty empty bullets plus a title and
+invented a plausible topic from the title alone.
+"""
+import json
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import loci_groom as g
+
+
+class HasLlmSummaryTest(unittest.TestCase):
+    """The deterministic stub must not count as done, or one run with the backend
+    down would permanently mark every investigation as summarised."""
+
+    def test_model_authored_summary_counts(self):
+        self.assertTrue(g._has_llm_summary(
+            {"summary_l1": ["a point"], "summary_l2": "A real paragraph about it."}))
+
+    def test_deterministic_stub_does_not_count(self):
+        self.assertFalse(g._has_llm_summary(
+            {"summary_l1": ["raw finding text"],
+             "summary_l2": "Investigation with 12 findings. Latest: something."}))
+
+    def test_singular_stub_does_not_count(self):
+        self.assertFalse(g._has_llm_summary(
+            {"summary_l1": ["x"], "summary_l2": "Investigation with 1 finding."}))
+
+    def test_missing_pieces_do_not_count(self):
+        self.assertFalse(g._has_llm_summary({}))
+        self.assertFalse(g._has_llm_summary({"summary_l1": [], "summary_l2": "text"}))
+        self.assertFalse(g._has_llm_summary({"summary_l1": ["x"], "summary_l2": "   "}))
+
+
+class PassSummariesGateTest(unittest.TestCase):
+    def test_a_dead_backend_degrades_and_reflects_nothing(self):
+        called = []
+        rep = g.pass_summaries(gen_probe=lambda: False,
+                               reflect_fn=lambda **kw: called.append(kw))
+        self.assertEqual(rep["status"], "degraded")
+        self.assertIn("generation backend", rep["detail"])
+        self.assertEqual(called, [], "must not stamp a stub with no model")
+
+    def test_a_raising_probe_also_degrades(self):
+        rep = g.pass_summaries(
+            gen_probe=lambda: (_ for _ in ()).throw(OSError("refused")))
+        self.assertEqual(rep["status"], "degraded")
+
+
+class PassSummariesWorkTest(unittest.TestCase):
+    def _inv(self, tmp, name, manifest):
+        d = tmp / name
+        d.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps(manifest))
+        return d
+
+    def setUp(self):
+        import tempfile, pathlib
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_skips_investigations_that_already_have_one(self):
+        self._inv(self.root, "done", {"investigation_id": "done",
+                                      "summary_l1": ["p"], "summary_l2": "Real summary."})
+        seen = []
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=lambda **kw: seen.append(kw))
+        self.assertEqual(seen, [])
+        self.assertEqual(rep["already_had"], 1)
+        self.assertEqual(rep["summarised"], 0)
+
+    def test_summarises_one_that_lacks_it(self):
+        d = self._inv(self.root, "todo", {"investigation_id": "todo"})
+
+        def reflect(investigation_id):
+            m = json.loads((d / "manifest.json").read_text())
+            m["summary_l1"] = ["a point"]
+            m["summary_l2"] = "A real paragraph."
+            (d / "manifest.json").write_text(json.dumps(m))
+
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=reflect)
+        self.assertEqual(rep["summarised"], 1)
+        self.assertEqual(rep["errors"], 0)
+
+    def test_a_stub_written_by_reflect_counts_as_an_error_not_a_success(self):
+        """Otherwise a transient model failure would be recorded as done and the
+        investigation would never be retried."""
+        d = self._inv(self.root, "todo", {"investigation_id": "todo"})
+
+        def reflect(investigation_id):
+            m = json.loads((d / "manifest.json").read_text())
+            m["summary_l1"] = ["raw text"]
+            m["summary_l2"] = "Investigation with 3 findings."
+            (d / "manifest.json").write_text(json.dumps(m))
+
+        rep = g.pass_summaries(memory_dir=self.root, gen_probe=lambda: True,
+                               reflect_fn=reflect)
+        self.assertEqual(rep["summarised"], 0)
+        self.assertEqual(rep["errors"], 1)
+        self.assertEqual(rep["status"], "degraded")
+
+    def test_budget_bounds_the_run(self):
+        for i in range(5):
+            self._inv(self.root, f"inv{i}", {"investigation_id": f"inv{i}"})
+
+        def reflect(investigation_id):
+            p = self.root / investigation_id / "manifest.json"
+            m = json.loads(p.read_text())
+            m["summary_l1"] = ["p"]
+            m["summary_l2"] = "Real."
+            p.write_text(json.dumps(m))
+
+        rep = g.pass_summaries(memory_dir=self.root, limit=2,
+                               gen_probe=lambda: True, reflect_fn=reflect)
+        self.assertEqual(rep["summarised"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
