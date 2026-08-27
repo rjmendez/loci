@@ -5,7 +5,7 @@ the exclusion rules regressed — both worth failing loudly on."""
 from .. import config
 
 
-def test_corpus_is_exactly_118_files():
+def test_corpus_is_exactly_119_files():
     files = config.iter_corpus_files_worktree()
     assert len(files) == 119, sorted(files)
 

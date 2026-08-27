@@ -4,7 +4,7 @@ from .. import ingest
 from ..tests.helpers import source_file
 
 
-def test_load_corpus_worktree_parses_118_files_with_no_errors():
+def test_load_corpus_worktree_parses_119_files_with_no_errors():
     sources, origin = ingest.load_corpus(rev=None)
     assert origin == "working tree"
     assert len(sources) == 119
