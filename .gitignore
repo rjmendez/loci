@@ -80,3 +80,4 @@ build/
 # published by accident. The few already tracked were added deliberately;
 # git does not untrack them, which is the intended behaviour.
 .claude/workflows/
+investigation_store_decomposition_plan.md
