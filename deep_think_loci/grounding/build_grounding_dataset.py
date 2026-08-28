@@ -16,14 +16,14 @@ drop-in upgrade for when the corpus grows (high CV AUC = headroom).
 Usage:
   python3 build_grounding_dataset.py \
     --findings ~/.hermes/memory-sessions/dt-loci-*/findings.jsonl \
-    --out . [--ollama http://100.73.200.19:11434/v1/embeddings]
+    --out . [--ollama http://ollama.internal:11434/v1/embeddings]
 """
 import argparse, glob, itertools, json, os, random, re, urllib.request
 from collections import Counter
 import numpy as np
 
 EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://100.73.200.19:11434").rstrip("/") + "/v1/embeddings"
+DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://ollama.internal:11434").rstrip("/") + "/v1/embeddings"
 
 
 def topic_of(rec):

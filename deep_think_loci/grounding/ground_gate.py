@@ -21,7 +21,7 @@ import argparse, json, os, sys, urllib.request
 import numpy as np
 
 # Loci convention: OLLAMA_BASE_URL has no /v1 suffix; EMBED_MODEL names the embedder.
-_BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://100.73.200.19:11434").rstrip("/")
+_BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://ollama.internal:11434").rstrip("/")
 OLLAMA = _BASE + "/v1/embeddings"
 EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 # The trained bleed-detector, co-located. Beats cosine IN-SAMPLE (qf-eval f1 0.94

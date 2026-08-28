@@ -75,3 +75,8 @@ backends.toml
 # setuptools build output (pip wheel / pip install -e)
 build/
 *.egg-info/
+
+# Workflow scripts are working notes and carry host detail, so new ones are not
+# published by accident. The few already tracked were added deliberately;
+# git does not untrack them, which is the intended behaviour.
+.claude/workflows/
