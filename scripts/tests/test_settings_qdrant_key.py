@@ -3,7 +3,7 @@
 Three scripts fall back to ``~/.claude/settings.json`` when QDRANT_API_KEY is unset in the
 environment, and each indexes ``mcpServers`` by the server's registration name. That name is
 now ``loci`` (what the checked-in ``.mcp.json`` and the READMEs use); it used to be
-``loci_memory``. A lookup pinned to one name fails soft on the other -- the scripts swallow
+``hermes_memory``, which is what older settings files on disk still say. A lookup pinned to one name fails soft on the other -- the scripts swallow
 the KeyError and connect with no api-key, which surfaces as an auth error from Qdrant far from
 the actual cause, or as a silent unauthenticated connection against an open instance.
 
@@ -99,7 +99,7 @@ class TestPayloadIndexesKeyLookup(unittest.TestCase):
 
     def test_reads_legacy_hermes_memory_registration(self):
         self.assertEqual(
-            self._key_with({"loci_memory": _entry("key-legacy")}), "key-legacy")
+            self._key_with({"hermes_memory": _entry("key-legacy")}), "key-legacy")
 
     def test_returns_empty_when_neither_name_is_registered(self):
         self.assertEqual(self._key_with({"something_else": _entry("nope")}), "")

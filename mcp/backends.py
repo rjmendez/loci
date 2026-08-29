@@ -180,7 +180,7 @@ def memory_dir() -> str:
     """Curated MEMORY.md dir for the grounding memory lane: env -> config -> LOCI_MEMORY_DIR -> ''.
     No machine/user-specific default (the old ~/.claude/.../-home-<user>/memory default is gone)."""
     return (os.environ.get("LOCI_MEMORY_MD_DIR") or _cfg("memory", "dir", "")
-            or os.environ.get("LOCI_MEMORY_DIR", "") or "")
+            or os.environ.get("LOCI_MEMORY_DIR") or os.environ.get("HERMES_MEMORY_DIR", "") or "")
 
 
 def _reset_cache() -> None:

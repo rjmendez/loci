@@ -37,7 +37,8 @@ def _default_memory_dir() -> str:
         import backends
         return backends.memory_dir()
     except Exception:
-        return os.environ.get("LOCI_MEMORY_MD_DIR") or os.environ.get("LOCI_MEMORY_DIR", "")
+        return (os.environ.get("LOCI_MEMORY_MD_DIR") or os.environ.get("LOCI_MEMORY_DIR")
+                or os.environ.get("HERMES_MEMORY_DIR", ""))
 
 
 _MEMORY_DIR_DEFAULT = _default_memory_dir()

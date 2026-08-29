@@ -33,7 +33,7 @@ if not QDRANT_KEY:
         _servers = _cfg["mcpServers"]
         # "loci" is the current registration name; "hermes_memory" is what older
         # settings.json files used. Accept either.
-        _entry = _servers.get("loci") or _servers["loci_memory"]
+        _entry = _servers.get("loci") or _servers["hermes_memory"]
         QDRANT_KEY = _entry["env"]["QDRANT_API_KEY"]
     except Exception:
         pass
