@@ -90,7 +90,9 @@ def main():
     a.ollama = a.ollama or _default_ollama()
     random.seed(0); np.random.seed(0)
 
-    files = [f for pat in a.findings for f in glob.glob(pat)]
+    # sorted: glob does not promise an order, and "first row per id wins" makes
+    # the kept row depend on it. An unordered builder is not a reproducible one.
+    files = sorted({f for pat in a.findings for f in glob.glob(pat)})
     # findings.jsonl is a mixed log: alongside real findings it carries text-less
     # `access` rows, and one id can appear many times. Keeping them produced a
     # dataset that was 97% duplicate rows, 69% of it a single claim=""/evidence=""

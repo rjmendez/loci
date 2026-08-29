@@ -34,8 +34,13 @@ def test_every_fit_announces_itself_before_it_starts_and_flushes():
         window = range(max(1, call.lineno - 8), call.lineno)
         near = [prints[ln] for ln in window if ln in prints]
         assert near, f"fit at line {call.lineno} has no print in the 8 lines above it"
-        assert any(any(k.arg == "flush" for k in n.keywords) for n in near), (
-            f"the print announcing the fit at line {call.lineno} does not flush"
+        # The NEAREST preceding print is the announcement. Accepting any flushing
+        # print in the window lets an unrelated flush elsewhere satisfy the check
+        # while the announcing line itself stays buffered.
+        announcing = max(near, key=lambda n: n.lineno)
+        assert any(k.arg == "flush" for k in announcing.keywords), (
+            f"the print at line {announcing.lineno} announcing the fit at line "
+            f"{call.lineno} does not flush"
         )
 
 

@@ -198,10 +198,18 @@ def load_env(repo: "Path | None" = None) -> dict:
     which is what mlops/loop.py depends on.
     """
     root = Path(repo) if repo else Path(__file__).resolve().parent.parent
+    preexisting = dict(os.environ)
     try:
         from dotenv import load_dotenv
         load_dotenv(root / ".env")
+        # override=True lets mcp/.env win over the repo .env, which is the point
+        # — but it also overwrites the caller's own environment, contradicting
+        # the precedence this function documents. Anything that was already set
+        # goes back afterwards, so an explicit export still wins.
         load_dotenv(root / "mcp" / ".env", override=True)
+        for key, was in preexisting.items():
+            if os.environ.get(key) != was:
+                os.environ[key] = was
     except Exception as exc:
         logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
                        "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
@@ -213,7 +221,10 @@ def load_env(repo: "Path | None" = None) -> dict:
             if url:
                 os.environ["QDRANT_URL"] = resolved["QDRANT_URL"] = url
                 if key and not os.environ.get("QDRANT_API_KEY"):
-                    os.environ["QDRANT_API_KEY"] = key
+                    # Reported as well as set: mlops/loop.py restores its own
+                    # environment from this dict, and a key it never hears about
+                    # is a key it leaves behind.
+                    os.environ["QDRANT_API_KEY"] = resolved["QDRANT_API_KEY"] = key
         except Exception as exc:
             logger.warning("load_env: could not resolve Qdrant: %r", exc)
 
