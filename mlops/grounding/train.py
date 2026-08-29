@@ -377,11 +377,11 @@ def main():
 
     cos_cv_mean, cos_cv_std = cosine_f1_on_folds(cos_scores, labels, fold_indices)
     # These folds split PAIRS, so a finding lands on both sides of a split and
-    # every number below is optimistic. Measured on this corpus: GBC scores 0.944
-    # here and 0.908 when findings are split before pairs are built, against a
-    # cosine baseline that barely moves (0.864 -> 0.878). Two thirds of the
-    # apparent margin over cosine is the leak. Say so on every line, because this
-    # is the figure that gets quoted later as though it were the model's score.
+    # every number below is optimistic — most of the apparent margin over cosine
+    # is that leak. Say so on every line, because this is the figure that gets
+    # quoted later as though it were the model's score. The measured size of the
+    # gap lives in docs/grounding-corpus-limits.md, where it can be updated when
+    # the corpus changes; figures pinned in a comment only go stale.
     print(f"\nPair-level 10-fold CV (optimistic — a finding appears in train and test):")
     print(f"  cosine baseline: F1 = {cos_cv_mean:.3f} ± {cos_cv_std:.3f}")
 
@@ -398,10 +398,10 @@ def main():
             clf, X, labels,
             # The same folds per_fold_f1 scores below. A fresh StratifiedKFold
             # here stratifies on labels while fold_indices stratifies on cosine
-            # quartiles, and the two partitions agree at chance — measured 10.3%
-            # overlap on a 12,684-row matrix. The mean survives that (every
-            # sample still gets an out-of-fold prediction) but the reported std
-            # was the spread across arbitrary subsets, not across folds.
+            # quartiles, and the two partitions overlap at chance. The mean
+            # survives that (every sample still gets an out-of-fold prediction)
+            # but the reported std becomes the spread across arbitrary subsets
+            # rather than across folds.
             cv=fold_indices,
             method="predict_proba",
             n_jobs=CV_JOBS,
@@ -442,15 +442,26 @@ def main():
 
     beat_baseline = best_f1 > eval_baseline
     decision = "PROMOTE" if beat_baseline else "HOLD"
-    basis = "leave-one-run-out OOS" if oos_results else "pair-level CV (OPTIMISTIC)"
+    # Requested is not the same as used: --findings-glob can be passed and OOS
+    # still return {} (fewer than 2 runs, or no fold with both classes). The
+    # banner used to blame a missing flag for that, which sends the reader to fix
+    # the one thing that was already right.
+    if oos_results:
+        basis = "leave-one-run-out OOS"
+    elif args.findings_glob:
+        basis = "pair-level CV (OPTIMISTIC) — OOS was requested but produced no folds"
+    else:
+        basis = "pair-level CV (OPTIMISTIC) — no --findings-glob"
     print(f"\n{'='*60}")
     print(f"Decision: {decision}   [on {basis}]")
     print(f"  Best model F1:    {best_f1:.3f}  ({best_name})")
     print(f"  Cosine baseline:  {eval_baseline:.3f}")
     print(f"  Beat baseline:    {beat_baseline}")
     if not oos_results:
-        print("  WARNING: no --findings-glob, so this decision rests on the leaky")
-        print("           pair-level split. Expect ~2/3 of the margin to be leak.")
+        why = ("--findings-glob was passed but leave-one-run-out produced no usable "
+               "folds" if args.findings_glob else "no --findings-glob was passed")
+        print(f"  WARNING: {why}, so this decision rests on the")
+        print("           leaky pair-level split — see docs/grounding-corpus-limits.md")
     print(f"{'='*60}\n")
 
     best_clf = candidates[best_name]

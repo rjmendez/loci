@@ -103,7 +103,6 @@ def test_the_scored_folds_are_the_folds_that_made_the_predictions():
     a 12,684-row matrix the two partitions agree at 10.3% — chance. The mean
     survived (every sample still gets an out-of-fold prediction) but the reported
     std was the spread across arbitrary subsets, not across folds."""
-    tree = ast.parse(TRAIN.read_text())
     call = _call("cross_val_predict")
     assert call is not None
     cv = next((k.value for k in call.keywords if k.arg == "cv"), None)
@@ -124,3 +123,31 @@ def test_env_int_rejects_junk_without_crashing_the_import(monkeypatch):
         assert mod._env_int("X_JOBS", -1, allow="n_jobs") == -1
     monkeypatch.setenv("X_JOBS", "4")
     assert mod._env_int("X_JOBS", -1, allow="n_jobs") == 4
+
+
+def test_the_banner_distinguishes_oos_requested_from_oos_used():
+    """--findings-glob can be passed and OOS still return {} — fewer than 2 runs,
+    or no fold carrying both classes. The banner blamed a missing flag for that,
+    which sends the reader to fix the one thing that was already right."""
+    src = TRAIN.read_text()
+    assert "OOS was requested but produced no folds" in src, (
+        "the basis line must separate 'requested' from 'used'"
+    )
+    assert "no --findings-glob" in src, "the genuinely-absent-flag case must stay"
+    assert "elif args.findings_glob:" in src, (
+        "the two cases must be distinguished on args.findings_glob, not on "
+        "oos_results alone"
+    )
+
+
+def test_no_measured_figures_are_pinned_in_code_comments():
+    """A comment carrying 0.944/0.908/0.864 goes stale the moment the corpus
+    changes, and a stale figure in code reads as current. The numbers live in
+    docs/grounding-corpus-limits.md, which can be updated with the measurement."""
+    import re as _re
+    comments = [ln for ln in TRAIN.read_text().splitlines() if ln.lstrip().startswith("#")]
+    for ln in comments:
+        # F1-shaped literals: a bare 0.NNN in prose
+        assert not _re.search(r"\b0\.\d{3}\b", ln), (
+            f"measured figure pinned in a comment, put it in the doc instead:\n  {ln.strip()}"
+        )

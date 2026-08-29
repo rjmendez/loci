@@ -38,7 +38,10 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         print(f"[{name}] ignoring non-integer {raw!r}, using {default}")
         return default
-    return val if val > 0 else default
+    if val <= 0:
+        print(f"[{name}] ignoring non-positive {val}, using {default}")
+        return default
+    return val
 
 
 BAKE_TIMEOUT_S = _env_int("LOCI_MLOPS_BAKE_TIMEOUT", 1800)

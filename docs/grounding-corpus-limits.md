@@ -8,7 +8,7 @@ and the printed ones are the ones that get quoted later.
 
 `grounding_dataset.jsonl` holds pairs, and pairs are `C(n,2)` within a topic:
 
-| findings | positives | |
+| findings | positives | note |
 |---|---|---|
 | 303 (now) | 4,203 | |
 | 454 (1.5x) | 9,560 | 2.3x the rows from 1.5x the evidence |
