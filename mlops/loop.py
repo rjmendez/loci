@@ -43,6 +43,41 @@ def _run(cmd, timeout: int | None = None):
 
 REPO = Path(__file__).parent.parent
 MLOPS = REPO / "mlops"
+
+# Run as a script, sys.path[0] is mlops/, not the repo root, so `import mlops.*`
+# fails. The monitor step did exactly that and had never once run.
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+# Steps that failed outright, as opposed to steps deliberately skipped. A run
+# that reports "done" after every step errored is the failure mode this loop
+# spent 67 nights in.
+FAILED_STEPS: list[str] = []
+
+
+def _last_error_line(stderr: str) -> str:
+    """The exception line out of a traceback. Slicing the last N chars of stderr
+    lands mid-frame and prints a row of carets instead of the actual error."""
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return "no stderr"
+    for ln in reversed(lines):
+        if not ln.lstrip().startswith(("File \"", "^", "~", "|")) and not ln.startswith("    "):
+            return ln[:300]
+    return lines[-1][:300]
+
+
+def _fail(step: str, detail: str) -> None:
+    FAILED_STEPS.append(step)
+    print(f"[loop] {step} failed: {detail}")
+
+
+def _skip_reason(ollama_ok: bool, days_ago: int, cadence: int, ollama: str) -> str:
+    """Why a cadence-gated step did not run. These gates are also Ollama-gated, so
+    reciting only the cadence blames the schedule for an unreachable backend."""
+    if not ollama_ok:
+        return f"Ollama unreachable at {ollama}"
+    return f"not due ({days_ago}d ago, cadence {cadence}d)"
 GROUNDING_DIR = REPO / "deep_think_loci" / "grounding"
 STATE_FILE = MLOPS / "loop_state.json"
 HISTORY_FILE = MLOPS / "loop_history.jsonl"
@@ -126,7 +161,7 @@ def _rebuild_dataset(findings_glob: str, ollama: str) -> int:
          "--ollama", f"{ollama}/v1/embeddings"],
     )
     if result.returncode != 0:
-        print(f"[loop] dataset rebuild failed:\n{result.stderr[-500:]}")
+        _fail("dataset rebuild", _last_error_line(result.stderr))
         return _current_dataset_size()
 
     size = _current_dataset_size()
@@ -160,7 +195,7 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     result = _run(cmd)
     print(result.stdout[-1000:])
     if result.returncode != 0:
-        print(f"[loop] train.py failed:\n{result.stderr[-500:]}")
+        _fail("train.py", _last_error_line(result.stderr))
         return None
 
     if metrics_path.exists():
@@ -209,7 +244,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         r = _run(cmd)
         print(r.stdout[-500:])
         if r.returncode != 0:
-            print(f"[loop] SFT step failed: {r.stderr[-300:]}")
+            _fail("SFT bake", _last_error_line(r.stderr))
             return False
 
     if not sft.exists() or sft.stat().st_size < 100:
@@ -238,7 +273,7 @@ def _run_decay(db_path: str, dry_run: bool) -> dict:
               f"mean_retention={stats.get('mean_retention', 0):.3f}")
         return stats
     except Exception as exc:
-        print(f"[loop] decay step failed: {exc}")
+        _fail("decay", str(exc))
         return {}
 
 
@@ -252,7 +287,7 @@ def _run_live_evo(db_path: str, hook_state: str, dry_run: bool) -> dict:
               f"correlated={stats.get('n_correlated')} penalized={stats.get('n_penalized')}")
         return stats
     except Exception as exc:
-        print(f"[loop] live_evo step failed: {exc}")
+        _fail("live_evo", str(exc))
         return {}
 
 
@@ -277,7 +312,7 @@ def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
             print("[loop] ALERT: rollback recommended — check monitor_history.jsonl")
         return result
     except Exception as exc:
-        print(f"[loop] monitor step failed: {exc}")
+        _fail("monitor", str(exc))
         return {}
 
 
@@ -359,7 +394,7 @@ def _emit_embedding_trigger() -> None:
 RUNS_SEEN_MAX = int(os.environ.get("LOCI_RUNS_SEEN_MAX", "1000"))
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description="Loci MLOps self-closing loop")
     ap.add_argument("--findings", default=DEFAULT_FINDINGS,
                     help="Glob for investigation findings.jsonl files")
@@ -474,7 +509,7 @@ def main() -> None:
         if ok and not args.dry_run:
             state["last_sft_bake"] = now_iso
     else:
-        print(f"[loop] SFT bake skipped (last was {sft_days_ago}d ago, cadence={args.sft_every}d)")
+        print(f"[loop] SFT bake skipped — {_skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama)}")
 
     # ── 8. Embedding trigger (cadence-gated) ──────────────────────────────────
     last_emb = state.get("last_embedding_tune")
@@ -498,7 +533,7 @@ def main() -> None:
         if al_result.get("exit_code", 1) == 0 and not args.dry_run:
             state["last_active_learn"] = now_iso
     else:
-        print(f"[loop] active_learn skipped ({al_days_ago}d ago, cadence={args.active_learn_every}d)")
+        print(f"[loop] active_learn skipped — {_skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama)}")
 
     # ── 9. Persist state + history ────────────────────────────────────────────
     state["last_run"] = now_iso
@@ -514,10 +549,13 @@ def main() -> None:
         "promoted": promoted,
         "train_metrics": train_metrics,
         "dry_run": args.dry_run,
+        "failed_steps": list(FAILED_STEPS),
     })
 
-    print(f"[loop] done. promoted={promoted} dataset={state['last_dataset_size']} total_promotions={state['total_promotions']}")
+    status = "done" if not FAILED_STEPS else f"done with {len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS)
+    print(f"[loop] {status}. promoted={promoted} dataset={state['last_dataset_size']} total_promotions={state['total_promotions']}")
+    return 1 if FAILED_STEPS else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
