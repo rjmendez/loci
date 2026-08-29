@@ -13,6 +13,7 @@ harness._http / harness.embed / subprocess.run, all of which are monkeypatched.
 import contextlib
 import importlib
 import json
+import re
 import math
 import os
 import subprocess
@@ -836,13 +837,22 @@ def test_gge_run_raises_on_a_malformed_dataset_line(tmp_path, monkeypatch):
 
 
 def test_gge_run_reads_the_real_repo_dataset_in_dry_mode(monkeypatch, capsys):
-    """Smoke-pins the shipped corpus: 5235 topical pairs, gate still separates."""
+    """Smoke-pins the shipped corpus: the gate still separates on whatever is there.
+
+    This used to assert `pairs=5235`, which held only while the shipped dataset
+    was untouched. mlops/loop.py rebuilds that same file in place, so any machine
+    that had run the loop failed here — the test was reporting the corpus size,
+    not the gate. Assert the invariant instead: a plausible number of topical
+    pairs, and cosine still ranking on-topic above bleed.
+    """
     if not gge.DATASET.exists():
         pytest.skip("shipped grounding_dataset.jsonl not present")
     monkeypatch.setattr(harness, "DRY_RUN", True)
     gge.run()
     out = capsys.readouterr().out
-    assert "pairs=5235 thr=0.59 dry_run=True" in out
+    m = re.search(r"pairs=(\d+) thr=0\.59 dry_run=True", out)
+    assert m, f"expected a pairs=/thr= line, got:\n{out}"
+    assert int(m.group(1)) > 500, "corpus implausibly small — did the rebuild break?"
     auc = float(next(l for l in out.splitlines() if "auc" in l).split()[-1])
     assert auc > 0.5  # cosine still ranks on-topic above bleed
 

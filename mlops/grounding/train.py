@@ -353,7 +353,14 @@ def main():
     fold_indices = list(skf.split(X, cos_quartiles))
 
     cos_cv_mean, cos_cv_std = cosine_f1_on_folds(cos_scores, labels, fold_indices)
-    print(f"\nCosine baseline 10-fold CV: F1 = {cos_cv_mean:.3f} ± {cos_cv_std:.3f}")
+    # These folds split PAIRS, so a finding lands on both sides of a split and
+    # every number below is optimistic. Measured on this corpus: GBC scores 0.944
+    # here and 0.908 when findings are split before pairs are built, against a
+    # cosine baseline that barely moves (0.864 -> 0.878). Two thirds of the
+    # apparent margin over cosine is the leak. Say so on every line, because this
+    # is the figure that gets quoted later as though it were the model's score.
+    print(f"\nPair-level 10-fold CV (optimistic — a finding appears in train and test):")
+    print(f"  cosine baseline: F1 = {cos_cv_mean:.3f} ± {cos_cv_std:.3f}")
 
     cv_results = {}
     for name, clf in candidates.items():
@@ -383,7 +390,7 @@ def main():
 
     best_name = max(cv_results, key=lambda n: cv_results[n]["mean"])
     best_f1 = cv_results[best_name]["mean"]
-    print(f"\nBest CV model: {best_name} (F1={best_f1:.3f})")
+    print(f"\nBest pair-level CV model: {best_name} (F1={best_f1:.3f}, optimistic)")
 
     oos_results = {}
     if args.findings_glob:
@@ -406,11 +413,15 @@ def main():
 
     beat_baseline = best_f1 > eval_baseline
     decision = "PROMOTE" if beat_baseline else "HOLD"
+    basis = "leave-one-run-out OOS" if oos_results else "pair-level CV (OPTIMISTIC)"
     print(f"\n{'='*60}")
-    print(f"Decision: {decision}")
-    print(f"  Best model F1:    {best_f1:.3f}")
+    print(f"Decision: {decision}   [on {basis}]")
+    print(f"  Best model F1:    {best_f1:.3f}  ({best_name})")
     print(f"  Cosine baseline:  {eval_baseline:.3f}")
     print(f"  Beat baseline:    {beat_baseline}")
+    if not oos_results:
+        print("  WARNING: no --findings-glob, so this decision rests on the leaky")
+        print("           pair-level split. Expect ~2/3 of the margin to be leak.")
     print(f"{'='*60}\n")
 
     best_clf = candidates[best_name]
@@ -440,6 +451,8 @@ def main():
         "cosine_baseline_cv_f1": round(cos_cv_mean, 4),
         "beat_baseline": beat_baseline,
         "decision": decision,
+        "decision_basis": "oos_leave_one_run_out" if oos_results else "pair_level_cv_optimistic",
+        "cv_is_pair_level_and_optimistic": True,
         "n_train": len(rows),
         "feature_dim": X.shape[1],
         "threshold": round(best_thresh, 4),
