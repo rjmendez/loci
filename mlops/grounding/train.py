@@ -39,7 +39,30 @@ def _resolve_backends() -> None:
 # it finished. Measured 5.2x here (not 10x: GBC is single-threaded per fold, the
 # folds do not balance evenly, and BLAS threads contend). Parallelism lives at
 # the CV level only; giving the estimators n_jobs as well just oversubscribes.
-CV_JOBS = int(os.environ.get("LOCI_TRAIN_CV_JOBS", "-1"))
+def _env_int(name: str, default: int, *, allow: str = "positive") -> int:
+    """Env-parsed int that refuses to crash a nightly at import.
+
+    int(os.environ[...]) raises ValueError before argparse has run, so a typo in
+    a cron line takes down the job with a traceback and no context. A bad value
+    falls back to the default and says so."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"[{name}] ignoring non-integer {raw!r}, using {default}", flush=True)
+        return default
+    if allow == "positive" and val <= 0:
+        print(f"[{name}] ignoring non-positive {val}, using {default}", flush=True)
+        return default
+    if allow == "n_jobs" and (val == 0 or val < -1):
+        print(f"[{name}] ignoring invalid n_jobs {val}, using {default}", flush=True)
+        return default
+    return val
+
+
+CV_JOBS = _env_int("LOCI_TRAIN_CV_JOBS", -1, allow="n_jobs")
 
 
 def _emb_model():
@@ -373,7 +396,13 @@ def main():
         t0 = time.monotonic()
         proba = cross_val_predict(
             clf, X, labels,
-            cv=StratifiedKFold(n_splits=10, shuffle=True, random_state=42),
+            # The same folds per_fold_f1 scores below. A fresh StratifiedKFold
+            # here stratifies on labels while fold_indices stratifies on cosine
+            # quartiles, and the two partitions agree at chance — measured 10.3%
+            # overlap on a 12,684-row matrix. The mean survives that (every
+            # sample still gets an out-of-fold prediction) but the reported std
+            # was the spread across arbitrary subsets, not across folds.
+            cv=fold_indices,
             method="predict_proba",
             n_jobs=CV_JOBS,
         )[:, 1]

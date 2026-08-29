@@ -28,8 +28,21 @@ import textwrap
 
 
 
-BAKE_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_BAKE_TIMEOUT", "1800"))
-PROBE_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_PROBE_TIMEOUT", "120"))
+def _env_int(name: str, default: int) -> int:
+    """A typo in an env var should not crash the bake before argparse runs."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"[{name}] ignoring non-integer {raw!r}, using {default}")
+        return default
+    return val if val > 0 else default
+
+
+BAKE_TIMEOUT_S = _env_int("LOCI_MLOPS_BAKE_TIMEOUT", 1800)
+PROBE_TIMEOUT_S = _env_int("LOCI_MLOPS_PROBE_TIMEOUT", 120)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 

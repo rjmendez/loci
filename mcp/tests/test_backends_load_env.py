@@ -96,3 +96,30 @@ def test_the_loop_resolves_at_run_time_not_import_time(monkeypatch, tmp_path):
     assert 'ap.add_argument("--ollama", default=None' in src, (
         "--ollama must default to None so the config file gets a say"
     )
+
+
+def test_dotenv_override_does_not_beat_the_callers_environment(monkeypatch, tmp_path):
+    """load_dotenv(override=True) is how mcp/.env wins over the repo .env, but it
+    also overwrote whatever the caller had exported — contradicting the
+    precedence this function documents."""
+    _clean(monkeypatch)
+    (tmp_path / "mcp").mkdir(exist_ok=True)
+    (tmp_path / ".env").write_text("OLLAMA_BASE_URL=http://from-repo-env:11434\n")
+    (tmp_path / "mcp" / ".env").write_text("OLLAMA_BASE_URL=http://from-mcp-env:11434\n")
+    monkeypatch.setattr(backends, "_CONFIG_PATH", str(tmp_path / "none.toml"))
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://from-the-caller:11434")
+    backends._reset_cache()
+
+    backends.load_env(tmp_path)
+    assert os.environ["OLLAMA_BASE_URL"] == "http://from-the-caller:11434"
+
+
+def test_the_api_key_is_reported_so_a_caller_can_put_it_back(monkeypatch, tmp_path):
+    """mlops/loop.py restores its own environment from this dict. A key that is
+    set but never reported is a key left behind in the process."""
+    _clean(monkeypatch)
+    _config(monkeypatch, tmp_path,
+            '[qdrant]\nurl = "http://q-host:6333"\napi_key = "sekrit"\n')
+    resolved = backends.load_env(tmp_path)
+    assert resolved.get("QDRANT_API_KEY") == "sekrit"
+    assert os.environ["QDRANT_API_KEY"] == "sekrit"
