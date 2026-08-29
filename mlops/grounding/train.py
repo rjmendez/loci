@@ -4,6 +4,7 @@ import glob
 import hashlib
 import json
 import os
+import time
 import urllib.request
 from datetime import datetime, timezone
 
@@ -178,6 +179,8 @@ def oos_from_findings(
         for name, clf_proto in candidates.items():
             import copy
             c = copy.deepcopy(clf_proto)
+            print(f"  [oos] held={held} fitting {name} on {X_tr_arr.shape[0]} pairs...",
+                  flush=True)
             c.fit(X_tr_arr, Y_tr_arr)
             fold_clfs[name] = c
 
@@ -215,7 +218,8 @@ def oos_from_findings(
             proba = c.predict_proba(X_te_arr)[:, 1]
             mf1 = f1_score(Y_te, (proba > 0.5).astype(int), zero_division=0)
             model_f1s[name].append(mf1)
-            print(f"  [oos] held={held} {name} f1={mf1:.3f} | cosine f1={best_cos_f1:.3f}")
+            print(f"  [oos] held={held} {name} f1={mf1:.3f} | cosine f1={best_cos_f1:.3f}",
+                  flush=True)
 
     if not cos_f1s:
         return {}
@@ -283,7 +287,8 @@ def main():
     cos_scores = np.array([r.get("cos", 0.0) for r in rows], dtype=np.float32)
 
     all_texts = list(dict.fromkeys(claims + evidences))
-    print(f"Embedding {len(all_texts)} unique texts (cache has {len(cache)} entries)...")
+    print(f"Embedding {len(all_texts)} unique texts (cache has {len(cache)} entries)...",
+          flush=True)
     embs = embed_texts(all_texts, args.ollama, cache)
     _save_cache(cache)
     print(f"Cache saved to {CACHE_PATH}")
@@ -314,11 +319,18 @@ def main():
 
     cv_results = {}
     for name, clf in candidates.items():
+        # Announce before fitting, not after. GradientBoosting over this feature
+        # matrix is 2,000 trees x 10 folds and runs for tens of minutes; printing
+        # only on completion leaves an unattended run silent and indistinguishable
+        # from hung.
+        print(f"  {name}: fitting 10 folds on {X.shape[0]}x{X.shape[1]}...", flush=True)
+        t0 = time.monotonic()
         proba = cross_val_predict(
             clf, X, labels,
             cv=StratifiedKFold(n_splits=10, shuffle=True, random_state=42),
             method="predict_proba",
         )[:, 1]
+        elapsed = time.monotonic() - t0
         per_fold_f1 = []
         for _, val_idx in fold_indices:
             pv = proba[val_idx]
@@ -326,8 +338,8 @@ def main():
             per_fold_f1.append(f1_score(yv, (pv > 0.5).astype(int), zero_division=0))
         mean_f1 = float(np.mean(per_fold_f1))
         std_f1 = float(np.std(per_fold_f1))
-        cv_results[name] = {"mean": mean_f1, "std": std_f1}
-        print(f"  {name}: CV F1 = {mean_f1:.3f} ± {std_f1:.3f}")
+        cv_results[name] = {"mean": mean_f1, "std": std_f1, "fit_seconds": round(elapsed, 1)}
+        print(f"  {name}: CV F1 = {mean_f1:.3f} ± {std_f1:.3f}  ({elapsed:.0f}s)", flush=True)
 
     best_name = max(cv_results, key=lambda n: cv_results[n]["mean"])
     best_f1 = cv_results[best_name]["mean"]
@@ -362,7 +374,10 @@ def main():
     print(f"{'='*60}\n")
 
     best_clf = candidates[best_name]
+    print(f"Refitting {best_name} on all {X.shape[0]} rows...", flush=True)
+    t0 = time.monotonic()
     best_clf.fit(X, labels)
+    print(f"  refit done in {time.monotonic() - t0:.0f}s", flush=True)
 
     all_proba = best_clf.predict_proba(X)[:, 1]
     thresholds = np.linspace(0.2, 0.9, 71)
