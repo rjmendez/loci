@@ -909,7 +909,8 @@ def test_ollama_backend_writes_modelfile_then_creates_and_probes(
 
     assert runner.calls[0][0] == [
         "ollama", "create", "loci-tuned", "-f", str(mf)]
-    assert runner.calls[0][1] == {"capture_output": False}
+    assert runner.calls[0][1]["capture_output"] is False
+    assert runner.calls[0][1]["timeout"] > 0, "the bake must be bounded"
     assert runner.calls[1][0] == [
         "ollama", "run", "loci-tuned",
         "What is the most important memory about authentication?"]
