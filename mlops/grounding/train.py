@@ -4,13 +4,38 @@ import glob
 import hashlib
 import json
 import os
+import pathlib
 import time
 import urllib.request
 from datetime import datetime, timezone
 
 import numpy as np
 
-EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+
+def _resolve_backends() -> None:
+    """Fill OLLAMA_BASE_URL/EMBED_MODEL from ~/.loci/backends.toml when unset.
+
+    Run standalone or from cron this inherits no MCP environment, and nothing
+    listens on the localhost default. backends.py already reads the config file
+    that records the real endpoint; without this the run fails at the first
+    embedding call with a bare connection-refused.
+
+    Called from __main__ only. It writes to os.environ, which is right for a run
+    and wrong on import — a test that imports this module would otherwise change
+    what every other module in the process resolves."""
+    try:
+        import sys as _sys
+        _repo = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_repo / "mcp"))
+        import backends
+        backends.load_env(_repo)
+    except Exception:
+        pass  # a missing config is not a reason to refuse to run
+
+
+def _emb_model():
+    """Read at call time: _resolve_backends() runs after import."""
+    return os.environ.get("EMBED_MODEL") or "nomic-embed-text"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CLF_PATH = os.path.join(REPO_ROOT, "deep_think_loci", "grounding", "grounding_bleed_clf.joblib")
 CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".emb_cache.npz")
@@ -51,7 +76,7 @@ def embed_texts(texts: list, ollama_base: str, cache: dict) -> np.ndarray:
     need = [t for t in texts if _sha(t) not in cache]
     for i in range(0, len(need), 16):
         batch = [t[:2000] for t in need[i:i + 16]]
-        body = json.dumps({"model": EMB_MODEL, "input": batch}).encode()
+        body = json.dumps({"model": _emb_model(), "input": batch}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         resp = json.loads(urllib.request.urlopen(req, timeout=60).read())
         for j, d in enumerate(resp["data"]):
@@ -253,11 +278,15 @@ def main():
     ap.add_argument("--dataset", default=os.path.join(REPO_ROOT, "deep_think_loci", "grounding", "grounding_dataset.jsonl"))
     ap.add_argument("--out", default=os.path.join(REPO_ROOT, "mlops", "grounding", "train_metrics.json"))
     ap.add_argument("--findings-glob", default=None)
-    ap.add_argument("--ollama", default=(os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434"))
+    ap.add_argument("--ollama", default=None,
+                    help="Ollama base URL. Default: $OLLAMA_BASE_URL, else "
+                         "~/.loci/backends.toml, else http://localhost:11434")
     ap.add_argument("--dry-run", action="store_true", help="Eval only; never write the joblib")
     ap.add_argument("--candidate-out", default=None,
                     help="Write winning candidate model here instead of live path (used by loop.py)")
     args = ap.parse_args()
+    _resolve_backends()
+    args.ollama = args.ollama or os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434"
 
     from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
     from sklearn.linear_model import LogisticRegression

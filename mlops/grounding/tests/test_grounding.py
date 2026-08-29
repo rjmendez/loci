@@ -862,7 +862,7 @@ def test_embed_texts_batches_by_sixteen_and_hits_the_v1_endpoint(fake_ollama):
     out = train.embed_texts([f"text {i}" for i in range(20)], "http://host:11434/", cache)
     assert [len(c["body"]["input"]) for c in fake_ollama] == [16, 4]
     assert fake_ollama[0]["url"] == "http://host:11434/v1/embeddings"
-    assert fake_ollama[0]["body"]["model"] == train.EMB_MODEL == "nomic-embed-text"
+    assert fake_ollama[0]["body"]["model"] == train._emb_model() == "nomic-embed-text"
     assert fake_ollama[0]["timeout"] == 60
     assert out.shape == (20, 2)
 
@@ -1211,3 +1211,12 @@ def test_hard_negatives_defaults_missing_label_to_zero(tmp_path):
     recs = [{"text": "the quick brown fox"}, {"text": "the quick brown dog"}]
     p.write_text("".join(json.dumps(r) + "\n" for r in recs))
     assert al.hard_negatives(str(p)) == []
+
+
+def test_embed_model_is_read_at_call_time_not_import_time(monkeypatch):
+    """A module constant is fixed before _resolve_backends() has read the config
+    file, so an EMBED_MODEL set there would never reach the request body."""
+    monkeypatch.setenv("EMBED_MODEL", "some-other-embedder")
+    assert train._emb_model() == "some-other-embedder"
+    monkeypatch.delenv("EMBED_MODEL")
+    assert train._emb_model() == "nomic-embed-text"

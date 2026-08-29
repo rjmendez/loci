@@ -31,11 +31,21 @@ from pathlib import Path
 STEP_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_STEP_TIMEOUT", "3600"))
 
 
+CHILD_ENV: dict[str, str] = {}
+
+
 def _run(cmd, timeout: int | None = None):
-    """subprocess.run with a bound. A hung child stalls the whole nightly."""
+    """subprocess.run with a bound, plus whatever backends resolved for the children.
+
+    A hung child stalls the whole nightly, and a child that cannot see
+    OLLAMA_BASE_URL falls back to a localhost nothing listens on. The resolved
+    values are handed over here rather than written into this process's own
+    environment, so importing this module changes nothing for anyone else.
+    """
     limit = timeout or STEP_TIMEOUT_S
+    env = {**os.environ, **CHILD_ENV} if CHILD_ENV else None
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=limit, env=env)
     except subprocess.TimeoutExpired as exc:
         out = exc.stdout if isinstance(exc.stdout, str) else ""
         return subprocess.CompletedProcess(cmd, 124, out,
@@ -87,6 +97,37 @@ CANDIDATE_MODEL = MLOPS / "grounding" / "candidate.joblib"
 LIVE_MODEL = GROUNDING_DIR / "grounding_bleed_clf.joblib"
 DATASET = GROUNDING_DIR / "grounding_dataset.jsonl"
 ACTIVE_CANDIDATES = MLOPS / "grounding" / "active_candidates.jsonl"
+
+def _resolve_backends() -> dict:
+    """Fill OLLAMA_BASE_URL and friends from ~/.loci/backends.toml at run time.
+
+    Nothing listens on localhost:11434 on a scheduled host — the endpoint is
+    recorded in the config file that backends.py already reads, and until now
+    only the MCP launcher's own process environment carried it. Without this the
+    loop resolves the localhost default, every embedding step fails or skips, and
+    the log blames the cadence.
+
+    backends.load_env writes into os.environ, which is right for a real run and
+    wrong for a test process, so the values are captured, this process is put
+    back the way it was, and CHILD_ENV carries them to the children instead.
+    """
+    before = dict(os.environ)
+    try:
+        sys.path.insert(0, str(REPO / "mcp"))
+        import backends
+        resolved = backends.load_env(REPO)
+    except Exception as exc:  # never block a run on config resolution
+        print(f"[loop] backend resolution unavailable: {exc}")
+        resolved = {}
+    for key in resolved:
+        if key in before:
+            os.environ[key] = before[key]
+        else:
+            os.environ.pop(key, None)
+    CHILD_ENV.clear()
+    CHILD_ENV.update(resolved)
+    return resolved
+
 
 DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
 DEFAULT_FINDINGS = os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findings.jsonl")
@@ -400,7 +441,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Loci MLOps self-closing loop")
     ap.add_argument("--findings", default=DEFAULT_FINDINGS,
                     help="Glob for investigation findings.jsonl files")
-    ap.add_argument("--ollama", default=DEFAULT_OLLAMA)
+    ap.add_argument("--ollama", default=None,
+                    help="Ollama base URL. Default: $OLLAMA_BASE_URL, else ~/.loci/backends.toml, "
+                         "else http://localhost:11434")
     ap.add_argument("--min-new-runs", type=int, default=2,
                     help="Minimum new investigation runs before retraining (default: 2)")
     ap.add_argument("--min-new-pairs", type=int, default=200,
@@ -423,12 +466,19 @@ def main() -> int:
     args = ap.parse_args()
 
     FAILED_STEPS.clear()  # module-global; a second main() in one process must start clean
+    resolved = _resolve_backends()
+    if args.ollama is None:
+        args.ollama = (os.environ.get("OLLAMA_BASE_URL")
+                       or resolved.get("OLLAMA_BASE_URL")
+                       or "http://localhost:11434").rstrip("/")
 
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     state = _load_state()
 
     print(f"[loop] starting at {now_iso}")
+    if resolved:
+        print("[loop] resolved from backends.toml: " + ", ".join(sorted(resolved)))
     print(f"[loop] state: last_run={state['last_run']} dataset={state['last_dataset_size']} promotions={state['total_promotions']}")
 
     # ── 1. Ollama probe ────────────────────────────────────────────────────────
