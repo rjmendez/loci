@@ -23,12 +23,37 @@ mkdir -p "$STATE"
 
 [ -x "$PY" ] || { echo "mlops-loop: no interpreter at $PY" >&2; exit 1; }
 
+# RUN_TREE reaches `git reset --hard`, `git clean -fd` and `rm -rf`, and it comes
+# from the environment. A wrapper written to protect the working checkout must
+# not be one LOCI_MLOPS_TREE=$REPO turns into the thing that destroys it.
+case "$RUN_TREE" in
+  /*) ;;
+   *) echo "mlops-loop: LOCI_MLOPS_TREE must be an absolute path, got '$RUN_TREE'" >&2; exit 1 ;;
+esac
+RUN_TREE_RAW="$RUN_TREE"
+RUN_TREE="${RUN_TREE%/}"
+case "$RUN_TREE" in
+  "" | "/" | "$HOME" | "$REPO" | "$REPO"/*)
+    echo "mlops-loop: refusing to use '$RUN_TREE_RAW' as the run worktree — it is the" >&2
+    echo "            repo, inside it, \$HOME, or /; this path gets reset --hard and rm -rf" >&2
+    exit 1 ;;
+esac
+if [ -e "$RUN_TREE" ] && [ ! -e "$RUN_TREE/.git" ]; then
+  echo "mlops-loop: '$RUN_TREE' exists and is not a git worktree — refusing to remove it" >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$RUN_TREE")"
+
 git -C "$REPO" fetch -q origin main 2>/dev/null || \
   echo "mlops-loop: fetch failed, running against whatever the worktree has" >&2
 
-if [ -d "$RUN_TREE/.git" ] || [ -f "$RUN_TREE/.git" ]; then
-  git -C "$RUN_TREE" reset -q --hard origin/main
-  git -C "$RUN_TREE" clean -qfd
+if [ -e "$RUN_TREE/.git" ]; then
+  # A failed reset means the loop would run against an unknown revision, which is
+  # exactly the baseline guarantee this wrapper exists to provide. Fail instead.
+  git -C "$RUN_TREE" reset -q --hard origin/main || {
+    echo "mlops-loop: reset to origin/main failed in $RUN_TREE — not running" >&2; exit 1; }
+  git -C "$RUN_TREE" clean -qfd || {
+    echo "mlops-loop: clean failed in $RUN_TREE — not running" >&2; exit 1; }
 else
   rm -rf "$RUN_TREE"
   git -C "$REPO" worktree add -q --detach "$RUN_TREE" origin/main || {
@@ -42,7 +67,7 @@ rc=$?
 changed="$(git -C "$RUN_TREE" status --porcelain -- deep_think_loci/grounding/)"
 if [ -n "$changed" ]; then
   echo "mlops-loop: the run produced new grounding artifacts in $RUN_TREE"
-  echo "$changed" | sed 's/^/  /'
+  printf '%s\n' "$changed" | sed 's/^/  /'
   echo "mlops-loop: review and commit them deliberately; nothing was applied to $REPO"
 fi
 
