@@ -16,14 +16,41 @@ drop-in upgrade for when the corpus grows (high CV AUC = headroom).
 Usage:
   python3 build_grounding_dataset.py \
     --findings ~/.hermes/memory-sessions/dt-loci-*/findings.jsonl \
-    --out . [--ollama http://ollama.internal:11434/v1/embeddings]
+    --out . [--ollama http://ollama-host:11434/v1/embeddings]
 """
-import argparse, glob, itertools, json, os, random, re, urllib.request
+import argparse, glob, itertools, json, os, pathlib, random, re, urllib.request
 from collections import Counter
 import numpy as np
 
-EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
-DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://ollama.internal:11434").rstrip("/") + "/v1/embeddings"
+def _resolve_backends() -> None:
+    """Fill OLLAMA_BASE_URL/EMBED_MODEL from ~/.loci/backends.toml when unset.
+
+    Run standalone or from cron this inherits no MCP environment, and nothing
+    listens on ollama.internal or the localhost default. backends.py already
+    reads the config file that records the real endpoint; without this the run
+    dies at the first embedding call with a bare name-resolution error.
+
+    Called from main(), not on import: it writes to os.environ, which is right
+    for a run and wrong on import — a test that imports this module would
+    otherwise change what every other module in the process resolves."""
+    try:
+        import sys as _sys
+        _repo = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_repo / "mcp"))
+        import backends
+        backends.load_env(_repo)
+    except Exception:
+        pass  # a missing config is not a reason to refuse to run
+
+
+def _emb_model():
+    """Read at call time: _resolve_backends() runs after import."""
+    return os.environ.get("EMBED_MODEL") or "nomic-embed-text"
+
+
+def _default_ollama():
+    base = os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434"
+    return base.rstrip("/") + "/v1/embeddings"
 
 
 def topic_of(rec):
@@ -42,7 +69,8 @@ def topic_of(rec):
 def embed(texts, url):
     out = []
     for i in range(0, len(texts), 16):
-        body = json.dumps({"model": EMB_MODEL, "input": [t[:2000] for t in texts[i:i + 16]]}).encode()
+        body = json.dumps({"model": _emb_model(),
+                           "input": [t[:2000] for t in texts[i:i + 16]]}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         out += [d["embedding"] for d in json.loads(urllib.request.urlopen(req, timeout=60).read())["data"]]
     v = np.array(out, dtype=np.float32)
@@ -53,9 +81,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--findings", nargs="+", required=True, help="findings.jsonl glob(s)")
     ap.add_argument("--out", default=".")
-    ap.add_argument("--ollama", default=DEFAULT_OLLAMA, help="embeddings endpoint (default: $OLLAMA_BASE_URL/v1/embeddings)")
+    ap.add_argument("--ollama", default=None,
+                    help="embeddings endpoint (default: $OLLAMA_BASE_URL, else "
+                         "~/.loci/backends.toml, else localhost:11434, + /v1/embeddings)")
     ap.add_argument("--neg-ratio", type=int, default=2)
     a = ap.parse_args()
+    _resolve_backends()
+    a.ollama = a.ollama or _default_ollama()
     random.seed(0); np.random.seed(0)
 
     files = [f for pat in a.findings for f in glob.glob(pat)]
