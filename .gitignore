@@ -81,3 +81,16 @@ build/
 # git does not untrack them, which is the intended behaviour.
 .claude/workflows/
 investigation_store_decomposition_plan.md
+
+# MLOps loop runtime state. Rewritten every tick, so a cron run would otherwise
+# leave the tree dirty and invite a 5k-line dataset or a binary model into a
+# commit. The promoted live model under deep_think_loci/grounding/ stays tracked
+# on purpose — that one is the shipped artifact.
+mlops/loop_state.json
+mlops/loop_history.jsonl
+mlops/run_contrastive.sh
+mlops/grounding/.emb_cache.npz
+mlops/grounding/candidate.joblib
+mlops/grounding/train_metrics.json
+mlops/grounding/active_candidates.jsonl
+mlops/grounding/monitor_history.jsonl
