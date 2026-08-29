@@ -65,10 +65,13 @@ jobs:
     runs-on: [self-hosted, loci]
     timeout-minutes: 120
     needs: validate
-    # Only fire on self-hosted. On GitHub-hosted runners (no Ollama, no
-    # findings data) the validate job above is the full CI contribution.
-    # Remove the `if` condition when a self-hosted runner is registered.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    # Needs a [self-hosted, loci] runner with Ollama and the findings corpus.
+    # None is registered, so on `schedule` this job queued and was cancelled 66
+    # times between 2026-06-23 and 2026-08-28 — every nightly, never a step run.
+    # Manual dispatch only until a runner exists; add 'schedule' back then.
+    # The supported local path is cron on a box that has the corpus; see
+    # loop.py's docstring.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
 
     env:
       OLLAMA_BASE_URL: ${{ vars.OLLAMA_BASE_URL || 'http://localhost:11434' }}

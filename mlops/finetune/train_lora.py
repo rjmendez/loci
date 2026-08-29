@@ -27,6 +27,10 @@ import sys
 import textwrap
 
 
+
+BAKE_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_BAKE_TIMEOUT", "1800"))
+PROBE_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_PROBE_TIMEOUT", "120"))
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -101,7 +105,7 @@ def run_ollama_modelfile_backend(args: argparse.Namespace) -> None:
     print("[train] running: ollama create loci-tuned -f", modelfile_path)
     result = subprocess.run(
         ["ollama", "create", "loci-tuned", "-f", modelfile_path],
-        capture_output=False,
+        capture_output=False, timeout=BAKE_TIMEOUT_S,
     )
     if result.returncode != 0:
         print(f"[train] ollama create failed (exit {result.returncode})", file=sys.stderr)
@@ -111,7 +115,7 @@ def run_ollama_modelfile_backend(args: argparse.Namespace) -> None:
     probe = subprocess.run(
         ["ollama", "run", "loci-tuned",
          "What is the most important memory about authentication?"],
-        capture_output=False,
+        capture_output=False, timeout=PROBE_TIMEOUT_S,
     )
     if probe.returncode != 0:
         print(f"[train] probe run failed (exit {probe.returncode})", file=sys.stderr)
