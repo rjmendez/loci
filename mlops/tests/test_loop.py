@@ -94,7 +94,11 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "ACTIVE_CANDIDATES", mlops / "grounding" / "active_candidates.jsonl")
 
     runner = Runner()
-    monkeypatch.setattr(loop.subprocess, "run", runner)
+    # Patch _run, not subprocess.run: _run streams a live child through Popen, and
+    # what these tests are about is what the callers do with the result. _run's own
+    # bounding and streaming are covered against real children in
+    # test_loop_timeouts.py and test_loop_streaming.py.
+    monkeypatch.setattr(loop, "_run", runner)
 
     saved_path = list(sys.path)
     yield types.SimpleNamespace(
@@ -408,10 +412,13 @@ def test_retrain_propagates_malformed_metrics_json(env):
         loop._retrain("g", "o", False)
 
 
-def test_retrain_prints_last_1000_chars_of_stdout(env, capsys):
+def test_retrain_does_not_re_print_stdout_after_the_fact(env, capsys):
+    """It used to dump the last 1000 chars once train.py had exited, which is the
+    one moment the output is no longer useful. _run streams it live instead, so
+    printing it again here would only duplicate it."""
     env.run.set("train.py", FakeResult(0, stdout="Y" * 1500))
     loop._retrain("g", "o", False)
-    assert capsys.readouterr().out.count("Y") == 1000
+    assert capsys.readouterr().out.count("Y") == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

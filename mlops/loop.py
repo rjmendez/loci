@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -34,22 +35,79 @@ STEP_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_STEP_TIMEOUT", "3600"))
 CHILD_ENV: dict[str, str] = {}
 
 
-def _run(cmd, timeout: int | None = None):
-    """subprocess.run with a bound, plus whatever backends resolved for the children.
+def _child_label(cmd) -> str:
+    """The script being run, for prefixing its output in a merged log."""
+    for part in cmd[1:]:
+        if isinstance(part, str) and part.endswith(".py"):
+            return Path(part).stem
+    return Path(str(cmd[0])).stem
 
-    A hung child stalls the whole nightly, and a child that cannot see
-    OLLAMA_BASE_URL falls back to a localhost nothing listens on. The resolved
-    values are handed over here rather than written into this process's own
-    environment, so importing this module changes nothing for anyone else.
+
+def _run(cmd, timeout: int | None = None, stream: bool = True):
+    """Run a child with a bound, resolved backends, and its output echoed live.
+
+    Three things a nightly needs and subprocess.run does not give together.
+
+    A hung child stalls the whole run, so every call is bounded and a timeout
+    comes back as returncode 124 rather than an exception.
+
+    A child that cannot see OLLAMA_BASE_URL falls back to a localhost nothing
+    listens on, so CHILD_ENV carries what backends resolved. It is handed over
+    here rather than written into this process's own environment, so importing
+    this module changes nothing for anyone else.
+
+    And capture_output alone buffers everything until the child exits: train.py
+    prints which model it is fitting, and none of that reached this log until the
+    step was already over — 17 minutes of silence in the log cron actually mails
+    you. Output is streamed as it arrives AND captured, so callers that parse
+    result.stdout keep working. PYTHONUNBUFFERED is set because a child writing
+    to a pipe block-buffers by default, which would make the streaming a no-op.
     """
     limit = timeout or STEP_TIMEOUT_S
-    env = {**os.environ, **CHILD_ENV} if CHILD_ENV else None
+    env = {**os.environ, **CHILD_ENV}
+    env["PYTHONUNBUFFERED"] = "1"
+    if not stream:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=limit, env=env)
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout if isinstance(exc.stdout, str) else ""
+            return subprocess.CompletedProcess(cmd, 124, out,
+                                               f"timed out after {limit}s")
+
+    label = _child_label(cmd)
+    captured: dict[str, list[str]] = {"out": [], "err": []}
+
+    def drain(pipe, key, echo):
+        try:
+            for line in pipe:
+                captured[key].append(line)
+                if echo:
+                    print(f"  [{label}] {line.rstrip()}", flush=True)
+        finally:
+            pipe.close()
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1, env=env)
+    threads = [
+        threading.Thread(target=drain, args=(proc.stdout, "out", True), daemon=True),
+        threading.Thread(target=drain, args=(proc.stderr, "err", False), daemon=True),
+    ]
+    for t in threads:
+        t.start()
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=limit, env=env)
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout if isinstance(exc.stdout, str) else ""
-        return subprocess.CompletedProcess(cmd, 124, out,
-                                           f"timed out after {limit}s")
+        code = proc.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        code = 124
+    for t in threads:
+        t.join(timeout=5)
+    err = "".join(captured["err"])
+    if code == 124:
+        err = (err + f"\ntimed out after {limit}s").strip()
+    return subprocess.CompletedProcess(cmd, code, "".join(captured["out"]), err)
+
 
 REPO = Path(__file__).parent.parent
 MLOPS = REPO / "mlops"
@@ -236,7 +294,6 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
         cmd.append("--dry-run")
 
     result = _run(cmd)
-    print(result.stdout[-1000:])
     if result.returncode != 0:
         _fail("train.py", f"train.py failed: {_last_error_line(result.stderr)}")
         return None
@@ -264,7 +321,6 @@ def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
         cmd.append("--dry-run")
 
     result = _run(cmd)
-    print(result.stdout[-1000:])
     if result.returncode == 1:
         print("[loop] ALERT: canary drift detected")
     return {"exit_code": result.returncode, "stdout": result.stdout[-500:]}
@@ -285,7 +341,6 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
          "--traces", str(traces), "--out", str(sft), "--mode", "both"],
     ]:
         r = _run(cmd)
-        print(r.stdout[-500:])
         if r.returncode != 0:
             _fail("SFT bake", f"SFT step failed: {_last_error_line(r.stderr)}")
             return False
@@ -300,7 +355,6 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
             "--sft", str(sft), "--backend", "ollama-modelfile",
         ]
         r = _run(bake_cmd)
-        print(r.stdout[-500:])
         return r.returncode == 0
     return True
 
@@ -372,14 +426,12 @@ def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
                "--dataset", str(DATASET), "--ollama", ollama,
                "--anchor", str(anchor), "--build-anchor"]
         result = _run(cmd)
-        print(result.stdout[-300:])
         return {"built_anchor": True}
     out_path = MLOPS / "embedding" / "drift_result.json"
     cmd = [sys.executable, str(drift_script),
            "--dataset", str(DATASET), "--ollama", ollama,
            "--anchor", str(anchor), "--out", str(out_path)]
     result = _run(cmd)
-    print(result.stdout[-300:])
     if result.returncode == 1:
         print("[loop] ALERT: embedding drift detected — scheduling embedding fine-tune")
         if not dry_run:
@@ -407,7 +459,6 @@ def _run_active_learn(ollama: str) -> dict:
          "--out", str(ACTIVE_CANDIDATES),
          "--ollama", ollama],
     )
-    print(result.stdout[-300:])
     return {"exit_code": result.returncode}
 
 
