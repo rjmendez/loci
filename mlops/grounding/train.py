@@ -33,6 +33,15 @@ def _resolve_backends() -> None:
         pass  # a missing config is not a reason to refuse to run
 
 
+# Folds are independent, so they run in parallel. Serial 10-fold
+# GradientBoosting over 12,684 x 1,540 took over 45 minutes on a 28-core box —
+# long enough that the loop's own 3600s step bound would cut the nightly before
+# it finished. Measured 5.2x here (not 10x: GBC is single-threaded per fold, the
+# folds do not balance evenly, and BLAS threads contend). Parallelism lives at
+# the CV level only; giving the estimators n_jobs as well just oversubscribes.
+CV_JOBS = int(os.environ.get("LOCI_TRAIN_CV_JOBS", "-1"))
+
+
 def _emb_model():
     """Read at call time: _resolve_backends() runs after import."""
     return os.environ.get("EMBED_MODEL") or "nomic-embed-text"
@@ -352,12 +361,14 @@ def main():
         # matrix is 2,000 trees x 10 folds and runs for tens of minutes; printing
         # only on completion leaves an unattended run silent and indistinguishable
         # from hung.
-        print(f"  {name}: fitting 10 folds on {X.shape[0]}x{X.shape[1]}...", flush=True)
+        print(f"  {name}: fitting 10 folds on {X.shape[0]}x{X.shape[1]} "
+              f"(n_jobs={CV_JOBS})...", flush=True)
         t0 = time.monotonic()
         proba = cross_val_predict(
             clf, X, labels,
             cv=StratifiedKFold(n_splits=10, shuffle=True, random_state=42),
             method="predict_proba",
+            n_jobs=CV_JOBS,
         )[:, 1]
         elapsed = time.monotonic() - t0
         per_fold_f1 = []
