@@ -29,7 +29,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-STEP_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_STEP_TIMEOUT", "3600"))
+def _env_int(name: str, default: int) -> int:
+    """Env-parsed int that refuses to crash the nightly at import. A typo in a
+    cron line should not take the job down with a traceback and no context."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"[loop] {name}={raw!r} is not an integer — using {default}")
+        return default
+    if val <= 0:
+        print(f"[loop] {name}={val} is not positive — using {default}")
+        return default
+    return val
+
+
+STEP_TIMEOUT_S = _env_int("LOCI_MLOPS_STEP_TIMEOUT", 3600)
 
 
 CHILD_ENV: dict[str, str] = {}
@@ -102,7 +119,11 @@ def _run(cmd, timeout: int | None = None, stream: bool = True):
         proc.wait()
         code = 124
     for t in threads:
-        t.join(timeout=5)
+        # No timeout. Returning while a drain thread still holds a pipe means log
+        # lines land after the caller has moved on, interleaved into the next
+        # step's output. The pipes are closed once the process is reaped, so
+        # these threads end on their own.
+        t.join()
     err = "".join(captured["err"])
     if code == 124:
         err = (err + f"\ntimed out after {limit}s").strip()
