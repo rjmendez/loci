@@ -6,6 +6,7 @@ mails you was silent for the 17 minutes the step actually took, which is
 indistinguishable from a hang. These run real children, because the defect was
 in the plumbing, not in a caller.
 """
+import pathlib
 import subprocess
 import sys
 import threading
@@ -14,7 +15,7 @@ import time
 
 import pytest
 
-sys.path.insert(0, __file__.rsplit("/mlops/", 1)[0])
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 from mlops import loop  # noqa: E402
 
 

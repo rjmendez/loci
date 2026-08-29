@@ -80,3 +80,14 @@ def test_last_error_line_extracts_the_exception_not_a_row_of_carets():
     assert "^" not in got
     assert loop._last_error_line("") == "no stderr"
     assert loop._last_error_line("   \n  \n") == "no stderr"
+
+
+def test_env_parsed_ints_do_not_crash_at_import(monkeypatch):
+    """int(os.environ[...]) at module level raises before argparse has run, so a
+    typo in a cron line takes the nightly down with a traceback and no context."""
+    loop = _load()
+    for bad in ("not-a-number", "", "0", "-5", "3.5"):
+        monkeypatch.setenv("LOCI_MLOPS_STEP_TIMEOUT", bad)
+        assert loop._env_int("LOCI_MLOPS_STEP_TIMEOUT", 3600) == 3600
+    monkeypatch.setenv("LOCI_MLOPS_STEP_TIMEOUT", "120")
+    assert loop._env_int("LOCI_MLOPS_STEP_TIMEOUT", 3600) == 120

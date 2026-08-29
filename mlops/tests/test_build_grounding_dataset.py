@@ -22,6 +22,7 @@ BUILDER = REPO / "deep_think_loci" / "grounding" / "build_grounding_dataset.py"
 @pytest.fixture
 def builder():
     spec = importlib.util.spec_from_file_location("bgd", BUILDER)
+    assert spec and spec.loader, f"cannot load the builder from {BUILDER}"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
