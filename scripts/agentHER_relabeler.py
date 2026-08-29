@@ -56,7 +56,8 @@ def get_qdrant_key():
         return key
     # Try loading from known env files
     for env_path in [
-        os.path.expanduser(os.environ.get("LOCI_ENV_FILE", "~/.hermes/.env")),
+        os.path.expanduser(os.environ.get("LOCI_ENV_FILE")
+                           or os.environ.get("HERMES_ENV_FILE") or "~/.hermes/.env"),
         os.path.expanduser("~/.claude/settings.json"),
     ]:
         if env_path.endswith(".json") and os.path.exists(env_path):

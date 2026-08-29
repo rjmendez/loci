@@ -7,7 +7,8 @@ Run standalone or from cron.
 import sqlite3, json, hashlib, sys, time, subprocess, os, base64, urllib.request
 
 # Load .env before anything else — override path with LOCI_ENV_FILE
-_ENV_FILE = os.path.expanduser(os.environ.get("LOCI_ENV_FILE", "~/.hermes/.env"))
+_ENV_FILE = os.path.expanduser(os.environ.get("LOCI_ENV_FILE")
+                             or os.environ.get("HERMES_ENV_FILE") or "~/.hermes/.env")
 if os.path.exists(_ENV_FILE):
     with open(_ENV_FILE) as _env_fh:
         for _line in _env_fh:
