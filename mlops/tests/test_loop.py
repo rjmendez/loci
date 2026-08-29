@@ -324,14 +324,22 @@ def test_rebuild_dataset_argv_appends_v1_embeddings_to_ollama(env):
                        "--ollama", "http://o:1/v1/embeddings"]
 
 
-def test_rebuild_dataset_failure_returns_current_size_and_prints_stderr_tail(env, capsys):
+def test_rebuild_dataset_failure_returns_current_size_and_prints_the_exception(env, capsys):
+    """The last 500 chars of a traceback land mid-frame, so the log used to read
+    "dataset rebuild failed: ^^^^^^^^^^". Report the exception line instead."""
     (env.repo / "deep_think_loci" / "grounding" / "build_grounding_dataset.py").write_text("")
     write_dataset(env, 7)
-    env.run.set("build_grounding_dataset.py", FakeResult(2, stderr="X" * 900))
+    tb = ("Traceback (most recent call last):\n"
+          '  File "/usr/lib/python3.12/urllib/request.py", line 1347, in do_open\n'
+          "    raise URLError(err)\n"
+          "    ^^^^^^^^^^^^^^^^^^^\n"
+          "urllib.error.URLError: <urlopen error [Errno 111] Connection refused>\n")
+    env.run.set("build_grounding_dataset.py", FakeResult(2, stderr=tb))
     assert loop._rebuild_dataset("g", "http://o") == 7
     out = capsys.readouterr().out
     assert "dataset rebuild failed" in out
-    assert out.count("X") == 500
+    assert "urllib.error.URLError" in out
+    assert "^^^" not in out
 
 
 def test_rebuild_dataset_success_reports_post_run_size(env, capsys):
@@ -1147,7 +1155,8 @@ def test_main_history_record_shape(mainenv):
     e.main()
     rec = read_history(e)[0]
     assert set(rec) == {"run_at", "new_runs", "dataset_size", "retrained",
-                        "promoted", "train_metrics", "dry_run"}
+                        "promoted", "train_metrics", "dry_run", "failed_steps"}
+    assert rec["failed_steps"] == []
     assert rec["new_runs"] == 2
     assert rec["dataset_size"] == 42
     assert rec["retrained"] is False
@@ -1259,7 +1268,7 @@ def test_main_sft_skipped_within_cadence(mainenv, capsys):
     seed_state(e, last_sft_bake=recent)
     e.main("--sft-every", "7")
     assert e.calls["sft"] == []
-    assert "SFT bake skipped (last was 3d ago, cadence=7d)" in capsys.readouterr().out
+    assert "SFT bake skipped — not due (3d ago, cadence 7d)" in capsys.readouterr().out
     assert state_of(e)["last_sft_bake"] == recent
 
 
