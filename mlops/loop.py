@@ -67,9 +67,11 @@ def _last_error_line(stderr: str) -> str:
     return lines[-1][:300]
 
 
-def _fail(step: str, detail: str) -> None:
+def _fail(step: str, line: str) -> None:
+    """Record a step as failed and print its message. The step name is the ledger
+    key; the message stays whatever the call site already said."""
     FAILED_STEPS.append(step)
-    print(f"[loop] {step} failed: {detail}")
+    print(f"[loop] {line}")
 
 
 def _skip_reason(ollama_ok: bool, days_ago: int, cadence: int, ollama: str) -> str:
@@ -161,7 +163,7 @@ def _rebuild_dataset(findings_glob: str, ollama: str) -> int:
          "--ollama", f"{ollama}/v1/embeddings"],
     )
     if result.returncode != 0:
-        _fail("dataset rebuild", _last_error_line(result.stderr))
+        _fail("dataset rebuild", f"dataset rebuild failed: {_last_error_line(result.stderr)}")
         return _current_dataset_size()
 
     size = _current_dataset_size()
@@ -195,7 +197,7 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     result = _run(cmd)
     print(result.stdout[-1000:])
     if result.returncode != 0:
-        _fail("train.py", _last_error_line(result.stderr))
+        _fail("train.py", f"train.py failed: {_last_error_line(result.stderr)}")
         return None
 
     if metrics_path.exists():
@@ -244,7 +246,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         r = _run(cmd)
         print(r.stdout[-500:])
         if r.returncode != 0:
-            _fail("SFT bake", _last_error_line(r.stderr))
+            _fail("SFT bake", f"SFT step failed: {_last_error_line(r.stderr)}")
             return False
 
     if not sft.exists() or sft.stat().st_size < 100:
@@ -273,7 +275,7 @@ def _run_decay(db_path: str, dry_run: bool) -> dict:
               f"mean_retention={stats.get('mean_retention', 0):.3f}")
         return stats
     except Exception as exc:
-        _fail("decay", str(exc))
+        _fail("decay", f"decay step failed: {exc}")
         return {}
 
 
@@ -287,7 +289,7 @@ def _run_live_evo(db_path: str, hook_state: str, dry_run: bool) -> dict:
               f"correlated={stats.get('n_correlated')} penalized={stats.get('n_penalized')}")
         return stats
     except Exception as exc:
-        _fail("live_evo", str(exc))
+        _fail("live_evo", f"live_evo step failed: {exc}")
         return {}
 
 
@@ -312,7 +314,7 @@ def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
             print("[loop] ALERT: rollback recommended — check monitor_history.jsonl")
         return result
     except Exception as exc:
-        _fail("monitor", str(exc))
+        _fail("monitor", f"monitor step failed: {exc}")
         return {}
 
 
@@ -419,6 +421,8 @@ def main() -> int:
     ap.add_argument("--active-learn-every", type=int, default=7,
                     help="Generate active learning candidates every N days (default: 7)")
     args = ap.parse_args()
+
+    FAILED_STEPS.clear()  # module-global; a second main() in one process must start clean
 
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
