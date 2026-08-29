@@ -27,6 +27,20 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+STEP_TIMEOUT_S = int(os.environ.get("LOCI_MLOPS_STEP_TIMEOUT", "3600"))
+
+
+def _run(cmd, timeout: int | None = None):
+    """subprocess.run with a bound. A hung child stalls the whole nightly."""
+    limit = timeout or STEP_TIMEOUT_S
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout if isinstance(exc.stdout, str) else ""
+        return subprocess.CompletedProcess(cmd, 124, out,
+                                           f"timed out after {limit}s")
+
 REPO = Path(__file__).parent.parent
 MLOPS = REPO / "mlops"
 GROUNDING_DIR = REPO / "deep_think_loci" / "grounding"
@@ -105,12 +119,11 @@ def _rebuild_dataset(findings_glob: str, ollama: str) -> int:
         print("[loop] build_grounding_dataset.py not found — skipping rebuild")
         return _current_dataset_size()
 
-    result = subprocess.run(
+    result = _run(
         [sys.executable, str(builder),
          "--findings", findings_glob,
          "--out", str(GROUNDING_DIR),
          "--ollama", f"{ollama}/v1/embeddings"],
-        capture_output=True, text=True
     )
     if result.returncode != 0:
         print(f"[loop] dataset rebuild failed:\n{result.stderr[-500:]}")
@@ -144,7 +157,7 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if dry_run:
         cmd.append("--dry-run")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run(cmd)
     print(result.stdout[-1000:])
     if result.returncode != 0:
         print(f"[loop] train.py failed:\n{result.stderr[-500:]}")
@@ -172,7 +185,7 @@ def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if dry_run:
         cmd.append("--dry-run")
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run(cmd)
     print(result.stdout[-1000:])
     if result.returncode == 1:
         print("[loop] ALERT: canary drift detected")
@@ -193,7 +206,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         [sys.executable, str(MLOPS / "finetune" / "format_sft.py"),
          "--traces", str(traces), "--out", str(sft), "--mode", "both"],
     ]:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = _run(cmd)
         print(r.stdout[-500:])
         if r.returncode != 0:
             print(f"[loop] SFT step failed: {r.stderr[-300:]}")
@@ -208,7 +221,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
             sys.executable, str(MLOPS / "finetune" / "train_lora.py"),
             "--sft", str(sft), "--backend", "ollama-modelfile",
         ]
-        r = subprocess.run(bake_cmd, capture_output=True, text=True)
+        r = _run(bake_cmd)
         print(r.stdout[-500:])
         return r.returncode == 0
     return True
@@ -280,14 +293,14 @@ def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
         cmd = [sys.executable, str(drift_script),
                "--dataset", str(DATASET), "--ollama", ollama,
                "--anchor", str(anchor), "--build-anchor"]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run(cmd)
         print(result.stdout[-300:])
         return {"built_anchor": True}
     out_path = MLOPS / "embedding" / "drift_result.json"
     cmd = [sys.executable, str(drift_script),
            "--dataset", str(DATASET), "--ollama", ollama,
            "--anchor", str(anchor), "--out", str(out_path)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run(cmd)
     print(result.stdout[-300:])
     if result.returncode == 1:
         print("[loop] ALERT: embedding drift detected — scheduling embedding fine-tune")
@@ -309,13 +322,12 @@ def _run_active_learn(ollama: str) -> dict:
     script = MLOPS / "grounding" / "active_learn.py"
     if not script.exists():
         return {}
-    result = subprocess.run(
+    result = _run(
         [sys.executable, str(script),
          "--model", str(LIVE_MODEL),
          "--dataset", str(DATASET),
          "--out", str(ACTIVE_CANDIDATES),
          "--ollama", ollama],
-        capture_output=True, text=True,
     )
     print(result.stdout[-300:])
     return {"exit_code": result.returncode}
