@@ -882,6 +882,10 @@ def mainenv(env, monkeypatch):
             return ret
         return f
 
+    # Hermetic: without this the suite reads the developer's ~/.loci/backends.toml
+    # and the asserted Ollama default becomes whatever that machine has configured.
+    monkeypatch.setattr(loop, "_resolve_backends", lambda: {})
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.setattr(loop, "_ollama_ok", lambda base: rv["ollama_ok"])
     monkeypatch.setattr(loop, "_discover_runs", lambda g, seen: list(rv["new_runs"]))
     monkeypatch.setattr(loop, "_rebuild_dataset", lambda g, o: (
