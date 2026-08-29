@@ -183,6 +183,67 @@ def memory_dir() -> str:
             or os.environ.get("LOCI_MEMORY_DIR") or os.environ.get("HERMES_MEMORY_DIR", "") or "")
 
 
+def load_env(repo: "Path | None" = None) -> dict:
+    """Put resolved backends into os.environ so unattended entry points can reach them.
+
+    A cron or CI run inherits none of the MCP launcher's environment, and on this
+    host the only record of the Ollama and Qdrant endpoints lives inside that
+    launcher's process. Without this, a scheduled job resolves the localhost
+    default, finds nothing listening, and reports every backend step "skipped" —
+    which reads as a schedule decision rather than a missing endpoint.
+
+    Precedence is unchanged: anything already in the environment wins, then the
+    repo .env files, then ~/.loci/backends.toml. Returns only what it set, so a
+    caller can log what it had to fill in. Also propagates to child processes,
+    which is what mlops/loop.py depends on.
+    """
+    root = Path(repo) if repo else Path(__file__).resolve().parent.parent
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(root / ".env")
+        load_dotenv(root / "mcp" / ".env", override=True)
+    except Exception as exc:
+        logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
+                       "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
+
+    resolved: dict = {}
+    if not os.environ.get("QDRANT_URL"):
+        try:
+            url, key = qdrant()
+            if url:
+                os.environ["QDRANT_URL"] = resolved["QDRANT_URL"] = url
+                if key and not os.environ.get("QDRANT_API_KEY"):
+                    os.environ["QDRANT_API_KEY"] = key
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Qdrant: %r", exc)
+
+    if not os.environ.get("OLLAMA_BASE_URL"):
+        try:
+            url = ollama_url()
+            if url:
+                os.environ["OLLAMA_BASE_URL"] = resolved["OLLAMA_BASE_URL"] = url
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Ollama: %r", exc)
+
+    if not os.environ.get("EMBED_MODEL"):
+        try:
+            model = embed_model()
+            if model:
+                os.environ["EMBED_MODEL"] = resolved["EMBED_MODEL"] = model
+        except Exception as exc:
+            logger.warning("load_env: could not resolve the embed model: %r", exc)
+
+    # backends.toml is stdlib tomllib, so the setting that protects the corpus needs no import.
+    if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
+        try:
+            days = _cfg("qdrant", "retention_days", None)
+            if days is not None:
+                os.environ["LOCI_QDRANT_RETENTION_DAYS"] = resolved["LOCI_QDRANT_RETENTION_DAYS"] = str(days)
+        except Exception as exc:
+            logger.warning("load_env: could not resolve retention: %r", exc)
+    return resolved
+
+
 def _reset_cache() -> None:
     """Test hook: clear memoized resolutions (env/config may have changed)."""
     for fn in (_config, ollama_url, vllm_url):

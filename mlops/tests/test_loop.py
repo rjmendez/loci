@@ -1417,11 +1417,13 @@ def test_main_default_thresholds(mainenv, capsys):
 
 def test_main_argparse_defaults(mainenv, monkeypatch):
     captured = {}
+    namespaces = []
     real_parse = loop.argparse.ArgumentParser.parse_args
 
     def spy(self, *a, **k):
         ns = real_parse(self, *a, **k)
         captured.update(vars(ns))
+        namespaces.append(ns)
         return ns
 
     monkeypatch.setattr(loop.argparse.ArgumentParser, "parse_args", spy)
@@ -1435,7 +1437,10 @@ def test_main_argparse_defaults(mainenv, monkeypatch):
     assert captured["dry_run"] is False
     assert captured["force"] is False
     assert captured["findings"] == loop.DEFAULT_FINDINGS
-    assert captured["ollama"] == loop.DEFAULT_OLLAMA
+    # --ollama parses as None and is resolved after, so the config file gets a say;
+    # an import-time default would have been fixed before backends.toml was read.
+    assert captured["ollama"] is None
+    assert namespaces[0].ollama, "main() must fill in an Ollama URL"
     assert captured["db"] == loop.DEFAULT_DB
     assert captured["hook_state"] == loop.DEFAULT_HOOK_STATE
 
