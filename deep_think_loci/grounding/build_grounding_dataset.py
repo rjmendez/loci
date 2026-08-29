@@ -59,7 +59,14 @@ def main():
     random.seed(0); np.random.seed(0)
 
     files = [f for pat in a.findings for f in glob.glob(pat)]
-    findings = []
+    # findings.jsonl is a mixed log: alongside real findings it carries text-less
+    # `access` rows, and one id can appear many times. Keeping them produced a
+    # dataset that was 97% duplicate rows, 69% of it a single claim=""/evidence=""
+    # pair labelled positive, because two empty strings embed identically and
+    # score cos=1.0. Take one row per id — the first with usable text — and drop
+    # the rest before anything is embedded or paired.
+    rows = seen = 0
+    by_id = {}
     for f in files:
         inv = f.split("/")[-2]
         for line in open(f, errors="ignore"):
@@ -67,10 +74,21 @@ def main():
                 r = json.loads(line)
             except Exception:
                 continue
-            findings.append({"id": r.get("id"), "text": (r.get("text") or "")[:2000],
-                             "topic": topic_of(r), "derived_from": r.get("derived_from") or [], "inv": inv})
-    by_id = {x["id"]: x for x in findings}
-    print("findings:", len(findings), "topics:", dict(Counter(x["topic"] for x in findings)))
+            rows += 1
+            fid, text = r.get("id"), (r.get("text") or "").strip()[:2000]
+            if not fid or not text:
+                continue
+            seen += 1
+            if fid in by_id:
+                continue
+            by_id[fid] = {"id": fid, "text": text, "topic": topic_of(r),
+                          "derived_from": r.get("derived_from") or [], "inv": inv}
+    findings = list(by_id.values())
+    if not findings:
+        raise SystemExit(f"no usable findings in {len(files)} file(s): "
+                         f"{rows} rows, none with both an id and text")
+    print(f"findings: {len(findings)} (from {rows} rows, {rows - seen} text-less or id-less, "
+          f"{seen - len(findings)} duplicate ids) topics: {dict(Counter(x['topic'] for x in findings))}")
 
     E = embed([x["text"] for x in findings], a.ollama)
     emb = {findings[i]["id"]: E[i] for i in range(len(findings))}
