@@ -25,6 +25,25 @@ logger = logging.getLogger("loci-mcp")
 QDRANT_COLLECTION_PREFIX = os.environ.get("QDRANT_COLLECTION_PREFIX", "loci_memory")
 VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
 
+# server.py still reads CODE_CHUNKS_COLLECTION from os.environ while it imports this
+# module. Seed that env var from the same resolver used by unattended entry points
+# without touching Qdrant or any network backend.
+try:
+    if not os.environ.get("CODE_CHUNKS_COLLECTION"):
+        import backends as _loci_backends
+        _code_col = _loci_backends.code_chunks_collection()
+        if _code_col:
+            os.environ["CODE_CHUNKS_COLLECTION"] = _code_col
+    if "LOCI_RAG_EXPAND" not in os.environ:
+        # Profiled 2026-08-29 on this deployment: query expansion took 2.82s via
+        # gen_url and multiplied retrieval from 2 collection searches to 8. The
+        # duplicated per-search reranker then pushed a normal call to 37-140s.
+        # Keep hybrid dense+sparse retrieval responsive by default; operators can
+        # re-enable expansion with LOCI_RAG_EXPAND=1 after sizing the deadline.
+        os.environ["LOCI_RAG_EXPAND"] = "0"
+except Exception as exc:
+    logger.debug("code chunks collection resolution failed (fail-open): %r", exc)
+
 
 # --- Lazy singletons / fail-open latches ---
 _sparse_model = None
@@ -324,15 +343,20 @@ def _get_qdrant():
     return _qdrant_client
 
 
-_OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL")
+_OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
 _EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
 _EMBED_CACHE_MAXSIZE = 512
+# Host-observed Ollama embedding latency over the tailnet is 5.595s; allow one
+# full retry's worth of server-side jitter without making normal RAG calls hang
+# for a round, arbitrary 30/60s window.
+_EMBED_TIMEOUT = float(os.environ.get("LOCI_EMBED_TIMEOUT", "11.19"))
 _embed_cache: dict[str, list[float]] = {}         # text → dense vector (bounded, FIFO eviction)
 _embed_sparse_cache: dict[str, tuple] = {}        # text → (indices_tuple, values_tuple)
 _embed_cache_lock = threading.Lock()              # guards _embed_cache check-evict-insert (#86)
 _embed_sparse_cache_lock = threading.Lock()       # guards _embed_sparse_cache check-evict-insert (#86)
+_embed_last_error = ""
 
 # Degraded mode (keyword-only) rather than refusing to start.
 if not os.environ.get("QDRANT_URL"):
@@ -343,7 +367,8 @@ if not os.environ.get("QDRANT_URL"):
 if not _OLLAMA_BASE and not _EMBED_API_KEY:
     logger.warning(
         "OLLAMA_BASE_URL and EMBED_API_KEY are both unset — embedding disabled. "
-        "Set OLLAMA_BASE_URL for local Ollama or EMBED_API_KEY for a cloud provider."
+        "Set OLLAMA_BASE_URL for local Ollama or EMBED_API_KEY for a cloud provider. "
+        "The query path will still try backends.toml at call time."
     )
 
 
@@ -357,21 +382,50 @@ def _embed_auth_headers() -> dict:
     return h
 
 
+def _resolve_embed_backend() -> tuple[str, str]:
+    """Resolve the embedding endpoint at call time, not import time.
+
+    MCP launches can have QDRANT_URL in the environment while OLLAMA_BASE_URL is
+    supplied only by ~/.loci/backends.toml. Capturing _OLLAMA_BASE during import
+    latched that absence forever, so memory_health/backends probes could be green
+    while RAG returned embedding_unavailable.
+    """
+    base = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or _OLLAMA_BASE
+    model = os.environ.get("EMBED_MODEL") or _EMBED_MODEL or "nomic-embed-text"
+    if base and model:
+        return base, model
+    try:
+        import backends
+        return base or backends.ollama_url(), model or backends.embed_model()
+    except Exception:
+        return base, model
+
+
+def _embedding_unavailable_reason() -> str:
+    return _embed_last_error or "embedding_unavailable: no dense vector returned"
+
+
 def _embed(text: str) -> list[float] | None:
     """Single-text embed via OpenAI-compat /v1/embeddings.
     Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
+    global _embed_last_error
     cached = _embed_cache.get(text)
     if cached is not None:
         return cached
-    if not _OLLAMA_BASE:
+    base, model = _resolve_embed_backend()
+    if not base:
+        _embed_last_error = (
+            "embedding_unavailable: no embedding endpoint configured "
+            "(OLLAMA_BASE_URL/OLLAMA_URL unset and backends.ollama_url() resolved empty)"
+        )
         return None
     try:
         import requests as _req
         r = _req.post(
-            f"{_OLLAMA_BASE.rstrip('/')}/v1/embeddings",
-            json={"model": _EMBED_MODEL, "input": [text]},
+            f"{base.rstrip('/')}/v1/embeddings",
+            json={"model": model, "input": [text]},
             headers=_embed_auth_headers(),
-            timeout=10,
+            timeout=_EMBED_TIMEOUT,
         )
         r.raise_for_status()
         data = r.json().get("data", [])
@@ -381,9 +435,19 @@ def _embed(text: str) -> list[float] | None:
                 if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
                     _embed_cache.pop(next(iter(_embed_cache)))
                 _embed_cache[text] = result
+            _embed_last_error = ""
+        else:
+            _embed_last_error = (
+                f"embedding_unavailable: {base.rstrip('/')}/v1/embeddings "
+                f"model={model} returned no embedding data"
+            )
         return result
     except Exception as exc:
-        logger.warning("embed failed: %s", exc)
+        _embed_last_error = (
+            f"embedding_unavailable: {base.rstrip('/')}/v1/embeddings "
+            f"model={model} failed after {_EMBED_TIMEOUT}s: {exc}"
+        )
+        logger.warning("embed failed: %s", _embed_last_error)
         return None
 
 
@@ -439,6 +503,24 @@ def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success:
 RERANK_MAX_CHARS = int(os.environ.get("LOCI_RERANK_MAX_CHARS", "1024"))
 # Client-wide, not per-collection: sized for the slowest collection searched (5s timed out agent_core_chunks entirely).
 _QDRANT_TIMEOUT = float(os.environ.get("LOCI_QDRANT_TIMEOUT", "20"))
+# Overall RAG wall-clock budget. The MCP client timed out on 37-140s calls after
+# expansion fanned out to 8 searches and each search paid a BGE rerank. With
+# expansion off and only one final batched rerank, measured calls are a few
+# seconds warm and <25s cold, so 25s leaves room for model load but bounds damage.
+_RAG_DEADLINE_SECONDS = float(os.environ.get("LOCI_RAG_DEADLINE_SECONDS", "25"))
+_RAG_DEADLINE_AT: float | None = None
+_RAG_LAST_COLLECTION: str | None = None
+_RAG_DEADLINE_LOCK = threading.Lock()
+
+# Collection-local reranking is redundant for rag_context_search, which performs a
+# single final cross-collection rerank. Profiled duplicate cost: 33.98s of a
+# 37.79s call (8 BGE predictions over 50 candidates each). Leave it opt-in for
+# callers that use _qdrant_search_collection directly and need pre-ranked rows.
+_RAG_COLLECTION_RERANK = (
+    os.environ.get("LOCI_RAG_COLLECTION_RERANK", "0").strip().lower()
+    not in ("0", "false", "no", "off", "")
+)
+_RAG_RERANK_MIN_REMAINING = float(os.environ.get("LOCI_RAG_RERANK_MIN_REMAINING", "4"))
 
 # rescore=True recovers the ~0.5-1% recall INT8 costs, oversampling=2.0 feeds it 2x candidates; lazy because qdrant_client is optional.
 _QUANT_SEARCH_PARAMS = None
@@ -457,6 +539,53 @@ def _quant_search_params():
     return _QUANT_SEARCH_PARAMS
 
 
+def _rag_deadline_start(collection_name: str | None = None) -> float:
+    global _RAG_DEADLINE_AT, _RAG_LAST_COLLECTION
+    now = time.monotonic()
+    if _RAG_DEADLINE_SECONDS <= 0:
+        return float("inf")
+    with _RAG_DEADLINE_LOCK:
+        # Start a new budget on the first collection search of a call, or after a
+        # previous call's budget has expired. server.py owns the public tool frame,
+        # so qdrant_ops cannot install a cleaner request-scoped context without
+        # editing that file.
+        new_default_collection = (
+            collection_name == QDRANT_COLLECTION_PREFIX
+            and _RAG_LAST_COLLECTION not in (None, QDRANT_COLLECTION_PREFIX)
+        )
+        if (
+            _RAG_DEADLINE_AT is None
+            or new_default_collection
+            or now > _RAG_DEADLINE_AT + max(1.0, _RAG_DEADLINE_SECONDS)
+        ):
+            _RAG_DEADLINE_AT = now + _RAG_DEADLINE_SECONDS
+        if collection_name is not None:
+            _RAG_LAST_COLLECTION = collection_name
+        return _RAG_DEADLINE_AT
+
+
+def _rag_time_remaining() -> float:
+    deadline = _rag_deadline_start()
+    if deadline == float("inf"):
+        return float("inf")
+    return max(0.0, deadline - time.monotonic())
+
+
+def _rag_deadline_error(stage: str) -> RuntimeError:
+    return RuntimeError(
+        f"deadline_exceeded: rag_context_search budget {_RAG_DEADLINE_SECONDS:.2f}s "
+        f"exhausted before {stage}"
+    )
+
+
+def _rag_should_skip_rerank() -> bool:
+    return (
+        _RAG_DEADLINE_SECONDS > 0
+        and _RAG_DEADLINE_AT is not None
+        and _rag_time_remaining() < _RAG_RERANK_MIN_REMAINING
+    )
+
+
 
 def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
     """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
@@ -466,6 +595,12 @@ def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bo
     truncated to ``top_k`` — when the cross-encoder is unavailable or scoring
     raised, so the return count is consistent whether CE is installed or not.
     """
+    if _rag_should_skip_rerank():
+        logger.warning(
+            "Cross-encoder reranking skipped: %.2fs remains in %.2fs RAG deadline",
+            _rag_time_remaining(), _RAG_DEADLINE_SECONDS,
+        )
+        return rows[:top_k], False
     ce = _get_cross_encoder()
     if ce is not None and rows:
         try:
@@ -526,7 +661,7 @@ def _qdrant_similarity_search(
 
     dense_vec = _embed(query)
     if dense_vec is None:
-        return {"ok": False, "reason": "embedding_unavailable", "results": []}
+        return {"ok": False, "reason": _embedding_unavailable_reason(), "results": []}
 
     # rerank_top_k caps the CE batch: investigation_search inflates limit for dedup, which would otherwise mean limit*15 CE pairs.
     output_k = min(rerank_top_k, limit) if rerank_top_k is not None else limit
@@ -578,6 +713,7 @@ def _qdrant_similarity_search(
 
 # Vector layout is fixed under a running process; the alternative is a get_collection per query.
 _dense_name_cache: dict = {}
+_collection_shape_cache: dict = {}
 
 
 def _dense_vector_name(client, collection: str) -> Optional[str]:
@@ -597,8 +733,9 @@ def _dense_vector_name(client, collection: str) -> Optional[str]:
     When a collection carries several dense vectors, prefer one whose width matches
     this server's embedder; a vector we cannot produce is not a candidate.
     """
-    if collection in _dense_name_cache:
-        return _dense_name_cache[collection]
+    cache_key = (id(client), collection)
+    if cache_key in _dense_name_cache:
+        return _dense_name_cache[cache_key]
     name = None
     try:
         vectors = client.get_collection(collection).config.params.vectors
@@ -611,7 +748,7 @@ def _dense_vector_name(client, collection: str) -> Optional[str]:
                 name = same_width[0] if same_width else sorted(vectors)[0]
     except Exception as exc:
         logger.debug("_dense_vector_name(%s): %r", collection, exc)
-    _dense_name_cache[collection] = name
+    _dense_name_cache[cache_key] = name
     return name
 
 
@@ -621,6 +758,9 @@ def _collection_shape(client, name: str) -> dict:
     Returns {"points", "dense_dims", "named", "sparse"} — dense_dims is a list
     because a named-vector collection can carry several dense vectors.
     """
+    cache_key = (id(client), name)
+    if cache_key in _collection_shape_cache:
+        return dict(_collection_shape_cache[cache_key])
     info = client.get_collection(name)
     params = info.config.params
     vectors = params.vectors
@@ -633,7 +773,9 @@ def _collection_shape(client, name: str) -> dict:
         dims = []
     sparse = bool(getattr(params, "sparse_vectors", None))
     points = int(getattr(info, "points_count", 0) or 0)
-    return {"points": points, "dense_dims": dims, "named": named, "sparse": sparse}
+    shape = {"points": points, "dense_dims": dims, "named": named, "sparse": sparse}
+    _collection_shape_cache[cache_key] = dict(shape)
+    return shape
 
 
 def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
@@ -722,13 +864,19 @@ def _qdrant_search_collection(
     Returns a flat list of payload dicts with an added 'score' key.
     Raises on Qdrant errors so callers can catch per-collection failures.
     """
+    _rag_deadline_start(collection_name)
+    if _rag_time_remaining() <= 0:
+        raise _rag_deadline_error(f"collection {collection_name}")
+
     client, _default_col = _get_qdrant()
     if client is None:
         raise RuntimeError("qdrant_unavailable")
 
     dense_vec = _embed(query)
     if dense_vec is None:
-        raise RuntimeError("embedding_unavailable")
+        raise RuntimeError(_embedding_unavailable_reason())
+    if _rag_time_remaining() <= 0:
+        raise _rag_deadline_error(f"qdrant search for {collection_name}")
 
     fetch_limit = limit * 5
     sparse_vec = _embed_sparse(query)
@@ -741,9 +889,18 @@ def _qdrant_search_collection(
         vectors_config = col_info.config.params.vectors
         has_named_vectors = isinstance(vectors_config, dict)
         has_sparse_index = has_named_vectors and "sparse" in (vectors_config or {})
-    except Exception:
-        has_named_vectors = False
-        has_sparse_index = False
+        shape = _collection_shape(client, collection_name)
+        dense_dims = shape.get("dense_dims") or []
+        if dense_dims and len(dense_vec) not in dense_dims:
+            raise RuntimeError(
+                "dimension_mismatch: "
+                f"collection {collection_name} dense dim(s)={dense_dims}; "
+                f"embedder produced {len(dense_vec)}"
+            )
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"collection_unavailable: get_collection failed: {exc}") from exc
 
     # The dense vector is not always called "dense" — see _dense_vector_name.
     dense_name = _dense_vector_name(client, collection_name) if has_named_vectors else None
@@ -785,6 +942,8 @@ def _qdrant_search_collection(
             query_filter=query_filter,
             search_params=_qsp,
         )
+    if _rag_time_remaining() <= 0:
+        raise _rag_deadline_error(f"rerank for {collection_name}")
 
     rows = []
     for p in result.points:
@@ -797,7 +956,9 @@ def _qdrant_search_collection(
             "origin": collection_name,
         })
 
-    rows, _ = _ce_rerank(query, rows, limit)
+    if _RAG_COLLECTION_RERANK:
+        rows, _ = _ce_rerank(query, rows, limit)
+    else:
+        rows = rows[:limit]
 
     return rows
-

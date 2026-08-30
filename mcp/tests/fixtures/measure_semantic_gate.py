@@ -2,8 +2,9 @@
 """Regenerate semantic_gate_probe.json (this directory) from the live corpus.
 
 Needs a reachable Qdrant + embedder (QDRANT_URL / QDRANT_API_KEY / OLLAMA_BASE_URL,
-LOCI_QDRANT_RETENTION_DAYS=0) and the session store at ~/.hermes/memory-sessions.
-Run with mcp/.venv/bin/python.
+LOCI_QDRANT_RETENTION_DAYS=0) and an explicit
+LOCI_SEMANTIC_GATE_SOURCE_DIR pointing at the source session store. Run with
+mcp/.venv/bin/python.
 
 Two probe classes, 300 each, seed 1183:
 
@@ -33,13 +34,21 @@ sys.path.insert(0, str(REPO / "mcp"))
 os.environ.setdefault("LOCI_QDRANT_RETENTION_DAYS", "0")
 logging.disable(logging.WARNING)
 
+if not os.environ.get("LOCI_SEMANTIC_GATE_SOURCE_DIR"):
+    raise SystemExit(
+        "Refusing to default to a live memory store; set "
+        "LOCI_SEMANTIC_GATE_SOURCE_DIR explicitly."
+    )
+MEM = os.path.expanduser(os.environ["LOCI_SEMANTIC_GATE_SOURCE_DIR"])
+os.environ["LOCI_MEMORY_DIR"] = MEM
+os.environ["HERMES_MEMORY_DIR"] = MEM
+
 import qdrant_ops  # noqa: E402
 import server as S  # noqa: E402
 from qdrant_client.models import FieldCondition, Filter, MatchValue  # noqa: E402
 
 SEED = 1183
 N = 300
-MEM = os.path.expanduser("~/.hermes/memory-sessions")
 OUT = Path(__file__).resolve().parent / "semantic_gate_probe.json"
 
 
@@ -152,7 +161,7 @@ def main():
 
     OUT.write_text(json.dumps({
         "generated_by": "mcp/tests/fixtures/measure_semantic_gate.py",
-        "corpus": "~/.hermes/memory-sessions, dense vectors from the live Qdrant collection",
+        "corpus": f"{MEM}, dense vectors from the configured Qdrant collection",
         "embedder": "nomic-embed-text (cosine)",
         "seed": SEED,
         "notes": (

@@ -165,6 +165,21 @@ def qdrant() -> tuple[str, str]:
             os.environ.get("QDRANT_API_KEY") or _cfg("qdrant", "api_key", "") or "")
 
 
+def code_chunks_collection() -> str:
+    """Code RAG collection: env -> config -> deployment default.
+
+    Keep this out of tool code so a deployment can override the code corpus without
+    editing server.py. Intentionally do not fall back to agent_core_chunks: that
+    collection is mostly telemetry, not code.
+    """
+    return (
+        os.environ.get("CODE_CHUNKS_COLLECTION")
+        or _cfg("qdrant", "code_chunks_collection", "")
+        or _cfg("code", "chunks_collection", "")
+        or "dama_gotchi_code"
+    )
+
+
 def openrouter() -> tuple[str, str]:
     """(base_url, api_key) for the OpenRouter tier: env -> config -> ('', '').
 
@@ -243,6 +258,14 @@ def load_env(repo: "Path | None" = None) -> dict:
                 os.environ["EMBED_MODEL"] = resolved["EMBED_MODEL"] = model
         except Exception as exc:
             logger.warning("load_env: could not resolve the embed model: %r", exc)
+
+    if not os.environ.get("CODE_CHUNKS_COLLECTION"):
+        try:
+            collection = code_chunks_collection()
+            if collection:
+                os.environ["CODE_CHUNKS_COLLECTION"] = resolved["CODE_CHUNKS_COLLECTION"] = collection
+        except Exception as exc:
+            logger.warning("load_env: could not resolve the code chunks collection: %r", exc)
 
     # backends.toml is stdlib tomllib, so the setting that protects the corpus needs no import.
     if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):

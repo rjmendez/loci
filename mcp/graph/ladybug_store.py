@@ -12,11 +12,13 @@ Persists two overlaid graphs in a single embedded Kuzu database:
 It answers relationship queries over both, including a full graph port of the
 in-memory contamination algorithm (``memcheck.checks.contagion.find_contamination``).
 
-Design contract: **fail-open everywhere.** If ``import ladybug`` fails, the db
+Design contract: **fail-open except for proven native corruption.** If ``import ladybug`` fails, the db
 cannot be opened, or any query raises, public methods return ``False`` / ``[]``
 / ``{}`` and :meth:`available` stays ``False`` — nothing propagates out. The
 sole intentional exception is :meth:`code_query`, which raises ``ValueError`` on
-a write-shaped query before touching the database.
+a write-shaped query before touching the database. A child-process SIGSEGV while
+materializing a known-risk column raises ``LadybugCorruptColumnError`` so tools
+fail closed with a repairable graph-store message instead of killing the server.
 """
 
 from __future__ import annotations
@@ -24,14 +26,25 @@ from __future__ import annotations
 import fcntl
 import functools
 import logging
+import multiprocessing
 import os
 import re
+import signal
 import threading
 import time
 from contextlib import contextmanager
 from typing import Optional
 
 logger = logging.getLogger("loci-mcp.ladybug")
+
+
+class LadybugCorruptColumnError(RuntimeError):
+    """Raised when an isolated Ladybug/Kuzu read dies materializing a column."""
+
+
+def _raise_if_corrupt_column(exc: Exception) -> None:
+    if isinstance(exc, LadybugCorruptColumnError):
+        raise exc
 
 
 def _writes(failopen):
@@ -56,6 +69,8 @@ def _writes(failopen):
 # Bounded so a wedged lease holder can never hang the server.
 _LEASE_TIMEOUT_S = 6.0
 _LEASE_POLL_S = 0.05
+_CORRUPT_PROBE_TIMEOUT_S = 30.0
+_RISKY_COLUMNS = (("Finding", "text"),)
 
 try:  # ladybug (LadybugDB) is optional — the store degrades to unavailable.
     import ladybug  # type: ignore
@@ -64,7 +79,7 @@ except Exception:  # pragma: no cover - environment without ladybug
     ladybug = None  # type: ignore
     _HAS_LADYBUG = False
 
-__all__ = ["LadybugStore"]
+__all__ = ["LadybugCorruptColumnError", "LadybugStore"]
 
 # Query shapes that mutate the graph — rejected by code_query's read-only guard.
 _WRITE_GUARD_RE = re.compile(
@@ -82,6 +97,52 @@ _DUCK_STOPWORDS = frozenset({
     "flush", "group", "groups", "groupdict", "match", "search", "finditer", "findall",
     "sub", "send", "throw", "next", "name", "value", "isdigit", "isalpha", "isspace",
 })
+
+
+def _probe_ladybug_column_direct(db_path: str, label: str, column: str) -> int:
+    """Open a fresh read-only handle and fully materialize one risky column."""
+    db = conn = res = None
+    rows = 0
+    try:
+        db = ladybug.Database(db_path, read_only=True)
+        conn = ladybug.Connection(db)
+        res = conn.execute(f"MATCH (n:{label}) RETURN n.{column}")
+        while res.has_next():
+            res.get_next()
+            rows += 1
+        return rows
+    finally:
+        for obj in (res, conn, db):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
+
+
+def _probe_ladybug_column_worker(db_path: str, label: str, column: str, pipe) -> None:
+    try:
+        forced = os.environ.get("LOCI_LADYBUG_PROBE_FORCE_SIGSEGV")
+        if forced in {"1", f"{label}.{column}"}:  # test-only fault injection hook
+            try:
+                import faulthandler
+
+                faulthandler.disable()
+            except Exception:
+                pass
+            os.kill(os.getpid(), signal.SIGSEGV)
+        rows = _probe_ladybug_column_direct(db_path, label, column)
+        pipe.send(("ok", rows))
+    except BaseException as exc:  # includes native binding SystemExit-style failures
+        try:
+            pipe.send(("error", repr(exc)))
+        except Exception:
+            pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
 
 
 def _enclosing_class(sym_id: str) -> Optional[str]:
@@ -254,6 +315,7 @@ class LadybugStore:
         self._lock = threading.RLock()
         self._active = None           # the currently-open scoped Connection, if any
         self._schema_ready = False    # schema ensured once per process (idempotent)
+        self._column_health: dict[tuple[str, str], str] = {}
         # "worth attempting" — the DB is opened per-op, so the store self-heals when the lock frees.
         self.ok = bool(_HAS_LADYBUG and db_path)
         if not _HAS_LADYBUG:
@@ -299,24 +361,29 @@ class LadybugStore:
             fd = os.open(self._lease_path, os.O_CREAT | os.O_RDWR, 0o644)
             got = False
             db = conn = None
+            session_error = None
             try:
-                if not self._acquire_lease(fd, exclusive=write):
-                    logger.debug("ladybug lease busy (%s) — fail-open",
-                                 "write" if write else "read")
+                try:
+                    if not self._acquire_lease(fd, exclusive=write):
+                        logger.debug("ladybug lease busy (%s) — fail-open",
+                                     "write" if write else "read")
+                        session_error = "lease"
+                    else:
+                        got = True
+                        db = ladybug.Database(self.db_path, read_only=not write)
+                        conn = ladybug.Connection(db)
+                        if write:
+                            self._ensure_schema(conn)
+                            self._stamp_holder(fd)
+                except Exception as exc:  # open/lock failure -> fail-open, retried next op
+                    logger.debug("ladybug session (%s) unavailable: %s",
+                                 "write" if write else "read", exc)
+                    session_error = exc
+                if session_error is not None:
                     yield None
                     return
-                got = True
-                db = ladybug.Database(self.db_path, read_only=not write)
-                conn = ladybug.Connection(db)
-                if write:
-                    self._ensure_schema(conn)
-                    self._stamp_holder(fd)
                 self._active = conn
                 yield conn
-            except Exception as exc:  # open/lock failure -> fail-open, retried next op
-                logger.debug("ladybug session (%s) unavailable: %s",
-                             "write" if write else "read", exc)
-                yield None
             finally:
                 self._active = None
                 for c in (conn, db):
@@ -424,6 +491,103 @@ class LadybugStore:
         except Exception as exc:
             logger.debug("_close_result: fail-open swallow: %r", exc)
 
+    @staticmethod
+    def _risky_columns_in_query(cypher: str) -> list[tuple[str, str]]:
+        """Return known native-risk columns that this read appears to materialize."""
+        if not isinstance(cypher, str):
+            return []
+        found: list[tuple[str, str]] = []
+        for label, column in _RISKY_COLUMNS:
+            aliases = set(
+                re.findall(rf"\(\s*([A-Za-z_]\w*)\s*:\s*{re.escape(label)}\b", cypher)
+            )
+            if not aliases:
+                continue
+            for alias in aliases:
+                materializes_column = re.search(
+                    rf"\b{re.escape(alias)}\s*\.\s*{re.escape(column)}\b", cypher
+                )
+                # Returning a whole Finding node materializes all of its properties.
+                materializes_node = re.search(
+                    rf"\bRETURN\b[\s\S]*?(?:^|[, \t\r\n])(?:DISTINCT\s+)?"
+                    rf"{re.escape(alias)}(?:\s*(?:,|$|LIMIT|SKIP|ORDER|WITH))",
+                    cypher,
+                    re.IGNORECASE,
+                )
+                if materializes_column or materializes_node:
+                    found.append((label, column))
+                    break
+        return found
+
+    def _probe_ladybug_column_in_child(self, label: str, column: str) -> tuple[str, object]:
+        """Probe risky materialization in an explicit child process and report status."""
+        ctx = multiprocessing.get_context("spawn")
+        parent, child = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_probe_ladybug_column_worker,
+            args=(self.db_path, label, column, child),
+        )
+        proc.start()
+        child.close()
+        proc.join(_CORRUPT_PROBE_TIMEOUT_S)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(2)
+            return ("timeout", None)
+        if proc.exitcode is not None and proc.exitcode < 0:
+            return ("signal", -proc.exitcode)
+        if parent.poll():
+            return parent.recv()
+        return ("exit", proc.exitcode)
+
+    def _ensure_risky_columns_safe(self, cypher: str) -> None:
+        """Latch health of known crash-prone columns before in-process reads.
+
+        We intentionally do NOT fork every query. Only queries that materialize
+        known native-risk columns pay a one-time child-process validation cost per
+        store instance; once validated, hot reads use the normal in-process path.
+        """
+        for label, column in self._risky_columns_in_query(cypher):
+            key = (label, column)
+            state = self._column_health.get(key)
+            if state == "ok":
+                continue
+            if state and state.startswith("corrupt:"):
+                raise LadybugCorruptColumnError(state[len("corrupt:"):])
+            if self._active is not None:
+                raise LadybugCorruptColumnError(
+                    f"cannot safely validate native column {label}.{column} while a "
+                    "LadybugDB write session is active"
+                )
+            status, detail = self._probe_ladybug_column_in_child(label, column)
+            if status == "ok":
+                self._column_health[key] = "ok"
+                logger.debug("validated LadybugDB column %s.%s (%s rows)", label, column, detail)
+                continue
+            if status == "signal":
+                signum = int(detail)
+                try:
+                    signame = signal.Signals(signum).name
+                except ValueError:  # pragma: no cover - platform-specific signal table
+                    signame = f"signal {signum}"
+                msg = (
+                    f"corrupt column {label}.{column}: isolated LadybugDB read died "
+                    f"with {signame}; rebuild or restore the graph store"
+                )
+                self._column_health[key] = "corrupt:" + msg
+                raise LadybugCorruptColumnError(msg)
+            if status == "timeout":
+                raise RuntimeError(
+                    f"LadybugDB safety probe for {label}.{column} timed out; "
+                    "refusing unsafe in-process materialization"
+                )
+            if status == "error":
+                logger.debug("LadybugDB safety probe for %s.%s failed: %s", label, column, detail)
+                continue
+            raise RuntimeError(
+                f"LadybugDB safety probe for {label}.{column} exited unexpectedly: {detail}"
+            )
+
     def _exec(self, cypher: str, params: Optional[dict] = None):
         """Execute a WRITE statement in a leased RW session; returns None (writes have no
         result callers use). Raises RuntimeError if the session is unavailable (fail-open
@@ -439,6 +603,7 @@ class LadybugStore:
     def _rows(self, cypher: str, params: Optional[dict] = None) -> list[list]:
         """Read rows in a leased READ-ONLY session (many readers share). Drains AND closes
         the result INSIDE the session — the QueryResult is invalid once the conn closes."""
+        self._ensure_risky_columns_safe(cypher)
         with self._session(write=False) as conn:
             if conn is None:
                 return []
@@ -938,6 +1103,7 @@ class LadybugStore:
             )
             return [self._finding_row(r) for r in rows]
         except Exception as exc:
+            _raise_if_corrupt_column(exc)
             logger.debug("entity_findings failed: %s", exc)
             return []
 
@@ -1014,6 +1180,7 @@ class LadybugStore:
             )
             return [self._finding_row(r) for r in rows]
         except Exception as exc:
+            _raise_if_corrupt_column(exc)
             logger.debug("symbol_findings failed: %s", exc)
             return []
 
@@ -1049,6 +1216,7 @@ class LadybugStore:
         try:
             return self._rows(cypher, params)
         except Exception as exc:
+            _raise_if_corrupt_column(exc)
             logger.debug("code_query failed: %s", exc)
             return []
 
