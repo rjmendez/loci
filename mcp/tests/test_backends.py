@@ -46,7 +46,8 @@ def test_empty_when_nothing_configured(monkeypatch):
 
 def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL",
-              "QDRANT_API_KEY", "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR"):
+              "QDRANT_API_KEY", "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR",
+              "HERMES_MEMORY_DIR", "CODE_CHUNKS_COLLECTION"):
         monkeypatch.delenv(k, raising=False)
     cfg = tmp_path / "b.toml"
     cfg.write_text('[embed]\nmodel="e"\n[vllm]\nmodel="v"\n[rerank]\nmodel="r"\n'
@@ -55,6 +56,19 @@ def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     B._reset_cache()
     assert B.embed_model() == "e" and B.vllm_model() == "v" and B.rerank_model() == "r"
     assert B.qdrant() == ("q", "k") and B.memory_dir() == "/m"
+    assert B.code_chunks_collection() == "dama_gotchi_code"
+
+
+def test_code_chunks_collection_resolution(tmp_path, monkeypatch):
+    monkeypatch.delenv("CODE_CHUNKS_COLLECTION", raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[qdrant]\ncode_chunks_collection="from-qdrant"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.code_chunks_collection() == "from-qdrant"
+
+    monkeypatch.setenv("CODE_CHUNKS_COLLECTION", "from-env")
+    assert B.code_chunks_collection() == "from-env"
 
 
 def test_env_overrides_config_for_models(tmp_path, monkeypatch):
@@ -82,7 +96,8 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
 
 _ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "EMBED_MODEL",
                     "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
-                    "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR")
+                    "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR", "HERMES_MEMORY_DIR",
+                    "CODE_CHUNKS_COLLECTION")
 
 
 def _fresh_install(mp, config_path):
@@ -110,6 +125,7 @@ def test_fresh_install_full_config_resolves_all_backends(tmp_path, monkeypatch):
     assert B.rerank_model() == "cfg-rerank"
     assert B.qdrant() == ("http://cfg-qdrant:6333", "cfg-key")
     assert B.memory_dir() == "/cfg/mem"
+    assert B.code_chunks_collection() == "dama_gotchi_code"
 
 
 def test_fresh_install_bare_defaults(monkeypatch):

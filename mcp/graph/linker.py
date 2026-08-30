@@ -23,8 +23,10 @@ Confidence rules (see :func:`extract_symbol_refs`):
   ``update``, ``handle``, ``data``, ``text`` …); or an ambiguous multi-id plain
   name (unless it is a type).
 
-All public functions are **fail-open**: on any error the writers return ``0`` /
-an empty result rather than propagating, exactly like the rest of the store.
+All public functions are **fail-open** except for proven native graph corruption:
+ordinary errors return ``0`` / an empty result, while
+``LadybugCorruptColumnError`` propagates so callers can surface a repairable
+graph-store message.
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional
+
+from .ladybug_store import LadybugCorruptColumnError
 
 logger = logging.getLogger("loci-mcp.linker")
 
@@ -320,5 +324,7 @@ def relink_all(ks) -> dict:
         created = link_findings(ks, findings, index)
         return {"findings_scanned": len(findings), "links_created": created}
     except Exception as exc:
+        if isinstance(exc, LadybugCorruptColumnError):
+            raise
         logger.debug("relink_all failed: %s", exc)
         return empty

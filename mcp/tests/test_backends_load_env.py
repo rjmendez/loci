@@ -16,7 +16,7 @@ import backends  # noqa: E402
 
 
 VARS = ("OLLAMA_BASE_URL", "QDRANT_URL", "QDRANT_API_KEY", "EMBED_MODEL",
-        "LOCI_QDRANT_RETENTION_DAYS", "OLLAMA_URL")
+        "LOCI_QDRANT_RETENTION_DAYS", "OLLAMA_URL", "CODE_CHUNKS_COLLECTION")
 
 
 def _clean(monkeypatch):
@@ -45,6 +45,7 @@ model = "some-embed-model"
 url = "http://qdrant-host:6333"
 api_key = "sekrit"
 retention_days = 0
+code_chunks_collection = "cfg_code"
 ''')
     resolved = backends.load_env(tmp_path)
 
@@ -52,8 +53,10 @@ retention_days = 0
     assert os.environ["QDRANT_URL"] == "http://qdrant-host:6333"
     assert os.environ["QDRANT_API_KEY"] == "sekrit"
     assert os.environ["EMBED_MODEL"] == "some-embed-model"
+    assert os.environ["CODE_CHUNKS_COLLECTION"] == "cfg_code"
     assert os.environ["LOCI_QDRANT_RETENTION_DAYS"] == "0"
-    assert set(resolved) >= {"OLLAMA_BASE_URL", "QDRANT_URL", "EMBED_MODEL"}
+    assert set(resolved) >= {"OLLAMA_BASE_URL", "QDRANT_URL", "EMBED_MODEL",
+                             "CODE_CHUNKS_COLLECTION"}
 
 
 def test_an_existing_environment_variable_always_wins(monkeypatch, tmp_path):

@@ -18,6 +18,7 @@ import logging
 from typing import Any
 
 from . import queries as Q
+from .ladybug_store import LadybugCorruptColumnError
 
 logger = logging.getLogger("loci-mcp.analytics")
 
@@ -35,6 +36,8 @@ def _q(ks: Any, cypher: str, params: dict | None = None) -> list:
     try:
         return ks.code_query(cypher, params) or []
     except Exception as exc:
+        if isinstance(exc, LadybugCorruptColumnError):
+            raise
         logger.debug("analytics query failed: %s", exc)
         return []
 

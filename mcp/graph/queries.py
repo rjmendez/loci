@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from .ladybug_store import LadybugCorruptColumnError
+
 logger = logging.getLogger("loci-mcp.queries")
 
 __all__ = [
@@ -240,6 +242,8 @@ def symbol_findings(ks: Any, symbol: str, limit: int = 50) -> list:
         rows = ks.code_query(cy, {"q": str(symbol), "lim": lim})
         return [_finding_row(r) for r in rows]
     except Exception as exc:  # pragma: no cover - defensive
+        if isinstance(exc, LadybugCorruptColumnError):
+            raise
         logger.debug("symbol_findings failed: %s", exc)
         return []
 
@@ -346,6 +350,8 @@ def symbol_impact(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
     try:
         rows = ks.code_query(cy, {"q": str(symbol), "lim": lim * 10})
     except Exception as exc:  # pragma: no cover - defensive
+        if isinstance(exc, LadybugCorruptColumnError):
+            raise
         logger.debug("symbol_impact failed: %s", exc)
         return empty
 
@@ -394,6 +400,8 @@ def related_findings_via_code(ks: Any, finding_id: str, limit: int = 25) -> list
     try:
         rows = ks.code_query(cy, {"fid": str(finding_id), "lim": lim})
     except Exception as exc:  # pragma: no cover - defensive
+        if isinstance(exc, LadybugCorruptColumnError):
+            raise
         logger.debug("related_findings_via_code failed: %s", exc)
         return []
     out = []
