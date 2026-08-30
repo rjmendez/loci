@@ -11,8 +11,8 @@
 
 set -uo pipefail
 
-HOOKS=(pre_llm_grounding.py pre_tool_grounding.py session_end_sync.py legacy_env.py
-       workflow_balanced_models.py)
+HOOKS=(pre_llm_grounding.py pre_tool_grounding.py session_end_sync.py session_end_sync.sh
+       session_end_learn.py session_end_learn.sh legacy_env.py workflow_balanced_models.py)
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${CLAUDE_HOOKS_DIR:-$HOME/.claude/hooks}"
 
@@ -23,6 +23,8 @@ if [[ "${1:-}" == "--check" ]]; then
       echo "MISSING  $DEST/$h"; drift=1
     elif ! diff -q "$SRC/$h" "$DEST/$h" >/dev/null; then
       echo "DRIFTED  $h"; diff -u "$SRC/$h" "$DEST/$h" | sed -n '3,$p' | head -20; drift=1
+    elif [[ "$(stat -c '%a' "$DEST/$h")" != "755" ]]; then
+      echo "MODE     $DEST/$h is $(stat -c '%a' "$DEST/$h"), expected 755"; drift=1
     fi
   done
   [[ $drift -eq 0 ]] && echo "hooks in sync"
@@ -36,7 +38,7 @@ for h in "${HOOKS[@]}"; do
   if [[ -f "$DEST/$h" ]] && ! diff -q "$SRC/$h" "$DEST/$h" >/dev/null; then
     mkdir -p "$backup"; cp "$DEST/$h" "$backup/"
   fi
-  cp "$SRC/$h" "$DEST/$h"; chmod +x "$DEST/$h"
+  cp "$SRC/$h" "$DEST/$h"; chmod 755 "$DEST/$h"
   echo "installed $h"
 done
 [[ -d "$backup" ]] && echo "previous copies backed up to $backup"

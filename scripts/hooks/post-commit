@@ -1,31 +1,41 @@
 #!/usr/bin/env bash
-# post-commit: re-ingest loci-codebase when Python files change.
-# Hook failures never block commits — all exit paths end with || true.
+# post-commit: re-ingest loci-codebase when Python files change and refresh
+# contract extraction for changed source files.
+#
+# Hook failures must never block commits. Keep this script fail-open: wrap work
+# in main, ignore main's status at the end, and use background jobs for Claude.
 
 set -uo pipefail
 
-# Check whether any .py files were touched in the most recent commit.
-if ! git diff-tree --no-commit-id -r --name-only HEAD 2>/dev/null \
-     | grep -q '\.py$'; then
-  exit 0
-fi
+main() {
+  local repo_root changed log_dir
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  changed="$(git diff-tree --root --no-commit-id -r --name-only HEAD 2>/dev/null || true)"
 
-echo "[post-commit] Python files changed — triggering loci-codebase re-ingest..."
+  if [[ -z "$changed" ]]; then
+    return 0
+  fi
 
-# Locate the repo root so the workflow path is always absolute.
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+  log_dir="$repo_root/.git/loci-hook-logs"
+  mkdir -p "$log_dir" 2>/dev/null || log_dir="$repo_root/.git"
 
-# Bail gracefully if the claude CLI is not available.
-if ! command -v claude >/dev/null 2>&1; then
-  echo "[post-commit] Warning: 'claude' CLI not found; skipping ingest." >&2
-  exit 0
-fi
+  if grep -qE '\.py$' <<<"$changed"; then
+    echo "[post-commit] Python files changed — triggering loci-codebase re-ingest..."
+    if command -v claude >/dev/null 2>&1; then
+      (
+        cd "$repo_root" || exit 0
+        env -u ANTHROPIC_API_KEY \
+          claude -p --dangerously-skip-permissions "/loci-codebase-ingest"
+      ) >> "$log_dir/loci-post-commit-ingest.log" 2>&1 &
+    else
+      echo "[post-commit] Warning: 'claude' CLI not found; skipping ingest." >&2
+    fi
+  fi
 
-env -u ANTHROPIC_API_KEY \
-  claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
-  >> /tmp/loci-post-commit-ingest.log 2>&1 &
+  if grep -qE '\.(py|ts|go|rs|java)$' <<<"$changed"; then
+    "$repo_root/scripts/hooks/post-commit-contract-extract.sh" || true
+  fi
+}
 
-# Run contract extraction for any .py/.ts/.go/.rs/.java change (non-blocking)
-"$REPO_ROOT/scripts/hooks/post-commit-contract-extract.sh" || true
-
+main "$@" || true
 exit 0
