@@ -11,7 +11,9 @@ if ! git diff-tree --no-commit-id -r --name-only HEAD 2>/dev/null \
   exit 0
 fi
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+LOG_DIR="$REPO_ROOT/.git/loci-hook-logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="$REPO_ROOT/.git"
 
 # Need both claude and an active investigation to proceed
 command -v claude >/dev/null 2>&1 || exit 0
@@ -40,6 +42,6 @@ fi
 env -u ANTHROPIC_API_KEY \
   claude -p --dangerously-skip-permissions \
        "/contract-sync {\"root\": \"$REPO_ROOT\", \"loci_investigation\": \"$INV\", \"since_commit\": \"HEAD~1\"}" \
-  >> "${TMPDIR:-/tmp}/loci-contract-extract.log" 2>&1 &
+  >> "$LOG_DIR/loci-contract-extract.log" 2>&1 &
 
 exit 0
