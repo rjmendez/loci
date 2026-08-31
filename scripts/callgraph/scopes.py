@@ -115,8 +115,15 @@ class ModuleAssign:
     target: str
     value_kind: str    # "name" | "attribute" | "other"
     value_name: Optional[str]       # for "name": the RHS identifier
-    # No fields for the "attribute" kind: imports.py only resolves value_kind
-    # == "name", so an attribute alias is recorded and then ignored.
+    # For "attribute": the `A = mod.B` halves. These were removed once on the
+    # reasoning that imports.py only resolves value_kind == "name", but the call
+    # site below was left passing them, so constructing an attribute alias raised
+    # TypeError. Nothing noticed because the whole corpus contained exactly one
+    # module-level `A = mod.B`, in a test file. Adding two re-exports to
+    # mlops/grounding/train.py took the callgraph suite from 3 failures to 19
+    # failures and 32 errors.
+    value_module: Optional[str] = None   # for "attribute": the `mod` in mod.B
+    value_attr: Optional[str] = None     # for "attribute": the `B` in mod.B
 
 
 class ModuleScope:
