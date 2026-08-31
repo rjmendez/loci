@@ -806,8 +806,24 @@ def _empty(file: str, lang: Optional[str]) -> Dict[str, Any]:
     }
 
 
+# Grammars do not agree on one node type for "a name". Counting only `identifier`
+# silently drops whole languages: Kotlin spells every name `simple_identifier`, so a
+# Kotlin file yields {} and every symbol in it scores zero occurrences; TS/JS use
+# `property_identifier` and Go/Rust/C++ `field_identifier` for method names, so a
+# called method scores zero the same way. Zero occurrences is what dead-code
+# detection reads as "delete this", so a missing node type becomes a delete
+# recommendation. Count every name-bearing type.
+_NAME_NODE_TYPES = frozenset({
+    "identifier",
+    "simple_identifier",    # kotlin
+    "property_identifier",  # typescript / javascript
+    "field_identifier",     # go / rust / c / c++
+    "type_identifier",      # kotlin / typescript / go / rust / c++
+})
+
+
 def _identifier_counts(root) -> Dict[str, int]:
-    """Count every identifier token in the tree (name -> occurrences).
+    """Count every name token in the tree (name -> occurrences).
 
     A defined symbol whose name occurs MORE than it is defined is *used* somewhere
     (called, referenced in a registry list, passed as a callback, dispatched
@@ -820,7 +836,7 @@ def _identifier_counts(root) -> Dict[str, int]:
     try:
         while stack:
             n = stack.pop()
-            if n.type == "identifier":
+            if n.type in _NAME_NODE_TYPES:
                 t = _text(n)
                 if t:
                     counts[t] = counts.get(t, 0) + 1
