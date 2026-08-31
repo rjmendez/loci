@@ -16,11 +16,21 @@ import numpy as np
 
 # Embedding width is fixed by the embedder (nomic-embed-text, 768).
 EMBED_DIM = 768
-# |a-b| + a*b + cos  — what build_grounding_dataset.py and ground_gate.py have
-# always produced, and what the currently shipped joblib expects.
-LEGACY_DIM = 2 * EMBED_DIM + 1
-# ... + cos**2 + length ratio + token overlap.
-CURRENT_DIM = LEGACY_DIM + 3
+
+
+def dims_for(embed_dim: int) -> tuple[int, int]:
+    """(legacy, current) widths for pairs embedded at `embed_dim`.
+
+    The contract is a shape rule, not two magic numbers: legacy is
+    |a-b| + a*b + cos, current adds cos**2, a length ratio and a token overlap.
+    Callers that embed at something other than EMBED_DIM (tests, and any future
+    embedder swap) get the same two layouts at their own width.
+    """
+    return (2 * embed_dim + 1, 2 * embed_dim + 4)
+
+
+# The two widths at the production embedder's size.
+LEGACY_DIM, CURRENT_DIM = dims_for(EMBED_DIM)
 
 
 def token_overlap(a: str, b: str) -> float:
@@ -35,23 +45,27 @@ def len_ratio(a: str, b: str) -> float:
     return min(la, lb) / (max(la, lb) + 1)
 
 
-def make_features(claims, evidences, emb_claims, emb_evidences, *, dim: int = CURRENT_DIM):
+def make_features(claims, evidences, emb_claims, emb_evidences, *, dim: int | None = None):
     """Feature matrix for (claim, evidence) pairs.
 
     `dim` selects the contract version. Pass a model's n_features_in_ to build
-    exactly what that model was trained on, rather than assuming.
+    exactly what that model was trained on, rather than assuming; None means the
+    current layout at whatever width the embeddings came in.
     """
     emb_claims = np.asarray(emb_claims, dtype=np.float32)
     emb_evidences = np.asarray(emb_evidences, dtype=np.float32)
     diff = np.abs(emb_claims - emb_evidences)
     prod = emb_claims * emb_evidences
     cos = prod.sum(axis=1, keepdims=True)
-    if dim == LEGACY_DIM:
+    legacy, current = dims_for(emb_claims.shape[1])
+    if dim is None:
+        dim = current
+    if dim == legacy:
         return np.concatenate([diff, prod, cos], axis=1)
-    if dim != CURRENT_DIM:
+    if dim != current:
         raise ValueError(
             f"no grounding feature contract produces {dim} columns "
-            f"(known: {LEGACY_DIM} legacy, {CURRENT_DIM} current)"
+            f"(known: {legacy} legacy, {current} current)"
         )
     lr = np.array([[len_ratio(c, e)] for c, e in zip(claims, evidences)], dtype=np.float32)
     jac = np.array([[token_overlap(c, e)] for c, e in zip(claims, evidences)], dtype=np.float32)

@@ -2,9 +2,8 @@
 Characterization tests for eval/ (harness.py, tasks.py, grounding_gate_eval.py,
 grounding_gate_qf_eval.py, grounding_gate_oos_eval.py).
 
-These pin the behaviour AS IT IS TODAY -- including two genuine defects that are
-deliberately NOT fixed here (see test_qf_run_persist_raises_unbound_local_when_no_model
-and test_oos_verdict_else_branch_drops_the_verdict_text).
+These pin the behaviour AS IT IS TODAY -- including a genuine defect that is
+deliberately NOT fixed here (see test_oos_verdict_else_branch_drops_the_verdict_text).
 
 No network / Qdrant / Ollama / GPU is used: every outbound call goes through
 harness._http / harness.embed / subprocess.run, all of which are monkeypatched.
@@ -1087,39 +1086,70 @@ def test_qf_run_reports_but_survives_a_broken_model_file(tmp_path, monkeypatch, 
     assert "IN-SAMPLE" not in out
 
 
-def test_qf_run_persist_raises_unbound_local_when_no_model(tmp_path, monkeypatch):
-    """BUG (pinned, not fixed): `mdl_m` is only bound inside `if MODEL.exists()`,
-    but the persist loop references it unconditionally. A live run (HARNESS_DRY_RUN
-    unset) with no classifier on disk crashes AFTER printing the cosine metrics --
-    so the cosine scores are never persisted either."""
-    glob_pat = _write_corpus(tmp_path, QF_ROWS)
+def _live_run(tmp_path, monkeypatch, model_path):
+    """A live (persisting) qf run against the standard corpus; returns the upserts."""
+    upserts = []
     monkeypatch.setattr(harness, "OLLAMA_URL", "http://o")
     monkeypatch.setattr(harness, "DRY_RUN", False)
     monkeypatch.setattr(harness, "embed", unit_embedder(QF_VECTORS))
     monkeypatch.setattr(harness, "ensure_collection", lambda *a, **k: None)
-    monkeypatch.setattr(harness, "upsert_score", lambda **kw: pytest.fail("should not reach"))
-    monkeypatch.setattr(qf, "CORPUS", glob_pat)
-    monkeypatch.setattr(qf, "MODEL", tmp_path / "absent.joblib")
+    monkeypatch.setattr(harness, "upsert_score", lambda **kw: upserts.append(kw))
+    monkeypatch.setattr(qf, "CORPUS", _write_corpus(tmp_path, QF_ROWS))
+    monkeypatch.setattr(qf, "MODEL", model_path)
+    qf.run()
+    return upserts
 
-    with pytest.raises(UnboundLocalError, match="mdl_m"):
-        qf.run()
+
+def test_qf_run_persists_the_cosine_arm_when_there_is_no_model(tmp_path, monkeypatch):
+    """`mdl_m` was only bound inside `if MODEL.exists()` while the persist loop
+    referenced it unconditionally, so a live run with no classifier on disk died
+    of UnboundLocalError AFTER printing the cosine metrics -- losing those too."""
+    upserts = _live_run(tmp_path, monkeypatch, tmp_path / "absent.joblib")
+    ids = sorted(u["task_id"] for u in upserts)
+    assert ids == sorted(f"dtl.gate_qf.cosine.{m}" for m in
+                         ("recall", "bleed_rejection", "f1", "accuracy", "auc"))
 
 
-def test_qf_run_persist_also_crashes_when_the_model_fails_to_load(tmp_path, monkeypatch):
-    """Same defect via the other branch: joblib.load raising leaves mdl_m unbound."""
+def test_qf_run_persists_the_cosine_arm_when_the_model_fails_to_load(tmp_path, monkeypatch):
+    """Same defect via the other branch: joblib.load raising left mdl_m unbound."""
     bad = tmp_path / "bad.joblib"
     bad.write_bytes(b"garbage")
-    glob_pat = _write_corpus(tmp_path, QF_ROWS)
-    monkeypatch.setattr(harness, "OLLAMA_URL", "http://o")
-    monkeypatch.setattr(harness, "DRY_RUN", False)
-    monkeypatch.setattr(harness, "embed", unit_embedder(QF_VECTORS))
-    monkeypatch.setattr(harness, "ensure_collection", lambda *a, **k: None)
-    monkeypatch.setattr(harness, "upsert_score", lambda **kw: None)
-    monkeypatch.setattr(qf, "CORPUS", glob_pat)
-    monkeypatch.setattr(qf, "MODEL", bad)
+    upserts = _live_run(tmp_path, monkeypatch, bad)
+    assert {u["task_id"] for u in upserts} == {
+        f"dtl.gate_qf.cosine.{m}" for m in ("recall", "bleed_rejection", "f1", "accuracy", "auc")}
 
-    with pytest.raises(UnboundLocalError, match="mdl_m"):
-        qf.run()
+
+def _stub_model_wide(tmp_path):
+    """The same sigmoid(10*cos - 6) scorer, in the trainer's 2*d+4 layout.
+
+    Column order is [diff(d), prod(d), cos, cos^2, len_ratio, jaccard], so at
+    d=2 the cosine sits at index 4.
+    """
+    import joblib
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+
+    clf = LogisticRegression()
+    clf.coef_ = np.array([[0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0]])
+    clf.intercept_ = np.array([-6.0])
+    clf.classes_ = np.array([0, 1])
+    clf.n_features_in_ = 8
+    p = tmp_path / "wide.joblib"
+    joblib.dump(clf, str(p))
+    return p
+
+
+def test_qf_run_scores_a_train_shaped_model_instead_of_skipping_it(tmp_path, monkeypatch, capsys):
+    """train.py writes THIS path in the wider layout. The eval built a hard-coded
+    2*d+1 vector, so predict_proba raised and the bare except printed
+    '[model skipped]' -- the model arm silently vanished from the trend."""
+    upserts = _live_run(tmp_path, monkeypatch, _stub_model_wide(tmp_path))
+    out = capsys.readouterr().out
+    assert "[model skipped]" not in out
+    assert ("  MODEL  @0.50  : {'recall': 1.0, 'bleed_rejection': 0.5, 'f1': 0.8, "
+            "'accuracy': 0.75, 'auc': 1.0}") in out
+    by_id = {u["task_id"]: u["score"] for u in upserts}
+    assert by_id["dtl.gate_qf.model.f1"] == pytest.approx(0.8)
 
 
 def test_qf_run_uses_target_name_as_query_for_unknown_targets(tmp_path, monkeypatch):
