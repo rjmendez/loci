@@ -2483,6 +2483,19 @@ def finding_resolve(
     }, indent=2)
 
 
+def _procedure_success_rate(success_count: int, attempt_count: int) -> float | None:
+    """Successes per attempt, or None when the procedure has never been attempted.
+
+    Untried and always-failed are the two states a caller most needs to tell apart
+    when picking a procedure to follow, and 0.0 spells both. A brand-new procedure
+    — exactly the one whose author wants it exercised — read as a 0% success rate
+    and lost to anything that had ever succeeded once. Never measured has no number.
+    """
+    if attempt_count <= 0:
+        return None
+    return round(success_count / attempt_count, 4)
+
+
 # ---- Tool: procedure_attempt ----
 
 @mcp.tool()
@@ -2506,6 +2519,8 @@ def procedure_attempt(
     Returns:
         JSON: {"finding_id": "<id>", "success_count": int, "attempt_count": int,
                "success_rate": float|null}
+        ``success_rate`` is null for a procedure that has never been attempted —
+        that is not the same as a 0.0 success rate.
         On error: {"error": "<message>"}
     """
     try:
@@ -2541,7 +2556,7 @@ def procedure_attempt(
 
         attempt_count = target["procedure_meta"]["attempt_count"]
         success_count = target["procedure_meta"]["success_count"]
-        success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+        success_rate = _procedure_success_rate(success_count, attempt_count)
 
         # Atomic rewrite: write to temp file then rename
         import tempfile as _tempfile
@@ -2599,6 +2614,9 @@ def procedure_search(
     Returns:
         JSON: {"procedures": [{"finding_id", "text", "source", "success_rate",
                "procedure_meta", "investigation_id", "score"}], "count": int}
+        ``success_rate`` is null for a procedure that has never been attempted —
+        that is not the same as a 0.0 success rate. ``procedure_meta`` carries
+        ``attempt_count`` if you need to rank the untried ones yourself.
         On error: {"error": "<message>", "procedures": [], "count": 0}
     """
     try:
@@ -2626,7 +2644,7 @@ def procedure_search(
                     pm = h.get("procedure_meta", {})
                     attempt_count = pm.get("attempt_count", 0) if pm else 0
                     success_count = pm.get("success_count", 0) if pm else 0
-                    success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+                    success_rate = _procedure_success_rate(success_count, attempt_count)
                     procedures.append({
                         "finding_id": h.get("id", ""),
                         "text": h.get("text", ""),
@@ -2667,7 +2685,7 @@ def procedure_search(
                                 pm = f.get("procedure_meta", {})
                                 attempt_count = pm.get("attempt_count", 0) if pm else 0
                                 success_count = pm.get("success_count", 0) if pm else 0
-                                success_rate = round(success_count / attempt_count, 4) if attempt_count > 0 else 0.0
+                                success_rate = _procedure_success_rate(success_count, attempt_count)
                                 candidates.append({
                                     "finding_id": f.get("id", ""),
                                     "text": text,
