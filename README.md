@@ -84,6 +84,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 | What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
 | How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 | How to deploy (Docker / systemd) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| What the grounding corpus is worth | [docs/grounding-corpus-limits.md](docs/grounding-corpus-limits.md) |
 
 ---
 

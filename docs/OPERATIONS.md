@@ -243,7 +243,13 @@ $LOCI/eval/run_eval.sh
 ```
 
 Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`,
-`grounding_gate_qf_eval.py` — and passes its arguments through to each. Scores are
+`grounding_gate_qf_eval.py` — and passes its arguments through to each.
+
+> The CV figure `mlops/grounding/train.py` prints is a pair-level split and is
+> optimistic by roughly 2/3 of its margin over cosine. See
+> [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
+> numbers and what more findings are actually worth.
+ Scores are
 upserted to the Qdrant `eval_scores` collection with `run_date` in the payload.
 Query longitudinal scores:
 
