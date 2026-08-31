@@ -796,6 +796,62 @@ class TestNumericConfidence(unittest.TestCase):
                 self.assertIn("numeric_confidence", node,
                               f"Chain node missing numeric_confidence: {node}")
 
+    def test_declare_tools_stamp_numeric_confidence(self):
+        """contract_declare / wiring_obligation_declare build their finding dict
+        by hand, bypassing _store_build_finding. Without a stamped
+        numeric_confidence the reader defaulted them to 1.0 — a "gap" record,
+        the weakest tier there is, scoring perfect certainty."""
+        inv_id = _new_id("declare-nc")
+        server.investigation_start(investigation_id=inv_id, title="Declare nc test")
+
+        server.contract_declare(
+            investigation_id=inv_id, entity="POST /api/users", role="producer",
+            fields='{"user_id": "int"}',
+        )
+        server.wiring_obligation_declare(
+            investigation_id=inv_id, class_name="MetricsPublisher",
+            method_name="publish", expected_effect="publishes to MQTT",
+        )
+
+        rows = [json.loads(l) for l in
+                (server._inv_dir(inv_id) / "findings.jsonl")
+                .read_text().splitlines() if l.strip()]
+        by_source = {r.get("source"): r for r in rows}
+        for src in ("contract_declare", "wiring_obligation_declare"):
+            self.assertIn(src, by_source)
+            row = by_source[src]
+            self.assertIn("numeric_confidence", row,
+                          f"{src} wrote a finding with no numeric_confidence")
+            self.assertAlmostEqual(row["numeric_confidence"], 0.6, places=5,
+                                   msg=f"{src} is confidence 'medium' -> 0.6")
+
+    def test_unstamped_finding_does_not_score_perfect_certainty(self):
+        """A record with no numeric_confidence must resolve from its own
+        confidence label, not 1.0. 1.0 is the top of the scale, and in a
+        product it also stops the node constraining the aggregate at all."""
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "medium"}), 0.6, places=5)
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "low"}), 0.3, places=5)
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "high"}), 0.9, places=5)
+        # No label either -> neutral, still not 1.0.
+        self.assertAlmostEqual(server._node_numeric_confidence({}), 0.6, places=5)
+        # An explicitly stamped value still wins.
+        self.assertAlmostEqual(
+            server._node_numeric_confidence(
+                {"confidence": "low", "numeric_confidence": 0.95}), 0.95, places=5)
+
+    def test_aggregate_confidence_of_unstamped_chain(self):
+        """_compute_aggregate_confidence over unstamped nodes must not be 1.0."""
+        findings_by_id = {
+            "a": {"id": "a", "confidence": "medium", "derived_from": ["b"]},
+            "b": {"id": "b", "confidence": "medium", "derived_from": []},
+        }
+        agg = server._compute_aggregate_confidence("a", findings_by_id)
+        self.assertAlmostEqual(agg, 0.36, places=5,
+                               msg="two unstamped 'medium' nodes are 0.6*0.6, not 1.0")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

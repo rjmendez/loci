@@ -208,7 +208,7 @@ from inv_store import (  # noqa: E402,F401
     _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
     _load_resolution_overrides, _load_retracted_ids, _make_ref, _tag_finding_ids,
     _summarise_finding, _safe_float, _CONFIDENCE_RANK, _RESOLUTION_STATES,
-    _distinctive_entity_set,
+    _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
 )
 
 
@@ -1574,7 +1574,9 @@ def _compute_aggregate_confidence(
     """Walk the derived_from chain for a finding and return the product of
     numeric_confidence values along the chain (up to max_depth nodes).
 
-    Findings without numeric_confidence are treated as 1.0 (backward compat).
+    A finding with no numeric_confidence is resolved from its own confidence label
+    (_node_numeric_confidence), not scored 1.0 — absence is not perfect certainty,
+    and in a product a 1.0 node silently stops constraining the aggregate.
     Returns 1.0 if the finding_id is not found or the chain is empty.
     """
     try:
@@ -1587,7 +1589,7 @@ def _compute_aggregate_confidence(
             node = findings_by_id.get(current_id)
             if not node:
                 break
-            nc = node.get("numeric_confidence", 1.0)
+            nc = _node_numeric_confidence(node)
             try:
                 product *= float(nc)
             except (TypeError, ValueError) as exc:
@@ -2123,7 +2125,6 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 _STORE_FINDING_TYPES = {"observed", "inferred", "assumed", "gap", "procedure"}
 _STORE_CONFIDENCES = {"high", "medium", "low"}
 _STORE_TIERS = {"hot", "warm", "cold"}
-_CONFIDENCE_TO_NUMERIC = {"high": 0.9, "medium": 0.6, "low": 0.3}
 
 
 def _store_validate(finding_type: str, confidence: str, tier: str, resolution: str) -> Optional[str]:
@@ -2504,7 +2505,7 @@ def procedure_attempt(
 
     Returns:
         JSON: {"finding_id": "<id>", "success_count": int, "attempt_count": int,
-               "success_rate": float}
+               "success_rate": float|null}
         On error: {"error": "<message>"}
     """
     try:
@@ -5729,6 +5730,7 @@ def contract_declare(
         "text": text,
         "source": "contract_declare",
         "confidence": "medium",
+        "numeric_confidence": _store_numeric_confidence("medium", None),
         "tags": tags,
         "derived_from": [],
         "entities": {},
@@ -5933,6 +5935,7 @@ def wiring_obligation_declare(
         "text": text,
         "source": "wiring_obligation_declare",
         "confidence": "medium",
+        "numeric_confidence": _store_numeric_confidence("medium", None),
         "tags": tags,
         "derived_from": [],
         "entities": {},

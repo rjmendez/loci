@@ -43,6 +43,31 @@ def _safe_float(value, default: float = 0.0) -> float:
 # Defined once here to avoid the same dict appearing inline in multiple functions.
 _CONFIDENCE_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
 
+# The numeric weight each confidence label carries into a derived_from chain product.
+# Lives here, not in server.py, because investigation_tools reads the same chain and
+# must not import server.
+_CONFIDENCE_TO_NUMERIC: dict[str, float] = {"high": 0.9, "medium": 0.6, "low": 0.3}
+_NEUTRAL_NUMERIC_CONFIDENCE = 0.6
+
+
+def _node_numeric_confidence(node: dict) -> float:
+    """The confidence a stored finding contributes to a derived_from chain product.
+
+    Absence is not certainty. A record whose writer never stamped numeric_confidence
+    has no measured value, and scoring that 1.0 puts it at the TOP of the scale — it
+    reads as perfect certainty and, because the chain is a product, stops the record
+    constraining the aggregate at all. Fall back to the record's own confidence label,
+    then to the same neutral 0.6 _store_numeric_confidence uses when there is no label.
+    """
+    nc = node.get("numeric_confidence")
+    if nc is not None:
+        try:
+            return max(0.0, min(1.0, float(nc)))
+        except (TypeError, ValueError):
+            pass
+    label = str(node.get("confidence") or "").strip().lower()
+    return _CONFIDENCE_TO_NUMERIC.get(label, _NEUTRAL_NUMERIC_CONFIDENCE)
+
 
 # Finding lifecycle/resolution states. "open" is the default and the implied value for
 # any finding record stored before this field existed (absent -> "open"). The three
