@@ -1423,7 +1423,10 @@ def test_main_default_thresholds(mainenv, capsys):
     write_dataset(e, 100)
     e.main()
     out = capsys.readouterr().out
-    assert "dataset pairs: 100 (+100 new) | retrain=False" in out
+    # One new run is under min_new_runs (2), so nothing is rebuilt, and the line
+    # says which threshold decided rather than only reporting the outcome.
+    assert "rebuild=False" in out
+    assert "1 new runs < 2" in out
 
 
 def test_main_argparse_defaults(mainenv, monkeypatch):
@@ -1472,3 +1475,48 @@ def test_main_forwards_findings_glob_to_every_consumer(mainenv):
     assert e.calls["retrain"][0][0] == ("GLOB", "http://o", False)
     assert e.calls["canary"][0][0] == ("GLOB", "http://o", False)
     assert e.calls["monitor"][0][0] == ("GLOB", "http://o", False)
+
+
+# --- the retrain gate decides from inputs -------------------------------------
+
+def test_new_runs_alone_trigger_a_rebuild_even_when_the_file_shrank(mainenv, capsys):
+    """The bug this split fixes. The cron wrapper resets its worktree to
+    origin/main nightly, restoring the committed dataset while loop_state.json
+    outside the worktree holds the previous run's larger count. The delta came out
+    at -7,266 and vetoed everything on the night three new investigations carrying
+    1,139 findings had just been discovered."""
+    e = mainenv
+    seed_state(e, last_dataset_size=12684)
+    e.rv["new_runs"] = ["hunt-a", "hunt-b", "hunt-c"]
+    write_dataset(e, 5418)                      # the reset artifact
+    e.rv["rebuild"] = 12684                     # what the rebuild actually finds
+    e.main()
+    out = capsys.readouterr().out
+    assert "rebuild=True" in out, out
+    assert "3 new runs >= 2" in out
+    assert len(e.calls["rebuild"]) == 1
+
+
+def test_the_pair_threshold_is_applied_to_the_real_delta_not_the_stale_one(mainenv, capsys):
+    """min_new_pairs still matters — it just has to be measured after the rebuild,
+    which is the only point the number exists."""
+    e = mainenv
+    seed_state(e, last_dataset_size=1000)
+    e.rv["new_runs"] = ["a", "b"]
+    write_dataset(e, 1000)
+    e.rv["rebuild"] = 1010                      # rebuild adds only 10 pairs
+    e.main()
+    out = capsys.readouterr().out
+    assert len(e.calls["rebuild"]) == 1, "the rebuild should still run"
+    assert e.calls["retrain"] == [], "training on +10 pairs is not justified"
+    assert "under the 200 needed" in out
+
+
+def test_a_shrinking_dataset_is_reported_rather_than_silently_vetoing(mainenv, capsys):
+    e = mainenv
+    seed_state(e, last_dataset_size=12684)
+    e.rv["new_runs"] = ["a", "b"]
+    write_dataset(e, 5418)
+    e.rv["rebuild"] = 12684
+    e.main()
+    assert "-7266 vs last run, pre-rebuild" in capsys.readouterr().out
