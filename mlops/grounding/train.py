@@ -4,6 +4,7 @@ import glob
 import hashlib
 import json
 import os
+import sys
 import pathlib
 import time
 import urllib.request
@@ -122,27 +123,21 @@ def embed_texts(texts: list, ollama_base: str, cache: dict) -> np.ndarray:
 # Feature engineering
 # ---------------------------------------------------------------------------
 
-def _token_overlap(a: str, b: str) -> float:
-    sa = set(a.split())
-    sb = set(b.split())
-    if not sa and not sb:
-        return 1.0
-    return len(sa & sb) / len(sa | sb)
+sys.path.insert(0, os.path.join(REPO_ROOT, "deep_think_loci", "grounding"))
+import features as _feat  # noqa: E402
 
 
-def _len_ratio(a: str, b: str) -> float:
-    la, lb = len(a), len(b)
-    return min(la, lb) / (max(la, lb) + 1)
+# Kept as names, not as second copies: existing tests and callers reach for
+# train._len_ratio / train._token_overlap, and re-exporting them keeps that
+# surface while leaving exactly one definition.
+_token_overlap = _feat.token_overlap
+_len_ratio = _feat.len_ratio
 
 
-def make_features(claims: list, evidences: list, emb_claims: np.ndarray, emb_evidences: np.ndarray) -> np.ndarray:
-    diff = np.abs(emb_claims - emb_evidences)
-    prod = emb_claims * emb_evidences
-    cos = (emb_claims * emb_evidences).sum(axis=1, keepdims=True)
-    cos_sq = cos ** 2
-    lr = np.array([[_len_ratio(c, e)] for c, e in zip(claims, evidences)], dtype=np.float32)
-    jac = np.array([[_token_overlap(c, e)] for c, e in zip(claims, evidences)], dtype=np.float32)
-    return np.concatenate([diff, prod, cos, cos_sq, lr, jac], axis=1)
+def make_features(claims: list, evidences: list, emb_claims, emb_evidences):
+    """One definition, in deep_think_loci/grounding/features.py, so this trainer
+    cannot drift away from what ground_gate.py is able to build."""
+    return _feat.make_features(claims, evidences, emb_claims, emb_evidences)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,10 @@ Exit: prints JSON {kept:[...], dropped:[...], threshold, mode} to --out or stdou
 import argparse, json, os, sys, urllib.request
 import numpy as np
 
+# features.py sits beside this file; the gate is run as a script, so its own
+# directory is not otherwise importable when invoked from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # Loci convention: OLLAMA_BASE_URL has no /v1 suffix; EMBED_MODEL names the embedder.
 _BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://ollama.internal:11434").rstrip("/")
 OLLAMA = _BASE + "/v1/embeddings"
@@ -58,11 +62,25 @@ def gate(query, cands, threshold=0.59, model=None):
 
     if model:
         import joblib
+        import features as _feat
         clf = joblib.load(model)
-        feats = np.array([np.concatenate([np.abs(cv[i] - qv), cv[i] * qv, [cos[i]]]) for i in range(len(cands))])
+        # Build exactly what THIS model was trained on. The trainer and this gate
+        # drifted to different widths (1540 vs 1537) and nothing caught it, because
+        # no model has ever been promoted — the first promotion would have raised
+        # here, inside the live grounding path.
+        dim = int(getattr(clf, "n_features_in_", _feat.LEGACY_DIM))
+        if dim not in _feat.supported_dims():
+            raise ValueError(
+                f"{model} expects {dim} features; this gate builds "
+                f"{_feat.supported_dims()}. Refusing to score with a model whose "
+                "feature contract is unknown."
+            )
+        texts = [c.get("text", "") for c in cands]
+        feats = _feat.make_features(texts, [query] * len(cands), cv,
+                                    np.tile(qv, (len(cands), 1)), dim=dim)
         score = clf.predict_proba(feats)[:, 1].tolist()
         keep = [s >= 0.5 for s in score]
-        mode = "model:" + model.split("/")[-1]
+        mode = f"model:{model.split('/')[-1]}:{dim}f"
     else:
         score = cos
         keep = [c >= threshold for c in cos]
