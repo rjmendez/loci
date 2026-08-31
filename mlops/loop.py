@@ -562,28 +562,48 @@ def main() -> int:
     new_runs = _discover_runs(args.findings, state["runs_seen"])
     print(f"[loop] new investigation runs: {len(new_runs)} {new_runs}")
 
-    # ── 3. Decide whether to retrain ──────────────────────────────────────────
+    # ── 3. Decide whether to rebuild ──────────────────────────────────────────
+    #
+    # Each threshold is applied where its input is actually knowable.
+    # min_new_runs gates the REBUILD and is decidable now: discovery has just run.
+    # min_new_pairs gates the TRAINING and is not — grounding_dataset.jsonl is an
+    # OUTPUT of the rebuild, so its size here is last run's result. Under the cron
+    # wrapper it is not even that: that wrapper resets its worktree to origin/main
+    # nightly, restoring the committed 5,418-row file while loop_state.json outside
+    # the worktree still holds the previous run's 12,684. The delta came out at
+    # -7,266 and vetoed everything on the night three new investigations carrying
+    # 1,139 findings had just been found.
     current_size = _current_dataset_size()
-    new_pairs = current_size - state["last_dataset_size"]
+    stale_delta = current_size - state["last_dataset_size"]
 
-    should_retrain = args.force or (
-        ollama_ok and
-        len(new_runs) >= args.min_new_runs and
-        new_pairs >= args.min_new_pairs
-    )
-    print(f"[loop] dataset pairs: {current_size} (+{new_pairs} new) | retrain={should_retrain}")
+    should_rebuild = args.force or (ollama_ok and len(new_runs) >= args.min_new_runs)
+    why = ("forced" if args.force
+           else f"Ollama unreachable at {args.ollama}" if not ollama_ok
+           else f"{len(new_runs)} new runs >= {args.min_new_runs}" if should_rebuild
+           else f"{len(new_runs)} new runs < {args.min_new_runs}")
+    print(f"[loop] dataset on disk: {current_size} pairs "
+          f"({stale_delta:+d} vs last run, pre-rebuild) | rebuild={should_rebuild} ({why})")
 
     promoted = False
     train_metrics = None
 
-    if should_retrain:
+    should_retrain = should_rebuild
+    if should_rebuild:
         # ── 4. Rebuild dataset ────────────────────────────────────────────────
         new_size = _rebuild_dataset(args.findings, args.ollama)
         new_pairs = new_size - state["last_dataset_size"]
-        print(f"[loop] dataset after rebuild: {new_size} pairs (+{new_pairs})")
+        print(f"[loop] dataset after rebuild: {new_size} pairs ({new_pairs:+d})")
+
+        # NOW the pair delta is real, so min_new_pairs can be applied to it.
+        if not args.force and new_pairs < args.min_new_pairs:
+            should_retrain = False
+            print(f"[loop] rebuild produced {new_pairs:+d} pairs, under the "
+                  f"{args.min_new_pairs} needed to justify training — skipping the "
+                  "retrain. The dataset is still refreshed and the counts below "
+                  "are current.")
 
         # ── 5. Retrain ────────────────────────────────────────────────────────
-        train_metrics = _retrain(args.findings, args.ollama, args.dry_run)
+        train_metrics = _retrain(args.findings, args.ollama, args.dry_run) if should_retrain else None
         if train_metrics:
             decision = train_metrics.get("decision", "HOLD")
             print(f"[loop] train decision: {decision}  model={train_metrics.get('model')}  "
