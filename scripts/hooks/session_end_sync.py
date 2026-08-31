@@ -351,12 +351,14 @@ def qdrant_upsert(point_id: int, vector: list, payload: dict):
         result = json.loads(resp.read())
     return result.get("status") == "ok"
 
-def _check_wiring_obligations(investigation_id: str, payload: dict) -> str:
+def _check_wiring_obligations(investigation_id: str, payload: dict) -> "str | None":
     """Query Loci for unresolved wiring obligations and append to upsert payload.
 
     Uses the MCP HTTP API if QDRANT-side Loci is available; otherwise reads
     the investigation findings.jsonl directly for the wiring_obligation tag.
-    Non-fatal: returns empty string on any error.
+    Non-fatal. Returns "" when the check ran and found nothing outstanding, and
+    None when the check could not run — a health report whose failure mode is a
+    clean line is worse than no report.
     """
     loci_dir = os.path.expanduser(
         os.environ.get("LOCI_INVESTIGATIONS_DIR", "~/.loci/investigations")
@@ -382,8 +384,9 @@ def _check_wiring_obligations(investigation_id: str, payload: dict) -> str:
             tags = rec.get("tags", [])
             if "wiring_obligation" in tags and rec.get("record_type") == "gap":
                 unresolved.append(rec.get("text", fid)[:120])
-    except Exception:
-        return ""
+    except Exception as e:
+        print(f"[session_end_sync] wiring-obligation check failed: {e}", file=sys.stderr)
+        return None
 
     count = len(unresolved)
     if count == 0:
@@ -459,8 +462,11 @@ def main():
         if ACTIVE_INV:
             try:
                 unresolved_note = _check_wiring_obligations(ACTIVE_INV, payload)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[session_end_sync] wiring-obligation check failed: {e}", file=sys.stderr)
+                unresolved_note = None
+            if unresolved_note is None:
+                unresolved_note = " | wiring-obligation check FAILED"
 
         print(f"[session_end_sync] synced {session_id[:20]} ({sess['msg_count']} msgs) in {elapsed:.2f}s{unresolved_note}")
 

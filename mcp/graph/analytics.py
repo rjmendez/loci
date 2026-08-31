@@ -30,13 +30,25 @@ def _ok(ks: Any) -> bool:
         return False
 
 
-def _q(ks: Any, cypher: str, params: dict | None = None) -> list:
-    """Fail-open read via the store's read-only code_query."""
+def _q(ks: Any, cypher: str, params: dict | None = None, failures: list | None = None) -> list:
+    """Fail-open read via the store's read-only code_query.
+
+    ``failures``: optional list; every read that did not run gets its cypher appended.
+    The store swallows read errors to [] internally, so failure is detected via its
+    monotonic ``code_query_failures`` counter — [] alone cannot say whether the graph
+    held no rows or the query never ran.
+    """
+    before = getattr(ks, "code_query_failures", 0)
     try:
-        return ks.code_query(cypher, params) or []
+        rows = ks.code_query(cypher, params) or []
     except Exception as exc:
         logger.debug("analytics query failed: %s", exc)
+        if failures is not None:
+            failures.append(cypher)
         return []
+    if failures is not None and getattr(ks, "code_query_failures", 0) != before:
+        failures.append(cypher)
+    return rows
 
 
 def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict:
@@ -49,20 +61,28 @@ def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
 
     Shape: ``{symbol, resolved:[{id,name,kind}], direct_callers:[names],
     transitive_caller_count, referencing_finding_count,
-    investigations:[{id, finding_count, sample}], co_referenced:[{name,count}]}``.
+    investigations:[{id, finding_count, sample}], co_referenced:[{name,count}],
+    partial, queries_failed}``.
+
+    ``partial`` is the honesty flag: reads fail open, so a dead CALLS query would
+    otherwise report a resolved symbol as having zero callers — a positive claim,
+    and the exact input to a decision to change or delete it. When ``partial`` is
+    true the counts are floors, not measurements.
     """
     empty = {"symbol": symbol, "resolved": [], "direct_callers": [],
              "transitive_caller_count": 0, "referencing_finding_count": 0,
-             "investigations": [], "co_referenced": []}
+             "investigations": [], "co_referenced": [],
+             "partial": False, "queries_failed": 0}
     if not _ok(ks) or not symbol:
         return empty
     hops = max(1, min(int(hops or 1), 6))
+    failed: list = []
 
     # 1) Resolve the name to target symbol ids (by id first, else by name).
     rows = _q(ks, "MATCH (s:CodeSymbol) WHERE s.id = $s OR s.name = $s "
-                  "RETURN s.id, s.name, s.kind, s.file", {"s": symbol})
+                  "RETURN s.id, s.name, s.kind, s.file", {"s": symbol}, failures=failed)
     if not rows:
-        return empty
+        return {**empty, "partial": bool(failed), "queries_failed": len(failed)}
     targets = {r[0]: {"id": r[0], "name": r[1], "kind": r[2], "file": r[3]} for r in rows}
 
     # 2) For class-like targets, fold in the class's own methods (prefix match on id).
@@ -71,7 +91,7 @@ def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
         if t["kind"] in type_kinds:
             prefix = f"{t['file']}::{t['name']}."
             for r in _q(ks, "MATCH (s:CodeSymbol) WHERE s.file = $f AND s.kind = 'method' "
-                            "RETURN s.id, s.name, s.kind, s.file", {"f": t["file"]}):
+                            "RETURN s.id, s.name, s.kind, s.file", {"f": t["file"]}, failures=failed):
                 if r[0].startswith(prefix):
                     targets.setdefault(r[0], {"id": r[0], "name": r[1], "kind": r[2], "file": r[3]})
     target_ids = list(targets)
@@ -81,17 +101,17 @@ def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
         f"MATCH (c:CodeSymbol)-[:CALLS*1..{hops}]->(t:CodeSymbol) "
         "WHERE t.id IN $ids AND NOT c.id IN $ids "
         "RETURN DISTINCT c.id, c.name LIMIT $lim",
-        {"ids": target_ids, "lim": int(limit)})
+        {"ids": target_ids, "lim": int(limit)}, failures=failed)
     caller_ids = [r[0] for r in caller_rows]
     direct = _q(ks,
         "MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol) WHERE t.id IN $ids AND NOT c.id IN $ids "
-        "RETURN DISTINCT c.name LIMIT 40", {"ids": target_ids})
+        "RETURN DISTINCT c.name LIMIT 40", {"ids": target_ids}, failures=failed)
 
     # 4) Findings referencing any target OR caller; grouped by investigation.
     affected = target_ids + caller_ids
     fi = _q(ks,
         "MATCH (f:Finding)-[:REFERENCES]->(s:CodeSymbol) WHERE s.id IN $ids "
-        "RETURN DISTINCT f.id, f.investigation, f.text", {"ids": affected})
+        "RETURN DISTINCT f.id, f.investigation, f.text", {"ids": affected}, failures=failed)
     by_inv: dict[str, dict] = {}
     seen_f: set = set()
     for fid, inv, text in fi:
@@ -107,7 +127,7 @@ def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
     co = _q(ks,
         "MATCH (f:Finding)-[:REFERENCES]->(t:CodeSymbol) WHERE t.id IN $ids "
         "MATCH (f)-[:REFERENCES]->(o:CodeSymbol) WHERE NOT o.id IN $ids "
-        "RETURN o.name, count(DISTINCT f) AS c ORDER BY c DESC LIMIT 8", {"ids": target_ids})
+        "RETURN o.name, count(DISTINCT f) AS c ORDER BY c DESC LIMIT 8", {"ids": target_ids}, failures=failed)
 
     return {
         "symbol": symbol,
@@ -117,6 +137,8 @@ def impact_report(ks: Any, symbol: str, hops: int = 3, limit: int = 200) -> dict
         "referencing_finding_count": len(seen_f),
         "investigations": investigations,
         "co_referenced": [{"name": r[0], "count": r[1]} for r in co],
+        "partial": bool(failed),
+        "queries_failed": len(failed),
     }
 
 

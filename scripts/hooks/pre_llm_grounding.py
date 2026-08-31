@@ -480,7 +480,11 @@ def _clean_content(content: str) -> str:
     return f"user: {m.group(1)[:200]}" if m else ""
 
 
-def _format_results(hits: list[dict], query: str, used_fallback: bool) -> str:
+def _format_results(hits: list[dict], query: str, used_fallback: bool,
+                    unreachable: int = 0) -> str:
+    """Render the recall block. ``unreachable`` is the number of collections whose
+    search failed this turn; the header states real coverage, because the model is
+    asked to trust it as "this is what memory holds"."""
     lines = []
     seen = set()
     for h in hits:
@@ -502,7 +506,14 @@ def _format_results(hits: list[dict], query: str, used_fallback: bool) -> str:
     if not lines:
         return GROUNDING_DIRECTIVE
 
-    src = "BeamMemory fallback" if used_fallback else f"{len(COLLECTIONS)} Qdrant collections"
+    if used_fallback:
+        src = "BeamMemory fallback"
+    elif unreachable:
+        reached = max(len(COLLECTIONS) - unreachable, 0)
+        src = (f"{reached} of {len(COLLECTIONS)} Qdrant collections "
+               f"({unreachable} unreachable)")
+    else:
+        src = f"{len(COLLECTIONS)} Qdrant collections"
     header = f'MEMORY MATCH ({len(lines)} results from {src}) for "{query}":'
     body = "\n".join(lines)
     footer = (
@@ -589,6 +600,7 @@ def main() -> None:
     # ── v3: embed → parallel Qdrant fan-out (main session) ───────────────────
     vector = _embed(intent)
     used_fallback = False
+    failed = 0
 
     if vector is None:
         hits = _beam_fallback(intent)
@@ -616,7 +628,7 @@ def main() -> None:
                 ): col
                 for col, cf, impf, named in COLLECTIONS
             }
-            searched = failed = 0
+            searched = 0
             for f in as_completed(futures):
                 searched += 1
                 try:
@@ -680,7 +692,17 @@ def main() -> None:
                 pass
 
     if hits:
-        recall_block = _format_results(hits, intent, used_fallback)
+        recall_block = _format_results(hits, intent, used_fallback, failed)
+    elif failed:
+        # Nothing came back AND part of memory was dark: an empty result is what a
+        # genuine miss looks like too, so say which one this was.
+        recall_block = (
+            f"[WARNING: memory grounding INCOMPLETE this turn — {failed} of "
+            f"{len(COLLECTIONS)} Qdrant collections were unreachable and no result "
+            "came back. Treat this as 'memory was not searched', not as 'memory "
+            "holds nothing'. Read the relevant files before using any name.]\n\n"
+            + GROUNDING_DIRECTIVE
+        )
     else:
         recall_block = GROUNDING_DIRECTIVE
 

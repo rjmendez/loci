@@ -108,6 +108,39 @@ def test_dead_code_candidates(tmp_path):
     assert names.isdisjoint({"tool_fn", "_private", "main", "setUp", "used_fn"})
 
 
+def test_impact_report_healthy_run_is_not_partial(ks):
+    r = A.impact_report(ks, "foo")
+    assert r["partial"] is False
+    assert r["queries_failed"] == 0
+
+
+def test_impact_report_flags_a_dead_caller_query_instead_of_claiming_no_callers(ks, monkeypatch):
+    """Reads fail open to [], so a dead CALLS query would otherwise report a symbol
+    that IS in the graph as having zero callers — the input to a delete decision."""
+    real_rows = ks._rows
+
+    def flaky(cypher, params=None):
+        if "CALLS" in cypher:
+            raise RuntimeError("ladybug read session unavailable")
+        return real_rows(cypher, params)
+
+    monkeypatch.setattr(ks, "_rows", flaky)
+    r = A.impact_report(ks, "foo")
+
+    assert {x["name"] for x in r["resolved"]} == {"foo"}   # the symbol resolved fine
+    assert r["direct_callers"] == []                       # ... but nobody asked
+    assert r["transitive_caller_count"] == 0
+    assert r["partial"] is True
+    assert r["queries_failed"] == 2                        # transitive + direct
+
+
+def test_impact_report_flags_a_dead_resolve_query(ks, monkeypatch):
+    monkeypatch.setattr(ks, "_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    r = A.impact_report(ks, "foo")
+    assert r["resolved"] == []
+    assert r["partial"] is True   # "not in the graph" and "never asked" are different
+
+
 def test_fail_open():
     class Dead:
         def available(self):

@@ -907,6 +907,16 @@ def test_format_results_skips_hits_cleaned_to_empty(hook):
     assert out.count("[c|") == 1 and "real content" in out
 
 
+def test_format_results_header_states_real_coverage_on_a_partial_outage(hook):
+    """The header is a coverage claim the model is asked to trust: on a partial
+    outage it must not assert that all three collections answered."""
+    hits = [{"collection": "loci_memory", "score": 0.5, "content": "x"}]
+    out = hook._format_results(hits, "q", False, 2)
+    assert out.splitlines()[0] == (
+        'MEMORY MATCH (1 results from 1 of 3 Qdrant collections (2 unreachable)) for "q":'
+    )
+
+
 def test_format_results_returns_directive_when_nothing_survives(hook):
     assert hook._format_results([], "q", False) == hook.GROUNDING_DIRECTIVE
     only_empty = [{"collection": "c", "score": 0.9, "content": "   "}]
@@ -1107,6 +1117,33 @@ def test_main_one_collection_blowing_up_does_not_sink_the_turn(hook):
     assert "from loci_sessions" in ctx and "from loci_memory" in ctx
     assert "from mnemosyne" not in ctx
     assert "(2 results" in ctx
+    assert "2 of 3 Qdrant collections (1 unreachable)" in ctx
+
+
+def test_main_partial_outage_with_no_hits_warns_instead_of_a_bare_directive(hook):
+    """An empty result is what a genuine miss looks like too. When part of memory
+    was dark, say so -- the total-outage path already does."""
+    def _search(col, vec, cf, impf, named, top_k):
+        if col == "mnemosyne":
+            raise RuntimeError("collection on fire")
+        return []
+
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = _search
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt())
+    ctx = context_of(out)
+    assert ctx.startswith("[WARNING: memory grounding INCOMPLETE this turn")
+    assert "1 of 3 Qdrant collections were unreachable" in ctx
+    assert ctx.endswith(hook.GROUNDING_DIRECTIVE)
+
+
+def test_main_healthy_empty_search_stays_a_bare_directive(hook):
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = lambda *a, **k: []
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt())
+    assert context_of(out) == hook.GROUNDING_DIRECTIVE
 
 
 def test_main_filters_hits_below_min_importance(hook):

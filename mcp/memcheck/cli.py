@@ -534,7 +534,7 @@ def _cmd_stats(argv: list[str]) -> int:
     engine = VerdictEngine(backend, EmlConfig())
     stats = asyncio.run(engine.stats())
     print(json.dumps(stats, indent=2, sort_keys=True))
-    return 0
+    return 0 if stats.get("ok", True) else 1
 
 
 # --------------------------------------------------------------------------- #
