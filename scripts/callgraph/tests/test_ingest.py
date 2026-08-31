@@ -4,10 +4,10 @@ from .. import ingest
 from ..tests.helpers import source_file
 
 
-def test_load_corpus_worktree_parses_123_files_with_no_errors():
+def test_load_corpus_worktree_parses_125_files_with_no_errors():
     sources, origin = ingest.load_corpus(rev=None)
     assert origin == "working tree"
-    assert len(sources) == 123
+    assert len(sources) == 125
     errors = [(sf.rel_path, sf.error) for sf in sources if sf.error is not None]
     assert errors == []
     assert all(sf.tree is not None for sf in sources)
@@ -16,7 +16,7 @@ def test_load_corpus_worktree_parses_123_files_with_no_errors():
 def test_load_corpus_rev_head_reads_git_blobs():
     sources, origin = ingest.load_corpus(rev="HEAD")
     assert origin.startswith("rev ")
-    assert len(sources) == 123
+    assert len(sources) == 125
     assert all(sf.error is None for sf in sources)
     server = next(sf for sf in sources if sf.rel_path == "mcp/server.py")
     assert "loci-mcp" in server.source[:200]
