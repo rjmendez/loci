@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 123
+    assert head_build.meta.file_count == 125
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -99,9 +99,14 @@ def test_unresolved_imports_are_all_genuinely_optional_third_party(head_build):
     unresolved = [e for e in head_build.store.edges_of_kind("IMPORTS") if e.attrs.get("resolved_via") == "unresolved"]
     modules = {e.attrs["module"] for e in unresolved}
     # All optional deps absent from the venv; a corpus-internal name appearing here IS a regression.
+    # "features" is first-party but lives in deep_think_loci/grounding/, which is
+    # outside CORPUS_ROOTS, and is reached through a runtime sys.path.insert that
+    # static analysis cannot follow — the same reason mnemosyne is on this list.
+    # A name from mcp/, scripts/, a2a_server/, mlops/ or eval/ appearing here
+    # would still be the regression this gate is for.
     assert modules <= {
         "cy_ioc_extract", "mnemosyne", "mnemosyne.core.memory", "mnemosyne.core.beam",
-        "psycopg2", "psutil",
+        "psycopg2", "psutil", "features",
     }
     assert len(unresolved) < 20, "the unresolved list must fit on one screen"
 
