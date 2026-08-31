@@ -137,6 +137,48 @@ each tier resolves its own.
 
 ---
 
+## MLOps loop
+
+`mlops/loop.py` rebuilds the grounding dataset, retrains the classifier
+ensemble, canary-evaluates the candidate and promotes it if it beats the
+baseline. It ran for the first time on 2026-08-29; before that it had queued
+against a self-hosted runner that does not exist for 67 consecutive nights, and
+every child process was unbounded (#238).
+
+Scheduled from the user crontab through `scripts/mlops_loop_cron.sh`:
+
+| When | What |
+|---|---|
+| `0 2 * * *` | full loop, into an isolated worktree |
+
+**The loop promotes by writing into the repo.** `grounding_bleed_clf.joblib`,
+`grounding_dataset.jsonl` and `metrics.json` under `deep_think_loci/grounding/`
+are all tracked, so running the loop in a working checkout leaves that checkout
+dirty — which is how a 12,684-row rebuilt dataset ends up in an unrelated
+commit. The wrapper runs it in `~/.loci/mlops/worktree`, reset to `origin/main`
+each night, and prints what changed. **Nothing is applied automatically**;
+adopting a promoted model is a deliberate commit.
+
+Roughly twenty minutes end to end, the bulk of it GradientBoosting under 10-fold
+CV. Each step is bounded at `LOCI_MLOPS_STEP_TIMEOUT` (3600s), and a step that
+times out comes back as returncode 124 rather than hanging the run. Child output
+is streamed as it arrives, prefixed with the script that produced it.
+
+| Code | Meaning |
+|---|---|
+| 0 | ok — including steps deliberately skipped (Ollama unreachable, nothing new) |
+| 1 | one or more steps **failed**, named in the summary line |
+
+A skip is not a failure, and the log says which it was: a cadence-gated step that
+could not run because the backend was unreachable says so rather than reciting
+the cadence.
+
+See [grounding-corpus-limits.md](grounding-corpus-limits.md) before reading much
+into the scores — the CV figure it prints is a pair-level split and optimistic by
+about two thirds of its margin over cosine.
+
+---
+
 ## Manual operations
 
 The repo is `loci` (github.com/rjmendez/loci). The commands below assume:
