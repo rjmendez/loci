@@ -26,7 +26,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
+import os as _os
+import sys as _sys
+
+# mcp/ is this file's grandparent; vecmath lives there.
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from vecmath import cosine as _vecmath_cosine  # noqa: E402
 import os
 import urllib.request
 
@@ -401,18 +406,8 @@ def embed_texts(texts: list[str], *, timeout: float = 60.0, batch: int = 16) -> 
     return out
 
 
-def cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity in pure Python (no numpy). 0.0 on degenerate input."""
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    denom = math.sqrt(na) * math.sqrt(nb)
-    if denom <= 0.0:
-        return 0.0
-    return dot / denom
+def cosine(a, b):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable;
+    callers that need a float choose their own default rather than inheriting
+    0.0, which reads as a confident 'not similar'."""
+    return _vecmath_cosine(a, b)

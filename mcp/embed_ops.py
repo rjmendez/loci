@@ -140,14 +140,12 @@ def warm(embed_fn: Optional[Callable[[list[str]], list[list[float]]]] = None) ->
     return True
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    import math
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    return dot / (na * nb) if na and nb else 0.0
+def _cosine(a: list[float], b: list[float]):
+    """Delegates to vecmath. This returned 0.0 on a length mismatch, which reads
+    as "orthogonal — definitely not a match": a confident negative a ranker acts
+    on. None says the question could not be answered."""
+    from vecmath import cosine
+    return cosine(a, b)
 
 
 def _text_of(item, key: Optional[str]) -> str:
@@ -190,7 +188,8 @@ def dedup(items: list, threshold: float = 0.88, key: Optional[str] = None,
     for i in range(n):
         placed = False
         for ci, rep in enumerate(reps):
-            if _cosine(vecs[i], vecs[rep]) >= threshold:
+            sim = _cosine(vecs[i], vecs[rep])
+            if sim is not None and sim >= threshold:
                 clusters[ci]["member_indices"].append(i)
                 placed = True
                 break
@@ -213,4 +212,7 @@ def relevance(texts: list[str], topic: str,
     if len(vecs) != len(texts) + 1:
         return {"scores": [None] * len(texts), "degraded": True}
     tvec = vecs[0]
-    return {"scores": [round(_cosine(tvec, v), 4) for v in vecs[1:]], "degraded": False}
+    # None for a pair that cannot be compared, matching the [None] * len(texts)
+    # this function already returns when the embedder itself came back short.
+    scores = [(None if (x := _cosine(tvec, v)) is None else round(x, 4)) for v in vecs[1:]]
+    return {"scores": scores, "degraded": False}
