@@ -484,10 +484,13 @@ def _clean_content(content: str) -> str:
 
 
 def _format_results(hits: list[dict], query: str, used_fallback: bool,
-                    unreachable: int = 0) -> str:
+                    unreachable: int = 0, searched: int | None = None) -> str:
     """Render the recall block. ``unreachable`` is the number of collections whose
     search failed this turn; the header states real coverage, because the model is
-    asked to trust it as "this is what memory holds"."""
+    asked to trust it as "this is what memory holds". ``searched`` overrides
+    len(COLLECTIONS) for a caller that queries a subset — the subagent path below
+    searches loci_memory only, and claiming all of COLLECTIONS answered is the same
+    kind of over-statement as hiding an outage."""
     lines = []
     seen = set()
     for h in hits:
@@ -509,14 +512,15 @@ def _format_results(hits: list[dict], query: str, used_fallback: bool,
     if not lines:
         return GROUNDING_DIRECTIVE
 
+    total = len(COLLECTIONS) if searched is None else searched
     if used_fallback:
         src = "BeamMemory fallback"
     elif unreachable:
-        reached = max(len(COLLECTIONS) - unreachable, 0)
-        src = (f"{reached} of {len(COLLECTIONS)} Qdrant collections "
+        reached = max(total - unreachable, 0)
+        src = (f"{reached} of {total} Qdrant collections "
                f"({unreachable} unreachable)")
     else:
-        src = f"{len(COLLECTIONS)} Qdrant collections"
+        src = f"{total} Qdrant collection" + ("" if total == 1 else "s")
     header = f'MEMORY MATCH ({len(lines)} results from {src}) for "{query}":'
     body = "\n".join(lines)
     footer = (
@@ -568,6 +572,7 @@ def main() -> None:
     # loci_memory only: the collection most relevant to code generation mid-investigation.
     if is_subagent:
         sub_hits: list[dict] = []
+        sub_used_fallback = False
         if QDRANT_URL:
             sub_vec = _embed(intent)
             if sub_vec is not None:
@@ -578,6 +583,7 @@ def main() -> None:
                     )
                 except _SearchFailed:
                     sub_hits = _beam_fallback(intent)
+                    sub_used_fallback = True
                 sub_hits = [h for h in sub_hits if h["importance"] >= MIN_IMPORTANCE]
                 _sub_ts = time.time()
                 for h in sub_hits:
@@ -585,9 +591,11 @@ def main() -> None:
                 sub_hits = sorted(sub_hits, key=lambda h: h["_ms_score"], reverse=True)[:2]
             else:
                 sub_hits = _beam_fallback(intent)
+                sub_used_fallback = True
 
         if sub_hits:
-            recall_block = _format_results(sub_hits, intent, False)
+            recall_block = _format_results(sub_hits, intent, sub_used_fallback,
+                                           searched=1)
         else:
             recall_block = (
                 "[WARNING: memory grounding unavailable in subagent context — "

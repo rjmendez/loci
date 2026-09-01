@@ -1570,7 +1570,7 @@ def _compute_aggregate_confidence(
     finding_id: str,
     findings_by_id: dict,
     max_depth: int = 5,
-) -> float:
+) -> float | None:
     """Walk the derived_from chain for a finding and return the product of
     numeric_confidence values along the chain (up to max_depth nodes).
 
@@ -1578,6 +1578,11 @@ def _compute_aggregate_confidence(
     (_node_numeric_confidence), not scored 1.0 — absence is not perfect certainty,
     and in a product a 1.0 node silently stops constraining the aggregate.
     Returns 1.0 if the finding_id is not found or the chain is empty.
+    Returns None if the walk itself failed: for the same reason a node is not
+    worth 1.0, a crash is not worth 1.0 either — it is the top of the scale AND
+    the identity element of the product, so it would report perfect certainty
+    over a chain that was never read. investigation_finding_provenance already
+    returns None here (investigation_tools.py).
     """
     try:
         product = 1.0
@@ -1598,8 +1603,9 @@ def _compute_aggregate_confidence(
             current_id = str(parents[0]) if parents else None
             depth += 1
         return round(product, 6)
-    except Exception:
-        return 1.0
+    except Exception as exc:
+        logger.debug("_compute_aggregate_confidence: chain walk failed: %r", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3516,6 +3522,11 @@ def _pre_answer_chain_confidence(
         for ev_id in matched_ids:
             if ev_id and ev_id in findings_by_id_for_conf:
                 agg = _compute_aggregate_confidence(ev_id, findings_by_id_for_conf)
+                if agg is None:
+                    # The chain walk failed: no measurement. It must not enter the
+                    # min() as 1.0, which cannot lower the bucket and so renders an
+                    # unread chain as 'high'.
+                    continue
                 chain_confidences.append(agg)
         if chain_confidences:
             min_chain_confidence = round(min(chain_confidences), 6)
