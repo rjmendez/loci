@@ -1101,28 +1101,38 @@ def test_embed_posts_to_the_native_ollama_api(monkeypatch):
 
 # ── boundary_samples ──────────────────────────────────────────────────────────
 
+# The sampler scores (claim, evidence) pairs through the shared grounding feature
+# contract, so a fake model has to advertise one of the widths that contract
+# builds at the production embedding size.
+_EMBED_DIM = 768
+_LEGACY_DIM = 2 * _EMBED_DIM + 1
+
+
+def _stub_vec():
+    return [1.0] + [0.0] * (_EMBED_DIM - 1)
+
+
 @pytest.fixture
 def boundary_dataset(tmp_path):
     texts = [f"candidate text number {i} padded out to length" for i in range(6)]
     p = tmp_path / "ds.jsonl"
     with open(p, "w") as fh:
         for i, t in enumerate(texts):
-            fh.write(json.dumps({"text": t, "id": i}) + "\n")
-        fh.write(json.dumps({"text": "short", "id": 99}) + "\n")
+            fh.write(json.dumps({"text": t, "evidence": f"evidence {i}", "id": i}) + "\n")
+        fh.write(json.dumps({"text": "short", "evidence": "e", "id": 99}) + "\n")
     return str(p), texts
 
 
 @pytest.fixture
-def graded_model(tmp_path, monkeypatch, boundary_dataset):
-    """A model whose P(1) walks away from 0.5 as the record index grows."""
-    _, texts = boundary_dataset
-    index = {t: i for i, t in enumerate(texts)}
-    monkeypatch.setattr(al, "_embed", lambda text, url, model: [float(index[text])])
+def graded_model(tmp_path, monkeypatch):
+    """A model whose P(1) walks away from 0.5 as the record's row position grows."""
+    monkeypatch.setattr(al, "_embed", lambda text, url, model: _stub_vec())
 
     class Graded:
-        def predict_proba(self, vecs):
-            i = vecs[0][0]
-            return [[1.0 - (0.5 + 0.05 * i), 0.5 + 0.05 * i]]
+        n_features_in_ = _LEGACY_DIM
+
+        def predict_proba(self, feats):
+            return np.array([[0.5 - 0.05 * i, 0.5 + 0.05 * i] for i in range(len(feats))])
 
     path = tmp_path / "m.joblib"
     path.write_bytes(b"stub")
@@ -1140,7 +1150,7 @@ def test_boundary_samples_unloadable_model_returns_empty(tmp_path, boundary_data
     bad = tmp_path / "bad.joblib"
     bad.write_bytes(b"garbage")
     assert al.boundary_samples(str(bad), ds) == []
-    assert "could not load model" in capsys.readouterr().err
+    assert "could not load model" in capsys.readouterr().out
 
 
 def test_boundary_samples_empty_dataset_returns_empty(graded_model, tmp_path):
@@ -1157,7 +1167,7 @@ def test_boundary_samples_sorts_by_uncertainty_and_annotates(graded_model, bound
     assert out[0]["proba"] == pytest.approx(0.5)
     assert out[0]["uncertainty"] == pytest.approx(0.0)
     assert out[3]["uncertainty"] == pytest.approx(0.15)
-    assert set(out[0]) == {"text", "id", "candidate_type", "proba", "uncertainty"}
+    assert set(out[0]) == {"text", "evidence", "id", "candidate_type", "proba", "uncertainty"}
 
 
 def test_boundary_samples_band_is_halved(graded_model, boundary_dataset):
@@ -1177,42 +1187,136 @@ def test_boundary_samples_skips_records_shorter_than_twenty_chars(graded_model, 
     assert 99 not in [c["id"] for c in al.boundary_samples(graded_model, ds, uncertainty_band=2.0)]
 
 
-def test_boundary_samples_swallows_per_record_failures(tmp_path, monkeypatch, boundary_dataset):
-    """BUG PIN: it scores raw embeddings, so a real classifier raises and is silently skipped."""
+def test_boundary_samples_reports_a_scoring_failure_instead_of_returning_a_bare_empty(
+        tmp_path, monkeypatch, boundary_dataset, capsys):
+    """A model that raises at predict_proba must say so once, not be indistinguishable
+    from a corpus with no uncertain samples."""
     from sklearn.linear_model import LogisticRegression
     ds, _ = boundary_dataset
     rng = np.random.RandomState(0)
-    X = rng.rand(40, 12)
+    X = rng.rand(40, _LEGACY_DIM)
     y = (X[:, 0] > 0.5).astype(int)
-    model = LogisticRegression(max_iter=500).fit(X, y)
+    model = LogisticRegression(max_iter=50).fit(X, y)
+    model.n_features_in_ = _LEGACY_DIM
     path = tmp_path / "m.joblib"
     path.write_bytes(b"stub")
     monkeypatch.setattr(joblib, "load", lambda p: model)
     monkeypatch.setattr(al, "_embed", lambda text, url, m: [0.1, 0.2, 0.3, 0.4])
     assert al.boundary_samples(str(path), ds) == []
+    assert "scoring 6 rows failed" in capsys.readouterr().out
 
 
-def test_boundary_samples_uses_text_content_query_in_that_order(tmp_path, monkeypatch):
+def test_boundary_samples_uses_text_claim_content_query_in_that_order(tmp_path, monkeypatch,
+                                                                     graded_model):
+    """`claim` sits second in the chain: it is the key the live corpus actually uses,
+    and adding it must not displace the three that were already read."""
     seen = []
-    monkeypatch.setattr(al, "_embed", lambda text, url, m: seen.append(text) or [0.0])
+    real = al._embed
+    monkeypatch.setattr(al, "_embed", lambda text, url, m: seen.append(text) or real(text, url, m))
+    ds = tmp_path / "ds.jsonl"
+    with open(ds, "w") as fh:
+        fh.write(json.dumps({"text": "from the text field padded out", "claim": "ignored",
+                             "evidence": "e0"}) + "\n")
+        fh.write(json.dumps({"claim": "from the claim field padded ok", "content": "ignored",
+                             "evidence": "e1"}) + "\n")
+        fh.write(json.dumps({"content": "from the content field padded", "evidence": "e2"}) + "\n")
+        fh.write(json.dumps({"query": "from the query field padded ok", "evidence": "e3"}) + "\n")
+        fh.write(json.dumps({"other": "invisible field, no text at all", "evidence": "e4"}) + "\n")
+    al.boundary_samples(graded_model, str(ds), uncertainty_band=2.0)
+    assert [t for t in seen if not t.startswith("e")] == [
+        "from the text field padded out",
+        "from the claim field padded ok",
+        "from the content field padded",
+        "from the query field padded ok",
+    ]
 
-    class Half:
-        def predict_proba(self, vecs):
-            return [[0.5, 0.5]]
+
+def test_boundary_samples_scores_the_claim_evidence_schema_the_corpus_uses(tmp_path,
+                                                                          graded_model):
+    """The live grounding_dataset.jsonl rows carry only {claim, evidence, label, ...}.
+
+    Before the fix the field chain read text/content/query, so `len(text) < 20`
+    fired on all 5418 rows and boundary_samples() returned [] having consulted
+    nothing — while the loop logged 'boundary=0' as an ordinary result.
+    """
+    ds = tmp_path / "corpus.jsonl"
+    with open(ds, "w") as fh:
+        for i in range(4):
+            fh.write(json.dumps({"claim": f"a claim long enough to survive the gate {i}",
+                                 "evidence": f"supporting evidence {i}",
+                                 "label": i % 2, "signal": "topical"}) + "\n")
+    out = al.boundary_samples(graded_model, str(ds), uncertainty_band=2.0)
+    assert len(out) == 4
+    assert [c["claim"][-1] for c in out] == ["0", "1", "2", "3"]
+    assert out[0]["candidate_type"] == "boundary"
+    assert "signal" in out[0]  # the source row is carried through intact
+
+
+def test_boundary_samples_feeds_the_model_pair_features_at_its_own_width(tmp_path, monkeypatch,
+                                                                        boundary_dataset):
+    """It used to hand predict_proba one raw 768-d embedding per record. The live
+    classifier declares n_features_in_ = 1537, so that raised for every record and
+    the per-record `except: continue` swallowed it."""
+    ds, _ = boundary_dataset
+    monkeypatch.setattr(al, "_embed", lambda text, url, m: _stub_vec())
+    shapes = []
+
+    class Recorder:
+        n_features_in_ = _LEGACY_DIM
+
+        def predict_proba(self, feats):
+            shapes.append(np.asarray(feats).shape)
+            return np.array([[0.5, 0.5]] * len(feats))
 
     path = tmp_path / "m.joblib"
     path.write_bytes(b"stub")
-    monkeypatch.setattr(joblib, "load", lambda p: Half())
-    ds = tmp_path / "ds.jsonl"
+    monkeypatch.setattr(joblib, "load", lambda p: Recorder())
+    al.boundary_samples(str(path), ds)
+    assert shapes == [(6, _LEGACY_DIM)]
+
+
+def test_boundary_samples_embeds_each_distinct_string_once(tmp_path, monkeypatch, graded_model):
+    """The corpus repeats its claims and evidences (5418 rows over 143 of each), so
+    a naive two-embeds-per-row loop would be ~38x the Ollama traffic it needs."""
+    calls = []
+    monkeypatch.setattr(al, "_embed", lambda text, url, m: calls.append(text) or _stub_vec())
+    ds = tmp_path / "dupes.jsonl"
     with open(ds, "w") as fh:
-        fh.write(json.dumps({"text": "from the text field padded out", "content": "ignored"}) + "\n")
-        fh.write(json.dumps({"content": "from the content field padded"}) + "\n")
-        fh.write(json.dumps({"query": "from the query field padded ok"}) + "\n")
-        fh.write(json.dumps({"other": "invisible field, no text at all"}) + "\n")
-    al.boundary_samples(str(path), str(ds))
-    assert seen == ["from the text field padded out",
-                    "from the content field padded",
-                    "from the query field padded ok"]
+        for _ in range(5):
+            fh.write(json.dumps({"claim": "one claim repeated across every row here",
+                                 "evidence": "one evidence repeated too"}) + "\n")
+    al.boundary_samples(graded_model, str(ds), uncertainty_band=2.0)
+    assert sorted(calls) == ["one claim repeated across every row here",
+                             "one evidence repeated too"]
+
+
+def test_boundary_samples_says_so_when_no_row_is_scorable(tmp_path, graded_model, capsys):
+    """An all-dropped run must be distinguishable from a genuine 'no uncertain
+    samples', which is exactly what 'boundary=0' hid for the whole corpus."""
+    ds = tmp_path / "unscorable.jsonl"
+    with open(ds, "w") as fh:
+        for i in range(3):
+            fh.write(json.dumps({"summary": f"no field this sampler reads {i}"}) + "\n")
+    assert al.boundary_samples(graded_model, str(ds)) == []
+    assert "examined 3 rows, 0 carried a (claim, evidence) pair" in capsys.readouterr().out
+
+
+def test_boundary_samples_refuses_a_model_of_unknown_feature_width(tmp_path, monkeypatch,
+                                                                  boundary_dataset, capsys):
+    ds, _ = boundary_dataset
+    monkeypatch.setattr(al, "_embed", lambda text, url, m: _stub_vec())
+
+    class Wrong:
+        n_features_in_ = 12
+
+        def predict_proba(self, feats):  # pragma: no cover - must never be reached
+            raise AssertionError("scored with an unknown feature contract")
+
+    path = tmp_path / "m.joblib"
+    path.write_bytes(b"stub")
+    monkeypatch.setattr(joblib, "load", lambda p: Wrong())
+    assert al.boundary_samples(str(path), ds) == []
+    assert "expects 12 features" in capsys.readouterr().out
 
 
 # ── hard_negatives ────────────────────────────────────────────────────────────
@@ -1313,3 +1417,21 @@ def test_embed_model_is_read_at_call_time_not_import_time(monkeypatch):
     assert train._emb_model() == "some-other-embedder"
     monkeypatch.delenv("EMBED_MODEL")
     assert train._emb_model() == "nomic-embed-text"
+
+
+def test_boundary_samples_reports_embed_failures_once_not_once_per_string(
+        tmp_path, monkeypatch, graded_model, capsys):
+    """With Ollama down this is every distinct text in the corpus, and the nightly
+    log is the only reader."""
+    monkeypatch.setattr(al, "_embed", lambda text, url, m: (_ for _ in ()).throw(
+        RuntimeError("connection refused")))
+    ds = tmp_path / "ds.jsonl"
+    with open(ds, "w") as fh:
+        for i in range(4):
+            fh.write(json.dumps({"claim": f"a claim long enough to survive it {i}",
+                                 "evidence": f"evidence {i}"}) + "\n")
+    assert al.boundary_samples(graded_model, str(ds)) == []
+    out = capsys.readouterr().out
+    assert out.count("embeds failed") == 1
+    assert "8/8 embeds failed, first: connection refused" in out
+    assert "4 scorable rows, 0 embedded" in out
