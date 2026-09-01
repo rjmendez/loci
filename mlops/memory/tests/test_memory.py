@@ -196,16 +196,32 @@ def test_apply_decay_ignores_null_importance_rows(tmp_path):
     assert _read_importance(db)[2] is None
 
 
-def test_apply_decay_silently_skips_naive_timestamps(tmp_path):
-    # BUG: created_at without a timezone offset makes `now - created_dt` raise
-    # TypeError, which the bare `except Exception: continue` swallows. Such rows
-    # are counted in n_rows but never decayed and never contribute a retention.
+def test_apply_decay_treats_naive_timestamps_as_utc(tmp_path):
+    # created_at without a timezone offset is what SQLite CURRENT_TIMESTAMP writes,
+    # i.e. every production row. It is naive UTC and must decay like any other row,
+    # not raise TypeError into the except and be skipped.
     db = _make_db(tmp_path / "m.db", [(1, "a", 0.9, "2020-01-01T00:00:00", "s1")])
     res = D.apply_decay(db)
     assert res["n_rows"] == 1
-    assert res["n_decayed"] == 0
-    assert res["mean_retention"] == 1.0
-    assert _read_importance(db)[1] == 0.9  # a 5-year-old row keeps full importance
+    assert res["n_decayed"] == 1
+    assert res["mean_retention"] < 0.01
+    assert _read_importance(db)[1] == D.DEFAULT_MIN_IMPORTANCE
+
+
+def test_apply_decay_naive_and_aware_created_at_agree(tmp_path):
+    # The sqlite "YYYY-MM-DD HH:MM:SS" form and the same instant written as
+    # offset-aware ISO-8601 must produce the same retention.
+    aware = (datetime.now(timezone.utc) - timedelta(days=200)).replace(microsecond=0)
+    naive_db = _make_db(tmp_path / "naive.db",
+                        [(1, "a", 0.9, aware.strftime("%Y-%m-%d %H:%M:%S"), "s1")])
+    aware_db = _make_db(tmp_path / "aware.db", [(1, "a", 0.9, aware.isoformat(), "s1")])
+
+    naive_res = D.apply_decay(naive_db, dry_run=True)
+    aware_res = D.apply_decay(aware_db, dry_run=True)
+
+    assert naive_res["n_decayed"] == aware_res["n_decayed"] == 1
+    assert naive_res["mean_retention"] < 1.0
+    assert naive_res["mean_retention"] == pytest.approx(aware_res["mean_retention"], abs=1e-6)
 
 
 def test_apply_decay_skips_unparseable_and_null_created_at(tmp_path):

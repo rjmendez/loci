@@ -36,7 +36,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── config ────────────────────────────────────────────────────────────────────
 
@@ -196,7 +196,12 @@ def sweep_orphans(dry_run: bool) -> int:
             continue
         created = row["created_at"]
         try:
-            ts = datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+            dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+            # SQLite CURRENT_TIMESTAMP is naive UTC; .timestamp() would otherwise
+            # read it as local wall-clock and skew the TTL by the UTC offset.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts = dt.timestamp()
         except Exception:
             continue
         if ts < cutoff_ts:

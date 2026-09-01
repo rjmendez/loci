@@ -18,6 +18,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -63,8 +64,16 @@ def apply_decay(
             created_raw = row["created_at"] or ""
             try:
                 created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                # SQLite CURRENT_TIMESTAMP writes naive UTC; stamp it so the
+                # subtraction against an aware `now` does not raise.
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
                 age_days = (now - created_dt).total_seconds() / 86400.0
-            except Exception:
+            except (ValueError, TypeError) as exc:
+                print(
+                    f"[decay] skipping row {row['id']}: bad created_at {created_raw!r} ({exc})",
+                    file=sys.stderr,
+                )
                 continue
 
             retention = weibull_retention(age_days, lambda_days, k)
