@@ -52,8 +52,13 @@ CONFLICT_KEYWORD_PAIRS = [
 # Embedding
 # ---------------------------------------------------------------------------
 
-def embed(text: str) -> list[float]:
-    """Return the embedding vector for *text* via Ollama."""
+def embed(text: str) -> list[float] | None:
+    """Return the embedding vector for *text* via Ollama, or None on failure.
+
+    None (rather than raising) lets the caller treat this row as unanswerable
+    for cosine comparisons, same as vecmath.cosine already does for a length
+    mismatch — one unresponsive row degrades instead of hanging the run.
+    """
     payload = json.dumps({"model": EMBED_MODEL, "input": text}).encode()
     req = urllib.request.Request(
         f"{OLLAMA_URL}/v1/embeddings",
@@ -61,18 +66,25 @@ def embed(text: str) -> list[float]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
-        body = json.loads(resp.read())
-    # Ollama returns {"data": [{"embedding": [...]}]}
-    return body["data"][0]["embedding"]
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+        # Ollama returns {"data": [{"embedding": [...]}]}
+        return body["data"][0]["embedding"]
+    except Exception as e:
+        print(f"[amem] embed error: {e}", file=_sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Cosine similarity
 # ---------------------------------------------------------------------------
 
-def cosine(a: list[float], b: list[float]):
-    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable."""
+def cosine(a: list[float] | None, b: list[float] | None):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable.
+
+    A missing vector (embed() returned None) is one such case: vecmath.cosine
+    already answers None for anything falsy, so it needs no guard here."""
     return _vecmath.cosine(a, b)
 
 
@@ -169,7 +181,7 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Phase 1 — Embed all entries
         # ------------------------------------------------------------------
-        entries: list[tuple[str, str, list[float], str]] = []
+        entries: list[tuple[str, str, list[float] | None, str]] = []
         for row in rows:
             vec = embed(row["content"])
             entries.append((row["id"], row["content"], vec, row["created_at"] or ""))
