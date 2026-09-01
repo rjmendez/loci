@@ -47,8 +47,31 @@ from typing import Callable, Optional
 # Same base-URL convention as embed_ops.py / llm_local.py.
 _OLLAMA = os.environ.get("OLLAMA_BASE_URL") or os.environ.get("OLLAMA_URL") or ""
 
-# The two hot models to keep resident. [gen] qwen2.5:3b, [retrieval] nomic-embed-text.
-_GEN_MODEL = os.environ.get("WARM_GEN_MODEL", "qwen2.5:3b")
+
+def _resolve_gen_model() -> str:
+    """WARM_GEN_MODEL env -> backends.ollama_gen_model() -> the qwen2.5:3b default.
+
+    Same resolution chain mcp/memcheck/llm.py._llm_model() already uses, so the
+    model this script pins resident can't silently diverge from the model
+    mcp/llm_local.py actually generates with.
+    """
+    explicit = os.environ.get("WARM_GEN_MODEL")
+    if explicit:
+        return explicit
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "mcp"))
+        import backends
+        m = backends.ollama_gen_model()
+        if m:
+            return m
+    except Exception:
+        pass
+    return "qwen2.5:3b"
+
+
+# The two hot models to keep resident. [gen] resolved via backends (see
+# _resolve_gen_model); [retrieval] nomic-embed-text.
+_GEN_MODEL = _resolve_gen_model()
 _EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 
 # Generous timeout: a cold load is ~70s [substrate]; 120s covers cold-load + tiny gen.
