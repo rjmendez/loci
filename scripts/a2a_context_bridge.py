@@ -116,10 +116,15 @@ ECHO_SOURCE_PREFIXES = [
 ]
 
 
-def _fetch_recent_memories(since: str, min_importance: float, max_items: int) -> list[dict]:
+def _fetch_recent_memories(since: str, min_importance: float, max_items: int) -> list[dict] | None:
     """
     Fetch memories newer than `since` (ISO timestamp) with importance >= min_importance,
     excluding anything that arrived through the mesh (see ECHO_SOURCE_PREFIXES).
+
+    Returns None -- NOT [] -- when the DB could not be read at all (file absent, or no
+    queryable table). An empty list means "the window really was quiet" and lets the
+    caller advance its watermark; None must not, because everything written during the
+    outage would fall behind the new watermark and never be bridged.
 
     Reads BOTH tiers. This used to read working_memory and fall back to `memories` only on
     OperationalError -- i.e. only if the table did not exist. working_memory does exist, and
@@ -134,7 +139,7 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
     """
     if not os.path.exists(MNEMOSYNE_DB):
         log.warning("Mnemosyne DB not found: %s", MNEMOSYNE_DB)
-        return []
+        return None
 
     echo_clause = ""
     params_tail: list = []
@@ -149,6 +154,7 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
     conn.row_factory = sqlite3.Row
     out: list[dict] = []
     seen: set = set()
+    tables_read = 0
     since_norm = (since or "").replace(" ", "T")
     _ALLOWED_TABLES = {"memories", "working_memory"}
     try:
@@ -167,6 +173,7 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
             except sqlite3.OperationalError as e:
                 log.debug("skipping %s: %s", table, e)
                 continue
+            tables_read += 1
             for r in rows:
                 d = dict(r)
                 if d["id"] in seen:
@@ -175,6 +182,11 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
                 out.append(d)
     finally:
         conn.close()
+
+    if not tables_read:
+        log.warning("No queryable memory table in %s — treating as unreadable, not as empty",
+                    MNEMOSYNE_DB)
+        return None
 
     out.sort(key=lambda m: (m.get("created_at") or "").replace(" ", "T"), reverse=True)
     return out[:max_items]
@@ -242,10 +254,21 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
             data = await r.json()
             if r.status == 200:
                 out = data.get("result", {}).get("output", {})
-                ok_peers = sum(
-                    1 for p in out.get("broadcast", []) if p.get("status") == "ok"
-                )
-                return {"status": "ok", "id": mem["id"], "peers_ok": ok_peers}
+                peers = out.get("broadcast") or []
+                ok_peers = sum(1 for p in peers if p.get("status") == "ok")
+                peers_count = int(out.get("peers_count") or 0)
+                if ok_peers:
+                    return {"status": "ok", "id": mem["id"],
+                            "peers_ok": ok_peers, "peers_count": peers_count}
+                # 200 from our OWN server means the request parsed, not that the memory
+                # left the node: store_local is False above, so a run where every peer
+                # was skipped (no PEER_A2A_URLS, no token, bad TOTP seed) or 401'd
+                # delivered it nowhere. Reporting that as ok stamps the id into sent_ids
+                # and advances the watermark, and no later tick ever retries it.
+                reasons = ", ".join(sorted({str(p.get("status")) for p in peers})) or "no result"
+                return {"status": "no_peers" if peers_count == 0 else "peers_failed",
+                        "id": mem["id"], "peers_ok": 0, "peers_count": peers_count,
+                        "error": reasons}
             return {"status": f"http_{r.status}", "id": mem["id"]}
     except Exception as e:
         return {"status": "error", "id": mem["id"], "error": str(e)}
@@ -271,6 +294,13 @@ async def run(dry_run: bool, verbose: bool):
         log.info("First run — looking back %d min (since %s)", LOOKBACK_MIN, since)
 
     mems = _fetch_recent_memories(since, MIN_IMP, MAX_ITEMS)
+    if mems is None:
+        log.error(
+            "Could not read %s — holding the watermark at %s. Advancing it on a failed "
+            "read would put every memory written during the outage permanently behind it.",
+            MNEMOSYNE_DB, since,
+        )
+        return
     log.info("Found %d memories to bridge (imp>=%.1f)", len(mems), MIN_IMP)
 
     if not mems:
