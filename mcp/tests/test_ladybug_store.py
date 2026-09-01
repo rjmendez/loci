@@ -512,3 +512,23 @@ def test_fail_open_on_bad_query(tmp_path):
     assert store.symbol_findings("nope") == []
     assert store.contamination(["ghost"]) == {"contaminated_ids": ["ghost"],
                                               "reasons": {"ghost": ["seed"]}}
+
+
+def test_session_propagates_callers_exception(tmp_path):
+    """A caller exception raised inside `with store._session(...)` must come out
+    as itself, not `RuntimeError("generator didn't stop after throw()")` -- the
+    contextmanager's fail-open except must not sit around the `yield conn` line."""
+    store = LadybugStore(str(tmp_path / "propdb"))
+    assert store.available()
+
+    class MarkerError(Exception):
+        pass
+
+    # A write session first creates the on-disk db so a later read session opens cleanly.
+    with store._session(write=True) as conn:
+        assert conn is not None
+
+    with pytest.raises(MarkerError):
+        with store._session(write=False) as conn:
+            assert conn is not None
+            raise MarkerError("boom")

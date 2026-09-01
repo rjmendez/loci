@@ -97,8 +97,14 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
-    Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(STATE_FILE).write_text(json.dumps(state, indent=2))
+    """Same-directory temp + os.replace. This runs on a 10-minute timer, and a
+    truncated state file reads back as {}: sent_ids empty re-broadcasts the whole
+    lookback window to every peer, and a lost last_run drops the held watermark."""
+    p = Path(STATE_FILE)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.parent / (p.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, p)
 
 
 # ── Mnemosyne query ───────────────────────────────────────────────────────────────
