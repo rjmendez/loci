@@ -10,7 +10,6 @@ or by replacing ``drift._embed``, and no sentence-transformers model is ever dow
 
 import importlib
 import json
-import math
 import os
 import random
 import sys
@@ -119,17 +118,15 @@ def test_cosine_empty_vectors_return_zero():
     assert D._cosine([], [1.0, 2.0]) == 0.0
 
 
-def test_cosine_silently_accepts_ragged_vectors():
-    """BUG-ish: zip() truncates the dot product but the norms use the FULL vectors.
-
-    No length check is performed, so mismatched dimensionality yields a plausible-looking
-    number instead of an error.
+def test_cosine_rejects_ragged_vectors():
+    """Mismatched dimensionality (e.g. anchor built under a different EMBED_MODEL)
+    must not silently truncate via zip() into a plausible-looking score. It now
+    matches the guard already used by mcp/embed_ops.py, mcp/memcheck/backend.py,
+    and mcp/memcheck/llm.py.
     """
-    # dot is over the 1-element overlap (=1.0), both norms are 1.0 -> "perfect similarity"
-    assert D._cosine([1.0, 0.0], [1.0]) == pytest.approx(1.0)
-    # here the longer vector's extra component inflates its norm and drags the score down
-    assert D._cosine([1.0, 1.0], [1.0]) == pytest.approx(1.0 / math.sqrt(2))
-    assert D._cosine([1.0], [1.0, 1.0]) == pytest.approx(1.0 / math.sqrt(2))
+    assert D._cosine([1.0, 0.0], [1.0]) == 0.0
+    assert D._cosine([1.0, 1.0], [1.0]) == 0.0
+    assert D._cosine([1.0], [1.0, 1.0]) == 0.0
 
 
 def test_cosine_result_is_a_plain_float():
