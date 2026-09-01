@@ -75,7 +75,17 @@ def test_pin_embed_hits_embed_with_keep_alive():
     assert call["json"]["model"] == "nomic-embed-text"
 
 
-def test_warm_once_pins_both_models():
+def test_warm_once_pins_both_models(monkeypatch):
+    """The generation model is resolved, not hardcoded, so this test must fix it
+    rather than inherit whatever the machine has configured.
+
+    WARM_GEN_MODEL is the highest-precedence source; without pinning it, the
+    assertion below reads ~/.loci/backends.toml and passes on a runner (no config,
+    so the qwen default) while failing on an operator box that has one. A test
+    that is green in CI and red on the machine that matters is the read-but-never
+    -set trap in the test layer."""
+    monkeypatch.setenv("WARM_GEN_MODEL", "qwen2.5:3b")
+    monkeypatch.setattr(G, "_GEN_MODEL", G._resolve_gen_model())
     poster = _RecordingPoster()
     report = G.warm_once(keep_alive="-1", post_fn=poster, include_gpu=False)
     assert report["degraded"] is False
