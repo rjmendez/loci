@@ -38,6 +38,7 @@ _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
     _os.path.abspath(__file__))), "mcp"))
 import vecmath as _vecmath  # noqa: E402
 import os
+import fcntl
 import sqlite3
 import sys
 import time
@@ -412,46 +413,50 @@ def check_content_shift(ollama_url: str | None = None, sample_n: int = 50) -> di
 # ── mutex ──────────────────────────────────────────────────────────────────────
 
 class _Mutex:
+    """Exclusive lock via flock() on a fixed lock file.
+
+    flock is atomic at the kernel level (no check-then-act window) and is
+    released automatically when the holding process's fd closes -- including
+    on crash or kill -- so a dead owner's lock is never "stale": the OS has
+    already freed it. That removes the need for any PID-liveness bookkeeping.
+    """
+
     def __init__(self, path: str):
         self._path = path
+        self._fd = None
 
     def __enter__(self):
-        if os.path.exists(self._path):
-            with open(self._path) as f:
-                info = f.read().strip()
-            # Parse PID from lock file contents (e.g. "pid=1234 ts=...")
-            pid = None
-            for part in info.split():
-                if part.startswith("pid="):
-                    try:
-                        pid = int(part[4:])
-                    except ValueError:
-                        pass
-                    break
-            # Check if the owning process is still alive
-            pid_alive = False
-            if pid is not None:
-                try:
-                    import psutil
-                    pid_alive = psutil.pid_exists(pid)
-                except ImportError:
-                    pid_alive = os.path.exists(f"/proc/{pid}")
-            if pid_alive:
-                raise RuntimeError(f"Another sweep is running (lock: {info}). Aborting.")
-            # Stale lock — owning process is gone; remove it and continue
+        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
             try:
-                os.remove(self._path)
+                info = os.read(fd, 256).decode(errors="replace").strip()
             except OSError:
-                pass
-        with open(self._path, "w") as f:
-            f.write(f"pid={os.getpid()} ts={int(time.time())}")
+                info = "<unknown>"
+            os.close(fd)
+            raise RuntimeError(f"Another sweep is running (lock: {info}). Aborting.")
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()} ts={int(time.time())}".encode())
+        self._fd = fd
         return self
 
     def __exit__(self, *_):
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(self._fd)
+        except OSError:
+            pass
         try:
             os.remove(self._path)
-        except Exception:
+        except OSError:
             pass
+        self._fd = None
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
