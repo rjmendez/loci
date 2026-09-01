@@ -191,6 +191,27 @@ def test_sample_texts_no_qualifying_rows_returns_empty_list(tmp_path):
     assert D._sample_texts(str(ds), 10) == []
 
 
+def test_sample_texts_reads_the_grounding_dataset_row_shape(tmp_path):
+    """The dataset drift.py is pointed at (mlops/loop.py DATASET) is written by
+    build_grounding_dataset.py as {claim, evidence, label, signal, cos} — no
+    text/content/query on any row. Reading only those three keys sampled nothing,
+    so build_anchor returned 'no texts found in dataset' and the drift detector
+    has never taken a measurement."""
+    ds = _write_jsonl(tmp_path / "grounding_dataset.jsonl", [
+        {"claim": _long("a"), "evidence": _long("b"), "label": 1,
+         "signal": "topical", "cos": 0.71},
+    ])
+    assert D._sample_texts(str(ds), 10) == [_long("a")]
+
+
+def test_sample_texts_finds_rows_in_the_committed_dataset():
+    """Against the real file, not a fixture of it."""
+    ds = Path(__file__).resolve().parents[3] / "deep_think_loci" / "grounding" / "grounding_dataset.jsonl"
+    if not ds.exists():
+        pytest.skip("no committed grounding dataset in this checkout")
+    assert len(D._sample_texts(str(ds), 20)) == 20
+
+
 def test_sample_texts_non_dict_json_line_raises_attributeerror(tmp_path):
     """BUG: only JSONDecodeError is caught. A valid-but-non-object line crashes."""
     ds = _write_jsonl(tmp_path / "d.jsonl", ["[1, 2, 3]"])

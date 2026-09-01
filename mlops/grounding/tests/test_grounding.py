@@ -297,11 +297,8 @@ def test_eval_run_enumerates_every_target_x_finding_pair(no_network_embed):
 
 
 def test_eval_run_feature_layout_is_absdiff_prod_cos(no_network_embed):
-    """Pins the 2*d+1 feature vector canary builds: [|f-q|, f*q, cos].
-
-    NOTE: train.make_features builds 2*d+4 features ([diff, prod, cos, cos^2,
-    len_ratio, jaccard]). The two are incompatible — see bugs_found.
-    """
+    """A model that does not say what it wants is fed the legacy 2*d+1 layout:
+    [|f-q|, f*q, cos]. That is the shipped classifier's contract."""
     findings = [{"text": "alpha one", "target": "alpha"}, {"text": "beta two", "target": "beta"}]
     clf = CosClf()
     canary._eval_run(findings, 0.5, clf, "http://unused")
@@ -425,21 +422,52 @@ def test_evaluate_gate_averages_across_runs(no_network_embed, tmp_path):
     assert out["cosine"]["std_f1"] == pytest.approx(abs(11 / 12 - 1.0) / 2)
 
 
-def test_evaluate_gate_rejects_a_train_shaped_model(no_network_embed, one_run_glob,
-                                                    stub_joblib_load, tmp_path):
-    """BUG PIN: a model trained by train.py (2*d+4 features) cannot be scored.
-
-    canary feeds 2*d+1 features, so sklearn raises and the exception escapes
-    evaluate_gate uncaught — the canary crashes instead of holding.
-    """
+def _fit_lr(n_features, seed=0):
     from sklearn.linear_model import LogisticRegression
-    rng = np.random.RandomState(0)
-    X = rng.rand(40, 2 * 2 + 4)
+    rng = np.random.RandomState(seed)
+    X = rng.rand(40, n_features)
     y = (X[:, 0] > 0.5).astype(int)
     y[0], y[1] = 0, 1
-    path = stub_joblib_load(tmp_path / "cand.joblib", LogisticRegression(max_iter=500).fit(X, y))
-    with pytest.raises(ValueError, match="8 features"):
+    return LogisticRegression(max_iter=500).fit(X, y)
+
+
+def test_evaluate_gate_scores_a_train_shaped_model(no_network_embed, one_run_glob,
+                                                   stub_joblib_load, tmp_path):
+    """A candidate from train.py (the wider 2*d+4 layout) must be scoreable.
+
+    canary used to build a hard-coded 2*d+1 vector, so sklearn raised and the
+    exception escaped evaluate_gate uncaught — the promotion gate could never
+    pass, and loop.py read the crash as 'canary drift detected'.
+    """
+    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_lr(2 * 2 + 4))
+    out = canary.evaluate_gate(findings_glob=one_run_glob, candidate_model_path=path,
+                               threshold=0.5)
+    assert out["decision"] in ("PROMOTE", "HOLD")
+    assert out["model"]["mean_f1"] == out["model"]["mean_f1"]  # scored, not NaN
+
+
+def test_evaluate_gate_still_scores_the_legacy_shipped_model(no_network_embed, one_run_glob,
+                                                             stub_joblib_load, tmp_path):
+    """The joblib in production is the 2*d+1 one; it must keep working."""
+    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_lr(2 * 2 + 1))
+    out = canary.evaluate_gate(findings_glob=one_run_glob, candidate_model_path=path,
+                               threshold=0.5)
+    assert out["model"]["mean_f1"] == out["model"]["mean_f1"]
+
+
+def test_evaluate_gate_refuses_a_model_of_unknown_width(no_network_embed, one_run_glob,
+                                                        stub_joblib_load, tmp_path):
+    """Neither contract produces 2*d+2 columns — say so rather than guess."""
+    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_lr(2 * 2 + 2))
+    with pytest.raises(ValueError, match="no grounding feature contract produces 6"):
         canary.evaluate_gate(findings_glob=one_run_glob, candidate_model_path=path, threshold=0.5)
+
+
+def test_canary_has_no_second_copy_of_the_feature_layout(tmp_path):
+    """A private copy is how canary drifted away from the trainer in the first place."""
+    src = (Path(canary.__file__)).read_text()
+    assert "_feat.make_features" in src
+    assert "np.abs(fv - qv), fv * qv, [cos]" not in src
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -735,12 +763,13 @@ def test_make_features_layout_and_dimension():
     assert list(X[1]) == pytest.approx([0.6, 0.2, 0.0, 0.8, 0.8, 0.64, 8 / 9, 0.5], abs=1e-6)
 
 
-def test_make_features_dimension_differs_from_canary_feature_builder():
-    """Regression guard for the train/canary feature mismatch (see bugs_found)."""
+def test_make_features_dimension_is_what_canary_now_builds_for_such_a_model():
+    """The trainer's default is 2*d+4, and canary builds that width when the
+    candidate says it wants it — the mismatch the two used to have."""
     d = 5
     ec = np.zeros((1, d), dtype=np.float32)
     ee = np.zeros((1, d), dtype=np.float32)
-    assert train.make_features(["a"], ["b"], ec, ee).shape[1] == 2 * d + 4  # canary builds 2*d+1
+    assert train.make_features(["a"], ["b"], ec, ee).shape[1] == 2 * d + 4
 
 
 def test_cosine_f1_on_folds_picks_the_best_threshold_per_validation_fold():

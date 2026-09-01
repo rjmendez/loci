@@ -60,7 +60,11 @@ def _sample_texts(dataset_path: str, n: int) -> list[str]:
             for line in fh:
                 try:
                     rec = json.loads(line.strip())
-                    t = rec.get("text") or rec.get("content") or rec.get("query", "")
+                    # grounding_dataset.jsonl rows are {claim, evidence, label,
+                    # signal, cos} — none of text/content/query exists on any of
+                    # them, so this sampled nothing and the anchor was never built.
+                    t = (rec.get("text") or rec.get("claim") or rec.get("content")
+                         or rec.get("query", ""))
                     if len(t) > 30:
                         texts.append(t)
                 except json.JSONDecodeError:

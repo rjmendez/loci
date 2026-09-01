@@ -31,6 +31,22 @@ def test_both_contract_versions_have_the_widths_the_models_expect():
     assert F.supported_dims() == (1537, 1540)
 
 
+def test_the_contract_is_a_shape_rule_not_two_magic_numbers():
+    """The two layouts are 2d+1 and 2d+4 at whatever width the embeddings came
+    in. Pinning them to 768 made the shared definition unusable to the callers
+    that had to keep their own copy — which is how they drifted."""
+    assert F.dims_for(F.EMBED_DIM) == (F.LEGACY_DIM, F.CURRENT_DIM) == (1537, 1540)
+    assert F.dims_for(2) == (5, 8)
+    a, b = _emb(3), _emb(3)
+    txt = ["alpha beta"] * 3
+    small = np.ones((3, 2), dtype=np.float32)
+    assert F.make_features(txt, txt, small, small, dim=5).shape[1] == 5
+    assert F.make_features(txt, txt, small, small, dim=8).shape[1] == 8
+    # no dim = the current layout at that width, not the 768-sized constant
+    assert F.make_features(txt, txt, small, small).shape[1] == 8
+    assert F.make_features(txt, txt, a, b).shape[1] == 1540
+
+
 def test_an_unknown_width_is_refused_rather_than_guessed():
     a, b = _emb(), _emb()
     with pytest.raises(ValueError, match="no grounding feature contract"):
