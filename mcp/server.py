@@ -240,11 +240,12 @@ def _investigation_lock(investigation_id: str) -> threading.Lock:
 _ladybug_store = None                     # LadybugStore singleton once initialized
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
+_ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
 _LADYBUG_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
 _ladybug_lock = threading.Lock()
 
 
-def _get_ladybug():
+def _get_ladybug(backfill: bool = True):
     """Lazy, fail-open LadybugStore singleton. Returns None if unavailable.
 
     Distinguishes a genuinely UNRECOVERABLE failure (ladybug is not importable) — which
@@ -252,15 +253,20 @@ def _get_ladybug():
     holds Kuzu's single-writer lock, or a transient IO error at open time), which does
     NOT latch: a later call retries after a short backoff so the code graph self-heals
     once the other writer releases the lock. Never raises.
+
+    backfill=False opens the store WITHOUT the one-time findings backfill, which writes
+    and therefore takes the writer lease. loci_health passes False so a health check
+    stays a read: the backfill still runs, on the first caller that actually wants to
+    use the graph.
     """
-    global _ladybug_store, _ladybug_failed, _ladybug_last_attempt
+    global _ladybug_store, _ladybug_failed, _ladybug_last_attempt, _ladybug_backfilled
     if _ladybug_store is not None:
-        return _ladybug_store
+        return _ladybug_backfill_once(backfill)
     if _ladybug_failed:
         return None
     with _ladybug_lock:
         if _ladybug_store is not None:
-            return _ladybug_store
+            return _ladybug_backfill_once(backfill)
         if _ladybug_failed:
             return None
         # Back off between transient-failure retries so we don't hammer a held lock.
@@ -293,11 +299,22 @@ def _get_ladybug():
             _ladybug_last_attempt = time.monotonic()
             logger.warning("LadybugDB graph init failed (%r) — will retry after %ss.", exc, _LADYBUG_RETRY_SECONDS)
             return None
-    # One-time backfill of pre-existing findings, guarded by an empty-graph check.
-    try:
-        _ladybug_backfill_if_empty(_ladybug_store)
-    except Exception as exc:
-        logger.debug("LadybugDB backfill skipped (fail-open): %r", exc)
+    return _ladybug_backfill_once(backfill)
+
+
+def _ladybug_backfill_once(backfill: bool):
+    """Run the one-time findings backfill on first use, then return the store.
+
+    Deferred rather than done at init so a health check can open the store without
+    triggering a write. Attempted at most once per process either way — a failed
+    attempt is not retried, matching the previous behaviour."""
+    global _ladybug_backfilled
+    if backfill and not _ladybug_backfilled:
+        _ladybug_backfilled = True
+        try:
+            _ladybug_backfill_if_empty(_ladybug_store)
+        except Exception as exc:
+            logger.debug("LadybugDB backfill skipped (fail-open): %r", exc)
     return _ladybug_store
 
 
@@ -317,17 +334,20 @@ def _ladybug_health_state() -> str:
     honours the permanent latch and the transient-failure backoff, so this cannot turn
     a real failure into a retry storm."""
     try:
-        store = _get_ladybug()
-        if store is not None:
-            probe = getattr(store, "readable_probe", None)
-            if probe is not None and not probe():
-                return "contended"
-            return "available"
-        if _ladybug_failed:
-            return "latched"
-        if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
-            return "backoff"
-        return "unavailable"
+        store = _ladybug_store
+        if store is None:
+            # These two answers are predetermined — settle them before opening anything.
+            if _ladybug_failed:
+                return "latched"
+            if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
+                return "backoff"
+            store = _get_ladybug(backfill=False)
+        if store is None:
+            return "unavailable"
+        probe = getattr(store, "readable_probe", None)
+        if probe is not None and not probe():
+            return "contended"
+        return "available"
     except Exception:
         return "unavailable"
 

@@ -84,7 +84,7 @@ def test_callers_proven_finds_in_server_callsites(capsys):
     code, out = _run(capsys, ["callers", "_get_ladybug", "--rev", "HEAD", "--conf", "proven"])
     assert code == 0
     assert "-- PROVEN" in out
-    assert out.count("call[name-def-local]") == 2
+    assert out.count("call[name-def-local]") == 3
     assert out.count("passed-by-ref") == 2
 
 
@@ -95,14 +95,14 @@ def test_callers_ambiguous_bare_name_lists_candidates(capsys):
 
 
 def test_callers_json_format(capsys):
-    # Default --conf is "probable": 2 PROVEN + 15 rung-4 PROBABLE + 2 REFERENCES.
+    # Default --conf is "probable": 3 PROVEN + 15 rung-4 PROBABLE + 2 REFERENCES.
     code, out = _run(capsys, ["callers", "_get_ladybug", "--rev", "HEAD", "--format", "json"])
     assert code == 0
     rows = json.loads(out)
-    assert isinstance(rows, list) and len(rows) == 19
+    assert isinstance(rows, list) and len(rows) == 20
     from collections import Counter
     counts = Counter((r["kind"], r["confidence"]) for r in rows)
-    assert counts[("CALLS", "PROVEN")] == 2
+    assert counts[("CALLS", "PROVEN")] == 3
     assert counts[("CALLS", "PROBABLE")] == 15
     assert counts[("REFERENCES", "PROVEN")] == 2
     assert all(r.get("rung") == "name-via-injected-global" for r in rows if r["kind"] == "CALLS" and r["confidence"] == "PROBABLE")
