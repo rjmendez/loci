@@ -6,6 +6,7 @@ is stubbed via backends._alive; the warm-ping is exercised with an injected embe
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
@@ -193,3 +194,151 @@ def test_warm_does_not_latch_when_thread_start_fails(monkeypatch):
     _reset_warm()
     assert embed_ops.warm(embed_fn=lambda t: []) is True
     assert embed_ops.warmed() is True
+
+
+def test_health_initializes_the_lazy_graph_store_instead_of_reporting_unavailable(monkeypatch):
+    """A healthy-but-not-yet-opened graph must report 'available', not 'unavailable'.
+
+    Production shape: a fresh server process. The store singleton is created lazily on
+    the first graph op, so before this fix the first loci_health of every process read
+    'unavailable' for a perfectly good graph — and callers switch the code-graph lane
+    off on that false negative.
+    """
+    class _HealthyStore:
+        def readable_probe(self):
+            return True
+
+        def lock_holder_pid(self):
+            return 4242
+
+    # Fresh-process state: nothing initialized, nothing latched, no backoff pending.
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", False)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+
+    opened = []
+
+    def fake_get(backfill=True):
+        store = _HealthyStore()
+        opened.append(store)
+        monkeypatch.setattr(server, "_ladybug_store", store)
+        return store
+
+    monkeypatch.setattr(server, "_get_ladybug", fake_get)
+
+    assert server._ladybug_health_state() == "available"
+    assert opened, "health must attempt the lazy initialization, not read the global and give up"
+
+
+def test_health_reports_latched_without_attempting_init(monkeypatch):
+    """A permanent latch is a predetermined answer — settle it without opening anything."""
+    attempts = []
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", True)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+    monkeypatch.setattr(server, "_get_ladybug", lambda *a, **k: attempts.append(k) or None)
+
+    assert server._ladybug_health_state() == "latched"
+    assert not attempts, "latched is predetermined; health must not try to open the store"
+
+
+def test_health_reports_backoff_without_attempting_init(monkeypatch):
+    """Likewise for the transient-failure backoff window."""
+    attempts = []
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", False)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", time.monotonic())
+    monkeypatch.setattr(server, "_get_ladybug", lambda *a, **k: attempts.append(k) or None)
+
+    assert server._ladybug_health_state() == "backoff"
+    assert not attempts, "inside the backoff window health must not hammer the open"
+
+
+def test_health_opens_the_store_without_running_the_backfill(monkeypatch):
+    """loci_health must stay a read: the backfill writes, and writes take the writer lease."""
+    kwargs = {}
+
+    def fake_get(backfill=True):
+        kwargs["backfill"] = backfill
+        store = type("S", (), {"readable_probe": lambda self: True})()
+        monkeypatch.setattr(server, "_ladybug_store", store)
+        return store
+
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", False)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+    monkeypatch.setattr(server, "_get_ladybug", fake_get)
+
+    assert server._ladybug_health_state() == "available"
+    assert kwargs["backfill"] is False
+
+
+def test_backfill_deferred_by_health_still_runs_for_the_next_real_caller(monkeypatch):
+    """Deferring it must not lose it — the first caller that wants the graph gets it."""
+    ran = []
+    monkeypatch.setattr(server, "_ladybug_store", object())
+    monkeypatch.setattr(server, "_ladybug_backfilled", False)
+    monkeypatch.setattr(server, "_ladybug_backfill_if_empty", lambda store: ran.append(store))
+
+    server._get_ladybug(backfill=False)
+    assert ran == [], "health's open must not backfill"
+
+    server._get_ladybug()
+    assert len(ran) == 1, "the next real caller must run the deferred backfill"
+
+    server._get_ladybug()
+    assert len(ran) == 1, "and only once per process"
+
+
+def test_backfill_claim_is_serialized_by_its_own_lock(monkeypatch):
+    """The one-time claim must be made under a lock, or two threads both take the writer lease.
+
+    Asserted on the lock itself rather than by racing threads: a timing race reproduces only
+    intermittently, and a test that usually passes is not a guard.
+    """
+    class _RecordingLock:
+        def __init__(self):
+            self.entered = 0
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            self.entered += 1
+            return self._lock.__enter__()
+
+        def __exit__(self, *exc):
+            return self._lock.__exit__(*exc)
+
+    lock = _RecordingLock()
+    ran = []
+    monkeypatch.setattr(server, "_ladybug_store", object())
+    monkeypatch.setattr(server, "_ladybug_backfilled", False)
+    monkeypatch.setattr(server, "_ladybug_backfill_lock", lock)
+    monkeypatch.setattr(server, "_ladybug_backfill_if_empty", lambda store: ran.append(store))
+
+    server._get_ladybug()
+    assert lock.entered == 1, "the one-time claim was made without holding the lock"
+    assert len(ran) == 1
+
+    server._get_ladybug()
+    assert lock.entered == 1, "an already-claimed backfill must not re-enter the lock"
+    assert len(ran) == 1
+
+
+def test_backfill_lock_is_not_the_store_lock(monkeypatch):
+    """_ladybug_lock is non-reentrant and is already held on one of the call paths."""
+    assert server._ladybug_backfill_lock is not server._ladybug_lock
+
+
+def test_health_reports_backoff_armed_by_the_open_it_just_attempted(monkeypatch):
+    """A failed open arms the backoff; health must re-read that, not call it unavailable."""
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", False)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+
+    def failing_open(backfill=True):
+        monkeypatch.setattr(server, "_ladybug_last_attempt", time.monotonic())
+        return None
+
+    monkeypatch.setattr(server, "_get_ladybug", failing_open)
+
+    assert server._ladybug_health_state() == "backoff"
