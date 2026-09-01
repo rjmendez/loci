@@ -316,3 +316,30 @@ def test_cross_project_source_entry_survives(tmp_path, mod):
 
     assert "../other-project/memory/thing.md" in out
     assert "Elsewhere" in out
+
+
+def test_regenerating_from_own_output_keeps_every_entry(tmp_path, mod):
+    """Round-trip: files with no home in the source land in a type-derived
+    section, and that section becomes a real section of the next run's source.
+    If the type pass assigns rather than appends, run two silently drops
+    everything run one put there — the generator eating its own output."""
+    _write_mem(tmp_path, "listed.md", "listed", "in the curated index", mtype="project")
+    for i in range(3):
+        _write_mem(tmp_path, f"orphan-{i}.md", f"orphan-{i}", f"not in the index {i}",
+                   mtype="project")
+    source = "# Memory index\n\n## Curated\n- [Listed](listed.md) — in the curated index\n"
+
+    first = mod.render(mod.build_sections(
+        mod.load_entries(tmp_path)[0], *mod.parse_source_sections(source)[:2]))
+    assert all(f"orphan-{i}.md" in first for i in range(3))
+
+    # now a new file arrives and the previous output is the source
+    _write_mem(tmp_path, "newcomer.md", "newcomer", "arrived later", mtype="project")
+    order, secs, curated = mod.parse_source_sections(first)
+    entries = mod.apply_curated(mod.load_entries(tmp_path)[0], curated)
+    second = mod.render(mod.build_sections(entries, order, secs))
+
+    for i in range(3):
+        assert f"orphan-{i}.md" in second, f"orphan-{i}.md dropped on regeneration"
+    assert "newcomer.md" in second
+    assert "listed.md" in second

@@ -240,7 +240,10 @@ def build_sections(entries: list[Entry], source_order: list[str],
         by_type.setdefault(_type_section_name(e.mtype), []).append(e)
     for section in sorted(by_type):
         by_type[section].sort(key=lambda e: e.filename)
-        result[section] = by_type[section]
+        # Append: a type-derived name can collide with a section the source pass
+        # already filled, and assigning would drop everything that landed there
+        # on an earlier run — the generator eating its own output.
+        result.setdefault(section, []).extend(by_type[section])
 
     return result
 
