@@ -257,3 +257,78 @@ def test_parse_path_walks_dir(tmp_path):
     files = {os.path.basename(r["file"]) for r in results}
     assert "notes.txt" not in files
     assert "b.py" not in files
+
+
+# --------------------------------------------------------------------------- #
+# ident_counts — the usage signal behind dead-code detection.
+#
+# ladybug_store marks a symbol referenced when ident_counts[name] > (times it is
+# defined). Counting only tree-sitter's `identifier` node type made a name the
+# grammar spells differently score zero occurrences, which reads as "never used"
+# and is returned as a delete-this candidate. Each case below is a method that is
+# both defined AND called in the same snippet.
+# --------------------------------------------------------------------------- #
+
+_USED_METHOD_SNIPPETS = {
+    # (file, source, method name, times the name is defined in the snippet)
+    "kotlin": ("F.kt", b"class Foo {\n"
+                       b"    fun greetUser(x: Int): Int { return x + 1 }\n"
+                       b"    fun other() { greetUser(1) }\n"
+                       b"}\n", "greetUser"),
+    "typescript": ("f.ts", b"class Foo {\n"
+                           b"  greetUser(x: number): number { return x + 1; }\n"
+                           b"}\n"
+                           b"const y = new Foo().greetUser(1);\n", "greetUser"),
+    "javascript": ("f.js", b"class Foo { greetUser(x) { return x + 1; } }\n"
+                           b"new Foo().greetUser(1);\n", "greetUser"),
+    "go": ("f.go", b"package main\n"
+                   b"type F struct{}\n"
+                   b"func (f *F) GreetUser(x int) int { return x + 1 }\n"
+                   b"func Run() { f := &F{}; x := f.GreetUser(1); _ = x }\n", "GreetUser"),
+    "rust": ("f.rs", b"struct S;\n"
+                     b"impl S { fn greet_user(&self, x: i32) -> i32 { x + 1 } }\n"
+                     b"fn run() { let s = S; let _ = s.greet_user(1); }\n", "greet_user"),
+    "java": ("Foo.java", b"class Foo {\n"
+                         b"  int greetUser(int x) { return x + 1; }\n"
+                         b"  void other() { greetUser(1); }\n"
+                         b"}\n", "greetUser"),
+    "python": ("f.py", b"class Foo:\n"
+                       b"    def greet_user(self, x):\n"
+                       b"        return x + 1\n"
+                       b"    def other(self):\n"
+                       b"        return self.greet_user(1)\n", "greet_user"),
+}
+
+
+def test_ident_counts_see_a_called_method_in_every_language():
+    """A method defined once and called once must out-count its definitions.
+
+    This is exactly the comparison ladybug_store makes to set `referenced`, so a
+    language missing here is a language whose every method is reported dead.
+    """
+    for lang, (fname, src, method) in _USED_METHOD_SNIPPETS.items():
+        res = parse_source(fname, src)
+        counts = res["ident_counts"]
+        defs = sum(1 for s in res["symbols"] if s["name"] == method)
+        assert defs == 1, f"{lang}: expected one definition of {method}, got {defs}"
+        assert counts.get(method, 0) > defs, (
+            f"{lang}: {method} is called but scores "
+            f"{counts.get(method, 0)} occurrences vs {defs} definitions "
+            f"-> dead-code detection would flag it. ident_counts={counts}"
+        )
+
+
+def test_ident_counts_non_empty_for_every_supported_language():
+    """An empty ident_counts is a silent zero for every symbol in the file."""
+    for lang, (fname, src, _method) in _USED_METHOD_SNIPPETS.items():
+        res = parse_source(fname, src)
+        assert res["ident_counts"], f"{lang}: ident_counts is empty for {fname}"
+
+
+def test_ident_counts_still_flags_a_genuinely_uncalled_method():
+    """The broadened count must not make everything look used."""
+    _fname, src, _m = _USED_METHOD_SNIPPETS["kotlin"]
+    res = parse_source("F.kt", src)
+    # `other` is defined but never called anywhere in the snippet.
+    assert res["ident_counts"].get("other", 0) == 1
+    assert sum(1 for s in res["symbols"] if s["name"] == "other") == 1
