@@ -23,7 +23,12 @@ MNEMOSYNE_DB = os.path.expanduser(
 )
 QDRANT_URL   = os.environ.get("QDRANT_URL")
 OLLAMA_URL   = os.environ.get("OLLAMA_URL")
-EMBED_MODEL  = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+# Follows the collection this writes (mnemosyne), not the script family: its only
+# reader, a2a_server, embeds with MNEMOSYNE_EMBEDDING_MODEL and drops every hit
+# under a hard 0.59 score floor, so a wrong-space positive is never returned.
+EMBED_MODEL  = (os.environ.get("MNEMOSYNE_EMBEDDING_MODEL")
+                or os.environ.get("EMBED_MODEL")
+                or "nomic-embed-text")
 GEN_MODEL    = os.environ.get("AGENTHER_GEN_MODEL", "llama3.2:latest")
 # Batch size. Own name, because the three consolidation scripts each had a
 # different budget under the shared MAX_PER_RUN; setting it for one silently

@@ -41,11 +41,20 @@ from datetime import datetime, timezone
 QDRANT_URL            = os.environ.get("QDRANT_URL")
 QDRANT_KEY            = os.environ.get("QDRANT_API_KEY",   "")
 OLLAMA_URL            = os.environ.get("OLLAMA_URL")
-EMBED_MODEL           = os.environ.get("MNEMOSYNE_EMBEDDING_MODEL", "nomic-embed-text")
+# This script reads and writes mcp's loci_memory, so it must embed with mcp's
+# knob (qdrant_ops.py:328), not the a2a server's. Under MNEMOSYNE_EMBEDDING_MODEL
+# alone, an operator following .env.example wrote consolidated abstractions into
+# loci_memory in a vector space no reader searches it with — silently unrankable.
+EMBED_MODEL           = (os.environ.get("EMBED_MODEL")
+                         or os.environ.get("MNEMOSYNE_EMBEDDING_MODEL")
+                         or "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
 _EMBED_API_KEY_HEADER = os.environ.get("EMBED_API_KEY_HEADER", "Authorization")
 LLM_MODEL    = os.environ.get("SWR_LLM_MODEL",   "llama3.2:latest")
-COLLECTION   = os.environ.get("SWR_COLLECTION",  "loci_memory")
+# Same collection mcp owns: follow QDRANT_COLLECTION_PREFIX (qdrant_ops.py:25) so
+# renaming it there does not leave this script writing to the old name.
+COLLECTION   = (os.environ.get("SWR_COLLECTION")
+                or os.environ.get("QDRANT_COLLECTION_PREFIX", "loci_memory"))
 
 LOOKBACK_HOURS = float(os.environ.get("SWR_LOOKBACK_HOURS", "6"))
 REPLAY_K       = int(os.environ.get("SWR_REPLAY_K",        "7"))    # theta-gamma bound
