@@ -13,7 +13,12 @@ from __future__ import annotations
 import abc
 import asyncio
 import os
-import math
+import os as _os
+import sys as _sys
+
+# mcp/ is this file's grandparent; vecmath lives there.
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from vecmath import cosine as _vecmath_cosine  # noqa: E402
 from dataclasses import dataclass
 
 from .verdict import Verdict
@@ -30,25 +35,11 @@ __all__ = [
 _COALESCE_THRESHOLD = 0.97
 
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity of two equal-length vectors.
-
-    Returns 0.0 for empty vectors, length mismatch, or a zero-magnitude vector
-    (so callers never divide by zero and an absent embedding simply never
-    matches).
-    """
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    mag_a = 0.0
-    mag_b = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        mag_a += x * x
-        mag_b += y * y
-    if mag_a == 0.0 or mag_b == 0.0:
-        return 0.0
-    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
+def cosine_similarity(a, b):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable;
+    callers that need a float choose their own default rather than inheriting
+    0.0, which reads as a confident 'not similar'."""
+    return _vecmath_cosine(a, b)
 
 
 @dataclass
@@ -147,18 +138,23 @@ class InMemoryBackend(VerdictBackend):
                     existing_emb = self._embeddings.get(existing.id)
                     if not existing_emb:
                         continue
-                    if cosine_similarity(existing_emb, embedding) >= _COALESCE_THRESHOLD:
-                        # Coalesce: bump occurrence count + last_seen, keep the
-                        # strongest (highest-confidence) decision/rationale.
-                        existing.occurrences += 1
-                        existing.last_seen = verdict.last_seen
-                        if verdict.confidence > existing.confidence:
-                            existing.decision = verdict.decision
-                            existing.rationale = verdict.rationale
-                            existing.verdict_type = verdict.verdict_type
-                            existing.confidence = verdict.confidence
-                            existing.source = verdict.source
-                        return
+                    sim = cosine_similarity(existing_emb, embedding)
+                    # Not comparable -> not a duplicate. Coalescing merges two
+                    # verdicts and drops one; doing that on a similarity computed
+                    # from a prefix would silently lose a finding.
+                    if sim is None or sim < _COALESCE_THRESHOLD:
+                        continue
+                    # Coalesce: bump occurrence count + last_seen, keep the
+                    # strongest (highest-confidence) decision/rationale.
+                    existing.occurrences += 1
+                    existing.last_seen = verdict.last_seen
+                    if verdict.confidence > existing.confidence:
+                        existing.decision = verdict.decision
+                        existing.rationale = verdict.rationale
+                        existing.verdict_type = verdict.verdict_type
+                        existing.confidence = verdict.confidence
+                        existing.source = verdict.source
+                    return
             self._verdicts.append(verdict)
             if embedding:
                 self._embeddings[verdict.id] = embedding
@@ -175,7 +171,13 @@ class InMemoryBackend(VerdictBackend):
             scored = [
                 ScoredVerdict(
                     verdict=v,
-                    similarity=cosine_similarity(self._embeddings.get(v.id, []), embedding),
+                    # A verdict stored without an embedding is not similar to
+                    # the query — it is uncomparable, and used to score 0.0 and
+                    # sort to the bottom as though it had been ranked. -1.0 keeps
+                    # the sort total while staying outside the [-1, 1] a real
+                    # cosine can produce, so it is distinguishable downstream.
+                    similarity=(cosine_similarity(self._embeddings.get(v.id, []),
+                                                  embedding) or -1.0),
                 )
                 for v in self._verdicts
                 if v.subject_kind == kind
