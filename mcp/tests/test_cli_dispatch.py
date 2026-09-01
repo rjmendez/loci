@@ -186,5 +186,46 @@ class TestProcessCode(unittest.TestCase):
         self.assertIsInstance(record, dict)
 
 
+class TestStatsDegradation(unittest.TestCase):
+    """A zeroed stats page is what a never-firing memcheck AND an unreachable store
+    both produce. The degraded one has to say so."""
+
+    class _DeadBackend(InMemoryBackend):
+        async def stats(self) -> dict:
+            raise RuntimeError("qdrant unreachable")
+
+    def test_healthy_stats_pass_through_without_an_ok_flag(self):
+        import asyncio
+
+        stats = asyncio.run(_engine().stats())
+        self.assertEqual(stats.get("total_verdicts"), 0)
+        self.assertNotIn("error", stats)
+        self.assertTrue(stats.get("ok", True))
+
+    def test_backend_error_is_marked_not_measured(self):
+        import asyncio
+
+        engine = VerdictEngine(self._DeadBackend(), EmlConfig())
+        stats = asyncio.run(engine.stats())
+        self.assertEqual(stats["total_verdicts"], 0)
+        self.assertIs(stats["ok"], False)
+        self.assertIn("qdrant unreachable", stats["error"])
+
+    def test_cmd_stats_exit_code_follows_the_ok_flag(self):
+        import io
+        import contextlib
+        from unittest import mock
+
+        with mock.patch.object(cli, "_build_qdrant_backend", lambda: self._DeadBackend()), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = cli._cmd_stats([])
+        self.assertEqual(rc, 1)
+        self.assertIn('"ok": false', out.getvalue())
+
+        with mock.patch.object(cli, "_build_qdrant_backend", lambda: InMemoryBackend()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli._cmd_stats([]), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

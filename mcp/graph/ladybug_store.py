@@ -256,6 +256,10 @@ class LadybugStore:
         self._schema_ready = False    # schema ensured once per process (idempotent)
         # "worth attempting" — the DB is opened per-op, so the store self-heals when the lock frees.
         self.ok = bool(_HAS_LADYBUG and db_path)
+        # Monotonic count of read errors swallowed by code_query(). Fail-open callers
+        # sample it around a call to tell "the graph held no rows" from "the query
+        # never ran" — an empty list on its own says both.
+        self.code_query_failures = 0
         if not _HAS_LADYBUG:
             logger.info("ladybug not importable; LadybugStore unavailable")
 
@@ -1050,6 +1054,7 @@ class LadybugStore:
             return self._rows(cypher, params)
         except Exception as exc:
             logger.debug("code_query failed: %s", exc)
+            self.code_query_failures += 1
             return []
 
     # ------------------------------------------------------------------ #

@@ -414,10 +414,13 @@ def test_call_grounding_default_interpreter_is_the_hermes_venv(monkeypatch):
     assert seen["argv"][0].endswith("/.hermes/hermes-agent/venv/bin/python3")
 
 
-def test_call_grounding_nonzero_exit_returns_empty_silently(monkeypatch, capsys):
-    monkeypatch.setattr(harness.subprocess, "run", lambda *a, **k: FakeProc(3, b"boom"))
-    assert harness.call_grounding("x") == ""
-    assert capsys.readouterr().err == ""  # no warning on this branch
+def test_call_grounding_nonzero_exit_reports_none_and_prints_the_stderr(monkeypatch, capsys):
+    """None, not "": a broken harness must not score like an empty recall."""
+    monkeypatch.setattr(harness.subprocess, "run",
+                        lambda *a, **k: FakeProc(3, b"boom", b"ModuleNotFoundError: qdrant"))
+    assert harness.call_grounding("x") is None
+    err = capsys.readouterr().err
+    assert "grounding exited 3" in err and "ModuleNotFoundError: qdrant" in err
 
 
 def test_call_grounding_missing_context_key_returns_empty(monkeypatch):
@@ -425,15 +428,15 @@ def test_call_grounding_missing_context_key_returns_empty(monkeypatch):
     assert harness.call_grounding("x") == ""
 
 
-def test_call_grounding_unparseable_stdout_warns_and_returns_empty(monkeypatch, capsys):
+def test_call_grounding_unparseable_stdout_warns_and_returns_none(monkeypatch, capsys):
     monkeypatch.setattr(harness.subprocess, "run", lambda *a, **k: FakeProc(0, b"not json"))
-    assert harness.call_grounding("x") == ""
+    assert harness.call_grounding("x") is None
     assert "grounding call failed" in capsys.readouterr().err
 
 
-def test_call_grounding_non_dict_json_warns_and_returns_empty(monkeypatch, capsys):
+def test_call_grounding_non_dict_json_warns_and_returns_none(monkeypatch, capsys):
     monkeypatch.setattr(harness.subprocess, "run", lambda *a, **k: FakeProc(0, b"[1,2]"))
-    assert harness.call_grounding("x") == ""
+    assert harness.call_grounding("x") is None
     err = capsys.readouterr().err
     assert "'list' object has no attribute 'get'" in err
 
@@ -443,14 +446,14 @@ def test_call_grounding_timeout_is_fail_open(monkeypatch, capsys):
         raise subprocess.TimeoutExpired(cmd="py", timeout=60)
 
     monkeypatch.setattr(harness.subprocess, "run", _boom)
-    assert harness.call_grounding("x") == ""
+    assert harness.call_grounding("x") is None
     assert "grounding call failed" in capsys.readouterr().err
 
 
 def test_call_grounding_missing_interpreter_is_fail_open(monkeypatch, capsys):
     """The real degraded path on CI: the hermes venv does not exist."""
     monkeypatch.setenv("LOCI_PY", "/nonexistent/python-does-not-exist")
-    assert harness.call_grounding("anything") == ""
+    assert harness.call_grounding("anything") is None
     assert "grounding call failed" in capsys.readouterr().err
 
 
@@ -552,8 +555,8 @@ def test_run_with_no_tasks_reports_zero_mean(monkeypatch, capsys):
     assert "[eval] mean_score=0.000 (0 tasks)" in capsys.readouterr().out
 
 
-def test_run_scores_zero_when_grounding_is_unavailable(monkeypatch, capsys):
-    """Fail-open: a dead grounding hook produces a clean 0.000 run, not an error."""
+def test_run_scores_zero_when_grounding_returns_an_empty_context(monkeypatch, capsys):
+    """The hook RAN and matched nothing: that is a real 0.000 measurement."""
     monkeypatch.setattr(harness, "DRY_RUN", True)
     monkeypatch.setattr(harness, "TASKS", _TWO_TASKS)
     monkeypatch.setattr(harness, "call_grounding", lambda p: "")
@@ -561,6 +564,27 @@ def test_run_scores_zero_when_grounding_is_unavailable(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "score=0.000" in out
     assert "[eval] mean_score=0.000 (2 tasks)" in out
+    assert "SKIPPED" not in out
+
+
+def test_run_skips_tasks_whose_grounding_call_never_ran(monkeypatch, capsys):
+    """A dead hook must not write a full run of fabricated 0.000 into eval_scores --
+    the longitudinal series would show a quality regression that never happened."""
+    monkeypatch.setattr(harness, "DRY_RUN", False)
+    monkeypatch.setattr(harness, "TASKS", _TWO_TASKS)
+    monkeypatch.setattr(harness, "call_grounding", lambda p: None if p == "p1" else "gamma")
+    monkeypatch.setattr(harness, "ensure_collection", lambda *a, **k: None)
+    monkeypatch.setattr(harness, "embed", lambda t: [1.0])
+    upserts = []
+    monkeypatch.setattr(harness, "upsert_score", lambda **kw: upserts.append(kw))
+
+    harness.run()
+    out = capsys.readouterr().out
+
+    assert [u["task_id"] for u in upserts] == ["t2"]      # no fabricated row for t1
+    assert "t1: SKIPPED (grounding unavailable)" in out
+    assert "[eval] mean_score=1.000 (1 tasks)" in out
+    assert "WARNING: 1 task(s) skipped" in out
 
 
 def test_run_propagates_keyerror_for_a_malformed_task(monkeypatch):

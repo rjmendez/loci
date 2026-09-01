@@ -138,10 +138,12 @@ def upsert_score(
 # Grounding call
 # ---------------------------------------------------------------------------
 
-def call_grounding(prompt: str) -> str:
+def call_grounding(prompt: str) -> "str | None":
     """
     Invoke pre_llm_grounding.py, sending the prompt as a JSON payload on stdin.
-    Returns the context string, or empty string on failure.
+    Returns the context string, or None if the call could not be made — a broken
+    harness and a genuinely empty recall must not both score 0.000 into the
+    longitudinal eval_scores series.
     """
     payload = json.dumps(
         {"hook_event_name": "pre_llm_call", "extra": {"user_message": prompt}}
@@ -160,12 +162,15 @@ def call_grounding(prompt: str) -> str:
             timeout=60,
         )
         if result.returncode != 0:
-            return ""
+            err = (result.stderr or b"").decode("utf-8", "replace").strip()
+            print(f"  [warn] grounding exited {result.returncode}: {err[-2000:]}",
+                  file=sys.stderr)
+            return None
         parsed = json.loads(result.stdout)
         return parsed.get("context", "")
     except Exception as exc:
         print(f"  [warn] grounding call failed: {exc}", file=sys.stderr)
-        return ""
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +196,7 @@ def run() -> None:
         ensure_collection()
 
     scores: list[float] = []
+    skipped = 0
     for task in TASKS:
         task_id: str = task["id"]
         task_name: str = task["name"]
@@ -199,6 +205,12 @@ def run() -> None:
         expected_keywords: list[str] = task["expected_keywords"]
 
         context = call_grounding(prompt)
+        if context is None:
+            # The grounding call never ran. Record no measurement rather than a
+            # fabricated 0.000 that is indistinguishable from a quality regression.
+            skipped += 1
+            print(f"  [{category}] {task_id}: SKIPPED (grounding unavailable)")
+            continue
         score = score_context(context, expected_keywords)
         scores.append(score)
 
@@ -224,6 +236,9 @@ def run() -> None:
 
     mean_score = sum(scores) / len(scores) if scores else 0.0
     print(f"[eval] mean_score={mean_score:.3f} ({len(scores)} tasks)")
+    if skipped:
+        print(f"[eval] WARNING: {skipped} task(s) skipped — grounding unavailable, "
+              "this run is not comparable to a full one")
 
 
 if __name__ == "__main__":

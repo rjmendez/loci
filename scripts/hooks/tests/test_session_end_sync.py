@@ -865,17 +865,34 @@ def test_wiring_samples_capped_at_three_but_count_is_total(inv_env):
     assert payload["unresolved_wiring_obligation_samples"] == ["t6", "t5", "t4"]
 
 
-def test_wiring_explicit_null_text_aborts_the_whole_scan(inv_env):
-    """BUG: `rec.get("text", fid)` returns None for `"text": null`; the
-    resulting TypeError is swallowed by the outer handler, so *every*
-    obligation in the file is discarded, not just the bad record."""
+def test_wiring_explicit_null_text_aborts_the_whole_scan(inv_env, capsys):
+    """BUG (still): `rec.get("text", fid)` returns None for `"text": null`, and the
+    resulting TypeError discards *every* obligation in the file, not just the bad
+    record. It now reports None ("could not check") rather than "" ("none open")."""
     write_findings(inv_env, "inv1", [
         gap("f1", "real obligation"),
         {"id": "f2", "text": None, "tags": ["wiring_obligation"], "record_type": "gap"},
     ])
     payload = {}
-    assert inv_env._check_wiring_obligations("inv1", payload) == ""
+    assert inv_env._check_wiring_obligations("inv1", payload) is None
     assert payload == {}
+    assert "wiring-obligation check failed" in capsys.readouterr().err
+
+
+def test_wiring_unreadable_findings_file_is_reported_not_read_as_zero(inv_env, capsys):
+    """A health report whose failure mode is "healthy" is worse than no report:
+    "" means checked-and-clean, None means the check could not run."""
+    d = pathlib.Path(inv_env.os.environ["LOCI_INVESTIGATIONS_DIR"]) / "inv1"
+    (d / "findings.jsonl").mkdir(parents=True)      # exists, but open() blows up
+    payload = {}
+    assert inv_env._check_wiring_obligations("inv1", payload) is None
+    assert payload == {}
+    assert "wiring-obligation check failed" in capsys.readouterr().err
+
+
+def test_wiring_returns_empty_string_when_it_checked_and_found_nothing(inv_env):
+    write_findings(inv_env, "inv1", [gap("f1", tags=["other"])])
+    assert inv_env._check_wiring_obligations("inv1", {}) == ""
 
 
 def test_wiring_reads_the_investigations_dir_at_call_time(hook, tmp_path, monkeypatch):
@@ -1122,12 +1139,24 @@ def test_main_skips_the_wiring_check_without_an_active_investigation(wired, caps
     assert "unresolved_wiring_obligations" not in wired._rec["upsert"][0]["payload"]
 
 
-def test_main_wiring_check_failure_is_swallowed(wired, capsys):
+def test_main_wiring_check_failure_is_non_fatal_but_visible(wired, capsys):
     wired.ACTIVE_INV = "inv1"
     wired._check_wiring_obligations = mock.Mock(side_effect=RuntimeError("nope"))
     seed_session(wired)
     assert run_main(wired, {"session_id": "s1"}) is None
-    assert "[session_end_sync] synced s1 (2 msgs)" in capsys.readouterr().out
+    cap = capsys.readouterr()
+    assert "[session_end_sync] synced s1 (2 msgs)" in cap.out
+    assert "| wiring-obligation check FAILED" in cap.out
+    assert "nope" in cap.err
+
+
+def test_main_reports_a_check_that_could_not_run(wired, capsys):
+    """The unreadable-file path: the sync line must not read as a clean bill."""
+    wired.ACTIVE_INV = "inv1"
+    wired._check_wiring_obligations = mock.Mock(return_value=None)
+    seed_session(wired)
+    run_main(wired, {"session_id": "s1"})
+    assert "| wiring-obligation check FAILED" in capsys.readouterr().out
 
 
 def test_main_end_to_end_over_a_patched_urlopen(hook, capsys):

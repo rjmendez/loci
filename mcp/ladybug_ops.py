@@ -127,7 +127,14 @@ def _get_symbol_index(ks):
         return None
     try:
         rows = ks.code_query("MATCH (s:CodeSymbol) RETURN count(s)")
-        count = int(rows[0][0]) if rows and rows[0] else 0
+        if not rows or not rows[0]:
+            # A successful count always returns one row, so this is the query failing
+            # (code_query swallows read errors to []). Keep whatever index is already
+            # warm — evicting it here would drop every later finding's code links on a
+            # transient store error and report it as "no code graph ingested yet".
+            logger.warning("symbol index: CodeSymbol count query failed; keeping cached index")
+            return _symbol_index_cache
+        count = int(rows[0][0])
         if count == 0:
             _symbol_index_cache, _symbol_index_count = None, 0
             return None
@@ -218,10 +225,16 @@ def _ladybug_backfill_if_empty(ks) -> None:
         for iv in invs:
             ks.upsert_investigation(iv, "")
         n = ks.upsert_findings_batch(finding_rows)
-        ks.link_mentions_batch(mention_rows)
-        ks.link_derived_from_batch(derived_rows)
+        m = ks.link_mentions_batch(mention_rows)
+        d = ks.link_derived_from_batch(derived_rows)
         logger.info("LadybugDB backfill: mirrored %d findings, %d mentions, %d derivations (batched).",
-                    n, len(mention_rows), len(derived_rows))
+                    n, m, d)
+        # The batch writers fail open to 0 (store down, write lease contended), so
+        # report what was written, not what was offered.
+        if n < len(finding_rows) or m < len(mention_rows) or d < len(derived_rows):
+            logger.warning("LadybugDB backfill short-wrote: findings %d/%d, mentions %d/%d, "
+                           "derivations %d/%d — graph analytics will under-report.",
+                           n, len(finding_rows), m, len(mention_rows), d, len(derived_rows))
     except Exception as exc:
         logger.debug("LadybugDB backfill batch failed (fail-open): %r", exc)
 

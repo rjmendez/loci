@@ -137,12 +137,17 @@ class VerdictEngine:
             return 0
 
     async def stats(self) -> dict:
-        """Backend stats. Fail-open: returns zeroed stats on error."""
+        """Backend stats. Fail-open: returns zeroed stats marked ``ok: False`` on error.
+
+        The zeros are invented, not measured, and they are exactly what a memcheck
+        that has never fired also reports — so the caller is told which one it got.
+        """
         try:
             return await self.backend.stats()
         except Exception as exc:  # noqa: BLE001 — fail-open boundary
             _log.debug("memcheck stats failed, degrading to zeros: %r", exc)
-            return {"total_verdicts": 0, "recurring_blocks": 0}
+            return {"total_verdicts": 0, "recurring_blocks": 0,
+                    "ok": False, "error": repr(exc)}
 
     def summary(self) -> str:
         """Human-readable one-liner describing the engine configuration."""

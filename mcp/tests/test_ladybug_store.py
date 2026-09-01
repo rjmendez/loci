@@ -394,6 +394,19 @@ def test_code_query_write_guard(tmp_path):
             store.code_query(bad)
 
 
+def test_code_query_counts_the_reads_it_swallows(tmp_path, monkeypatch):
+    """code_query fails open to [], which is also what "no rows" looks like. The
+    counter is the only way a fail-open caller can tell the two apart."""
+    store = LadybugStore(str(tmp_path / "counterdb"))
+    assert store.available()
+    assert store.code_query("MATCH (s:CodeSymbol) RETURN s.id") == []
+    assert store.code_query_failures == 0
+
+    monkeypatch.setattr(store, "_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    assert store.code_query("MATCH (s:CodeSymbol) RETURN s.id") == []
+    assert store.code_query_failures == 1
+
+
 def _sym(sid, name, file, line=1, lang="python"):
     return {"id": sid, "name": name, "kind": "function",
             "line": line, "lang": lang, "file": file}
