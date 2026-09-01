@@ -241,6 +241,7 @@ _ladybug_store = None                     # LadybugStore singleton once initiali
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
 _ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
+_ladybug_backfill_lock = threading.Lock()  # own lock: _ladybug_lock is non-reentrant and already held on one path
 _LADYBUG_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
 _ladybug_lock = threading.Lock()
 
@@ -307,14 +308,22 @@ def _ladybug_backfill_once(backfill: bool):
 
     Deferred rather than done at init so a health check can open the store without
     triggering a write. Attempted at most once per process either way — a failed
-    attempt is not retried, matching the previous behaviour."""
+    attempt is not retried, matching the previous behaviour.
+
+    Claims the attempt under its own lock: this runs on a path where the caller may
+    already hold the non-reentrant _ladybug_lock, and two threads racing the flag would
+    both take the writer lease."""
     global _ladybug_backfilled
-    if backfill and not _ladybug_backfilled:
+    if not backfill or _ladybug_backfilled:
+        return _ladybug_store
+    with _ladybug_backfill_lock:
+        if _ladybug_backfilled:
+            return _ladybug_store
         _ladybug_backfilled = True
-        try:
-            _ladybug_backfill_if_empty(_ladybug_store)
-        except Exception as exc:
-            logger.debug("LadybugDB backfill skipped (fail-open): %r", exc)
+    try:
+        _ladybug_backfill_if_empty(_ladybug_store)
+    except Exception as exc:
+        logger.debug("LadybugDB backfill skipped (fail-open): %r", exc)
     return _ladybug_store
 
 
@@ -336,20 +345,30 @@ def _ladybug_health_state() -> str:
     try:
         store = _ladybug_store
         if store is None:
-            # These two answers are predetermined — settle them before opening anything.
-            if _ladybug_failed:
-                return "latched"
-            if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
-                return "backoff"
+            # Predetermined answers cost nothing to settle — do that before opening anything.
+            closed = _ladybug_closed_state()
+            if closed is not None:
+                return closed
             store = _get_ladybug(backfill=False)
         if store is None:
-            return "unavailable"
+            # The open just failed; it will have latched or armed the backoff, so re-read
+            # rather than reporting the attempt as an unknown.
+            return _ladybug_closed_state() or "unavailable"
         probe = getattr(store, "readable_probe", None)
         if probe is not None and not probe():
             return "contended"
         return "available"
     except Exception:
         return "unavailable"
+
+
+def _ladybug_closed_state() -> Optional[str]:
+    """'latched' / 'backoff' if the store is known to be unopenable right now, else None."""
+    if _ladybug_failed:
+        return "latched"
+    if _ladybug_last_attempt and (time.monotonic() - _ladybug_last_attempt) < _LADYBUG_RETRY_SECONDS:
+        return "backoff"
+    return None
 
 
 def _ladybug_writer_pid() -> Optional[int]:
