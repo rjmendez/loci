@@ -183,6 +183,38 @@ def test_save_state_writes_indent_2_json(env):
     assert "\n  " in text
 
 
+def test_save_state_keeps_the_old_state_when_the_write_dies(env):
+    """A crash part-way through the save must not leave the state file empty.
+
+    _load_state cannot tell a truncated file from a first run: it swallows the
+    JSONDecodeError and returns the defaults, so runs_seen=[] re-discovers every
+    historical run as new, last_dataset_size=0 disarms the --min-new-pairs veto,
+    and every cadence gate opens at once. The state is written once, at the end
+    of the run, so losing it costs the whole night's bookkeeping.
+    """
+    committed = {"last_dataset_size": 4200, "runs_seen": ["r1", "r2"],
+                 "total_promotions": 3}
+    loop._save_state(committed)
+    assert loop._load_state() == committed
+
+    def half_write_text(self, data, *args, **kwargs):
+        with open(self, "w") as fh:
+            fh.write(data[: len(data) // 2])
+        raise OSError("simulated crash mid-write")
+
+    # Its own context: the `env` fixture holds the function-scoped monkeypatch,
+    # so undoing that one would put STATE_FILE back to the real repo path.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "write_text", half_write_text)
+        with pytest.raises(OSError):
+            loop._save_state({"last_dataset_size": 5300,
+                              "runs_seen": ["r1", "r2", "r3"],
+                              "total_promotions": 4})
+
+    assert loop._load_state() == committed
+    assert (env.mlops / "loop_state.json").read_text() == json.dumps(committed, indent=2)
+
+
 def test_save_state_overwrites_previous_content(env):
     loop._save_state({"a": 1})
     loop._save_state({"b": 2})

@@ -311,7 +311,13 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Same-directory temp + os.replace. Truncate-in-place loses the loop's only
+    cross-run state if the process dies mid-write, and _load_state cannot tell an
+    empty file from a first run: it returns the defaults, which re-discovers every
+    historical run as new and opens every cadence gate at once."""
+    tmp = STATE_FILE.parent / (STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
 
 
 def _append_history(record: dict) -> None:
