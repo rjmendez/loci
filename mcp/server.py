@@ -157,18 +157,19 @@ def _extract_entities(text: str) -> dict:
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
-# The .env files above are only two of the three places a backend endpoint lives; the
-# third is ~/.loci/backends.toml, deliberately outside the git tree so the Qdrant key is
-# never committable. Nothing here used to consult it, so a server launched without an
-# env block (the tracked .mcp.json registers loci as bare stdio) started with no
-# QDRANT_URL — and every RAG gate below reads os.environ directly. The failure is silent
-# and actively misleading: loci_health resolves through backends.qdrant(), which DOES read
-# backends.toml, so it reports qdrant_reachable=true while investigation_search returns
-# {"mode":"rag_required","qdrant_enabled":false,"results":[]}. Callers that treat an empty
-# result set as "nothing matched" then fail open — the codebase-ingest supersede step reads
-# it as "no prior doc to retire" and appends a duplicate. load_env() applies the same
-# precedence (existing env > .env > backends.toml) and must run before qdrant_ops is
-# imported, since that module reads os.environ at import time.
+# The .env files above are two of the three places a backend endpoint lives; the third
+# is ~/.loci/backends.toml, kept outside the tree so the Qdrant key is not committable.
+# Nothing here consulted it, so a server started without an env block (.mcp.json
+# registers loci as bare stdio) had no QDRANT_URL, while every RAG gate below reads
+# os.environ directly. That fails inverted: loci_health resolves through
+# backends.qdrant(), which DOES read backends.toml, so health reports reachable while
+# investigation_search returns qdrant_enabled=false with no results — and a caller
+# reading empty as "nothing matched" appends a duplicate instead of superseding.
+#
+# load_env() only fills what is still unset, so it ranks below both .env files. Note the
+# mcp/.env call above passes override=True and so beats even an exported variable:
+# measured effective order is mcp/.env > exported env > ../.env > backends.toml. Must run
+# before qdrant_ops is imported — that module reads os.environ at module level.
 import backends  # noqa: E402
 backends.load_env()
 
