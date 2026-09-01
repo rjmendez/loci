@@ -13,7 +13,12 @@ Algorithm:
 from __future__ import annotations
 
 import json
-import math
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))), "mcp"))
+import vecmath as _vecmath  # noqa: E402
 import os
 import re
 import urllib.request
@@ -97,13 +102,11 @@ def _embed(text: str) -> Optional[list[float]]:
 
 # ── cosine similarity ─────────────────────────────────────────────────────────
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+def _cosine(a: list[float], b: list[float]):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable —
+    this was the seventh hand-rolled copy and, like two others, never checked
+    that the two vectors were the same length."""
+    return _vecmath.cosine(a, b)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -152,6 +155,11 @@ def main() -> None:
             if va is None or vb is None:
                 continue
             sim = _cosine(va, vb)
+            # Not comparable -> not a shadow pair. Reporting one on a similarity
+            # computed from a prefix would send someone to reconcile two skills
+            # that were never actually alike.
+            if sim is None:
+                continue
             if sim >= SHADOW_THRESHOLD:
                 shadow_pairs.append((records[i]["name"], records[j]["name"], sim))
 
