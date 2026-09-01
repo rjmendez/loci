@@ -49,8 +49,9 @@ class _Client:
 
 
 @pytest.fixture
-def stub_server(monkeypatch, se):
-    """Stand in for mcp/server.py rather than importing it.
+def long_passage(monkeypatch, se):
+    """Stand in for mcp/server.py rather than importing it, and hand back the
+    stored passage.
 
     Importing the real module pulls in `from dotenv import load_dotenv` at
     server.py:66, and the test-scripts CI job installs only pytest, pytest-timeout
@@ -59,7 +60,10 @@ def stub_server(monkeypatch, se):
     errors; this stub gives 0.
 
     _make_retrieve reaches for exactly two names, so a module carrying those two
-    is a complete stand-in, and the test still fails against origin/main."""
+    is a complete stand-in, and the test still fails against origin/main.
+
+    The passage is returned so a caller can assert it overran the budget:
+    "the result fits" would also pass on a passage that was never cut."""
     import sys
     import types
 
@@ -71,16 +75,18 @@ def stub_server(monkeypatch, se):
     return text
 
 
-def test_retrieved_passages_are_cut_at_the_production_rerank_budget(se, stub_server):
+def test_retrieved_passages_are_cut_at_the_production_rerank_budget(se, long_passage):
+    assert len(long_passage) > qdrant_ops.RERANK_MAX_CHARS, "fixture no longer overruns the budget"
     cands = se._make_retrieve(5)("some query", exclude_id="other")
     assert len(cands) == 1
     assert len(cands[0]["text"]) == qdrant_ops.RERANK_MAX_CHARS
     assert qdrant_ops.RERANK_MAX_CHARS == 1024, "the swept default moved; re-check the gate"
 
 
-def test_the_budget_is_imported_not_restated(se, stub_server, monkeypatch):
+def test_the_budget_is_imported_not_restated(se, long_passage, monkeypatch):
     """Overriding the module constant must move the harness with it — a second
     literal is exactly how the two copies drifted apart."""
+    assert len(long_passage) > 777
     monkeypatch.setattr(qdrant_ops, "RERANK_MAX_CHARS", 777)
     cands = se._make_retrieve(5)("some query", exclude_id="other")
     assert len(cands[0]["text"]) == 777
