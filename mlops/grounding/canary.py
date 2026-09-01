@@ -30,6 +30,13 @@ from pathlib import Path
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# One definition of the pair-feature contract, shared with ground_gate.py and
+# train.py. This file used to carry its own inline copy, frozen at the legacy
+# width, so the first candidate train.py produced could not be scored at all.
+sys.path.insert(0, str(_REPO_ROOT / "deep_think_loci" / "grounding"))
+import features as _feat  # noqa: E402
+
 _HISTORY_PATH = Path(__file__).resolve().parent / "canary_history.jsonl"
 _PROMOTIONS_PATH = Path(__file__).resolve().parent / "promotions.jsonl"
 _MONITOR_PATH = Path(__file__).resolve().parent / "monitor_history.jsonl"
@@ -119,7 +126,8 @@ def _eval_run(findings, threshold, clf, ollama_url):
     text_idx = {t: i for i, t in enumerate(texts)}
     target_idx = {t: i for i, t in enumerate(targets)}
 
-    labels, cos_scores, model_scores = [], [], []
+    labels, cos_scores = [], []
+    pair_texts, pair_targets, pair_text_vecs, pair_target_vecs = [], [], [], []
 
     for target in targets:
         qv = target_vecs[target_idx[target]]
@@ -130,16 +138,21 @@ def _eval_run(findings, threshold, clf, ollama_url):
             labels.append(label)
             cos_scores.append(cos)
             if clf is not None:
-                feat = np.concatenate([np.abs(fv - qv), fv * qv, [cos]])
-                model_scores.append(feat)
+                pair_texts.append(f["text"])
+                pair_targets.append(target)
+                pair_text_vecs.append(fv)
+                pair_target_vecs.append(qv)
 
     if not labels or sum(labels) == 0:
         return None
 
     cos_m = _metrics(labels, cos_scores, threshold)
-    if clf is not None and model_scores:
-        import joblib as _joblib  # noqa: F401 — already imported at call site
-        X = np.array(model_scores)
+    if clf is not None and pair_texts:
+        # Build exactly what THIS candidate was trained on. train.py emits the
+        # current (2d+4) layout; the shipped model is the legacy (2d+1) one.
+        dim = int(getattr(clf, "n_features_in_", 0)) or _feat.dims_for(text_vecs.shape[1])[0]
+        X = _feat.make_features(pair_texts, pair_targets,
+                                np.array(pair_text_vecs), np.array(pair_target_vecs), dim=dim)
         proba = clf.predict_proba(X)[:, 1].tolist()
         model_m = _metrics(labels, proba, 0.5)
     else:
