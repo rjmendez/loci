@@ -52,6 +52,24 @@ def get_git_hash(project_root):
         return ""
 
 
+def skip_reason(git_hash, last_hash, fg_mtime, last_mtime):
+    """Why this project needs no re-ingest, or "" if it does.
+
+    BOTH stamps have to be unchanged. The git gate used to be checked first and on its
+    own, which made the git hash a claim about the graph: ua-ingest.py exits 0 after
+    upserting zero points from an empty final-graph.json, ua-watch stamps the current
+    HEAD anyway, and re-running understand-anything to produce a real graph could not
+    get the project back into the collection — the git gate fired before the mtime gate
+    and printed "SKIP (git unchanged)" until someone happened to commit to that repo.
+    """
+    graph_unchanged = last_mtime > 0 and fg_mtime <= last_mtime
+    if not graph_unchanged:
+        return ""
+    if git_hash and git_hash != last_hash:
+        return ""
+    return f"git unchanged: {git_hash[:8]}" if git_hash else "graph unchanged"
+
+
 def find_ua_projects(roots):
     """Find directories with a completed understand-anything pipeline."""
     found = []
@@ -122,14 +140,10 @@ def main():
         fg_mtime = fg_path.stat().st_mtime
         last_mtime = state.get(key, {}).get("fg_mtime", 0)
 
-        if git_hash and git_hash == last:
+        reason = skip_reason(git_hash, last, fg_mtime, last_mtime)
+        if reason:
             skipped += 1
-            print(f"  SKIP {project.name} (git unchanged: {git_hash[:8]})")
-            continue
-
-        if fg_mtime <= last_mtime and last_mtime > 0:
-            skipped += 1
-            print(f"  SKIP {project.name} (graph unchanged)")
+            print(f"  SKIP {project.name} ({reason})")
             continue
 
         print(f"\n  INGEST {project.name} (git: {git_hash[:8] or 'unknown'})")
