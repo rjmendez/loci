@@ -38,7 +38,12 @@ def load_state():
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    """Same-directory temp + os.replace. Called once per project inside the scan
+    loop, so a run over N projects opens the truncate window N times; a lost file
+    re-ingests every project into Qdrant."""
+    tmp = STATE_FILE.parent / (STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
 
 
 def get_git_hash(project_root):

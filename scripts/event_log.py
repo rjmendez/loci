@@ -165,10 +165,17 @@ def compact(
         for ev in old_events:
             gz.write(json.dumps(ev) + "\n")
 
-    # Rewrite live log with only recent events
-    with open(path, "w") as fh:
+    # Rewrite live log with only recent events, via a same-directory temp +
+    # os.replace: truncate-in-place loses the entire log if the process dies
+    # part-way, and this file is the only record independent of the live store.
+    # This closes the crash half only. Events appended by another process between
+    # the read above and the replace are still dropped, because the snapshot is
+    # already stale by then; closing that needs a lock shared with append().
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "w") as fh:
         for ev in new_events:
             fh.write(json.dumps(ev) + "\n")
+    os.replace(tmp, path)
 
     return {
         "archived": len(old_events),
