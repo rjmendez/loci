@@ -314,6 +314,14 @@ silently before — a hand-edited `pre_tool_grounding.py` accepting `PreToolUse`
 against a repo copy that only accepted the Hermes name, where a fresh install
 would have disabled the hook.
 
+`--check` also reads `~/.claude/settings.json` (`$CLAUDE_SETTINGS`) and prints
+`UNMANAGED` for any hook an event invokes out of the hooks dir that this repo does
+not ship — on the reference host, the `Stop` wrapper `session_end_sync.sh`, which
+supplies `QDRANT_URL` and the embedding endpoint and exists in no commit. Those
+lines do not affect the exit status; only file drift does. Grading the shipped
+files alone meant `--check` said "hooks in sync" without ever looking at the file
+the `Stop` hook actually runs.
+
 Two payload shapes to get right when writing a new hook; both were wrong until
 #228, and all three hooks ran, exited 0, and did nothing:
 
