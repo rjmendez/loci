@@ -20,7 +20,11 @@ REPO_ROOT = PACKAGE_ROOT.parent.parent
 CORPUS_ROOTS: tuple[str, ...] = ("mcp", "scripts", "a2a_server", "mlops", "eval")
 
 # Directory (path-component) names excluded anywhere they occur under a
-# corpus root.
+# corpus root. Dot-directories are excluded as a class by is_excluded_rel --
+# naming them one at a time is how .pytest_cache got in (213 fixture files
+# under mcp/.pytest_cache/tmp, 2.7x the real corpus, on a machine that had run
+# the test suite). The explicit names below are the non-dot ones plus the two
+# that predate the class rule.
 EXCLUDE_DIR_NAMES: frozenset[str] = frozenset({
     "tests",
     "__pycache__",
@@ -47,6 +51,10 @@ def is_excluded_rel(rel_posix: str) -> bool:
     parts = rel_posix.split("/")
     for part in parts:
         if part in EXCLUDE_DIR_NAMES:
+            return True
+        # Any dot-directory: .pytest_cache, .mypy_cache, .ruff_cache, .tox,
+        # .venv, .git. Tool state, never analyzed source.
+        if len(part) > 1 and part.startswith("."):
             return True
         if part.endswith(EXCLUDE_DIR_SUFFIXES):
             return True
@@ -95,10 +103,13 @@ def iter_test_files_worktree(repo_root: Path = REPO_ROOT) -> list[str]:
         for dirpath, dirnames, filenames in os.walk(base):
             rel_dir = Path(dirpath).relative_to(repo_root).as_posix()
             parts = [] if rel_dir == "." else rel_dir.split("/")
+            # Same exclusions as the corpus walk minus `tests`, which this
+            # function exists to collect. Derived from is_excluded_rel rather
+            # than restated -- the restated copy had already drifted (it was
+            # missing .cache, and every dot-directory).
             dirnames[:] = [
                 d for d in dirnames
-                if d not in {"__pycache__", ".venv", "venv", ".git", "node_modules"}
-                and not d.endswith(".egg-info")
+                if d == "tests" or not is_excluded_rel(f"{rel_dir}/{d}" if rel_dir != "." else d)
             ]
             if "tests" not in parts:
                 continue
