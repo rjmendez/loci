@@ -467,8 +467,11 @@ def main(
             print(f"[glym] shift check: {shift_result}")
             return
         if not shift_result.get("should_sweep", True):
-            print(f"[glym] content shift below threshold ({shift_result.get('drift_score'):.4f}) "
-                  "— skipping sweep")
+            # drift_score is None on every early return (db_not_found, table_not_found,
+            # too_few_rows, embed_failed); report the reason those carry instead.
+            drift = shift_result.get("drift_score")
+            detail = f"{drift:.4f}" if drift is not None else shift_result.get("reason", "unknown")
+            print(f"[glym] content shift below threshold ({detail}) — skipping sweep")
             return
         print(f"[glym] content shift triggered sweep (drift={shift_result.get('drift_score'):.4f})")
 

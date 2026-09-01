@@ -199,7 +199,8 @@ class TestNoneCallableSafetyGuard(unittest.IsolatedAsyncioTestCase):
     async def test_record_none_does_not_raise(self):
         backend = MnemosyneBackend(remember=None)
         v = _make_verdict("memory")
-        await backend.record(v)  # should not raise
+        result = await backend.record(v)  # should not raise
+        self.assertIsNone(result)
 
     async def test_both_none_recall_empty(self):
         backend = MnemosyneBackend()
