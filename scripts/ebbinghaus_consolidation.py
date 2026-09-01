@@ -94,18 +94,19 @@ def days_since(ts_str: str) -> float:
     if not ts_str:
         return 0.0
     ts_str = ts_str.strip()
+    # fromisoformat, not a strptime menu: the three formats tried here all
+    # rejected fractional seconds, so every timestamp this script writes back
+    # itself (now_iso() -> '...T13:56:27.745013+00:00') came back unparseable.
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except ValueError:
+        print(f"[warn] unrecognised timestamp format: {ts_str!r}")
+        return -1.0
     # Normalise SQLite datetimes that lack timezone info.
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(ts_str, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - dt
-            return delta.total_seconds() / 86400.0
-        except ValueError:
-            continue
-    print(f"[warn] unrecognised timestamp format: {ts_str!r}")
-    return -1.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    return delta.total_seconds() / 86400.0
 
 
 def _init_difficulty(importance: float) -> float:
