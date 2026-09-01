@@ -153,6 +153,84 @@ def test_ground_budget_respected(tmp_path, monkeypatch):
     assert r["chars"] <= 800 + 500
 
 
+def _fake_healthy_server():
+    """A server double where every OTHER lane is healthy/non-degraded, so a degraded=True
+    result can only be attributed to the memory lane under test."""
+    import types
+    fake = types.ModuleType("server")
+    fake.investigation_load = lambda cid, **k: {"manifest": {}, "recent_findings": []}
+    fake.investigation_entity_lookup = lambda ent, **k: {"total_findings": 0}
+    fake.rag_context_search = lambda q, **k: {"context": "", "result_count": 0, "qdrant_available": True}
+    fake.investigation_search = lambda q, **k: {"results": []}
+    return fake
+
+
+def test_ground_marks_degraded_when_memory_dir_unconfigured(monkeypatch):
+    """An unconfigured memory dir ('') must be visible to the caller, not silently healthy.
+
+    Regression: memory_dir='' made _select_memory_files() return [] with no trace anywhere
+    in the result -- indistinguishable from a configured lane that just found no match.
+    """
+    monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
+    r = G.ground({"title": "why is auth failing", "focus": "auth"}, {"budgetChars": 500, "memoryDir": ""})
+    assert r["degraded"] is True or any("memory" in s for s in r["sources"]), (
+        "unconfigured memory dir left no trace: degraded=%r sources=%r" % (r["degraded"], r["sources"])
+    )
+
+
+def test_ground_marks_degraded_when_memory_dir_missing_index(tmp_path, monkeypatch):
+    """A configured-but-broken memory dir (no MEMORY.md at the configured path) is a
+    stronger signal than 'unconfigured' -- a deployment that thinks it has curated memory
+    but doesn't. Must set degraded=True, not silently no-op like the unconfigured case."""
+    monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
+    r = G.ground({"title": "why is auth failing", "focus": "auth"},
+                 {"budgetChars": 500, "memoryDir": str(tmp_path / "nope")})
+    assert r["degraded"] is True, (
+        "configured memory dir with missing MEMORY.md reported degraded=False -- "
+        "indistinguishable from a healthy empty lane"
+    )
+
+
+def test_ground_rag_budget_scales_with_large_ask(monkeypatch):
+    """budget_chars passed to rag_context_search must scale with the caller's ask, not be
+    hard-capped at 2000 regardless of how much budget the caller actually has."""
+    import types
+    seen = {}
+    fake = types.ModuleType("server")
+
+    def _capture(q, budget_chars=None, limit=6):
+        seen["budget_chars"] = budget_chars
+        return {"context": "x" * 100, "result_count": 1}
+
+    fake.rag_context_search = _capture
+    monkeypatch.setitem(sys.modules, "server", fake)
+    G.ground({"title": "t", "focus": "f"}, {"budgetChars": 8000, "memoryDir": "/nonexistent"})
+    assert seen["budget_chars"] > 2000, (
+        "large caller budget (8000) still clamped the RAG lane to the old 2000 absolute cap: "
+        "got budget_chars=%r" % seen.get("budget_chars")
+    )
+
+
+def test_ground_rag_budget_floor_unchanged_for_small_ask(monkeypatch):
+    """A caller with the (small/default) old-style budget must see identical RAG behaviour
+    to before this fix -- the floor preserves it."""
+    import types
+    seen = {}
+    fake = types.ModuleType("server")
+
+    def _capture(q, budget_chars=None, limit=6):
+        seen["budget_chars"] = budget_chars
+        return {"context": "x" * 100, "result_count": 1}
+
+    fake.rag_context_search = _capture
+    monkeypatch.setitem(sys.modules, "server", fake)
+    G.ground({"title": "t", "focus": "f"}, {"budgetChars": 4000, "memoryDir": "/nonexistent"})
+    assert seen["budget_chars"] == 2000, (
+        "default-sized budget (4000) must keep the old 2000 cap unchanged: got budget_chars=%r"
+        % seen.get("budget_chars")
+    )
+
+
 def test_ground_marks_degraded_when_server_import_fails(monkeypatch):
     """A total grounding failure must be distinguishable from 'nothing stored'.
 

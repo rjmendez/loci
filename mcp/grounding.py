@@ -113,6 +113,11 @@ _MEM_STOP = {"the", "and", "for", "with", "not", "via", "per", "any", "all", "ne
 
 _MEM_DISTINCTIVE = 7  # a shared token this long is topical, not incidental English
 
+# RAG lane budget: a proportional share of the caller's total ask, floored at the old
+# absolute cap so a small/default budgetChars keeps its pre-existing behaviour exactly.
+_RAG_BUDGET_FRACTION = 0.35  # matches the add() slice_frac already used for the "rag" tag
+_RAG_BUDGET_FLOOR = 2000
+
 
 def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
                          min_score: int = 2) -> list[tuple[str, str, str]]:
@@ -287,7 +292,8 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     if S and remaining[0] > 400:
         try:
             q = f"{task.get('title','')} {task.get('focus','')}".strip()
-            res = _jload(S.rag_context_search(q, budget_chars=min(remaining[0], 2000), limit=6))
+            rag_cap = max(_RAG_BUDGET_FLOOR, int(budget * _RAG_BUDGET_FRACTION))
+            res = _jload(S.rag_context_search(q, budget_chars=min(remaining[0], rag_cap), limit=6))
             ctx = (res or {}).get("context", "") if isinstance(res, dict) else ""
             if ctx and (res.get("result_count") or 0) > 0:
                 add("rag", ctx, 0.35)
@@ -299,6 +305,15 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
 
     # Curated memory files — a SUPPLEMENT after the precise (case/RAG) lanes, so a
     # fuzzy-matched memory can never crowd them out. Capped + thresholded selection.
+    # The lane must be VISIBLE when it can't run at all: '' (never configured) and "configured
+    # but no MEMORY.md at that path" (broken deployment) are both requested-but-dead, so both
+    # degrade the result rather than looking identical to "configured, searched, no match".
+    if not memory_dir:
+        degraded = True
+        sources.append("memory:unconfigured")
+    elif not (Path(memory_dir) / "MEMORY.md").exists():
+        degraded = True
+        sources.append("memory:missing-index")
     for fname, line, body in _select_memory_files(task, memory_dir):
         add(f"memory:{fname[:-3]}", (body or line), 0.15)
 
