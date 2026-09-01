@@ -68,6 +68,9 @@ QDRANT_TIMEOUT_S = 1.0
 PROMOTE_AFTER = 3  # mirrors EmlConfig.promote_after; a block-class verdict at
 # this many occurrences is what enforce-mode WOULD act on.
 DEFAULT_AUDIT_LOG = "~/.hermes/memcheck-audit.jsonl"
+# Same ceiling the sibling PreToolUse hook uses (pre_tool_grounding.MAX_AUDIT_BYTES).
+MAX_AUDIT_BYTES = 5 * 1024 * 1024
+KEEP_AUDIT_BYTES = 2 * 1024 * 1024
 
 # Decisions that count as a "block-class" verdict for would_flag accounting.
 _BLOCKING = ("flag", "warn", "quarantine")
@@ -153,11 +156,32 @@ def audit_log_path() -> Path:
     return Path(raw).expanduser()
 
 
+def _rotate_audit_if_needed(path: Path) -> None:
+    """Truncate the audit log to its tail once it passes ``MAX_AUDIT_BYTES``.
+
+    Mirrors ``_rotate_if_needed`` in scripts/hooks/pre_tool_grounding.py, which
+    is why that hook's log sits at a steady size while this one had no bound at
+    all. The first newline in the retained slice is dropped so no reader ever
+    sees a half record.
+    """
+    try:
+        if path.stat().st_size <= MAX_AUDIT_BYTES:
+            return
+        tail = path.read_bytes()[-KEEP_AUDIT_BYTES:]
+        cut = tail.find(b"\n")
+        path.write_bytes(tail[cut + 1:] if cut >= 0 else b"")
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 — rotation must never break the hook
+        logger.debug("_rotate_audit_if_needed: fail-open swallow: %r", exc)
+
+
 def _append_audit_line(record: dict) -> None:
     """Append one JSON line to the audit log. Best-effort — never raises."""
     try:
         path = audit_log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_audit_if_needed(path)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
     except Exception as exc:  # noqa: BLE001 — logging must never break the hook

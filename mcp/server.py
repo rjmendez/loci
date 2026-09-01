@@ -193,6 +193,15 @@ REFLECTION_LOG_TAIL_MIN_FILE_BYTES = 1_000_000
 REFLECTION_LOG_TAIL_READ_BYTES = 512_000
 REFLECTION_SIGNATURE_OBSERVE_LIMIT = 3
 REFLECTION_SIGNATURE_MAP_LIMIT = 500
+# One seed can offer ~620 candidates while a tick drains at most 20, so the
+# queue only grows. Keep the highest-priority window and drop the rest.
+REFLECTION_QUEUE_MAX = 400
+# ``processed`` exists only to stop a seed re-enqueueing a path already handled.
+REFLECTION_PROCESSED_MAX = 2000
+# Statuses `_process_reflection_item` will still return on the next tick: the
+# file is gone, or the kind has no scanner. Re-queueing those replays the item
+# — and its "gap" finding — forever.
+REFLECTION_TERMINAL_STATUSES = frozenset({"missing", "unsupported_kind"})
 AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 
 # ---------------------------------------------------------------------------
@@ -1057,8 +1066,28 @@ def _load_reflection_state() -> dict:
     return merged
 
 
+def _prune_reflection_processed(processed: dict) -> dict:
+    """Keep the ``REFLECTION_PROCESSED_MAX`` most recently processed dedupe keys.
+
+    Losing an old key only risks re-enqueueing a path once; the whole state file
+    is rewritten on every seed and every tick, so an unbounded map is paid for
+    on every call.
+    """
+    if not isinstance(processed, dict):
+        return {}
+    if len(processed) <= REFLECTION_PROCESSED_MAX:
+        return processed
+    ranked = sorted(
+        processed.items(),
+        key=lambda kv: str((kv[1] or {}).get("processed_at") or "") if isinstance(kv[1], dict) else "",
+        reverse=True,
+    )[:REFLECTION_PROCESSED_MAX]
+    return dict(ranked)
+
+
 def _save_reflection_state(state: dict) -> None:
     state["updated_at"] = _now()
+    state["processed"] = _prune_reflection_processed(state.get("processed") or {})
     _atomic_write_text(REFLECTION_STATE_FILE, json.dumps(state, indent=2))
 
 
@@ -2846,10 +2875,20 @@ def reflection_loop_seed(
         existing_keys.add(key)
         added += 1
 
+    # Bound the queue. A stable sort by priority keeps seed order (mtime-desc)
+    # inside each kind, so the tail dropped here is the lowest-priority kind's
+    # least-recently-touched files — exactly what a tick would have reached last.
+    dropped_over_cap = 0
+    if len(queue) > REFLECTION_QUEUE_MAX:
+        queue.sort(key=lambda item: _reflection_queue_priority(item.get("kind")))
+        dropped_over_cap = len(queue) - REFLECTION_QUEUE_MAX
+        del queue[REFLECTION_QUEUE_MAX:]
+
     state["queue"] = queue
     _save_reflection_state(state)
     return json.dumps({
         "queued_added": added,
+        "queued_dropped_over_cap": dropped_over_cap,
         "queue_size": len(queue),
         "investigation_id": investigation_id,
         "sources": {
@@ -3058,30 +3097,41 @@ def _reflection_batch_error_signature(investigation_id: str, batch_error_signatu
 
 
 def _reflection_requeue_dropped(
-    queue: list, dropped_items: list[dict], investigation_id: str, store_item_findings: bool
+    queue: list, dropped_items: list[tuple[dict, str]], investigation_id: str, store_item_findings: bool
 ) -> int:
-    """Re-queue dropped items and record a gap finding for each, in place.
+    """Re-queue retryable dropped items and record a gap finding for each, in place.
+
+    Each entry is the ``(item, status)`` pair `reflection_loop_tick` could not
+    process. A ``REFLECTION_TERMINAL_STATUSES`` status will not change on a
+    retry, so that item is dropped instead of re-queued — otherwise a rotated-away
+    session log recurs, with a fresh "gap" finding, on every tick forever.
 
     Mutates ``queue`` via ``.append`` -- never rebinds it, since the caller
     persists the same list object via ``state["queue"] = queue``. Returns the
     number to add to ``findings_written``.
     """
     added = 0
-    for dropped in dropped_items:
-        queue.append(dropped)
+    for dropped, status in dropped_items:
+        terminal = status in REFLECTION_TERMINAL_STATUSES
+        if not terminal:
+            queue.append(dropped)
         if store_item_findings:
             d_kind = str(dropped.get("kind") or "")
             d_path = str(dropped.get("path") or "")
             gap_text = (
-                f"reflection_loop_tick could not process item kind={d_kind} path={d_path}; "
-                "item re-queued for future processing."
+                f"reflection_loop_tick could not process item kind={d_kind} path={d_path} "
+                f"(status={status}); "
+                + ("item dropped, not retryable." if terminal else "item re-queued for future processing.")
             )
             if _reflection_store_finding(
                 investigation_id=investigation_id,
                 finding_type="gap",
                 text=gap_text,
                 confidence="low",
-                tags="self-reflection,loop-tick,dropped-item,re-queued",
+                tags=(
+                    "self-reflection,loop-tick,dropped-item,"
+                    + ("terminal" if terminal else "re-queued")
+                ),
             ):
                 added += 1
     return added
@@ -3138,7 +3188,7 @@ def reflection_loop_tick(
     batch_warning_signatures: Counter[str] = Counter()
     item_reports: list[dict] = []
     low_signal_session_events: list[dict[str, Any]] = []
-    dropped_items: list[dict] = []
+    dropped_items: list[tuple[dict, str]] = []
 
     for _ in range(min(max_items, len(queue))):
         next_index = min(
@@ -3150,8 +3200,9 @@ def reflection_loop_tick(
         path = str(item.get("path") or "")
         summary = _process_reflection_item(kind, path, max_lines=max_lines_per_file)
         item_reports.append(summary)
-        if summary.get("status") != "processed":
-            dropped_items.append(item)
+        status = str(summary.get("status") or "")
+        if status != "processed":
+            dropped_items.append((item, status))
             continue
 
         key = f"{kind}|{path}"

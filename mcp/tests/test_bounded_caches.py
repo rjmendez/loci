@@ -7,6 +7,7 @@ Stop hook actually writes (`LOCI_SYNC_CACHE`, 7 files), and the daemon's
 unbounded recv().
 """
 import asyncio
+import json
 import os
 import socket
 import sys
@@ -18,6 +19,9 @@ import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
 
+from pathlib import Path  # noqa: E402
+
+from memcheck import cli  # noqa: E402
 from memcheck.backend import InMemoryBackend  # noqa: E402
 from memcheck.verdict import new_verdict  # noqa: E402
 
@@ -118,6 +122,45 @@ class DaemonReadTimeoutTest(unittest.TestCase):
         finally:
             srv["s"].shutdown()
             srv["s"].server_close()
+
+
+class MemcheckAuditLogBoundTests(unittest.TestCase):
+    """The PreToolUse audit log must rotate like its sibling hook's does.
+
+    `_append_audit_line` runs once per tool call and had no size check, so the
+    log grew forever while scripts/hooks/pre_tool_grounding.py — the other hook,
+    same host, same kind of log — stayed flat under MAX_AUDIT_BYTES.
+    """
+
+    def _append_into(self, tmpdir: str, records: int, max_bytes: int, keep_bytes: int) -> Path:
+        path = Path(tmpdir) / "memcheck-audit.jsonl"
+        with unittest.mock.patch.dict(os.environ, {"MEMCHECK_AUDIT_LOG": str(path)}), \
+                unittest.mock.patch.object(cli, "MAX_AUDIT_BYTES", max_bytes), \
+                unittest.mock.patch.object(cli, "KEEP_AUDIT_BYTES", keep_bytes):
+            for i in range(records):
+                cli._append_audit_line({"i": i, "pad": "x" * 200})
+        return path
+
+    def test_append_rotates_once_past_the_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._append_into(tmpdir, records=200, max_bytes=4096, keep_bytes=2048)
+            size = path.stat().st_size
+            lines = path.read_text(encoding="utf-8").splitlines()
+
+        # Without a rotation guard 200 records is ~45 KB and only ever grows.
+        self.assertLessEqual(size, 4096 + 512)
+        # Rotation slices bytes, so the retained head must not be half a record.
+        for line in lines:
+            json.loads(line)
+        # The newest record is always kept.
+        self.assertEqual(json.loads(lines[-1])["i"], 199)
+
+    def test_append_below_the_cap_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._append_into(tmpdir, records=5, max_bytes=4096, keep_bytes=2048)
+            lines = path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual([json.loads(line)["i"] for line in lines], [0, 1, 2, 3, 4])
 
 
 if __name__ == "__main__":
