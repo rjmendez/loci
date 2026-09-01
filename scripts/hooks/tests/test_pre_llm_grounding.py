@@ -889,12 +889,22 @@ def test_format_results_fallback_source_label(hook):
     assert "from BeamMemory fallback" in hook._format_results(hits, "q", True)
 
 
-def test_format_results_source_label_counts_all_collections_even_when_unused(hook):
-    """Note: the label reports len(COLLECTIONS), not how many were searched --
-    the subagent path searches one collection but still claims three."""
+def test_format_results_source_label_defaults_to_every_configured_collection(hook):
+    """With no `searched` override the label reports len(COLLECTIONS) -- correct
+    for the main-session fan-out, which queries all of them."""
     hits = [{"collection": "loci_memory", "score": 0.5, "content": "x"}]
     hook.COLLECTIONS = hook.COLLECTIONS + [("extra", "text", None, True)]
     assert "from 4 Qdrant collections" in hook._format_results(hits, "q", False)
+
+
+def test_format_results_searched_override_states_the_real_collection_count(hook):
+    """A caller that queried a subset says so; the header is a coverage claim."""
+    hits = [{"collection": "loci_memory", "score": 0.5, "content": "x"}]
+    out = hook._format_results(hits, "q", False, searched=1)
+    assert out.splitlines()[0] == (
+        'MEMORY MATCH (1 results from 1 Qdrant collection) for "q":'
+    )
+    assert "3 Qdrant collections" not in out
 
 
 def test_format_results_dedupes_on_first_80_chars(hook):
@@ -1407,8 +1417,44 @@ def test_subagent_falls_back_to_beam_when_embedding_fails(hook):
     _, out = run_main(hook, _prompt(task_id="subagent-1"))
     ctx = context_of(out)
     assert "[mnemosyne-beam|0.60] beam says hi" in ctx
-    # used_fallback is hard-coded False on this path -> label is wrong
-    assert "Qdrant collections" in ctx and "BeamMemory fallback" not in ctx
+    # These are BeamMemory rows: the header must not attribute them to Qdrant.
+    assert "from BeamMemory fallback" in ctx
+    assert "Qdrant collection" not in ctx
+
+
+def test_subagent_search_failure_labels_the_beam_fallback_as_such(hook):
+    """A _SearchFailed on the one collection this path queries must not still
+    render as 'from N Qdrant collections' -- the header is a provenance claim the
+    subagent is told to trust as 'this is what memory holds'."""
+    def _boom(*a, **k):
+        raise hook._SearchFailed("qdrant down")
+
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = _boom
+    hook._beam_fallback = lambda q: [{"collection": "mnemosyne_beam", "score": 0.6,
+                                      "importance": 0.9, "fused": 0.5,
+                                      "content": "beam says hi", "payload": {}}]
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt(task_id="subagent-1"))
+    ctx = context_of(out)
+    assert "beam says hi" in ctx
+    assert "from BeamMemory fallback" in ctx
+    assert "Qdrant collection" not in ctx
+
+
+def test_subagent_healthy_header_counts_the_one_collection_it_searched(hook):
+    """The subagent path searches loci_memory only; it must not report that all
+    of COLLECTIONS answered."""
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = lambda *a, **k: [
+        {"collection": "loci_memory", "point_id": None, "score": 0.9,
+         "importance": 0.9, "fused": 0.81, "content": "a finding", "payload": {}}]
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt(task_id="subagent-1"))
+    ctx = context_of(out)
+    assert ctx.splitlines()[0].startswith(
+        "MEMORY MATCH (1 results from 1 Qdrant collection) for "
+    )
 
 
 def test_subagent_filters_importance_and_caps_at_two(hook):

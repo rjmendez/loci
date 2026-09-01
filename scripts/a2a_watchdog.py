@@ -53,29 +53,44 @@ def check_health():
 
 
 def get_wsl_ip():
+    """Current eth0 IPv4. Returns (ip, None) or (None, reason).
+
+    A reason is not the same answer as "no rule": both drift branches below key
+    off this value, and returning a bare None for a probe that never ran skipped
+    them both — leaving the watchdog silent, which the contract above reads as
+    healthy while the portproxy drifts.
+    """
     try:
         result = subprocess.run(
             ["ip", "addr", "show", "eth0"],
             capture_output=True, text=True, timeout=5
         )
-        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", result.stdout)
-        return m.group(1) if m else None
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"`ip addr show eth0` failed: {exc!r}"
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/", result.stdout)
+    if not m:
+        return None, "`ip addr show eth0` printed no inet address"
+    return m.group(1), None
 
 
 def get_portproxy_wsl_ip():
-    """Read current portproxy rule for our port from Windows via PowerShell."""
+    """Read current portproxy rule for our port from Windows via PowerShell.
+
+    Returns (ip, None) when the rule was read, (None, None) when the read
+    succeeded and there is genuinely no rule, and (None, reason) when the read
+    could not be made — those last two are opposite findings, and collapsing them
+    turned "I could not ask Windows" into "there is no rule, go run netsh".
+    """
     try:
         result = subprocess.run(
             ["powershell.exe", "-Command",
              f"netsh interface portproxy show v4tov4 | Select-String '{A2A_PORT}'"],
             capture_output=True, text=True, timeout=10
         )
-        m = re.search(rf"{re.escape(TAILSCALE_IP)}\s+{A2A_PORT}\s+(\d+\.\d+\.\d+\.\d+)", result.stdout)
-        return m.group(1) if m else None
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"netsh portproxy read failed: {exc!r}"
+    m = re.search(rf"{re.escape(TAILSCALE_IP)}\s+{A2A_PORT}\s+(\d+\.\d+\.\d+\.\d+)", result.stdout)
+    return (m.group(1) if m else None), None
 
 
 def write_portproxy_script(wsl_ip):
@@ -136,8 +151,18 @@ if not check_health():
         alerts.append(f"  Logs:  journalctl --user -u {SERVICE} -n 50")
 
 # ── 2. Portproxy IP drift check ──────────────────────────────────────────────
-wsl_ip = get_wsl_ip()
-proxy_ip = get_portproxy_wsl_ip()
+wsl_ip, wsl_err = get_wsl_ip()
+proxy_ip, proxy_err = get_portproxy_wsl_ip()
+
+# A probe that could not run is not a reading, and both failures are silent by
+# default: no output is no cron delivery. Say so instead.
+if wsl_err:
+    alerts.append(f"Could not read the WSL eth0 IP — portproxy drift NOT checked. {wsl_err}")
+if proxy_err:
+    alerts.append(
+        f"Could not read the Windows portproxy rule for port {A2A_PORT} — drift NOT "
+        f"checked. {proxy_err}"
+    )
 
 # write_portproxy_script returns False when the write failed (read-only FS, bad
 # permissions). Reporting "script written" regardless told the operator to go run a
@@ -151,8 +176,8 @@ if wsl_ip and proxy_ip and wsl_ip != proxy_ip:
         alerts.append(f"Run elevated: powershell -ExecutionPolicy Bypass -File {PORTPROXY_PS1}")
     else:
         alerts.append(f"Portproxy rule is stale, and {PORTPROXY_PS1} could NOT be written.")
-elif wsl_ip and not proxy_ip:
-    # No portproxy rule at all
+elif wsl_ip and not proxy_ip and not proxy_err:
+    # The read succeeded and returned no rule: there really is no portproxy rule.
     alerts.append(f"No portproxy rule found for port {A2A_PORT}.")
     if write_portproxy_script(wsl_ip):
         alerts.append(f"Script written to {PORTPROXY_PS1} — run elevated to apply.")

@@ -852,6 +852,44 @@ class TestNumericConfidence(unittest.TestCase):
         self.assertAlmostEqual(agg, 0.36, places=5,
                                msg="two unstamped 'medium' nodes are 0.6*0.6, not 1.0")
 
+    def test_aggregate_confidence_of_a_chain_it_could_not_walk_is_none(self):
+        """A crash in the walk must not render as 1.0 either. 1.0 is the top of
+        the scale AND the identity of the product, so it claims perfect certainty
+        over a chain that was never read, and is indistinguishable from the
+        legitimate 'no chain' answer."""
+        # A truthy non-subscriptable derived_from (an externally-imported or
+        # hand-edited findings.jsonl row) raises TypeError on parents[0].
+        findings_by_id = {"a": {"id": "a", "confidence": "high", "derived_from": 7}}
+        self.assertIsNone(
+            server._compute_aggregate_confidence("a", findings_by_id),
+            msg="an unwalkable chain is 'no measurement', not perfect certainty")
+        # The genuinely empty chain keeps its documented 1.0.
+        self.assertAlmostEqual(
+            server._compute_aggregate_confidence("missing", {}), 1.0, places=5)
+
+    def test_pre_answer_chain_confidence_does_not_report_high_for_unwalkable_chains(self):
+        """investigation_pre_answer_check emits min_chain_confidence /
+        confidence_summary as the agent's go/no-go on evidence quality. When every
+        chain walk failed there is no measurement, so it must report none rather
+        than min([1.0]) -> 'high'."""
+        inv_id = _new_id("chainconf")
+        server.investigation_start(investigation_id=inv_id, title="Chain confidence test")
+        (server._inv_dir(inv_id) / "findings.jsonl").write_text(
+            json.dumps({"id": "f1", "confidence": "high", "derived_from": 7}) + "\n"
+        )
+
+        conf, summary = server._pre_answer_chain_confidence(inv_id, {"f1"})
+        self.assertIsNone(conf, msg="a failed walk must not become a confidence value")
+        self.assertIsNone(summary)
+
+        # A walkable chain still measures, so the lane is not simply switched off.
+        (server._inv_dir(inv_id) / "findings.jsonl").write_text(
+            json.dumps({"id": "f1", "confidence": "medium", "derived_from": []}) + "\n"
+        )
+        conf, summary = server._pre_answer_chain_confidence(inv_id, {"f1"})
+        self.assertAlmostEqual(conf, 0.6, places=5)
+        self.assertEqual(summary, "medium (0.5-0.8)")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
