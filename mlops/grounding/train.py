@@ -144,11 +144,44 @@ def make_features(claims: list, evidences: list, emb_claims, emb_evidences):
 # Cosine baseline F1 (best threshold on same fold split)
 # ---------------------------------------------------------------------------
 
-def cosine_f1_on_folds(cos_scores: np.ndarray, labels: np.ndarray, fold_indices: list) -> tuple:
+def measured_cosines(rows: list) -> tuple:
+    """Split ``rows`` into (cos_scores, measured).
+
+    ``measured[i]`` is True only when row i actually carries a numeric ``cos``;
+    its score is NaN otherwise. The dataset builder writes ``cos`` on the topical
+    rows only, so the lineage rows (all label=1) have none — and a real cosine of
+    0.0 must stay distinguishable from a cosine that was never computed.
+    """
+    measured = np.array(
+        [isinstance(r.get("cos"), (int, float)) and not isinstance(r.get("cos"), bool)
+         for r in rows], dtype=bool)
+    scores = np.array([float(r["cos"]) if m else np.nan
+                       for r, m in zip(rows, measured)], dtype=np.float32)
+    return scores, measured
+
+
+def cosine_f1_on_folds(cos_scores: np.ndarray, labels: np.ndarray, fold_indices: list,
+                       measured: np.ndarray | None = None) -> tuple:
+    """Best-threshold F1 of the raw cosine, per fold.
+
+    ``measured`` marks the rows whose cosine was actually computed. Rows without
+    one are dropped from the validation set rather than scored: a row with no
+    cosine is not a row with cosine 0.0, and the dataset's unmeasured rows are
+    ALL positives, so scoring them 0.0 is a guaranteed false negative at every
+    threshold and can only push this baseline down. That baseline is what the
+    candidate model has to beat to overwrite the deployed one.
+
+    Returns (nan, nan) if no fold had a usable validation set — the caller must
+    not promote off a baseline that was never measured.
+    """
     from sklearn.metrics import f1_score
     per_fold = []
     thresholds = np.linspace(0.2, 0.9, 71)
     for train_idx, val_idx in fold_indices:
+        if measured is not None:
+            val_idx = np.asarray(val_idx)[measured[np.asarray(val_idx)]]
+            if len(val_idx) == 0 or len(np.unique(labels[val_idx])) < 2:
+                continue
         cos_val = cos_scores[val_idx]
         y_val = labels[val_idx]
         best_f1 = max(
@@ -156,6 +189,8 @@ def cosine_f1_on_folds(cos_scores: np.ndarray, labels: np.ndarray, fold_indices:
             for t in thresholds
         )
         per_fold.append(best_f1)
+    if not per_fold:
+        return float("nan"), float("nan")
     return float(np.mean(per_fold)), float(np.std(per_fold))
 
 
@@ -340,7 +375,12 @@ def main():
     claims = [r["claim"] for r in rows]
     evidences = [r["evidence"] for r in rows]
     labels = np.array([r["label"] for r in rows], dtype=np.int32)
-    cos_scores = np.array([r.get("cos", 0.0) for r in rows], dtype=np.float32)
+    # `cos` is written only on the topical rows; the lineage rows carry none and are
+    # all label=1. r.get("cos", 0.0) turned "never computed" into "maximally
+    # dissimilar", which is a free head start for the candidate at the promotion gate.
+    # Keep absence explicit and exclude those rows from the baseline and the strata.
+    cos_scores, cos_measured = measured_cosines(rows)
+    n_no_cos = int((~cos_measured).sum())
 
     all_texts = list(dict.fromkeys(claims + evidences))
     print(f"Embedding {len(all_texts)} unique texts (cache has {len(cache)} entries)...",
@@ -366,11 +406,20 @@ def main():
         ),
     }
 
-    cos_quartiles = np.digitize(cos_scores, np.percentile(cos_scores, [25, 50, 75]))
+    # Bin 0 is reserved for "no measured cosine" so the strata are not partly invented.
+    cos_quartiles = np.zeros(len(rows), dtype=np.int64)
+    if cos_measured.any():
+        _qs = np.percentile(cos_scores[cos_measured], [25, 50, 75])
+        cos_quartiles[cos_measured] = np.digitize(cos_scores[cos_measured], _qs) + 1
     skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
     fold_indices = list(skf.split(X, cos_quartiles))
 
-    cos_cv_mean, cos_cv_std = cosine_f1_on_folds(cos_scores, labels, fold_indices)
+    cos_cv_mean, cos_cv_std = cosine_f1_on_folds(cos_scores, labels, fold_indices,
+                                                 measured=cos_measured)
+    if n_no_cos:
+        print(f"\ncosine baseline computed over {len(rows) - n_no_cos}/{len(rows)} rows "
+              f"— {n_no_cos} rows carry no measured cosine and were excluded "
+              f"(they are not cosine 0.0).")
     # These folds split PAIRS, so a finding lands on both sides of a split and
     # every number below is optimistic — most of the apparent margin over cosine
     # is that leak. Say so on every line, because this is the figure that gets
@@ -435,7 +484,11 @@ def main():
     else:
         eval_baseline = cos_cv_mean
 
-    beat_baseline = best_f1 > eval_baseline
+    # NaN baseline = never measured. `>` on NaN is already False, so this HOLDs; say why.
+    if not np.isfinite(eval_baseline):
+        print("  WARNING: the cosine baseline could not be measured on any fold — "
+              "HOLDing rather than promoting against an unknown.")
+    beat_baseline = bool(np.isfinite(eval_baseline) and best_f1 > eval_baseline)
     decision = "PROMOTE" if beat_baseline else "HOLD"
     # Requested is not the same as used: --findings-glob can be passed and OOS
     # still return {} (fewer than 2 runs, or no fold with both classes). The
@@ -484,6 +537,8 @@ def main():
         "cv_f1_mean": round(cv_results[best_name]["mean"], 4),
         "cv_f1_std": round(cv_results[best_name]["std"], 4),
         "cosine_baseline_cv_f1": round(cos_cv_mean, 4),
+        "cosine_baseline_n_rows": len(rows) - n_no_cos,
+        "cosine_baseline_rows_without_cos": n_no_cos,
         "beat_baseline": beat_baseline,
         "decision": decision,
         "decision_basis": "oos_leave_one_run_out" if oos_results else "pair_level_cv_optimistic",

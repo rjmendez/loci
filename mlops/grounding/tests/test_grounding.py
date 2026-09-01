@@ -796,6 +796,70 @@ def test_cosine_f1_on_folds_ignores_the_train_index():
     assert a == b == (1.0, 0.0)
 
 
+def test_measured_cosines_keeps_absence_distinct_from_zero():
+    rows = [
+        {"cos": 0.8, "label": 1},     # measured
+        {"cos": 0.0, "label": 0},     # measured, and genuinely 0.0
+        {"label": 1, "signal": "lineage"},   # never computed
+        {"cos": None, "label": 1},    # written, but not a number
+    ]
+    scores, measured = train.measured_cosines(rows)
+    assert list(measured) == [True, True, False, False]
+    assert scores[0] == np.float32(0.8)
+    assert scores[1] == np.float32(0.0), "a real 0.0 must survive as a measurement"
+    assert np.isnan(scores[2]) and np.isnan(scores[3])
+
+
+def test_cosine_f1_on_folds_excludes_rows_with_no_measured_cosine():
+    """A row whose cosine was never computed is not a row with cosine 0.0.
+
+    The grounding dataset's unmeasured rows are all positives (the `lineage`
+    pairs, which the builder writes without a `cos` field). Scoring them 0.0
+    makes them false negatives at every threshold in the sweep, which can only
+    push the cosine baseline DOWN — and that baseline is what a candidate model
+    must beat before train.py overwrites the deployed classifier.
+    """
+    # Two clean positives, two clean negatives, plus two positives whose cosine
+    # was never measured (the nan rows).
+    cos = np.array([0.9, 0.85, 0.1, 0.2, np.nan, np.nan])
+    lab = np.array([1, 1, 0, 0, 1, 1])
+    measured = np.array([True, True, True, True, False, False])
+    folds = [(np.array([0]), np.array([0, 1, 2, 3, 4, 5]))]
+
+    honest = train.cosine_f1_on_folds(cos, lab, folds, measured=measured)
+    assert honest == (1.0, 0.0), (
+        "the four rows with a measured cosine separate perfectly; the unmeasured "
+        f"rows must not drag the baseline down, got {honest}"
+    )
+
+    # Same fold, the shipped behaviour: absence spelled 0.0.
+    as_zero = train.cosine_f1_on_folds(np.nan_to_num(cos, nan=0.0), lab, folds)
+    assert as_zero[0] < honest[0], (
+        "sanity: spelling the missing cosines 0.0 is what depressed the baseline"
+    )
+
+
+def test_cosine_f1_on_folds_returns_nan_when_no_fold_is_measurable():
+    """An unmeasurable baseline must not read as 0.0 — 0.0 is beatable by anything."""
+    cos = np.array([np.nan, np.nan])
+    lab = np.array([1, 0])
+    mean, std = train.cosine_f1_on_folds(cos, lab, [(np.array([0]), np.array([0, 1]))],
+                                         measured=np.array([False, False]))
+    assert np.isnan(mean) and np.isnan(std)
+    # And NaN cannot be beaten, so the promotion gate holds.
+    assert not (0.99 > mean)
+
+
+def test_cosine_f1_on_folds_skips_a_fold_left_single_class_by_the_mask():
+    cos = np.array([0.9, 0.8, 0.1])
+    lab = np.array([1, 1, 0])
+    measured = np.array([True, True, False])
+    # Masking row 2 away leaves only positives in the validation set.
+    mean, std = train.cosine_f1_on_folds(cos, lab, [(np.array([0]), np.array([0, 1, 2]))],
+                                         measured=measured)
+    assert np.isnan(mean) and np.isnan(std)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # train._extract_topic
 # ══════════════════════════════════════════════════════════════════════════════
