@@ -80,8 +80,11 @@ def embed(text: str) -> list[float] | None:
 # Cosine similarity
 # ---------------------------------------------------------------------------
 
-def cosine(a: list[float], b: list[float]):
-    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable."""
+def cosine(a: list[float] | None, b: list[float] | None):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable.
+
+    A missing vector (embed() returned None) is one such case: vecmath.cosine
+    already answers None for anything falsy, so it needs no guard here."""
     return _vecmath.cosine(a, b)
 
 
@@ -178,7 +181,7 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Phase 1 — Embed all entries
         # ------------------------------------------------------------------
-        entries: list[tuple[str, str, list[float], str]] = []
+        entries: list[tuple[str, str, list[float] | None, str]] = []
         for row in rows:
             vec = embed(row["content"])
             entries.append((row["id"], row["content"], vec, row["created_at"] or ""))
