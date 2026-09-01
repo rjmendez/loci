@@ -55,17 +55,19 @@ def read_recent_failures():
         # Table or column may differ; try a fallback without bank filter
         try:
             conn = sqlite3.connect(MNEMOSYNE_DB)
-            fallback_query = """
-                SELECT content, importance
-                FROM memories
-                WHERE importance >= 5
-                  AND created_at >= ?
-                ORDER BY importance DESC, created_at DESC
-                LIMIT 20
-            """
-            rows = conn.execute(fallback_query, (cutoff,)).fetchall()
-            conn.close()
-            return [row[0] for row in rows]
+            try:
+                fallback_query = """
+                    SELECT content, importance
+                    FROM memories
+                    WHERE importance >= 5
+                      AND created_at >= ?
+                    ORDER BY importance DESC, created_at DESC
+                    LIMIT 20
+                """
+                rows = conn.execute(fallback_query, (cutoff,)).fetchall()
+                return [row[0] for row in rows]
+            finally:
+                conn.close()
         except Exception as exc2:
             print(f"[exif] db read error: {exc2}", file=sys.stderr)
             return []
