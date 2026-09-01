@@ -157,6 +157,22 @@ def _extract_entities(text: str) -> dict:
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
+# The .env files above are two of the three places a backend endpoint lives; the third
+# is ~/.loci/backends.toml, kept outside the tree so the Qdrant key is not committable.
+# Nothing here consulted it, so a server started without an env block (.mcp.json
+# registers loci as bare stdio) had no QDRANT_URL, while every RAG gate below reads
+# os.environ directly. That fails inverted: loci_health resolves through
+# backends.qdrant(), which DOES read backends.toml, so health reports reachable while
+# investigation_search returns qdrant_enabled=false with no results — and a caller
+# reading empty as "nothing matched" appends a duplicate instead of superseding.
+#
+# load_env() only fills what is still unset, so it ranks below both .env files. Note the
+# mcp/.env call above passes override=True and so beats even an exported variable:
+# measured effective order is mcp/.env > exported env > ../.env > backends.toml. Must run
+# before qdrant_ops is imported — that module reads os.environ at module level.
+import backends  # noqa: E402
+backends.load_env()
+
 import logging
 logging.basicConfig(
     level=logging.INFO,
