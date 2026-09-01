@@ -89,6 +89,10 @@ investigation_store_decomposition_plan.md
 mlops/loop_state.json
 mlops/loop_history.jsonl
 mlops/run_contrastive.sh
+# Contrastive fine-tune output — a multi-hundred-MB model, and loop.py dates
+# the tune cadence from this directory, so the cron wrapper's `git clean -fd`
+# must not sweep it.
+mlops/embedding/loci-embed-*/
 mlops/grounding/.emb_cache.npz
 mlops/grounding/candidate.joblib
 mlops/grounding/train_metrics.json

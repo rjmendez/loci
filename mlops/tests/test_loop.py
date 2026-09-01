@@ -11,6 +11,7 @@ every dynamic import performed by the loop is replaced with an in-process fake.
 
 import json
 import os
+import subprocess
 import stat
 import sys
 import types
@@ -848,7 +849,9 @@ def test_emit_embedding_trigger_content_and_mode(env, capsys):
     assert body.startswith("#!/bin/bash\n")
     assert "set -e\n" in body
     assert f"cd {env.repo}\n" in body
-    assert "python3 mlops/embedding/contrastive.py" in body
+    assert f"{sys.executable} mlops/embedding/contrastive.py" in body, (
+        "the emitted command must use this interpreter: contrastive.py imports "
+        "sentence_transformers, which the system python3 does not have")
     assert "--model-size small" in body
     assert stat.S_IMODE(p.stat().st_mode) == 0o755
     assert f"embedding trigger written to {p}" in capsys.readouterr().out
@@ -859,6 +862,51 @@ def test_emit_embedding_trigger_is_idempotent_overwrite(env):
     p.write_text("junk")
     loop._emit_embedding_trigger()
     assert "junk" not in p.read_text()
+
+
+def test_emit_embedding_trigger_leaves_mtime_alone_when_body_is_unchanged(env):
+    """_embedding_tune_ran() dates a fine-tune against this file, so re-emitting
+    an identical body must not touch it — otherwise every nightly tick would
+    make a completed tune look older than its own trigger."""
+    p = env.mlops / "run_contrastive.sh"
+    loop._emit_embedding_trigger()
+    os.utime(p, (1_000_000, 1_000_000))
+    loop._emit_embedding_trigger()
+    assert p.stat().st_mtime == 1_000_000
+    assert stat.S_IMODE(p.stat().st_mode) == 0o755
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _embedding_tune_ran
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_embedding_tune_ran_false_with_no_trigger_and_no_model(env):
+    assert loop._embedding_tune_ran() is False
+
+
+def test_embedding_tune_ran_false_when_model_predates_the_trigger(env):
+    """The emitted script is not evidence of a tune: a loci-embed-* dir left over
+    from an older run does not clear the cadence."""
+    old_model = env.mlops / "embedding" / "loci-embed-small"
+    old_model.mkdir()
+    os.utime(old_model, (1_000_000, 1_000_000))
+    loop._emit_embedding_trigger()
+    assert loop._embedding_tune_ran() is False
+
+
+def test_embedding_tune_ran_true_when_model_postdates_the_trigger(env):
+    loop._emit_embedding_trigger()
+    trigger = env.mlops / "run_contrastive.sh"
+    os.utime(trigger, (1_000_000, 1_000_000))
+    (env.mlops / "embedding" / "loci-embed-small").mkdir()
+    assert loop._embedding_tune_ran() is True
+
+
+def test_embedding_tune_ran_ignores_a_file_named_like_the_model_dir(env):
+    loop._emit_embedding_trigger()
+    os.utime(env.mlops / "run_contrastive.sh", (1_000_000, 1_000_000))
+    (env.mlops / "embedding" / "loci-embed-small").write_text("not a model")
+    assert loop._embedding_tune_ran() is False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1369,7 +1417,32 @@ def test_main_embedding_trigger_fires_on_first_tick_ignoring_ollama(mainenv, cap
     e.main()
     assert len(e.calls["emit"]) == 1
     assert "embedding trigger (last was 999d ago)" in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_does_not_stamp_the_cadence_on_emission(mainenv, capsys):
+    """Nothing in the repo runs run_contrastive.sh. Stamping on emission bought
+    30 days of silence for a fine-tune that had not happened, so with no
+    loci-embed-* output the cadence stays unstamped and the run says so."""
+    e = mainenv
+    e.main()
+    assert state_of(e)["last_embedding_tune"] is None
+    assert ("embedding fine-tune pending — run: bash "
+            f"{e.mlops / 'run_contrastive.sh'}") in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_stamps_once_a_fine_tune_exists(mainenv, capsys):
+    e = mainenv
+    (e.mlops / "embedding" / "loci-embed-small").mkdir()
+    e.main()
     assert state_of(e)["last_embedding_tune"] is not None
+    assert "embedding fine-tune pending" not in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_does_not_stamp_a_fine_tune_in_dry_run(mainenv):
+    e = mainenv
+    (e.mlops / "embedding" / "loci-embed-small").mkdir()
+    e.main("--dry-run")
+    assert not (e.mlops / "loop_state.json").exists()
 
 
 def test_main_embedding_trigger_skipped_within_cadence(mainenv):
@@ -1538,3 +1611,63 @@ def test_a_shrinking_dataset_is_reported_rather_than_silently_vetoing(mainenv, c
     e.rv["rebuild"] = 12684
     e.main()
     assert "-7266 vs last run, pre-rebuild" in capsys.readouterr().out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# the embedding cadence, driven through main() with the REAL emit
+#
+# Every other test here stubs _emit_embedding_trigger, so the trigger file never
+# exists and _embedding_tune_ran() takes its emitted=0.0 branch. That is what let
+# a one-shot cadence look like a 30-day one: the script's body is stable, so it is
+# written once and its mtime freezes, and a tune done once stays newer than that
+# frozen mtime forever. These drive the real emit across three ticks.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_a_single_tune_does_not_satisfy_the_cadence_forever(env):
+    """The regression the review caught: after one real tune, every later cadence
+    tick re-stamped last_embedding_tune for work that never happened."""
+    loop._emit_embedding_trigger()                       # freezes the trigger mtime
+    script = env.mlops / "run_contrastive.sh"
+    assert script.exists()
+
+    # Whole seconds throughout: a stamp is an ISO string truncated to
+    # microseconds while an mtime is a float with more precision than that, and
+    # a sub-microsecond difference is not what this test is about.
+    emitted = float(int(script.stat().st_mtime))
+    os.utime(script, (emitted, emitted))
+    tuned = env.mlops / "embedding" / "loci-embed-small"
+    tuned.mkdir(parents=True)
+    tune_time = emitted + 10
+    os.utime(tuned, (tune_time, tune_time))
+
+    def iso(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+    # Tick 1: a real tune, newer than the trigger. It counts, and main() stamps.
+    assert loop._embedding_tune_ran(None) is True
+    assert loop._embedding_tune_ran(iso(emitted)) is True, (
+        "a tune done after the last stamp must count"
+    )
+
+    # Tick 2, a cadence later, no new tune. The directory is unchanged, so it must
+    # NOT count again -- the trigger's mtime is frozen at first write, which is
+    # what made one tune satisfy the gate for the rest of time.
+    assert loop._embedding_tune_ran(iso(tune_time)) is False, (
+        "the same tune directory satisfied the gate a second time; the cadence "
+        "must date against the last recorded tune, not only the frozen trigger"
+    )
+    assert loop._embedding_tune_ran(iso(tune_time + 86400 * 31)) is False
+
+
+def test_the_emitted_command_can_actually_import_its_dependencies(env):
+    """The nag says `bash run_contrastive.sh`. If that command dies on import the
+    fine-tune never happens and the nag is permanent."""
+    loop._emit_embedding_trigger()
+    body = (env.mlops / "run_contrastive.sh").read_text()
+    interp = body.split(" mlops/embedding/contrastive.py")[0].splitlines()[-1].strip()
+    out = subprocess.run([interp, "-c", "import sentence_transformers"],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, (
+        f"the emitted script runs {interp}, which cannot import sentence_transformers:\n"
+        + out.stderr.strip()
+    )

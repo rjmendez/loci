@@ -85,9 +85,18 @@ def print_stats(rows: list[dict]) -> None:
         print(f"Cosine similarity — mean={np.mean(cos_vals):.3f}, std={np.std(cos_vals):.3f}")
 
 
-def print_ollama_instructions(model_dir: pathlib.Path) -> None:
+def print_ollama_instructions(model_dir: pathlib.Path, delta: float) -> None:
+    """`delta` is finetuned_spearman - baseline_spearman. eval.json records it and
+    nothing read it, so this told the operator to load the model whether the
+    fine-tune helped or hurt."""
     print()
     print("=" * 60)
+    if delta <= 0:
+        print(f"Fine-tune did not beat the baseline (delta {delta:+.4f}) —")
+        print("  not an improvement: do not load it, keep the current model.")
+        print("=" * 60)
+        print()
+        return
     print("To use as an Ollama model:")
     print("  # Option A — llama.cpp convert script:")
     print("  git clone https://github.com/ggerganov/llama.cpp")
@@ -216,7 +225,7 @@ def main() -> None:
     eval_path.write_text(json.dumps(eval_record, indent=2))
     print(f"Eval results written to: {eval_path}")
 
-    print_ollama_instructions(model_out_dir)
+    print_ollama_instructions(model_out_dir, delta)
 
 
 if __name__ == "__main__":

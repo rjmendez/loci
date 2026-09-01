@@ -815,12 +815,24 @@ def test_print_stats_on_empty_rows(C, capsys):
 
 
 def test_print_ollama_instructions_embeds_the_model_dir(C, capsys):
-    C.print_ollama_instructions(Path("/models/loci-embed-small"))
+    C.print_ollama_instructions(Path("/models/loci-embed-small"), 0.08)
     out = capsys.readouterr().out
     assert "convert_hf_to_gguf.py /models/loci-embed-small" in out
     assert "--outfile /models/loci-embed-small/model.gguf --outtype q8_0" in out
     assert "ollama create loci-embed -f Modelfile" in out
     assert out.count("=" * 60) == 2
+
+
+@pytest.mark.parametrize("delta", [-0.30, 0.0])
+def test_print_ollama_instructions_withholds_a_model_that_did_not_win(C, capsys, delta):
+    """eval.json's delta was written and never read, so "load this model" printed
+    whether the fine-tune helped or hurt."""
+    C.print_ollama_instructions(Path("/models/loci-embed-small"), delta)
+    out = capsys.readouterr().out
+    assert f"delta {delta:+.4f}" in out
+    assert "do not load it" in out
+    assert "ollama create loci-embed -f Modelfile" not in out
+    assert "convert_hf_to_gguf.py" not in out
 
 
 class _StubCard:
