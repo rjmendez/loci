@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -160,6 +161,16 @@ if str(REPO) not in sys.path:
 # spent 67 nights in.
 FAILED_STEPS: list[str] = []
 
+# A step that did its job and found something a human has to act on. Distinct
+# from FAILED_STEPS on purpose: "the canary recommends a rollback" is not a
+# broken step, and burying it in the failure list would make both mean less.
+ALERTS: list[str] = []
+
+# Whole-run wall clock. LOCI_MLOPS_STEP_TIMEOUT bounds each child; nothing
+# bounded the run, so one slow-but-not-hung step could push the nightly into the
+# next day and hold the lock the whole time.
+DEADLINE_SECONDS = float(os.environ.get("LOCI_MLOPS_DEADLINE", "10800"))
+
 
 
 def _last_error_line(stderr: str) -> str:
@@ -179,6 +190,29 @@ def _fail(step: str, line: str) -> None:
     key; the message stays whatever the call site already said."""
     FAILED_STEPS.append(step)
     print(f"[loop] {line}")
+
+
+def _over_deadline(started: float, next_step: str) -> bool:
+    """True once the run has used its whole wall clock.
+
+    Checked BETWEEN steps only. A step already running is bounded by its own
+    LOCI_MLOPS_STEP_TIMEOUT and by _run's drain-join bound; this stops the loop
+    from starting more work after the night is gone, and from holding the lock
+    into the next day's tick.
+    """
+    used = time.monotonic() - started
+    if used < DEADLINE_SECONDS:
+        return False
+    _fail("deadline", f"run deadline reached after {used / 60:.0f}m "
+                      f"(LOCI_MLOPS_DEADLINE={DEADLINE_SECONDS:.0f}s) — "
+                      f"stopping before {next_step}")
+    return True
+
+
+def _alert(step: str, line: str) -> None:
+    """The step worked and the answer needs someone. Reported, never silent."""
+    ALERTS.append(step)
+    print(f"[loop] ALERT: {line}")
 
 
 def _days_since(now: datetime, iso_ts, default: int = 999) -> int:
@@ -366,6 +400,9 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
 
 # ── Canary evaluation ─────────────────────────────────────────────────────────
 
+# mlops/grounding/canary.py exit contract.
+CANARY_OK, CANARY_DRIFT, CANARY_ROLLBACK = 0, 1, 2
+
 def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if not CANDIDATE_MODEL.exists():
         print("[loop] no candidate model to evaluate")
@@ -381,9 +418,17 @@ def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if dry_run:
         cmd.append("--dry-run")
 
+    # canary.py's contract: 0 clean, 1 drift, 2 ROLLBACK RECOMMENDED. Only 1 was
+    # read, so a rollback recommendation -- the loudest thing it can say -- was
+    # discarded, and any other exit looked like a clean run.
     result = _run(cmd)
-    if result.returncode == 1:
-        print("[loop] ALERT: canary drift detected")
+    if result.returncode == CANARY_ROLLBACK:
+        _alert("canary", "canary recommends ROLLBACK — see canary output above")
+    elif result.returncode == CANARY_DRIFT:
+        _alert("canary", "canary drift detected")
+    elif result.returncode != CANARY_OK:
+        _fail("canary", f"canary exited {result.returncode}: "
+                        f"{_last_error_line(result.stderr)}")
     return {"exit_code": result.returncode, "stdout": result.stdout[-500:]}
 
 
@@ -494,21 +539,37 @@ def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
                "--dataset", str(DATASET), "--ollama", ollama,
                "--anchor", str(anchor), "--build-anchor"]
         result = _run(cmd)
+        if result.returncode != 0:
+            _fail("embedding drift", "anchor build failed: "
+                                     f"{_last_error_line(result.stderr)}")
+            return {"exit_code": result.returncode}
         return {"built_anchor": True}
+
     out_path = MLOPS / "embedding" / "drift_result.json"
+    # drift.py exits 1 for BOTH "drift exceeded" and "could not measure" (anchor
+    # unreadable, Ollama down). It writes --out only on the measuring path, so a
+    # file this run produced is the discriminator -- without it a down Ollama
+    # read as drift and scheduled a fine-tune.
+    before = out_path.stat().st_mtime if out_path.exists() else -1.0
     cmd = [sys.executable, str(drift_script),
            "--dataset", str(DATASET), "--ollama", ollama,
            "--anchor", str(anchor), "--out", str(out_path)]
     result = _run(cmd)
-    if result.returncode == 1:
-        print("[loop] ALERT: embedding drift detected — scheduling embedding fine-tune")
+    measured = out_path.exists() and out_path.stat().st_mtime > before
+
+    if result.returncode == 1 and measured:
+        _alert("embedding drift", "embedding drift detected — scheduling embedding fine-tune")
         if not dry_run:
             _emit_embedding_trigger()
-    if out_path.exists():
+    elif result.returncode != 0:
+        _fail("embedding drift", f"drift.py exited {result.returncode} without writing a "
+                                 f"result: {_last_error_line(result.stderr)}")
+
+    if measured:
         try:
             return json.loads(out_path.read_text())
-        except Exception:
-            pass
+        except Exception as exc:
+            _fail("embedding drift", f"drift.py wrote unreadable JSON: {exc}")
     return {"exit_code": result.returncode}
 
 
@@ -561,9 +622,15 @@ def _emit_embedding_trigger() -> None:
         f"  --out mlops/embedding/\n"
         f"echo 'Done. Load mlops/embedding/loci-embed-small/ as your embedding model.'\n"
     )
-    if not script.exists() or script.read_text() != body:
-        script.write_text(body)
-    script.chmod(0o755)
+    try:
+        if not script.exists() or script.read_text() != body:
+            script.write_text(body)
+        script.chmod(0o755)
+    except OSError as exc:
+        # The nag that follows tells the operator to run this file. If it was not
+        # written, that instruction is wrong and the tune can never happen.
+        _fail("embedding trigger", f"could not write {script}: {exc}")
+        return
     print(f"[loop] embedding trigger written to {script}")
 
 
@@ -640,6 +707,8 @@ def main() -> int:
     args = ap.parse_args()
 
     FAILED_STEPS.clear()  # module-global; a second main() in one process must start clean
+    ALERTS.clear()
+    started = time.monotonic()
     resolved = _resolve_backends()
     if args.ollama is None:
         args.ollama = (os.environ.get("OLLAMA_BASE_URL")
@@ -729,8 +798,12 @@ def main() -> int:
         # write as it went.
         state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
 
-    # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
     loop_count = state.get("total_loop_runs", 0) + 1
+    if _over_deadline(started, "decay"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics)
+
+    # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
     if loop_count % args.decay_every == 0:
         _run_decay(args.db, args.dry_run or not args.decay_apply)
     else:
@@ -745,6 +818,10 @@ def main() -> int:
     # ── 7d. Embedding drift detection ─────────────────────────────────────────
     if ollama_ok:
         _run_embedding_drift(args.ollama, args.dry_run)
+
+    if _over_deadline(started, "the SFT bake"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics)
 
     # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
     sft_days_ago = _days_since(now, state.get("last_sft_bake"))
@@ -772,6 +849,10 @@ def main() -> int:
     else:
         print(f"[loop] embedding trigger skipped ({emb_days_ago}d ago, cadence={args.embedding_every}d)")
 
+    if _over_deadline(started, "active learning"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics)
+
     # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
     al_days_ago = _days_since(now, state.get("last_active_learn"))
     if ollama_ok and al_days_ago >= args.active_learn_every:
@@ -783,6 +864,18 @@ def main() -> int:
         print(f"[loop] active_learn skipped — {_skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama)}")
 
     # ── 9. Persist state + history ────────────────────────────────────────────
+    return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                   should_retrain, promoted, train_metrics)
+
+
+def _finish(state, args, now_iso, loop_count, new_runs, current_size,
+            should_retrain, promoted, train_metrics) -> int:
+    """Persist, report, and return the exit code.
+
+    Its own function because the deadline check returns here from the middle of
+    the run: a loop that stops early still has to write its state and say why,
+    or the early exit looks exactly like a clean one.
+    """
     state["last_run"] = now_iso
     state["total_loop_runs"] = loop_count
     if not args.dry_run:
@@ -797,10 +890,17 @@ def main() -> int:
         "train_metrics": train_metrics,
         "dry_run": args.dry_run,
         "failed_steps": list(FAILED_STEPS),
+        "alerts": list(ALERTS),
     })
 
-    status = "done" if not FAILED_STEPS else f"done with {len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS)
-    print(f"[loop] {status}. promoted={promoted} dataset={state['last_dataset_size']} total_promotions={state['total_promotions']}")
+    parts = []
+    if FAILED_STEPS:
+        parts.append(f"{len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS))
+    if ALERTS:
+        parts.append(f"{len(ALERTS)} alert(s): " + ", ".join(ALERTS))
+    status = "done" if not parts else "done with " + "; ".join(parts)
+    print(f"[loop] {status}. promoted={promoted} dataset={state['last_dataset_size']} "
+          f"total_promotions={state['total_promotions']}")
     return 1 if FAILED_STEPS else 0
 
 

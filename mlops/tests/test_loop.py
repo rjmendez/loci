@@ -102,6 +102,12 @@ def env(tmp_path, monkeypatch):
     # test_loop_timeouts.py and test_loop_streaming.py.
     monkeypatch.setattr(loop, "_run", runner)
 
+    # Module-level accumulators. main() clears them, but a test calling a single
+    # step does not, and a leaked entry makes the next test assert on the
+    # previous one's failure.
+    loop.FAILED_STEPS.clear()
+    loop.ALERTS.clear()
+
     saved_path = list(sys.path)
     yield types.SimpleNamespace(
         tmp=tmp_path, repo=repo, mlops=mlops, grounding=grounding, run=runner,
@@ -458,11 +464,23 @@ def test_run_canary_drift_exit_1_still_returns_dict_not_none(env, capsys):
     assert "ALERT: canary drift detected" in capsys.readouterr().out
 
 
-def test_run_canary_other_nonzero_exit_has_no_alert(env, capsys):
+def test_run_canary_exit_2_is_a_rollback_recommendation_not_silence(env, capsys):
+    """Was test_run_canary_other_nonzero_exit_has_no_alert, which characterised
+    the bug: canary.py exits 2 for ROLLBACK RECOMMENDED -- the loudest thing it
+    can say -- and only exit 1 was read, so it went nowhere."""
     (env.mlops / "grounding" / "candidate.joblib").write_text("m")
-    env.run.set("canary.py", FakeResult(2, stdout="crash"))
+    env.run.set("canary.py", FakeResult(2, stdout="rollback"))
     assert loop._run_canary("g", "o", False)["exit_code"] == 2
-    assert "ALERT" not in capsys.readouterr().out
+    assert "ROLLBACK" in capsys.readouterr().out
+    assert "canary" in loop.ALERTS
+    assert "canary" not in loop.FAILED_STEPS, "a rollback recommendation is not a broken step"
+
+
+def test_run_canary_an_unexpected_exit_is_a_failed_step(env):
+    (env.mlops / "grounding" / "candidate.joblib").write_text("m")
+    env.run.set("canary.py", FakeResult(3, stderr="Traceback\nValueError: x"))
+    loop._run_canary("g", "o", False)
+    assert "canary" in loop.FAILED_STEPS
 
 
 def test_run_canary_truncates_stored_stdout_to_500(env):
@@ -744,11 +762,13 @@ def test_embedding_drift_builds_anchor_when_absent(env, capsys):
     assert "no anchor — building anchor set" in capsys.readouterr().out
 
 
-def test_embedding_drift_reports_built_anchor_even_when_build_fails(env):
-    """The anchor-build branch never inspects the return code."""
+def test_embedding_drift_a_failed_anchor_build_is_not_reported_as_built(env):
+    """Was ..._reports_built_anchor_even_when_build_fails: the branch never
+    inspected the return code, so a failed build claimed an anchor exists."""
     _drift_script(env)
     env.run.set("drift.py", FakeResult(1, stderr="boom"))
-    assert loop._run_embedding_drift("o", False) == {"built_anchor": True}
+    assert loop._run_embedding_drift("o", False) == {"exit_code": 1}
+    assert "embedding drift" in loop.FAILED_STEPS
 
 
 def test_embedding_drift_clean_run_returns_exit_code(env):
@@ -765,13 +785,14 @@ def test_embedding_drift_prefers_result_json_over_exit_code(env):
     assert loop._run_embedding_drift("o", False) == {"drift": 0.4}
 
 
-def test_embedding_drift_returns_stale_result_json(env):
-    """A drift_result.json left by an earlier run is returned verbatim even when
-    this run's drift.py wrote nothing."""
+def test_embedding_drift_does_not_return_a_stale_result_json(env):
+    """Was ..._returns_stale_result_json. A file an earlier run left behind was
+    returned verbatim as this run's answer -- last week's drift score reported
+    as today's."""
     _drift_script(env)
     (env.mlops / "embedding" / "anchor.npz").write_text("a")
     (env.mlops / "embedding" / "drift_result.json").write_text('{"stale": true}')
-    assert loop._run_embedding_drift("o", False) == {"stale": True}
+    assert loop._run_embedding_drift("o", False) == {"exit_code": 0}
 
 
 def test_embedding_drift_malformed_result_json_falls_back_to_exit_code(env):
@@ -782,22 +803,44 @@ def test_embedding_drift_malformed_result_json_falls_back_to_exit_code(env):
     assert loop._run_embedding_drift("o", False) == {"exit_code": 1}
 
 
-def test_embedding_drift_exit_1_emits_contrastive_script(env, capsys):
+def _measured_drift(env, exceeded=True):
+    """drift.py writes --out only on the path where it actually measured."""
+    env.run.on_call("drift.py", lambda: (env.mlops / "embedding" / "drift_result.json")
+                    .write_text('{"exceeded": %s}' % ("true" if exceeded else "false")))
+
+
+def test_embedding_drift_exit_1_with_a_measurement_emits_contrastive_script(env, capsys):
     _drift_script(env)
     (env.mlops / "embedding" / "anchor.npz").write_text("a")
     env.run.set("drift.py", FakeResult(1))
+    _measured_drift(env)
     loop._run_embedding_drift("o", dry_run=False)
     assert (env.mlops / "run_contrastive.sh").exists()
-    assert "ALERT: embedding drift detected" in capsys.readouterr().out
+    assert "embedding drift detected" in capsys.readouterr().out
+
+
+def test_embedding_drift_exit_1_without_a_measurement_is_a_failure_not_drift(env, capsys):
+    """drift.py exits 1 for BOTH 'exceeded' and 'could not measure'. It writes
+    --out only when it measured, so a down Ollama used to read as drift and
+    schedule a fine-tune."""
+    _drift_script(env)
+    (env.mlops / "embedding" / "anchor.npz").write_text("a")
+    env.run.set("drift.py", FakeResult(1, stderr="[drift] ERROR: connection refused"))
+    loop._run_embedding_drift("o", dry_run=False)
+    out = capsys.readouterr().out
+    assert not (env.mlops / "run_contrastive.sh").exists(), "scheduled a tune for an error"
+    assert "embedding drift" in loop.FAILED_STEPS
+    assert "drift detected" not in out
 
 
 def test_embedding_drift_dry_run_alerts_but_emits_nothing(env, capsys):
     _drift_script(env)
     (env.mlops / "embedding" / "anchor.npz").write_text("a")
     env.run.set("drift.py", FakeResult(1))
+    _measured_drift(env)
     loop._run_embedding_drift("o", dry_run=True)
     assert not (env.mlops / "run_contrastive.sh").exists()
-    assert "ALERT: embedding drift detected" in capsys.readouterr().out
+    assert "embedding drift detected" in capsys.readouterr().out
 
 
 def test_embedding_drift_exit_2_does_not_emit(env):
@@ -968,7 +1011,7 @@ def mainenv(env, monkeypatch):
 
     def run(*extra):
         monkeypatch.setattr(sys, "argv", ["loop.py", *extra])
-        loop.main()
+        return loop.main()
 
     env.main = run
     return env
@@ -1215,8 +1258,10 @@ def test_main_history_record_shape(mainenv):
     e.main()
     rec = read_history(e)[0]
     assert set(rec) == {"run_at", "new_runs", "dataset_size", "retrained",
-                        "promoted", "train_metrics", "dry_run", "failed_steps"}
+                        "promoted", "train_metrics", "dry_run", "failed_steps",
+                        "alerts"}
     assert rec["failed_steps"] == []
+    assert rec["alerts"] == []
     assert rec["new_runs"] == 2
     assert rec["dataset_size"] == 42
     assert rec["retrained"] is False
@@ -1713,3 +1758,47 @@ def test_run_says_so_when_it_abandons_a_blocked_reader(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "still blocked" in out, out
     assert "still blocked" in result.stderr, result.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# the run has a wall clock
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_main_stops_at_the_deadline_and_still_persists(mainenv, monkeypatch, capsys):
+    """A run that stops early must write its state and say why. An early exit
+    that looks like a clean one is the whole problem."""
+    e = mainenv
+    write_dataset(e, 10)
+    monkeypatch.setattr(loop, "DEADLINE_SECONDS", 0.0)
+    rc = e.main()
+    out = capsys.readouterr().out
+    assert rc == 1, "a run cut short is not a clean run"
+    assert "run deadline reached" in out, out
+    assert "deadline" in loop.FAILED_STEPS
+    rec = read_history(e)[0]
+    assert rec["failed_steps"] == ["deadline"]
+    assert (e.mlops / "loop_state.json").exists(), "state was not persisted on the early exit"
+
+
+def test_main_does_not_stop_when_inside_the_deadline(mainenv, monkeypatch, capsys):
+    e = mainenv
+    write_dataset(e, 10)
+    monkeypatch.setattr(loop, "DEADLINE_SECONDS", 10_000.0)
+    assert e.main() == 0
+    assert "run deadline reached" not in capsys.readouterr().out
+
+
+def test_alerts_are_reported_separately_from_failures(mainenv, monkeypatch, capsys):
+    """A canary rollback recommendation is not a broken step, and must not be
+    filed as one -- nor swallowed. main() clears both lists at entry, so the
+    alert has to be raised by a step during the run."""
+    e = mainenv
+    write_dataset(e, 10)
+    monkeypatch.setattr(loop, "_run_monitor",
+                        lambda *a, **k: (loop._alert("canary", "recommends ROLLBACK"), {})[1])
+    rc = e.main()
+    rec = read_history(e)[0]
+    assert rec["alerts"] == ["canary"], rec
+    assert rec["failed_steps"] == [], "an alert is not a failure"
+    assert rc == 0, "an alert alone must not fail the run"
+    assert "1 alert(s): canary" in capsys.readouterr().out
