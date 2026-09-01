@@ -94,20 +94,26 @@ def build_anchor(
         return {"error": "no texts found in dataset"}
 
     embeddings = []
+    # measure_drift() pairs anchor_embs[i] with texts[i], so the saved texts must
+    # be the ones that actually embedded. Slicing texts[:len(embeddings)] drops
+    # from the tail while the failure happened mid-list, which silently shifted
+    # every later text against a stranger's vector for the life of the anchor.
+    kept = []
     for i, text in enumerate(texts):
         try:
             vec = _embed(text, ollama_url, model)
-            embeddings.append(vec)
         except Exception as exc:
             print(f"[drift] embed failed for sample {i}: {exc}", file=sys.stderr)
             continue
+        embeddings.append(vec)
+        kept.append(text)
 
     if not embeddings:
         return {"error": "all embeddings failed"}
 
     arr = np.array(embeddings, dtype=np.float32)
     Path(anchor_path).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(anchor_path, embeddings=arr, texts=texts[:len(embeddings)])
+    np.savez_compressed(anchor_path, embeddings=arr, texts=kept)
     print(f"[drift] anchor built: {len(embeddings)} embeddings → {anchor_path}")
     return {"n_anchored": len(embeddings), "anchor_path": anchor_path}
 

@@ -56,6 +56,28 @@ def _load_dataset(dataset_path: str) -> list[dict]:
     return records
 
 
+def _record_pair(rec: dict) -> tuple[str, str]:
+    """(claim, evidence) for one dataset row.
+
+    grounding_dataset.jsonl rows are {claim, evidence, label, signal, cos} — none
+    of text/content/query exists on any of them, so the old field chain measured
+    every row as too short and dropped the whole corpus before scoring.
+    """
+    claim = (rec.get("text") or rec.get("claim") or rec.get("content")
+             or rec.get("query", ""))
+    evidence = rec.get("evidence") or rec.get("context", "")
+    return claim, evidence
+
+
+def _feature_contract():
+    """deep_think_loci/grounding/features.py — the one grounding feature contract."""
+    grounding = Path(__file__).resolve().parents[2] / "deep_think_loci" / "grounding"
+    if str(grounding) not in sys.path:
+        sys.path.insert(0, str(grounding))
+    import features
+    return features
+
+
 def boundary_samples(
     model_path: str,
     dataset_path: str,
@@ -68,6 +90,8 @@ def boundary_samples(
         return []
     try:
         import joblib
+        import numpy as np
+        _feat = _feature_contract()
         clf = joblib.load(model_path)
     except Exception as exc:
         print(f"[active_learn] could not load model: {exc}", file=sys.stderr)
@@ -77,18 +101,65 @@ def boundary_samples(
     if not records:
         return []
 
-    scored = []
-    for rec in records:
-        text = rec.get("text") or rec.get("content") or rec.get("query", "")
-        if len(text) < 20:
-            continue
-        try:
-            vec = _embed(text, ollama_url, embed_model)
-            proba = clf.predict_proba([vec])[0][1]
-            uncertainty = abs(proba - 0.5)
-            scored.append({"rec": rec, "proba": float(proba), "uncertainty": float(uncertainty)})
-        except Exception:
-            continue
+    # The live classifier scores (claim, evidence) PAIRS at the width it was
+    # trained on. This handed it one raw 768-d embedding, so predict_proba raised
+    # on every record and the per-record `except: continue` ate it — a field-name
+    # fix alone would still have scored nothing, just slower.
+    dim = int(getattr(clf, "n_features_in_", _feat.LEGACY_DIM))
+    if dim not in _feat.supported_dims():
+        print(f"[active_learn] {model_path} expects {dim} features; this sampler "
+              f"builds {_feat.supported_dims()} — refusing to score with a model "
+              "whose feature contract is unknown.", file=sys.stderr)
+        return []
+
+    usable = [(rec, c, e) for rec, (c, e) in ((r, _record_pair(r)) for r in records)
+              if len(c) >= 20 and e]
+    if not usable:
+        print(f"[active_learn] examined {len(records)} rows, 0 carried a "
+              "(claim, evidence) pair this model can score", file=sys.stderr)
+        return []
+
+    # One embed per distinct string, not two per row: the corpus repeats its
+    # claims and evidences heavily (5418 rows over 143 of each).
+    cache: dict[str, list] = {}
+    failures = []
+    for _, claim, evidence in usable:
+        for text in (claim, evidence):
+            if text in cache:
+                continue
+            try:
+                cache[text] = _embed(text, ollama_url, embed_model)
+            except Exception as exc:
+                failures.append(exc)
+                cache[text] = None
+    if failures:
+        # One line, not one per string: with Ollama down this is every distinct
+        # text in the corpus and the nightly log is the only reader.
+        print(f"[active_learn] {len(failures)}/{len(cache)} embeds failed, first: "
+              f"{failures[0]}", file=sys.stderr)
+
+    rows = [(rec, c, e) for rec, c, e in usable if cache.get(c) and cache.get(e)]
+    if not rows:
+        print(f"[active_learn] {len(usable)} scorable rows, 0 embedded",
+              file=sys.stderr)
+        return []
+
+    def _unit(texts):
+        arr = np.asarray([cache[t] for t in texts], dtype=np.float32)
+        return arr / (np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9)
+
+    claims = [c for _, c, _ in rows]
+    evidences = [e for _, _, e in rows]
+    try:
+        feats = _feat.make_features(claims, evidences, _unit(claims), _unit(evidences),
+                                    dim=dim)
+        probas = clf.predict_proba(feats)[:, 1]
+    except Exception as exc:
+        print(f"[active_learn] scoring {len(rows)} rows failed: {exc}", file=sys.stderr)
+        return []
+
+    scored = [{"rec": rec, "proba": float(p), "uncertainty": float(abs(p - 0.5))}
+              for (rec, _, _), p in zip(rows, probas)]
 
     boundary = [s for s in scored if s["uncertainty"] <= uncertainty_band / 2]
     boundary.sort(key=lambda x: x["uncertainty"])
@@ -106,6 +177,12 @@ def hard_negatives(
     dataset_path: str,
     n: int = DEFAULT_N_HARD_NEG,
 ) -> list[dict]:
+    # NOT fixed alongside boundary_samples, deliberately. This reads the same
+    # absent text/content fields and so returns [] on the live corpus, but
+    # teaching it `claim` would emit claim-vs-claim pairs under {text, context}
+    # keys — neither the negative this (claim, evidence) classifier needs nor a
+    # shape the dataset can ingest. Fixing it is a design decision about what a
+    # hard negative is here, not a field-name repair.
     records = _load_dataset(dataset_path)
     positives = [r for r in records if r.get("label", 0) == 1]
     if len(positives) < 2:
