@@ -9,6 +9,7 @@ and peer fanout happen atomically server-side.
 Env vars (from ~/.hermes/.env or ~/.hermes/profiles/{HERMES_PROFILE}/.env):
   LOCI_A2A_URL      Local A2A server endpoint (default: http://127.0.0.1:8201)
   LOCI_A2A_TOKEN    Bearer token for the local server
+                    (the legacy HERMES_* spelling is still accepted for both)
   BRIDGE_LOOKBACK_MIN How many minutes back to look for new memories (default: 30)
   BRIDGE_MIN_IMP      Minimum importance to bridge (default: 0.5)
   BRIDGE_MAX_ITEMS    Max memories to push per run (default: 20)
@@ -55,9 +56,16 @@ if os.path.exists(_ENV):
             os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── config ───────────────────────────────────────────────────────────────────────
-LOCAL_A2A_URL  = os.environ.get("LOCI_A2A_URL", "http://127.0.0.1:8201")
+# The legacy spelling is read directly rather than through legacy_env.apply(): this
+# script runs standalone from systemd and has no import path to mcp/. The unit this
+# repo ships points EnvironmentFile= at a profile that supplies only HERMES_A2A_*,
+# so reading the new name alone silently produced an empty token and no TOTP header.
+LOCAL_A2A_URL  = (os.environ.get("LOCI_A2A_URL")
+                  or os.environ.get("HERMES_A2A_URL")
+                  or "http://127.0.0.1:8201")
 # Empty, not "changeme": the server defaults the same variable to '' so an unset token fails closed.
-LOCAL_A2A_TOKEN = os.environ.get("LOCI_A2A_TOKEN", "")
+LOCAL_A2A_TOKEN = (os.environ.get("LOCI_A2A_TOKEN")
+                   or os.environ.get("HERMES_A2A_TOKEN") or "")
 if not LOCAL_A2A_TOKEN:
     print('WARNING: LOCI_A2A_TOKEN is not set. The bridge will be rejected by any '
           'server that enforces bearer auth. Generate one with: '
@@ -68,7 +76,8 @@ MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
 AGENT_ID       = os.environ.get("HERMES_AGENT_ID", "hermes")
 
 # The local server may enforce TOTP on /a2a, where the bearer alone 401s; empty seed sends no header.
-LOCAL_A2A_TOTP_SEED = os.environ.get("LOCI_A2A_TOTP_SEED", "").strip()
+LOCAL_A2A_TOTP_SEED = (os.environ.get("LOCI_A2A_TOTP_SEED")
+                       or os.environ.get("HERMES_A2A_TOTP_SEED") or "").strip()
 
 _mnem_dir   = os.path.expanduser(os.environ.get("MNEMOSYNE_DATA_DIR", "~/.hermes/mnemosyne/data"))
 MNEMOSYNE_DB= os.path.join(_mnem_dir, "mnemosyne.db")

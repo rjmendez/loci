@@ -62,6 +62,33 @@ def test_the_settings_json_legacy_registration_name_is_hermes_memory():
             f"{f} looks up a legacy MCP registration name that never existed")
 
 
+@pytest.mark.parametrize("attr, legacy", [
+    ("LOCAL_A2A_URL",       "HERMES_A2A_URL"),
+    ("LOCAL_A2A_TOKEN",     "HERMES_A2A_TOKEN"),
+    ("LOCAL_A2A_TOTP_SEED", "HERMES_A2A_TOTP_SEED"),
+])
+def test_the_context_bridge_honours_the_legacy_a2a_names(attr, legacy, tmp_path):
+    """scripts/systemd/mrpink-context-bridge.service points EnvironmentFile= at a
+    profile that supplies only HERMES_A2A_*. Reading the new name alone left the
+    bridge with an empty token and no TOTP header, so every send 401'd."""
+    home = tmp_path / "no-hermes-here"          # keep the module's .env loader a no-op
+    env = {"HERMES_HOME": str(home), legacy: "from-legacy"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert getattr(_fresh("a2a_context_bridge"), attr) == "from-legacy"
+
+
+@pytest.mark.parametrize("attr, legacy, current", [
+    ("LOCAL_A2A_URL",       "HERMES_A2A_URL",       "LOCI_A2A_URL"),
+    ("LOCAL_A2A_TOKEN",     "HERMES_A2A_TOKEN",     "LOCI_A2A_TOKEN"),
+    ("LOCAL_A2A_TOTP_SEED", "HERMES_A2A_TOTP_SEED", "LOCI_A2A_TOTP_SEED"),
+])
+def test_the_context_bridge_prefers_the_current_a2a_names(attr, legacy, current, tmp_path):
+    home = tmp_path / "no-hermes-here"
+    env = {"HERMES_HOME": str(home), legacy: "from-legacy", current: "from-current"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert getattr(_fresh("a2a_context_bridge"), attr) == "from-current"
+
+
 def test_the_contract_hook_falls_back_too():
     src = (REPO / "scripts" / "hooks" / "post-commit-contract-extract.sh").read_text()
     assert "HERMES_ACTIVE_INVESTIGATION" in src
