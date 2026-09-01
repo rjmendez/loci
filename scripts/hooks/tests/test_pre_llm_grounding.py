@@ -168,7 +168,7 @@ def test_collections_base_set_and_field_mapping():
     assert h.COLLECTIONS == [
         ("mnemosyne", "content", "importance", True),
         ("loci_sessions", "content_preview", None, True),
-        ("loci_memory", "text", "confidence", True),
+        ("loci_memory", "text", "numeric_confidence", True),
     ]
 
 
@@ -370,9 +370,9 @@ def test_search_collection_importance_defaults_and_falsy_coercion(hook):
 
 
 def test_search_collection_non_numeric_importance_raises(hook):
-    """BUG: the try/except only wraps the HTTP call. A textual confidence
-    ('high'/'medium'/'low' -- exactly what _multi_signal_score expects to see
-    in that field) makes float() raise straight out of the search."""
+    """The importance field must be numeric: float() on a label raises straight
+    out of the search (the try/except only wraps the HTTP call). That is why
+    loci_memory reads numeric_confidence -- see the tests below."""
     pts = [{"id": "a", "score": 0.9, "payload": {"text": "x", "confidence": "high"}}]
     calls = fake_urlopen(hook, _hit_response(pts))
     try:
@@ -380,6 +380,26 @@ def test_search_collection_non_numeric_importance_raises(hook):
             hook._search_collection("loci_memory", [1.0], "text", "confidence", True)
     finally:
         calls.stop()
+
+
+def test_loci_memory_reads_the_numeric_confidence_the_producer_writes(hook):
+    """A loci_memory finding carries BOTH fields: 'confidence' is the
+    high/medium/low label _multi_signal_score reads, and 'numeric_confidence' is
+    the float. Reading the label as importance made float() raise, so the lane
+    contributed nothing on every prompt -- silently in the main session, and
+    fatally in a subagent, where only _SearchFailed is caught."""
+    pts = [{"id": "a", "score": 0.9,
+            "payload": {"text": "x", "confidence": "high", "numeric_confidence": 0.9}}]
+    calls = fake_urlopen(hook, _hit_response(pts))
+    try:
+        col, _, impf, named = hook.COLLECTIONS[2]
+        assert col == "loci_memory"
+        hits = hook._search_collection(col, [1.0], "text", impf, named)
+    finally:
+        calls.stop()
+    assert [h["importance"] for h in hits] == [0.9]
+    # and the label is still there for the ranker that wants a label
+    assert hook._multi_signal_score(hits[0], time.time()) > 0
 
 
 def test_search_collection_raises_on_transport_error(hook):
@@ -1088,7 +1108,7 @@ def test_main_fans_out_over_every_configured_collection(hook):
     assert sorted(calls) == sorted([
         ("mnemosyne", (0.25,), "content", "importance", True, 3),
         ("loci_sessions", (0.25,), "content_preview", None, True, 3),
-        ("loci_memory", (0.25,), "text", "confidence", True, 3),
+        ("loci_memory", (0.25,), "text", "numeric_confidence", True, 3),
     ])
 
 
@@ -1301,7 +1321,7 @@ def test_subagent_detection_sources(hook, payload_extra, session_id, env):
     # lightweight path: exactly one collection, capped at 2 results
     assert len(seen) == 1
     assert seen[0][0][0] == "loci_memory"
-    assert seen[0][0][2:] == ("text", "confidence", True)
+    assert seen[0][0][2:] == ("text", "numeric_confidence", True)
     assert seen[0][1] == {"top_k": 2}
     assert "grounding unavailable in subagent context" in context_of(out)
 

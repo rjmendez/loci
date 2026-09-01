@@ -145,7 +145,10 @@ _DEFAULT_EXTRA_FIELDS = ("text", None, True)
 _BASE_COLLECTIONS = [
     ("mnemosyne",       "content",         "importance", True),
     ("loci_sessions", "content_preview", None,         True),
-    ("loci_memory",   "text",            "confidence", True),
+    # numeric_confidence, not confidence: the producer writes BOTH — a float
+    # here and the 'high'/'medium'/'low' label that _multi_signal_score reads.
+    # float()ing the label raised, losing this lane on every prompt.
+    ("loci_memory",   "text",            "numeric_confidence", True),
 ]
 _extra_names = [
     c.strip() for c in os.environ.get("GROUNDING_EXTRA_COLLECTIONS", "").split(",")
@@ -559,7 +562,7 @@ def main() -> None:
             if sub_vec is not None:
                 try:
                     sub_hits = _search_collection(
-                        "loci_memory", sub_vec, "text", "confidence", True,
+                        "loci_memory", sub_vec, "text", "numeric_confidence", True,
                         top_k=min(RECALL_TOP_K, 2),
                     )
                 except _SearchFailed:

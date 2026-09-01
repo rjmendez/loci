@@ -45,7 +45,14 @@ def _load_corpus(limit_scan: int) -> list:
 
 
 def _make_retrieve(pool: int):
-    """retrieve_fn(query, exclude_id) -> [{id, text}] dense-search candidate pool."""
+    """retrieve_fn(query, exclude_id) -> [{id, text}] dense-search candidate pool.
+
+    Passages are truncated to the SAME budget production feeds the cross-encoder
+    (qdrant_ops.RERANK_MAX_CHARS). A hard-coded 512 here scored every arm at a
+    length the repo separately measured as worse than no reranker at all, so the
+    ordering this gate produced was not evidence about the pipeline that runs.
+    """
+    import qdrant_ops
     import server as S
     client, col = S._get_qdrant()
 
@@ -60,7 +67,8 @@ def _make_retrieve(pool: int):
             rid = str(r.id)
             if rid == str(exclude_id):
                 continue
-            out.append({"id": rid, "text": str((r.payload or {}).get("text", ""))[:512]})
+            out.append({"id": rid,
+                        "text": str((r.payload or {}).get("text", ""))[:qdrant_ops.RERANK_MAX_CHARS]})
         return out[:pool]
 
     return retrieve

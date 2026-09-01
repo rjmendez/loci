@@ -26,6 +26,7 @@ import glob
 import json
 import math
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -35,6 +36,11 @@ from grounding_gate_eval import _metrics  # reuse metric computation
 THRESHOLD = float(os.environ.get("DTL_GROUND_THRESHOLD", "0.59"))
 CORPUS = os.environ.get("DTL_CORPUS_GLOB", os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findings.jsonl"))
 MODEL = Path(__file__).resolve().parent.parent / "deep_think_loci/grounding/grounding_bleed_clf.joblib"
+
+# The pair-feature contract lives next to the model, in one place, so this eval
+# cannot drift away from the width the loaded classifier was trained on.
+sys.path.insert(0, str(MODEL.parent))
+import features as _feat  # noqa: E402
 
 # Built-in focus queries for the example dama-gotchi targets; override with
 # $DTL_TARGET_FOCUS (inline JSON or a path). Unknown targets fall back to the
@@ -102,7 +108,7 @@ def run():
             cos = sum(a * b for a, b in zip(q, cv))
             labels.append(1 if x["target"] == t else 0)
             cosv.append(cos)
-            feats.append((q, cv, cos))
+            feats.append((x["text"], focus.get(t, t), cv, q))
 
     print(f"[gate-qf-eval] run_date={run_date} targets={len(targets)} findings={len(findings)} "
           f"pairs={len(labels)} (pos={sum(labels)}) thr={THRESHOLD} dry_run={harness.DRY_RUN}")
@@ -129,14 +135,18 @@ def run():
     print("  COSINE @%.2f   :" % THRESHOLD, {k: round(v, 3) for k, v in cos_m.items()})
     print("  COSINE @best=%.3f:" % cos_best["thr"], {k: round(v, 3) for k, v in cos_best.items() if k != "thr"})
 
-    mdl_best = None
+    mdl_m = mdl_best = None
     if MODEL.exists():
         try:
             import joblib
             import numpy as np
             clf = joblib.load(str(MODEL))
-            X = np.array([np.concatenate([np.abs(np.array(q) - np.array(cv)), np.array(q) * np.array(cv), [cos]])
-                          for q, cv, cos in feats])
+            cvm = np.array([f[2] for f in feats], dtype=np.float32)
+            qvm = np.array([f[3] for f in feats], dtype=np.float32)
+            # Build for the model that was actually loaded: train.py writes this
+            # same path, and it emits the wider (2d+4) layout.
+            dim = int(getattr(clf, "n_features_in_", 0)) or _feat.dims_for(cvm.shape[1])[0]
+            X = _feat.make_features([f[0] for f in feats], [f[1] for f in feats], cvm, qvm, dim=dim)
             proba = clf.predict_proba(X)[:, 1].tolist()
             mdl_m = _metrics(labels, proba, 0.5)
             mdl_best = _best_f1(proba)
