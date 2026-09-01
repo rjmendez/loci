@@ -1323,23 +1323,41 @@ def test_main_sft_bake_is_still_attempted_in_dry_run(mainenv):
     assert not (e.mlops / "loop_state.json").exists()
 
 
-def test_main_naive_sft_timestamp_crashes_the_loop(mainenv):
-    """BUG pinned: cadence arithmetic subtracts a state timestamp from an
-    aware ``now`` with no normalisation. A naive ISO string in loop_state.json
-    (hand-edited, or written by a pre-timezone version) raises TypeError and
-    the nightly never reaches state persist or history append."""
+def test_main_naive_sft_timestamp_is_read_as_utc(mainenv):
+    """A naive ISO string in loop_state.json (hand-edited, or written by a
+    pre-timezone version) used to raise TypeError out of the cadence gate — which
+    sits after the retrain and canary and before the state persist, so the tick
+    did its work and threw the result away. It is now read as UTC."""
     e = mainenv
     seed_state(e, last_sft_bake="2024-01-01T00:00:00")
-    with pytest.raises(TypeError):
-        e.main()
-    assert read_history(e) == []
+    e.main()
+    assert len(e.calls["sft"]) == 1
+    assert read_history(e) != []
 
 
-def test_main_unparseable_sft_timestamp_crashes_the_loop(mainenv):
+def test_main_unparseable_sft_timestamp_is_treated_as_ancient(mainenv, capsys):
+    """Same crash through ValueError. Unreadable age now falls back to the
+    missing-key default — ancient, so the step runs — and says which value it
+    could not read."""
     e = mainenv
     seed_state(e, last_sft_bake="never")
-    with pytest.raises(ValueError):
-        e.main()
+    e.main()
+    assert len(e.calls["sft"]) == 1
+    assert "unreadable timestamp 'never' in loop_state.json" in capsys.readouterr().out
+    assert read_history(e) != []
+
+
+def test_days_since_normalises_a_naive_stamp_instead_of_raising():
+    now = datetime(2026, 1, 11, tzinfo=timezone.utc)
+    assert loop._days_since(now, "2026-01-01T00:00:00") == 10
+    assert loop._days_since(now, "2026-01-01T00:00:00+00:00") == 10
+
+
+def test_days_since_falls_back_to_the_missing_key_default():
+    now = datetime(2026, 1, 11, tzinfo=timezone.utc)
+    assert loop._days_since(now, "never") == 999
+    assert loop._days_since(now, None) == 999
+    assert loop._days_since(now, "") == 999
 
 
 # --- embedding trigger cadence ------------------------------------------------

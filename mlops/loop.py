@@ -163,6 +163,28 @@ def _fail(step: str, line: str) -> None:
     print(f"[loop] {line}")
 
 
+def _days_since(now: datetime, iso_ts, default: int = 999) -> int:
+    """Whole days between a loop_state.json timestamp and ``now``.
+
+    Flooring is fine — for an integer cadence ``floor(x) >= n`` and ``x >= n``
+    agree. Raising is not: a naive or hand-edited timestamp threw out of the
+    cadence gate, which sits AFTER the retrain and canary and BEFORE _save_state,
+    so the tick did its work and then lost its state. A naive stamp is read as
+    UTC; an unreadable one falls back to the same ``default`` a missing key gets
+    (ancient, so run), and says so.
+    """
+    if not iso_ts:
+        return default
+    try:
+        then = datetime.fromisoformat(str(iso_ts))
+    except (TypeError, ValueError):
+        print(f"[loop] unreadable timestamp {iso_ts!r} in loop_state.json — treating as {default}d ago")
+        return default
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (now - then).days
+
+
 def _skip_reason(ollama_ok: bool, days_ago: int, cadence: int, ollama: str) -> str:
     """Why a cadence-gated step did not run. These gates are also Ollama-gated, so
     reciting only the cadence blames the schedule for an unreachable backend."""
@@ -662,10 +684,7 @@ def main() -> int:
         _run_embedding_drift(args.ollama, args.dry_run)
 
     # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
-    last_sft = state.get("last_sft_bake")
-    sft_days_ago = (
-        (now - datetime.fromisoformat(last_sft)).days if last_sft else 999
-    )
+    sft_days_ago = _days_since(now, state.get("last_sft_bake"))
     if ollama_ok and sft_days_ago >= args.sft_every:
         print(f"[loop] SFT bake (last was {sft_days_ago}d ago)")
         ok = _run_sft_bake(args.ollama, args.dry_run)
@@ -675,10 +694,7 @@ def main() -> int:
         print(f"[loop] SFT bake skipped — {_skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama)}")
 
     # ── 8. Embedding trigger (cadence-gated) ──────────────────────────────────
-    last_emb = state.get("last_embedding_tune")
-    emb_days_ago = (
-        (now - datetime.fromisoformat(last_emb)).days if last_emb else 999
-    )
+    emb_days_ago = _days_since(now, state.get("last_embedding_tune"))
     if emb_days_ago >= args.embedding_every:
         print(f"[loop] embedding trigger (last was {emb_days_ago}d ago)")
         _emit_embedding_trigger()
@@ -688,8 +704,7 @@ def main() -> int:
         print(f"[loop] embedding trigger skipped ({emb_days_ago}d ago, cadence={args.embedding_every}d)")
 
     # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
-    last_al = state.get("last_active_learn")
-    al_days_ago = (now - datetime.fromisoformat(last_al)).days if last_al else 999
+    al_days_ago = _days_since(now, state.get("last_active_learn"))
     if ollama_ok and al_days_ago >= args.active_learn_every:
         print(f"[loop] active_learn (last was {al_days_ago}d ago)")
         al_result = _run_active_learn(args.ollama)

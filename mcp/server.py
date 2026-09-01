@@ -6401,9 +6401,17 @@ def _rag_apply_decay(results: list[dict]) -> None:
             ts_val = r.get("created_at_ts") or r.get("ts")
             if ts_val is None:
                 continue
-            # ts may be an ISO string; created_at_ts is always an int epoch
+            # ts may be an ISO string (inv_store._now); created_at_ts is always an
+            # int epoch. float() alone raised on every ISO fallback, so any point
+            # carrying only ts — the corpus predating created_at_ts — escaped decay.
             try:
-                age_days = (now_ts - float(ts_val)) / 86400.0
+                ts_num = float(ts_val)
+            except (TypeError, ValueError):
+                ts_num = float(_coerce_ts(ts_val))
+            if ts_num <= 0:
+                continue
+            try:
+                age_days = (now_ts - ts_num) / 86400.0
                 if age_days < 0:
                     age_days = 0.0
                 raw_score = float(r.get("score") or 0.0)
