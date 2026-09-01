@@ -1309,14 +1309,17 @@ async def skill_docker_status(task: dict) -> dict:
             ['docker', 'ps', '--format', '{{.Names}}\t{{.Status}}\t{{.Image}}'],
             capture_output=True, text=True, timeout=10
         )
-        containers = []
-        for line in r.stdout.strip().splitlines():
-            parts = line.split('\t')
-            if len(parts) >= 3:
-                entry = {'name': parts[0], 'status': parts[1], 'image': parts[2]}
-                if not flt or flt.lower() in parts[0].lower():
-                    containers.append(entry)
-        results['docker'] = containers
+        if r.returncode != 0:
+            results['docker_error'] = r.stderr.strip() or f'docker ps exited {r.returncode}'
+        else:
+            containers = []
+            for line in r.stdout.strip().splitlines():
+                parts = line.split('\t')
+                if len(parts) >= 3:
+                    entry = {'name': parts[0], 'status': parts[1], 'image': parts[2]}
+                    if not flt or flt.lower() in parts[0].lower():
+                        containers.append(entry)
+            results['docker'] = containers
     except Exception as e:
         results['docker_error'] = str(e)
 
@@ -1328,14 +1331,17 @@ async def skill_docker_status(task: dict) -> dict:
              '-o', 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.phase,READY:.status.containerStatuses[0].ready'],
             capture_output=True, text=True, timeout=15
         )
-        pods = []
-        for line in r.stdout.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 3:
-                entry = {'namespace': parts[0], 'name': parts[1], 'status': parts[2], 'ready': parts[3] if len(parts) > 3 else '?'}
-                if not flt or flt.lower() in parts[1].lower():
-                    pods.append(entry)
-        results['k3s_pods'] = pods
+        if r.returncode != 0:
+            results['k3s_error'] = r.stderr.strip() or f'kubectl get pods exited {r.returncode}'
+        else:
+            pods = []
+            for line in r.stdout.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 3:
+                    entry = {'namespace': parts[0], 'name': parts[1], 'status': parts[2], 'ready': parts[3] if len(parts) > 3 else '?'}
+                    if not flt or flt.lower() in parts[1].lower():
+                        pods.append(entry)
+            results['k3s_pods'] = pods
     except Exception as e:
         results['k3s_error'] = str(e)
 
@@ -1368,6 +1374,8 @@ async def skill_ua_search(task: dict) -> dict:
 
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return {'error': r.stderr.strip()[-500:] or f'ua_search exited {r.returncode}', 'query': query}
         results = json.loads(r.stdout) if r.stdout.strip() else []
         return {'results': results, 'count': len(results), 'query': query}
     except Exception as e:
