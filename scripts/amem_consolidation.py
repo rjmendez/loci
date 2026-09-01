@@ -7,7 +7,13 @@ Phase 2: Conflict detection for near-duplicate but divergent entries.
 
 import importlib.util
 import json
-import math
+import os as _os
+import sys as _sys
+
+# mcp/ holds the shared vector helpers; these scripts run standalone.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))), "mcp"))
+import vecmath as _vecmath  # noqa: E402
 import os
 import sqlite3
 import urllib.request
@@ -65,13 +71,9 @@ def embed(text: str) -> list[float]:
 # Cosine similarity
 # ---------------------------------------------------------------------------
 
-def cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+def cosine(a: list[float], b: list[float]):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable."""
+    return _vecmath.cosine(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,10 @@ def main() -> None:
 
                 sim = cosine(vec_a, vec_b)
 
+                # Not comparable -> no edge. Linking two memories on a similarity
+                # computed from a prefix is worse than not linking them.
+                if sim is None:
+                    continue
                 if sim > AMEM_LINK_THRESHOLD:
                     cur.execute(
                         """
