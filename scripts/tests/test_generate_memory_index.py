@@ -90,7 +90,7 @@ def test_preserves_existing_section_grouping(tmp_path, mod):
                        encoding="utf-8")
 
     entries, _ = mod.load_entries(tmp_path)
-    order, secs = mod.parse_source_sections(source.read_text(encoding="utf-8"))
+    order, secs, _curated = mod.parse_source_sections(source.read_text(encoding="utf-8"))
     sections = mod.build_sections(entries, order, secs)
 
     assert "Custom Group" in sections
@@ -281,3 +281,38 @@ def test_inline_error_shown_even_when_description_present(tmp_path, mod):
     assert any(fname == "noname.md" for fname, _ in malformed)
     by_name = {e.filename: e for e in entries}
     assert "frontmatter" in by_name["noname.md"].hook
+
+
+def test_curated_line_wins_over_frontmatter_description(tmp_path, mod):
+    """The source index's hand-written line is the higher-signal text: it carries
+    the operator's markers and shorthand, which the frontmatter description does
+    not. Deriving the index from descriptions silently discards that."""
+    _write_mem(tmp_path, "a.md", "a-slug", "FRONTMATTER FALLBACK TEXT")
+    _write_mem(tmp_path, "b.md", "b-slug", "B DESCRIPTION")
+    source = ("# Memory index\n\n## Working agreements\n"
+              "- [Curated Title ⚠️](a.md) — ⚠️CURATED HOOK\n")
+    order, secs, curated = mod.parse_source_sections(source)
+    entries, _ = mod.load_entries(tmp_path)
+    entries = mod.apply_curated(entries, curated)
+    out = mod.render(mod.build_sections(entries, order, secs))
+
+    assert "Curated Title" in out
+    assert "CURATED HOOK" in out
+    assert "FRONTMATTER FALLBACK TEXT" not in out
+    assert "B DESCRIPTION" in out, "a file the index never listed keeps its description"
+
+
+def test_cross_project_source_entry_survives(tmp_path, mod):
+    """A curated link pointing outside the memory dir is still a real memory.
+    Dropping it because it does not glob is the orphan bug in another form."""
+    _write_mem(tmp_path, "a.md", "a", "local")
+    source = ("# Memory index\n\n## Refs\n"
+              "- [Elsewhere](../other-project/memory/thing.md) — sibling store\n"
+              "- [A](a.md) — local\n")
+    order, secs, curated = mod.parse_source_sections(source)
+    entries, _ = mod.load_entries(tmp_path)
+    entries = mod.apply_curated(entries, curated)
+    out = mod.render(mod.build_sections(entries, order, secs))
+
+    assert "../other-project/memory/thing.md" in out
+    assert "Elsewhere" in out

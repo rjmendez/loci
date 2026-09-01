@@ -52,7 +52,7 @@ DEFAULT_HEADROOM_PCT = 5.0
 ELLIPSIS = "…"
 _FRONTMATTER_KEY_RE = re.compile(r'^([A-Za-z_][\w-]*):\s*(.*)$')
 _SECTION_RE = re.compile(r'^##\s+(.+?)\s*$')
-_LINK_RE = re.compile(r'\(([\w.\-]+\.md)\)')
+_LINK_RE = re.compile(r'\(([\w./\-]+\.md)\)')
 _WORKING_AGREEMENTS_SECTION = "Working agreements"
 _MARKER_WARNING = "⚠"  # ⚠ — entries carrying this keep more of their hook under truncation
 _MARKER_STATUS = "✅"   # ✅
@@ -157,10 +157,19 @@ def load_entries(memory_dir: Path) -> tuple[list[Entry], list[tuple[str, str]]]:
     return entries, malformed
 
 
-def parse_source_sections(text: str) -> tuple[list[str], dict[str, list[str]]]:
-    """Recover '## Section' -> [filenames] from an existing index, in order."""
+_CURATED_RE = re.compile(
+    r'^-\s*\[(?P<title>[^\]]*)\]\((?P<file>[\w./\-]+\.md)\)\s*(?:\u2014\s*(?P<hook>.*))?$')
+
+
+def parse_source_sections(
+        text: str) -> tuple[list[str], dict[str, list[str]], dict[str, tuple[str, str]]]:
+    """Recover '## Section' -> [filenames] from an existing index, in order,
+    plus each entry's curated title and hook. The curated hook is hand-written
+    and carries the markers and shorthand that a frontmatter description does
+    not, so it is the better source for the index line."""
     order: list[str] = []
     sections: dict[str, list[str]] = {}
+    curated: dict[str, tuple[str, str]] = {}
     current: str | None = None
     for line in text.splitlines():
         h = _SECTION_RE.match(line)
@@ -175,13 +184,40 @@ def parse_source_sections(text: str) -> tuple[list[str], dict[str, list[str]]]:
         m = _LINK_RE.search(line)
         if m:
             sections[current].append(m.group(1))
-    return order, sections
+            c = _CURATED_RE.match(line.strip())
+            if c:
+                curated[c.group("file")] = (
+                    (c.group("title") or "").strip(), (c.group("hook") or "").strip())
+    return order, sections, curated
 
 
 def _type_section_name(mtype: str | None) -> str:
     if not mtype:
         return "Other"
     return mtype.replace("_", " ").replace("-", " ").title()
+
+
+def apply_curated(entries: list[Entry],
+                  curated: dict[str, tuple[str, str]]) -> list[Entry]:
+    """Prefer the source index's hand-written title and hook over the frontmatter
+    description. The curated line carries the operator's markers and shorthand;
+    the description is prose written for a different purpose. Files the index
+    never listed keep their description, and a curated link pointing outside the
+    memory dir is carried through rather than silently dropped."""
+    if not curated:
+        return entries
+    by_file = {e.filename: e for e in entries}
+    for fname, (ctitle, chook) in curated.items():
+        e = by_file.get(fname)
+        if e is None:
+            if "/" in fname:
+                entries.append(Entry(fname, ctitle or fname, chook, None, None))
+            continue
+        if ctitle:
+            e.title = ctitle
+        if chook and not e.error:
+            e.hook = chook
+    return entries
 
 
 def build_sections(entries: list[Entry], source_order: list[str],
@@ -355,14 +391,22 @@ def main(argv: list[str] | None = None) -> int:
 
     source_order: list[str] = []
     source_sections: dict[str, list[str]] = {}
+    curated: dict[str, tuple[str, str]] = {}
     if source_path:
         sp = Path(source_path)
         if sp.exists():
-            source_order, source_sections = parse_source_sections(
+            source_order, source_sections, curated = parse_source_sections(
                 sp.read_text(encoding="utf-8", errors="replace"))
         else:
             print(f"[generate_memory_index] WARNING: --source {sp} not found; "
                   f"grouping by metadata.type instead", file=sys.stderr)
+
+    entries = apply_curated(entries, curated)
+
+    for e in entries:
+        if "/" in e.filename and not (d / e.filename).exists():
+            print(f"[generate_memory_index] WARNING: {e.filename}: link does not resolve "
+                  f"from {d}", file=sys.stderr)
 
     sections = build_sections(entries, source_order, source_sections)
 
