@@ -796,6 +796,62 @@ class TestNumericConfidence(unittest.TestCase):
                 self.assertIn("numeric_confidence", node,
                               f"Chain node missing numeric_confidence: {node}")
 
+    def test_declare_tools_stamp_numeric_confidence(self):
+        """contract_declare / wiring_obligation_declare build their finding dict
+        by hand, bypassing _store_build_finding. Without a stamped
+        numeric_confidence the reader defaulted them to 1.0 — a "gap" record,
+        the weakest tier there is, scoring perfect certainty."""
+        inv_id = _new_id("declare-nc")
+        server.investigation_start(investigation_id=inv_id, title="Declare nc test")
+
+        server.contract_declare(
+            investigation_id=inv_id, entity="POST /api/users", role="producer",
+            fields='{"user_id": "int"}',
+        )
+        server.wiring_obligation_declare(
+            investigation_id=inv_id, class_name="MetricsPublisher",
+            method_name="publish", expected_effect="publishes to MQTT",
+        )
+
+        rows = [json.loads(l) for l in
+                (server._inv_dir(inv_id) / "findings.jsonl")
+                .read_text().splitlines() if l.strip()]
+        by_source = {r.get("source"): r for r in rows}
+        for src in ("contract_declare", "wiring_obligation_declare"):
+            self.assertIn(src, by_source)
+            row = by_source[src]
+            self.assertIn("numeric_confidence", row,
+                          f"{src} wrote a finding with no numeric_confidence")
+            self.assertAlmostEqual(row["numeric_confidence"], 0.6, places=5,
+                                   msg=f"{src} is confidence 'medium' -> 0.6")
+
+    def test_unstamped_finding_does_not_score_perfect_certainty(self):
+        """A record with no numeric_confidence must resolve from its own
+        confidence label, not 1.0. 1.0 is the top of the scale, and in a
+        product it also stops the node constraining the aggregate at all."""
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "medium"}), 0.6, places=5)
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "low"}), 0.3, places=5)
+        self.assertAlmostEqual(
+            server._node_numeric_confidence({"confidence": "high"}), 0.9, places=5)
+        # No label either -> neutral, still not 1.0.
+        self.assertAlmostEqual(server._node_numeric_confidence({}), 0.6, places=5)
+        # An explicitly stamped value still wins.
+        self.assertAlmostEqual(
+            server._node_numeric_confidence(
+                {"confidence": "low", "numeric_confidence": 0.95}), 0.95, places=5)
+
+    def test_aggregate_confidence_of_unstamped_chain(self):
+        """_compute_aggregate_confidence over unstamped nodes must not be 1.0."""
+        findings_by_id = {
+            "a": {"id": "a", "confidence": "medium", "derived_from": ["b"]},
+            "b": {"id": "b", "confidence": "medium", "derived_from": []},
+        }
+        agg = server._compute_aggregate_confidence("a", findings_by_id)
+        self.assertAlmostEqual(agg, 0.36, places=5,
+                               msg="two unstamped 'medium' nodes are 0.6*0.6, not 1.0")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
@@ -888,6 +944,41 @@ class TestProceduralMemory(unittest.TestCase):
         self.assertEqual(r3.get("attempt_count"), 3)
         self.assertEqual(r3.get("success_count"), 2)
         self.assertAlmostEqual(r3.get("success_rate"), 2 / 3, places=3)
+
+    def test_never_attempted_procedure_has_no_success_rate(self):
+        """Untried and always-failed are the two states a caller most needs to
+        tell apart when picking a procedure, and 0.0 spelled both."""
+        self.assertIsNone(server._procedure_success_rate(0, 0),
+                          "never attempted has no measured success rate")
+        self.assertEqual(server._procedure_success_rate(0, 1), 0.0,
+                         "one attempt, no successes, IS a measured 0.0")
+        self.assertEqual(server._procedure_success_rate(1, 2), 0.5)
+        # A never-attempted procedure must not be ranked below one that has failed.
+        untried = server._procedure_success_rate(0, 0)
+        failed = server._procedure_success_rate(0, 4)
+        self.assertNotEqual(untried, failed,
+                            "a brand-new procedure and a 0-for-4 procedure must "
+                            "not report the same success_rate")
+
+    def test_procedure_search_reports_null_rate_for_an_untried_procedure(self):
+        inv_id = _new_id("proc-untried")
+        server.investigation_start(investigation_id=inv_id, title="Untried procedure")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="procedure",
+            text="Drain the node before kernel upgrade.",
+            source="runbook:kernel-upgrade",
+            confidence="medium",
+            procedure_steps="1. cordon\n2. drain\n3. upgrade",
+        )
+        res = _json(server.procedure_search(query="kernel upgrade", investigation_id=inv_id))
+        self.assertNotIn("error", res, f"Unexpected error: {res}")
+        rows = res.get("procedures") or []
+        self.assertTrue(rows, "the stored procedure should be findable")
+        row = rows[0]
+        self.assertEqual(row.get("procedure_meta", {}).get("attempt_count"), 0)
+        self.assertIsNone(row.get("success_rate"),
+                          "a never-attempted procedure must not report 0.0")
 
     def test_procedure_attempt_rejects_nonexistent_finding(self):
         inv_id = _new_id("proc-miss")
