@@ -27,6 +27,8 @@ from inv_store import (
     _now,
     _read_jsonl,
     _save_manifest,
+    _node_numeric_confidence,
+    _NEUTRAL_NUMERIC_CONFIDENCE,
 )
 
 logger = logging.getLogger("loci-mcp")
@@ -648,7 +650,7 @@ def investigation_finding_provenance(
             "ts": node.get("ts"),
             "record_type": node.get("record_type") or node.get("type"),
             "confidence": node.get("confidence"),
-            "numeric_confidence": node.get("numeric_confidence", 1.0),
+            "numeric_confidence": _node_numeric_confidence(node),
             "source": node.get("source"),
             "text": str(node.get("text", ""))[:400],
             "derived_from": node.get("derived_from", []),
@@ -663,12 +665,13 @@ def investigation_finding_provenance(
     root_type = root.get("record_type") if root else None
     grounded = root_type == "observed"
 
-    # A finding without numeric_confidence counts as 1.0.
+    # A finding without numeric_confidence resolves from its own confidence label
+    # (_node_numeric_confidence); an unstamped record is not worth 1.0.
     try:
         aggregate_confidence = 1.0
         for node_entry in chain:
             if "error" not in node_entry:
-                nc = node_entry.get("numeric_confidence", 1.0)
+                nc = node_entry.get("numeric_confidence", _NEUTRAL_NUMERIC_CONFIDENCE)
                 try:
                     aggregate_confidence *= float(nc)
                 except (TypeError, ValueError) as exc:
