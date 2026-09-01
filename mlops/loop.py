@@ -743,7 +743,7 @@ def main() -> int:
     if emb_days_ago >= args.embedding_every:
         print(f"[loop] embedding trigger (last was {emb_days_ago}d ago)")
         _emit_embedding_trigger()
-        if _embedding_tune_ran(last_emb):
+        if _embedding_tune_ran(state.get("last_embedding_tune")):
             if not args.dry_run:
                 state["last_embedding_tune"] = now_iso
         else:
