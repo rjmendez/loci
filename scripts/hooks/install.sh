@@ -15,6 +15,7 @@ HOOKS=(pre_llm_grounding.py pre_tool_grounding.py session_end_sync.py legacy_env
        workflow_balanced_models.py)
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${CLAUDE_HOOKS_DIR:-$HOME/.claude/hooks}"
+SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 
 if [[ "${1:-}" == "--check" ]]; then
   drift=0
@@ -25,7 +26,34 @@ if [[ "${1:-}" == "--check" ]]; then
       echo "DRIFTED  $h"; diff -u "$SRC/$h" "$DEST/$h" | sed -n '3,$p' | head -20; drift=1
     fi
   done
-  [[ $drift -eq 0 ]] && echo "hooks in sync"
+
+  # HOOKS is what this repo ships, not what Claude Code runs. settings.json can
+  # point an event at a file in the hooks dir that HOOKS does not name -- the Stop
+  # hook on the reference host runs session_end_sync.sh, a wrapper that exports the
+  # Qdrant and embedding endpoints and exists in no commit. Checking HOOKS alone
+  # examined every file except the entry point and still said "hooks in sync".
+  unmanaged=()
+  if [[ -f "$SETTINGS" ]]; then
+    while IFS= read -r path; do
+      name="${path##*/}"
+      known=0
+      for h in "${HOOKS[@]}"; do [[ "$h" == "$name" ]] && { known=1; break; }; done
+      [[ $known -eq 1 ]] || unmanaged+=("$name")
+    done < <(tr -s '[:space:],"' '\n' < "$SETTINGS" | grep -F "$DEST/" | sort -u)
+  fi
+  if [[ ${#unmanaged[@]} -gt 0 ]]; then
+    for u in "${unmanaged[@]}"; do
+      echo "UNMANAGED $u  (invoked from $SETTINGS, not managed by this script)"
+    done
+  fi
+
+  if [[ $drift -eq 0 ]]; then
+    if [[ ${#unmanaged[@]} -gt 0 ]]; then
+      echo "${#HOOKS[@]} hooks in sync; ${#unmanaged[@]} invoked but not managed here"
+    else
+      echo "hooks in sync"
+    fi
+  fi
   exit $drift
 fi
 
