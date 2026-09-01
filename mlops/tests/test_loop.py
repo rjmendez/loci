@@ -861,6 +861,51 @@ def test_emit_embedding_trigger_is_idempotent_overwrite(env):
     assert "junk" not in p.read_text()
 
 
+def test_emit_embedding_trigger_leaves_mtime_alone_when_body_is_unchanged(env):
+    """_embedding_tune_ran() dates a fine-tune against this file, so re-emitting
+    an identical body must not touch it — otherwise every nightly tick would
+    make a completed tune look older than its own trigger."""
+    p = env.mlops / "run_contrastive.sh"
+    loop._emit_embedding_trigger()
+    os.utime(p, (1_000_000, 1_000_000))
+    loop._emit_embedding_trigger()
+    assert p.stat().st_mtime == 1_000_000
+    assert stat.S_IMODE(p.stat().st_mode) == 0o755
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _embedding_tune_ran
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_embedding_tune_ran_false_with_no_trigger_and_no_model(env):
+    assert loop._embedding_tune_ran() is False
+
+
+def test_embedding_tune_ran_false_when_model_predates_the_trigger(env):
+    """The emitted script is not evidence of a tune: a loci-embed-* dir left over
+    from an older run does not clear the cadence."""
+    old_model = env.mlops / "embedding" / "loci-embed-small"
+    old_model.mkdir()
+    os.utime(old_model, (1_000_000, 1_000_000))
+    loop._emit_embedding_trigger()
+    assert loop._embedding_tune_ran() is False
+
+
+def test_embedding_tune_ran_true_when_model_postdates_the_trigger(env):
+    loop._emit_embedding_trigger()
+    trigger = env.mlops / "run_contrastive.sh"
+    os.utime(trigger, (1_000_000, 1_000_000))
+    (env.mlops / "embedding" / "loci-embed-small").mkdir()
+    assert loop._embedding_tune_ran() is True
+
+
+def test_embedding_tune_ran_ignores_a_file_named_like_the_model_dir(env):
+    loop._emit_embedding_trigger()
+    os.utime(env.mlops / "run_contrastive.sh", (1_000_000, 1_000_000))
+    (env.mlops / "embedding" / "loci-embed-small").write_text("not a model")
+    assert loop._embedding_tune_ran() is False
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # main()  — orchestration
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1351,7 +1396,32 @@ def test_main_embedding_trigger_fires_on_first_tick_ignoring_ollama(mainenv, cap
     e.main()
     assert len(e.calls["emit"]) == 1
     assert "embedding trigger (last was 999d ago)" in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_does_not_stamp_the_cadence_on_emission(mainenv, capsys):
+    """Nothing in the repo runs run_contrastive.sh. Stamping on emission bought
+    30 days of silence for a fine-tune that had not happened, so with no
+    loci-embed-* output the cadence stays unstamped and the run says so."""
+    e = mainenv
+    e.main()
+    assert state_of(e)["last_embedding_tune"] is None
+    assert ("embedding fine-tune pending — run: bash "
+            f"{e.mlops / 'run_contrastive.sh'}") in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_stamps_once_a_fine_tune_exists(mainenv, capsys):
+    e = mainenv
+    (e.mlops / "embedding" / "loci-embed-small").mkdir()
+    e.main()
     assert state_of(e)["last_embedding_tune"] is not None
+    assert "embedding fine-tune pending" not in capsys.readouterr().out
+
+
+def test_main_embedding_trigger_does_not_stamp_a_fine_tune_in_dry_run(mainenv):
+    e = mainenv
+    (e.mlops / "embedding" / "loci-embed-small").mkdir()
+    e.main("--dry-run")
+    assert not (e.mlops / "loop_state.json").exists()
 
 
 def test_main_embedding_trigger_skipped_within_cadence(mainenv):
