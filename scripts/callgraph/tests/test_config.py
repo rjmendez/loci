@@ -50,3 +50,50 @@ def test_stdlib_module_names_contains_known_stdlib():
 def test_third_party_names_finds_installed_packages():
     names = config.third_party_top_level_names()
     assert "dotenv" in names or "starlette" in names
+
+
+# ── tool caches are not corpus ────────────────────────────────────────────────
+# Found by running the suite on a developer machine: pytest's tmp_path fixtures
+# leave .py files under mcp/.pytest_cache/tmp, and the corpus walk counted 339
+# files instead of 126. CI never saw it because it checks out clean and runs the
+# callgraph job in its own job, before anything populates the cache.
+
+def test_dot_directories_are_excluded_as_a_class():
+    for d in (".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".venv", ".git"):
+        assert config.is_excluded_rel(f"mcp/{d}/tmp/x.py"), d
+        assert config.is_excluded_rel(f"mcp/{d}"), d
+
+
+def test_a_leading_dot_does_not_exclude_a_corpus_root_relative_path():
+    assert not config.is_excluded_rel("mcp/server.py")
+    assert not config.is_excluded_rel("scripts/hunt_to_corpus.py")
+
+
+def _tree(root, rel_paths):
+    for rel in rel_paths:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x = 1\n")
+
+
+def test_corpus_walk_skips_tool_cache_directories(tmp_path):
+    _tree(tmp_path, [
+        "mcp/server.py",
+        "mcp/.pytest_cache/tmp/test_thing0/fixture.py",
+        "mcp/.mypy_cache/3.11/mod.py",
+        "mcp/__pycache__/server.cpython-311.py",
+    ])
+    assert config.iter_corpus_files_worktree(tmp_path) == ["mcp/server.py"]
+
+
+def test_the_two_walkers_share_one_exclusion_rule(tmp_path):
+    """iter_test_files_worktree is the complement of the corpus walk, so it must
+    differ on `tests` and nothing else."""
+    _tree(tmp_path, [
+        "mcp/server.py",
+        "mcp/tests/test_server.py",
+        "mcp/.pytest_cache/tmp/test_thing0/fixture.py",
+        "mcp/tests/.pytest_cache/junk.py",
+    ])
+    assert config.iter_corpus_files_worktree(tmp_path) == ["mcp/server.py"]
+    assert config.iter_test_files_worktree(tmp_path) == ["mcp/tests/test_server.py"]
