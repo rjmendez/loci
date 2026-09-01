@@ -381,13 +381,13 @@ def test_build_anchor_respects_n(tmp_path, monkeypatch):
     assert result["n_anchored"] == 2
 
 
-def test_build_anchor_partial_failure_misaligns_texts_and_embeddings(tmp_path, monkeypatch):
-    """BUG: on a mid-list embedding failure, texts are truncated with `texts[:len(embs)]`
-    instead of tracking which texts actually succeeded.
+def test_build_anchor_partial_failure_keeps_texts_aligned_with_embeddings(tmp_path, monkeypatch):
+    """A mid-list embedding failure must drop that text, not the tail.
 
-    Sampled order for this dataset is C, A, B. Failing on A drops row 1, so the saved
-    embeddings are [vec(C), vec(B)] while the saved texts are ["C...", "A..."]. Row 1 now
-    pairs text "A" with B's vector.
+    Sampled order for this dataset is C, A, B. Failing on A must leave ["C", "B"]
+    against [vec(C), vec(B)]; the old `texts[:len(embeddings)]` slice saved
+    ["C", "A"] instead, so measure_drift() compared A's live vector with B's
+    anchor vector for the life of the anchor file.
     """
     import numpy as np
 
@@ -404,9 +404,34 @@ def test_build_anchor_partial_failure_misaligns_texts_and_embeddings(tmp_path, m
     assert D.build_anchor(str(ds), anchor_path=str(anchor))["n_anchored"] == 2
 
     z = np.load(anchor, allow_pickle=True)
-    assert [t[0] for t in z["texts"].tolist()] == ["C", "A"]
-    assert z["embeddings"].tolist() == [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]  # C's vec, then B's
-    # -> row 1 claims to be text "A" but holds the embedding of text "B"
+    assert [t[0] for t in z["texts"].tolist()] == ["C", "B"]
+    assert z["embeddings"].tolist() == [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]
+
+
+def test_measure_drift_reads_back_a_partially_failed_anchor_as_no_drift(tmp_path, monkeypatch):
+    """End to end: build an anchor over a flaky embedder, then measure against the
+    same embedder. Every surviving text must meet its own vector, so cosine is 1.0
+    and nothing is reported as drifted. Under the tail-slice bug the second row met
+    a stranger's vector and reported drift the model had not undergone."""
+    ds = _write_jsonl(tmp_path / "d.jsonl", [{"text": _long(c)} for c in "ABC"])
+    vecs = {"A": [1.0, 0.0, 0.0], "B": [0.0, 1.0, 0.0], "C": [0.0, 0.0, 1.0]}
+
+    def flaky(text, url, model):
+        if text.startswith("A"):
+            raise RuntimeError("boom")
+        return vecs[text[0]]
+
+    monkeypatch.setattr(D, "_embed", flaky)
+    anchor = tmp_path / "a.npz"
+    D.build_anchor(str(ds), anchor_path=str(anchor))
+
+    # The transient failure is over by measurement time — the usual case, and the
+    # one where a misaligned anchor is invisible rather than merely skipped.
+    monkeypatch.setattr(D, "_embed", lambda text, url, model: vecs[text[0]])
+    result = D.measure_drift(anchor_path=str(anchor))
+    assert result["mean_cosine"] == pytest.approx(1.0)
+    assert result["n_drifted_095"] == 0
+    assert result["exceeded"] is False
 
 
 # ======================================================================================
