@@ -177,6 +177,8 @@ def test_apply_decay_success_dict_shape(tmp_path):
     assert set(res) == {
         "n_rows", "n_decayed", "mean_retention", "min_retention",
         "lambda_days", "k", "dry_run",
+        "n_grounding_visible_before", "n_grounding_visible_after",
+        "grounding_min_importance",
     }
     assert res["lambda_days"] == 30.0 and res["k"] == 0.8
     assert res["dry_run"] is True
@@ -307,16 +309,53 @@ def test_apply_decay_custom_lambda_and_k_are_echoed_and_used(tmp_path):
     assert _read_importance(db)[1] == pytest.approx(math.exp(-1.0), rel=1e-3)
 
 
-def test_apply_decay_is_not_idempotent(tmp_path):
-    # Each run multiplies by retention again — importance is recomputed from the
-    # *current* value, never from an original baseline.
+def test_apply_decay_is_idempotent(tmp_path):
+    # Was test_apply_decay_is_not_idempotent, which characterised the compounding:
+    # retention is a function of absolute age, so recomputing from the *current*
+    # value multiplies it again on every run. Decay now reads base_importance.
     db = _make_db(tmp_path / "m.db", [(1, "a", 0.8, _ago(30), "s1")])
     D.apply_decay(db)
     first = _read_importance(db)[1]
     D.apply_decay(db)
     second = _read_importance(db)[1]
-    assert second < first
-    assert second == pytest.approx(first * math.exp(-1.0), rel=1e-3)
+    assert second == pytest.approx(first, abs=1e-9)
+    assert first == pytest.approx(0.8 * math.exp(-1.0), rel=1e-3)
+
+
+def _base_importance(db_path: str, rid: int):
+    conn = sqlite3.connect(db_path)
+    out = conn.execute("SELECT base_importance FROM working_memory WHERE id=?", (rid,)).fetchone()[0]
+    conn.close()
+    return out
+
+
+def test_apply_decay_preserves_the_authored_importance(tmp_path):
+    """Nothing else stores the authored value, so an in-place write is one-way."""
+    db = _make_db(tmp_path / "m.db", [(1, "a", 0.9, _ago(90), "s1")])
+    D.apply_decay(db)
+    assert _read_importance(db)[1] < 0.2
+    assert _base_importance(db, 1) == pytest.approx(0.9), "the authored 0.9 cannot be restored"
+
+
+def test_apply_decay_does_not_reseed_the_baseline_from_a_decayed_value(tmp_path):
+    """Seeding on every run would re-derive the baseline from decayed output --
+    idempotent-looking on run two, and still one-way."""
+    db = _make_db(tmp_path / "m.db", [(1, "a", 0.9, _ago(90), "s1")])
+    D.apply_decay(db)
+    D.apply_decay(db)
+    assert _base_importance(db, 1) == pytest.approx(0.9)
+
+
+def test_apply_decay_reports_what_it_costs_the_grounding_hook(tmp_path):
+    """A row under HOOK_RECALL_MIN_IMPORTANCE stays in the table and drops out of
+    recall, so n_decayed alone does not say what a run costs."""
+    db = _make_db(tmp_path / "m.db", [
+        (1, "old", 0.9, _ago(90), "s1"),
+        (2, "new", 0.9, _ago(1), "s1"),
+    ])
+    res = D.apply_decay(db, dry_run=True)
+    assert (res["n_grounding_visible_before"], res["n_grounding_visible_after"]) == (2, 1)
+    assert _read_importance(db) == {1: 0.9, 2: 0.9}, "dry_run wrote to the database"
 
 
 def test_apply_decay_retention_stats_cover_only_parseable_rows(tmp_path):
@@ -795,3 +834,13 @@ def test_live_evo_main_on_missing_db_prints_none_for_penalized(tmp_path, monkeyp
     with redirect_stdout(buf):
         L.main()
     assert buf.getvalue() == "[live_evo] failures=0 correlated=0 penalized=None dry_run=False\n"
+
+
+def test_apply_decay_dry_run_does_not_alter_the_schema(tmp_path):
+    """A dry run that adds a column has already written to the database."""
+    db = _make_db(tmp_path / "m.db", [(1, "a", 0.9, _ago(90), "s1")])
+    D.apply_decay(db, dry_run=True)
+    conn = sqlite3.connect(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(working_memory)")}
+    conn.close()
+    assert "base_importance" not in cols
