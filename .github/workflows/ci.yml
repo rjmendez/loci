@@ -115,7 +115,12 @@ jobs:
           pip install pytest pytest-timeout
           # mlops/embedding and mlops/finetune import these at module scope,
           # so collection fails without them.
-          pip install numpy transformers datasets sentence-transformers
+          # Kept in step with the code by mlops/tests/test_ci_installs_what_mlops_imports.py:
+          # a module-scope import of something missing here fails COLLECTION, which
+          # pytest reports as "N errors", not as a missing dependency.
+          # scikit-learn and joblib were arriving transitively via sentence-transformers
+          # and are named now because they are imported at module scope.
+          pip install numpy scikit-learn joblib transformers datasets sentence-transformers
 
       - name: Run tests
         # 120s, not the 30s used elsewhere: the first import of
