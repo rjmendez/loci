@@ -60,6 +60,12 @@ def _child_label(cmd) -> str:
     return Path(str(cmd[0])).stem
 
 
+# How long to wait for a child's output readers after the child itself has gone.
+# Only reached when a grandchild inherited the pipe; the drains are daemons and
+# a hung loop is far worse than a truncated log.
+DRAIN_JOIN_SECONDS = float(os.environ.get("LOCI_MLOPS_DRAIN_JOIN", "10"))
+
+
 def _run(cmd, timeout: int | None = None, stream: bool = True):
     """Run a child with a bound, resolved backends, and its output echoed live.
 
@@ -118,13 +124,24 @@ def _run(cmd, timeout: int | None = None, stream: bool = True):
         proc.kill()
         proc.wait()
         code = 124
+    # Bounded. Joining without a timeout assumed reaping the child closes the
+    # pipes, and that is only true if the child had no grandchild: a grandchild
+    # inherits the pipe fds and holds the write end open after its parent dies,
+    # so `for line in pipe` never returns and this join never comes back.
+    # Measured 2026-09-01: a loop.py sat in futex_wait_queue for 19h07m with two
+    # threads in pipe_read, holding /tmp/loci-mlops.lock, which made every
+    # subsequent `flock -n` nightly exit silently. The threads are daemons, so
+    # abandoning them costs nothing but a few interleaved log lines.
     for t in threads:
-        # No timeout. Returning while a drain thread still holds a pipe means log
-        # lines land after the caller has moved on, interleaved into the next
-        # step's output. The pipes are closed once the process is reaped, so
-        # these threads end on their own.
-        t.join()
+        t.join(timeout=DRAIN_JOIN_SECONDS)
+    stuck = [t for t in threads if t.is_alive()]
     err = "".join(captured["err"])
+    if stuck:
+        msg = (f"{len(stuck)} output reader(s) still blocked {DRAIN_JOIN_SECONDS}s after "
+               f"{label} exited — a grandchild is holding the pipe open. "
+               "Output past this point is lost; the step's result is not.")
+        print(f"  [{label}] {msg}", flush=True)
+        err = (err + "\n" + msg).strip()
     if code == 124:
         err = (err + f"\ntimed out after {limit}s").strip()
     return subprocess.CompletedProcess(cmd, code, "".join(captured["out"]), err)
@@ -142,6 +159,7 @@ if str(REPO) not in sys.path:
 # that reports "done" after every step errored is the failure mode this loop
 # spent 67 nights in.
 FAILED_STEPS: list[str] = []
+
 
 
 def _last_error_line(stderr: str) -> str:
