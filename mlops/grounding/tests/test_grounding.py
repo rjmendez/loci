@@ -1150,7 +1150,7 @@ def test_boundary_samples_unloadable_model_returns_empty(tmp_path, boundary_data
     bad = tmp_path / "bad.joblib"
     bad.write_bytes(b"garbage")
     assert al.boundary_samples(str(bad), ds) == []
-    assert "could not load model" in capsys.readouterr().err
+    assert "could not load model" in capsys.readouterr().out
 
 
 def test_boundary_samples_empty_dataset_returns_empty(graded_model, tmp_path):
@@ -1203,7 +1203,7 @@ def test_boundary_samples_reports_a_scoring_failure_instead_of_returning_a_bare_
     monkeypatch.setattr(joblib, "load", lambda p: model)
     monkeypatch.setattr(al, "_embed", lambda text, url, m: [0.1, 0.2, 0.3, 0.4])
     assert al.boundary_samples(str(path), ds) == []
-    assert "scoring 6 rows failed" in capsys.readouterr().err
+    assert "scoring 6 rows failed" in capsys.readouterr().out
 
 
 def test_boundary_samples_uses_text_claim_content_query_in_that_order(tmp_path, monkeypatch,
@@ -1298,7 +1298,7 @@ def test_boundary_samples_says_so_when_no_row_is_scorable(tmp_path, graded_model
         for i in range(3):
             fh.write(json.dumps({"summary": f"no field this sampler reads {i}"}) + "\n")
     assert al.boundary_samples(graded_model, str(ds)) == []
-    assert "examined 3 rows, 0 carried a (claim, evidence) pair" in capsys.readouterr().err
+    assert "examined 3 rows, 0 carried a (claim, evidence) pair" in capsys.readouterr().out
 
 
 def test_boundary_samples_refuses_a_model_of_unknown_feature_width(tmp_path, monkeypatch,
@@ -1316,7 +1316,7 @@ def test_boundary_samples_refuses_a_model_of_unknown_feature_width(tmp_path, mon
     path.write_bytes(b"stub")
     monkeypatch.setattr(joblib, "load", lambda p: Wrong())
     assert al.boundary_samples(str(path), ds) == []
-    assert "expects 12 features" in capsys.readouterr().err
+    assert "expects 12 features" in capsys.readouterr().out
 
 
 # ── hard_negatives ────────────────────────────────────────────────────────────
@@ -1431,7 +1431,7 @@ def test_boundary_samples_reports_embed_failures_once_not_once_per_string(
             fh.write(json.dumps({"claim": f"a claim long enough to survive it {i}",
                                  "evidence": f"evidence {i}"}) + "\n")
     assert al.boundary_samples(graded_model, str(ds)) == []
-    err = capsys.readouterr().err
-    assert err.count("embeds failed") == 1
-    assert "8/8 embeds failed, first: connection refused" in err
-    assert "4 scorable rows, 0 embedded" in err
+    out = capsys.readouterr().out
+    assert out.count("embeds failed") == 1
+    assert "8/8 embeds failed, first: connection refused" in out
+    assert "4 scorable rows, 0 embedded" in out

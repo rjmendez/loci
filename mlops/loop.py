@@ -487,6 +487,11 @@ def _run_active_learn(ollama: str) -> dict:
          "--out", str(ACTIVE_CANDIDATES),
          "--ollama", ollama],
     )
+    if result.returncode != 0:
+        # _run drains child stderr with echo=False, so without this a crash in
+        # the sampler is a silent step that leaves the previous candidates file
+        # in place. Same treatment the dataset-rebuild and train.py steps get.
+        _fail("active_learn", f"active_learn failed: {_last_error_line(result.stderr)}")
     return {"exit_code": result.returncode}
 
 

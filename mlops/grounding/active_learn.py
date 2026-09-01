@@ -78,6 +78,18 @@ def _feature_contract():
     return features
 
 
+def _say(msg: str) -> None:
+    """Print a "the lane is dark, and here is why" line where the nightly can see it.
+
+    mlops/loop.py runs this script through _run(), which drains the child's
+    stdout with echo=True and its stderr with echo=False, and _run_active_learn
+    returns only the exit code. A diagnostic on stderr is therefore invisible in
+    the one log that reads it -- the nightly would print "boundary=0" alone,
+    which is the defect this file was changed to fix.
+    """
+    print(f"[active_learn] {msg}", flush=True)
+
+
 def boundary_samples(
     model_path: str,
     dataset_path: str,
@@ -94,7 +106,7 @@ def boundary_samples(
         _feat = _feature_contract()
         clf = joblib.load(model_path)
     except Exception as exc:
-        print(f"[active_learn] could not load model: {exc}", file=sys.stderr)
+        _say(f"could not load model: {exc}")
         return []
 
     records = _load_dataset(dataset_path)
@@ -107,16 +119,16 @@ def boundary_samples(
     # fix alone would still have scored nothing, just slower.
     dim = int(getattr(clf, "n_features_in_", _feat.LEGACY_DIM))
     if dim not in _feat.supported_dims():
-        print(f"[active_learn] {model_path} expects {dim} features; this sampler "
-              f"builds {_feat.supported_dims()} — refusing to score with a model "
-              "whose feature contract is unknown.", file=sys.stderr)
+        _say(f"{model_path} expects {dim} features; this sampler builds "
+             f"{_feat.supported_dims()} — refusing to score with a model whose "
+             "feature contract is unknown.")
         return []
 
     usable = [(rec, c, e) for rec, (c, e) in ((r, _record_pair(r)) for r in records)
               if len(c) >= 20 and e]
     if not usable:
-        print(f"[active_learn] examined {len(records)} rows, 0 carried a "
-              "(claim, evidence) pair this model can score", file=sys.stderr)
+        _say(f"examined {len(records)} rows, 0 carried a (claim, evidence) "
+             "pair this model can score")
         return []
 
     # One embed per distinct string, not two per row: the corpus repeats its
@@ -135,13 +147,11 @@ def boundary_samples(
     if failures:
         # One line, not one per string: with Ollama down this is every distinct
         # text in the corpus and the nightly log is the only reader.
-        print(f"[active_learn] {len(failures)}/{len(cache)} embeds failed, first: "
-              f"{failures[0]}", file=sys.stderr)
+        _say(f"{len(failures)}/{len(cache)} embeds failed, first: {failures[0]}")
 
     rows = [(rec, c, e) for rec, c, e in usable if cache.get(c) and cache.get(e)]
     if not rows:
-        print(f"[active_learn] {len(usable)} scorable rows, 0 embedded",
-              file=sys.stderr)
+        _say(f"{len(usable)} scorable rows, 0 embedded")
         return []
 
     def _unit(texts):
@@ -155,7 +165,7 @@ def boundary_samples(
                                     dim=dim)
         probas = clf.predict_proba(feats)[:, 1]
     except Exception as exc:
-        print(f"[active_learn] scoring {len(rows)} rows failed: {exc}", file=sys.stderr)
+        _say(f"scoring {len(rows)} rows failed: {exc}")
         return []
 
     scored = [{"rec": rec, "proba": float(p), "uncertainty": float(abs(p - 0.5))}
