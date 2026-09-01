@@ -193,3 +193,47 @@ def test_warm_does_not_latch_when_thread_start_fails(monkeypatch):
     _reset_warm()
     assert embed_ops.warm(embed_fn=lambda t: []) is True
     assert embed_ops.warmed() is True
+
+
+def test_health_initializes_the_lazy_graph_store_instead_of_reporting_unavailable(monkeypatch):
+    """A healthy-but-not-yet-opened graph must report 'available', not 'unavailable'.
+
+    Production shape: a fresh server process. The store singleton is created lazily on
+    the first graph op, so before this fix the first loci_health of every process read
+    'unavailable' for a perfectly good graph — and callers switch the code-graph lane
+    off on that false negative.
+    """
+    class _HealthyStore:
+        def readable_probe(self):
+            return True
+
+        def lock_holder_pid(self):
+            return 4242
+
+    # Fresh-process state: nothing initialized, nothing latched, no backoff pending.
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", False)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+
+    opened = []
+
+    def fake_get():
+        store = _HealthyStore()
+        opened.append(store)
+        monkeypatch.setattr(server, "_ladybug_store", store)
+        return store
+
+    monkeypatch.setattr(server, "_get_ladybug", fake_get)
+
+    assert server._ladybug_health_state() == "available"
+    assert opened, "health must attempt the lazy initialization, not read the global and give up"
+
+
+def test_health_still_reports_latched_without_reinitializing(monkeypatch):
+    """The permanent latch and the transient backoff must survive the lazy init."""
+    monkeypatch.setattr(server, "_ladybug_store", None)
+    monkeypatch.setattr(server, "_ladybug_failed", True)
+    monkeypatch.setattr(server, "_ladybug_last_attempt", 0.0)
+    monkeypatch.setattr(server, "_get_ladybug", lambda: None)
+
+    assert server._ladybug_health_state() == "latched"

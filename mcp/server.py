@@ -308,10 +308,18 @@ def _ladybug_health_state() -> str:
     right now — a RO open fails) | 'latched' (permanent failure, won't retry) |
     'backoff' (transient failure, retrying after the window) | 'unavailable' (not yet
     initialized / unknown). With per-op leasing the store no longer holds the lock
-    between ops, so 'contended' is transient and self-heals. Never raises."""
+    between ops, so 'contended' is transient and self-heals. Never raises.
+
+    The store is lazily created on first graph op, so health MUST attempt that
+    initialization itself — otherwise the first loci_health of every process reports
+    'unavailable' for a perfectly healthy graph, and callers switch the code-graph lane
+    off on a false negative. _get_ladybug() is idempotent and fail-open, and still
+    honours the permanent latch and the transient-failure backoff, so this cannot turn
+    a real failure into a retry storm."""
     try:
-        if _ladybug_store is not None:
-            probe = getattr(_ladybug_store, "readable_probe", None)
+        store = _get_ladybug()
+        if store is not None:
+            probe = getattr(store, "readable_probe", None)
             if probe is not None and not probe():
                 return "contended"
             return "available"
