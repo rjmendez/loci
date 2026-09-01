@@ -304,23 +304,28 @@ class LadybugStore:
             got = False
             db = conn = None
             try:
-                if not self._acquire_lease(fd, exclusive=write):
-                    logger.debug("ladybug lease busy (%s) — fail-open",
-                                 "write" if write else "read")
+                try:
+                    if not self._acquire_lease(fd, exclusive=write):
+                        logger.debug("ladybug lease busy (%s) — fail-open",
+                                     "write" if write else "read")
+                        yield None
+                        return
+                    got = True
+                    db = ladybug.Database(self.db_path, read_only=not write)
+                    conn = ladybug.Connection(db)
+                    if write:
+                        self._ensure_schema(conn)
+                        self._stamp_holder(fd)
+                    self._active = conn
+                except Exception as exc:  # open/lock failure -> fail-open, retried next op
+                    logger.debug("ladybug session (%s) unavailable: %s",
+                                 "write" if write else "read", exc)
                     yield None
                     return
-                got = True
-                db = ladybug.Database(self.db_path, read_only=not write)
-                conn = ladybug.Connection(db)
-                if write:
-                    self._ensure_schema(conn)
-                    self._stamp_holder(fd)
-                self._active = conn
+                # Outside the open/lock try: a caller exception at this yield must
+                # propagate to the caller, not be re-caught above (contextlib would
+                # throw it back into an already-yielded generator, corrupting it).
                 yield conn
-            except Exception as exc:  # open/lock failure -> fail-open, retried next op
-                logger.debug("ladybug session (%s) unavailable: %s",
-                             "write" if write else "read", exc)
-                yield None
             finally:
                 self._active = None
                 for c in (conn, db):
