@@ -296,7 +296,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             res = _jload(S.rag_context_search(q, budget_chars=min(remaining[0], rag_cap), limit=6))
             ctx = (res or {}).get("context", "") if isinstance(res, dict) else ""
             if ctx and (res.get("result_count") or 0) > 0:
-                add("rag", ctx, 0.35)
+                add("rag", ctx, _RAG_BUDGET_FRACTION)
             elif isinstance(res, dict) and not res.get("qdrant_available", True):
                 degraded = True
         except Exception as exc:
@@ -305,17 +305,30 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
 
     # Curated memory files — a SUPPLEMENT after the precise (case/RAG) lanes, so a
     # fuzzy-matched memory can never crowd them out. Capped + thresholded selection.
-    # The lane must be VISIBLE when it can't run at all: '' (never configured) and "configured
-    # but no MEMORY.md at that path" (broken deployment) are both requested-but-dead, so both
-    # degrade the result rather than looking identical to "configured, searched, no match".
+    # The lane must be VISIBLE when it can't run, but only a genuine deployment fault
+    # degrades: '' is _default_memory_dir()'s documented no-op default for a host that
+    # never configured curated memory, so marking it degraded would make the shipped
+    # default always-degraded. "configured but no MEMORY.md at that path" IS broken and
+    # degrades. Never build a Path from memory_dir before confirming it's configured —
+    # Path('') == Path('.') would silently read a MEMORY.md from the process CWD. The
+    # existence check stays fail-open (memory_dir can arrive as a non-str from a
+    # misconfigured caller) rather than raising straight out of ground(). Tags use the
+    # 'memory-lane:' namespace, distinct from add()'s 'memory:<slug>', so a consumer
+    # can't mistake a dead-lane marker for a real memory file named unconfigured.md.
+    has_index = False
+    if memory_dir:
+        try:
+            has_index = (Path(memory_dir) / "MEMORY.md").exists()
+        except Exception:
+            has_index = False
     if not memory_dir:
+        sources.append("memory-lane:unconfigured")
+    elif not has_index:
         degraded = True
-        sources.append("memory:unconfigured")
-    elif not (Path(memory_dir) / "MEMORY.md").exists():
-        degraded = True
-        sources.append("memory:missing-index")
-    for fname, line, body in _select_memory_files(task, memory_dir):
-        add(f"memory:{fname[:-3]}", (body or line), 0.15)
+        sources.append("memory-lane:missing-index")
+    else:
+        for fname, line, body in _select_memory_files(task, memory_dir):
+            add(f"memory:{fname[:-3]}", (body or line), 0.15)
 
     # 6. Keyword/FTS fallback (off by default; filtered) — only if structured yield was thin.
     if opts.get("allowKeyword") and S and sum(len(p) for p in parts) < 500:

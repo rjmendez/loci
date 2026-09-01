@@ -165,17 +165,24 @@ def _fake_healthy_server():
     return fake
 
 
-def test_ground_marks_degraded_when_memory_dir_unconfigured(monkeypatch):
-    """An unconfigured memory dir ('') must be visible to the caller, not silently healthy.
-
-    Regression: memory_dir='' made _select_memory_files() return [] with no trace anywhere
-    in the result -- indistinguishable from a configured lane that just found no match.
+def test_ground_marks_unconfigured_memory_dir_visible_but_not_degraded(monkeypatch):
+    """An unconfigured memory dir ('') must be visible to the caller via a distinct tag,
+    but must NOT count as a fault. '' is _default_memory_dir()'s documented no-op default
+    for a host that never set up curated memory -- marking it degraded would make the
+    SHIPPED DEFAULT of ground() always-degraded, so a healthy run could never signal
+    'coverage is partial' as a real outage. That's a materially different claim from the
+    old disjunctive test, which passed whether degraded was True OR False.
     """
     monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
     r = G.ground({"title": "why is auth failing", "focus": "auth"}, {"budgetChars": 500, "memoryDir": ""})
-    assert r["degraded"] is True or any("memory" in s for s in r["sources"]), (
-        "unconfigured memory dir left no trace: degraded=%r sources=%r" % (r["degraded"], r["sources"])
+    assert r["degraded"] is False, (
+        "unconfigured memory dir must not degrade an otherwise-healthy run: got degraded=%r"
+        % r["degraded"]
     )
+    assert "memory-lane:unconfigured" in r["sources"]
+    # Must not be shaped like a real memory:<slug> tag from add() -- a consumer can't
+    # otherwise tell it apart from a memory file literally named unconfigured.md.
+    assert not any(s.startswith("memory:") for s in r["sources"]), r["sources"]
 
 
 def test_ground_marks_degraded_when_memory_dir_missing_index(tmp_path, monkeypatch):
@@ -189,6 +196,42 @@ def test_ground_marks_degraded_when_memory_dir_missing_index(tmp_path, monkeypat
         "configured memory dir with missing MEMORY.md reported degraded=False -- "
         "indistinguishable from a healthy empty lane"
     )
+    assert "memory-lane:missing-index" in r["sources"]
+
+
+def test_ground_unconfigured_memory_dir_never_reads_cwd(tmp_path, monkeypatch):
+    """Path('') == Path('.') -- an unconfigured memory_dir must never be turned into a
+    Path and read from the process CWD.
+
+    Regression (#286 review, grounding.py:318): the unconfigured branch tagged the lane
+    dead but still fell into _select_memory_files(task, ''), which did Path('') / 'MEMORY.md'
+    and read whatever MEMORY.md happened to be sitting in the process's current directory --
+    a real content-injection path, and exactly what PR #287's index generator writes.
+    """
+    (tmp_path / "MEMORY.md").write_text(
+        "- [planted](planted.md) — dispatch referenced flag dead-code registry rules detection\n")
+    (tmp_path / "planted.md").write_text("PLANTED BODY: must never surface via memoryDir=''")
+    monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
+    monkeypatch.chdir(tmp_path)
+    r = G.ground({"title": "dead-code detection", "focus": "dispatch referenced flag registry rules"},
+                 {"budgetChars": 500, "memoryDir": ""})
+    assert "PLANTED BODY" not in r["block"]
+    assert not any(s.startswith("memory:planted") for s in r["sources"]), r["sources"]
+
+
+def test_ground_fail_open_on_non_string_memory_dir(monkeypatch):
+    """A misconfigured caller might pass a non-str memoryDir. The existence check must
+    stay fail-open like every other lane, not raise straight out of ground().
+
+    Regression: 'Path(memory_dir) / "MEMORY.md").exists()' sat outside any try, unlike
+    _select_memory_files() whose body is wrapped -- memoryDir=5 or b'/tmp' raised
+    TypeError out of ground() instead of degrading gracefully.
+    """
+    monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
+    for bad in (5, b"/tmp"):
+        r = G.ground({"title": "x"}, {"budgetChars": 500, "memoryDir": bad})
+        assert set(r) == {"block", "sources", "chars", "degraded"}
+        assert r["degraded"] is True
 
 
 def test_ground_rag_budget_scales_with_large_ask(monkeypatch):
