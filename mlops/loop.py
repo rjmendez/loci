@@ -388,7 +388,14 @@ def _run_decay(db_path: str, dry_run: bool) -> dict:
         from memory.decay import apply_decay
         stats = apply_decay(db_path=db_path, dry_run=dry_run)
         print(f"[loop] decay: n_rows={stats.get('n_rows')} n_decayed={stats.get('n_decayed')} "
-              f"mean_retention={stats.get('mean_retention', 0):.3f}")
+              f"mean_retention={stats.get('mean_retention', 0):.3f}"
+              f"{' (dry run)' if dry_run else ''}")
+        before = stats.get("n_grounding_visible_before")
+        after = stats.get("n_grounding_visible_after")
+        if before is not None:
+            print(f"[loop] decay: rows visible to the grounding hook "
+                  f"(importance >= {stats.get('grounding_min_importance')}): "
+                  f"{before} -> {after}")
         return stats
     except Exception as exc:
         _fail("decay", f"decay step failed: {exc}")
@@ -532,7 +539,12 @@ def main() -> int:
     ap.add_argument("--hook-state", default=DEFAULT_HOOK_STATE,
                     help="Directory containing guard_bash_*.log files for Live-Evo")
     ap.add_argument("--decay-every", type=int, default=1,
-                    help="Apply Weibull decay every N loop runs (default: every run)")
+                    help="Evaluate Weibull decay every N loop runs (default: every run)")
+    ap.add_argument("--decay-apply", action="store_true",
+                    help="Write the decayed importances back. Without this the decay step "
+                         "reports what it would do and changes nothing -- decay has never "
+                         "actually run against a real corpus, and the first write is large "
+                         "and not something a nightly cron should do unasked.")
     ap.add_argument("--active-learn-every", type=int, default=7,
                     help="Generate active learning candidates every N days (default: 7)")
     args = ap.parse_args()
@@ -630,7 +642,7 @@ def main() -> int:
     # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
     loop_count = state.get("total_loop_runs", 0) + 1
     if loop_count % args.decay_every == 0:
-        _run_decay(args.db, args.dry_run)
+        _run_decay(args.db, args.dry_run or not args.decay_apply)
     else:
         print(f"[loop] decay skipped (run {loop_count}, cadence={args.decay_every})")
 
