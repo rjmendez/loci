@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import stat
+import time
 import sys
 import types
 import urllib.error
@@ -1671,3 +1672,44 @@ def test_the_emitted_command_can_actually_import_its_dependencies(env):
         f"the emitted script runs {interp}, which cannot import sentence_transformers:\n"
         + out.stderr.strip()
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _run must not be able to hang
+#
+# Measured 2026-09-01: a loop.py sat in futex_wait_queue for 19h07m with its two
+# drain threads in pipe_read, holding /tmp/loci-mlops.lock. The join had no
+# timeout on the assumption that reaping the child closes the pipes -- true only
+# when the child had no grandchild. A grandchild inherits the pipe fds and holds
+# the write end open after its parent dies, so `for line in pipe` never returns.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_run_returns_even_when_a_grandchild_holds_the_pipe_open(monkeypatch):
+    """The child exits immediately; a grandchild keeps stdout open past it."""
+    monkeypatch.setattr(loop, "DRAIN_JOIN_SECONDS", 1.0, raising=False)
+    started = time.monotonic()
+    result = loop._run([
+        sys.executable, "-c",
+        # spawn a grandchild that inherits stdout and outlives us, then exit
+        "import subprocess,sys;"
+        "print('parent line', flush=True);"
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        "sys.exit(0)",
+    ])
+    elapsed = time.monotonic() - started
+    assert elapsed < 20, f"_run took {elapsed:.1f}s — it is waiting on the grandchild"
+    assert result.returncode == 0
+    assert "parent line" in result.stdout
+
+
+def test_run_says_so_when_it_abandons_a_blocked_reader(monkeypatch, capsys):
+    monkeypatch.setattr(loop, "DRAIN_JOIN_SECONDS", 0.5, raising=False)
+    result = loop._run([
+        sys.executable, "-c",
+        "import subprocess,sys;"
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        "sys.exit(0)",
+    ])
+    out = capsys.readouterr().out
+    assert "still blocked" in out, out
+    assert "still blocked" in result.stderr, result.stderr
