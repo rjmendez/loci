@@ -149,12 +149,13 @@ def test_unresolved_callsites_go_to_the_sink_not_dropped(head_build):
 
 def test_callers_get_ladybug_proven_finds_the_in_server_callsites(head_build):
     # Proven tier sees only the direct in-server calls; the 15 injected-global ones are rung 4.
+    # Three of them: graph_tools registration, ladybug_ops, and the health-state probe.
     store = head_build.store
     rows = direct_callers(store, "fn:mcp/server.py::_get_ladybug")
     calls = [r for r in rows if r.kind == "CALLS" and r.edge.confidence == Confidence.PROVEN]
     call_locs = {(r.site_node.line, r.site_node.col) for r in calls}
-    assert len(calls) == 2, call_locs
-    assert all(loc[0] > 0 for loc in call_locs)  # both callsites resolved to real lines in server.py
+    assert len(calls) == 3, call_locs
+    assert all(loc[0] > 0 for loc in call_locs)  # every callsite resolved to a real line in server.py
     refs = [r for r in rows if r.kind == "REFERENCES"]
     assert len(refs) == 2  # passed by reference at server.py:365 and the graph_tools.register() call
 
