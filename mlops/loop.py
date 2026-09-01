@@ -349,12 +349,18 @@ def _discover_runs(findings_glob: str, seen: list[str]) -> list[str]:
 
 # ── Dataset rebuild ───────────────────────────────────────────────────────────
 
-def _rebuild_dataset(findings_glob: str, ollama: str) -> int:
-    """Run build_grounding_dataset.py to refresh the dataset. Returns new pair count."""
+def _rebuild_dataset(findings_glob: str, ollama: str) -> int | None:
+    """Run build_grounding_dataset.py to refresh the dataset. Returns new pair count.
+
+    Returns None when the rebuild did not run to completion. The size on disk is the
+    same shape on both paths, so returning it for a failed build tells the caller
+    nothing happened while looking exactly like a build that produced that count —
+    and the caller uses the return to mark the runs it was supposed to ingest as seen.
+    """
     builder = REPO / "deep_think_loci" / "grounding" / "build_grounding_dataset.py"
     if not builder.exists():
         print("[loop] build_grounding_dataset.py not found — skipping rebuild")
-        return _current_dataset_size()
+        return None
 
     result = _run(
         [sys.executable, str(builder),
@@ -364,7 +370,7 @@ def _rebuild_dataset(findings_glob: str, ollama: str) -> int:
     )
     if result.returncode != 0:
         _fail("dataset rebuild", f"dataset rebuild failed: {_last_error_line(result.stderr)}")
-        return _current_dataset_size()
+        return None
 
     size = _current_dataset_size()
     print(f"[loop] dataset rebuilt → {size} pairs")
@@ -767,7 +773,9 @@ def main() -> int:
     should_retrain = should_rebuild
     if should_rebuild:
         # ── 4. Rebuild dataset ────────────────────────────────────────────────
-        new_size = _rebuild_dataset(args.findings, args.ollama)
+        rebuilt = _rebuild_dataset(args.findings, args.ollama)
+        rebuild_ok = rebuilt is not None
+        new_size = rebuilt if rebuild_ok else _current_dataset_size()
         new_pairs = new_size - state["last_dataset_size"]
         print(f"[loop] dataset after rebuild: {new_size} pairs ({new_pairs:+d})")
 
@@ -797,12 +805,20 @@ def main() -> int:
                 else:
                     print("[loop] canary held back or drift detected — keeping current model")
 
-        state["last_dataset_size"] = new_size
-        # Truncate: runs_seen only exists to skip runs already ingested, so the
-        # tail is what matters. It appended forever and was rewritten in full on
-        # every tick, so the state file grew without bound and got slower to
-        # write as it went.
-        state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
+        # Only a rebuild that completed may mark these runs seen: _discover_runs
+        # excludes anything in runs_seen, so stamping them after a failed build
+        # hides them from every later tick and the next rebuild waits for
+        # --min-new-runs FRESH investigations instead of retrying these.
+        if rebuild_ok:
+            state["last_dataset_size"] = new_size
+            # Truncate: runs_seen only exists to skip runs already ingested, so the
+            # tail is what matters. It appended forever and was rewritten in full on
+            # every tick, so the state file grew without bound and got slower to
+            # write as it went.
+            state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
+        else:
+            print(f"[loop] holding {len(new_runs)} new run(s) unseen — the rebuild that "
+                  "was supposed to ingest them did not complete")
 
     loop_count = state.get("total_loop_runs", 0) + 1
     if _over_deadline(started, "decay"):

@@ -3162,12 +3162,17 @@ def reflection_loop_tick(
         raw_warnings = {str(k): int(v) for k, v in (summary.get("warnings") or {}).items()}
         stats["errors_seen"] += sum(raw_errors.values())
         stats["warnings_seen"] += sum(raw_warnings.values())
-        processed[key] = {
-            "kind": kind,
-            "path_hash": _hash_path(path),
-            "processed_at": _now(),
-            "lines_scanned": summary.get("lines_scanned"),
-        }
+        if store_item_findings:
+            # Only a tick that could store findings may mark an item done:
+            # reflection_loop_seed permanently excludes every key in processed, so a
+            # preview tick (store_item_findings=False writes nothing) would otherwise
+            # retire the artifacts it only looked at, and no reseed brings them back.
+            processed[key] = {
+                "kind": kind,
+                "path_hash": _hash_path(path),
+                "processed_at": _now(),
+                "lines_scanned": summary.get("lines_scanned"),
+            }
         batch_error_signatures.update(raw_errors)
         batch_warning_signatures.update(raw_warnings)
 

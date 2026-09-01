@@ -348,9 +348,12 @@ def test_current_dataset_size_counts_final_line_without_newline(env):
 # _rebuild_dataset
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_rebuild_dataset_missing_builder_returns_current_size_without_subprocess(env, capsys):
+def test_rebuild_dataset_missing_builder_reports_no_rebuild_without_subprocess(env, capsys):
+    """No builder means nothing was ingested. Returning the size on disk made that
+    indistinguishable from a build that produced it, and the caller marks the runs
+    it was supposed to ingest as seen on the strength of that return."""
     write_dataset(env, 4)
-    assert loop._rebuild_dataset("g", "http://o") == 4
+    assert loop._rebuild_dataset("g", "http://o") is None
     assert env.run.calls == []
     assert "build_grounding_dataset.py not found" in capsys.readouterr().out
 
@@ -368,7 +371,7 @@ def test_rebuild_dataset_argv_appends_v1_embeddings_to_ollama(env):
                        "--ollama", "http://o:1/v1/embeddings"]
 
 
-def test_rebuild_dataset_failure_returns_current_size_and_prints_the_exception(env, capsys):
+def test_rebuild_dataset_failure_reports_no_rebuild_and_prints_the_exception(env, capsys):
     """The last 500 chars of a traceback land mid-frame, so the log used to read
     "dataset rebuild failed: ^^^^^^^^^^". Report the exception line instead."""
     (env.repo / "deep_think_loci" / "grounding" / "build_grounding_dataset.py").write_text("")
@@ -379,7 +382,7 @@ def test_rebuild_dataset_failure_returns_current_size_and_prints_the_exception(e
           "    ^^^^^^^^^^^^^^^^^^^\n"
           "urllib.error.URLError: <urlopen error [Errno 111] Connection refused>\n")
     env.run.set("build_grounding_dataset.py", FakeResult(2, stderr=tb))
-    assert loop._rebuild_dataset("g", "http://o") == 7
+    assert loop._rebuild_dataset("g", "http://o") is None
     out = capsys.readouterr().out
     assert "dataset rebuild failed" in out
     assert "urllib.error.URLError" in out
@@ -1239,6 +1242,44 @@ def test_main_consumes_new_data_signal_even_when_training_failed(mainenv):
     e.rv["rebuild"] = 900
     e.main("--force")
     assert state_of(e)["last_dataset_size"] == 900
+
+
+# Captured at import, before the mainenv fixture stubs it out: the two tests below
+# drive the REAL rebuild step so the failure they assert on is the one the nightly
+# actually hits (builder exits non-zero), not a hand-written return value.
+_REAL_REBUILD = loop._rebuild_dataset
+
+
+def _failing_rebuild(e, monkeypatch):
+    (e.repo / "deep_think_loci" / "grounding" / "build_grounding_dataset.py").write_text("")
+    e.run.set("build_grounding_dataset.py",
+              FakeResult(2, stderr="urllib.error.URLError: connection refused\n"))
+    monkeypatch.setattr(loop, "_rebuild_dataset", _REAL_REBUILD)
+
+
+def test_main_runs_seen_held_when_the_rebuild_failed(mainenv, monkeypatch):
+    """_discover_runs excludes anything already in runs_seen, so a run marked seen
+    by a build that never ingested it is never offered to a later tick: the loop
+    then reports "new investigation runs: 0" and waits for --min-new-runs fresh
+    investigations before it tries again."""
+    e = mainenv
+    write_dataset(e, 11)
+    seed_state(e, runs_seen=["old"], last_dataset_size=11)
+    e.rv["new_runs"] = ["n1", "n2"]
+    _failing_rebuild(e, monkeypatch)
+    e.main("--force")
+    s = state_of(e)
+    assert s["runs_seen"] == ["old"]
+    assert s["last_dataset_size"] == 11
+
+
+def test_main_says_which_runs_it_held(mainenv, monkeypatch, capsys):
+    e = mainenv
+    seed_state(e)
+    e.rv["new_runs"] = ["n1", "n2"]
+    _failing_rebuild(e, monkeypatch)
+    e.main("--force")
+    assert "holding 2 new run(s) unseen" in capsys.readouterr().out
 
 
 def test_main_total_loop_runs_increments_and_persists(mainenv):

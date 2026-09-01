@@ -121,6 +121,46 @@ class ReflectionLoopTests(unittest.TestCase):
         self.assertEqual(processed_kinds[0], "process_log")
         self.assertEqual(processed_kinds[1], "session_event")
 
+    def _tick_with(self, store_item_findings):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["queue"] = [{"kind": "process_log", "path": "/tmp/a.log"}]
+        summary = {
+            "status": "processed",
+            "kind": "process_log",
+            "path": "/tmp/a.log",
+            "lines_scanned": 10,
+            "bytes_scanned": 100,
+            "sampling_mode": "full",
+            "events": {},
+            "tools": {},
+            "errors": {},
+            "warnings": {},
+        }
+        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+        ), patch.object(
+            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+        ), patch.object(
+            server, "_process_reflection_item", side_effect=[summary]
+        ), patch.object(
+            server, "investigation_store", return_value=json.dumps({"stored": True})
+        ):
+            server.reflection_loop_tick(max_items=1, max_lines_per_file=100,
+                                        store_item_findings=store_item_findings)
+        return state
+
+    def test_preview_tick_does_not_retire_the_item_it_stored_nothing_for(self):
+        """reflection_loop_seed drops every key in processed and only reset_queue=True
+        clears it, so an item marked processed by a tick that wrote no finding is out of
+        the reflection corpus for good."""
+        state = self._tick_with(store_item_findings=False)
+        self.assertEqual(state["processed"], {})
+
+    def test_storing_tick_still_marks_the_item_processed(self):
+        state = self._tick_with(store_item_findings=True)
+        self.assertEqual(list(state["processed"]), ["process_log|/tmp/a.log"])
+
     def test_tick_batches_low_signal_session_events_into_one_observed(self):
         state = server._reflection_default_state()
         state["investigation_id"] = "test-inv"
