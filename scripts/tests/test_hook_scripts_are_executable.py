@@ -62,3 +62,14 @@ def test_the_contract_extract_hook_is_runnable():
     failure is invisible because the caller ends in `|| true`."""
     rel = "scripts/hooks/post-commit-contract-extract.sh"
     assert _indexed_modes("scripts/hooks")[rel] == "100755"
+
+
+def test_generate_memory_index_is_runnable():
+    """Committed 100644 despite a shebang and a docstring documenting direct
+    invocation ('scripts/generate_memory_index.py ...') -> Permission denied.
+    Named on its own rather than folded into _is_script: that helper stays
+    narrow (.sh/.bash/scripts/hooks) because scripts/ carries many shebanged
+    .py modules that are imported, not invoked by path, and are not this
+    PR's concern."""
+    rel = "scripts/generate_memory_index.py"
+    assert _indexed_modes("scripts")[rel] == "100755"

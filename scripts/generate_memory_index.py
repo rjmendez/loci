@@ -10,15 +10,30 @@ This script derives the index from the memory files themselves and enforces
 the budget structurally — by construction the output can never exceed it.
 
 Usage:
-    scripts/generate_memory_index.py [memory_dir] [--budget-chars N] [--source PATH] [--dry-run]
+    scripts/generate_memory_index.py [memory_dir] [--budget-chars N] [--source PATH]
+                                      [--headroom-pct N] [--dry-run] [--check]
 
-memory_dir defaults to backends.memory_dir() (env -> gitignored config ->
-LOCI_MEMORY_DIR/HERMES_MEMORY_DIR) — the same resolution the grounding lane
-uses. No host-specific path is hardcoded here.
+memory_dir defaults to backends.memory_dir(), which resolves in order:
+LOCI_MEMORY_MD_DIR env -> gitignored config [memory].dir -> LOCI_MEMORY_DIR env ->
+HERMES_MEMORY_DIR env -> '' (unconfigured) — the same resolution the grounding
+lane uses. No host-specific path is hardcoded here.
+
+--source defaults to <memory_dir>/MEMORY.md when that file exists, so the
+default run preserves its existing section grouping instead of collapsing it
+to metadata.type buckets (the destructive failure mode this script must not
+have on its primary documented invocation).
 
 Output: <memory_dir>/MEMORY.md. An existing file is backed up first, as
-MEMORY.md.bak-YYYYMMDD-HHMMSS (matching the operator's manual-backup convention),
-unless --dry-run.
+MEMORY.md.bak-YYYYMMDD-HHMMSS-ffffff (matching the operator's manual-backup
+convention, with microseconds so same-second reruns don't clobber a backup),
+unless --dry-run. --headroom-pct (default 5) targets generation below
+--budget-chars so a manual edit between runs doesn't immediately re-overflow.
+
+Wiring: nothing currently invokes this script on a schedule or in CI — the
+budget guarantee is structural only when something calls it. --check exits
+non-zero when the on-disk index has drifted from what regeneration would
+produce, without writing; wire that into a cron job or pre-commit hook to make
+the guarantee real rather than aspirational.
 """
 from __future__ import annotations
 
@@ -33,10 +48,14 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mcp"))
 
 DEFAULT_BUDGET_CHARS = 24986  # 24.4 KiB, measured in characters — see [m1]
+DEFAULT_HEADROOM_PCT = 5.0
 ELLIPSIS = "…"
 _FRONTMATTER_KEY_RE = re.compile(r'^([A-Za-z_][\w-]*):\s*(.*)$')
 _SECTION_RE = re.compile(r'^##\s+(.+?)\s*$')
 _LINK_RE = re.compile(r'\(([\w.\-]+\.md)\)')
+_WORKING_AGREEMENTS_SECTION = "Working agreements"
+_MARKER_WARNING = "⚠"  # ⚠ — entries carrying this keep more of their hook under truncation
+_MARKER_STATUS = "✅"   # ✅
 
 
 def resolve_memory_dir(cli_arg: str | None) -> str | None:
@@ -117,13 +136,23 @@ def load_entries(memory_dir: Path) -> tuple[list[Entry], list[tuple[str, str]]]:
     entries: list[Entry] = []
     malformed: list[tuple[str, str]] = []
     for p in files:
-        text = p.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            err = str(exc)
+            malformed.append((p.name, err))
+            print(f"[generate_memory_index] WARNING: {p.name}: unreadable: {err}", file=sys.stderr)
+            entries.append(Entry(p.name, _title_from(None, p), f"(unreadable: {err})", None, err))
+            continue
         fields, err = parse_frontmatter(text)
         if err:
             malformed.append((p.name, err))
             print(f"[generate_memory_index] WARNING: {p.name}: {err}", file=sys.stderr)
         title = _title_from(fields.get("name"), p)
-        hook = fields.get("description") or (f"(frontmatter: {err})" if err else "")
+        hook = fields.get("description") or ""
+        if err:
+            note = f"(frontmatter: {err})"
+            hook = f"{hook} {note}".strip() if hook else note
         entries.append(Entry(p.name, title, hook, fields.get("type"), err))
     return entries, malformed
 
@@ -199,6 +228,24 @@ def render(sections: dict[str, list[Entry]]) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
+def _boundary_cut(hook: str, limit: int) -> str:
+    """Cut `hook` to at most `limit` chars, preferring a word/clause boundary
+    and never leaving an unbalanced backtick span, so an identifier/path/PR
+    number already inside the limit isn't split in half."""
+    candidate = hook[:limit]
+    if candidate.count("`") % 2 == 1:
+        last_tick = candidate.rfind("`")
+        if last_tick > 0:
+            candidate = candidate[:last_tick]
+    if candidate and not candidate[-1].isspace():
+        window = max(0, len(candidate) - 40)
+        for i in range(len(candidate) - 1, window - 1, -1):
+            if candidate[i] in " ,;:":
+                candidate = candidate[:i]
+                break
+    return candidate
+
+
 def _truncate_hook(hook: str, allowance: int) -> str:
     if len(hook) <= allowance:
         return hook
@@ -206,22 +253,41 @@ def _truncate_hook(hook: str, allowance: int) -> str:
         return ""
     if allowance == 1:
         return hook[:1]
-    return hook[:allowance - 1].rstrip() + ELLIPSIS
+    return _boundary_cut(hook, allowance - 1).rstrip() + ELLIPSIS
+
+
+def _entry_weight(section: str, hook: str) -> float:
+    """Salience: warning/status markers and the operator's curated agreements
+    section earn more of the truncation budget than a routine entry."""
+    weight = 1.0
+    if _MARKER_WARNING in hook:
+        weight += 2.0
+    if _MARKER_STATUS in hook:
+        weight += 1.0
+    if section == _WORKING_AGREEMENTS_SECTION:
+        weight += 1.0
+    return weight
 
 
 def fit_to_budget(sections: dict[str, list[Entry]], budget_chars: int) -> bool:
-    """Shorten hooks, longest-first, to the largest uniform per-entry allowance
-    that fits — never touching a title or link. Returns False only when the
-    budget can't be met even with every hook emptied out."""
+    """Shorten hooks to fit, weighting the per-entry allowance by salience
+    (warning/status markers, the Working agreements section) so the highest-
+    value entries are truncated last and least — never touching a title or
+    link. Binary-searches a scale factor over a real render, so the hard
+    budget is still guaranteed. Returns False only when the budget can't be
+    met even with every hook emptied out."""
     entries = [e for ents in sections.values() for e in ents]
     original = {id(e): e.hook for e in entries}
+    weight = {id(e): _entry_weight(section, original[id(e)])
+              for section, ents in sections.items() for e in ents}
 
-    def apply(allowance: int) -> None:
+    def apply(scale: int) -> None:
         for e in entries:
+            allowance = min(len(original[id(e)]), max(0, round(scale * weight[id(e)])))
             e.hook = _truncate_hook(original[id(e)], allowance)
 
-    def fits(allowance: int) -> bool:
-        apply(allowance)
+    def fits(scale: int) -> bool:
+        apply(scale)
         return len(render(sections)) <= budget_chars
 
     if not fits(0):
@@ -240,6 +306,12 @@ def fit_to_budget(sections: dict[str, list[Entry]], budget_chars: int) -> bool:
     return True
 
 
+def _apply_headroom(budget_chars: int, headroom_pct: float) -> int:
+    if headroom_pct <= 0:
+        return budget_chars
+    return max(0, int(budget_chars * (1 - headroom_pct / 100.0)))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -248,14 +320,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--budget-chars", type=int, default=DEFAULT_BUDGET_CHARS,
                      help=f"hard char budget for the generated index (default {DEFAULT_BUDGET_CHARS})")
     ap.add_argument("--source", default=None,
-                     help="existing index to read '## Section' grouping from")
+                     help="existing index to read '## Section' grouping from "
+                          "(default: <memory_dir>/MEMORY.md, if it exists)")
+    ap.add_argument("--headroom-pct", type=float, default=DEFAULT_HEADROOM_PCT,
+                     help=f"target this %% below --budget-chars, leaving room for a manual "
+                          f"edit before the next run (default {DEFAULT_HEADROOM_PCT})")
     ap.add_argument("--dry-run", action="store_true", help="print to stdout, write nothing")
+    ap.add_argument("--check", action="store_true",
+                     help="exit non-zero if the on-disk index has drifted from what "
+                          "regeneration would produce; writes nothing")
     args = ap.parse_args(argv)
 
     memory_dir_str = resolve_memory_dir(args.memory_dir)
     if not memory_dir_str:
         print("error: no memory directory given and none configured "
-              "(pass one, or set LOCI_MEMORY_MD_DIR / [memory].dir / LOCI_MEMORY_DIR)",
+              "(pass one, or set LOCI_MEMORY_MD_DIR / [memory].dir / "
+              "LOCI_MEMORY_DIR / HERMES_MEMORY_DIR)",
               file=sys.stderr)
         return 2
     d = Path(memory_dir_str)
@@ -268,10 +348,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: no memory files found in {d}", file=sys.stderr)
         return 2
 
+    out_path = d / "MEMORY.md"
+    source_path = args.source
+    if source_path is None and out_path.exists():
+        source_path = str(out_path)
+
     source_order: list[str] = []
     source_sections: dict[str, list[str]] = {}
-    if args.source:
-        sp = Path(args.source)
+    if source_path:
+        sp = Path(source_path)
         if sp.exists():
             source_order, source_sections = parse_source_sections(
                 sp.read_text(encoding="utf-8", errors="replace"))
@@ -281,8 +366,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sections = build_sections(entries, source_order, source_sections)
 
-    if not fit_to_budget(sections, args.budget_chars):
+    target_budget = _apply_headroom(args.budget_chars, args.headroom_pct)
+    if not fit_to_budget(sections, target_budget):
         print(f"error: cannot fit {len(entries)} entries within --budget-chars={args.budget_chars} "
+              f"(target {target_budget} after --headroom-pct={args.headroom_pct}) "
               f"even with every hook emptied — raise the budget or reduce the memory count",
               file=sys.stderr)
         return 3
@@ -297,15 +384,23 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[generate_memory_index] {len(entries)} memory files indexed "
           f"({len(malformed)} flagged: malformed/missing frontmatter), "
-          f"{len(doc)} chars (budget {args.budget_chars})", file=sys.stderr)
+          f"{len(doc)} chars (budget {args.budget_chars}, target {target_budget})", file=sys.stderr)
+
+    if args.check:
+        current = out_path.read_text(encoding="utf-8") if out_path.exists() else None
+        if current != doc:
+            print(f"error: {out_path} is stale relative to its source memory files "
+                  f"(run without --check to regenerate)", file=sys.stderr)
+            return 4
+        print(f"OK: {out_path} is up to date", file=sys.stderr)
+        return 0
 
     if args.dry_run:
         print(doc)
         return 0
 
-    out_path = d / "MEMORY.md"
     if out_path.exists():
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = d / f"MEMORY.md.bak-{stamp}"
         shutil.copy2(out_path, backup)
         print(f"[generate_memory_index] backed up {out_path} -> {backup}", file=sys.stderr)
