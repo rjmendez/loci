@@ -8,7 +8,7 @@ Chunked at 4000 chars to keep embedding quality high and avoid
 Ollama stall on huge inputs.
 
 Uses embedding-worker (NodePort 30888) -> agent_core_chunks -> copy
-vector -> loci_sessions (named vector "dense", 768-dim Cosine).
+vector -> loci_sessions (named vector "dense", MNEMOSYNE_EMBEDDING_DIM Cosine).
 
 Incremental: tracks synced sessions by session_id in payload.
 Run standalone or from cron (no_agent=True).
@@ -23,6 +23,11 @@ COLLECTION   = "loci_sessions"
 SRC_COLL     = "agent_core_chunks"
 MAX_CHARS    = 4000   # per-session content cap before embedding
 BATCH_SIZE   = 4      # sessions per embed round-trip (keep under 32-chunk Ollama limit)
+
+# One source for the vector width. The validator below used a 768 literal while
+# the collection was created from this env, so a deployment on 1536-dim embeddings
+# dropped every chunk as "malformed" and still exited 0.
+VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
 
 AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 PROFILE  = os.environ.get("HERMES_PROFILE", "")
@@ -57,7 +62,7 @@ def ensure_collection(key, name=None, dim=None):
     curl_json returns {} rather than raising, so probe by response shape.
     """
     name = name or COLLECTION
-    dim  = int(dim or os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+    dim  = int(dim or VECTOR_DIM)
     if curl_json("GET", f"{QDRANT}/collections/{name}", key=key).get("result"):
         return False
     curl_json("PUT", f"{QDRANT}/collections/{name}",
@@ -136,8 +141,6 @@ def get_synced_ids(key):
         if not offset:
             break
     return synced
-
-VECTOR_DIM = 768
 
 def embed_batch(chunks, key):
     """Embed via worker, return ({chunk_id: vector}, dropped_count) for successfully embedded chunks."""

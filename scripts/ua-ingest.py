@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 
 # ── Config from env or defaults ────────────────────────────────────────────
 QDRANT_URL  = os.environ.get("QDRANT_URL")
-QDRANT_KEY  = os.environ.get("QDRANT_KEY", "")
+QDRANT_KEY  = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_KEY", "")
 OLLAMA_URL  = os.environ.get("OLLAMA_URL")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 COLLECTION  = os.environ.get("UA_COLLECTION", "understand_anything")

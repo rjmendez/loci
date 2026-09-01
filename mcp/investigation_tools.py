@@ -1037,6 +1037,7 @@ def investigation_import(
 
         # Re-index findings into Qdrant (fail-open).
         qdrant_indexed = 0
+        import_ts = int(datetime.now(timezone.utc).timestamp())
         for finding in findings:
             if not isinstance(finding, dict):
                 continue
@@ -1045,13 +1046,24 @@ def investigation_import(
             if not text or not finding_id:
                 continue
             try:
-                payload = {
+                # Index the whole finding, as the native store path does
+                # (server._store_finding). A hand-built payload dropped
+                # created_at_ts, and every age check reads that key: ranking
+                # decay skipped the row and the retention purge could not match
+                # it, so imported findings outranked native ones forever.
+                payload = dict(finding)
+                payload.update({
                     "investigation_id": new_id,
                     "type": finding.get("type") or finding.get("record_type") or "observed",
                     "source": finding.get("source") or "",
                     "confidence": finding.get("confidence") or "medium",
                     "tags": finding.get("tags") or [],
-                }
+                })
+                if not payload.get("created_at_ts"):
+                    # A bundle with no age at all: substitute import time and say so,
+                    # so a reader can tell a real age from a stand-in.
+                    payload["created_at_ts"] = import_ts
+                    payload["age_source"] = "imported"
                 _qdrant_upsert(finding_id, text, payload)
                 qdrant_indexed += 1
             except Exception as exc:
