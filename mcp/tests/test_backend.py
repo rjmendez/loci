@@ -39,14 +39,14 @@ class TestCosineSimilarity(unittest.TestCase):
     def test_opposite_vectors(self):
         self.assertAlmostEqual(cosine_similarity([1.0, 0.0], [-1.0, 0.0]), -1.0)
 
-    def test_empty_vectors_return_zero(self):
-        self.assertEqual(cosine_similarity([], []), 0.0)
+    def test_empty_vectors_are_uncomparable(self):
+        self.assertIsNone(cosine_similarity([], []))
 
-    def test_mismatched_length_returns_zero(self):
-        self.assertEqual(cosine_similarity([1.0], [1.0, 2.0]), 0.0)
+    def test_mismatched_length_is_uncomparable(self):
+        self.assertIsNone(cosine_similarity([1.0], [1.0, 2.0]))
 
-    def test_zero_vector_returns_zero(self):
-        self.assertEqual(cosine_similarity([0.0, 0.0], [1.0, 0.0]), 0.0)
+    def test_zero_magnitude_is_uncomparable(self):
+        self.assertIsNone(cosine_similarity([0.0, 0.0], [1.0, 0.0]))
 
     def test_negative_components(self):
         a = [-1.0, -1.0]

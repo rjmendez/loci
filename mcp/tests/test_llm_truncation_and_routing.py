@@ -84,8 +84,9 @@ class TruncationDetectionTest(unittest.TestCase):
         log.warning.assert_not_called()
 
     def test_a_garbage_count_does_not_raise(self):
-        with mock.patch.object(llm, "_log"):
+        with mock.patch.object(llm, "_log") as log:
             llm._warn_if_truncated("x" * 100, {"prompt_eval_count": "many"}, "m")
+        log.warning.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -30,6 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os as _os
+import sys as _sys
+
+# mcp/ holds the shared vector helpers; these scripts run standalone.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))), "mcp"))
+import vecmath as _vecmath  # noqa: E402
 import os
 import sqlite3
 import sys
@@ -115,13 +122,11 @@ def _delete_points(collection: str, ids: list, dry_run: bool) -> int:
         return 0
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na  = math.sqrt(sum(x * x for x in a))
-    nb  = math.sqrt(sum(x * x for x in b))
-    if na < 1e-9 or nb < 1e-9:
-        return 0.0
-    return dot / (na * nb)
+def _cosine(a: list[float], b: list[float]):
+    """Delegates to mcp/vecmath.py. None when the comparison is unanswerable —
+    most importantly on a length mismatch, which this used to answer with a
+    plausible number computed over the shorter vector's prefix."""
+    return _vecmath.cosine(a, b)
 
 
 # ── step 1: superseded verdicts ───────────────────────────────────────────────
@@ -292,6 +297,11 @@ def sweep_duplicates(dry_run: bool) -> int:
             if pt_b["id"] in to_delete:
                 continue
             sim = _cosine(vec_a, vec_b)
+            # This branch DELETES a memory, so an unanswerable comparison must
+            # never reach the threshold. A 768/384 mismatch used to score 0.707
+            # here, which clears DUPLICATE_COS_THRESHOLD.
+            if sim is None:
+                continue
             if sim >= DUPLICATE_COS_THRESHOLD:
                 pl_b = pt_b.get("payload") or {}
                 imp_b = float(pl_b.get("importance", 0.5) or 0.5)
@@ -322,11 +332,11 @@ def _embed_text(text: str, ollama_url: str) -> list[float] | None:
         return None
 
 
-def _cosine_vecs(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(x * x for x in b)) or 1.0
-    return dot / (na * nb)
+def _cosine_vecs(a: list[float], b: list[float]):
+    """Same contract as _cosine. The `or 1.0` this replaced turned a zero-magnitude
+    vector into a unit one and returned 0.0 — a drift reading manufactured from a
+    vector that carried nothing."""
+    return _vecmath.cosine(a, b)
 
 
 def check_content_shift(ollama_url: str | None = None, sample_n: int = 50) -> dict:
@@ -457,8 +467,11 @@ def main(
             print(f"[glym] shift check: {shift_result}")
             return
         if not shift_result.get("should_sweep", True):
-            print(f"[glym] content shift below threshold ({shift_result.get('drift_score'):.4f}) "
-                  "— skipping sweep")
+            # drift_score is None on every early return (db_not_found, table_not_found,
+            # too_few_rows, embed_failed); report the reason those carry instead.
+            drift = shift_result.get("drift_score")
+            detail = f"{drift:.4f}" if drift is not None else shift_result.get("reason", "unknown")
+            print(f"[glym] content shift below threshold ({detail}) — skipping sweep")
             return
         print(f"[glym] content shift triggered sweep (drift={shift_result.get('drift_score'):.4f})")
 
