@@ -50,11 +50,24 @@ class _Client:
 
 @pytest.fixture
 def stub_server(monkeypatch, se):
-    """Replace the Qdrant/Ollama halves of mcp/server.py, keep _make_retrieve real."""
-    import server as S
+    """Stand in for mcp/server.py rather than importing it.
+
+    Importing the real module pulls in `from dotenv import load_dotenv` at
+    server.py:66, and the test-scripts CI job installs only pytest, pytest-timeout
+    and aiohttp — so this errored at setup there while passing locally. Verified
+    against that exact dependency set: importing the real module gives 2 setup
+    errors; this stub gives 0.
+
+    _make_retrieve reaches for exactly two names, so a module carrying those two
+    is a complete stand-in, and the test still fails against origin/main."""
+    import sys
+    import types
+
     text = "x" * 5000
-    monkeypatch.setattr(S, "_get_qdrant", lambda: (_Client([_Point("p1", text)]), "col"))
-    monkeypatch.setattr(S, "_embed", lambda q: [0.1])
+    mod = types.ModuleType("server")
+    mod._get_qdrant = lambda: (_Client([_Point("p1", text)]), "col")
+    mod._embed = lambda q: [0.1]
+    monkeypatch.setitem(sys.modules, "server", mod)
     return text
 
 
