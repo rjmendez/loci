@@ -253,6 +253,14 @@ def apply_curated(entries: list[Entry],
         if ctitle:
             e.title = ctitle
         if chook and not e.error:
+            # A curated hook ending in the ellipsis is this generator's OWN truncated
+            # output, not operator prose. Preferring it makes truncation cumulative and
+            # irreversible: every run re-reads the shortened line as the source of record,
+            # so a hook shaved once can never grow back even when budget is freed — which
+            # is how a store of full descriptions decayed into a page of stubs. Fall back
+            # to the frontmatter description, which is never truncated.
+            if chook.endswith(ELLIPSIS) and e.hook:
+                continue
             e.hook = chook
     return entries
 

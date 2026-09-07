@@ -464,6 +464,30 @@ def test_hand_written_wiki_file_is_not_deleted(tmp_path, mod):
     assert mine.exists(), "a file this generator never wrote must not be deleted"
 
 
+def test_truncated_curated_hook_does_not_become_the_source_of_record(tmp_path, mod):
+    """Truncation must not be cumulative. The curated line wins over the frontmatter
+    description — but a line ending in the ellipsis is this generator's own shortened
+    output, so preferring it means a hook shaved once can never grow back, and each
+    run re-truncates its own truncation until the index is a page of stubs."""
+    full = "the complete description that frontmatter still carries in full"
+    _write_mem(tmp_path, "m.md", "m", full, mtype="project")
+    source = f"# Memory index\n\n## Curated\n- [M](m.md) — the complete des{mod.ELLIPSIS}\n"
+    entries = mod.apply_curated(
+        mod.load_entries(tmp_path)[0], mod.parse_source_sections(source)[2])
+    hook = {e.filename: e.hook for e in entries}["m.md"]
+    assert hook == full, f"truncated hook was taken as the source of record: {hook!r}"
+
+
+def test_untruncated_curated_hook_still_wins(tmp_path, mod):
+    """The fallback must be narrow: an ordinary curated hook carries the operator's
+    markers and shorthand and still beats the frontmatter description."""
+    _write_mem(tmp_path, "m.md", "m", "bland frontmatter prose", mtype="project")
+    source = "# Memory index\n\n## Curated\n- [M](m.md) — ⚠️the operator's own hook\n"
+    entries = mod.apply_curated(
+        mod.load_entries(tmp_path)[0], mod.parse_source_sections(source)[2])
+    assert {e.filename: e.hook for e in entries}["m.md"] == "⚠️the operator's own hook"
+
+
 def test_unrollable_overflow_warns_but_still_writes(tmp_path, mod):
     """When the protected sections alone overflow there is nothing left to move.
     An over-long index still loads partially; refusing to write would leave a
