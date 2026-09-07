@@ -343,3 +343,158 @@ def test_regenerating_from_own_output_keeps_every_entry(tmp_path, mod):
         assert f"orphan-{i}.md" in second, f"orphan-{i}.md dropped on regeneration"
     assert "newcomer.md" in second
     assert "listed.md" in second
+
+
+# --- line budget and section rollup ------------------------------------------
+#
+# The char budget cannot bound the line count: the generator emits one line per
+# memory file and only ever shortens hooks. A growing store therefore meets the
+# char cap by shaving hooks to stubs while the line count climbs past the
+# reader's window anyway — 256 files rendered 283 lines of fragments and were
+# still over. Rolling whole sections into hub files is the structural lever;
+# these tests hold its two edges: it must actually get under the line budget,
+# and it must never lose or duplicate an entry doing so.
+
+def _mem_block(tmp_path, prefix, count, mtype, hook="a perfectly ordinary hook"):
+    for i in range(count):
+        _write_mem(tmp_path, f"{prefix}-{i:02d}.md", f"{prefix}-{i:02d}", hook, mtype=mtype)
+
+
+def test_line_budget_rolls_a_section_into_a_hub(tmp_path, mod):
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    doc = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    assert mod.line_count(doc) <= 20, f"index is {mod.line_count(doc)} lines"
+    assert list(tmp_path.glob(f"{mod.HUB_PREFIX}*.md")), "over budget but nothing rolled out"
+
+
+def test_rolled_section_members_all_appear_in_the_hub(tmp_path, mod):
+    """The whole point: rolled out of sight is not rolled out of existence."""
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    everywhere = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    for hub in tmp_path.glob(f"{mod.HUB_PREFIX}*.md"):
+        everywhere += hub.read_text(encoding="utf-8")
+    for i in range(40):
+        assert f"(big-{i:02d}.md)" in everywhere, f"big-{i:02d}.md vanished in the rollup"
+
+
+def test_protected_sections_are_never_rolled(tmp_path, mod):
+    """Standing rules are read every session. Rolling them behind a pointer means
+    the agent stops seeing them without a second read — the exact failure the line
+    budget exists to prevent, just relocated."""
+    _mem_block(tmp_path, "agree", 30, "feedback")   # -> the protected 'Feedback' section
+    _mem_block(tmp_path, "ref", 30, "reference")    # -> rollable
+    assert mod.main([str(tmp_path), "--budget-lines", "25"]) == 0
+    doc = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    for i in range(30):
+        assert f"(agree-{i:02d}.md)" in doc, "a protected-section entry was rolled away"
+    assert list(tmp_path.glob(f"{mod.HUB_PREFIX}*.md")), "the rollable section should have rolled"
+
+
+def test_hub_keeps_full_hook_while_index_is_budgeted(tmp_path, mod):
+    """Rolling a section out should RESTORE detail, not lose it: only MEMORY.md is
+    budgeted, so the hub carries the hook the char budget would have shaved."""
+    long_hook = "distinctive tail marker " * 12
+    _mem_block(tmp_path, "big", 40, "project", hook=long_hook)
+    assert mod.main([str(tmp_path), "--budget-lines", "20", "--budget-chars", "3000"]) == 0
+    hub_text = "".join(h.read_text(encoding="utf-8")
+                       for h in tmp_path.glob(f"{mod.HUB_PREFIX}*.md"))
+    assert long_hook.strip() in hub_text, "hub hooks must be full text, not truncated"
+
+
+def test_rollup_round_trips_and_is_idempotent(tmp_path, mod):
+    """Once a section is rolled, MEMORY.md no longer lists its files. If the next
+    run does not read the grouping back out of the hub it scatters them into
+    metadata.type buckets — the generator eating its own output, one level down."""
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    first = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    first_hubs = {h.name: h.read_text(encoding="utf-8")
+                  for h in tmp_path.glob(f"{mod.HUB_PREFIX}*.md")}
+
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    assert (tmp_path / "MEMORY.md").read_text(encoding="utf-8") == first, "run 2 drifted"
+    assert {h.name: h.read_text(encoding="utf-8")
+            for h in tmp_path.glob(f"{mod.HUB_PREFIX}*.md")} == first_hubs
+    assert mod.main([str(tmp_path), "--budget-lines", "20", "--check"]) == 0
+
+
+def test_check_detects_a_drifted_hub(tmp_path, mod):
+    """A hub holds the entries MEMORY.md no longer mentions. If --check ignored
+    hubs it would report green on exactly the content the rollup moved out."""
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    hub = next(iter(tmp_path.glob(f"{mod.HUB_PREFIX}*.md")))
+    hub.write_text(hub.read_text(encoding="utf-8") + "\n- [smuggled](nope.md)\n",
+                   encoding="utf-8")
+    assert mod.main([str(tmp_path), "--budget-lines", "20", "--check"]) == 4
+
+
+def test_hub_files_are_not_indexed_as_memories(tmp_path, mod):
+    """A hub is this script's output, not a memory. Indexing one would add an entry
+    per hub per run, and let a hub's contents be rolled into a further hub."""
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    entries, _ = mod.load_entries(tmp_path)
+    assert not [e for e in entries if e.filename.startswith(mod.HUB_PREFIX)]
+
+
+def test_stale_hub_is_retired_and_entries_come_back_inline(tmp_path, mod):
+    """A hub for a section that no longer rolls up would keep re-seeding its
+    grouping from a frozen member list forever."""
+    _mem_block(tmp_path, "big", 40, "project")
+    assert mod.main([str(tmp_path), "--budget-lines", "20"]) == 0
+    assert list(tmp_path.glob(f"{mod.HUB_PREFIX}*.md"))
+    assert mod.main([str(tmp_path), "--budget-lines", "500"]) == 0
+    assert not list(tmp_path.glob(f"{mod.HUB_PREFIX}*.md")), "stale hub was not retired"
+    doc = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    for i in range(40):
+        assert f"(big-{i:02d}.md)" in doc, "un-rolling must put entries back inline"
+
+
+def test_hand_written_wiki_file_is_not_deleted(tmp_path, mod):
+    """Retirement is keyed on this generator's own marker, so a wiki-*.md the
+    operator happens to own is left alone."""
+    _mem_block(tmp_path, "big", 40, "project")
+    mine = tmp_path / f"{mod.HUB_PREFIX}hand-written.md"
+    mine.write_text("---\nname: wiki-hand-written\ndescription: mine\n---\n\nkeep me\n",
+                    encoding="utf-8")
+    assert mod.main([str(tmp_path), "--budget-lines", "500"]) == 0
+    assert mine.exists(), "a file this generator never wrote must not be deleted"
+
+
+def test_truncated_curated_hook_does_not_become_the_source_of_record(tmp_path, mod):
+    """Truncation must not be cumulative. The curated line wins over the frontmatter
+    description — but a line ending in the ellipsis is this generator's own shortened
+    output, so preferring it means a hook shaved once can never grow back, and each
+    run re-truncates its own truncation until the index is a page of stubs."""
+    full = "the complete description that frontmatter still carries in full"
+    _write_mem(tmp_path, "m.md", "m", full, mtype="project")
+    source = f"# Memory index\n\n## Curated\n- [M](m.md) — the complete des{mod.ELLIPSIS}\n"
+    entries = mod.apply_curated(
+        mod.load_entries(tmp_path)[0], mod.parse_source_sections(source)[2])
+    hook = {e.filename: e.hook for e in entries}["m.md"]
+    assert hook == full, f"truncated hook was taken as the source of record: {hook!r}"
+
+
+def test_untruncated_curated_hook_still_wins(tmp_path, mod):
+    """The fallback must be narrow: an ordinary curated hook carries the operator's
+    markers and shorthand and still beats the frontmatter description."""
+    _write_mem(tmp_path, "m.md", "m", "bland frontmatter prose", mtype="project")
+    source = "# Memory index\n\n## Curated\n- [M](m.md) — ⚠️the operator's own hook\n"
+    entries = mod.apply_curated(
+        mod.load_entries(tmp_path)[0], mod.parse_source_sections(source)[2])
+    assert {e.filename: e.hook for e in entries}["m.md"] == "⚠️the operator's own hook"
+
+
+def test_unrollable_overflow_warns_but_still_writes(tmp_path, mod):
+    """When the protected sections alone overflow there is nothing left to move.
+    An over-long index still loads partially; refusing to write would leave a
+    staler one in place, which is strictly worse."""
+    _mem_block(tmp_path, "agree", 60, "feedback")  # protected, and alone over budget
+    assert mod.main([str(tmp_path), "--budget-lines", "10"]) == 0
+    doc = (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    assert mod.line_count(doc) > 10
+    for i in range(60):
+        assert f"(agree-{i:02d}.md)" in doc
