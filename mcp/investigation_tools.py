@@ -178,6 +178,89 @@ def _field_invariants(findings: list) -> dict:
     return out
 
 
+# A gap is something that should be checked and has not been; an assumption is a
+# working hypothesis carrying no evidence. Both are open obligations, and both are
+# most dangerous exactly when they have aged out of the recent window — the older a
+# gap is, the more likely everyone has forgotten it is still open. Recency is the
+# wrong axis to drop them on.
+_PROTECTED_RECORD_TYPES = frozenset({"gap", "assumed"})
+# Promotion is off for windows below this. Two reasons. A caller asking for a
+# handful of findings wants a tight recent view, and spending half of it on
+# promotions distorts a small sample far more than a large one. And concretely:
+# grounding.py loads a case with last_n_findings=6 and then takes [:3], which —
+# since selection is chronological and promoted records are older than the window
+# — would have handed it three gaps and no recent findings at all. Measured on
+# dama-gunshot-2026-08-25, which has four gaps among 51 findings, that is exactly
+# what happened. The default window of 20 is unaffected.
+_MIN_WINDOW_FOR_PROMOTION = 10
+
+
+def _record_type(finding: dict) -> str:
+    return str(finding.get("record_type") or finding.get("type") or "")
+
+
+def _select_findings(findings: list, limit: int) -> tuple:
+    """Pick which findings ``last_n_findings`` returns, and say what it dropped.
+
+    The slice was ``findings[-limit:]``: pure recency, silently. On a long
+    investigation that means an open gap recorded early is gone from every
+    full-fidelity load, with nothing in the payload indicating a selection
+    happened at all — the caller sees ``total_findings`` and a list, and no
+    statement that the list is not the whole of it.
+
+    Two changes. Protected record types older than the window may claim slots,
+    newest first, evicting the oldest unprotected finding in the window — the same
+    "shed the routine first" ordering a budgeted summariser uses. And the
+    remainder is reported rather than dropped in silence.
+
+    Protected findings take at most half the window, so an investigation that is
+    mostly gaps cannot squeeze recency out entirely; a caller asking for the last
+    20 still gets at least 10 genuinely recent ones. Windows below
+    _MIN_WINDOW_FOR_PROMOTION do not promote at all — see the constant.
+
+    Returns ``(selected, omitted)`` where selected stays in chronological order.
+    """
+    total = len(findings)
+    if limit <= 0 or total <= limit:
+        return list(findings), {}
+
+    kept = list(range(total - limit, total))
+    older = range(0, total - limit)
+    promotable = ([i for i in older if _record_type(findings[i]) in _PROTECTED_RECORD_TYPES]
+                  if limit >= _MIN_WINDOW_FOR_PROMOTION else [])
+    max_promoted = max(1, limit // 2)
+
+    promoted = 0
+    for i in reversed(promotable):  # newest-first: an older gap loses to a newer one
+        if promoted >= max_promoted:
+            break
+        victim = next((j for j in kept
+                       if _record_type(findings[j]) not in _PROTECTED_RECORD_TYPES), None)
+        if victim is None:
+            break  # every slot already holds a protected finding
+        kept.remove(victim)
+        kept.append(i)
+        promoted += 1
+    kept.sort()
+
+    keptset = set(kept)
+    by_type: dict = {}
+    for i in range(total):
+        if i in keptset:
+            continue
+        rt = _record_type(findings[i]) or "(untyped)"
+        by_type[rt] = by_type.get(rt, 0) + 1
+    omitted = {
+        "count": total - len(kept),
+        "by_record_type": dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "promoted_past_the_window": promoted,
+        "note": ("Selection is recency plus protected types "
+                 f"({', '.join(sorted(_PROTECTED_RECORD_TYPES))}); raise "
+                 "last_n_findings or use investigation_search to see the rest."),
+    }
+    return [findings[i] for i in kept], omitted
+
+
 def investigation_load(
     investigation_id: str,
     last_n_findings: int = 20,
@@ -198,7 +281,12 @@ def investigation_load(
 
     Args:
         investigation_id: Investigation identifier.
-        last_n_findings: How many recent findings to include (default 20).
+        last_n_findings: Size of the finding window (default 20). The window is
+                         the most recent findings, except that older ``gap`` and
+                         ``assumed`` records may claim up to half of it — they are
+                         open obligations, and aging out of the window is when a
+                         forgotten one does the most damage. Whatever the window
+                         leaves out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
                              provided and the investigation has a non-empty ACL,
@@ -218,7 +306,7 @@ def investigation_load(
         When fidelity is "summary" or "brief", the ``recent_findings`` key is
         omitted and replaced with ``summary_l1`` and/or ``summary_l2``.
 
-        "full" and "summary" also carry ``field_invariants``: what the structured
+        "full" and "summary" carry ``field_invariants``: what the structured
         fields of the whole surviving finding set agree on, as
         ``constant`` (one value across the set), ``varies`` (value counts, up to
         five), ``distinct_only`` (a count, for fields with more values than that),
@@ -227,6 +315,11 @@ def investigation_load(
         it covers findings the ``last_n_findings`` slice leaves out. "brief" omits
         it deliberately — it reads no findings at all, and the manifest's
         ``finding_counts`` already carries the type breakdown.
+
+        "full" carries ``findings_omitted`` whenever the window left something
+        out: how many, broken down by record type, and how many protected records
+        were pulled in from outside it. The key is absent when nothing was
+        dropped, so its presence is the signal that the list is partial.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -289,7 +382,7 @@ def investigation_load(
             or f.get("authored_by", "") in acl_set
         ]
 
-    recent = findings[-last_n_findings:]
+    recent, findings_omitted = _select_findings(findings, last_n_findings)
     # Append-log overrides win, else stored/default "open"; findings without these fields read open and not-stale.
     _apply_lifecycle(recent, investigation_id)
 
@@ -303,6 +396,9 @@ def investigation_load(
         # being given a count of, including the part the slice left out.
         "field_invariants": _field_invariants(findings),
         "excluded_retracted": excluded_retracted,
+        # Present only when the window actually left something out, so a load that
+        # returned everything does not carry a paragraph saying it dropped nothing.
+        **({"findings_omitted": findings_omitted} if findings_omitted else {}),
         "total_retracted": total_retracted,
         "include_retracted": include_retracted,
     }
