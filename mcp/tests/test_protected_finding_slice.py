@@ -73,13 +73,26 @@ class SelectFindingsTest(unittest.TestCase):
         self.assertEqual(len(recent), 5)
 
     def test_newest_protected_wins_a_contested_slot(self):
-        findings = ([_f(0, rt="gap"), _f(1, rt="gap")]
-                    + [_f(i) for i in range(2, 30)])
-        selected, _ = _select_findings(findings, 2)
-        # limit 2 -> at most 1 promotion; the newer gap (f001) takes it.
+        # limit 10 -> at most 5 promotions, but six old gaps compete for them.
+        findings = [_f(i, rt="gap") for i in range(6)] + [_f(i) for i in range(6, 40)]
+        selected, omitted = _select_findings(findings, 10)
         ids = [f["id"] for f in selected]
-        self.assertIn("f001", ids)
-        self.assertNotIn("f000", ids)
+        self.assertEqual(omitted["promoted_past_the_window"], 5)
+        self.assertNotIn("f000", ids, "the oldest gap is the one that loses")
+        for i in range(1, 6):
+            self.assertIn(f"f{i:03d}", ids)
+
+    def test_small_windows_do_not_promote_at_all(self):
+        """grounding.py loads a case with last_n_findings=6 and takes [:3]. Since
+        selection is chronological and promoted records are older than the window,
+        promoting into a 6-window would hand that lane three gaps and no recent
+        findings. Measured on a real 51-finding case before this guard existed."""
+        findings = [_f(i, rt="gap") for i in range(4)] + [_f(i) for i in range(4, 51)]
+        selected, omitted = _select_findings(findings, 6)
+        self.assertEqual(omitted["promoted_past_the_window"], 0)
+        self.assertEqual([f["id"] for f in selected],
+                         [f"f{i:03d}" for i in range(45, 51)])
+        self.assertNotIn("gap", [f["record_type"] for f in selected[:3]])
 
     def test_omission_report_breaks_down_by_record_type(self):
         findings = ([_f(i) for i in range(20)]
@@ -97,7 +110,7 @@ class SelectFindingsTest(unittest.TestCase):
 
     def test_legacy_type_key_is_honoured_for_protection(self):
         findings = [{"id": "f000", "type": "gap", "text": "t"}] + [_f(i) for i in range(1, 30)]
-        selected, _ = _select_findings(findings, 5)
+        selected, _ = _select_findings(findings, 10)
         self.assertIn("f000", [f["id"] for f in selected])
 
     def test_zero_or_negative_limit_returns_everything(self):

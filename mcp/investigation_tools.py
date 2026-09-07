@@ -184,6 +184,15 @@ def _field_invariants(findings: list) -> dict:
 # gap is, the more likely everyone has forgotten it is still open. Recency is the
 # wrong axis to drop them on.
 _PROTECTED_RECORD_TYPES = frozenset({"gap", "assumed"})
+# Promotion is off for windows below this. Two reasons. A caller asking for a
+# handful of findings wants a tight recent view, and spending half of it on
+# promotions distorts a small sample far more than a large one. And concretely:
+# grounding.py loads a case with last_n_findings=6 and then takes [:3], which —
+# since selection is chronological and promoted records are older than the window
+# — would have handed it three gaps and no recent findings at all. Measured on
+# dama-gunshot-2026-08-25, which has four gaps among 51 findings, that is exactly
+# what happened. The default window of 20 is unaffected.
+_MIN_WINDOW_FOR_PROMOTION = 10
 
 
 def _record_type(finding: dict) -> str:
@@ -206,7 +215,8 @@ def _select_findings(findings: list, limit: int) -> tuple:
 
     Protected findings take at most half the window, so an investigation that is
     mostly gaps cannot squeeze recency out entirely; a caller asking for the last
-    20 still gets at least 10 genuinely recent ones.
+    20 still gets at least 10 genuinely recent ones. Windows below
+    _MIN_WINDOW_FOR_PROMOTION do not promote at all — see the constant.
 
     Returns ``(selected, omitted)`` where selected stays in chronological order.
     """
@@ -216,7 +226,8 @@ def _select_findings(findings: list, limit: int) -> tuple:
 
     kept = list(range(total - limit, total))
     older = range(0, total - limit)
-    promotable = [i for i in older if _record_type(findings[i]) in _PROTECTED_RECORD_TYPES]
+    promotable = ([i for i in older if _record_type(findings[i]) in _PROTECTED_RECORD_TYPES]
+                  if limit >= _MIN_WINDOW_FOR_PROMOTION else [])
     max_promoted = max(1, limit // 2)
 
     promoted = 0
