@@ -29,9 +29,11 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
         n for n in head_build.store.nodes_of_kind("FUNCTION")
         if not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
-    # Band is the 1002 measured count +-5%; the LOCI_* rename and the grounding
-    # helpers moved it from ~951.
-    assert 950 <= len(module_level) <= 1055, len(module_level)
+    # Band is the 1060 measured count +-5%; the LOCI_* rename and the grounding
+    # helpers moved it from ~951 to ~1002, and the memory-index line budget's
+    # rollup helpers (hub_filename, line_count, _hub_pointer, inline_view,
+    # plan_rollups, render_hub) moved it from 1054 to 1060.
+    assert 1007 <= len(module_level) <= 1113, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
