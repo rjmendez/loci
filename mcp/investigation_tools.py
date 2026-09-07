@@ -111,6 +111,73 @@ def _only_findings(records: list) -> list:
             and (r.get("record_type") or r.get("type") or "") not in _NON_FINDING_RECORD_TYPES]
 
 
+# Structured, low-cardinality metadata only. Free text is deliberately excluded:
+# these are facts about the SET, and a prose field has no class to report.
+_INVARIANT_FIELDS = ("record_type", "confidence", "resolution", "tier",
+                     "authored_by", "agent_id", "source")
+# Past this many distinct values a field is an identifier, not a class. Listing it
+# restates the data instead of describing it, so only the count is reported.
+_INVARIANT_MAX_VALUES = 5
+_INVARIANT_ABSENT = "(absent)"
+
+
+def _field_invariants(findings: list) -> dict:
+    """Describe a finding SET by the structured fields its members share.
+
+    This is a deterministic floor under the summary ladder. summary_l1/summary_l2
+    are model-authored, so at fidelity="summary" or "brief" every word a caller
+    reads about a set of findings is generated — nothing states, from the data,
+    that all twenty were high-confidence or that one of them is a gap. These
+    counts cannot be invented and cost no tokens to produce.
+
+    Three shapes, borrowed from the way a log compressor describes an elided run:
+    a field the whole set agrees on is a constant; a field with a handful of
+    values is an enumeration with counts; a field with more values than that is an
+    identifier, reported as a distinct count only.
+
+    Nothing here is budget-trimmed. The output is bounded by construction —
+    len(_INVARIANT_FIELDS) entries of at most _INVARIANT_MAX_VALUES counts — so
+    there is never a shed to disclose. That is the point: a summary that silently
+    drops facts is worse than one that never had them, because a reader takes the
+    absence of a field as evidence the field did not hold.
+    """
+    n = len(findings)
+    out: dict = {"n": n, "constant": {}, "varies": {}, "distinct_only": {}}
+    if not n:
+        return out
+
+    for field in _INVARIANT_FIELDS:
+        counts: dict = {}
+        for f in findings:
+            raw = f.get(field)
+            # Older records carry "type" where newer ones carry "record_type".
+            if raw in (None, "") and field == "record_type":
+                raw = f.get("type")
+            value = _INVARIANT_ABSENT if raw in (None, "") else str(raw)
+            counts[value] = counts.get(value, 0) + 1
+        if not counts or list(counts) == [_INVARIANT_ABSENT]:
+            continue  # no finding carried it; say nothing rather than "(absent)×n"
+        if len(counts) == 1:
+            out["constant"][field] = next(iter(counts))
+        elif len(counts) <= _INVARIANT_MAX_VALUES:
+            out["varies"][field] = dict(
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        else:
+            out["distinct_only"][field] = len(counts)
+
+    # Tags are a list per finding, so they get set semantics rather than a class:
+    # which tags EVERY finding carries, and how many distinct ones exist at all.
+    tag_sets = [{str(t) for t in (f.get("tags") or [])} for f in findings]
+    universe: set = set()
+    for s in tag_sets:
+        universe |= s
+    if universe:
+        shared = set.intersection(*tag_sets) if all(tag_sets) else set()
+        out["tags_on_every_finding"] = sorted(shared)
+        out["tags_distinct"] = len(universe)
+    return out
+
+
 def investigation_load(
     investigation_id: str,
     last_n_findings: int = 20,
@@ -150,6 +217,16 @@ def investigation_load(
         ``excluded_retracted`` (count of findings filtered out).
         When fidelity is "summary" or "brief", the ``recent_findings`` key is
         omitted and replaced with ``summary_l1`` and/or ``summary_l2``.
+
+        "full" and "summary" also carry ``field_invariants``: what the structured
+        fields of the whole surviving finding set agree on, as
+        ``constant`` (one value across the set), ``varies`` (value counts, up to
+        five), ``distinct_only`` (a count, for fields with more values than that),
+        and the tags every finding shares. It is computed, not generated, so it
+        holds when the model-authored summaries are absent, stale, or wrong, and
+        it covers findings the ``last_n_findings`` slice leaves out. "brief" omits
+        it deliberately — it reads no findings at all, and the manifest's
+        ``finding_counts`` already carries the type breakdown.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -184,6 +261,10 @@ def investigation_load(
             "total_findings": len(findings),
             "summary_l1": summary_l1,
             "summary_l2": summary_l2,
+            # summary_l1/l2 are model-authored; this is not. At this fidelity the
+            # findings themselves are withheld, so without it every word the
+            # caller reads about them is generated.
+            "field_invariants": _field_invariants(findings),
             "excluded_retracted": excluded_retracted,
             "total_retracted": total_retracted,
             "include_retracted": include_retracted,
@@ -217,6 +298,10 @@ def investigation_load(
         "fidelity": "full",
         "total_findings": len(findings),
         "recent_findings": recent,
+        # Computed over every finding that survived filtering, not over the
+        # last_n_findings slice: its job is to describe the set the caller is
+        # being given a count of, including the part the slice left out.
+        "field_invariants": _field_invariants(findings),
         "excluded_retracted": excluded_retracted,
         "total_retracted": total_retracted,
         "include_retracted": include_retracted,
