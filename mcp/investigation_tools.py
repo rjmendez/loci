@@ -1,14 +1,9 @@
-"""Investigation lifecycle MCP tools — split out of server.py (P2b of the split).
+"""Investigation lifecycle MCP tools, split from server.py.
 
-The 11 tools here are the investigation lifecycle surface: create/load/share/export
-and the read-side views over an investigation. Storage primitives come from
-inv_store; the handful of server-side collaborators these tools still need
-(graph upsert, lifecycle folding, event log, self-check, qdrant upsert) are
-INJECTED through register() rather than imported, so this module never imports
-server and no import cycle exists.
-
-The memory root is injected the same way inv_store takes it — a lambda closing over
-server's global — so tests that rebind it to a tmpdir keep steering these tools too.
+Storage primitives come from ``inv_store``. Server-side collaborators still
+needed here are injected through ``register()`` so this module never imports
+``server`` and avoids an import cycle. The memory root is injected the same
+way, so tests that rebind it still steer these tools.
 """
 from __future__ import annotations
 
@@ -53,9 +48,8 @@ def investigation_start(
     context: Optional[str] = None,
 ) -> str:
     """
-    Create or resume an investigation. Call at the start of any session to
-    initialize the manifest. Idempotent — resuming an existing ID returns
-    the current manifest without overwriting it.
+    Create or resume an investigation manifest. Idempotent: an existing ID
+    returns the current manifest unchanged.
 
     Args:
         investigation_id: Short identifier — ticket number, case ID, or a
@@ -64,12 +58,9 @@ def investigation_start(
         context: Optional background to record on first creation only.
 
     Returns:
-        JSON: {"status": "created"|"resumed", "manifest": {id, title, context, status,
-               created_at, updated_at, hypothesis, open_questions, next_step,
-               checked_sources, finding_counts, closed_at, closed_summary}}
-
-        The investigation ID is at result["manifest"]["id"], NOT result["investigation_id"].
-        Example extraction: inv_id = json.loads(result)["manifest"]["id"]
+        JSON ``{"status":"created"|"resumed","manifest":{...}}``. The
+        investigation ID is at ``result["manifest"]["id"]``, not
+        ``result["investigation_id"]``.
     """
     existing = _load_manifest(investigation_id)
     if existing:
@@ -125,22 +116,14 @@ _INVARIANT_ABSENT = "(absent)"
 def _field_invariants(findings: list) -> dict:
     """Describe a finding SET by the structured fields its members share.
 
-    This is a deterministic floor under the summary ladder. summary_l1/summary_l2
-    are model-authored, so at fidelity="summary" or "brief" every word a caller
-    reads about a set of findings is generated — nothing states, from the data,
-    that all twenty were high-confidence or that one of them is a gap. These
-    counts cannot be invented and cost no tokens to produce.
+    This is the deterministic floor under model-authored summaries. At
+    ``fidelity="summary"`` or ``"brief"``, it preserves structured facts the
+    model could omit or invent, such as every finding sharing one confidence
+    tier or one record being a gap.
 
-    Three shapes, borrowed from the way a log compressor describes an elided run:
-    a field the whole set agrees on is a constant; a field with a handful of
-    values is an enumeration with counts; a field with more values than that is an
-    identifier, reported as a distinct count only.
-
-    Nothing here is budget-trimmed. The output is bounded by construction —
-    len(_INVARIANT_FIELDS) entries of at most _INVARIANT_MAX_VALUES counts — so
-    there is never a shed to disclose. That is the point: a summary that silently
-    drops facts is worse than one that never had them, because a reader takes the
-    absence of a field as evidence the field did not hold.
+    Each field is reported as one of three shapes: constant across the set,
+    a counted small enumeration, or a distinct-count-only identifier. The
+    output is bounded by construction, so nothing is silently shed.
     """
     n = len(findings)
     out: dict = {"n": n, "constant": {}, "varies": {}, "distinct_only": {}}
@@ -203,21 +186,13 @@ def _record_type(finding: dict) -> str:
 def _select_findings(findings: list, limit: int) -> tuple:
     """Pick which findings ``last_n_findings`` returns, and say what it dropped.
 
-    The slice was ``findings[-limit:]``: pure recency, silently. On a long
-    investigation that means an open gap recorded early is gone from every
-    full-fidelity load, with nothing in the payload indicating a selection
-    happened at all — the caller sees ``total_findings`` and a list, and no
-    statement that the list is not the whole of it.
+    Pure recency silently dropped early ``gap`` and ``assumed`` records from
+    long investigations. This selector lets those protected types claim up to
+    half the window, newest first, while the rest stay recency-based.
 
-    Two changes. Protected record types older than the window may claim slots,
-    newest first, evicting the oldest unprotected finding in the window — the same
-    "shed the routine first" ordering a budgeted summariser uses. And the
-    remainder is reported rather than dropped in silence.
-
-    Protected findings take at most half the window, so an investigation that is
-    mostly gaps cannot squeeze recency out entirely; a caller asking for the last
-    20 still gets at least 10 genuinely recent ones. Windows below
-    _MIN_WINDOW_FOR_PROMOTION do not promote at all — see the constant.
+    Whatever does not fit is reported in ``omitted`` instead of disappearing.
+    Small windows below ``_MIN_WINDOW_FOR_PROMOTION`` never promote protected
+    records, so tight recent views stay recent.
 
     Returns ``(selected, omitted)`` where selected stays in chronological order.
     """
@@ -270,57 +245,37 @@ def investigation_load(
     fidelity: str = "full",
 ) -> str:
     """
-    Retrieve manifest and recent findings for an investigation.
-    Use at session start to recover context without re-running all previous
-    tool calls. The manifest contains hypothesis, open questions, checked
-    sources, and next step — everything needed to resume cleanly.
+    Load an investigation manifest plus a recent-finding view for resuming work.
 
-    Soft-tombstoned (retracted) findings are excluded by default so a known
-    hallucination and its contaminated lineage don't re-enter recall. The data
-    is never lost — pass ``include_retracted=True`` to see them, and the count
-    of excluded findings is always reported as ``excluded_retracted``.
+    Retracted findings are excluded by default so known hallucinations and their
+    contaminated lineage do not re-enter recall. They are not lost: set
+    ``include_retracted=True`` to include them, and the excluded count is always
+    reported as ``excluded_retracted``.
 
     Args:
         investigation_id: Investigation identifier.
-        last_n_findings: Size of the finding window (default 20). The window is
-                         the most recent findings, except that older ``gap`` and
-                         ``assumed`` records may claim up to half of it — they are
-                         open obligations, and aging out of the window is when a
-                         forgotten one does the most damage. Whatever the window
-                         leaves out is reported as ``findings_omitted``.
+        last_n_findings: Window size (default 20). Mostly recency-based, except
+            older ``gap`` and ``assumed`` records may claim up to half the
+            window so open obligations do not age out silently. Anything left
+            out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
                              provided and the investigation has a non-empty ACL,
                              findings are filtered to those authored by agents
                              in the ACL or by the requesting agent itself.
         fidelity: Controls how much detail is returned. One of:
-                  "full"    — existing behavior: returns manifest + all recent findings.
-                  "summary" — returns manifest + summary_l1 (bullets) + summary_l2
-                              (paragraph) instead of full findings list. Useful when
-                              context window is constrained.
-                  "brief"   — returns manifest + summary_l2 only (single paragraph).
-                              Most compact form; good for quick orientation.
+                  "full"    — manifest plus recent findings.
+                  "summary" — manifest plus ``summary_l1`` and ``summary_l2``
+                              instead of the full finding list.
+                  "brief"   — manifest plus ``summary_l2`` only.
 
     Returns:
-        JSON with manifest, total finding count, recent findings, and
-        ``excluded_retracted`` (count of findings filtered out).
-        When fidelity is "summary" or "brief", the ``recent_findings`` key is
-        omitted and replaced with ``summary_l1`` and/or ``summary_l2``.
-
-        "full" and "summary" carry ``field_invariants``: what the structured
-        fields of the whole surviving finding set agree on, as
-        ``constant`` (one value across the set), ``varies`` (value counts, up to
-        five), ``distinct_only`` (a count, for fields with more values than that),
-        and the tags every finding shares. It is computed, not generated, so it
-        holds when the model-authored summaries are absent, stale, or wrong, and
-        it covers findings the ``last_n_findings`` slice leaves out. "brief" omits
-        it deliberately — it reads no findings at all, and the manifest's
-        ``finding_counts`` already carries the type breakdown.
-
-        "full" carries ``findings_omitted`` whenever the window left something
-        out: how many, broken down by record type, and how many protected records
-        were pulled in from outside it. The key is absent when nothing was
-        dropped, so its presence is the signal that the list is partial.
+        JSON with the manifest, total-finding counts, and the view selected by
+        ``fidelity``. ``summary`` and ``full`` also include deterministic
+        ``field_invariants`` computed over the whole surviving finding set, not
+        just the visible window. ``full`` adds ``findings_omitted`` only when
+        the window was partial; its presence is the signal that the list is not
+        complete.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -412,19 +367,13 @@ def investigation_load(
 def _verification_summary(investigation_id: str) -> Optional[dict]:
     """Fold finding_verifications.jsonl into something a reader will actually see.
 
-    investigation_verify_all writes adversarial verdicts to a separate log so they
-    never bloat the findings scan (inv_store.py). The side effect was that NOTHING
-    read them: a census of the tool-audit log found the verdicts' only other
-    would-be consumer, memory_self_check, invoked 0 times, while
-    investigation_store ran 299 times. A skeptic refuting a stored finding at 0.95
-    confidence was landing in a file with no reader.
+    ``investigation_verify_all`` writes adversarial verdicts to a separate log.
+    This surfaces them where readers already look: investigation loads.
 
-    This surfaces it where someone is already looking. Returns None when there are
-    no verdicts, so the 140 investigations without any are unchanged.
-
-    ``degraded`` verdicts are counted separately and NEVER as refutations: a
-    degraded result means no model was reached, which is not a judgement about
-    the finding.
+    Returns ``None`` when there are no verdicts, so unaffected investigations are
+    unchanged. ``degraded`` verdicts are counted separately and never as
+    refutations: they mean no model was reached, not that the finding was judged
+    false.
     """
     try:
         rows = _read_jsonl(_inv_dir(investigation_id) / "finding_verifications.jsonl")
@@ -469,15 +418,12 @@ def investigation_as_of(
     as_of_timestamp: str,
 ) -> str:
     """
-    Return findings from an investigation as they were believed at a specific point in time.
+    Return findings as they were believed at a specific time.
 
-    A finding is included when BOTH of the following hold:
-      - created_at_ts <= as_of_epoch  (the finding existed by that moment)
-      - valid_until is null OR valid_until >= as_of_timestamp  (it was still believed valid)
-
-    This supports bi-temporal analysis: you can reconstruct the investigation's
-    knowledge state at any historical moment, even after findings have been
-    superseded or retracted.
+    A finding is included only if it already existed
+    (``created_at_ts <= as_of_epoch``) and either has no ``valid_until`` or
+    stays valid through ``as_of_timestamp``. This enables bi-temporal
+    reconstruction even after later supersession or retraction.
 
     Args:
         investigation_id: Investigation identifier.
@@ -487,13 +433,8 @@ def investigation_as_of(
                          also excluded.
 
     Returns:
-        JSON: {
-          "investigation_id": "<id>",
-          "as_of": "<as_of_timestamp>",
-          "findings": [...],
-          "count": <int>
-        }
-        On error: {"error": "<message>"}
+        JSON ``{"investigation_id","as_of","findings","count"}``, or
+        ``{"error": ...}``.
     """
     try:
         manifest = _load_manifest(investigation_id)
@@ -881,21 +822,17 @@ def investigation_list(
     summary: bool = True,
 ) -> str:
     """
-    List investigations with status and finding counts, most recently
-    updated first.
+    List investigations, newest-updated first.
 
-    Bounded by default to avoid overflowing the tool-result token cap: only
-    `limit` investigations are returned starting at `offset`, and `summary`
-    mode returns a compact record per investigation (id, title, status,
-    finding_counts, updated_at). Set summary=False for the full record
-    (created_at, open_questions_count, hypothesis, visibility, tier_counts)
-    and/or raise limit to page through or fetch everything.
+    The default is bounded to avoid tool-result overflow: return ``limit``
+    investigations starting at ``offset``. ``summary=True`` returns compact
+    rows; ``summary=False`` adds ``created_at``, ``open_questions_count``,
+    ``hypothesis``, ``visibility``, and ``tier_counts``.
 
     Args:
         limit: Max investigations to return (default 30). Use 0 or a negative
-            value for no limit (return all remaining). Note: offset is still
-            honored when limit<=0, so this returns everything *starting at*
-            offset, not the entire list.
+            value for no limit. ``offset`` is still honored, so limit<=0 means
+            "everything starting at offset", not the entire list.
         offset: Number of investigations to skip from the front (default 0).
             Always applied, including when limit<=0.
         summary: If True (default), return only compact fields; if False,
@@ -991,9 +928,10 @@ def investigation_share(
     agent_ids: list,
 ) -> str:
     """
-    Grant read/write access to an investigation for one or more agents.
-    Adds the given agent_ids to the investigation's ACL (access control list).
-    Idempotent — adding an agent already in the ACL has no effect.
+    Grant investigation access to one or more agents.
+
+    Adds ``agent_ids`` to the investigation ACL. Idempotent: already-present
+    agents are left as-is.
 
     Args:
         investigation_id: Investigation identifier.
@@ -1033,9 +971,9 @@ def investigation_unshare(
     agent_ids: list,
 ) -> str:
     """
-    Revoke access to an investigation for one or more agents.
-    Removes the given agent_ids from the investigation's ACL.
-    Idempotent — removing an agent not in the ACL has no effect.
+    Revoke investigation access from one or more agents.
+
+    Removes ``agent_ids`` from the ACL. Idempotent: missing agents are ignored.
 
     Args:
         investigation_id: Investigation identifier.
@@ -1071,12 +1009,11 @@ def investigation_export(
     include_embeddings: bool = False,
 ) -> str:
     """
-    Export an investigation as a portable JSON bundle suitable for archival or
-    transfer to another Loci instance.
+    Export an investigation as a portable JSON bundle.
 
-    Bundles the manifest, all findings, conflicts, and entities into a single
-    JSON string.  The ``include_embeddings`` parameter is accepted for forward
-    compatibility but embeddings are not yet included in the bundle (future work).
+    The bundle includes the manifest, findings, conflicts, and entities.
+    ``include_embeddings`` is accepted for forward compatibility, but embeddings
+    are not yet exported.
 
     Args:
         investigation_id: Investigation identifier to export.
@@ -1128,12 +1065,11 @@ def investigation_import(
     new_title: Optional[str] = None,
 ) -> str:
     """
-    Import an investigation bundle (produced by ``investigation_export``) into
-    this Loci instance under a brand-new investigation ID.
+    Import an ``investigation_export`` bundle under a new investigation ID.
 
-    A fresh UUID is always assigned — the original investigation ID is preserved
-    in the manifest as ``imported_from``.  Findings are re-indexed into Qdrant
-    on a best-effort basis (fail-open: Qdrant may be unavailable).
+    A fresh UUID is always assigned; the original ID is preserved as
+    ``imported_from``. Findings are re-indexed into Qdrant on a best-effort,
+    fail-open basis.
 
     Args:
         bundle_json: The JSON string produced by ``investigation_export`` (the

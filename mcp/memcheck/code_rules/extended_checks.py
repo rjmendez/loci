@@ -1,36 +1,22 @@
-"""Extended LLM code-hallucination checks — loci-owned.
+"""Loci-owned extensions for LLM code-hallucination checks.
 
-The vendored ``llm_hallucination_checks`` ruff plugin covers only H1, H3, H7,
-H9 of the upstream taxonomy
-(https://github.com/example/llm-code-hallucination-patterns). This module
-extends coverage to the FULL taxonomy (H1–H9, SD, SS, CP, SL, SB, AC, TEC,
-AT, PB, MF, DC, CD, OG, WG, MC) at the strongest fidelity that *static*
-analysis of a single ``.py`` file allows.
+The vendored ``llm_hallucination_checks`` plugin covers only H1, H3, H7, and
+H9 of the upstream taxonomy. This module extends static single-file ``.py``
+coverage across the full taxonomy (H1–H9, SD, SS, CP, SL, SB, AC, TEC, AT, PB,
+MF, DC, CD, OG, WG, MC) at the strongest fidelity static analysis allows.
 
-Design rules (do not violate):
+Rules:
+* **Loci-owned, not vendored.** New logic lives here; the vendored checker is
+  untouched. Reuse its ``Issue`` dataclass for a uniform output surface.
+* **Advisory-only.** Every issue is a warning; nothing blocks.
+* **Fail-safe per check.** Broken checks are skipped, not raised.
+* **stdlib only.** ``ast`` and ``re`` only.
+* **Honest confidence.** Confidence reflects how well a static signal predicts
+  the real failure mode, from ~0.70 AST structure down to 0.00 when no
+  reliable static signal exists.
 
-* **Loci-owned, not vendored.** All new logic lives here; the vendored
-  checker is never edited. We reuse its :class:`Issue` dataclass for a uniform
-  surface into :func:`memcheck.checks.run_code_checks`.
-* **Advisory-only.** Every issue is a warning (the caller sets
-  ``decision="warn"``); nothing here blocks.
-* **Fail-safe per check.** Any check that errors on a file is skipped, never
-  raised. The top-level :func:`run_extended_checks` swallows per-check errors.
-* **stdlib only.** ``ast`` + ``re``. No new deps.
-* **Honest confidence.** Each pattern records a confidence reflecting how
-  reliably a *static* signal maps to the real failure mode:
-    - clean AST structural check  ~0.70
-    - regex / source heuristic    ~0.45
-    - advisory grep-wrap of a Tier-3 / runtime-only pattern ~0.25
-    - ruff_core (already covered by F821/B015/etc. upstream) — noted, optional
-      light regex backstop
-    - genuinely no static signal   0.00 (recorded in PATTERN_META, no check)
-
-``PATTERN_META`` is the source of truth for the per-pattern status; the
-coverage matrix in ``CODE_RULES_COVERAGE.md`` is generated from the same facts.
-Every pattern id in the taxonomy appears in ``PATTERN_META`` even when there is
-no runnable check (``detection="advisory"``, ``confidence=0.0``) so nothing is
-silently dropped.
+``PATTERN_META`` is the source of truth. Every taxonomy ID appears there even
+when no runnable check exists, so nothing is silently dropped.
 """
 
 from __future__ import annotations

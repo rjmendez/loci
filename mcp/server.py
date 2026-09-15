@@ -2471,74 +2471,67 @@ def investigation_store(
     code_refs: str | list[str] | None = None,
 ) -> str:
     """
-    Record a finding in the investigation.
+    Record a finding in an investigation.
 
     Args:
         investigation_id: Investigation identifier.
-        finding_type: One of: observed, inferred, assumed, gap, procedure.
-                      observed  — from a direct tool response; cite source and key values.
-                      inferred  — reasoned from observations but not directly stated.
-                      assumed   — working hypothesis with no current evidence.
-                      gap       — something that should be checked but hasn't been.
-                      procedure — a reusable step-by-step procedure (runbook/playbook entry).
-        text: The finding. For observed, include enough detail to reproduce the
-              query (table name, time range, key field values).
+        finding_type: One of ``observed``, ``inferred``, ``assumed``, ``gap``,
+            ``procedure``.
+            ``observed`` comes from a direct tool response and should cite source
+            plus key values. ``inferred`` is reasoned from observations but not
+            directly stated. ``assumed`` is a working hypothesis with no current
+            evidence. ``gap`` is something that should be checked but has not
+            been. ``procedure`` is a reusable step-by-step runbook entry.
+        text: The finding text. For ``observed``, include enough detail to
+            reproduce the query, such as table name, time range, and key values.
         source: Tool or data source this came from (e.g. sentinel__run_kql_query).
         confidence: high / medium / low.
-        tags: Optional comma-separated tags, or a list of tag strings.
-              Both forms are accepted (e.g. "lateral_movement,phishing" or
-              ["lateral_movement", "phishing"]).
-        derived_from: Optional finding id(s) (or claim strings) this finding
-                      builds on — a single id or a list. Recorded as a
-                      forward-derivation link so a later hallucination retraction
-                      (memory_retract) can follow the lineage and clean up
-                      everything built on a false fact. Omit when the finding
-                      stands alone.
-        numeric_confidence: Optional float in [0.0, 1.0]. When omitted, auto-derived
-                            from string confidence: high→0.9, medium→0.6, low→0.3.
-                            Values outside [0,1] are clamped.
-        procedure_preconditions: (procedure only) Comma-separated or natural-language
-                                 preconditions that must be true before running the procedure.
+        tags: Optional comma-separated tags or a list of tag strings; both forms
+            are accepted.
+        derived_from: Optional finding IDs or claim strings this finding builds
+            on, as one ID or a list. Stored as forward derivation so
+            ``memory_retract`` can follow lineage and clean up everything built
+            on a false fact. Omit when the finding stands alone.
+        numeric_confidence: Optional float in ``[0.0, 1.0]``. When omitted it is
+            derived from string confidence: ``high→0.9``, ``medium→0.6``,
+            ``low→0.3``. Out-of-range values are clamped.
+        procedure_preconditions: ``procedure`` only. Preconditions as comma-
+            separated or natural-language text.
         procedure_steps: (procedure only) Numbered steps as a string.
         procedure_postconditions: (procedure only) Expected outcomes after the procedure.
-        valid_from: ISO8601 timestamp from which this finding is valid. Defaults
-                    to the current time when the finding is stored. Use to record
-                    a finding that was true at an earlier point in time.
-        valid_until: ISO8601 timestamp at which this finding ceased to be valid,
-                     or null (default) meaning it is currently believed to be true.
-                     Set when a finding has a known expiry or is superseded.
-        authored_by: Optional agent_id of the agent storing this finding.
-                     Used with investigation ACL to filter findings per agent.
-        tier: Memory tier — "hot", "warm", or "cold". Default "warm".
-              hot  — indexed in Qdrant AND summarized in manifest notes (instantly in-context).
-              warm — indexed in Qdrant only (default, searchable).
-              cold — stored in JSONL only, NOT indexed in Qdrant (archived).
-        resolution: Lifecycle state of the finding. One of:
-              open (default) — active/unresolved; the normal state for a new finding.
-              fixed          — the issue has been addressed/remediated.
-              intentional    — reviewed and deemed acceptable/by-design.
-              wontfix        — acknowledged but will not be actioned.
-              superseded     — replaced by a newer finding.
-              The three resolved states (fixed/intentional/wontfix) let
-              exclusion-aware grounding auto-skip handled items on re-audit.
-              Findings stored before this field existed read as "open".
-        code_refs: Optional comma-separated (or list of) file paths this finding
-                   refers to, e.g. "mcp/server.py,mcp/verify.py". Authoritative when
-                   provided: pass ``[]`` / ``""`` to assert "no refs" (text is NOT
-                   parsed). Only when omitted entirely (None) are refs best-effort
-                   parsed from ``text`` (tokens like "path/file.py:12").
-                   Each readable file's current sha256 is stamped so investigation_load
-                   / investigation_search can flag the finding ``stale`` once that file
-                   changes. Fully optional + fail-open: unreadable paths are skipped.
+        valid_from: ISO8601 timestamp from which the finding is valid. Defaults
+            to store time; use it for facts that were true earlier.
+        valid_until: ISO8601 timestamp when the finding stopped being valid, or
+            null/default for "currently believed true". Use it for known expiry
+            or supersession.
+        authored_by: Optional storing agent ID. Used with investigation ACLs to
+            filter findings per agent.
+        tier: ``"hot"``, ``"warm"``, or ``"cold"``; default ``"warm"``.
+            ``hot`` is Qdrant-indexed and summarized in manifest notes.
+            ``warm`` is Qdrant-indexed only. ``cold`` is JSONL-only and not
+            indexed in Qdrant.
+        resolution: Lifecycle state: ``open`` (default), ``fixed``,
+            ``intentional``, ``wontfix``, or ``superseded``. The resolved states
+            ``fixed``/``intentional``/``wontfix`` let exclusion-aware grounding
+            skip handled items on re-audit. Older findings without the field read
+            as ``open``.
+        code_refs: Optional comma-separated paths or a list of paths this
+            finding refers to, e.g. ``"mcp/server.py,mcp/verify.py"``.
+            Provided refs are authoritative: pass ``[]`` or ``""`` to assert
+            "no refs", and the text will not be parsed. Only ``None`` triggers
+            best-effort parsing from ``text`` (tokens like ``"path/file.py:12"``).
+            Each readable file's current sha256 is stamped so
+            ``investigation_load`` and ``investigation_search`` can later flag
+            the finding ``stale`` if the file changes. Fully optional and
+            fail-open: unreadable paths are skipped.
 
     Returns:
-        JSON: {"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
-               "mnemo_stored": true|false, "tier": "<tier>"}
-        On error: {"error": "<message>"}
+        JSON ``{"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
+        "mnemo_stored": true|false, "tier": "<tier>"}``, or ``{"error": ...}``.
 
-    Note on arg name: the second positional parameter is ``finding_type``, NOT
-    ``record_type``.  Call as:
-        investigation_store(inv_id, "observed", "text", "source", "high")
+    Note: the second positional parameter is ``finding_type``, not
+    ``record_type``. Call as
+    ``investigation_store(inv_id, "observed", "text", "source", "high")``.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -4426,36 +4419,35 @@ def memory_self_check(
     """
     Run the server's advisory memory self-check over stored findings.
 
-    Checks the investigation's own memory against the rules the server's reasoning
-    discipline states but cannot otherwise verify:
-      - provenance     — every ``observed`` finding should trace to an audit
-                         receipt; flags ones that don't (``unsupported_observed``).
-      - contradiction  — surfaces pairs of findings that appear to disagree
-                         (negation-polarity mismatch on overlapping text).
+    It verifies two rules the server otherwise cannot prove:
+    - ``provenance``: every ``observed`` finding should trace to an audit
+      receipt; missing ones become ``unsupported_observed`` verdicts.
+    - ``contradiction``: surfaces finding pairs that appear to disagree.
 
-    It also surfaces ``hallucination_candidates``: findings that are BOTH
-    unsupported (no receipt) AND contradicted by a receipted finding — the
-    strongest "stored a fact testing later disproved" signal. These carry a hint
-    to run ``memory_retract``; they are NEVER auto-retracted.
+    It also surfaces ``hallucination_candidates``: findings that are both
+    unsupported and contradicted by a receipted finding. These are the strongest
+    "stored a fact that later failed testing" signal and include a hint to run
+    ``memory_retract``. They are never auto-retracted.
 
-    This is **advisory only**: verdicts annotate and surface. Nothing is hidden,
-    deleted, or mutated — findings.jsonl stays append-only. Verdicts are computed
-    purely over the JSONL, so the check still works when qdrant is unavailable;
-    recording into the shared ``loci_verdicts`` collection is best-effort.
+    Advisory only: verdicts annotate and surface. Nothing is hidden, deleted, or
+    mutated; ``findings.jsonl`` stays append-only. Computation uses JSONL only,
+    so the check still works without Qdrant. Recording into
+    ``loci_verdicts`` is best-effort.
 
     Args:
         investigation_id: Investigation to check, or omit to check all.
         checks: Comma-separated subset of: provenance, contradiction.
         record: When true and qdrant is reachable, record verdicts for recall.
-        llm_verify: Opt into the deep_think -> loci semantic contradiction path —
-            an embedding subject gate + LLM polarity judge that supersedes the
-            lexical token-overlap heuristic (drops its false positives, catches
-            the semantic negations it misses). Default False keeps the check
-            pure/offline. Also enabled by env MEMCHECK_LLM_CONTRADICTION=1.
-            Fail-open: lexical verdicts pass through if embeddings/LLM are down.
+        llm_verify: Opt into the deep_think->loci semantic contradiction path:
+            embedding subject gate plus LLM polarity judge. It replaces the
+            lexical token-overlap heuristic, reducing its false positives and
+            catching semantic negations it misses. Default ``False`` keeps the
+            check pure/offline. Also enabled by env
+            ``MEMCHECK_LLM_CONTRADICTION=1``. Fail-open: lexical verdicts pass
+            through if embeddings or the LLM are unavailable.
 
     Returns:
-        JSON with per-investigation counts and the advisory verdicts.
+        JSON with advisory verdicts and per-investigation counts.
     """
     llm_verify = llm_verify or os.environ.get(
         "MEMCHECK_LLM_CONTRADICTION", ""
@@ -4746,29 +4738,22 @@ def code_memory_correlate(
     entity: Optional[str] = None,
 ) -> str:
     """
-    Link a detected code hallucination to the memories it contaminated.
+    Link a suspected code hallucination to contaminated memories.
 
-    The code->memory loop. When generated CODE references a fabricated entity (a
-    fake ``localhost`` endpoint, a hallucinated module/symbol) and that same
-    entity also seeded or contaminated stored MEMORIES, this surfaces the
-    contaminated memory lineage so it can be cleaned up. It bridges part-1 code
-    detection (``run_code_checks``) into the memory contagion/retraction machinery
-    (``find_contamination`` + the ``memory_retract`` resolution path).
+    This is the code→memory loop: if generated code references a fabricated
+    entity such as a fake ``localhost`` endpoint or hallucinated module/symbol,
+    and that entity also seeded stored memories, the tool surfaces the
+    contaminated lineage so it can be reviewed for cleanup.
 
-    Resolve the suspected-hallucinated entities one of two ways:
-      - ``entity`` given — that string (plus its distinctive entities) is the anchor.
-      - ``target_file`` given (an existing ``.py``) — run ``run_code_checks`` to
-        confirm code-hallucination verdicts, then anchor on the file's distinctive
-        entities (URLs/hosts/identifiers from its content) PLUS any flagged symbol
-        from the verdicts. A file with no LH issues is reported as such but still
-        correlated on its entities (advisory).
+    Resolve suspected entities either from ``entity`` directly, or from
+    ``target_file`` by running ``run_code_checks`` on an existing ``.py`` file
+    and anchoring on its distinctive entities plus any flagged symbol. A file
+    with no LH issues is still correlated on its entities and reported as
+    advisory-only. At least one of ``entity`` or ``target_file`` is required.
 
-    At least one of ``entity`` / ``target_file`` is required.
-
-    This is strictly **advisory and read-only**: it suggests running
-    ``memory_retract`` for review and NEVER mutates, retracts, or creates
-    anything on disk or in qdrant. Fail-open: qdrant/file/parse errors degrade to
-    a well-formed report rather than raising.
+    The tool is strictly advisory and read-only: it only suggests a follow-up
+    ``memory_retract`` call. Qdrant, file, and parse errors fail open into a
+    well-formed report instead of raising.
 
     Args:
         investigation_id: Investigation whose memories to correlate against.
@@ -4777,9 +4762,9 @@ def code_memory_correlate(
                 or endpoint) to anchor on directly.
 
     Returns:
-        JSON: {investigation_id, suspected_entities, source, code_findings?,
-        contaminated_memories: [{finding_id, excerpt, reasons}], already_retracted,
-        count, suggestion, advisory:true}.
+        JSON ``{investigation_id, suspected_entities, source, code_findings?,
+        contaminated_memories:[{finding_id, excerpt, reasons}],
+        already_retracted, count, suggestion, advisory:true}``.
     """
     if not str(entity or "").strip() and not str(target_file or "").strip():
         return json.dumps({
@@ -5270,45 +5255,41 @@ def _selftest_rollup(rows: list[dict]) -> tuple[str, str]:
 def retrieval_selftest(query: str = "system architecture", limit: int = 3,
                        collections: Optional[list] = None, scope: str = "queried") -> str:
     """
-    Prove every Qdrant collection can actually be retrieved from.
+    Prove Qdrant collections are actually retrievable.
 
-    memory_health inspects the substrate — is Qdrant up, do the embedders load —
-    but only for the collections it knows by name. A store usually holds more,
-    written by other ingests at other embedding widths, and those fail in a way
-    nothing reports: the query raises on a width mismatch, the caller catches it
-    per-collection, and the collection becomes indistinguishable from one that
-    simply had no match.
+    ``memory_health`` checks substrate wiring for named collections, but stores
+    often contain more collections from other ingests or embedding widths. Those
+    can fail with width mismatches that otherwise look like simple no-hit
+    searches. This tool answers the operational question directly: if queried,
+    does the collection return rows?
 
-    This sweeps the whole store and answers the operational question directly:
-    if I ask this collection something, do rows come back? Per collection it
-    reports points, dense width, sparse presence and hit count, classified as
-    ok | empty | no_results | width_mismatch | error, rolling up to
-    ok | degraded | unhealthy. Remediations are deduplicated — one unmapped
-    width usually explains many collections at once.
+    For each collection it reports points, dense width, sparse presence, and hit
+    count, classifying results as ``ok`` | ``empty`` | ``no_results`` |
+    ``width_mismatch`` | ``error`` and rolling them up to ``ok`` |
+    ``degraded`` | ``unhealthy``. Remediations are deduplicated because one
+    missing width mapping often explains many collections.
 
-    Read-only. Bypasses the cross-encoder and its relevance floor on purpose:
-    the floor is a relevance judgement and this is a question about wiring.
+    Read-only. It intentionally bypasses the cross-encoder and relevance floor:
+    those judge relevance, while this tool is checking retrieval wiring.
 
-    Scope matters more than it looks. A store accumulates collections this server
-    never queries — feature vectors at their own widths, corpora left over from
-    other tools — and sweeping them rolls a dozen irrelevant width mismatches into
-    the health verdict. A diagnostic that reports `degraded` because of things
-    nobody asks about teaches you to ignore it, which is the exact failure this
-    tool exists to prevent. So the default scope is what the server would actually
-    retrieve from.
+    Scope matters. Stores accumulate collections this server never queries, and
+    counting their width mismatches against overall health teaches operators to
+    ignore the diagnostic. The default scope is therefore the collections this
+    server would actually query.
 
     Args:
-        query: Probe text. Any in-domain phrase works; the point is retrievability.
+        query: Probe text. Any in-domain phrase works; the point is
+            retrievability, not semantic quality.
         limit: Rows to request per collection (default 3).
         collections: Probe exactly these. Overrides ``scope``.
-        scope: ``queried`` (default) — the collections this server retrieves from:
-               the findings collection plus the configured code-chunks collection.
-               ``all`` — every collection in the store, for an inventory; width
-               mismatches outside the queried set are reported but do NOT count
-               against health, since nothing asks them anything.
+        scope: ``queried`` (default) checks the findings collection plus the
+            configured code-chunks collection. ``all`` inventories the whole
+            store; width mismatches outside the queried set are still reported
+            but do not count against health because this server never asks them
+            anything.
 
     Returns:
-        JSON with {status, summary, scope, collections, remediations}.
+        JSON ``{status, summary, scope, collections, remediations}``.
     """
     client, _col = _get_qdrant()
     if client is None:
@@ -5377,20 +5358,18 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
 @mcp.tool()
 def memory_health(investigation_id: Optional[str] = None) -> str:
     """
-    Check the server's own memory substrate — a read-only self-diagnosis.
+    Check the memory substrate itself, read-only.
 
-    Where ``memory_self_check`` inspects what the server *remembered*, this inspects
-    the machinery that does the remembering: qdrant reachability and collection
-    layout, the dense/sparse embedders, the mnemosyne mirror wired into this
-    venv, vector-dimension consistency, retraction-log integrity, and a store
-    inventory. It's the server's equivalent of ``mnemosyne diagnose`` and would have
-    surfaced the silently-broken loci->mnemo mirror as a failed probe.
+    Where ``memory_self_check`` inspects what the server remembered, this checks
+    the machinery that remembers: Qdrant reachability and collection layout,
+    dense and sparse embedders, the Mnemosyne mirror in this venv,
+    vector-dimension consistency, retraction-log integrity, and store counts.
+    It is the server-side equivalent of ``mnemosyne diagnose``.
 
-    This tool is strictly **read-only**: it writes, mutates, retracts, and
-    creates nothing on disk or in qdrant. The single side effect it may incur is
-    a transient throwaway embed of a tiny string to confirm the embedder loads.
-    Every probe is wrapped fail-open — one failing check never crashes the tool;
-    it becomes a ``fail`` entry in the report instead.
+    Strictly read-only: it does not write, mutate, retract, or create anything
+    on disk or in Qdrant. The only possible side effect is a transient tiny
+    embed to confirm the embedder loads. Every probe is fail-open, so one broken
+    probe becomes a ``fail`` entry instead of crashing the tool.
 
     Args:
         investigation_id: Scope retraction/store checks to one investigation.
@@ -5398,10 +5377,10 @@ def memory_health(investigation_id: Optional[str] = None) -> str:
             checks summarize across all investigations.
 
     Returns:
-        JSON: {checked_at, status: ok|degraded|unhealthy, checks: [{name,
-        status, detail, remediation?}], summary}. ``status`` is rolled up from
-        the worst check — any fail -> unhealthy (degraded if also otherwise
-        usable), any warn -> degraded, all ok -> ok.
+        JSON ``{checked_at, status: ok|degraded|unhealthy,
+        checks:[{name,status,detail,remediation?}], summary}``. ``status`` is
+        the worst-check rollup: any fail -> unhealthy, any warn -> degraded,
+        otherwise ok.
     """
     checks: list[dict] = []
     # Explicit holder shared by the first three probes and the dimension check.
@@ -5693,36 +5672,38 @@ def memory_retract(
     scope_semantic: bool = True,
 ) -> str:
     """
-    Retract a hallucinated finding and its contaminated lineage — reversibly.
+    Retract a hallucinated finding and its contaminated lineage, reversibly.
 
-    When testing reveals a stored fact never existed (e.g. a fabricated
-    ``http://localhost:8080/v1/foo`` endpoint), everything built on it is
-    contaminated. This finds that lineage — by shared distinctive entities,
-    semantic proximity (qdrant), and forward ``derived_from`` links — and
-    soft-tombstones it so it drops out of recall/search/reflect. Nothing is
-    hard-deleted: ``findings.jsonl`` stays append-only and ``memory_restore``
-    reverses any retraction.
+    If testing proves a stored fact never existed, everything derived from it is
+    contaminated. This tool finds that lineage through shared distinctive
+    entities, semantic proximity in Qdrant, and forward ``derived_from`` links,
+    then soft-tombstones it so it drops out of recall, search, and reflect.
+    Nothing is hard-deleted: ``findings.jsonl`` stays append-only, and
+    ``memory_restore`` reverses retractions.
 
-    **Advisory-first**: ``dry_run`` defaults to True and changes NOTHING — it
-    returns the proposed cluster for review. Re-run with ``dry_run=False`` to
+    Advisory-first: ``dry_run`` defaults to ``True`` and changes nothing. It
+    returns the proposed cluster for review; re-run with ``dry_run=False`` to
     apply the soft tombstone.
 
     Args:
         investigation_id: Investigation identifier.
-        target: A finding id to retract, OR a claim/entity string (e.g. the
-                hallucinated URL) — its distinctive entities become the anchor.
+        target: A finding ID to retract, or a claim/entity string such as the
+            hallucinated URL. Distinctive entities from that text become the
+            anchor.
         reason: Why this is being retracted (e.g. "endpoint never existed —
                 confirmed by testing"). Recorded in the retraction + audit trail.
         dry_run: When True (default), return the proposed cluster and change
                  nothing. When False, apply the soft tombstone.
-        scope_semantic: Include qdrant semantic neighbors in the cluster
-                        (default True). Fails open — if qdrant is down, the
-                        entity + derivation scope still applies.
+        scope_semantic: Include Qdrant semantic neighbors in the cluster
+            (default ``True``). Fail-open: if Qdrant is down, entity and
+            derivation scope still apply.
 
     Returns:
-        dry_run=True  -> {seed_ids, would_retract:[{finding_id, text_excerpt,
-                          reasons}], count, applied:false, advisory:...}
-        dry_run=False -> {seed_ids, retracted:[...], count, applied:true, ...}
+        ``dry_run=True`` returns
+        ``{seed_ids, would_retract:[{finding_id, text_excerpt, reasons}], count,
+        applied:false, advisory:...}``.
+        ``dry_run=False`` returns
+        ``{seed_ids, retracted:[...], count, applied:true, ...}``.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -6624,42 +6605,44 @@ def rag_context_search(
     expand_query: Optional[bool] = None,
 ) -> str:
     """
-    Hybrid RAG search over Qdrant corpus. Returns prompt-ready context with cited sources.
-    ALWAYS uses Qdrant — no keyword fallback. Raises rag_required error if Qdrant unavailable.
+    Run hybrid RAG over Qdrant and return prompt-ready cited context.
 
-    Searches QDRANT_COLLECTION_PREFIX (default "loci_memory", the findings) plus
-    CODE_CHUNKS_COLLECTION when that env var is set, merges, reranks with a
-    cross-encoder and assembles cited context.
+    This tool always uses Qdrant: there is no keyword fallback, and missing
+    Qdrant returns ``rag_required``. By default it searches
+    ``QDRANT_COLLECTION_PREFIX`` (usually ``"loci_memory"``) plus
+    ``CODE_CHUNKS_COLLECTION`` when configured, then merges results, reranks
+    them with a cross-encoder, and assembles cited context.
 
-    This used to claim it searched "agent_core_chunks (1.84M knowledge base)" by
-    default. It does not, and never did — the defaults are built from those two env
-    vars at :6606. On this deployment the second is dama_gotchi_code, and
-    agent_core_chunks is a 6.06M-point DAMA telemetry lake that is 86% GPS
-    trajectory points and 0.18% code. Naming it here sent callers to override
-    `collections` with it, which is slow and returns telemetry.
+    Important default note: the default collections come only from those two env
+    vars. The docstring used to claim an ``agent_core_chunks`` default; it never
+    existed. On this deployment that collection is a large DAMA telemetry lake,
+    mostly GPS points and barely any code, so overriding into it is usually slow
+    and irrelevant.
 
     Args:
         query: Natural language search query.
         limit: Results per collection (default 10).
-        collections: Override the collections list. The DEFAULT is
-                     [QDRANT_COLLECTION_PREFIX] + [CODE_CHUNKS_COLLECTION if set],
-                     NOT agent_core_chunks — see the note above before overriding.
+        collections: Override the collection list. The default is
+            ``[QDRANT_COLLECTION_PREFIX] + [CODE_CHUNKS_COLLECTION if set]``,
+            not ``agent_core_chunks``.
         budget_chars: Max characters in assembled context (default 6000).
-        exclude_types: Payload 'type' values to exclude from agent_core_chunks results.
-                       Default None → ['gps_trajectory'] to suppress high-volume GPS pings.
-                       Pass [] to disable filtering.
-        decay: If True (default), apply Ebbinghaus exponential time-decay rescoring to
-               findings from the main investigation collection before ranking.
-               Set False to disable decay and use raw similarity scores.
-        expand_query: Fan retrieval out over LLM-generated query paraphrases + keywords
-               (query_expand) before the cross-encoder re-pass, lifting recall. None
-               (default) reads env LOCI_RAG_EXPAND (default ON); True/False force it.
-               Fail-open: if the local generator is unavailable, falls back to the bare
-               query with no error. Gated on judge-eval evidence: +4% nDCG@10, no regression.
+        exclude_types: Payload ``type`` values to exclude from
+            ``agent_core_chunks``-style results. ``None`` defaults to
+            ``['gps_trajectory']`` to suppress high-volume GPS pings. Pass
+            ``[]`` to disable filtering.
+        decay: If ``True`` (default), apply Ebbinghaus exponential time-decay
+            rescoring to findings from the main investigation collection before
+            ranking. Set ``False`` to keep raw similarity scores.
+        expand_query: Expand retrieval with local-model paraphrases and keywords
+            from ``query_expand`` before the cross-encoder repass. ``None``
+            reads env ``LOCI_RAG_EXPAND`` (default on); ``True``/``False``
+            force it. Fail-open: if the local generator is unavailable, the tool
+            falls back to the original query. Enabled because judge evals showed
+            ``+4% nDCG@10`` with no regression.
 
     Returns:
-        JSON with {query, context, sources, total_chars, truncated, result_count, mode,
-                   collections_searched, qdrant_available}
+        JSON ``{query, context, sources, total_chars, truncated, result_count,
+        mode, collections_searched, qdrant_available}``.
     """
     if not query or not query.strip():
         return json.dumps({"error": "query must not be empty", "results": [], "query": query})
@@ -7708,33 +7691,32 @@ def investigation_reason(
     ground_threshold: float = 0.59,
     persist: bool = False,
 ) -> str:
-    """Reason over an investigation's findings with grounded, multi-perspective analysis.
+    """Reason over an investigation with grounded, multi-perspective analysis.
 
-    The in-server complement to the deep_think_loci Workflow: it fuses the merge's
-    two pieces of tech in-process — the **grounding gate** (embed the question +
-    each finding, keep only on-topic findings, dropping cross-target RAG-bleed)
-    and **deep_think fan-out** (N adversarial perspectives + a synthesis that
-    extracts converged vs contested claims). Runs N+1 LLM calls inline; intended
-    as an explicit, user-invoked "reason now" call, not a hot path.
+    This is the in-server counterpart to the deep_think_loci workflow. It runs
+    an on-topic grounding gate over findings, then fans out to N adversarial
+    perspectives plus one synthesis step that extracts converged and contested
+    claims. It makes ``N+1`` inline LLM calls, so it is for explicit "reason
+    now" use, not hot paths.
 
-    Requires an LLM endpoint (Ollama by default; anthropic/copilot if a key is
-    set). Fail-soft: returns an ``error`` field if the LLM is unreachable rather
-    than raising.
+    Requires an LLM endpoint (Ollama by default; Anthropic/Copilot when keys are
+    set). Fail-soft: returns an ``error`` field instead of raising if the LLM is
+    unreachable.
 
     Args:
         investigation_id: Investigation whose findings ground the reasoning.
         question:         The question/problem to reason about.
-        perspectives:     Number of adversarial perspectives (1-5). Default 3.
-        ground_threshold: Per-finding cosine keep threshold for the grounding
-                          gate (deep_think_loci convention: 0.59). Findings below
-                          it are dropped as off-topic before any model reasons.
-        persist:          If True, store each converged claim as an ``inferred``
-                          finding (source=investigation_reason). Default False.
+        perspectives: Number of adversarial perspectives (1-5). Default 3.
+        ground_threshold: Per-finding cosine threshold for the grounding gate.
+            Deep-think convention is ``0.59``; lower-scoring findings are
+            dropped as off-topic before any model reasons.
+        persist: If ``True``, store each converged claim as an ``inferred``
+            finding with ``source=investigation_reason``. Default ``False``.
 
     Returns:
-        JSON: {investigation_id, question, perspectives_used, grounded_findings,
-               gate_applied, confidence_score, converged_claims, contested_areas,
-               final_answer, persisted_finding_ids}.
+        JSON ``{investigation_id, question, perspectives_used,
+        grounded_findings, gate_applied, confidence_score, converged_claims,
+        contested_areas, final_answer, persisted_finding_ids}``.
     """
     from memcheck import llm as _llm
     from memcheck.checks.contradiction_llm import extract_json as _extract_json
@@ -8024,29 +8006,25 @@ def memory_hints(
     since_ts: Optional[str] = None,
 ) -> str:
     """
-    Return the most recent findings for an investigation as lightweight hints.
+    Return recent findings for an investigation as lightweight hints.
 
-    Suitable for polling after investigation_store to surface "what changed
-    recently" without loading the full investigation context.  Assigns a
-    recency_score (1.0 / (1 + age_hours)) to each hint so callers can rank
-    them by freshness.
+    This is suited for polling after ``investigation_store`` when callers want
+    "what changed recently" without reloading full context. Each hint carries
+    ``recency_score = 1.0 / (1 + age_hours)`` so callers can rank freshness.
 
-    The in-process session ring buffer (populated by investigation_store) is
-    preferred for speed; the tool falls back to reading findings.jsonl when
-    the ring buffer is empty (e.g. after a server restart).
+    The in-process session ring buffer is preferred for speed; if empty, the
+    tool falls back to ``findings.jsonl`` (for example after a server restart).
 
     Args:
         investigation_id: Investigation identifier.
         limit: Maximum number of hints to return (default 3, max 20).
-        since_ts: Optional ISO-8601 timestamp.  When provided, only findings
-                  with ts > since_ts are returned.  Use the ``as_of`` field
-                  from the previous response as the next ``since_ts`` to poll
-                  for changes incrementally.
+        since_ts: Optional ISO-8601 timestamp. When provided, only findings
+            with ``ts > since_ts`` are returned. Use the previous response's
+            ``as_of`` as the next ``since_ts`` for incremental polling.
 
     Returns:
-        JSON: {investigation_id, hints: [{finding_id, text, source,
-               record_type, recency_score, ts}], count, as_of}
-        On error: {"error": "<message>"}
+        JSON ``{investigation_id, hints:[{finding_id, text, source,
+        record_type, recency_score, ts}], count, as_of}``, or ``{"error": ...}``.
     """
     try:
         manifest = _load_manifest(investigation_id)
