@@ -1,22 +1,18 @@
-"""Grounding-injection for Loci-native workflows.
+"""Grounding injection for Loci-native workflows.
 
-`ground(task)` runs ONCE in the main loop before a fan-out and returns a compact,
-provenance-tagged, char-budgeted context block to inject into every agent prompt —
-so agents start with relevant prior knowledge instead of rediscovering it, and never
-each hit Loci themselves (cost).
+``ground(task)`` runs once before fan-out and returns a compact,
+provenance-tagged, char-budgeted block for every agent prompt, so agents start
+from relevant prior knowledge instead of each re-querying Loci.
 
-Design (from the Loci self-review plan):
-- STRUCTURED-FIRST, embedding-independent retrieval is the quality path: curated
-  memory files -> investigation_load(named case) -> investigation_entity_lookup(exact
-  IDs) -> code graph (when available). Semantic RAG and filtered keyword recall are
-  optional enhancements that no-op when down (degraded=True) rather than blocking.
-- filter_noise() drops pre_compress/session_end conversation-dump blobs that otherwise
-  pollute keyword/FTS recall.
-- Budget cascade: unused budget from an empty/skipped source rolls to the next.
-- Fail-open everywhere: a dead source never aborts grounding.
+Design:
+- Structured-first retrieval: curated memory files -> named cases ->
+  exact entities -> code graph -> semantic RAG -> optional keyword recall.
+- ``filter_noise()`` removes conversation-dump blobs from noisy recall lanes.
+- Unused budget rolls forward to later lanes.
+- Every lane is fail-open: dead sources set ``degraded=True`` instead of aborting.
 
-All Loci calls are lazy-imported from `server` so importing this module is cheap and
-does not create an import cycle.
+Loci calls are lazy-imported from ``server`` to keep import cost low and avoid
+an import cycle.
 """
 from __future__ import annotations
 
@@ -61,8 +57,11 @@ def _wrap_untrusted_memory_text(
 
 
 def _default_memory_dir() -> str:
-    """Curated MEMORY.md dir via backends (env -> gitignored config -> LOCI_MEMORY_DIR).
-    No machine/user-specific default — if nothing is configured the memory lane just no-ops."""
+    """Resolve the curated ``MEMORY.md`` dir via backends.
+
+    Lookup order: env -> gitignored config -> ``LOCI_MEMORY_DIR``. There is no
+    machine-specific fallback; if nothing is configured, the memory lane no-ops.
+    """
     try:
         import backends
         return backends.memory_dir()
@@ -97,10 +96,10 @@ def _looks_like_dump(text: str) -> bool:
 
 
 def filter_noise(items: list[dict]) -> list[dict]:
-    """Drop conversation-dump blobs + duplicates from fuzzy (keyword/FTS) results.
+    """Drop conversation dumps and duplicates from fuzzy keyword/FTS results.
 
-    Each item: {text, source?, type?, tags?, score?}. Curated/structured sources
-    should NOT be passed through this — it is only for the noisy recall lanes.
+    Each item is ``{text, source?, type?, tags?, score?}``. Use this only on
+    noisy recall lanes, not curated or structured sources.
     """
     out: list[dict] = []
     seen: set = set()
@@ -151,14 +150,15 @@ _RAG_BUDGET_FLOOR = 2000
 
 def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
                          min_score: int = 2) -> list[tuple[str, str, str]]:
-    """Top-`limit` MEMORY.md entries that share enough DISTINCTIVE tokens with the task.
-    Returns [(slug, index_line, body)] with bodies read. Fail-open.
+    """Return up to ``limit`` ``MEMORY.md`` entries that share enough distinctive
+    task tokens. Output is ``[(slug, index_line, body)]``. Fail-open.
 
-    A candidate must share >= `min_score` tokens AND >= 1 *distinctive* token (len >=
-    _MEM_DISTINCTIVE) — otherwise two incidental English words ("event", "single") from
-    an unrelated memory pass the bar and inject off-topic noise. Ranked by a weight that
-    counts distinctive tokens double. Capped so a fuzzy match never crowds out the precise
-    (case/RAG) lanes."""
+    A candidate must share at least ``min_score`` tokens and at least one
+    distinctive token (length ``>= _MEM_DISTINCTIVE``); otherwise incidental
+    English overlap would leak unrelated memory into the prompt. Distinctive
+    tokens count double in ranking. The lane is capped so fuzzy memory matches
+    cannot crowd out precise case or RAG lanes.
+    """
     out: list[tuple[str, str, str]] = []
     try:
         d = Path(memory_dir)
@@ -201,11 +201,12 @@ def _jload(s: Any) -> dict | list | None:
 
 
 def ground(task: dict, opts: Optional[dict] = None) -> dict:
-    """Assemble a grounding block for a task. Returns
-    {block: str, sources: [str], chars: int, degraded: bool}. Fail-open.
+    """Assemble a fail-open grounding block for a task.
 
-    task: {title, focus?, caseIds?:[str], entities?:[str], codeRefs?:[str]}
-    opts: {budgetChars=4000, memoryDir=..., allowKeyword=False, graphAvailable=False}
+    Returns ``{block: str, sources: [str], chars: int, degraded: bool}``.
+    ``task`` is ``{title, focus?, caseIds?, entities?, codeRefs?}``.
+    ``opts`` is ``{budgetChars=4000, memoryDir=..., allowKeyword=False,
+    graphAvailable=False}``.
     """
     opts = opts or {}
     budget = int(opts.get("budgetChars", 4000))

@@ -1,15 +1,14 @@
-"""Investigation storage layer — split out of server.py (P2b of the Loci self-review).
+"""On-disk investigation storage, split from server.py.
 
-Everything here is the on-disk investigation store: the per-investigation directory
-layout under the memory root, the JSONL append/read primitives, manifest load/save
-(with its write-through cache), and the small pure helpers the read paths share.
+This module owns per-investigation directory layout, JSONL append/read helpers,
+manifest load/save with a write-through cache, and small pure helpers shared by
+read paths.
 
-The memory root is INJECTED, not imported: server.py passes a lambda closing over
-its own memory-root global to ``register()``, so tests that rebind that global to a
-tmpdir keep steering every write here. This module deliberately holds no copy of
-that root and no module-level default for it — a default would silently resolve to
-the operator's real ~/.hermes/memory-sessions the moment one reference was missed,
-while fail-open behaviour kept the tests green. Everything goes through _root().
+The memory root is injected, not imported: server.py passes a lambda closing
+over its own global so tests that rebind that root still steer every write.
+This module keeps no default root because one missed reference would silently
+hit the operator's real store while fail-open behavior hid the mistake.
+Everything goes through ``_root()``.
 """
 from __future__ import annotations
 
@@ -87,11 +86,10 @@ _NEUTRAL_NUMERIC_CONFIDENCE = 0.6
 def _node_numeric_confidence(node: dict) -> float:
     """The confidence a stored finding contributes to a derived_from chain product.
 
-    Absence is not certainty. A record whose writer never stamped numeric_confidence
-    has no measured value, and scoring that 1.0 puts it at the TOP of the scale — it
-    reads as perfect certainty and, because the chain is a product, stops the record
-    constraining the aggregate at all. Fall back to the record's own confidence label,
-    then to the same neutral 0.6 _store_numeric_confidence uses when there is no label.
+    Absence is not certainty. Missing ``numeric_confidence`` must not become
+    ``1.0``, or the record reads as perfect certainty and stops constraining the
+    chain product. Fall back to the record's confidence label, then to the same
+    neutral ``0.6`` ``_store_numeric_confidence`` uses when no label exists.
     """
     nc = node.get("numeric_confidence")
     if nc is not None:
@@ -207,8 +205,8 @@ def _load_manifest(investigation_id: str) -> dict | None:
 def _atomic_write_text(path: Path, data: str) -> None:
     """Write ``data`` to ``path`` atomically via a same-directory temp file.
 
-    The temp file is removed and the error re-raised if anything fails, so a
-    failed write never leaves a partial file or stray temp behind.
+    On failure, remove the temp file and re-raise so no partial or stray file is
+    left behind.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -237,8 +235,8 @@ def _save_manifest(manifest: dict) -> None:
 def _acquire_file_lock(fd: int, path: Path, *, exclusive: bool, timeout_s: float | None = None) -> None:
     """Bounded advisory lock with short exponential backoff.
 
-    Raises StoreBusyError when the lease stays contended past the timeout so the
-    caller can return a retryable "busy" result instead of hanging until the
+    Raises ``StoreBusyError`` when contention outlives the timeout so callers
+    can return a retryable ``"busy"`` result instead of hanging until the
     transport dies.
     """
     timeout = _STORE_LOCK_TIMEOUT_S if timeout_s is None else float(timeout_s)

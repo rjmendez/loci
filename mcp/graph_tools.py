@@ -1,8 +1,7 @@
-"""Code<->memory graph MCP tools — split out of server.py (P1 of the Loci self-review).
+"""Code↔memory graph MCP wrappers, split from server.py.
 
-Thin wrappers over the graph.* layer; they need only a _get_ladybug accessor, injected by
-register(). server.py calls register(mcp, _get_ladybug) after the FastMCP instance exists,
-so the tools register identically (FastMCP reads each function signature + docstring).
+These thin wrappers sit on ``graph.*`` and only need the injected
+``_get_ladybug`` accessor from register().
 """
 import json
 import logging
@@ -16,19 +15,20 @@ _get_ladybug = None  # injected by register()
 
 def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool = False) -> str:
     """
-    Parse a source file or directory with tree-sitter and ingest its symbol graph
-    into the Kuzu code graph (CodeFile / CodeSymbol nodes; DEFINES / CALLS / IMPORTS
-    edges). Enables ``code_graph_query`` and the AST-backed code<->memory linkage.
+    Parse a source file or directory with tree-sitter and ingest its symbol
+    graph into LadybugDB. Enables ``code_graph_query`` and code↔memory linkage.
 
-    Supports python, java, kotlin, rust, javascript, typescript/tsx, go (c/c++
-    parse but currently yield file-level nodes only). Binary/oversized files and
-    common vendor dirs (.git, node_modules, .venv, build, dist, target) are skipped.
+    Supports python, java, kotlin, rust, javascript, typescript/tsx, and go;
+    c/c++ currently produce file-level nodes only. Binary or oversized files and
+    common vendor dirs (``.git``, ``node_modules``, ``.venv``, ``build``,
+    ``dist``, ``target``) are skipped.
 
-    Ingest is additive (MERGE) by default. When ``replace=True`` the existing
-    CodeFile/CodeSymbol nodes under this ``path`` (and their DEFINES/CALLS/IMPORTS
-    edges + inbound REFERENCES) are deleted BEFORE parsing, so re-ingesting a
-    moved or updated checkout stays idempotent and drops stale-path nodes. Only
-    code nodes are pruned — Findings / Investigations / Entities are untouched.
+    Ingest is additive by default. With ``replace=True``, existing
+    ``CodeFile``/``CodeSymbol`` nodes under ``path`` plus their
+    ``DEFINES``/``CALLS``/``IMPORTS`` edges and inbound ``REFERENCES`` are
+    deleted before parsing, keeping re-ingest idempotent and removing stale
+    paths. Only code nodes are pruned; findings, investigations, and entities
+    are untouched.
 
     Args:
         path: A source file or a directory root to walk.
@@ -37,8 +37,8 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool 
             (idempotent re-ingest). Default False preserves additive behaviour.
 
     Returns:
-        JSON with per-run counts {files, symbols, defines, calls, imports} (and a
-        ``pruned`` block when ``replace`` is set) or an error.
+        JSON with per-run counts ``{files, symbols, defines, calls, imports}``
+        plus ``pruned`` when ``replace`` is set, or an error.
     """
     ks = _get_ladybug()
     if not ks:
@@ -73,13 +73,12 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool 
 
 def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     """
-    Run a READ-ONLY Cypher query against the LadybugDB graph (code symbols + findings +
-    entities + investigations) and return the rows.
+    Run a read-only Cypher query against the LadybugDB graph and return rows.
 
-    Write-shaped queries (CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER) are rejected —
-    this tool never mutates the graph. Use it for impact analysis and traversal, e.g.
-    finding callers of a symbol, symbols a file defines, or findings that reference a
-    given CodeSymbol.
+    Write-shaped queries (``CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER``) are
+    rejected: this tool never mutates the graph. Use it for traversal or impact
+    analysis, e.g. callers of a symbol, symbols defined by a file, or findings
+    that reference a ``CodeSymbol``.
 
     Node tables: CodeFile(path,lang), CodeSymbol(id,name,kind,file,line,lang),
       Finding(id,investigation,ftype,text,confidence,source,ts), Entity(name,etype,distinctive),
@@ -89,14 +88,15 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
       DERIVED_FROM(Finding->Finding), IN_INVESTIGATION(Finding->Investigation),
       RELATED(Investigation->Investigation).
 
-    Example: MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol {name:'helper'}) RETURN c.id, c.file
+    Example: ``MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol {name:'helper'}) RETURN c.id, c.file``
 
     Args:
         cypher: A read-only Cypher query.
         params: Optional parameter dict for ``$name`` placeholders.
 
     Returns:
-        JSON with {rows: [...], row_count} or an error (including a write-guard rejection).
+        JSON ``{rows: [...], row_count}`` or an error, including write-guard
+        rejection.
     """
     ks = _get_ladybug()
     if not ks:
@@ -113,17 +113,17 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
 
 def code_memory_relink() -> str:
     """
-    (Re)build all Finding -> CodeSymbol REFERENCES edges across the whole graph.
+    Rebuild all ``Finding -> CodeSymbol`` ``REFERENCES`` edges.
 
-    Scans every Finding's text and links it to the CodeSymbols it distinctively
-    names (precision-focused: distinctive types / explicit ``symbol:`` markers /
-    ``File.ext`` mentions / unique long identifiers — never bare common words).
-    Idempotent (MERGE). Run this after ingesting code with ``code_graph_ingest``
-    so already-stored findings get connected; new findings auto-link on write.
+    Scans every finding's text and links distinctive symbol mentions: typed
+    entities, explicit ``symbol:`` markers, ``File.ext`` mentions, and unique
+    long identifiers, but never bare common words. Idempotent. Run it after
+    ``code_graph_ingest`` so old findings gain links; new findings auto-link on
+    write.
 
     Returns:
-        JSON ``{"findings_scanned": int, "links_created": int}`` (zeros if the
-        graph store is unavailable).
+        JSON ``{"findings_scanned": int, "links_created": int}``. Returns an
+        error if the graph store is unavailable.
     """
     ks = _get_ladybug()
     if not ks:
@@ -145,12 +145,11 @@ def code_memory_relink() -> str:
 
 def code_memory_map(anchor: str, anchor_type: str = "auto", hops: int = 1) -> str:
     """
-    Map the code<->memory neighbourhood around an anchor node as a subgraph.
+    Return the code↔memory neighborhood around an anchor as a subgraph.
 
-    Walks up to ``hops`` steps from the anchor over all edge types (CALLS,
-    DEFINES, REFERENCES, IN_INVESTIGATION, MENTIONS, ...) and returns the nodes
-    and edges around it — the concrete bridge between a code symbol and the
-    findings/investigations that touch it (and vice-versa).
+    Walks up to ``hops`` steps across all edge types (``CALLS``, ``DEFINES``,
+    ``REFERENCES``, ``IN_INVESTIGATION``, ``MENTIONS``, ...), showing which code
+    symbols, findings, and investigations touch the anchor.
 
     Args:
         anchor: The anchor's key — a CodeSymbol name, Finding id, Investigation
@@ -197,12 +196,10 @@ def code_memory_map(anchor: str, anchor_type: str = "auto", hops: int = 1) -> st
 
 def symbol_impact(symbol: str, hops: int = 3) -> str:
     """
-    Blast radius of a code symbol across code and memory.
+    Return the blast radius of a code symbol across code and memory.
 
-    Combines the transitive CALLS callers that reach ``symbol`` (up to ``hops``)
-    with the Findings — and their Investigations — that REFERENCE the symbol or
-    any of those callers. Answers "if this symbol is broken, which prior
-    findings/investigations are implicated, and what calls into it?"
+    Combines transitive callers of ``symbol`` (up to ``hops``) with findings and
+    investigations that reference the symbol or those callers.
 
     Args:
         symbol: A CodeSymbol id (``file::Qualname``) or a bare symbol name.
@@ -225,21 +222,19 @@ def symbol_impact(symbol: str, hops: int = 3) -> str:
 
 def impact_report(symbol: str, hops: int = 3) -> str:
     """
-    Change blast radius for a code symbol or class: who calls it (transitively) and
-    which findings / investigations reference it or its callers.
+    Report the change blast radius of a code symbol or class.
 
-    Answers "if I change this, what code and what prior analysis is affected?".
-    For a class name it also folds in the class's own methods. Composes the
-    graph.analytics.impact_report primitive over the code<->memory graph.
+    Shows transitive callers plus findings and investigations that reference the
+    symbol or its callers. For a class name, folds in the class's own methods.
 
     Args:
         symbol: A CodeSymbol name (method or class), e.g. "EskfFusion" or "updateGps".
         hops: Transitive CALLS depth for callers (default 3, max 6).
 
     Returns:
-        JSON with resolved symbols, direct + transitive caller counts, the count of
-        referencing findings, affected investigations (by finding count, with samples),
-        and the symbols most co-referenced with it. Empty structure if unavailable.
+        JSON with resolved symbols, direct and transitive caller counts,
+        referencing-finding count, affected investigations with samples, and the
+        most co-referenced symbols. Empty structure if unavailable.
     """
     ks = _get_ladybug()
     if not ks:
@@ -254,18 +249,15 @@ def impact_report(symbol: str, hops: int = 3) -> str:
 
 def finding_code_context(finding_id: str) -> str:
     """
-    The code a finding references, each symbol wrapped with its callers/callees.
-
-    Attach concrete code context when reviewing a finding — the CodeSymbols it
-    mentions plus each one's immediate call neighbourhood — so you can judge the
-    claim against the actual code. Composes graph.analytics.finding_code_context.
+    Return the code a finding references, with each symbol's immediate
+    caller/callee neighborhood. Use it to review a claim against actual code.
 
     Args:
         finding_id: The Finding id to contextualize.
 
     Returns:
-        JSON {finding_id, text, symbols:[{id,name,kind,file,line,callers,callees}]}.
-        Empty symbols if the finding references no code (or is unavailable).
+        JSON ``{finding_id, text, symbols:[{id,name,kind,file,line,callers,callees}]}``.
+        ``symbols`` is empty when the finding references no code or is unavailable.
     """
     ks = _get_ladybug()
     if not ks:
@@ -280,12 +272,12 @@ def finding_code_context(finding_id: str) -> str:
 
 def investigation_code_briefing(investigation_id: str, top: int = 3) -> str:
     """
-    The code story of an investigation: what code it touches, the blast radius of its
-    most-analysed symbols, and which other investigations share that code.
+    Summarize an investigation's code footprint, its hottest-symbol blast
+    radius, and other investigations that touch the same code.
 
-    A one-call briefing composed from investigation_footprint + impact_report (over the
-    investigation's hotspot symbols) + related_investigations_via_code. Use it to onboard
-    onto a case or see how it connects to the codebase and to other cases.
+    Composes ``investigation_footprint``, ``impact_report`` on hotspot symbols,
+    and ``related_investigations_via_code``. Useful for onboarding or tracing
+    how a case connects to the codebase.
 
     Args:
         investigation_id: The investigation to brief.
@@ -309,12 +301,11 @@ def investigation_code_briefing(investigation_id: str, top: int = 3) -> str:
 
 def subsystem_report(anchor: str, limit: int = 15) -> str:
     """
-    Full picture of a subsystem: the code under a file path or path/package prefix,
-    its call boundary (who calls in / what it calls out), the symbols most analysed
-    in memory, and which investigations touch it.
+    Report a subsystem's code boundary, memory hotspots, and linked
+    investigations.
 
-    Give a file (".../EskfFusion.java"), a directory, or a package prefix. Composes
-    graph.analytics.subsystem_report over the code<->memory graph.
+    ``anchor`` may be a file, directory, or path/package prefix. Composes
+    ``graph.analytics.subsystem_report`` over the code↔memory graph.
 
     Args:
         anchor: A CodeFile path, or a path/package prefix matching several files.
@@ -337,18 +328,18 @@ def subsystem_report(anchor: str, limit: int = 15) -> str:
 
 def related_investigations_via_code(investigation_id: str, limit: int = 15) -> str:
     """
-    Other investigations that reference the SAME code symbols as this one.
+    List investigations that reference the same code symbols as this one.
 
-    Code-mediated case linkage: surfaces prior investigations that touched the same
-    subsystem (shared CodeSymbols), ranked by overlap — even when they share no
-    entities or text. Composes graph.analytics.related_investigations_via_code.
+    This is code-mediated case linkage: it finds overlapping subsystems even
+    when investigations share no entities or text.
 
     Args:
         investigation_id: The investigation to find code-neighbours for.
         limit: Max related investigations (default 15).
 
     Returns:
-        JSON list of {investigation, shared_symbols, sample_symbols}, ranked desc.
+        JSON list of ``{investigation, shared_symbols, sample_symbols}``, ranked
+        by overlap descending.
     """
     ks = _get_ladybug()
     if not ks:
@@ -364,13 +355,12 @@ def related_investigations_via_code(investigation_id: str, limit: int = 15) -> s
 
 def dead_code_candidates(lang: Optional[str] = None, limit: int = 50) -> str:
     """
-    Functions/methods with no code caller and no finding reference — a reliable
-    dead-code list with framework entry points (@mcp.tool, @app.route, @property…),
-    private (_), test, and dunder symbols excluded.
+    List dead-code candidates: functions or methods with no code caller and no
+    finding reference.
 
-    Requires an ingested code graph (code_graph_ingest). Call-graph recall varies by
-    language (Python is sparser than Java/Kotlin), so treat results as candidates to
-    verify. Composes graph.analytics.dead_code_candidates.
+    Framework entry points (``@mcp.tool``, ``@app.route``, ``@property``...),
+    private names, tests, and dunder symbols are excluded. Requires an ingested
+    code graph. Call-graph recall varies by language, so verify results.
 
     Args:
         lang: Optional filter — "python" / "java" / "kotlin" / etc.

@@ -1,26 +1,20 @@
-"""memcheck CLI — the PreToolUse hook entrypoint (audit-only).
+"""memcheck CLI, the audit-only PreToolUse hook entrypoint.
 
-Invoked as ``python -m memcheck.cli <subcommand>``. The headline subcommand is
-``check-action`` (also the default), wired to a Claude Code ``PreToolUse`` hook
-that fires on every action-bearing tool call. Because it sits in the hot path of
-every tool call, it is built to three rules, in priority order:
+Run as ``python -m memcheck.cli <subcommand>``. The main subcommand is
+``check-action`` (also the default), wired into Claude Code's ``PreToolUse``
+hook for every action-bearing tool call.
 
-1. **FAST** — lazy imports, a deterministic hash embedder (no model load), a
-   single qdrant ``retrieve`` + one ``upsert``, and a short (~1s) qdrant
-   timeout. Worst case is a quick exit 0.
-2. **FAIL-OPEN** — *any* error (bad JSON, missing fields, import error, qdrant
-   down, timeout) results in writing nothing to stdout and ``sys.exit(0)``.
-   ``check-action`` is structurally incapable of a non-zero exit or non-empty
-   stdout on either the normal or the error path.
-3. **AUDIT-ONLY** — observe and record; never block, never auto-approve. The
-   hook contract reads: exit 0 + empty stdout = "no opinion, proceed normally".
-   We never emit ``{"decision":"approve"}`` (that would bypass the user's
-   permission prompt) and never emit a block / exit 2 (that would block the
-   tool). All diagnostics go to the audit log file or stderr, never to the
-   structured stdout the hook parses.
+Hot-path rules, in priority order:
+1. **FAST** — lazy imports, deterministic hash embeddings, one Qdrant
+   ``retrieve`` plus one ``upsert``, and a short timeout.
+2. **FAIL-OPEN** — any error yields empty stdout and ``sys.exit(0)``.
+   ``check-action`` never emits non-zero exit or non-empty stdout on normal or
+   error paths.
+3. **AUDIT-ONLY** — observe and record, never block or auto-approve. Diagnostics
+   go to the audit log or stderr, never to the structured stdout the hook
+   parses.
 
-``tail`` and ``stats`` are human-facing helpers (stdout is fine there — they are
-not on the hook path).
+``tail`` and ``stats`` are human-facing helpers and may write to stdout.
 """
 
 from __future__ import annotations
@@ -102,13 +96,12 @@ def _looks_secret(key: str) -> bool:
 def redact_tool_input(obj: Any) -> Any:
     """Recursively redact secret-ish values and bound long strings.
 
-    - Dict values under a secret-ish key are replaced with ``[REDACTED]``.
-    - Any string value is length-bounded via ``redact_excerpt`` (truncation
-      only bounds length; secret *content* is removed by the key match above).
-    - Lists/tuples are walked element-wise; other scalars pass through.
+    - Dict values under a secret-ish key become ``[REDACTED]``.
+    - Strings are length-bounded with ``redact_excerpt``.
+    - Lists and tuples are redacted element-wise; other scalars pass through.
 
-    The result is JSON-safe so it can be compacted into the descriptor and the
-    audit excerpt without leaking raw secrets.
+    The result stays JSON-safe for descriptors and audit excerpts without
+    leaking raw secrets.
     """
     if isinstance(obj, dict):
         redacted: dict[str, Any] = {}
@@ -137,9 +130,8 @@ def _compact_json(obj: Any) -> str:
 def build_descriptor(tool_name: str, tool_input: Any) -> str:
     """Normalized action descriptor: ``"<tool_name> <compact redacted input>"``.
 
-    ``tool_input`` is redacted *before* it is serialized, so neither the
-    signature nor the descriptor (which becomes the verdict excerpt and is what
-    we log) can carry a raw secret.
+    ``tool_input`` is redacted before serialization, so neither the signature
+    nor the logged descriptor can contain a raw secret.
     """
     redacted = redact_tool_input(tool_input if tool_input is not None else {})
     return f"{tool_name} {_compact_json(redacted)}"
@@ -253,11 +245,10 @@ def _append_loci_audit_receipt(payload: dict) -> bool:
 def _build_qdrant_backend() -> Optional[VerdictBackend]:
     """Construct a QdrantBackend against the configured URL, or None on failure.
 
-    Imports ``qdrant_client`` lazily, connects with a short timeout, ensures the
-    ``loci_verdicts`` collection exists (creating it with a 384-dim cosine
-    ``dense`` vector if missing), and wires the deterministic ``hash_embed`` so
-    no embedding model is ever loaded. Any failure (import error, connection
-    refused, timeout) returns None so the caller logs ``qdrant_unavailable`` and
+    Imports ``qdrant_client`` lazily, uses a short timeout, ensures the
+    ``loci_verdicts`` collection exists with a 384-dim cosine ``dense`` vector,
+    and wires deterministic ``hash_embed`` so no embedding model is loaded. Any
+    failure returns ``None`` so the caller logs ``qdrant_unavailable`` and
     exits 0 rather than stalling.
     """
     from .qdrant import QdrantBackend  # local import keeps package import cheap
