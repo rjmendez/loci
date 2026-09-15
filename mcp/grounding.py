@@ -196,7 +196,9 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
         chunk = compact_text(text, cap, preserve_sentence_boundary=not compact_mode) if compact_mode else _truncate(text, cap)
-        block = f"[{tag}] {re.sub(r'\s+', ' ', chunk).strip()}" if compact_mode else f"[{tag}] {chunk}"
+        if compact_mode:
+            chunk = re.sub(r"\s+", " ", chunk).strip()
+        block = f"[{tag}] {chunk}"
         parts.append(block)
         sources.append(tag)
         remaining[0] -= len(block)
