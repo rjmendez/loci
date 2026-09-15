@@ -59,7 +59,7 @@ import uuid
 import weakref
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1475,6 +1475,77 @@ def _entry_snippet(entry: dict) -> str:
     return text.replace("\n", " ").strip()[:260]
 
 
+_AUDIT_LANE_STALE_AFTER = timedelta(days=7)
+
+
+def _parse_utc_ts(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _audit_lane_state(
+    investigation_id: str,
+    findings: list[dict],
+    scoped_audit: list[dict],
+    global_recent_audit: list[dict],
+) -> tuple[dict, list[dict], list[dict]]:
+    scoped_entries = [e for e in scoped_audit if isinstance(e, dict)]
+    global_entries = [
+        e for e in global_recent_audit
+        if isinstance(e, dict) and str(e.get("investigation_id") or "") == investigation_id
+    ]
+    all_entries = scoped_entries + global_entries
+    audit_ts = [ts for ts in (_parse_utc_ts(e.get("ts")) for e in all_entries) if ts is not None]
+    finding_ts = [
+        ts for ts in (_parse_utc_ts(f.get("ts")) for f in findings if isinstance(f, dict))
+        if ts is not None
+    ]
+    latest_audit = max(audit_ts, default=None)
+    latest_finding = max(finding_ts, default=None)
+
+    base = {
+        "status": "empty",
+        "usable": False,
+        "reason": "no_audit_entries",
+        "threshold_seconds": int(_AUDIT_LANE_STALE_AFTER.total_seconds()),
+        "scoped_receipts": len(scoped_entries),
+        "global_receipts": len(global_entries),
+        "latest_audit_ts": latest_audit.isoformat() if latest_audit else None,
+        "latest_finding_ts": latest_finding.isoformat() if latest_finding else None,
+    }
+    if not all_entries:
+        return base, [], []
+    if latest_audit is None:
+        return {
+            **base,
+            "status": "stale",
+            "reason": "audit_timestamps_unparseable",
+        }, [], []
+    if latest_finding is not None and latest_finding - latest_audit > _AUDIT_LANE_STALE_AFTER:
+        return {
+            **base,
+            "status": "stale",
+            "reason": "audit_older_than_investigation",
+            "lag_seconds": int((latest_finding - latest_audit).total_seconds()),
+        }, [], []
+    return {
+        **base,
+        "status": "fresh",
+        "usable": True,
+        "reason": None,
+    }, scoped_entries, global_entries
+
+
 def _collect_recent_global_audit(limit: int = 200, days: int = 3) -> list[dict]:
     audit_dir = MEMORY_DIR.parent / "audit"
     if not audit_dir.exists():
@@ -1492,10 +1563,13 @@ def _collect_recent_global_audit(limit: int = 200, days: int = 3) -> list[dict]:
 def build_validation_evidence(
     investigation_id: str,
     min_confidence: str,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
     scoped_audit = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
     global_recent_audit = _collect_recent_global_audit(limit=150, days=2)
+    audit_lane, scoped_audit, global_recent_audit = _audit_lane_state(
+        investigation_id, findings, scoped_audit, global_recent_audit
+    )
 
     evidence: list[dict] = []
     for idx, finding in enumerate(findings):
@@ -1513,36 +1587,35 @@ def build_validation_evidence(
             "origin": "findings_jsonl",
         })
 
-    for idx, entry in enumerate(scoped_audit):
-        output = str(entry.get("output", ""))
-        evidence_text = f"{entry.get('tool', '')} {entry.get('inputs', '')} {output[:3000]}"
-        evidence.append({
-            "evidence_id": _evidence_id(entry, "audit_scoped", idx),
-            "record_type": "audit",
-            "source": str(entry.get("tool", "")),
-            "ts": entry.get("ts"),
-            "text": evidence_text,
-            "snippet": _entry_snippet(entry),
-            "tokens": tokenize(evidence_text),
-            "origin": "audit_jsonl",
-        })
+    if audit_lane["usable"]:
+        for idx, entry in enumerate(scoped_audit):
+            output = str(entry.get("output", ""))
+            evidence_text = f"{entry.get('tool', '')} {entry.get('inputs', '')} {output[:3000]}"
+            evidence.append({
+                "evidence_id": _evidence_id(entry, "audit_scoped", idx),
+                "record_type": "audit",
+                "source": str(entry.get("tool", "")),
+                "ts": entry.get("ts"),
+                "text": evidence_text,
+                "snippet": _entry_snippet(entry),
+                "tokens": tokenize(evidence_text),
+                "origin": "audit_jsonl",
+            })
 
-    for idx, entry in enumerate(global_recent_audit):
-        if entry.get("investigation_id") != investigation_id:
-            continue
-        output = str(entry.get("output", ""))
-        evidence_text = f"{entry.get('tool', '')} {entry.get('inputs', '')} {output[:2000]}"
-        evidence.append({
-            "evidence_id": _evidence_id(entry, "audit_global", idx),
-            "record_type": "audit",
-            "source": str(entry.get("tool", "")),
-            "ts": entry.get("ts"),
-            "text": evidence_text,
-            "snippet": _entry_snippet(entry),
-            "tokens": tokenize(evidence_text),
-            "origin": "global_audit_jsonl",
-        })
-    return evidence
+        for idx, entry in enumerate(global_recent_audit):
+            output = str(entry.get("output", ""))
+            evidence_text = f"{entry.get('tool', '')} {entry.get('inputs', '')} {output[:2000]}"
+            evidence.append({
+                "evidence_id": _evidence_id(entry, "audit_global", idx),
+                "record_type": "audit",
+                "source": str(entry.get("tool", "")),
+                "ts": entry.get("ts"),
+                "text": evidence_text,
+                "snippet": _entry_snippet(entry),
+                "tokens": tokenize(evidence_text),
+                "origin": "global_audit_jsonl",
+            })
+    return evidence, {"audit": audit_lane}
 
 
 def _search_qdrant_claim_evidence(
@@ -3648,7 +3721,9 @@ def investigation_pre_answer_check(
     if not normalized_claims:
         return json.dumps({"error": "claims must contain at least one non-empty claim"})
 
-    evidence_pool = build_validation_evidence(investigation_id, min_confidence=min_confidence)
+    evidence_pool, evidence_lanes = build_validation_evidence(
+        investigation_id, min_confidence=min_confidence
+    )
     claim_results: list[dict] = []
     matched_refs: list[dict] = []
     matched_ids: set[str] = set()
@@ -3765,6 +3840,7 @@ def investigation_pre_answer_check(
             "match_count": qdrant_matches_total,
             "errors": unique_errors,
         },
+        "evidence_lanes": evidence_lanes,
         "degraded_mode": {
             "active": degraded_active,
             "reason": degraded_reason,
@@ -4068,7 +4144,9 @@ def investigation_evidence_precheck(
     query = str(proposed_query).strip()
     query_tokens = tokenize(query)
 
-    evidence_pool = build_validation_evidence(investigation_id, min_confidence="low")
+    evidence_pool, evidence_lanes = build_validation_evidence(
+        investigation_id, min_confidence="low"
+    )
     lexical_matches: list[dict] = []
     for record in evidence_pool:
         score = _lexical_match_score(query_tokens, record.get("tokens", set()))
@@ -4115,6 +4193,7 @@ def investigation_evidence_precheck(
             "match_count": len(qdrant_matches),
             "errors": qdrant_errors,
         },
+        "evidence_lanes": evidence_lanes,
         "degraded_mode": {
             "active": degraded_active,
             "reason": degraded_reason,
