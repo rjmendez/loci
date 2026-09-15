@@ -43,7 +43,8 @@ def test_mcp_top_level_module_level_function_count(head_build):
         and not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
     # docs/census.txt estimate was 297; mcp/openrouter.py moved it to ~334.
-    assert 300 <= len(module_level) <= 370, len(module_level)
+    # PR #295 (ladybug lease bounded-wait/backoff helpers) moved it to ~371.
+    assert 300 <= len(module_level) <= 380, len(module_level)
 
 
 def test_every_mcp_tool_decorator_is_classified_registering(head_build):

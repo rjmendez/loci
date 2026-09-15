@@ -53,9 +53,24 @@ def _writes(failopen):
         return wrapper
     return deco
 
+def _parse_timeout(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, default) or "").strip()
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
 # Bounded so a wedged lease holder can never hang the server.
-_LEASE_TIMEOUT_S = 6.0
-_LEASE_POLL_S = 0.05
+_READ_LEASE_TIMEOUT_S = _parse_timeout("LOCI_LADYBUG_READ_LEASE_TIMEOUT_S", 0.25)
+_WRITE_LEASE_TIMEOUT_S = _parse_timeout("LOCI_LADYBUG_WRITE_LEASE_TIMEOUT_S", 1.5)
+_LEASE_TIMEOUT_S = _WRITE_LEASE_TIMEOUT_S  # backward-compat test knob for write calls
+_LEASE_INITIAL_BACKOFF_S = 0.01
+_LEASE_MAX_BACKOFF_S = 0.1
+_LEASE_POLL_S = _LEASE_INITIAL_BACKOFF_S  # backward-compat test knob
 
 try:  # ladybug (LadybugDB) is optional — the store degrades to unavailable.
     import ladybug  # type: ignore
@@ -266,13 +281,18 @@ class LadybugStore:
     # ------------------------------------------------------------------ #
     # Per-operation leased sessions (the concurrency contract)
     # ------------------------------------------------------------------ #
-    def _acquire_lease(self, fd: int, exclusive: bool) -> bool:
+    def _acquire_lease(self, fd: int, exclusive: bool, timeout_s: float | None = None) -> bool:
         """Acquire the advisory lease (fcntl.flock) with a bounded, non-blocking wait.
         Returns True on success, False if it could not acquire within the timeout —
         so a wedged holder can never hang the server. LOCK_SH for reads (many can
         share) / LOCK_EX for writes (one at a time, waits out readers)."""
+        timeout = (
+            _LEASE_TIMEOUT_S if exclusive
+            else _READ_LEASE_TIMEOUT_S
+        ) if timeout_s is None else float(timeout_s)
         mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
-        deadline = time.monotonic() + _LEASE_TIMEOUT_S
+        deadline = time.monotonic() + timeout
+        wait_s = _LEASE_POLL_S
         while True:
             try:
                 fcntl.flock(fd, mode)
@@ -280,10 +300,11 @@ class LadybugStore:
             except OSError:
                 if time.monotonic() >= deadline:
                     return False
-                time.sleep(_LEASE_POLL_S)
+                time.sleep(wait_s)
+                wait_s = min(wait_s * 2, _LEASE_MAX_BACKOFF_S)
 
     @contextmanager
-    def _session(self, write: bool):
+    def _session(self, write: bool, timeout_s: float | None = None):
         """Yield a short-lived LadybugDB Connection under the cross-process lease, then
         close it (releasing the lock) — nothing is held between operations.
 
@@ -305,7 +326,7 @@ class LadybugStore:
             db = conn = None
             try:
                 try:
-                    if not self._acquire_lease(fd, exclusive=write):
+                    if not self._acquire_lease(fd, exclusive=write, timeout_s=timeout_s):
                         logger.debug("ladybug lease busy (%s) — fail-open",
                                      "write" if write else "read")
                         yield None
@@ -355,7 +376,7 @@ class LadybugStore:
         if not self.ok:
             return False
         try:
-            with self._session(write=True) as conn:
+            with self._session(write=True, timeout_s=_LEASE_TIMEOUT_S) as conn:
                 return conn is not None
         except Exception:
             return False
@@ -367,7 +388,7 @@ class LadybugStore:
         if not self.ok:
             return False
         try:
-            with self._session(write=False) as conn:
+            with self._session(write=False, timeout_s=_READ_LEASE_TIMEOUT_S) as conn:
                 return conn is not None
         except Exception:
             return False

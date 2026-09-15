@@ -73,8 +73,11 @@ opened, or any query raises, public methods return `False` / `[]` / `{}` and
 failure (ladybug not importable — latches permanently) from a transient one
 (another process holds the single-writer lock — retried after a backoff), so the
 graph self-heals rather than staying dark for the process lifetime. Writes take a
-bounded cross-process lease (`_LEASE_TIMEOUT_S = 6.0`); a wedged holder can never
-hang the server.
+bounded cross-process lease (default write wait `1.5s`, read probe wait `0.25s`,
+via `LOCI_LADYBUG_WRITE_LEASE_TIMEOUT_S` / `LOCI_LADYBUG_READ_LEASE_TIMEOUT_S`);
+the JSONL append path also uses a bounded advisory lock
+(`LOCI_STORE_LOCK_TIMEOUT_S`, default `1.5s`). A wedged holder can never hang the
+server long enough for the MCP transport to drop the reply.
 
 `loci_groom.py codelink` links findings to symbols on cron: last run indexed 11,273
 symbols and generated 718 links.
