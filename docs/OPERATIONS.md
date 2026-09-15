@@ -2,7 +2,7 @@
 
 ## Environment variables
 
-Nothing is hardcoded. Settings resolve through a chain (`mcp/backends.py`):
+Settings resolve through a chain (`mcp/backends.py`):
 
 1. the environment variable
 2. a local probe — `http://localhost:11434` for Ollama, `:8000` for vLLM
@@ -10,9 +10,9 @@ Nothing is hardcoded. Settings resolve through a chain (`mcp/backends.py`):
 4. the code default
 
 `scripts/loci_groom.py:load_env()` inserts the repo `.env` and `mcp/.env` between
-steps 1 and 3, because a cron job does not inherit the MCP launcher's environment.
-Copy `backends.toml.example` to `~/.loci/backends.toml` for endpoints and keys
-that must not live in the repo.
+steps 1 and 3 because cron does not inherit the MCP launcher's environment. Copy
+`backends.toml.example` to `~/.loci/backends.toml` for endpoints and keys that must
+not live in the repo.
 
 ### Core infrastructure
 
@@ -28,9 +28,9 @@ that must not live in the repo.
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | all embedding operations |
 
 Note: `OLLAMA_URL` and `OLLAMA_BASE_URL` are distinct variables read by different
-files, and the split is not hooks-vs-standalone. The MCP server, the grooming tier
-and both Claude Code hooks read `OLLAMA_BASE_URL` (a bare host) and append `/v1`
-themselves. The older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py`,
+files; the split is not hooks-vs-standalone. The MCP server, the grooming tier, and
+both Claude Code hooks read `OLLAMA_BASE_URL` (a bare host) and append `/v1`
+themselves. Older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py`,
 `ebbinghaus_consolidation.py`, `amem_consolidation.py`, `agentHER_relabeler.py`,
 `skillops_maintenance.py`, `exif_skill_discovery.py`, `score_trace_collector.py`,
 `swr_replay.py`, `ua-ingest.py`, `gpu_warm.py`, and `eval/harness.py`.
@@ -68,13 +68,12 @@ themselves. The older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py
 `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled
 and is omitted from the table.
 
-These jobs are driven by `scripts/hermes_cron_runner.py`, intended to be ticked
-from a 1-minute user timer or crontab entry. Issue #205 was a stale
-`next_run_at` loop in the live gateway scheduler: it kept fast-forwarding
-overdue runs in memory, never persisted the new time, and therefore never
-executed the job. The runner here collapses backlog to one catch-up run, then
-writes the next run back to `jobs.json` on the same tick. The grooming tier
-below still runs from the user crontab separately.
+These jobs are driven by `scripts/hermes_cron_runner.py`, intended for a 1-minute
+user timer or crontab entry. Issue #205 was a stale `next_run_at` loop in the live
+gateway scheduler: it fast-forwarded overdue runs in memory, never persisted the new
+time, and never executed the job. The runner here collapses backlog to one catch-up
+run, then writes the next run back to `jobs.json` on the same tick. The grooming
+tier below still runs from the user crontab separately.
 
 Reference crontab line for the live profile copy:
 
@@ -90,13 +89,14 @@ Reference crontab line for the live profile copy:
 | `c857cd706f67` | mnemosyne-qdrant-sync | 30m | `mnemosyne_qdrant_sync.py` |
 | `a9fc1ea0886a` | state-db-qdrant-sync | 5m | `state_db_qdrant_sync.py` |
 
-**mnemosyne-consolidation** and **mnemosyne-session-summarizer** both use `mnemosyne_activity_check.py`
-as the pre-flight gate script. They differ in their agent prompt: consolidation runs a lightweight
-`mnemosyne_sleep` pass while the session-summarizer archives structured session facts, triples,
-and scratchpad state.
+**mnemosyne-consolidation** and **mnemosyne-session-summarizer** both use
+`mnemosyne_activity_check.py` as the pre-flight gate script. They differ in the
+agent prompt: consolidation runs a lightweight `mnemosyne_sleep` pass, while the
+session-summarizer archives structured session facts, triples, and scratchpad state.
 
-**mnemosyne-sleep-cli** (`no_agent: true`) invokes the Mnemosyne CLI directly via shell and
-runs consolidation across all configured banks without spawning an LLM agent.
+**mnemosyne-sleep-cli** (`no_agent: true`) invokes the Mnemosyne CLI directly via
+shell and runs consolidation across all configured banks without spawning an LLM
+agent.
 
 ---
 
@@ -120,9 +120,9 @@ Four are scheduled, from the user crontab, through `scripts/loci_groom_cron.sh`:
 the cost. `verify` is **not scheduled and is not fit to schedule** — the fixed
 benchmark in `eval/verify_skeptic_eval.py` measured 22% false refutation on main,
 and five prompt/guard variants were all neutral or worse (#231). A false
-"refuted" on a true finding is what a later reader acts on.
+"refuted" on a true finding is what later readers act on.
 
-The wrapper's exit code is the point of it:
+The wrapper's exit codes:
 
 | Code | Meaning |
 |---|---|
@@ -132,11 +132,11 @@ The wrapper's exit code is the point of it:
 
 The refusal that matters: `connect()` reads `_retention_days()` before touching
 Qdrant and refuses when it is not 0, because `_get_qdrant()` runs the startup
-purge on its first call in a process. Grooming re-indexes findings; against a
-non-zero retention window that is an index-then-delete loop that reports success.
-The wrapper prints the pass's own reason on stderr and appends one line per run
-to `$LOCI_GROOM_STATE/runs.jsonl` (default `~/.loci/groom/runs.jsonl`), so
-"did this ever actually run" has an answer.
+purge on its first call in a process. Grooming re-indexes findings; with a non-zero
+retention window that becomes an index-then-delete loop that reports success. The
+wrapper prints the pass's own reason on stderr and appends one line per run to
+`$LOCI_GROOM_STATE/runs.jsonl` (default `~/.loci/groom/runs.jsonl`), so "did this
+ever actually run" has an answer.
 
 Per-run ceilings: `LOCI_GROOM_VERIFY_INVESTIGATIONS` (5),
 `LOCI_GROOM_VERIFY_FINDINGS` (10), `LOCI_GROOM_SUMMARY_INVESTIGATIONS` (12),
@@ -149,9 +149,9 @@ each tier resolves its own.
 ## MLOps loop
 
 `mlops/loop.py` rebuilds the grounding dataset, retrains the classifier
-ensemble, canary-evaluates the candidate and promotes it if it beats the
+ensemble, canary-evaluates the candidate, and promotes it if it beats the
 baseline. It ran for the first time on 2026-08-29; before that it had queued
-against a self-hosted runner that does not exist for 67 consecutive nights, and
+against a self-hosted runner that did not exist for 67 consecutive nights, and
 every child process was unbounded (#238).
 
 Scheduled from the user crontab through `scripts/mlops_loop_cron.sh`:
@@ -161,12 +161,12 @@ Scheduled from the user crontab through `scripts/mlops_loop_cron.sh`:
 | `0 2 * * *` | full loop, into an isolated worktree |
 
 **The loop promotes by writing into the repo.** `grounding_bleed_clf.joblib`,
-`grounding_dataset.jsonl` and `metrics.json` under `deep_think_loci/grounding/`
+`grounding_dataset.jsonl`, and `metrics.json` under `deep_think_loci/grounding/`
 are all tracked, so running the loop in a working checkout leaves that checkout
-dirty — which is how a 12,684-row rebuilt dataset ends up in an unrelated
-commit. The wrapper runs it in `~/.loci/mlops/worktree`, reset to `origin/main`
-each night, and prints what changed. **Nothing is applied automatically**;
-adopting a promoted model is a deliberate commit.
+dirty — how a 12,684-row rebuilt dataset ends up in an unrelated commit. The
+wrapper runs it in `~/.loci/mlops/worktree`, reset to `origin/main` each night,
+and prints what changed. **Nothing is applied automatically**; adopting a
+promoted model is a deliberate commit.
 
 Roughly twenty minutes end to end, the bulk of it GradientBoosting under 10-fold
 CV. Each step is bounded at `LOCI_MLOPS_STEP_TIMEOUT` (3600s), and a step that
@@ -190,7 +190,7 @@ about two thirds of its margin over cosine.
 
 ## Manual operations
 
-The repo is `loci` (github.com/rjmendez/loci). The commands below assume:
+The commands below assume this repo is `loci` (github.com/rjmendez/loci):
 
 ```bash
 LOCI=~/development/loci                              # your checkout
@@ -251,15 +251,17 @@ When `ready_for_sft: true` (≥ 10 correction pairs), the dataset is usable for 
 $LOCI/eval/run_eval.sh
 ```
 
-Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`,
+Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`, and
 `grounding_gate_qf_eval.py` — and passes its arguments through to each.
 
 > The CV figure `mlops/grounding/train.py` prints is a pair-level split and is
 > optimistic by roughly 2/3 of its margin over cosine. See
 > [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
 > numbers and what more findings are actually worth.
- Scores are
-upserted to the Qdrant `eval_scores` collection with `run_date` in the payload.
+>
+> Scores are upserted to the Qdrant `eval_scores` collection with `run_date` in
+> the payload.
+
 Query longitudinal scores:
 
 ```bash
@@ -302,7 +304,7 @@ on a true claim is the damage.
 
 ## Claude Code hooks
 
-This repo ships three hooks, in `scripts/hooks/`. Each reads a JSON payload on
+This repo ships three hooks in `scripts/hooks/`. Each reads a JSON payload on
 stdin and exits 0 on any event name it does not recognise.
 
 | Script | Events accepted | Purpose |
@@ -319,17 +321,17 @@ scripts/hooks/install.sh --check  # report drift, exit 1 if any, change nothing
 ```
 
 Run `--check` before trusting a hook. The deployed and repo copies have diverged
-silently before — a hand-edited `pre_tool_grounding.py` accepting `PreToolUse`
-against a repo copy that only accepted the Hermes name, where a fresh install
-would have disabled the hook.
+silently before — a hand-edited `pre_tool_grounding.py` accepted `PreToolUse`
+while the repo copy accepted only the Hermes name, so a fresh install would have
+disabled the hook.
 
 `--check` also reads `~/.claude/settings.json` (`$CLAUDE_SETTINGS`) and prints
 `UNMANAGED` for any hook an event invokes out of the hooks dir that this repo does
 not ship — on the reference host, the `Stop` wrapper `session_end_sync.sh`, which
 supplies `QDRANT_URL` and the embedding endpoint and exists in no commit. Those
-lines do not affect the exit status; only file drift does. Grading the shipped
-files alone meant `--check` said "hooks in sync" without ever looking at the file
-the `Stop` hook actually runs.
+lines do not affect the exit status; only file drift does. Grading only the
+shipped files meant `--check` said "hooks in sync" without looking at the file the
+`Stop` hook actually runs.
 
 Two payload shapes to get right when writing a new hook; both were wrong until
 #228, and all three hooks ran, exited 0, and did nothing:
@@ -361,7 +363,7 @@ No infra address or path is hardcoded. To stand up on a new machine:
    `~/.claude/settings.json` at `mcpServers.loci.env.QDRANT_API_KEY`.
 
 The one setting worth checking by hand on a new machine is
-`LOCI_QDRANT_RETENTION_DAYS`. The code default is 0 and 0 is safe, so a fresh
+`LOCI_QDRANT_RETENTION_DAYS`. The code default is 0, and 0 is safe, so a fresh
 install needs nothing — but a stray non-zero value anywhere in the chain makes
 the first Qdrant call of every process delete findings.
 

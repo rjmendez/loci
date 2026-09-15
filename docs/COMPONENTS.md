@@ -7,14 +7,13 @@ covers purpose, inputs, outputs, config env vars, and schedule (if any).
 Three schedulers are declared in this repo:
 
 - **`cron/jobs.json`** — six agent jobs, five marked `"enabled": true`, driven
-  by `scripts/hermes_cron_runner.py` on a 1-minute user timer/crontab. Issue
-  #205 was a stale `next_run_at` loop in the live gateway scheduler; this repo
-  runner executes one catch-up run and persists the next future occurrence on
-  the same tick.
+  by `scripts/hermes_cron_runner.py` on a 1-minute user timer/crontab. Issue #205
+  was a stale `next_run_at` loop in the live gateway scheduler; this repo runner
+  executes one catch-up run and persists the next future occurrence on the same tick.
 - **the user crontab** — four `loci_groom_cron.sh` passes. Verified running:
   `~/.loci/groom/runs.jsonl` has an `rc:0` line for each within the last 24h.
-- **a systemd user timer** — `mrpink-context-bridge.timer`, every 10m, last
-  fired 2026-08-27 12:39 EDT.
+- **a systemd user timer** — `mrpink-context-bridge.timer`, every 10m, last fired
+  2026-08-27 12:39 EDT.
 
 ---
 
@@ -31,12 +30,12 @@ pheromone reinforcement, then injects MEMORY MATCH context.
 `UserPromptSubmit`, `SubagentStart` (Claude Code). Anything else exits 0.
 
 **Message field:** top-level `prompt`, falling back to `extra.user_message`.
-Before #228 only the nested form was read, so under Claude Code every turn
-grounded on an empty string and exited early.
+Before #228 only the nested form was read, so under Claude Code every turn grounded
+on an empty string and exited early.
 
-**Installed by:** `scripts/hooks/install.sh` (copies into `~/.claude/hooks`;
-`--check` reports drift between repo and deployed copy). It can also be reached
-through `grounding_client.py`, which proxies to the warm daemon.
+**Installed by:** `scripts/hooks/install.sh` (copies into `~/.claude/hooks`; `--check`
+reports drift between repo and deployed copy). It can also be reached through
+`grounding_client.py`, which proxies to the warm daemon.
 
 **Key env vars:**
 - `QDRANT_URL` (no default — Qdrant fan-out is skipped if unset)
@@ -101,11 +100,11 @@ eliminating Python startup cost (~80ms) from grounding latency.
 
 ### `scripts/hooks/session_end_sync.py`
 **Purpose:** Live-syncs the current session **into Qdrant** `loci_sessions` — it
-reads Hermes state, it does not write it. Fires at the end of every turn, not only
-at session end. Resolves session content from `state.db` first and falls back to
-the `transcript_path` the Claude Code Stop payload carries; before #228 only the
+reads Hermes state and does not write it. Fires at the end of every turn, not only
+at session end. Resolves session content from `state.db` first and falls back to the
+`transcript_path` the Claude Code Stop payload carries; before #228 only the
 `state.db` lookup existed, and Claude Code session UUIDs are not in that database,
-so the hook had never synced a session.
+so the hook never synced a session.
 
 Fast path: a session with no new messages since the last upsert (mtime cache under
 `$LOCI_SYNC_CACHE`, default `~/.hermes/.session_sync_cache`) exits 0 immediately.
@@ -122,8 +121,8 @@ Fast path: a session with no new messages since the last upsert (mtime cache und
 ## MCP server (`mcp/`)
 
 ### `mcp/server.py`
-**Purpose:** the FastMCP server. 8,433 lines; 42 tools defined here and 31 more
-registered by the submodules below, for **73 tools total** (counted by calling
+**Purpose:** the FastMCP server. 8,433 lines; 42 tools are defined here and 31 more
+are registered by the submodules below, for **73 tools total** (counted by calling
 `server.mcp.list_tools()`).
 
 **Transport:** `LOCI_MCP_TRANSPORT` — `stdio` (default), `sse`, or
@@ -145,8 +144,8 @@ the index held 912 findings against a corpus of 2,831 and the split was exactly
 the 30-day boundary. Resolution order: env, then `~/.loci/backends.toml`, then 0.
 A non-integer value disables the purge rather than guessing a window.
 
-**Tool modules** (each exposes `register(mcp, ...)`, injected rather than importing
-`server`, which is what keeps the imports acyclic):
+**Tool modules** (each exposes `register(mcp, ...)`; injection instead of importing
+`server` keeps the imports acyclic):
 - `investigation_tools.py` — 11 tools: start/load/as_of/note/reflect/provenance/
   list/share/unshare/export/import
 - `graph_tools.py` — 11 tools: `code_graph_ingest`, `code_graph_query`,
@@ -431,11 +430,11 @@ but cannot invent.
 the cost, so running both would spend a model to do worse.
 
 `load_env()` resolves backend config the way the server does — existing env, then
-the repo `.env` files, then `~/.loci/backends.toml` — because a cron job does not
-inherit the MCP launcher's environment. A failed `python-dotenv` import is logged
-loudly, not swallowed — per the code's own note, `LOCI_QDRANT_RETENTION_DAYS=0` is
-set in the (gitignored) `.env`, so swallowing the import is how a scheduled run
-turns destructive while reporting success. It is not in `.env.example` or
+the repo `.env` files, then `~/.loci/backends.toml` — because cron does not inherit
+the MCP launcher's environment. A failed `python-dotenv` import is logged loudly,
+not swallowed — per the code's own note, `LOCI_QDRANT_RETENTION_DAYS=0` is set in
+the (gitignored) `.env`, so swallowing the import is how a scheduled run turns
+destructive while reporting success. It is not in `.env.example` or
 `backends.toml.example`; the safe value comes from `_retention_days()`'s default.
 
 ### `scripts/loci_groom_cron.sh`
@@ -461,9 +460,9 @@ prompt/guard variants were all neutral or worse (#231).
 
 The summary ladder reached 137 of 142 investigations only after #229, which
 stopped counting access rows as findings — 3,681 of 6,610 records in
-`findings.jsonl` (55.7%) are text-less access rows, and `_only_findings()` drops
-them. #230 made an empty or fully-retracted investigation `nothing_to_say`
-rather than an error.
+`findings.jsonl` (55.7%) are textless access rows, and `_only_findings()` drops
+them. #230 made an empty or fully-retracted investigation `nothing_to_say` rather
+than an error.
 
 ---
 
@@ -477,10 +476,10 @@ up, and it can read a specific git revision rather than a possibly mid-edit
 working tree.
 
 It complements `mcp/graph_tools.py` / `mcp/graph/*` (which need a live LadybugDB)
-by modelling what this codebase actually does for dispatch and a symbol graph does
-not capture: `@mcp.tool()` registration, `register(mcp, deps)` injection,
-dict-of-callables dispatch, module-global reads/writes across files, and path/key
-literal agreement between producers and consumers.
+by modelling dispatch details a symbol graph does not capture: `@mcp.tool()`
+registration, `register(mcp, deps)` injection, dict-of-callables dispatch,
+module-global reads/writes across files, and path/key literal agreement between
+producers and consumers.
 
 **Invocation:** `PYTHONPATH=scripts python3 -m callgraph.cli <command> [--rev HEAD]`
 
@@ -568,8 +567,8 @@ Neither job has run.
 ### `scripts/a2a_context_bridge.py`
 Pushes this node's recent Mnemosyne memories to all mesh peers through the local
 A2A server's `context_broadcast` skill, so local storage and peer fanout happen
-atomically server-side. It reads Mnemosyne SQLite, not the Hermes event stream,
-and keeps its own watermark in `BRIDGE_STATE_FILE` so a skipped tick loses nothing.
+atomically server-side. It reads Mnemosyne SQLite, not the Hermes event stream, and
+keeps its own watermark in `BRIDGE_STATE_FILE`, so a skipped tick loses nothing.
 
 **Key env vars:** `LOCI_A2A_URL` (default `http://127.0.0.1:8201`),
 `LOCI_A2A_TOKEN`, `BRIDGE_LOOKBACK_MIN` (default `30`), `BRIDGE_MIN_IMP`
@@ -605,10 +604,11 @@ as a Claude Code **Workflow** over a Loci investigation — the supported replac
 the `deep_think` MCP server's reasoning surface. See `deep_think_loci/README.md` for the
 full reference and `deep_think_loci/CHANGELOG.md` for the v1→v3.2 evolution.
 
-**Not to be confused with the Grounding pipeline above.** That pipeline grounds *every
-user turn* (pre-LLM/pre-tool hooks). This engine grounds *its own multi-agent reasoning*:
-tiered models (haiku ideation → opus synthesis) fan out, persist findings to the
-investigation with lineage (`derived_from`), and an opus tier produces a grounded answer.
+**Not to be confused with the Grounding pipeline above.** That pipeline grounds *every*
+user turn (pre-LLM/pre-tool hooks). This engine grounds *its own* multi-agent
+reasoning: tiered models (haiku ideation → opus synthesis) fan out, persist findings
+to the investigation with lineage (`derived_from`), and an opus tier produces a
+grounded answer.
 
 `deep_think_loci/workflows/` holds 22 workflows: three engines (`deep-think.js`,
 `deep-think-loci.js`, `deep-think-v4.js`) and 19 single-purpose audits built on
