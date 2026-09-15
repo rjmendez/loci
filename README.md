@@ -2,10 +2,9 @@
 
 **Loci gives AI agents like Claude a long-term memory that survives across sessions.**
 
-Without it, every conversation starts from zero — no history, no accumulated knowledge,
-no memory of what you tried and why. With Loci, sessions build on each other. Decisions,
-findings, and context persist in a searchable memory store that Claude can read and write
-like a set of notes.
+Without it, every conversation starts from zero: no history, accumulated knowledge, or
+memory of what you tried and why. With Loci, sessions build on each other. Decisions,
+findings, and context persist in a searchable memory store Claude can read and write like notes.
 
 ![The memory problem Loci solves](docs/img/loci-problem.svg)
 
@@ -49,9 +48,8 @@ cp ../.env.example .env   # fill in QDRANT_URL and OLLAMA_BASE_URL at minimum
 .venv/bin/python server.py
 ```
 
-A Claude Code session started **inside this checkout** picks the server up from
-the checked-in `.mcp.json` — no wiring needed once the venv above exists. To use
-it from anywhere else, add absolute paths to `~/.claude/settings.json`:
+Inside this checkout, Claude Code picks the server up from the checked-in `.mcp.json`
+once the venv above exists. From anywhere else, add absolute paths to `~/.claude/settings.json`:
 
 ```json
 "loci": {
@@ -65,12 +63,12 @@ it from anywhere else, add absolute paths to `~/.claude/settings.json`:
 }
 ```
 
-The grounding and injection-scanning hooks are a separate, opt-in install:
+Grounding and injection-scanning hooks are a separate, opt-in install:
 `scripts/hooks/install.sh` copies the three hooks into `~/.claude/hooks`, and
 `install.sh --check` reports drift between the repo copy and the deployed one.
 
-See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide.
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
+See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide, and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
 ---
 
@@ -92,12 +90,11 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
 
 ![Tool groups](docs/img/loci-tools.svg)
 
-*This diagram groups an earlier 24-tool snapshot by purpose — the groupings still
-hold, but the surface has since grown to 73: 42 defined in `mcp/server.py`, plus
-11 investigation tools from `mcp/investigation_tools.py`, 11 code-graph tools from
-`mcp/graph_tools.py` and 9 local-model tools from `mcp/llm_tools.py`, each
-registered onto the shared FastMCP instance at import time. See the table below
-for the current inventory.*
+*This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds,
+but the surface is now 73 tools: 42 in `mcp/server.py`, plus 11 investigation tools
+from `mcp/investigation_tools.py`, 11 code-graph tools from `mcp/graph_tools.py`,
+and 9 local-model tools from `mcp/llm_tools.py`, all registered onto the shared
+FastMCP instance at import time. See the table below for the current inventory.*
 
 | Tool | Purpose |
 |---|---|
@@ -221,14 +218,14 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | Hook state | `~/.claude/hook-state/` | — |
 
 `OLLAMA_BASE_URL` is the **embedding** endpoint only. Generation resolves separately
-(`backends.ollama_gen_url()`, `mcp/backends.py:101`), so an Ollama that serves nothing but
-`nomic-embed-text` cannot silently absorb generation calls. `OLLAMA_URL` is the fallback the
-standalone scripts read. Set all three when the components run against different hosts.
+(`backends.ollama_gen_url()`, `mcp/backends.py:101`), so an Ollama that serves only
+`nomic-embed-text` cannot absorb generation calls. `OLLAMA_URL` is the standalone-script
+fallback. Set all three when the components run against different hosts.
 
-Anything left unset falls through `mcp/backends.py`: explicit env var, then a probe of
-`localhost`, then `~/.loci/backends.toml`, then empty — the offload tiers fail open on
-empty. `backends.toml.example` is the template for that file.
-See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full env var reference.
+Unset values fall through `mcp/backends.py`: explicit env var, localhost probe,
+`~/.loci/backends.toml`, then empty; the offload tiers fail open on empty.
+`backends.toml.example` is the template. See [docs/OPERATIONS.md](docs/OPERATIONS.md)
+for the full env var reference.
 
 Two `.env.example` files are provided:
 
@@ -290,16 +287,15 @@ Two `.env.example` files are provided:
 
 ## MCP transport modes
 
-By default the MCP server runs over `stdio` for use as a Claude Code subprocess.
-For Docker or remote deployments set `LOCI_MCP_TRANSPORT=sse` (or
-`streamable-http`) and configure `LOCI_MCP_HOST` / `LOCI_MCP_PORT`.
+Default transport is `stdio` for Claude Code subprocess use. For Docker or remote
+deployments set `LOCI_MCP_TRANSPORT=sse` (or `streamable-http`) and configure
+`LOCI_MCP_HOST` / `LOCI_MCP_PORT`.
 
-The bind is loopback by default. A wider bind publishes the whole tool surface, so
-it requires `LOCI_MCP_TOKEN`: without one the server exits with a message instead
-of serving (`mcp/server.py:8144`). With a token set, callers present
-`Authorization: Bearer <token>`; `/health` stays open so liveness probes still work.
-`docker-compose.yml` sets `LOCI_MCP_HOST=0.0.0.0` because a container has to bind
-all its interfaces, so a token must be present in `.env` before `docker compose up`.
+Loopback is default. Wider binds require `LOCI_MCP_TOKEN`; without one the server
+exits (`mcp/server.py:8144`). With a token set, callers present
+`Authorization: ******; `/health` stays open for liveness probes. `docker-compose.yml`
+sets `LOCI_MCP_HOST=0.0.0.0`, so `.env` must also set a token before
+`docker compose up`.
 
 ```bash
 # loopback — no token needed

@@ -15,7 +15,7 @@ Claude Code and compatible agent frameworks. It handles three time horizons:
 
 ## Data stores
 
-Four of them, and the split matters:
+Four stores:
 
 | Store | Role | Path |
 |---|---|---|
@@ -25,10 +25,10 @@ Four of them, and the split matters:
 | Mnemosyne SQLite | Structured/FTS substrate for the consolidation scripts and A2A | `~/.hermes/mnemosyne/data/mnemosyne.db` |
 
 A finding reaches Qdrant only on write (`_qdrant_upsert` at store time), so anything
-that leaves the index — the startup TTL purge below is the usual reason — is still on
-disk and simply invisible to search. `loci_groom.py index` is the reconciliation:
-on the live corpus `on_disk=2922`, `indexed=2769`, `missing=153`, `coverage=0.9476`.
-`index --apply` re-embeds and re-upserts the missing ones.
+that leaves the index — usually the startup TTL purge below — is still on disk and only
+invisible to search. `loci_groom.py index` reconciles that gap: on the live corpus
+`on_disk=2922`, `indexed=2769`, `missing=153`, `coverage=0.9476`. `index --apply`
+re-embeds and re-upserts the missing ones.
 
 ### Investigation store (`LOCI_MEMORY_DIR`, default `~/.hermes/memory-sessions`)
 
@@ -47,14 +47,13 @@ underscore-prefixed internal ones (`_groom`, `_reflection-loop`). Each holds:
 137 of the corpus's investigations already carry one, 5 report `nothing_to_say`.
 
 `findings.jsonl` is a **mixed** append log, not a findings list. Alongside real
-findings it carries access-tracking rows written on every read: they hold no text,
-and because one is appended per access they are also the newest rows, so any
-`findings[-N:]` slice fills with them. Measured across the corpus, 3,681 of 6,610
-records (55.7%) are access rows. `investigation_tools._only_findings()`
-(`mcp/investigation_tools.py:100-114`) drops them, and `investigation_load`,
-`investigation_as_of`, and `investigation_reflect` all read through it. A reader
-that opens the file directly gets the mixed log; `loci_groom._summarisable()`
-re-derives the same filter for that reason.
+findings it carries textless access-tracking rows written on every read, and because one
+is appended per access they are also the newest rows, so any `findings[-N:]` slice fills
+with them. Measured across the corpus, 3,681 of 6,610 records (55.7%) are access rows.
+`investigation_tools._only_findings()` (`mcp/investigation_tools.py:100-114`) drops
+those rows, and `investigation_load`, `investigation_as_of`, and
+`investigation_reflect` all read through it. Direct readers still get the mixed log;
+`loci_groom._summarisable()` re-derives the same filter.
 
 ### Code graph (`$LOCI_MEMORY_DIR/graph.ladybug`)
 
@@ -67,17 +66,17 @@ database holding two overlaid graphs in one file (40 MB on the live host):
   `MENTIONS` / `DERIVED_FROM` / `IN_INVESTIGATION` / `REFERENCES` / `RELATED`.
 
 The `derived_from` lineage edges and the `causal_infer` lane land here (#218, #212).
-The store is **fail-open everywhere**: if `import ladybug` fails, the db cannot be
-opened, or any query raises, public methods return `False` / `[]` / `{}` and
-`available()` stays `False`. `server._get_ladybug()` distinguishes an unrecoverable
-failure (ladybug not importable — latches permanently) from a transient one
-(another process holds the single-writer lock — retried after a backoff), so the
-graph self-heals rather than staying dark for the process lifetime. Writes take a
-bounded cross-process lease (default write wait `1.5s`, read probe wait `0.25s`,
-via `LOCI_LADYBUG_WRITE_LEASE_TIMEOUT_S` / `LOCI_LADYBUG_READ_LEASE_TIMEOUT_S`);
-the JSONL append path also uses a bounded advisory lock
-(`LOCI_STORE_LOCK_TIMEOUT_S`, default `1.5s`). A wedged holder can never hang the
-server long enough for the MCP transport to drop the reply.
+The store is **fail-open everywhere**: if `import ladybug` fails, the db cannot open,
+or any query raises, public methods return `False` / `[]` / `{}` and `available()`
+stays `False`. `server._get_ladybug()` distinguishes unrecoverable failure (ladybug not
+importable — latch permanently) from transient lock contention (another process holds
+the single-writer lock — retry after backoff), so the graph can self-heal instead of
+staying dark for the process lifetime. Writes take a bounded cross-process lease
+(default write wait `1.5s`, read probe wait `0.25s`, via
+`LOCI_LADYBUG_WRITE_LEASE_TIMEOUT_S` / `LOCI_LADYBUG_READ_LEASE_TIMEOUT_S`); the
+JSONL append path also uses a bounded advisory lock (`LOCI_STORE_LOCK_TIMEOUT_S`,
+default `1.5s`). A wedged holder cannot hang the server long enough for the MCP
+transport to drop the reply.
 
 `loci_groom.py codelink` links findings to symbols on cron: last run indexed 11,273
 symbols and generated 718 links.
@@ -132,9 +131,9 @@ investigation findings store.
 named-vector search must send `{"name": "dense", "vector": [...]}`; `{"dense": [...]}`
 is the *upsert* shape and a search with it returns HTTP 400. Sending a name to an
 unnamed collection returns `400 Not existing vector name error`. Both come back as
-zero hits, which is indistinguishable from a genuinely unmatched query — that is
-exactly how the grounding hook returned nothing from all three base collections for
-months (#228). Two mitigations exist:
+zero hits, indistinguishable from a genuinely unmatched query — exactly how the
+grounding hook returned nothing from all three base collections for months (#228).
+Two mitigations exist:
 
 - `qdrant_ops._dense_vector_name()` (`mcp/qdrant_ops.py:644`) probes the layout once
   per collection and caches it, so cross-collection search adapts instead of guessing.
@@ -219,12 +218,12 @@ pre_llm_grounding.py (v3)
 
 **Total latency target:** < 100ms (70ms embed + 30ms parallel Qdrant)
 
-With no hits, the hook still injects `GROUNDING_DIRECTIVE` — the turn is never
-left with an empty context block.
+With no hits, the hook still injects `GROUNDING_DIRECTIVE`; the turn never gets an
+empty context block.
 
-A companion hook, `scripts/hooks/pre_tool_grounding.py`, runs on `PreToolUse`. It
-does **not** inject grounding: it scans for supply-chain IOCs and prompt injection,
-and writes the tool audit log.
+A companion hook, `scripts/hooks/pre_tool_grounding.py`, runs on `PreToolUse`. It does
+**not** inject grounding: it scans for supply-chain IOCs and prompt injection, then
+writes the tool audit log.
 
 ### Key grounding env vars
 
@@ -270,10 +269,10 @@ and writes the tool audit log.
 
 This repo ships **three** hooks. `scripts/hooks/install.sh` copies them into
 `~/.claude/hooks/` (backing up what it replaces) and `install.sh --check` reports
-drift without changing anything — the two copies had already diverged once, with
-the deployed `pre_tool_grounding.py` hand-edited to accept Claude Code's
-`PreToolUse` event name while the repo copy still only accepted the Hermes name,
-so a fresh install would have silently disabled the hook.
+drift without changing anything. That drift already happened once: the deployed
+`pre_tool_grounding.py` was hand-edited to accept Claude Code's `PreToolUse` event
+name while the repo copy still accepted only the Hermes name, so a fresh install
+would have silently disabled the hook.
 
 ```
 UserPromptSubmit  → pre_llm_grounding.py
@@ -292,24 +291,24 @@ Stop              → session_end_sync.py
 
 `pre_llm_grounding.py` reads the user message from the payload's **top-level
 `prompt`** field, falling back to Hermes' `extra.user_message`. Reading only the
-Hermes shape is what made it inert under Claude Code: the hook ran, exited 0, and
-injected nothing (#228, `pre_llm_grounding.py:550-551`). It accepts both event
-names — Hermes' `pre_llm_call` and Claude Code's `UserPromptSubmit` /
-`SubagentStart` — and treats a run as subagent context when the task id says so or
-`HERMES_SUBAGENT` is set.
+Hermes shape made it inert under Claude Code: the hook ran, exited 0, and injected
+nothing (#228, `pre_llm_grounding.py:550-551`). It accepts both event names —
+Hermes' `pre_llm_call` and Claude Code's `UserPromptSubmit` / `SubagentStart` — and
+treats a run as subagent context when the task id says so or `HERMES_SUBAGENT` is
+set.
 
 `session_end_sync.py` prefers the session's messages from `LOCI_STATE_DB`
 (`~/.hermes/state.db`) and falls back to the Stop payload's `transcript_path`
-(`session_end_sync.py:186-204`). The fallback is the one that fires under Claude
-Code: Claude Code session UUIDs are not rows in a Hermes `state.db`, so the
-state.db-only version had never synced a session. A per-session mtime cache
-(`LOCI_SYNC_CACHE`) makes an unchanged session exit immediately.
+(`session_end_sync.py:186-204`). That fallback is what fires under Claude Code:
+Claude Code session UUIDs are not rows in a Hermes `state.db`, so the state.db-only
+version never synced a session. A per-session mtime cache (`LOCI_SYNC_CACHE`) makes
+an unchanged session exit immediately.
 
 `pre_tool_grounding.py` **audits by default**. `HOOK_BLOCK_MODE` is `0` unless set,
 so detections are logged, not refused. The one unconditional block is an injection
-pattern in an agent-config write target (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`),
-which blocks regardless of `HOOK_BLOCK_MODE`. Read-only and grounding tools are
-allowlisted out of the audit entirely to keep the log signal-bearing.
+pattern in an agent-config write target (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`).
+Read-only and grounding tools are allowlisted out of the audit to keep the log
+signal-bearing.
 
 ### session_end_sync.py env vars
 
@@ -417,8 +416,8 @@ lexical lane had returned nothing. 96.7% of those negatives scored inside the
 positive range, so no choice of threshold fixes it — cosine here is similarity
 inside a small pool, not a probability of support.
 
-`_semantic_ref_corroborated()` (`mcp/server.py:1408`) therefore requires a
-conjunction of two independent conditions, both fitted on 600 probes:
+`_semantic_ref_corroborated()` (`mcp/server.py:1408`) therefore requires two
+independent conditions, both fitted on 600 probes:
 
 | Condition | Constant | Meaning |
 |---|---|---|
@@ -436,16 +435,16 @@ Operating point of the conjunction, replayed offline in
 
 Neither half separates the classes on its own — best-ref lexical overlap is NEG p95
 0.162 vs POS p05 0.070, and best-ref margin is NEG p95 0.1013 vs POS p05 0.0528.
-The conjunction is what carries the measurement. The `pool_size` rule is close to a
-no-op on the headline numbers (removing it moves false support 1.67% → 2.00%) and
-is kept because it fails closed.
+The conjunction carries the measurement. The `pool_size` rule is nearly a no-op on
+the headline numbers (removing it moves false support 1.67% → 2.00%) and stays
+because it fails closed.
 
-The 0.55 score survives as a pre-filter, not as the decision: a neighbour above it
+The 0.55 score survives as a pre-filter, not the decision: a neighbour above it
 enters `support_refs` only when `_semantic_ref_corroborated` holds, and everything
 else is surfaced — labelled, not dropped — under `semantic_candidates`. Every ref
 carries `pool_size`, and each claim reports `support_basis` as `lexical` /
 `semantic_corroborated` / `semantic_candidate_only` / `none`, with `supported` true
-only for the first two. So a caller can always see which lane decided and why a
+only for the first two. Callers can still see which lane decided and why a
 candidate was not promoted.
 
 ---
@@ -454,7 +453,7 @@ candidate was not promoted.
 
 ### What actually runs on a schedule
 
-The **user crontab**, four grooming passes through `scripts/loci_groom_cron.sh`.
+The **user crontab** runs four grooming passes through `scripts/loci_groom_cron.sh`.
 Verified through that real entrypoint, with the last line each one logged:
 
 | Pass | Schedule | Last measured result |
@@ -464,16 +463,16 @@ Verified through that real entrypoint, with the last line each one logged:
 | `codelink` | `40 3 * * *` | ok, symbols=11273 generated=718 proposed=0 |
 | `summaries` | `50 4 * * *` | ok, already_had=137 nothing_to_say=5 errors=0 |
 
-Every pass holds three rules: **idempotent** (a second run over unchanged input
+Every pass follows three rules: **idempotent** (a second run over unchanged input
 proposes nothing new), **fail-open** (a dead backend degrades the pass to a report),
 and **shadow-first** (model-derived output goes to `_groom/proposals.jsonl` with its
 provenance and is *never* merged into `findings.jsonl`). `--apply` is honoured only
 by passes declaring `applyable` — today just `index`, whose write re-upserts a record
 already on disk, so it can restore but cannot invent.
 
-The wrapper exists for its exit codes: `0` ok, `1` a pass errored, `3` a pass refused
-or degraded. It appends one line per run to `~/.loci/groom/runs.jsonl`, so "has this
-ever actually run, and what did it say" is a question with an answer.
+The wrapper's exit codes are `0` ok, `1` a pass errored, `3` a pass refused or
+degraded. It appends one line per run to `~/.loci/groom/runs.jsonl`, so "has this
+ever actually run, and what did it say" has an answer.
 
 `loci_groom.py` also defines `tags`, `recall`, `verify`, and `reflect`. None are
 scheduled. **`verify` is not fit to schedule**: measured at 22% false-refutation
@@ -541,8 +540,7 @@ This prevents a noisy level from dominating the final ranking.
 `guard_tool_reflections.log` out of `STATE_DIR` (default `~/.claude/hook-state`,
 `scripts/skill_annotation_updater.py:17`). That directory does not exist on this
 host, no hook in `scripts/hooks/` writes the file, and none of the consumers are
-scheduled. The loop below is the design; treat it as unrun until a reflection
-writer is wired.
+scheduled. Treat the loop below as design only until a reflection writer is wired.
 
 The one tool-call record that *is* being written is `pre_tool_grounding.py`'s audit
 log at `~/.hermes/logs/tool-audit.log` (5 MB, self-rotating to the last 2 MB) — a
@@ -585,9 +583,8 @@ of each step in this loop.
 ## A2A mesh integration
 
 `a2a_server/server.py` (Loci A2A Server) provides an HTTP A2A-protocol server
-using FastAPI + uvicorn. It exposes memory operations as JSON-RPC 2.0 skills
-so peer agents can recall, store, and search memories without direct Qdrant
-credentials.
+using FastAPI + uvicorn. It exposes memory operations as JSON-RPC 2.0 skills so
+peer agents can recall, store, and search memories without direct Qdrant credentials.
 
 ### A2A skills
 
@@ -629,9 +626,9 @@ credentials.
 | `PEER_A2A_TOKEN` | `""` | Shared bearer token for all peers |
 
 Unlike the MCP server, the A2A server **binds `0.0.0.0` by default and only warns**
-when `LOCI_A2A_TOKEN` is unset (`a2a_server/server.py:210-216`) — every
-bearer check then fails, so callers are refused, but the port is still open on all
-interfaces. Set a token, or bind loopback, before running it anywhere reachable.
+when `LOCI_A2A_TOKEN` is unset (`a2a_server/server.py:210-216`). Every bearer check
+then fails, so callers are refused, but the port stays open on all interfaces. Set a
+token, or bind loopback, before running it anywhere reachable.
 
 `scripts/a2a_context_bridge.py` subscribes to Hermes events and routes context
 updates to the A2A `context_broadcast` endpoint, propagating discoveries across
