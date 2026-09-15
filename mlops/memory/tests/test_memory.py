@@ -5,9 +5,9 @@ Several assertions deliberately lock in behaviour that is arguably wrong (marked
 ``BUG:``); they exist so that a later refactor cannot change it silently.
 
 No external services are touched. Both modules talk only to a local SQLite file and
-the filesystem, so every test builds its own throwaway DB / hook-state directory under
-``tmp_path``. An autouse fixture redirects ``live_evo._ADAPTATION_LOG`` away from the
-repo so no test can append to ``mlops/memory/live_evo_log.jsonl``.
+the filesystem, so every test builds its own throwaway inputs under ``tmp_path``.
+An autouse fixture redirects ``live_evo._ADAPTATION_LOG`` away from the repo so no
+test can append to ``mlops/memory/live_evo_log.jsonl``.
 """
 
 import io
@@ -408,7 +408,7 @@ def test_decay_main_on_missing_db_reports_zero_retention(tmp_path, monkeypatch):
 
 
 # ======================================================================================
-# live_evo.py — module constants
+# live_evo.py — module constants + failure loading
 # ======================================================================================
 
 def test_live_evo_constants():
@@ -416,45 +416,24 @@ def test_live_evo_constants():
     assert L.DEFAULT_CONFIDENCE_FLOOR == 0.05
     assert L.SIMILARITY_WORDS == 6
     assert "~" not in L._DEFAULT_DB
-    assert "~" not in L._DEFAULT_HOOK_STATE
+    assert L.FAILURE_EVENTS == {
+        "hallucination_detected",
+        "grounding_fail",
+        "bleed_detected",
+        "retraction",
+    }
 
 
-# ======================================================================================
-# live_evo._load_guard_failures
-# ======================================================================================
-
-def test_load_guard_failures_missing_dir_returns_empty(tmp_path):
-    assert L._load_guard_failures(str(tmp_path / "absent")) == []
-
-
-def test_load_guard_failures_path_that_is_a_file_returns_empty(tmp_path):
-    f = tmp_path / "hook-state"
-    f.write_text("not a directory")
-    assert L._load_guard_failures(str(f)) == []
-
-
-def test_load_guard_failures_only_matches_guard_bash_glob(tmp_path):
-    hs = tmp_path / "hs"
-    hs.mkdir()
-    _write_log(hs / "guard_bash_a.log", [{"event": "retraction", "session_id": "keep"}])
-    _write_log(hs / "guard_other.log", [{"event": "retraction", "session_id": "drop1"}])
-    _write_log(hs / "guard_bash_a.jsonl", [{"event": "retraction", "session_id": "drop2"}])
-    got = L._load_guard_failures(str(hs))
-    assert [f["session_id"] for f in got] == ["keep"]
-
-
-def test_load_guard_failures_event_filter_and_field_defaults(tmp_path):
-    hs = tmp_path / "hs"
-    hs.mkdir()
-    _write_log(hs / "guard_bash_a.log", [
+def test_normalize_failures_filters_event_vocab_and_defaults_fields():
+    got = L._normalize_failures([
         {"event": "hallucination_detected", "session_id": "s1", "content": "c1"},
-        {"event": "grounding_fail", "text": "from-text"},          # content falls back to text
-        {"event": "bleed_detected", "session_id": "s3", "content": ""},  # empty content, no text
+        {"event": "grounding_fail", "text": "from-text"},
+        {"event": "bleed_detected", "session_id": "s3", "content": ""},
         {"event": "retraction", "session_id": "s4", "content": "c4"},
-        {"event": "tool_use", "session_id": "s5", "content": "ignored"},  # not a failure event
+        {"event": "tool_use", "session_id": "s5", "content": "ignored"},
         {"session_id": "s6", "content": "no event key"},
+        "not-a-dict",
     ])
-    got = L._load_guard_failures(str(hs))
     assert got == [
         {"session_id": "s1", "content": "c1", "event": "hallucination_detected"},
         {"session_id": "", "content": "from-text", "event": "grounding_fail"},
@@ -463,59 +442,17 @@ def test_load_guard_failures_event_filter_and_field_defaults(tmp_path):
     ]
 
 
-def test_load_guard_failures_skips_blank_and_malformed_lines(tmp_path):
-    hs = tmp_path / "hs"
-    hs.mkdir()
-    _write_log(hs / "guard_bash_a.log", [
-        "",
-        "   ",
-        "this is not json",
-        "{broken",
-        {"event": "retraction", "session_id": "survivor", "content": "c"},
-    ])
-    got = L._load_guard_failures(str(hs))
-    assert [f["session_id"] for f in got] == ["survivor"]
+def test_load_failures_jsonl_missing_file_returns_empty(tmp_path):
+    assert L.load_failures_jsonl(str(tmp_path / "absent.jsonl")) == []
 
 
-def test_load_guard_failures_non_dict_json_line_aborts_rest_of_file(tmp_path):
-    # BUG: a syntactically valid but non-object JSON line (a bare number, string or
-    # array) makes rec.get() raise AttributeError. That escapes the inner
-    # JSONDecodeError handler and is caught by the per-FILE `except Exception`,
-    # so every remaining line in that file is discarded.
-    hs = tmp_path / "hs"
-    hs.mkdir()
-    _write_log(hs / "guard_bash_a.log", [
-        {"event": "retraction", "session_id": "before", "content": "c"},
-        "12345",
-        {"event": "retraction", "session_id": "after", "content": "c"},
-    ])
-    _write_log(hs / "guard_bash_b.log", [
-        {"event": "retraction", "session_id": "next-file-ok", "content": "c"},
-    ])
-    got = L._load_guard_failures(str(hs))
-    assert [f["session_id"] for f in got] == ["before", "next-file-ok"]
-
-
-def test_load_guard_failures_reads_only_the_last_20_files_by_name(tmp_path):
-    hs = tmp_path / "hs"
-    hs.mkdir()
-    for i in range(25):
-        _write_log(hs / f"guard_bash_{i:03d}.log",
-                   [{"event": "retraction", "session_id": f"s{i:03d}", "content": "c"}])
-    got = L._load_guard_failures(str(hs))
-    assert len(got) == 20
-    # sorted() is lexicographic on the path, and the newest-by-name 20 win
-    assert got[0]["session_id"] == "s005"
-    assert got[-1]["session_id"] == "s024"
-
-
-def test_load_guard_failures_tolerates_undecodable_bytes(tmp_path):
-    hs = tmp_path / "hs"
-    hs.mkdir()
+def test_load_failures_jsonl_skips_blank_malformed_and_undecodable_lines(tmp_path):
     payload = json.dumps({"event": "retraction", "session_id": "s1", "content": "c"})
-    (hs / "guard_bash_a.log").write_bytes(b"\xff\xfe not json\n" + payload.encode() + b"\n")
-    got = L._load_guard_failures(str(hs))
-    assert [f["session_id"] for f in got] == ["s1"]
+    path = tmp_path / "failures.jsonl"
+    path.write_bytes(b"\xff\xfe not json\n\n{broken\n" + payload.encode() + b"\n")
+    assert L.load_failures_jsonl(str(path)) == [
+        {"session_id": "s1", "content": "c", "event": "retraction"}
+    ]
 
 
 # ======================================================================================
@@ -644,10 +581,8 @@ def test_find_correlated_session_match_wins_over_later_content_match(tmp_path):
     assert got == [(1, 0.5, "retraction")]
 
 
-def test_find_correlated_content_match_ignores_the_20_char_filter(tmp_path):
-    # BUG (dead code): `fail_texts` filters failures to content longer than 20 chars,
-    # but it is never used. The content-overlap loop iterates over ALL failures, so a
-    # short failure body that the filter meant to exclude can still trigger a match.
+def test_find_correlated_content_match_accepts_short_failure_text(tmp_path):
+    # There is no minimum-length filter before the content-overlap fallback.
     short = "a b c d e f"           # 11 chars, 6 words
     assert len(short) <= 20
     db = _make_db(tmp_path / "m.db", [(1, "a b c d e f", 0.5, _ago(1), "other")])
@@ -687,15 +622,8 @@ def test_find_correlated_zero_importance_row_is_kept(tmp_path):
 # live_evo.adapt
 # ======================================================================================
 
-def _hookdir(tmp_path, failures, name="guard_bash_a.log") -> str:
-    hs = tmp_path / "hs"
-    hs.mkdir(exist_ok=True)
-    _write_log(hs / name, failures)
-    return str(hs)
-
-
 def test_adapt_missing_db_returns_two_key_error_stub(tmp_path):
-    res = L.adapt(str(tmp_path / "nope.db"), str(tmp_path))
+    res = L.adapt(str(tmp_path / "nope.db"), [])
     assert res == {
         "error": f"db not found: {tmp_path / 'nope.db'}",
         "n_failures": 0,
@@ -708,7 +636,7 @@ def test_adapt_missing_db_returns_two_key_error_stub(tmp_path):
 
 def test_adapt_no_failures_returns_early_without_touching_db(tmp_path, _isolate_adaptation_log):
     db = _make_db(tmp_path / "m.db", [(1, "x", 0.8, _ago(1), "s1")])
-    res = L.adapt(db, str(tmp_path / "no-such-hook-dir"), dry_run=False)
+    res = L.adapt(db, [], dry_run=False)
     assert res == {"n_failures": 0, "n_correlated": 0, "n_penalized": 0, "dry_run": False}
     assert _read_importance(db)[1] == 0.8
     # the early return also skips the adaptation-log append
@@ -720,18 +648,15 @@ def test_adapt_applies_penalty_and_returns_counts(tmp_path):
         (1, "hit", 0.8, _ago(1), "s1"),
         (2, "miss", 0.6, _ago(1), "s2"),
     ])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    res = L.adapt(db, hs)
+    res = L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}])
     assert res == {"n_failures": 1, "n_correlated": 1, "n_penalized": 1, "dry_run": False}
     imp = _read_importance(db)
     assert imp[1] == pytest.approx(0.8 * 0.85)
     assert imp[2] == 0.6
 
-
 def test_adapt_dry_run_reports_but_does_not_write(tmp_path, _isolate_adaptation_log):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    res = L.adapt(db, hs, dry_run=True)
+    res = L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}], dry_run=True)
     assert res["n_penalized"] == 1 and res["dry_run"] is True
     assert _read_importance(db)[1] == 0.8
     assert not _isolate_adaptation_log.exists()
@@ -739,9 +664,9 @@ def test_adapt_dry_run_reports_but_does_not_write(tmp_path, _isolate_adaptation_
 
 def test_adapt_appends_a_differently_named_record_to_the_log(tmp_path, _isolate_adaptation_log):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    L.adapt(db, hs)
-    L.adapt(db, hs)
+    failures = [{"event": "retraction", "session_id": "s1", "content": ""}]
+    L.adapt(db, failures)
+    L.adapt(db, failures)
     lines = _isolate_adaptation_log.read_text().strip().splitlines()
     assert len(lines) == 2  # append-only, one JSON object per run
     rec = json.loads(lines[0])
@@ -760,8 +685,7 @@ def test_adapt_zero_importance_entry_is_raised_to_the_floor(tmp_path):
         (2, "tiny", 0.001, _ago(1), "s1"),
         (3, "atfloor", 0.05, _ago(1), "s1"),
     ])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    res = L.adapt(db, hs)
+    res = L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}])
     assert res["n_correlated"] == 3
     assert res["n_penalized"] == 2  # id=3 is already at the floor, no delta
     assert _read_importance(db) == {1: 0.05, 2: 0.05, 3: 0.05}
@@ -769,35 +693,34 @@ def test_adapt_zero_importance_entry_is_raised_to_the_floor(tmp_path):
 
 def test_adapt_penalty_zero_correlates_but_penalizes_nothing(tmp_path):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    res = L.adapt(db, hs, penalty=0.0)
+    res = L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}], penalty=0.0)
     assert res["n_correlated"] == 1 and res["n_penalized"] == 0
     assert _read_importance(db)[1] == 0.8
 
 
 def test_adapt_penalty_one_drops_to_the_floor(tmp_path):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    L.adapt(db, hs, penalty=1.0, importance_floor=0.02)
+    L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}],
+            penalty=1.0, importance_floor=0.02)
     assert _read_importance(db)[1] == 0.02
 
 
 def test_adapt_is_multiplicative_across_runs(tmp_path):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    L.adapt(db, hs)
-    L.adapt(db, hs)
+    failures = [{"event": "retraction", "session_id": "s1", "content": ""}]
+    L.adapt(db, failures)
+    L.adapt(db, failures)
     assert _read_importance(db)[1] == pytest.approx(0.8 * 0.85 * 0.85)
 
 
 def test_adapt_counts_failures_not_correlations(tmp_path):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [
+    failures = [
         {"event": "retraction", "session_id": "s1", "content": ""},
         {"event": "bleed_detected", "session_id": "zzz", "content": ""},
         {"event": "grounding_fail", "session_id": "yyy", "content": ""},
-    ])
-    res = L.adapt(db, hs, dry_run=True)
+    ]
+    res = L.adapt(db, failures, dry_run=True)
     assert res["n_failures"] == 3
     assert res["n_correlated"] == 1
 
@@ -805,8 +728,7 @@ def test_adapt_counts_failures_not_correlations(tmp_path):
 def test_adapt_missing_table_still_logs_a_zero_run(tmp_path, _isolate_adaptation_log):
     db = tmp_path / "empty.db"
     sqlite3.connect(str(db)).close()
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    res = L.adapt(str(db), hs)
+    res = L.adapt(str(db), [{"event": "retraction", "session_id": "s1", "content": ""}])
     assert res == {"n_failures": 1, "n_correlated": 0, "n_penalized": 0, "dry_run": False}
     assert json.loads(_isolate_adaptation_log.read_text().strip())["n_correlated"] == 0
 
@@ -817,9 +739,10 @@ def test_adapt_missing_table_still_logs_a_zero_run(tmp_path, _isolate_adaptation
 
 def test_live_evo_main_prints_summary(tmp_path, monkeypatch):
     db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
-    hs = _hookdir(tmp_path, [{"event": "retraction", "session_id": "s1", "content": ""}])
+    failures = tmp_path / "failures.jsonl"
+    _write_log(failures, [{"event": "retraction", "session_id": "s1", "content": ""}])
     monkeypatch.setattr(sys, "argv",
-                        ["live_evo", "--db", db, "--hook-state", hs, "--dry-run"])
+                        ["live_evo", "--db", db, "--failures-jsonl", str(failures), "--dry-run"])
     buf = io.StringIO()
     with redirect_stdout(buf):
         L.main()
