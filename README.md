@@ -335,8 +335,8 @@ loci/
 ├── deep_think_loci/       Multi-tier reasoning engine — Workflow over the Loci corpus (beta)
 ├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
 ├── rules/                 Agent behavioral rules (loaded at session start)
-├── cron/jobs.json         Reference job list — nothing reads it (issue #205); the live
-│                          schedule is the user crontab, calling scripts/loci_groom_cron.sh
+├── cron/jobs.json         Hermes cron job list — tick with scripts/hermes_cron_runner.py
+│                          on a 1-minute user timer/crontab; grooming stays separate
 ├── backends.toml.example  Template for ~/.loci/backends.toml
 └── .env.example           Full environment variable reference for all components
 ```

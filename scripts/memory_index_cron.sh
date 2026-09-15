@@ -6,8 +6,9 @@
 # generator nobody runs is the same failure with extra steps — so this is the
 # part that makes the guarantee continuous rather than per-invocation.
 #
-# Not scheduled via cron/jobs.json: those jobs have never fired (issue #205).
-# The live substrate is the user crontab, same as the grooming tier.
+# Not scheduled via cron/jobs.json: Hermes jobs have their own minute tick
+# through hermes_cron_runner.py. The curated index stays on the user crontab,
+# same as the grooming tier.
 #
 # Exit codes:
 #   0  index regenerated (and committed, if it changed)

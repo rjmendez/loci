@@ -4,12 +4,13 @@ Components live in four trees: `scripts/` (cron- and hook-driven jobs), `mcp/`
 (the MCP server and its libraries), `eval/`, and `deep_think_loci/`. Each entry
 covers purpose, inputs, outputs, config env vars, and schedule (if any).
 
-Three schedulers are declared in this repo and only two of them fire:
+Three schedulers are declared in this repo:
 
-- **`cron/jobs.json`** — six agent jobs, five marked `"enabled": true`. All six
-  carry `"last_run_at": null` and `"last_status": null` (read 2026-08-27).
-  Nothing on this host reads the file (issue #205). Treat an entry here as a
-  declaration, not a running job.
+- **`cron/jobs.json`** — six agent jobs, five marked `"enabled": true`, driven
+  by `scripts/hermes_cron_runner.py` on a 1-minute user timer/crontab. Issue
+  #205 was a stale `next_run_at` loop in the live gateway scheduler; this repo
+  runner executes one catch-up run and persists the next future occurrence on
+  the same tick.
 - **the user crontab** — four `loci_groom_cron.sh` passes. Verified running:
   `~/.loci/groom/runs.jsonl` has an `rc:0` line for each within the last 24h.
 - **a systemd user timer** — `mrpink-context-bridge.timer`, every 10m, last
@@ -677,7 +678,7 @@ Idempotent. It copies **only** `deep-think-loci.js` (landing as
 |---|---|---|
 | `mrpink-context-bridge.timer` | `a2a_context_bridge.py` | every 10m |
 
-### Declared in `cron/jobs.json` — none of these have ever run
+### Declared in `cron/jobs.json` — run through `scripts/hermes_cron_runner.py`
 
 | Script | Job name | Interval | Enabled |
 |---|---|---|---|
@@ -688,7 +689,9 @@ Idempotent. It copies **only** `deep-think-loci.js` (landing as
 | `state_db_qdrant_sync.py` | `state-db-qdrant-sync` | every 5m | yes |
 | `dtl_harvest.sh` | `deep-think-loci-harvest` | every 7d | **no** |
 
-All six carry `"last_run_at": null` and `"last_status": null`.
+Backlog is intentionally collapsed: if the host was down or the tick was
+delayed, the runner executes one catch-up run now and advances `next_run_at`
+past the current time instead of replaying every missed interval.
 
 ### On demand
 

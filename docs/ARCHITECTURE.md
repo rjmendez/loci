@@ -482,14 +482,17 @@ the raw log; an investigation that is empty or fully retracted reports
 `nothing_to_say`, not an error (#229/#230). Before that, the ladder was handed twenty
 text-less access rows and returned an invented summary.
 
-### cron/jobs.json — present, not running
+### cron/jobs.json — Hermes runner schedule
 
 `cron/jobs.json` describes six Hermes cron jobs (mnemosyne-consolidation,
 mnemosyne-session-summarizer, mnemosyne-sleep-cli, deep-think-loci-harvest,
-mnemosyne-qdrant-sync, state-db-qdrant-sync). Do not read it as a description of
-live behaviour: all six carry `last_run_at: null`, `~/.hermes/cron/` is empty, and
-`crontab -l` contains no Hermes runner (issue #205). Nothing on this host reads the
-file.
+mnemosyne-qdrant-sync, state-db-qdrant-sync). `scripts/hermes_cron_runner.py`
+is the tracked runner for that file: tick it from a 1-minute user timer or
+crontab entry. Issue #205 was a stale overdue-run loop in the live gateway
+scheduler — it fast-forwarded a past-due `next_run_at` without persisting the
+new value, so the same stale run was "missed" again on every tick and no job
+executed. The repo runner instead executes one catch-up run and writes the next
+future occurrence immediately.
 
 On-demand scripts (not croned):
 - `memgas_hierarchy.py --index` — rebuild MemGAS 3-level Qdrant collections
