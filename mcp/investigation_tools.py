@@ -27,6 +27,7 @@ from inv_store import (
     _now,
     _read_jsonl,
     _save_manifest,
+    _validated_investigation_id,
     _node_numeric_confidence,
     _NEUTRAL_NUMERIC_CONFIDENCE,
 )
@@ -801,7 +802,7 @@ def investigation_finding_provenance(
         each node annotated with its type, confidence, source, and text.
     """
     # Not _inv_dir(): it creates the directory, so a bad id would silently leave an empty investigation behind.
-    inv_path = _root() / investigation_id
+    inv_path = _root() / _validated_investigation_id(investigation_id)
     if not inv_path.is_dir():
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 

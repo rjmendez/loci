@@ -11,6 +11,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import inv_store  # noqa: E402 — must follow the path setup above
@@ -47,3 +49,16 @@ def test_store_writes_land_under_the_rebound_root(tmp_path, monkeypatch):
 def test_inv_store_holds_no_memory_root_of_its_own():
     """A module-level root in inv_store would shadow the injected one."""
     assert not [n for n in vars(inv_store) if "MEMORY_DIR" in n]
+
+
+@pytest.mark.parametrize("bad_id, expected", [
+    ("", "empty string"),
+    ("   ", "empty string"),
+    ("undefined", "missing-value sentinel"),
+    ("null", "missing-value sentinel"),
+    ("None", "missing-value sentinel"),
+])
+def test_inv_dir_rejects_missing_value_sentinels(tmp_path, monkeypatch, bad_id, expected):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    with pytest.raises(ValueError, match=expected):
+        inv_store._inv_dir(bad_id)

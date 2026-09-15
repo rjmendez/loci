@@ -29,6 +29,18 @@ if [ -z "$INV" ]; then
   exit 0
 fi
 
+INV="$(printf '%s' "$INV" | tr -d '[:space:]')"
+case "${INV,,}" in
+  ""|undefined|null|none)
+    echo "[loci] invalid active investigation id: $INV" >&2
+    exit 1
+    ;;
+esac
+if [[ ! "$INV" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "[loci] invalid active investigation id: $INV" >&2
+  exit 1
+fi
+
 WORKFLOW="$REPO_ROOT/deep_think_loci/workflows/contract-sync.js"
 if [ ! -f "$WORKFLOW" ]; then
   exit 0
