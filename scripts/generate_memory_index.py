@@ -1,50 +1,46 @@
 #!/usr/bin/env python3
-"""
-generate_memory_index.py — build the curated MEMORY.md index from memory files.
+"""Build the curated `MEMORY.md` index from memory files.
 
-Replaces hand-maintenance of MEMORY.md: hand-trimming does not hold (the index
-overflowed its context-load budget twice within days of a manual trim), and a
-flat hand-edited list silently drops files it forgets to link (orphans).
+This replaces hand-maintained `MEMORY.md`, which fails in two ways: manual
+trimming does not hold, and flat hand-edited lists silently orphan files they
+forget to link.
 
-This script derives the index from the memory files themselves and enforces
-the budget structurally — by construction the output can never exceed it.
+The script derives the index from the memory files and enforces the budget
+structurally, so the generated output cannot exceed it.
 
-The budget has two axes, because the reader truncates on both. --budget-chars is
-met by shortening hooks. --budget-lines cannot be: this emits one line per memory
-file, so a growing store meets the char cap by shaving hooks to stubs while the
-line count climbs past the reader's window regardless. Sections are therefore
-rolled out into generated 'wiki-<section>.md' topic-index files, leaving one
-pointer line each; --keep-inline names the sections that must never be rolled
-(the operator's standing rules, which are read every session). Rolled entries
-carry their FULL hook in the hub, so rolling a section out restores detail the
-char budget had already shaved off.
+The budget has two axes because the reader truncates on both:
+- `--budget-chars` is met by shortening hooks.
+- `--budget-lines` cannot be met by shortening hooks alone because the generator
+  still emits one line per memory file. Growing stores otherwise shave hooks
+  into stubs while line count escapes the reader window. To bound lines, the
+  script rolls whole sections into generated `wiki-<section>.md` topic indexes,
+  leaving one pointer line behind.
+- `--keep-inline` names sections that must never roll out (standing rules read
+  every session).
+- Rolled entries keep their full hook in the hub, so rollup restores detail the
+  char budget had already shaved away.
 
 Usage:
     scripts/generate_memory_index.py [memory_dir] [--budget-chars N] [--budget-lines N]
                                       [--keep-inline "A,B"] [--source PATH]
                                       [--headroom-pct N] [--dry-run] [--check]
 
-memory_dir defaults to backends.memory_dir(), which resolves in order:
-LOCI_MEMORY_MD_DIR env -> gitignored config [memory].dir -> LOCI_MEMORY_DIR env ->
-HERMES_MEMORY_DIR env -> '' (unconfigured) — the same resolution the grounding
-lane uses. No host-specific path is hardcoded here.
+`memory_dir` defaults to `backends.memory_dir()`, which resolves in order:
+`LOCI_MEMORY_MD_DIR` -> gitignored config `[memory].dir` -> `LOCI_MEMORY_DIR`
+-> `HERMES_MEMORY_DIR` -> `''` (unconfigured). No host-specific path is hardcoded.
 
---source defaults to <memory_dir>/MEMORY.md when that file exists, so the
-default run preserves its existing section grouping instead of collapsing it
-to metadata.type buckets (the destructive failure mode this script must not
-have on its primary documented invocation).
+`--source` defaults to `<memory_dir>/MEMORY.md` when it exists so the default
+run preserves the current section grouping instead of collapsing to
+`metadata.type` buckets.
 
-Output: <memory_dir>/MEMORY.md. An existing file is backed up first, as
-MEMORY.md.bak-YYYYMMDD-HHMMSS-ffffff (matching the operator's manual-backup
-convention, with microseconds so same-second reruns don't clobber a backup),
-unless --dry-run. --headroom-pct (default 5) targets generation below
---budget-chars so a manual edit between runs doesn't immediately re-overflow.
+Output: `<memory_dir>/MEMORY.md`. Existing files are backed up first as
+`MEMORY.md.bak-YYYYMMDD-HHMMSS-ffffff` unless `--dry-run`. `--headroom-pct`
+(default 5) targets generation below `--budget-chars` so a manual edit between
+runs does not immediately re-overflow.
 
-Wiring: nothing currently invokes this script on a schedule or in CI — the
-budget guarantee is structural only when something calls it. --check exits
-non-zero when the on-disk index has drifted from what regeneration would
-produce, without writing; wire that into a cron job or pre-commit hook to make
-the guarantee real rather than aspirational.
+Nothing currently wires this script into a schedule or CI. `--check` exits
+non-zero when the on-disk index has drifted from regenerated output without
+writing; wire that into cron or pre-commit to make the structural guarantee real.
 """
 from __future__ import annotations
 
@@ -69,18 +65,16 @@ _WORKING_AGREEMENTS_SECTION = "Working agreements"
 _MARKER_WARNING = "⚠"  # ⚠ — entries carrying this keep more of their hook under truncation
 _MARKER_STATUS = "✅"   # ✅
 
-# [m2] The char budget alone cannot bound the line count: this generator emits one
-# line per memory file and only ever shortens HOOKS, never the number of lines. So a
-# growing store meets the char cap by shaving hooks to stubs while the line count
-# climbs unbounded — which is how a 256-file store rendered 283 lines of increasingly
-# useless stubs and still overflowed the reader's ~200-line window. Bounding lines
-# needs a structural lever: roll whole sections out into generated topic-index
-# ("hub") files and leave one pointer line behind.
+# [m2] Char budget alone cannot bound line count: this generator emits one
+# line per memory file and only shortens hooks. A growing store can hit the char
+# cap by shaving hooks into stubs while still overflowing the reader's ~200-line
+# window. Bounding lines needs a structural lever: roll whole sections into
+# generated topic-index ("hub") files and leave one pointer line behind.
 HUB_PREFIX = "wiki-"
 HUB_SECTION = "Topic indexes"
-# Sections that must stay inline whatever the budget: these are read every session
-# and are behavioural rather than referential. Rolling them into a hub would mean
-# the agent no longer sees the operator's standing rules without a second read.
+# Sections that must stay inline regardless of budget: they are read every
+# session and are behavioural, not referential. Rolling them into a hub would
+# hide standing rules behind a second read.
 DEFAULT_KEEP_INLINE = (_WORKING_AGREEMENTS_SECTION, "Feedback")
 _HUB_GENERATED_MARKER = "<!-- generated by generate_memory_index.py -->"
 
@@ -110,11 +104,12 @@ def _unquote(v: str) -> str:
 
 
 def parse_frontmatter(text: str) -> tuple[dict, str | None]:
-    """Pull name/description/metadata.type out of a '---' YAML-ish block.
+    """Pull `name` / `description` / `metadata.type` from a `---` YAML-ish block.
 
-    Never raises. Returns (fields, error) — error is set (but fields still
-    populated with whatever was recoverable) for anything malformed, so a
-    broken file is reported rather than silently skipped."""
+    Never raises. Returns `(fields, error)`. On malformed input, `error` is set
+    and `fields` still contain whatever could be recovered, so broken files are
+    reported instead of skipped.
+    """
     fields: dict = {"name": None, "description": None, "type": None}
     start = text.find("---")
     if start == -1 or text[:start].strip():
@@ -165,9 +160,9 @@ def _title_from(name: str | None, path: Path) -> str:
 
 
 def load_entries(memory_dir: Path) -> tuple[list[Entry], list[tuple[str, str]]]:
-    # Hub files are this script's own output, not memories. Indexing them would add
-    # an entry per hub on the next run and, worse, let a hub's contents be re-rolled
-    # into a hub — the generator eating its own output, one level deeper.
+    # Hub files are generated output, not source memories. Indexing them would
+    # add one entry per hub next run and could re-roll hub contents into another
+    # hub: the generator eating its own output.
     files = sorted(p for p in memory_dir.glob("*.md")
                    if p.name != "MEMORY.md" and not p.name.startswith(HUB_PREFIX))
     entries: list[Entry] = []
@@ -200,10 +195,12 @@ _CURATED_RE = re.compile(
 
 def parse_source_sections(
         text: str) -> tuple[list[str], dict[str, list[str]], dict[str, tuple[str, str]]]:
-    """Recover '## Section' -> [filenames] from an existing index, in order,
-    plus each entry's curated title and hook. The curated hook is hand-written
-    and carries the markers and shorthand that a frontmatter description does
-    not, so it is the better source for the index line."""
+    """Recover `'## Section' -> [filenames]` from an existing index, in order.
+
+    Also recover each entry's curated title and hook. Curated hooks are hand-
+    written and preserve markers and shorthand that frontmatter descriptions do
+    not, so they are the better source for rendered index lines.
+    """
     order: list[str] = []
     sections: dict[str, list[str]] = {}
     curated: dict[str, tuple[str, str]] = {}
@@ -236,11 +233,13 @@ def _type_section_name(mtype: str | None) -> str:
 
 def apply_curated(entries: list[Entry],
                   curated: dict[str, tuple[str, str]]) -> list[Entry]:
-    """Prefer the source index's hand-written title and hook over the frontmatter
-    description. The curated line carries the operator's markers and shorthand;
-    the description is prose written for a different purpose. Files the index
-    never listed keep their description, and a curated link pointing outside the
-    memory dir is carried through rather than silently dropped."""
+    """Prefer curated titles/hooks from the source index over frontmatter text.
+
+    Curated lines carry operator markers and shorthand; frontmatter descriptions
+    serve a different purpose. Files never listed in the index keep their
+    description, and curated links outside the memory dir are preserved instead
+    of dropped.
+    """
     if not curated:
         return entries
     by_file = {e.filename: e for e in entries}
@@ -253,12 +252,10 @@ def apply_curated(entries: list[Entry],
         if ctitle:
             e.title = ctitle
         if chook and not e.error:
-            # A curated hook ending in the ellipsis is this generator's OWN truncated
-            # output, not operator prose. Preferring it makes truncation cumulative and
-            # irreversible: every run re-reads the shortened line as the source of record,
-            # so a hook shaved once can never grow back even when budget is freed — which
-            # is how a store of full descriptions decayed into a page of stubs. Fall back
-            # to the frontmatter description, which is never truncated.
+            # A curated hook ending in the ellipsis is this generator's own
+            # truncated output, not operator prose. Preferring it makes truncation
+            # cumulative and irreversible, so fall back to the never-truncated
+            # frontmatter description instead.
             if chook.endswith(ELLIPSIS) and e.hook:
                 continue
             e.hook = chook
@@ -267,8 +264,7 @@ def apply_curated(entries: list[Entry],
 
 def build_sections(entries: list[Entry], source_order: list[str],
                     source_sections: dict[str, list[str]]) -> dict[str, list[Entry]]:
-    """Preserve the source index's grouping where a file is still listed there;
-    group everything else (new/orphaned files) by metadata.type."""
+    """Keep source-index grouping for still-listed files; group the rest by `metadata.type`."""
     by_file = {e.filename: e for e in entries}
     used: set[str] = set()
     result: dict[str, list[Entry]] = {}
@@ -285,9 +281,8 @@ def build_sections(entries: list[Entry], source_order: list[str],
         by_type.setdefault(_type_section_name(e.mtype), []).append(e)
     for section in sorted(by_type):
         by_type[section].sort(key=lambda e: e.filename)
-        # Append: a type-derived name can collide with a section the source pass
-        # already filled, and assigning would drop everything that landed there
-        # on an earlier run — the generator eating its own output.
+        # Append, do not assign: a type-derived section can collide with an
+        # existing source section, and assignment would drop earlier members.
         result.setdefault(section, []).extend(by_type[section])
 
     return result
@@ -317,9 +312,11 @@ def line_count(text: str) -> int:
 
 
 def _hub_pointer(section: str, ents: list[Entry], preview: int = 4) -> Entry:
-    """The one line a rolled-up section leaves behind in MEMORY.md. It names a few
-    of its members so the pointer is searchable on content, not just on a heading —
-    an agent grepping for 'kinect' should still get a hit that tells it where to look."""
+    """Build the one pointer line a rolled-up section leaves in `MEMORY.md`.
+
+    It names a few members so the pointer is searchable by content, not just by
+    heading; a grep for `kinect` should still tell the agent where to look.
+    """
     shown = " · ".join(e.title for e in ents[:preview])
     hook = f"{len(ents)} memories: {shown}"
     if len(ents) > preview:
@@ -329,8 +326,7 @@ def _hub_pointer(section: str, ents: list[Entry], preview: int = 4) -> Entry:
 
 def inline_view(sections: dict[str, list[Entry]],
                 rolled: list[str]) -> dict[str, list[Entry]]:
-    """What MEMORY.md itself renders: every section that stayed inline, plus one
-    pointer line per rolled-up section gathered under a single heading."""
+    """Return what `MEMORY.md` renders: inline sections plus one pointer per rollup."""
     out: dict[str, list[Entry]] = {
         name: list(ents) for name, ents in sections.items() if name not in rolled}
     if rolled:
@@ -340,12 +336,13 @@ def inline_view(sections: dict[str, list[Entry]],
 
 def plan_rollups(sections: dict[str, list[Entry]], budget_lines: int,
                  keep_inline: tuple[str, ...] | set[str]) -> list[str]:
-    """Choose the fewest sections to roll into hub files to get under the line
-    budget, largest first — each rollup trades N lines for 1, so the biggest
-    section buys the most room per pointer spent. Protected sections are never
-    candidates, and when even rolling everything else is not enough we return what
-    we have rather than touching them: an over-long index is recoverable, a silently
-    un-loaded standing rule is not."""
+    """Choose the fewest section rollups needed to meet the line budget.
+
+    Roll largest sections first: each rollup trades `N` lines for `1`, so the
+    biggest section buys the most room per pointer spent. Protected sections are
+    never candidates. If even rolling everything else is insufficient, return the
+    best effort rather than hide standing rules.
+    """
     protected = set(keep_inline)
     rolled: list[str] = []
     while line_count(render(inline_view(sections, rolled))) > budget_lines:
@@ -358,13 +355,12 @@ def plan_rollups(sections: dict[str, list[Entry]], budget_lines: int,
 
 
 def render_hub(section: str, ents: list[Entry]) -> str:
-    """A rolled-up section as a standalone memory file.
+    """Render a rolled-up section as a standalone memory file.
 
-    Two properties matter. It carries a '## <section>' heading listing the same
-    files, so parse_source_sections recovers the grouping from it on the next run
-    and the rollup round-trips instead of decaying into metadata.type buckets. And
-    its hooks are FULL — only MEMORY.md is budgeted, so rolling a section out
-    actually restores detail the char budget had shaved away."""
+    The file keeps a `## <section>` listing so `parse_source_sections()` can
+    recover grouping next run, and it preserves full hooks because only
+    `MEMORY.md` is budgeted.
+    """
     stem = hub_filename(section)[:-3]
     lines = [
         "---",
@@ -391,9 +387,11 @@ def render_hub(section: str, ents: list[Entry]) -> str:
 
 
 def _boundary_cut(hook: str, limit: int) -> str:
-    """Cut `hook` to at most `limit` chars, preferring a word/clause boundary
-    and never leaving an unbalanced backtick span, so an identifier/path/PR
-    number already inside the limit isn't split in half."""
+    """Cut `hook` to `limit` chars without splitting obvious boundaries.
+
+    Prefer word/clause boundaries and never leave unbalanced backticks, so an
+    identifier/path/PR number already inside the limit is not cut in half.
+    """
     candidate = hook[:limit]
     if candidate.count("`") % 2 == 1:
         last_tick = candidate.rfind("`")
@@ -419,8 +417,7 @@ def _truncate_hook(hook: str, allowance: int) -> str:
 
 
 def _entry_weight(section: str, hook: str) -> float:
-    """Salience: warning/status markers and the operator's curated agreements
-    section earn more of the truncation budget than a routine entry."""
+    """Assign more truncation budget to warning/status markers and curated agreements."""
     weight = 1.0
     if _MARKER_WARNING in hook:
         weight += 2.0
@@ -432,12 +429,13 @@ def _entry_weight(section: str, hook: str) -> float:
 
 
 def fit_to_budget(sections: dict[str, list[Entry]], budget_chars: int) -> bool:
-    """Shorten hooks to fit, weighting the per-entry allowance by salience
-    (warning/status markers, the Working agreements section) so the highest-
-    value entries are truncated last and least — never touching a title or
-    link. Binary-searches a scale factor over a real render, so the hard
-    budget is still guaranteed. Returns False only when the budget can't be
-    met even with every hook emptied out."""
+    """Shorten hooks to fit while preserving the most valuable entries longest.
+
+    Weight each hook's allowance by salience (warning/status markers and the
+    `Working agreements` section), never touching titles or links. Binary-search
+    a scale factor over a real render, so the hard budget is still guaranteed.
+    Return `False` only when the budget fails even with every hook emptied.
+    """
     entries = [e for ents in sections.values() for e in ents]
     original = {id(e): e.hook for e in entries}
     weight = {id(e): _entry_weight(section, original[id(e)])
@@ -544,10 +542,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"[generate_memory_index] WARNING: --source {sp} not found; "
                   f"grouping by metadata.type instead", file=sys.stderr)
-    # Existing hubs are part of the source of grouping, not a separate store: once a
-    # section is rolled out, MEMORY.md no longer lists its files, so without this the
-    # next run would find them unassigned and scatter them into metadata.type buckets.
-    # MEMORY.md is absorbed first so its ordering keeps precedence.
+    # Existing hubs are part of grouping state, not a separate store. Once a
+    # section rolls out, `MEMORY.md` stops listing its files, so skipping hubs here
+    # would scatter them into `metadata.type` buckets next run. Absorb `MEMORY.md`
+    # first so its ordering wins.
     for hp in sorted(d.glob(f"{HUB_PREFIX}*.md")):
         absorb(hp.read_text(encoding="utf-8", errors="replace"))
 
@@ -562,8 +560,8 @@ def main(argv: list[str] | None = None) -> int:
 
     keep_inline = tuple(s.strip() for s in args.keep_inline.split(",") if s.strip())
     rolled = plan_rollups(sections, args.budget_lines, keep_inline)
-    # Rendered before fit_to_budget, which mutates hooks in place: hubs are not
-    # budgeted and must carry the full text.
+    # Render before `fit_to_budget`, which mutates hooks in place; hubs are not
+    # budgeted and must keep full text.
     hubs = {hub_filename(name): render_hub(name, sections[name]) for name in rolled}
     inline = inline_view(sections, rolled)
 
@@ -577,17 +575,16 @@ def main(argv: list[str] | None = None) -> int:
 
     doc = render(inline)
     if line_count(doc) > args.budget_lines:
-        # Only reachable when the protected sections alone overflow: plan_rollups has
-        # nothing left it is allowed to move. Warn loudly rather than fail the run —
-        # a long index still loads partially, and exiting non-zero here would leave
-        # the previous, staler index in place.
+        # Reached only when protected sections alone overflow and `plan_rollups`
+        # has nothing left it may move. Warn instead of failing: a long index still
+        # loads partially, while a non-zero exit would leave the older index in place.
         print(f"[generate_memory_index] WARNING: index is {line_count(doc)} lines, over "
               f"--budget-lines={args.budget_lines}; sections kept inline "
               f"({', '.join(keep_inline)}) already exceed it. Split one, or lower "
               f"--keep-inline.", file=sys.stderr)
     if len(doc) > args.budget_chars:
-        # fit_to_budget's own render() calls already guarantee this; a mismatch here
-        # would mean render() is non-deterministic, which is a bug, not a soft failure.
+        # `fit_to_budget()` already guarantees this. A mismatch means `render()`
+        # is non-deterministic, which is a bug, not a soft failure.
         print(f"error: generated index is {len(doc)} chars, over budget {args.budget_chars}",
               file=sys.stderr)
         return 3
@@ -603,9 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         stale = []
         if (out_path.read_text(encoding="utf-8") if out_path.exists() else None) != doc:
             stale.append(out_path.name)
-        # A drifted hub is as stale as a drifted index — it holds the entries that are
-        # no longer in MEMORY.md at all, so skipping it here would make --check green
-        # on exactly the content the rollup moved out of sight.
+        # A drifted hub is as stale as a drifted index: it holds entries no
+        # longer listed in `MEMORY.md`, so skipping it would let `--check` go green
+        # on content the rollup hid.
         for fname, text in hubs.items():
             hp = d / fname
             if (hp.read_text(encoding="utf-8") if hp.exists() else None) != text:
@@ -630,9 +627,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[generate_memory_index] backed up {out_path} -> {backup}", file=sys.stderr)
     for fname, text in hubs.items():
         (d / fname).write_text(text, encoding="utf-8")
-    # A hub for a section that no longer rolls up would keep re-seeding its grouping
-    # from a stale member list on every later run, so retire the ones we did not just
-    # write. Only files carrying this generator's marker are touched.
+    # A hub for a section that no longer rolls up would keep reseeding grouping
+    # from a stale member list, so retire hubs we did not just write. Touch only
+    # files carrying this generator's marker.
     for hp in sorted(d.glob(f"{HUB_PREFIX}*.md")):
         if hp.name not in hubs and _HUB_GENERATED_MARKER in hp.read_text(
                 encoding="utf-8", errors="replace"):

@@ -1,44 +1,43 @@
 #!/usr/bin/env python3
-"""reembed_daemon.py — SAFE, incremental GPU batch re-embed / index refresh for Qdrant.
+"""Safe, incremental GPU re-embed / index refresh for Qdrant.
 
-Re-embeds (or backfills) the dense vectors of Qdrant points on the local GPU via the
-Ollama nomic embedding path, for model/version changes or for points that are simply
-missing a vector. This is the batch counterpart to the online embed tier.
+Re-embeds or backfills dense vectors through the Ollama nomic embedding path.
+Use it for model/version changes or points missing vectors. It is the batch
+counterpart to the online embed tier.
 
-Substrate this is built against (session grounding — verify against live code):
-  - [retrieval] Qdrant is a SEPARATE k3s host (CPU, no GPU); collections include
-    loci_memory + agent_core_chunks (~1.84M points). It stores the vectors; we only
-    read/rewrite them. QDRANT_URL / QDRANT_API_KEY come from env (same convention as
-    scripts/qdrant_payload_indexes.py and scripts/mnemosyne_qdrant_sync.py).
-  - [gen]/[rerank note] The GPU work here is EMBEDDING, not generation. Embeddings come
-    from Ollama nomic-embed-text (768-dim), warm on GPU (OLLAMA_BASE_URL). We reuse the
-    exact embed path from mcp/embed_ops.py (embed_texts) as the default embed_fn.
-  - [pattern:fail-open] Every batch fails open: an embed or upsert error is logged and we
-    CONTINUE to the next batch; we never raise out of the run. Mirrors embed_ops/llm_local.
-  - [pattern:injectable] qdrant_client and embed_fn are injected (default None -> lazy
-    resolve from env), so importing this module hard-requires nothing and tests stub both.
+Grounding assumptions
+- Qdrant is a separate k3s CPU host storing vectors for collections such as
+  `loci_memory` and `agent_core_chunks` (~1.84M points). We only read/rewrite
+  vectors. `QDRANT_URL` / `QDRANT_API_KEY` follow the same env convention as
+  `scripts/qdrant_payload_indexes.py` and `scripts/mnemosyne_qdrant_sync.py`.
+- GPU work here is embeddings, not generation. Embeddings come from Ollama
+  `nomic-embed-text` (768-dim) via the exact `mcp/embed_ops.py:embed_texts`
+  path used online.
+- Every batch fails open: embed or upsert errors are logged and the run
+  continues, matching `embed_ops` / `llm_local`.
+- `qdrant_client` and `embed_fn` are injectable (`None` => lazy env resolve),
+  so importing the module hard-requires nothing and tests can stub both.
 
-SAFETY (critical):
-  - DEFAULT IS DRY-RUN. Without --apply we SCAN the collection, decide which points are
-    stale/missing, and REPORT the count — writing NOTHING and not even calling the GPU.
-  - --apply is the only way to mutate. There is no destructive default anywhere.
+Safety
+- Default is dry-run. Without `--apply`, the script scans, reports stale/missing
+  points, writes nothing, and does not even call the GPU.
+- `--apply` is the only mutating mode.
 
-Incremental / idempotent:
-  - A point is targeted only if it is MISSING a vector, or its payload embed_model /
-    embed_version differs from the current target. Freshly re-embedded points get those
-    payload fields stamped, so a second run targets nothing. Safe to re-run.
+Incremental / idempotent
+- A point is targeted only when it is missing a vector or its payload
+  `embed_model` / `embed_version` differ from the current target.
+- Freshly re-embedded points are stamped with those payload fields, so a second
+  run targets nothing.
 
 Usage:
-    # dry-run: report how many points WOULD be re-embedded, write nothing
     python3 scripts/reembed_daemon.py --collection loci_memory
-    # actually re-embed the stale/missing points
     python3 scripts/reembed_daemon.py --collection loci_memory --apply
 
 Env:
-    QDRANT_URL, QDRANT_API_KEY   — Qdrant endpoint (key falls back to ~/.claude settings)
-    OLLAMA_BASE_URL / OLLAMA_URL — Ollama for the nomic embed path (via embed_ops)
-    EMBED_MODEL                  — current embed model tag (default nomic-embed-text)
-    EMBED_VERSION                — current embed version marker (default "1")
+    QDRANT_URL, QDRANT_API_KEY   Qdrant endpoint (key also falls back to ~/.claude settings)
+    OLLAMA_BASE_URL / OLLAMA_URL Ollama for the nomic embed path (via embed_ops)
+    EMBED_MODEL                  current embed model tag (default `nomic-embed-text`)
+    EMBED_VERSION                current embed version marker (default `"1"`)
 """
 from __future__ import annotations
 
@@ -47,23 +46,22 @@ import os
 import sys
 from typing import Any, Callable, Optional
 
-# Current embedding target — a point whose payload disagrees with EITHER of these
-# (or has no vector at all) is considered stale and gets re-embedded.
+# Current embedding target. Missing vectors or mismatched payload stamps are stale.
 _EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 _EMBED_VERSION = os.environ.get("EMBED_VERSION", "1")
 
-# Payload keys we stamp on re-embed and compare against for staleness.
+# Payload keys stamped on re-embed and checked for staleness.
 _MODEL_KEY = "embed_model"
 _VERSION_KEY = "embed_version"
 
-# Candidate payload fields to pull the source text from, in priority order.
+# Candidate payload fields for source text, in priority order.
 _TEXT_KEYS = ("document", "text", "content", "summary", "title")
 
 
-# ── injectable resolvers (lazy; importing this module requires nothing) ──────────
+# ── injectable resolvers (lazy; import stays dependency-light) ──────────
 
 def _resolve_qdrant():
-    """Build a QdrantClient from env. Only called when no client was injected."""
+    """Build a `QdrantClient` from env when no client was injected."""
     from qdrant_client import QdrantClient  # lazy: not needed for import or tests
     url = os.environ.get("QDRANT_URL")
     key = os.environ.get("QDRANT_API_KEY", "")
@@ -73,8 +71,8 @@ def _resolve_qdrant():
             home = os.path.expanduser("~")
             cfg = json.load(open(os.path.join(home, ".claude", "settings.json")))
             servers = cfg["mcpServers"]
-            # "loci" is the current registration name; "hermes_memory" is what
-            # older settings.json files used. Accept either.
+            # Accept both the current "loci" registration name and older
+            # "hermes_memory" settings.json entries.
             entry = servers.get("loci") or servers["hermes_memory"]
             key = entry["env"]["QDRANT_API_KEY"]
         except Exception:
@@ -85,8 +83,8 @@ def _resolve_qdrant():
 
 
 def _resolve_embed_fn() -> Callable[[list[str]], list[list[float]]]:
-    """Default embed function — the warm-GPU nomic path from mcp/embed_ops.py [gen]."""
-    # Add mcp/ to the path so we reuse the exact online embed implementation.
+    """Default embed function: the warm-GPU nomic path from `mcp/embed_ops.py`."""
+    # Add mcp/ so we reuse the exact online embed implementation.
     here = os.path.dirname(os.path.abspath(__file__))
     mcp_dir = os.path.join(os.path.dirname(here), "mcp")
     if mcp_dir not in sys.path:
@@ -118,14 +116,14 @@ def _has_vector(point: Any, vector_name: Optional[str]) -> bool:
     if vector_name:
         return isinstance(vec, dict) and bool(vec.get(vector_name))
     if isinstance(vec, dict):
-        # a named-vector point where we didn't ask for a specific name
+        # Named-vector point when no specific name was requested.
         return any(bool(v) for v in vec.values())
     return bool(vec)
 
 
 def _is_stale(point: Any, vector_name: Optional[str],
               embed_model: str, embed_version: str) -> bool:
-    """A point is stale if it has no vector, or its stamped model/version differs."""
+    """A point is stale when it lacks a vector or its model/version stamp differs."""
     if not _has_vector(point, vector_name):
         return True
     payload = _attr(point, "payload") or {}
@@ -139,7 +137,7 @@ def _is_stale(point: Any, vector_name: Optional[str],
 
 
 def _make_point(pid, vector, payload: dict, vector_name: Optional[str]):
-    """Build an upsert point. Prefer qdrant's PointStruct; fall back to a dict."""
+    """Build an upsert point, preferring qdrant's `PointStruct` and falling back to a dict."""
     vec_payload = {vector_name: vector} if vector_name else vector
     try:
         from qdrant_client.models import PointStruct  # lazy
@@ -162,17 +160,17 @@ def reembed(collection: str,
             vector_name: Optional[str] = None,
             text_keys=_TEXT_KEYS,
             logger: Optional[Callable[[str], None]] = None) -> dict:
-    """Scan `collection` and (only with apply=True) re-embed stale/missing points.
+    """Scan `collection` and, only with `apply=True`, re-embed stale points.
 
-    Injected deps (both default None -> lazily resolved from env [pattern:injectable]):
-      qdrant_client : object with .scroll(...) -> (points, next_offset) and .upsert(...).
-      embed_fn      : list[str] -> list[list[float]] (fail-open: [] on failure).
+    Injected deps default to `None` and are resolved lazily from env:
+      `qdrant_client` needs `.scroll(...) -> (points, next_offset)` and `.upsert(...)`
+      `embed_fn` maps `list[str] -> list[list[float]]` and may fail open with `[]`
 
-    Returns a report dict (never raises [pattern:fail-open]):
+    Returns a fail-open report dict and never raises:
       {applied, dry_run, collection, scanned, missing_vector, stale_meta, targeted,
        reembedded, upserted_batches, embed_batches, errors:[...], degraded}
-    `reembedded` is what was actually written (0 on dry-run). On dry-run, `targeted` is
-    the count that WOULD be re-embedded and nothing (not even the GPU) is touched.
+    `reembedded` counts actual writes (0 on dry-run). On dry-run, `targeted` is
+    the would-write count and nothing, including the GPU, is touched.
     """
     log = logger or (lambda m: print(m, file=sys.stderr))
     report = {
@@ -192,7 +190,7 @@ def reembed(collection: str,
         "embed_version": embed_version,
     }
 
-    # Resolve injected deps lazily. Failure to resolve = fail-open degraded report.
+    # Resolve injected deps lazily. Resolution failure yields a fail-open degraded report.
     try:
         client = qdrant_client if qdrant_client is not None else _resolve_qdrant()
     except Exception as e:
@@ -202,11 +200,11 @@ def reembed(collection: str,
         return report
     ef = embed_fn if embed_fn is not None else None  # resolve only if we actually embed
 
-    # A buffer of (point_id, text, base_payload) awaiting a flush at batch_size.
+    # Buffer of (point_id, text, base_payload) awaiting a batch flush.
     pending: list[tuple] = []
 
     def _flush(batch: list[tuple]) -> None:
-        """Embed + upsert one batch. Fail-open: log and return on any error."""
+        """Embed and upsert one batch. Log and return on any error."""
         if not batch:
             return
         nonlocal ef
@@ -241,7 +239,7 @@ def reembed(collection: str,
         report["upserted_batches"] += 1
         report["reembedded"] += len(points)
 
-    # ── scroll the whole collection, paging ───────────────────────────────────
+    # ── scroll the collection, paging ───────────────────────────────────
     offset = None
     while True:
         try:
@@ -274,7 +272,7 @@ def reembed(collection: str,
             payload = _attr(point, "payload") or {}
             text = _point_text(payload, text_keys)
             if not text:
-                # nothing to embed for this point; note and skip (fail-open)
+                # No source text: note and skip (fail-open).
                 report["errors"].append(f"no-text: {_attr(point, 'id')}")
                 continue
             pending.append((_attr(point, "id"), text, payload))
@@ -329,7 +327,7 @@ def main(argv=None) -> int:
     )
     import json
     print(json.dumps(report, indent=2, default=str))
-    # Non-zero exit only on a hard degrade (couldn't scan at all), never on skipped batches.
+    # Non-zero exit only on hard degrade (could not scan at all), never on skipped batches.
     return 1 if report.get("degraded") else 0
 
 

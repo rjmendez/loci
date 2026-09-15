@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
-"""Passive grooming tier for the Loci corpus — runs unattended, on cron.
+"""Passive grooming for the Loci corpus; meant for unattended cron runs.
 
-Three rules hold for every pass:
+Per-pass rules:
+  IDEMPOTENT   rerunning unchanged input proposes nothing new
+  FAIL-OPEN    dead backends degrade to a report; they do not raise or leave the corpus half-written
+  SHADOW-FIRST model-derived output goes to `_groom/proposals.jsonl` with provenance
+               (`pass`, `model`, `score`) and never into `findings.jsonl`; proposals
+               must stay distinguishable from author-written fields
 
-  IDEMPOTENT   a second run over unchanged input proposes nothing new.
-  FAIL-OPEN    a dead backend degrades the pass to a report; it never raises and
-               never leaves the corpus half-written.
-  SHADOW-FIRST model-derived output is written to _groom/proposals.jsonl with its
-               provenance (pass, model, score) and is NEVER merged into
-               findings.jsonl. A proposal is a claim awaiting adjudication, and it
-               has to stay distinguishable from an author-written field.
-
-``--apply`` promotes only for passes that declare ``applyable`` — today just
-``index``, whose write is a re-upsert of the record already on disk, so it can
-restore but cannot invent.
+`--apply` promotes only passes that declare `applyable` — today just `index`,
+whose write is a re-upsert of the record already on disk, so it can restore but
+cannot invent.
 
 Usage:
-    loci_groom.py index                    # report Qdrant/disk drift
-    loci_groom.py index --apply            # re-embed and re-upsert what is missing
-    loci_groom.py tags --limit 200         # propose canonical tags via the local model
+    loci_groom.py index
+    loci_groom.py index --apply
+    loci_groom.py tags --limit 200
     loci_groom.py all --json
 """
 from __future__ import annotations
@@ -40,12 +37,12 @@ sys.path.insert(0, str(_REPO / "mcp"))
 
 
 def load_env() -> dict:
-    """Resolve backend config the way the server does, then from the config file.
+    """Resolve backend config the way the server does, then via config files.
 
-    A cron job does not inherit the MCP launcher's environment, and the running
-    server's QDRANT_URL currently lives only in its own process env — so without
-    this a scheduled pass silently reports 'qdrant unreachable' forever.
-    Precedence: existing env -> repo .env files -> ~/.loci/backends.toml.
+    Cron does not inherit the MCP launcher's environment, and the running
+    server's `QDRANT_URL` may exist only in that server process. Without this,
+    scheduled passes can report `qdrant unreachable` forever.
+    Precedence: existing env -> repo `.env` files -> `~/.loci/backends.toml`.
     """
     try:
         from dotenv import load_dotenv
@@ -77,7 +74,7 @@ def load_env() -> dict:
         except Exception as exc:
             logger.warning("load_env: could not resolve Ollama from backends: %r", exc)
 
-    # backends.toml is stdlib tomllib, so the setting that protects the corpus needs no import.
+    # backends.toml uses stdlib tomllib, so this safety setting needs no extra import.
     if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
         try:
             import backends
@@ -98,10 +95,10 @@ MEMORY_DIR = Path(os.environ.get(
 ))
 GROOM_DIR = MEMORY_DIR / "_groom"
 
-# Unset on purpose: vLLM and Ollama name the same model differently, so each tier resolves its own.
+# Unset on purpose: vLLM and Ollama name the same model differently.
 GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
 GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
-# Per-run ceilings. These bound a nightly job, not a human sitting in front of it.
+# Per-run ceilings bound a nightly job, not an interactive operator.
 VERIFY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_VERIFY_INVESTIGATIONS", "5"))
 VERIFY_PER_INVESTIGATION = int(os.environ.get("LOCI_GROOM_VERIFY_FINDINGS", "10"))
 SUMMARY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_SUMMARY_INVESTIGATIONS", "12"))
@@ -111,7 +108,7 @@ REFLECT_MAX_ITEMS = int(os.environ.get("LOCI_GROOM_REFLECT_ITEMS", "3"))
 # --- corpus access ----------------------------------------------------------
 
 def iter_findings(memory_dir: Optional[Path] = None) -> Iterable[dict]:
-    """Every finding on disk. The JSONL files are the system of record."""
+    """Yield every on-disk finding. The JSONL files are the system of record."""
     root = memory_dir or MEMORY_DIR
     for path in sorted(root.glob("*/findings.jsonl")):
         try:
@@ -144,7 +141,7 @@ def _proposal(pass_name: str, subject_id: str, kind: str, value, **extra) -> dic
 
 
 def write_proposals(rows: list[dict], groom_dir: Optional[Path] = None) -> int:
-    """Append proposals, skipping ids already on file. Returns the number written."""
+    """Append proposals, skip ids already on file, and return the number written."""
     if not rows:
         return 0
     root = groom_dir or GROOM_DIR
@@ -172,15 +169,14 @@ def write_proposals(rows: list[dict], groom_dir: Optional[Path] = None) -> int:
 # --- pass: index ------------------------------------------------------------
 
 def connect(require_safe_retention: bool = True):
-    """(client, collection, refusal) — the ONLY way this module reaches Qdrant.
+    """Return `(client, collection, refusal)`; the only Qdrant entrypoint here.
 
-    qdrant_ops._get_qdrant() runs _purge_old_records on its first call in a
-    process, so connecting is a destructive act when retention is not 0. Guarding
-    one pass is not enough: pass_index, pass_recall and pass_knn_tags all connect,
-    and a guard copied into each is a guard that will be forgotten by the fourth.
-    Everything goes through here instead.
+    `qdrant_ops._get_qdrant()` runs `_purge_old_records` on first use in a
+    process, so connecting is destructive when retention is non-zero. Guarding
+    one pass is not enough because `pass_index`, `pass_recall`, and
+    `pass_knn_tags` all connect. Centralize the guard here.
 
-    Returns a refusal dict when it is not safe to connect, else None in that slot.
+    When connecting is unsafe, return a refusal dict in the third slot.
     """
     try:
         import qdrant_ops
@@ -223,10 +219,9 @@ def indexed_ids(client, col: str) -> set:
 def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
     """Reconcile the JSONL corpus against the Qdrant index.
 
-    Findings reach Qdrant only on write (``_qdrant_upsert`` at store time) and the
-    startup TTL purge deletes by ``created_at_ts``, so anything past the retention
-    window leaves the index and nothing ever puts it back. Disk keeps it; search
-    does not see it. This pass is the missing reconciliation.
+    Findings reach Qdrant only via `_qdrant_upsert` at store time, while the
+    startup TTL purge deletes by `created_at_ts`. Records past retention stay on
+    disk but disappear from search. This pass restores that reconciliation.
     """
     on_disk = {}
     for f in iter_findings():
@@ -255,7 +250,7 @@ def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
         report.update(status="degraded", detail=f"scroll failed: {exc!r}")
         return report
 
-    # _qdrant_upsert stores the finding id verbatim as the point id.
+    # `_qdrant_upsert` stores the finding id verbatim as the point id.
     missing = [f for fid, f in on_disk.items() if fid not in indexed]
 
     report["indexed"] = len(indexed)
@@ -292,12 +287,11 @@ _TAG_PROMPT = (
 
 
 def _parse_tags(raw: str) -> Optional[list]:
-    """Pull a tag list out of a small model's JSON. None = unparseable.
+    """Pull a tag list out of a small model's JSON; `None` means unparseable.
 
-    A 3B model asked for {"tags": [...]} will sometimes answer with a bare list or
-    put the list under a key of its own choosing. Accepting those shapes is not the
-    same as accepting invented content — every term still has to survive the
-    vocabulary filter downstream.
+    A 3B model asked for `{"tags": [...]}` may answer with a bare list or put
+    the list under another key. Accept those shapes, but still run every term
+    through the downstream vocabulary filter.
     """
     try:
         obj = json.loads(raw or "")
@@ -315,17 +309,17 @@ def _parse_tags(raw: str) -> Optional[list]:
 
 
 def build_vocabulary(findings: Iterable[dict], min_uses: int = 5, top_n: int = 60) -> list[str]:
-    """The tags that carry signal — ones reused across the corpus.
+    """Return the tags that carry signal: tags reused across the corpus.
 
-    4,267 distinct tags exist on this corpus and 2,809 of them are used exactly
-    once, so the raw tag set is closer to free text than to a vocabulary. Terms
-    that recur are the ones a reader could actually filter on.
+    On this corpus, 4,267 distinct tags exist and 2,809 are single-use, so the
+    raw tag set behaves more like free text than a vocabulary. Repeated terms are
+    the ones a reader can actually filter on.
     """
     counts: collections.Counter = collections.Counter()
     for f in findings:
         for t in (f.get("tags") or []):
             t = str(t).strip().lower()
-            # dt_* are per-run provenance stamps, not subject tags.
+            # `dt_*` are per-run provenance stamps, not subject tags.
             if t and not t.startswith("dt_"):
                 counts[t] += 1
     return [t for t, n in counts.most_common(top_n) if n >= min_uses]
@@ -334,10 +328,10 @@ def build_vocabulary(findings: Iterable[dict], min_uses: int = 5, top_n: int = 6
 def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
               memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
               calibrate: bool = False, seed: int = 0, **_) -> dict:
-    """Propose vocabulary tags for findings that carry none.
+    """Propose vocabulary tags for untagged findings.
 
-    Proposals only — an author's tags are evidence about what they meant, and a 3B
-    model's guess must not become indistinguishable from them.
+    Proposals only: author tags are evidence of intent, and a 3B model's guess
+    must stay distinguishable from them.
     """
     findings = list(iter_findings(memory_dir))
     vocab = build_vocabulary(findings)
@@ -350,7 +344,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
         return report
 
     if calibrate:
-        # Same holdout protocol as knn_tags --calibrate, so every method lands on one scale.
+        # Same holdout protocol as `knn_tags --calibrate`, so methods share a scale.
         candidates = [f for f in findings
                       if f.get("text") and set(_tags_of(f)) & set(vocab)]
         random.Random(seed).shuffle(candidates)
@@ -374,7 +368,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
     vocab_block = ", ".join(vocab)
     vocab_set = set(vocab)
     proposals = []
-    # Counted per cause: a generation error and a declined answer are not the same zero.
+    # Count per cause: generation errors and declined answers are different zeros.
     rej = collections.Counter()
     scored: list = []
 
@@ -397,7 +391,7 @@ def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
             if tags is None:
                 rej["unparseable"] += 1
                 continue
-            # Out-of-vocabulary terms are dropped, not allowed to widen the given vocabulary.
+            # Drop out-of-vocabulary terms; do not widen the supplied vocabulary.
             if not tags:
                 rej["declined"] += 1        # the model saw no fitting term — a real answer
                 continue
@@ -461,18 +455,17 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
                 groom_dir: Optional[Path] = None, search_fn: Optional[Callable] = None,
                 seed: int = 0, limit: Optional[int] = None, rerank: bool = True,
                 **_) -> dict:
-    """Ask the retriever for findings it already holds, and see if it returns them.
+    """Ask the retriever for findings it already holds and measure the return path.
 
-    Two probes, kept apart on purpose, because today they fail identically:
+    Keep two probes separate because they fail for different reasons:
+      identity   the query is the finding text itself. A miss here is wiring:
+                 wrong embedder, wrong width, or an unqueryable collection.
+                 No model is involved.
+      paraphrase the query is a model-written question derived from the finding.
+                 A miss here with identity intact is semantic reach, not breakage.
 
-      identity   query = the finding's own text. A miss here is WIRING — wrong
-                 embedder, wrong width, a collection that cannot be queried at all.
-                 No model is involved, so a regression is unambiguous.
-      paraphrase query = a question the local model writes from the finding. A miss
-                 here with identity intact is SEMANTIC reach, not breakage.
-
-    Only findings that are actually indexed are sampled — otherwise this measures
-    the index gap that ``index`` already reports, and reads as a retrieval failure.
+    Sample only findings that are actually indexed; otherwise this just measures
+    the index gap that `index` already reports.
     """
     sample = limit or sample          # --limit is the CLI's name for the sample size
     report = {"pass": "recall", "k": k, "sample": sample, "rerank": rerank, "status": "ok"}
@@ -518,7 +511,7 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
     report["search_errors"] = errors
     report["identity"] = _score(ident_ranks, k, len(ident_ranks))
     if not ident_ranks:
-        # Every probe raised: writing recall_at_1=0.0 would record a dead GPU as retrieval collapse.
+        # If every probe raised, `recall_at_1=0.0` would misreport a dead GPU as retrieval collapse.
         report.update(status="degraded",
                       detail=f"all {errors} probe search(es) failed — no measurement taken")
         return report
@@ -567,7 +560,7 @@ def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
 
 
 def _append_recall(report: dict, groom_dir: Optional[Path] = None) -> None:
-    """One row per run. The number matters far less than its trend."""
+    """Append one row per run; the trend matters more than any single value."""
     root = groom_dir or GROOM_DIR
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -581,7 +574,7 @@ def _append_recall(report: dict, groom_dir: Optional[Path] = None) -> None:
 # --- pass: knn_tags ---------------------------------------------------------
 
 def _tags_of(row: dict) -> list:
-    """Payload tags, normalised. Some write paths store a comma-joined string."""
+    """Normalized payload tags. Some writers store them as a comma-joined string."""
     raw = row.get("tags")
     if isinstance(raw, str):
         raw = raw.split(",")
@@ -591,11 +584,10 @@ def _tags_of(row: dict) -> list:
 
 
 def _knn_vote(neighbours: list, self_id: str, vocab: set, min_weight: float) -> list:
-    """Similarity-weighted tag vote over retrieved neighbours.
+    """Run a similarity-weighted tag vote over retrieved neighbours.
 
-    Weighting by score rather than counting means one very close neighbour can
-    carry a tag that five loose ones cannot — which is the whole reason to use
-    the embedding rather than a bag of words.
+    Weight by score, not count, so one very close neighbour can carry a tag that
+    several weak neighbours cannot. That is the point of using embeddings here.
     """
     weights: dict = {}
     for row in neighbours:
@@ -616,13 +608,12 @@ def pass_knn_tags(limit: Optional[int] = None, k: int = 8, min_weight: float = 1
                   max_tags: int = 3, calibrate: bool = False, seed: int = 0,
                   memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
                   search_fn: Optional[Callable] = None, **_) -> dict:
-    """Transfer tags from a finding's nearest already-tagged neighbours.
+    """Transfer tags from a finding's nearest tagged neighbours.
 
-    No generation involved. The embeddings are already in the index, the author's
-    own tags are the labels, and the whole thing is deterministic — so unlike a
-    model's guess it can be scored against held-out truth before anyone promotes
-    it. ``calibrate=True`` does exactly that: it hides the tags of findings that
-    have them, re-derives them from neighbours, and reports how often it agrees.
+    No generation is involved. Embeddings are already in the index, author tags
+    are the labels, and the method is deterministic, so unlike a model guess it
+    can be scored against held-out truth before promotion. `calibrate=True`
+    hides existing tags, re-derives them from neighbours, and reports agreement.
     """
     report = {"pass": "knn_tags", "k": k, "min_weight": min_weight,
               "calibrate": calibrate, "status": "ok"}
@@ -711,15 +702,14 @@ _IDENT_STOP = frozenset({
 
 
 def _is_distinctive(tok: str) -> bool:
-    """Does this token name a symbol, or is it just a word that happens to be one?
+    """Decide whether `tok` looks like a real symbol, not just a word.
 
-    Measured, not guessed: the first live calibration linked `device`, `roll`,
-    `train`, `report`, `baseline` and `confirmed` to real symbols, because each is
-    genuinely a symbol name *somewhere* in an 11k-symbol graph across three
-    languages. A bare lowercase word carries no evidence that the author meant the
-    code. Structure does — an underscore, an internal case change, or real length.
-    This is the same judgement `code_memory_relink` encodes as "distinctive", and
-    it is why its coverage is conservative rather than broken.
+    This is measured, not guessed: live calibration linked plain words like
+    `device`, `roll`, `train`, `report`, `baseline`, and `confirmed` to real
+    symbols somewhere in an 11k-symbol, three-language graph. Bare lowercase
+    words are weak evidence; structure matters: underscore, internal case
+    change, or enough length. This matches `code_memory_relink`'s conservative
+    idea of "distinctive".
     """
     if "_" in tok:
         return True
@@ -729,11 +719,11 @@ def _is_distinctive(tok: str) -> bool:
 
 
 def _candidate_symbols(text: str, index: dict) -> tuple:
-    """(unique_hits, ambiguous_hits) for the identifier-shaped tokens in `text`.
+    """Return `(unique_hits, ambiguous_hits)` for identifier-shaped tokens.
 
-    A token that names exactly one symbol in the graph is evidence. A token that
-    names five is a question, and questions go to the model rather than being
-    guessed at — that asymmetry is the whole design.
+    A token naming exactly one symbol is evidence. A token naming several is a
+    question, so send it to the model instead of guessing. That asymmetry is the
+    design.
     """
     unique, ambiguous = {}, {}
     for raw in set(_IDENT_RE.findall(text or "")):
@@ -760,14 +750,14 @@ def pass_codelink(limit: Optional[int] = None, calibrate: bool = False,
                   gen_fn: Optional[Callable] = None, symbols_fn: Optional[Callable] = None,
                   linked_fn: Optional[Callable] = None, memory_dir: Optional[Path] = None,
                   groom_dir: Optional[Path] = None, **_) -> dict:
-    """Propose Finding -> CodeSymbol links the strict lexical linker will not make.
+    """Propose `Finding -> CodeSymbol` links the strict lexical linker skips.
 
-    ``code_memory_relink`` is precision-first by design and reaches 180 of 2,634
-    findings. This adds the two things it refuses to do: it treats a token that
-    resolves to exactly one symbol as evidence even when that token is not
-    'distinctive' by its rules, and it hands genuinely ambiguous tokens to the
-    local model with the candidate file paths attached. Proposals only — a wrong
-    code link is worse than no code link, because it survives as provenance.
+    `code_memory_relink` is precision-first and reaches 180 of 2,634 findings.
+    This pass adds the two things it avoids: treating uniquely resolved tokens as
+    evidence even when they are not "distinctive" by its rules, and sending
+    genuinely ambiguous tokens to the local model with candidate file paths.
+    Proposals only: a wrong code link is worse than none because it survives as
+    provenance.
     """
     report = {"pass": "codelink", "calibrate": calibrate, "status": "ok"}
 

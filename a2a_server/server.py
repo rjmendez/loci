@@ -1,162 +1,117 @@
 #!/usr/bin/env python3
-"""
-Loci A2A Server v0.1.0
-Exposes Mnemosyne memory operations over the A2A JSON-RPC protocol.
+"""Loci A2A Server v0.1.0 — Mnemosyne memory over A2A JSON-RPC.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RUNTIME REQUIREMENTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Runtime requirements
+- Python 3.11 (venv: ~/.hermes/hermes-agent/venv/bin/python3)
+- Pip packages from requirements.txt:
+  fastapi==0.133.1 HTTP server/dependency injection/******
+  uvicorn==0.41.0 ASGI runner
+  starlette==1.3.1 fastapi dep for Request/JSONResponse
+  pydantic==2.13.4 fastapi dep for validation
+  aiohttp==3.14.3 async HTTP client for Qdrant + Ollama
+  pyotp==2.9.0 TOTP (RFC 6238) for X-TOTP auth
+- Stdlib: os, uuid, json, sqlite3, logging, datetime, typing, asyncio, sys
 
-Python: 3.11  (venv: ~/.hermes/hermes-agent/venv/bin/python3)
-
-Pip packages (see requirements.txt for pinned versions):
-  fastapi==0.133.1     HTTP server, dependency injection, Bearer auth
-  uvicorn==0.41.0      ASGI runner
-  starlette==1.3.1     fastapi dep — Request, JSONResponse
-  pydantic==2.13.4     fastapi dep — validation
-  aiohttp==3.14.3      async HTTP client for Qdrant + Ollama
-  pyotp==2.9.0         TOTP (RFC 6238) for X-TOTP header auth
-
-stdlib (no install needed):
-  os, uuid, json, sqlite3, logging, datetime, typing, asyncio, sys
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ENVIRONMENT VARIABLES  (loaded from ~/.hermes/.env at startup)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+Env vars (loaded from ~/.hermes/.env at startup)
 Required:
-  LOCI_A2A_TOKEN          Bearer token callers must supply.
-                            REQUIRED — server exits at startup if unset.
-                            Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
-
+  LOCI_A2A_TOKEN ****** callers must supply.
+    REQUIRED — server exits at startup if unset.
+    Generate: python3 -c "import secrets;print(secrets.token_hex(32))"
 Optional / tunable:
-  LOCI_A2A_BOOTSTRAP_KEY  Pre-shared key for POST /bootstrap. Callers
-                            present this to receive a 24h session token
-                            usable as a bearer without TOTP. Eliminates
-                            the need to distribute LOCI_A2A_TOKEN+TOTP
-                            to every new session. If unset, /bootstrap 501s.
-                            Generate: python3 -c "import secrets;print(secrets.token_hex(24))"
-  LOCI_A2A_HOST           Bind address.  Default: 0.0.0.0
-  LOCI_A2A_PORT           Bind port.     Default: 8201
-  LOCI_A2A_URL            Public base URL injected into the agent card.
-                            Default: http://127.0.0.1:8201
-  LOCI_A2A_TOTP_SEED      Base32 TOTP seed (RFC 6238).  If set, callers
-                            must include a valid X-TOTP header.
-                            Default: '' (TOTP disabled)
-  HERMES_AGENT_ID           Agent identity tag written into memory metadata.
-                            Default: 'hermes-agent'
-  RERANK_HTTP_URL           llama.cpp `llama-server --rerank --pooling rank` endpoint,
-                            e.g. http://127.0.0.1:8082/rerank. When set, rag_search
-                            reorders its merged cross-collection hits with a
-                            cross-encoder instead of trusting raw cosine scores that
-                            are not comparable across collections. Adds no torch
-                            dependency here. Unset = cosine order (previous behaviour).
-                            Fails open on any error.
-  RERANK_TIMEOUT_S          Rerank request timeout. Default: 10
-  LOCI_ENV_FILE           Path to the .env file loaded at import time.
-                            Default: ~/.hermes/.env
-  EXTRA_RAG_COLLECTIONS     Comma-separated extra Qdrant collections appended to
-                            the core three for rag_search / memory_stats.
-                            Default: '' (core collections only)
-  EMBED_API_KEY             API key for the embedding endpoint. Default: ''
-                            (no auth header sent)
-  EMBED_API_KEY_HEADER      Header carrying EMBED_API_KEY. 'Authorization'
-                            sends 'Bearer <key>'; any other name sends the raw
-                            key.  Default: Authorization
-  LOCI_A2A_PRIVILEGED_SENDERS  Comma-separated sender IDs allowed to call
-                            DESTRUCTIVE_SKILLS (memory_remember, memory_sleep,
-                            context_broadcast, mnemosyne_triple_add).
-                            Default: '' (no sender is privileged — destructive
-                            skills are effectively disabled when unset).
-  PEER_A2A_URLS             Comma-separated peer A2A base URLs for the fan-out
-                            skills (memory_broadcast, memory_prime).
-                            Default: '' (fan-out returns "not configured")
-  PEER_A2A_TOKEN            Shared Bearer token used for every peer. Default: ''
-  PEER_A2A_TOKENS_JSON      JSON dict base_url -> token; overrides
-                            PEER_A2A_TOKEN per peer. Default: '{}'
-  PEER_A2A_TOTP_SEED        Shared base32 TOTP seed for peers requiring X-TOTP.
-                            Default: ''
-  PEER_A2A_TOTP_SEEDS_JSON  JSON dict base_url -> seed; overrides
-                            PEER_A2A_TOTP_SEED per peer. Default: '{}'
-  SAR_PRIMING_STATE_PATH    Where memory_prime persists per-peer priming state.
-                            Default: ~/.hermes/sar-priming.json
-  UA_SEARCH_SCRIPT          Path to the external UA search helper script.
-                            Default: '' (skill returns "not configured")
+  LOCI_A2A_BOOTSTRAP_KEY pre-shared key for POST /bootstrap.
+    Returns a 24h session token usable as bearer without TOTP.
+    If unset, /bootstrap 501s.
+    Generate: python3 -c "import secrets;print(secrets.token_hex(24))"
+  LOCI_A2A_HOST bind address. Default: 0.0.0.0
+  LOCI_A2A_PORT bind port. Default: 8201
+  LOCI_A2A_URL public base URL injected into the agent card.
+    Default: http://127.0.0.1:8201
+  LOCI_A2A_TOTP_SEED base32 TOTP seed (RFC 6238).
+    If set, callers must send X-TOTP. Default: '' (disabled)
+  HERMES_AGENT_ID agent identity tag written into memory metadata.
+    Default: 'hermes-agent'
+  RERANK_HTTP_URL llama.cpp `llama-server --rerank --pooling rank` endpoint.
+    Example: http://127.0.0.1:8082/rerank
+    When set, rag_search reranks merged cross-collection hits with a cross-encoder
+    instead of trusting raw cosine scores across collections. Adds no torch
+    dependency here. Unset = cosine order. Fails open on error.
+  RERANK_TIMEOUT_S rerank request timeout. Default: 10
+  LOCI_ENV_FILE path to the .env file loaded at import time.
+    Default: ~/.hermes/.env
+  EXTRA_RAG_COLLECTIONS comma-separated extra Qdrant collections appended to the
+    core three for rag_search / memory_stats. Default: ''
+  EMBED_API_KEY API key for the embedding endpoint. Default: '' (no auth header)
+  EMBED_API_KEY_HEADER header carrying EMBED_API_KEY.
+    'Authorization' sends '******'; any other name sends the raw key.
+    Default: Authorization
+  LOCI_A2A_PRIVILEGED_SENDERS comma-separated sender IDs allowed to call
+    DESTRUCTIVE_SKILLS (memory_remember, memory_sleep, context_broadcast,
+    mnemosyne_triple_add). Default: '' so destructive skills are effectively disabled.
+  PEER_A2A_URLS comma-separated peer A2A base URLs for fan-out skills
+    (memory_broadcast, memory_prime). Default: ''
+  PEER_A2A_TOKEN shared ****** for every peer. Default: ''
+  PEER_A2A_TOKENS_JSON JSON dict base_url -> token; overrides PEER_A2A_TOKEN.
+    Default: '{}'
+  PEER_A2A_TOTP_SEED shared base32 TOTP seed for peers requiring X-TOTP.
+    Default: ''
+  PEER_A2A_TOTP_SEEDS_JSON JSON dict base_url -> seed; overrides
+    PEER_A2A_TOTP_SEED. Default: '{}'
+  SAR_PRIMING_STATE_PATH where memory_prime persists per-peer priming state.
+    Default: ~/.hermes/sar-priming.json
+  UA_SEARCH_SCRIPT path to the external UA search helper script.
+    Default: '' (skill returns "not configured")
 
-Qdrant (shared with session_end_sync.py + state_db_qdrant_sync.py):
+Qdrant (shared with session_end_sync.py + state_db_qdrant_sync.py)
+  QDRANT_URL unset disables Qdrant-backed legs; they fail open to [].
+  QDRANT_API_KEY Qdrant API key; set in .env.
 
-  QDRANT_URL                Default: none — unset disables Qdrant-backed legs
-                            (they fail open to [])
-  QDRANT_API_KEY            Qdrant API key.  No default — set in .env.
+Ollama embedding (shared with sync scripts)
+  MNEMOSYNE_EMBEDDING_API_URL default http://localhost:11434/v1
+  MNEMOSYNE_EMBEDDING_MODEL default nomic-embed-text (768-dim)
+  MNEMOSYNE_EMBEDDING_DIM default 768
 
-Ollama embedding (shared with sync scripts):
-  MNEMOSYNE_EMBEDDING_API_URL  Default: http://localhost:11434/v1
-  MNEMOSYNE_EMBEDDING_MODEL    Default: nomic-embed-text  (768-dim)
-  MNEMOSYNE_EMBEDDING_DIM      Default: 768
+Mnemosyne SQLite
+  MNEMOSYNE_DATA_DIR directory containing mnemosyne.db.
+    Default: ~/.hermes/mnemosyne/data
 
-Mnemosyne SQLite:
-  MNEMOSYNE_DATA_DIR        Directory containing mnemosyne.db.
-                            Default: ~/.hermes/mnemosyne/data
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EXTERNAL SERVICE DEPENDENCIES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-
-Qdrant  http://localhost:6333
-  Collections used:
-    mnemosyne        768d/Cosine  named-vector "dense"
-    loci_sessions  768d/Cosine  named-vector "dense"
-    loci_memory    768d/Cosine  named-vector "dense"
+External services
+- Qdrant http://localhost:6333
+  Collections: mnemosyne, loci_sessions, loci_memory (all 768d/Cosine, named vector "dense")
   Auth: api-key header from QDRANT_API_KEY
   Used by: memory_recall (semantic), session_search, memory_stats
-  NOTE: search payload must include "vector": {"name": "dense", "vector": [...]}
-        (named-vector format — plain vector array will 400)
-
-Ollama  http://localhost:11434/v1
-  Model:    nomic-embed-text  (768-dim, Cosine)
-  Endpoint: POST /v1/embeddings  {"model": "nomic-embed-text", "input": "<text>"}
-  Response: data.data[0].embedding  OR  data.embedding  (both shapes handled)
-  Timeout:  10s — embedding failures degrade gracefully (FTS results still returned)
+  Search payload must include
+  "vector": {"name": "dense", "vector": [...]} (plain arrays 400)
+- Ollama http://localhost:11434/v1
+  Model: nomic-embed-text (768-dim, Cosine)
+  Endpoint: POST /v1/embeddings {"model": "nomic-embed-text", "input": "<text>"}
+  Response: data.data[0].embedding or data.embedding
+  Timeout: 10s; failures degrade gracefully so FTS results still return
   Used by: memory_recall (semantic leg), session_search
-
-Mnemosyne SQLite  ~/.hermes/mnemosyne/data/mnemosyne.db
-  Tables read:    fts_working (FTS5 full-text), fts_episodes (FTS5 external content),
-                  memories, episodic_memory (rowid join via fts_episodes)
-  Tables written: memories  (memory_remember skill)
+- Mnemosyne SQLite ~/.hermes/mnemosyne/data/mnemosyne.db
+  Reads: fts_working, fts_episodes, memories, episodic_memory
+  Writes: memories (memory_remember)
   Used by: memory_recall, memory_remember, memory_stats
+- Mnemosyne Dashboard http://127.0.0.1:8765 (optional, local only)
+  Endpoint: POST /api/sleep {"dry_run": bool}
+  Used by: memory_sleep
+  Failure: returns status="deferred"; server keeps running
 
-Mnemosyne Dashboard  http://127.0.0.1:8765  (optional — local only)
-  Endpoint: POST /api/sleep  {"dry_run": bool}
-  Used by:  memory_sleep skill
-  Failure:  returns status="deferred" — non-fatal, server continues running
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ENDPOINTS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  GET  /.well-known/agent.json      Agent card (RFC-002) — no auth required
+Endpoints
+  GET  /.well-known/agent.json      Agent card (RFC-002) — no auth
   GET  /.well-known/agent-card.json Agent card alias — no auth
-  GET  /health                       Liveness + config check — no auth required
-  POST /bootstrap                    Exchange bootstrap key → 24h session token — no auth
-  POST /a2a                          JSON-RPC 2.0 dispatch — Bearer required
-  GET  /a2a/tasks/{task_id}          Task status — Bearer required
+  GET  /health                      Liveness + config check — no auth
+  POST /bootstrap                   Exchange bootstrap key -> 24h session token — no auth
+  POST /a2a                         JSON-RPC 2.0 dispatch — ******
+  GET  /a2a/tasks/{task_id}         Task status — ******
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SKILLS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Skills
+  _SKILL_MAP is the source of truth and is also exposed by GET /health.
+  Public descriptions live in AGENT_CARD. See README.md "A2A skills (13)".
 
-  Skills are defined by _SKILL_MAP (single source of truth, also served by
-  GET /health); their public descriptions live in AGENT_CARD. See the root
-  README.md "A2A skills (13)" table.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-JSON-RPC CALL SHAPE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
+JSON-RPC call shape
   POST /a2a
-  Authorization: Bearer <LOCI_A2A_TOKEN>
-  X-TOTP: <6-digit code>   (only if LOCI_A2A_TOTP_SEED is set)
+  Authorization: ******
+  X-TOTP: <6-digit code>  (only if LOCI_A2A_TOTP_SEED is set)
 
   {
     "jsonrpc": "2.0",
@@ -164,9 +119,9 @@ JSON-RPC CALL SHAPE
     "method": "tasks/send",
     "params": {
       "skill_id": "memory_recall",
-      "message":  "recent authentication decisions",
-      "input":    {"query": "recent authentication decisions", "top_k": 5},
-      "sender":   "hermes-agent"
+      "message": "recent authentication decisions",
+      "input": {"query": "recent authentication decisions", "top_k": 5},
+      "sender": "hermes-agent"
     }
   }
 
@@ -176,8 +131,8 @@ JSON-RPC CALL SHAPE
     "id": "<caller-uuid>",
     "result": {
       "task_id": "<uuid>",
-      "status":  "completed",
-      "output":  { <skill-specific output> }
+      "status": "completed",
+      "output": { <skill-specific output> }
     }
   }
 """
@@ -186,8 +141,8 @@ import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, col
 from typing import Optional, Any
 from contextlib import contextmanager
 
-# Accept the legacy HERMES_* spelling of Loci's own variables. The A2A server is
-# deployed standalone, so it reaches the map by path rather than by package.
+# Accept legacy HERMES_* spellings. This server runs standalone and reaches
+# the map by path, not by package.
 try:
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "mcp"))
     from legacy_env import apply as _apply_legacy_env
@@ -196,8 +151,8 @@ except Exception:
     pass
 
 # ── load .env before anything else ─────────────────────────────────────────────
-# Override with LOCI_ENV_FILE env var. Default searches ~/.hermes/.env then
-# the legacy per-profile path for backward compatibility.
+# Override with LOCI_ENV_FILE. Default: ~/.hermes/.env, then the legacy
+# per-profile path for backward compatibility.
 _ENV_FILE = os.path.expanduser(
     os.environ.get('LOCI_ENV_FILE', '~/.hermes/.env')
 )
@@ -256,7 +211,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── per-skill privilege tiers ───────────────────────────────────────────────────
-# Skills that mutate or delete data — restricted to explicitly allowlisted senders.
+# Skills that mutate/delete data — restricted to explicitly allowlisted senders.
 DESTRUCTIVE_SKILLS: frozenset[str] = frozenset({
     'memory_remember',
     'memory_sleep',
@@ -264,8 +219,8 @@ DESTRUCTIVE_SKILLS: frozenset[str] = frozenset({
     'mnemosyne_triple_add',
 })
 
-# Senders allowed to call destructive skills.
-# Configure via: LOCI_A2A_PRIVILEGED_SENDERS=agent1,agent2
+# Senders allowed to call destructive skills. Configure via
+# LOCI_A2A_PRIVILEGED_SENDERS=agent1,agent2.
 _PRIVILEGED_SENDERS: frozenset[str] = frozenset(
     s.strip() for s in os.getenv('LOCI_A2A_PRIVILEGED_SENDERS', '').split(',') if s.strip()
 )
@@ -554,7 +509,7 @@ def _embed_auth_headers() -> dict:
 
 
 async def _embed(text: str) -> Optional[list]:
-    """Embed via OpenAI-compat /v1/embeddings. Works with Ollama and cloud providers."""
+    """Embed via OpenAI-compatible /v1/embeddings for Ollama or cloud providers."""
     url = OLLAMA_BASE.rstrip('/').removesuffix('/v1') + '/v1/embeddings'
     try:
         sess = _get_http_session()
@@ -577,7 +532,7 @@ async def _qdrant_search(
     top_k: int = 5,
     qdrant_filter: Optional[dict] = None
 ) -> list:
-    """Named-vector semantic search in Qdrant. Uses 'dense' vector name (matches sync scripts)."""
+    """Named-vector semantic search in Qdrant using the `dense` vector name."""
     url = f'{QDRANT_URL}/collections/{collection}/points/search'
     body: dict = {
         'vector': {'name': 'dense', 'vector': vector},
@@ -706,7 +661,7 @@ async def skill_memory_recall(task: dict) -> dict:
         results += await _recall_semantic(
             query, top_k, {r['id'] for r in results})
 
-    # Sort by score desc, deduplicate, cap at top_k
+    # Sort by score desc, dedupe, cap at top_k.
     results.sort(key=lambda x: x.get('score', 0), reverse=True)
     seen, deduped = set(), []
     for r in results:
@@ -871,23 +826,16 @@ async def skill_memory_sleep(task: dict) -> dict:
 
 # ── skill: rag_search ────────────────────────────────────────────────────────────
 async def _rerank(query: str, hits: list) -> bool:
-    """
-    Reorder `hits` IN PLACE with a cross-encoder, if RERANK_HTTP_URL is configured.
+    """Reorder `hits` in place with a cross-encoder when `RERANK_HTTP_URL` is set.
 
-    rag_search fans out across collections and then merges on raw cosine score. Those
-    scores are not comparable across collections -- different content types, different
-    chunk sizes, different embedding neighbourhoods -- so the merge is the weakest link
-    in the whole path, and it is exactly what a cross-encoder is good at.
+    rag_search merges raw cosine scores from different collections, and those
+    scores are not cross-collection comparable. A llama.cpp
+    `llama-server --rerank --pooling rank` endpoint fixes that weakest link
+    without adding a second model or a torch dependency here.
 
-    Points at a llama.cpp `llama-server --rerank --pooling rank` endpoint (the same one
-    mcp/reranker.py's RERANK_HTTP_URL uses), so a host already serving a reranker needs
-    no second model and this process gains no torch dependency.
-
-    FAILS OPEN. Unset URL, unreachable server, malformed response, or a short/oversized
-    result list all leave the cosine ordering untouched and return False. Search
-    degrading to "slightly worse ordering" is correct; degrading to an error is not.
-
-    Returns True only if the order was actually replaced.
+    Fails open: unset URL, unreachable server, malformed response, or a short /
+    oversized result list leave cosine order untouched and return `False`.
+    Return `True` only when the order changed.
     """
     url = os.environ.get('RERANK_HTTP_URL', '').strip()
     if not url or len(hits) < 2:
@@ -917,7 +865,7 @@ async def _rerank(query: str, hits: list) -> bool:
         except (KeyError, TypeError, ValueError):
             continue
 
-    # Partial coverage would silently drop hits, so only accept a complete permutation.
+    # Partial coverage would drop hits, so accept only a complete permutation.
     if len(scored) != len(hits) or len({i for i, _ in scored}) != len(hits):
         log.warning(f'rerank: got {len(scored)} scores for {len(hits)} hits — keeping cosine order')
         return False
@@ -934,10 +882,10 @@ async def _rerank(query: str, hits: list) -> bool:
 
 
 async def skill_rag_search(task: dict) -> dict:
-    """
-    Fan-out semantic search across ALL 768-dim Qdrant collections.
-    Lets any mesh agent query the full shared corpus
-    without needing Qdrant credentials or knowing collection names.
+    """Fan out semantic search across all 768-dim Qdrant collections.
+
+    Lets mesh agents query the shared corpus without direct Qdrant
+    credentials or hardcoded collection names.
 
     Input:  {query: str, top_k?: int=5, collections?: [str]}
     Output: {results: [...merged ranked hits], query: str, collections_searched: [str]}
@@ -950,7 +898,7 @@ async def skill_rag_search(task: dict) -> dict:
     if not query:
         return {'error': 'query is required'}
 
-    # Default collection list — core plus any extra configured via env var
+    # Default collection list: core plus any env-configured extras.
     ALL_COLLECTIONS = _CORE_RAG_COLLECTIONS + _EXTRA_RAG_COLLECTIONS
     collections = req_cols if (req_cols and isinstance(req_cols, list)) else ALL_COLLECTIONS
 
@@ -989,7 +937,7 @@ async def skill_rag_search(task: dict) -> dict:
 
     all_hits.sort(key=lambda x: x['score'], reverse=True)
 
-    # Deduplicate by (collection, id)
+    # Deduplicate by (collection, id).
     seen, deduped = set(), []
     for h in all_hits:
         key = f"{h['collection']}:{h['id']}"
@@ -1010,12 +958,10 @@ async def skill_rag_search(task: dict) -> dict:
 
 # ── skill: context_broadcast ─────────────────────────────────────────────────────
 def _peer_base_url(peer_url: str) -> str:
-    """
-    Strip a trailing '/a2a' path segment to get a peer's base URL.
+    """Strip one trailing `/a2a` path segment to get a peer base URL.
 
-    Uses an explicit suffix check rather than str.rstrip('/a2a'), which strips
-    any trailing run of the characters '/', 'a' and '2' and so mangles ports:
-    'http://host:8202/a2a'.rstrip('/a2a') == 'http://host:820'.
+    Use an explicit suffix check, not `str.rstrip('/a2a')`, because `rstrip`
+    removes any trailing run of `/`, `a`, and `2` and can mangle ports.
     """
     url = peer_url.rstrip('/')
     if url.endswith('/a2a'):
@@ -1024,13 +970,12 @@ def _peer_base_url(peer_url: str) -> str:
 
 
 def _peer_credentials() -> tuple[dict, str, dict, str]:
-    """
-    Read peer auth config from the environment.
+    """Read peer auth config from env.
 
-    Returns (token_map, default_token, seed_map, default_seed).
-
-    PEER_A2A_TOKEN / PEER_A2A_TOKENS_JSON      -> Bearer token, shared or per-peer
-    PEER_A2A_TOTP_SEED / PEER_A2A_TOTP_SEEDS_JSON -> base32 TOTP seed, shared or per-peer
+    Returns `(token_map, default_token, seed_map, default_seed)`.
+    `PEER_A2A_TOKEN` / `PEER_A2A_TOKENS_JSON` supply shared or per-peer
+    ******; `PEER_A2A_TOTP_SEED` / `PEER_A2A_TOTP_SEEDS_JSON` do the same for
+    base32 TOTP seeds.
     """
     default_token = os.environ.get('PEER_A2A_TOKEN', '')
     default_seed  = os.environ.get('PEER_A2A_TOTP_SEED', '')
@@ -1051,13 +996,11 @@ def _peer_credentials() -> tuple[dict, str, dict, str]:
 
 def _peer_headers(peer_url: str, token_map: dict, default_token: str,
                   seed_map: dict, default_seed: str):
-    """
-    Build outbound headers for a peer.
+    """Build outbound headers for one peer.
 
-    Returns (headers, None) on success or (None, reason) if the peer is not
-    callable. A peer that sets LOCI_A2A_TOTP_SEED rejects bearer-only
-    requests with 401, so X-TOTP is attached whenever a seed is configured
-    for that peer.
+    Returns `(headers, None)` on success or `(None, reason)` if the peer is
+    not callable. Peers with `LOCI_A2A_TOTP_SEED` reject bearer-only requests,
+    so attach `X-TOTP` whenever a seed is configured.
     """
     base  = _peer_base_url(peer_url)
     token = token_map.get(peer_url) or token_map.get(base) or default_token
@@ -1079,12 +1022,10 @@ def _peer_headers(peer_url: str, token_map: dict, default_token: str,
 
 
 def _peer_targets() -> list[tuple[str, Optional[dict], Optional[str]]]:
-    """
-    Resolve PEER_A2A_URLS into one (peer_url, headers, skip_reason) triple per
-    peer, in the order they appear in the env var. Credentials are read once.
+    """Resolve `PEER_A2A_URLS` into `(peer_url, headers, skip_reason)`.
 
-    headers is None exactly when the peer is not callable, in which case
-    skip_reason says why; otherwise skip_reason is None.
+    Preserve env order and read credentials once. `headers is None` means the
+    peer is not callable and `skip_reason` explains why.
     """
     token_map, default_token, seed_map, default_seed = _peer_credentials()
     targets: list[tuple[str, Optional[dict], Optional[str]]] = []
@@ -1114,19 +1055,21 @@ def _peer_task_payload(skill_id: str, message: str, inp: dict) -> dict:
 
 
 async def skill_context_broadcast(task: dict) -> dict:
-    """
-    Push a memory to all configured peer A2A endpoints (PEER_A2A_URLS env var).
-    Used by the a2a_context_bridge cron to propagate discoveries to the mesh.
+    """Push one memory to all configured peer A2A endpoints.
+
+    Used by the `a2a_context_bridge` cron to propagate discoveries through the
+    mesh.
 
     Input:  {content: str, source?: str, importance?: float=0.5, bank?: str="default"}
     Output: {broadcast: [{peer, status, error?}], stored_locally: bool}
 
-    PEER_A2A_URLS:  comma-separated list, e.g.
-        http://peer-a:8201/a2a,http://peer-b:8201/a2a
-    PEER_A2A_TOKEN: shared Bearer token for all peers (or set per-peer in PEER_A2A_TOKENS_JSON)
-    PEER_A2A_TOKENS_JSON: JSON dict mapping base_url -> token (overrides PEER_A2A_TOKEN per peer)
-    PEER_A2A_TOTP_SEED: shared base32 TOTP seed for peers that require X-TOTP
-    PEER_A2A_TOTP_SEEDS_JSON: JSON dict mapping base_url -> seed (overrides PEER_A2A_TOTP_SEED)
+    Peer auth config:
+      - `PEER_A2A_URLS`: comma-separated list such as
+        `http://peer-a:8201/a2a,http://peer-b:8201/a2a`
+      - `PEER_A2A_TOKEN`: shared ******, overrideable per peer via
+        `PEER_A2A_TOKENS_JSON`
+      - `PEER_A2A_TOTP_SEED`: shared base32 TOTP seed, overrideable per peer
+        via `PEER_A2A_TOTP_SEEDS_JSON`
     """
     inp        = task.get('input', {})
     content    = (inp.get('content') or task.get('message', '')).strip()
@@ -1138,11 +1081,9 @@ async def skill_context_broadcast(task: dict) -> dict:
     if not content:
         return {'error': 'content is required'}
 
-    # 1. Store locally first — unless the caller is relaying something it already holds.
-    # The context bridge reads this node's own database and pushes through this skill, so
-    # storing would insert a fresh copy of a memory that is already here, with a new id and
-    # a new created_at. That copy then looks "new" to the next bridge run and gets relayed
-    # again: unbounded local growth with no peer involved.
+    # 1. Store locally first unless the caller is relaying something this node
+    # already has. Re-storing a bridged memory gives it a new id/created_at, makes
+    # it look new to the next bridge run, and causes unbounded local duplication.
     store_local = bool(inp.get('store_local', True))
     if store_local:
         local_result = await skill_memory_remember({
@@ -1154,7 +1095,7 @@ async def skill_context_broadcast(task: dict) -> dict:
     else:
         stored_locally = False
 
-    # 2. Fan-out to peers
+    # 2. Fan out to peers.
     targets   = _peer_targets()
     peer_urls = [u for u, _, _ in targets]
     broadcast_results = []
