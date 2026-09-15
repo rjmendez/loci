@@ -60,7 +60,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -77,6 +77,7 @@ from memcheck.checks import (  # noqa: E402
     run_provenance,
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
+from compact import compact_context_rows, compact_finding_row, compact_sources  # noqa: E402
 from untrusted_memory import wrap_untrusted_memory_text  # noqa: E402
 
 # Accept the legacy HERMES_* spelling of Loci's own variables.
@@ -488,6 +489,7 @@ def context_assemble(
     query: str,
     budget_chars: int = 6000,
     include_metadata: bool = True,
+    mode: str = "normal",
 ) -> dict:
     """
     Assemble a RAG context block from search result dicts.
@@ -497,6 +499,28 @@ def context_assemble(
       sources  - list of {n, id, title, origin, score}
       query, total_chars, truncated, result_count
     """
+    def _wrap_untrusted_memory_text(text: str, row: dict) -> str:
+        attrs = {k: row.get(k) for k in
+                 ("origin", "investigation_id", "finding_id", "memory_id", "id", "source")}
+        return wrap_untrusted_memory_text(text, **attrs)
+
+    if mode == "compact":
+        compacted = compact_context_rows(
+            results,
+            budget_chars,
+            keep_scores=include_metadata,
+            wrap_text=_wrap_untrusted_memory_text,
+        )
+        return {
+            "query": query,
+            "context": compacted["context"],
+            "sources": compact_sources(results),
+            "total_chars": compacted["total_chars"],
+            "truncated": compacted["truncated"],
+            "result_count": compacted["result_count"],
+        }
+
+
     lines = [f"## Retrieved Context\nQuery: {query}\n"]
     sources = []
     total = 0
@@ -6665,6 +6689,7 @@ def rag_context_search(
     exclude_types: Optional[list] = None,
     decay: bool = True,
     expand_query: Optional[bool] = None,
+    mode: Literal["normal", "compact"] = "normal",
 ) -> str:
     """
     Run hybrid RAG over Qdrant and return prompt-ready cited context.
@@ -6701,6 +6726,8 @@ def rag_context_search(
             force it. Fail-open: if the local generator is unavailable, the tool
             falls back to the original query. Enabled because judge evals showed
             ``+4% nDCG@10`` with no regression.
+        mode: "normal" (default) for the legacy markdown block, or "compact" for
+            deterministic cited one-liners plus slim source metadata.
 
     Returns:
         JSON ``{query, context, sources, total_chars, truncated, result_count,
@@ -6760,7 +6787,12 @@ def rag_context_search(
     # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
 
-    ctx = context_assemble(all_results, query, budget_chars=budget_chars)
+    ctx = context_assemble(
+        all_results,
+        query,
+        budget_chars=budget_chars,
+        mode="compact" if mode == "compact" else "normal",
+    )
     # Count distinct failed collections: an all-errors search must not read back as a genuine zero-hit search.
     _failed_cols = {e.split(":", 1)[0] for e in errors}
     _failed = len(_failed_cols)
@@ -8083,6 +8115,7 @@ def memory_hints(
     investigation_id: str,
     limit: int = 3,
     since_ts: Optional[str] = None,
+    mode: Literal["normal", "compact"] = "normal",
 ) -> str:
     """
     Return recent findings for an investigation as lightweight hints.
@@ -8100,6 +8133,8 @@ def memory_hints(
         since_ts: Optional ISO-8601 timestamp. When provided, only findings
             with ``ts > since_ts`` are returned. Use the previous response's
             ``as_of`` as the next ``since_ts`` for incremental polling.
+        mode: "normal" (default) for the legacy payload, or "compact" to clip
+            each hint's text while preserving all other hint fields.
 
     Returns:
         JSON ``{investigation_id, hints:[{finding_id, text, source,
@@ -8111,6 +8146,9 @@ def memory_hints(
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
         limit = max(1, min(int(limit or 3), 20))
         payload = _compute_hints(investigation_id, limit, since_ts)
+        if mode == "compact":
+            payload = dict(payload)
+            payload["hints"] = [compact_finding_row(h) for h in payload.get("hints", [])]
         return json.dumps(payload, indent=2)
     except Exception as exc:  # noqa: BLE001
         logger.debug("memory_hints error: %r", exc)
