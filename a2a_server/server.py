@@ -12,9 +12,9 @@ Python: 3.11  (venv: ~/.hermes/hermes-agent/venv/bin/python3)
 Pip packages (see requirements.txt for pinned versions):
   fastapi==0.133.1     HTTP server, dependency injection, Bearer auth
   uvicorn==0.41.0      ASGI runner
-  starlette==1.0.1     fastapi dep — Request, JSONResponse
+  starlette==1.3.1     fastapi dep — Request, JSONResponse
   pydantic==2.13.4     fastapi dep — validation
-  aiohttp==3.13.4      async HTTP client for Qdrant + Ollama
+  aiohttp==3.14.3      async HTTP client for Qdrant + Ollama
   pyotp==2.9.0         TOTP (RFC 6238) for X-TOTP header auth
 
 stdlib (no install needed):
@@ -509,6 +509,16 @@ def _verify_totp(request: Request,
 
 # ── helpers ─────────────────────────────────────────────────────────────────────
 
+def _public_error(public_message: str, *, log_message: str,
+                  exc: Optional[BaseException] = None, **extra) -> dict:
+    if exc is None:
+        log.error(log_message)
+    else:
+        log.exception(log_message)
+    payload = {'error': public_message}
+    payload.update(extra)
+    return payload
+
 _http_session: aiohttp.ClientSession | None = None
 
 def _get_http_session() -> aiohttp.ClientSession:
@@ -734,8 +744,7 @@ async def skill_memory_remember(task: dict) -> dict:
             )
             conn.commit()
     except Exception as e:
-        log.error(f'memory_remember write failed: {e}')
-        return {'error': f'db write failed: {e}'}
+        return _public_error('db write failed', log_message='memory_remember write failed', exc=e)
 
     log.info(f'Stored memory {mem_id} from sender={sender} importance={importance}')
     return {'id': mem_id, 'status': 'stored', 'bank': bank, 'importance': importance}
@@ -755,8 +764,9 @@ async def skill_memory_stats(task: dict) -> dict:
                 except Exception as e:
                     log.debug(f'memory_stats: table {tbl}: {e}')
                     sqlite_stats[tbl] = -1
-    except Exception as e:
-        sqlite_stats['error'] = str(e)
+    except Exception:
+        log.exception('memory_stats: sqlite unavailable')
+        sqlite_stats['error'] = 'sqlite unavailable'
 
     # Qdrant collection point counts
     qdrant_stats: dict = {}
@@ -774,9 +784,11 @@ async def skill_memory_stats(task: dict) -> dict:
                     else:
                         qdrant_stats[col] = f'HTTP {r.status}'
             except Exception as e:
-                qdrant_stats[col] = str(e)
-    except Exception as e:
-        qdrant_stats['error'] = str(e)
+                log.warning(f'memory_stats: qdrant collection {col} unavailable: {e!r}')
+                qdrant_stats[col] = 'unavailable'
+    except Exception:
+        log.exception('memory_stats: qdrant unavailable')
+        qdrant_stats['error'] = 'unavailable'
 
     return {
         'sqlite': sqlite_stats,
@@ -1061,7 +1073,8 @@ def _peer_headers(peer_url: str, token_map: dict, default_token: str,
         try:
             headers['X-TOTP'] = pyotp.TOTP(seed).now()
         except Exception as e:
-            return None, f'invalid TOTP seed: {e}'
+            log.warning(f'_peer_headers: invalid TOTP seed for {peer_url}: {e!r}')
+            return None, 'invalid TOTP seed'
     return headers, None
 
 
@@ -1163,10 +1176,12 @@ async def skill_context_broadcast(task: dict) -> dict:
                     return {'peer': peer_url, 'status': 'ok',
                             'output': data.get('result', {}).get('output', {})}
                 body = await r.text()
+                log.warning(f'context_broadcast peer {peer_url} HTTP {r.status}: {body[:200]!r}')
                 return {'peer': peer_url, 'status': f'http_{r.status}',
-                        'error': body[:200]}
+                        'error': 'peer request failed'}
         except Exception as e:
-            return {'peer': peer_url, 'status': 'error', 'error': str(e)}
+            log.warning(f'context_broadcast peer {peer_url} failed: {e!r}')
+            return {'peer': peer_url, 'status': 'error', 'error': 'peer request failed'}
 
     if peer_urls:
         results = await asyncio.gather(*[_push_to_peer(*t) for t in targets])
@@ -1213,8 +1228,7 @@ async def skill_mnemosyne_triple_add(task: dict) -> dict:
             conn.commit()
             triple_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
     except Exception as e:
-        log.error(f'triple_add write failed: {e}')
-        return {'error': f'db write failed: {e}'}
+        return _public_error('db write failed', log_message='triple_add write failed', exc=e)
 
     log.info(f'Stored triple [{triple_id}] {subject} -{predicate}-> {obj}')
     return {
@@ -1273,8 +1287,8 @@ async def skill_mnemosyne_triple_query(task: dict) -> dict:
                 for r in rows
             ]
     except Exception as e:
-        log.error(f'triple_query failed: {e}')
-        return {'error': f'db query failed: {e}', 'triples': []}
+        return _public_error('db query failed', log_message='triple_query failed',
+                             exc=e, triples=[])
 
     return {'triples': triples, 'total': len(triples)}
 
@@ -1309,7 +1323,8 @@ async def skill_gpu_inference(task: dict) -> dict:
             content = d['choices'][0]['message']['content']
             return {'response': content, 'model': model, 'status': 'ok'}
     except Exception as e:
-        return {'error': str(e), 'status': 'error'}
+        return _public_error('inference failed', log_message='gpu_inference failed',
+                             exc=e, status='error')
 
 
 async def skill_docker_status(task: dict) -> dict:
@@ -1331,7 +1346,8 @@ async def skill_docker_status(task: dict) -> dict:
             capture_output=True, text=True, timeout=10
         )
         if r.returncode != 0:
-            results['docker_error'] = r.stderr.strip() or f'docker ps exited {r.returncode}'
+            log.warning(f'docker_status: docker ps exited {r.returncode}: {r.stderr.strip()!r}')
+            results['docker_error'] = 'docker unavailable'
         else:
             containers = []
             for line in r.stdout.strip().splitlines():
@@ -1342,7 +1358,8 @@ async def skill_docker_status(task: dict) -> dict:
                         containers.append(entry)
             results['docker'] = containers
     except Exception as e:
-        results['docker_error'] = str(e)
+        log.warning(f'docker_status: docker probe failed: {e!r}')
+        results['docker_error'] = 'docker unavailable'
 
     # k3s pods
     try:
@@ -1353,7 +1370,8 @@ async def skill_docker_status(task: dict) -> dict:
             capture_output=True, text=True, timeout=15
         )
         if r.returncode != 0:
-            results['k3s_error'] = r.stderr.strip() or f'kubectl get pods exited {r.returncode}'
+            log.warning(f'docker_status: kubectl get pods exited {r.returncode}: {r.stderr.strip()!r}')
+            results['k3s_error'] = 'kubectl unavailable'
         else:
             pods = []
             for line in r.stdout.strip().splitlines():
@@ -1364,7 +1382,8 @@ async def skill_docker_status(task: dict) -> dict:
                         pods.append(entry)
             results['k3s_pods'] = pods
     except Exception as e:
-        results['k3s_error'] = str(e)
+        log.warning(f'docker_status: kubectl probe failed: {e!r}')
+        results['k3s_error'] = 'kubectl unavailable'
 
     return results
 
@@ -1396,11 +1415,13 @@ async def skill_ua_search(task: dict) -> dict:
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return {'error': r.stderr.strip()[-500:] or f'ua_search exited {r.returncode}', 'query': query}
+            log.warning(f'ua_search exited {r.returncode}: {r.stderr.strip()[-500:]!r}')
+            return {'error': 'ua_search failed', 'query': query}
         results = json.loads(r.stdout) if r.stdout.strip() else []
         return {'results': results, 'count': len(results), 'query': query}
     except Exception as e:
-        return {'error': str(e), 'query': query}
+        return _public_error('ua_search failed', log_message='ua_search crashed',
+                             exc=e, query=query)
 
 
 # ── skill dispatcher ─────────────────────────────────────────────────────────────
@@ -1465,7 +1486,9 @@ async def skill_memory_prime(task: dict) -> dict:
             json.dump(state, f)
         os.replace(tmp, state_path)
     except Exception as e:
-        return {'error': f'Failed to write priming state: {e}'}
+        return _public_error('Failed to write priming state',
+                             log_message='memory_prime failed to write priming state',
+                             exc=e)
 
     broadcast_results = []
     if do_broadcast:
@@ -1487,7 +1510,8 @@ async def skill_memory_prime(task: dict) -> dict:
                 ) as resp:
                     return {'peer': peer_url, 'status': resp.status}
             except Exception as e:
-                return {'peer': peer_url, 'status': 'error', 'error': str(e)}
+                log.warning(f'memory_prime peer {peer_url} failed: {e!r}')
+                return {'peer': peer_url, 'status': 'error', 'error': 'peer request failed'}
 
         broadcast_results = await asyncio.gather(
             *[_prime_peer(*t) for t in targets], return_exceptions=False
