@@ -139,6 +139,12 @@ class TestRunProvenance(unittest.TestCase):
         results = run_provenance([f], [audit])
         self.assertEqual(len(results), 1)
 
+    def test_observed_name_match_with_stopword_only_overlap_is_still_flagged(self):
+        f = {"text": "the breach", "type": "observed", "source": "procmon"}
+        audit = {"tool": "procmon", "text": "the audit bucket allowed unrestricted access"}
+        results = run_provenance([f], [audit])
+        self.assertEqual(len(results), 1)
+
     def test_malformed_audit_entry_skipped(self):
         f = {"text": "the host contacted external.example.com endpoint", "type": "observed", "source": "netscan"}
         results = run_provenance([f], ["not a dict", None])
