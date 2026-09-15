@@ -239,7 +239,7 @@ await parallel(advTargets.map((t, i) => () => {
   return agent(
     base + `
 
-   Act as a skeptical red-team reviewer yourself. Try to REFUTE each idea:
+   Act as a skeptical red-team reviewer yourself. REFUTE each idea if you can:
    - Is the diagnosis wrong?
    - Is this already handled elsewhere?
    - Would the proposed fix cause regressions?

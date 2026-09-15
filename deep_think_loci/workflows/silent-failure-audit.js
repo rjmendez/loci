@@ -285,7 +285,7 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this silent-failure finding. Try to REFUTE it.
+    `Refute this silent-failure finding if you can.
 
 Finding ID: ${f.id} | Category: ${f.category}
 File: ${f.file || 'unknown'} (${f.line_hint || '?'})
@@ -300,7 +300,7 @@ Steps:
 4. Is the retry logic actually guarded by error type even if not visible in this snippet?
 5. Is the metastable concern mitigated by infrastructure (e.g., circuit breaker at load balancer level)?
 
-Return is_real=true only if the failure mode is confirmed unmitigated.`,
+Return is_real=true only for a confirmed unmitigated failure mode.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

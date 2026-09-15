@@ -260,8 +260,8 @@ log(`Verifying ${highPriority.length} critical/high findings`)
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the evidence by reading actual files.
+    `Refute this finding if you can.
+If the actual files don't confirm it, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 Title: ${f.title}
@@ -271,7 +271,7 @@ Producer: ${f.producer_file || f.file || 'unknown'}
 Consumer: ${f.consumer_file || 'unknown'}
 
 Read the actual code. Is there a framework, middleware, or adapter that mitigates this?
-Return is_real=true only if confirmed unmitigated.`,
+Return is_real=true only for a confirmed unmitigated issue.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

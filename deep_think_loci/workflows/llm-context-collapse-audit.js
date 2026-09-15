@@ -313,8 +313,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this LLM context failure finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm by reading the actual code.
+    `Refute this LLM context-failure finding if you can.
+If the actual code doesn't confirm it, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 File: ${f.file || 'unknown'} (${f.line_hint || '?'})
@@ -329,7 +329,7 @@ Steps:
 4. For ungrounded generation: is there a retrieval step in a parent function or middleware?
 5. For output validation: is there schema validation in a response parser class?
 
-Return is_real=true only if the context failure is confirmed and unmitigated.`,
+Return is_real=true only for a confirmed unmitigated context failure.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

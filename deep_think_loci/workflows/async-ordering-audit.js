@@ -266,8 +266,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this async/concurrency finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm by reading the actual code.
+    `Refute this async/concurrency finding if you can.
+If the actual code doesn't confirm it, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 File: ${f.file || 'unknown'} (${f.line_hint || '?'})
@@ -282,7 +282,7 @@ Steps:
 4. Is the task result checked elsewhere (not in the immediate caller)?
 5. Does a framework layer (Django, FastAPI, Celery) handle the async lifecycle transparently?
 
-Return is_real=true only if the async ordering problem is confirmed unmitigated.`,
+Return is_real=true only for a confirmed unmitigated async-ordering bug.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

@@ -45,7 +45,7 @@ function investigationIdOrDefault(value, fallback, fieldName = 'run_id') {
 }
 
 // ── args normalization ──
-// Workflow tool delivers args as a JSON STRING on some paths — coerce to object.
+// Workflow args can arrive as JSON text — coerce to object.
 const A = (typeof args === 'string')
   ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })()
   : (args || {})
@@ -75,9 +75,9 @@ const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
 const floorRank = SEV_RANK[FILE_FLOOR] || 2
 
 // ── Schemas ──
-// Ideas carry their own classification. The generator already reasoned about the
-// file, so it is the cheapest place to know whether a claim was read or inferred
-// and which line it came from — and it keeps the writer single-purpose.
+// Ideas carry their own classification. The generator already knows whether a
+// claim was read or inferred and which line it came from, which keeps the writer
+// single-purpose.
 const IDEA_SCHEMA = {
   type: 'object', required: ['target', 'ideas'],
   properties: {
@@ -131,10 +131,8 @@ const FINAL_SCHEMA = {
     summary: { type: 'string' },
     ranked_actions: {
       type: 'array', items: {
-        // finding_ids is REQUIRED: the integrity check in the Final prompt asks the
-        // agent to drop untraceable items, and a schema that does not carry the
-        // trace makes that instruction unverifiable by construction — the next
-        // phase files these publicly.
+        // finding_ids is REQUIRED: Final drops untraceable items, and the next phase
+        // files survivors publicly.
         type: 'object', required: ['rank', 'title', 'severity', 'file', 'description', 'issue_title', 'finding_ids'],
         properties: {
           finding_ids: { type: 'array', items: { type: 'string' } },
@@ -154,7 +152,7 @@ const FINAL_SCHEMA = {
 // ── Init ──
 phase('Init')
 await agent(
-  `Call mcp__loci__investigation_start(investigation_id="${RUN}", title="${TITLE}", context="${RAG_MODE ? 'RAG-mode' : 'direct-read-mode'} v4 run. Targets: ${TARGETS.map(t => t.name).join(', ')}."). Return one line confirming.`,
+  `Call mcp__loci__investigation_start(investigation_id="${RUN}", title="${TITLE}", context="${RAG_MODE ? 'RAG-mode' : 'direct-read-mode'} v4 run. Targets: ${TARGETS.map(t => t.name).join(', ')}."). Return one confirmation line.`,
   { label: 'init', phase: 'Init', model: 'haiku' }
 )
 
@@ -189,16 +187,14 @@ log(`Ideate: ${gens.length}/${TARGETS.length} generators, ${allIdeas.length} ide
 // ── Write ──
 phase('Write')
 const wrote = await agent(
-  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}". Do not classify, judge or edit them — every field is already decided and given to you below.\n\nFor EACH entry, one call:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type=<its finding_type>, text="<its target>: <its idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<its target>", code_refs=<its code_refs, omit if empty>)\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
+  `DEDICATED WRITER. Store each of the following ${allIdeas.length} ideas into Loci investigation "${RUN}". Do not classify, judge, or edit — every field is already set below.\n\nFor EACH entry, one call:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type=<its finding_type>, text="<its target>: <its idea>", source="${SRC('ideate','writer')}", confidence="medium", tags="dt_run:${RUN},dt_target:<its target>", code_refs=<its code_refs, omit if empty>)\n\nReturn attempted=${allIdeas.length} and the real finding_ids.\n${NO_FAB}\n\nIDEAS:\n${JSON.stringify(allIdeas, null, 1)}`,
   { label: 'writer', phase: 'Write', model: 'haiku', schema: WROTE_SCHEMA }
 )
 log(`Write: attempted=${wrote?.attempted}, persisted=${(wrote?.finding_ids||[]).length}`)
 
 
-// A run that persisted nothing cannot be synthesized from, and must not reach the
-// phase that files GitHub issues. Yesterday this was caught only because the Final
-// prompt was told to read the investigation first — a prompt instruction is not a
-// precondition. Fail loudly here instead.
+// A run that persisted nothing cannot be synthesized or filed to GitHub.
+// Guard it here instead of relying on a later prompt instruction.
 if (!(wrote?.finding_ids || []).length) {
   log(`ABORT: writer persisted 0 of ${allIdeas.length} ideas — nothing to synthesize.`)
   return {
@@ -246,7 +242,7 @@ const makeSynthPrompt = (group, idx) => {
   const gateNote = RAG_MODE
     ? `Then filter each result set through the grounding gate at ${GATE} (threshold ${THRESH}) to kill cross-target bleed before reasoning.`
     : ''
-  return `Adversarial Opus reviewer for group ${idx+1}: ${names || '(empty — return empty action_items)'}\n\n1. Search: ${queries}\n${gateNote}\n2. For each idea: try to REFUTE it (wrong diagnosis, already handled, impractical). Keep only ideas that survive.\n3. Return domain="${names}", top_findings that survived, red_team_refutals for killed ideas, and action_items with severity+file+description.\n4. Every action_item MUST carry finding_ids — the ids returned by the search above that support it. An item you cannot attribute is one the Final integrity check will drop, and the phase after that files to GitHub.\n${NO_FAB}\n\nIf group is empty, return domain="empty", empty arrays.`
+  return `Adversarial Opus reviewer for group ${idx+1}: ${names || '(empty — return empty action_items)'}\n\n1. Search: ${queries}\n${gateNote}\n2. For each idea: try to REFUTE it (wrong diagnosis, already handled, impractical). Keep only ideas that survive.\n3. Return domain="${names}", top_findings that survived, red_team_refutals for killed ideas, and action_items with severity+file+description.\n4. Every action_item MUST carry supporting finding_ids from the search above. The Final integrity check drops untraceable items, and the next phase files to GitHub.\n${NO_FAB}\n\nIf group is empty, return domain="empty", empty arrays.`
 }
 
 const synthResults = (await parallel(
@@ -261,7 +257,7 @@ log(`Synthesize: ${synthResults.length}/3 complete, ${confirmedItems.length} con
 // ── Final ──
 phase('Final')
 const final = await agent(
-  `Final Opus synthesis for "${RUN}".\n\n0. GROUND FIRST — before reasoning, call mcp__loci__investigation_load(investigation_id="${RUN}", last_n_findings=120) and treat THAT as the record of what was actually persisted. The JSON below is in-process state from the reviewers; it is not evidence that anything was stored.\n\nAll confirmed items from 3 domain reviewers:\n${JSON.stringify(confirmedItems, null, 2)}\n\n1. Merge and deduplicate (same bug from multiple angles = one item)\n2. Rank by (critical > high > medium > low) × impact on core reliability\n3. Write a 3-sentence summary\n4. Return ranked_actions (max 20) each with rank/title/severity/file/description/issue_title\n5. List gaps_identified (areas not covered)\n6. INTEGRITY CHECK — for every action you return, confirm it traces to a finding present in the investigation_load result. DROP any item you cannot trace, and record each dropped item in gaps_identified as "UNGROUNDED (dropped): <title>". The next phase files these to GitHub, so an item that survives this step is a claim you are making publicly.\n${NO_FAB}\n\nAlso store the summary:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type="observed", text="FINAL SYNTHESIS: <summary>", source="${SRC('final','opus')}", confidence="high", tags="dt_run:${RUN},final-synthesis")`,
+  `Final Opus synthesis for "${RUN}".\n\n0. GROUND FIRST — before reasoning, call mcp__loci__investigation_load(investigation_id="${RUN}", last_n_findings=120) and treat THAT as the record of what was actually persisted. The JSON below is reviewer state, not proof anything was stored.\n\nAll confirmed items from 3 domain reviewers:\n${JSON.stringify(confirmedItems, null, 2)}\n\n1. Merge and deduplicate (same bug from multiple angles = one item)\n2. Rank by (critical > high > medium > low) × impact on core reliability\n3. Write a 3-sentence summary\n4. Return ranked_actions (max 20) each with rank/title/severity/file/description/issue_title\n5. List gaps_identified (areas not covered)\n6. INTEGRITY CHECK — for every action you return, confirm it traces to a finding present in the investigation_load result. DROP any item you cannot trace, and record each dropped item in gaps_identified as "UNGROUNDED (dropped): <title>". The next phase files these to GitHub, so an item that survives this step is a claim you are making publicly.\n${NO_FAB}\n\nAlso store summary:\n  mcp__loci__investigation_store(investigation_id="${RUN}", finding_type="observed", text="FINAL SYNTHESIS: <summary>", source="${SRC('final','opus')}", confidence="high", tags="dt_run:${RUN},final-synthesis")`,
   { label: 'final', phase: 'Final', model: 'opus', schema: FINAL_SCHEMA }
 )
 log(`Final: ${(final?.ranked_actions||[]).length} ranked actions`)

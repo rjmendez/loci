@@ -298,8 +298,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this test coverage gap finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the test gap exists.
+    `Refute this test-coverage-gap finding if you can.
+If you can't confirm the gap, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 Class/Function: ${f.class_or_function || 'unknown'}
@@ -315,7 +315,7 @@ Steps:
 4. For error paths: is the error path exercised by a higher-level integration test?
 5. For contracts: does the OpenAPI spec enforce the contract at the framework level?
 
-Return is_real=true only if the coverage gap is confirmed absent from ALL test suites.`,
+Return is_real=true only if ALL test suites miss this coverage.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

@@ -284,8 +284,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this security finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the vulnerability by reading the actual code.
+    `Refute this security finding if you can.
+If the actual code doesn't confirm the vulnerability, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 File: ${f.file || 'unknown'} (${f.line_hint || '?'})
@@ -301,7 +301,7 @@ Steps:
 4. For secrets: is the value actually secret, or is it a public identifier?
 5. For CORS: does the application actually use credentials with the wildcard origin?
 
-Return is_real=true only if the security vulnerability is confirmed and unmitigated.`,
+Return is_real=true only for a confirmed unmitigated security bug.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

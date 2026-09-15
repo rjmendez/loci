@@ -102,7 +102,7 @@ Codebase root: ${ROOT}
 
 Hunt for N+1 query patterns — places where a query is executed inside a loop, causing O(N) database round-trips where one batched query would suffice.
 
-Search for:
+Search:
 1. ORM queries inside for/forEach/map loops:
    - Python/SQLAlchemy: \`for item in items:\\n    session.query\` or \`.filter()\` inside a loop
    - TypeScript/Prisma: \`for (const x of xs) { await prisma.model.find\`
@@ -115,7 +115,7 @@ Search for:
 
 For each finding, estimate the load multiplier: if the loop runs over N items and the inner query is O(1), it's O(N) round-trips that become O(1) with batching. State the multiplier.
 
-Return findings with: file, line, severity (high if in a hot path like API handler; medium if in a background job), title, detail (include the loop variable and the query being repeated), fix (the batch query or eager-load alternative), load_multiplier.`,
+Return: file, line, severity (high if in a hot path like API handler; medium if in a background job), title, detail (include the loop variable and the query being repeated), fix (the batch query or eager-load alternative), load_multiplier.`,
   },
   {
     key: 'missing_db_index',
@@ -127,7 +127,7 @@ Codebase root: ${ROOT}
 
 Hunt for columns used in WHERE, ORDER BY, or JOIN clauses that have no corresponding index in the schema/migration files.
 
-Search approach:
+Search:
 1. Find all WHERE filters in ORM queries:
    \`grep -rn "where:\\|filter(\\|WHERE " ${ROOT} --include="*.ts" --include="*.py" --include="*.sql" | grep -v test | head -40\`
 2. Find all ORDER BY / orderBy clauses:
@@ -143,7 +143,7 @@ Search approach:
 
 Severity: high if the table is expected to grow unboundedly (audit logs, events, findings); medium if the table is small and bounded.
 
-Return findings with: file, line, severity, title (include column and table name), detail (what query uses it, estimated table size if determinable), fix (the index declaration to add).`,
+Return: file, line, severity, title (include column and table name), detail (what query uses it, estimated table size if determinable), fix (the index declaration to add).`,
   },
   {
     key: 'sync_io_in_async_path',
@@ -155,7 +155,7 @@ Codebase root: ${ROOT}
 
 Hunt for synchronous (blocking) I/O operations called inside async handlers, route handlers, or event-driven code paths where they block the event loop or thread pool.
 
-Search for:
+Search:
 1. Node.js/TypeScript blocking APIs in async functions:
    \`grep -rn "readFileSync\\|writeFileSync\\|execSync\\|spawnSync\\|existsSync\\|readdirSync" ${ROOT} --include="*.ts" --include="*.js" | grep -v test | grep -v "node_modules" | head -30\`
 2. Python blocking calls in async functions (asyncio):
@@ -165,12 +165,12 @@ Search for:
 4. Image/file processing (sharp, PIL, cv2) called synchronously in a request handler without offloading to a worker
 5. \`JSON.parse\` on very large payloads inside the request path (blocks event loop on large inputs)
 
-For each finding, identify:
+For each finding:
 - Is it on the hot request path (API handler, middleware) → high severity
 - Is it in a background job / startup → medium/low severity
 - What is the async alternative (fs.promises.readFile, asyncio subprocess, aiofiles, etc.)
 
-Return findings with: file, line, severity, title, detail, fix.`,
+Return: file, line, severity, title, detail, fix.`,
   },
   {
     key: 'unbounded_result_set',
@@ -182,7 +182,7 @@ Codebase root: ${ROOT}
 
 Hunt for database queries or collection operations that load all matching records into memory with no LIMIT, pagination, or streaming.
 
-Search for:
+Search:
 1. ORM findMany/findAll with no \`take\`/\`limit\`/\`first\`/pagination:
    \`grep -rn "findMany\\|findAll\\|\.all()\\|\.objects\.filter" ${ROOT} --include="*.ts" --include="*.py" | grep -v test | grep -v "node_modules" | head -40\`
    Check each result: does the call have a \`take:\` or \`limit=\` argument? If not, flag it.
@@ -195,7 +195,7 @@ Search for:
 
 Severity: high if the table is an audit log, findings store, or event log expected to grow without bound; medium if table size is naturally bounded.
 
-Return findings with: file, line, severity, title (include table/model name), detail (explain what happens at 10K/100K rows), fix (add \`take:\`/\`limit=\`, cursor pagination, or streaming).`,
+Return: file, line, severity, title (include table/model name), detail (explain what happens at 10K/100K rows), fix (add \`take:\`/\`limit=\`, cursor pagination, or streaming).`,
   },
   {
     key: 'hot_path_inefficiency',
@@ -207,7 +207,7 @@ Codebase root: ${ROOT}
 
 Hunt for O(N²) patterns, redundant recomputation, and expensive operations repeated unnecessarily in hot code paths.
 
-Search for:
+Search:
 1. Nested loops over the same collection (O(N²)):
    Look for \`for x in items: for y in items\` or \`items.forEach(() => items.find/filter/map)\`
    \`grep -rn "\.find(\\|\.filter(\\|\.some(" ${ROOT} --include="*.ts" --include="*.py" | grep -v test | head -20\`
@@ -224,7 +224,7 @@ Search for:
    - Config parsing, env var reading with validation, or schema compilation repeated on every request
    - \`grep -rn "JSON\.parse(process\.env\\|dotenv\.config\\|zod.*parse" ${ROOT} --include="*.ts" | grep -v test | head -20\`
 
-Return findings with: file, line, severity (high if in a route handler called at high frequency; medium if in a background job), title, detail (include the complexity and what triggers the hot path), fix.`,
+Return: file, line, severity (high if in a route handler called at high frequency; medium if in a background job), title, detail (include the complexity and what triggers the hot path), fix.`,
   },
 ]
 
@@ -254,7 +254,7 @@ phase('Triage')
 const highCritical = allFindings.filter(f => f.severity === 'critical' || f.severity === 'high')
 
 const triageResults = await parallel(highCritical.map(f => () =>
-  agent(`You are an adversarial performance reviewer. Your job is to REFUTE the following finding if possible.
+  agent(`You are an adversarial performance reviewer. REFUTE this finding if you can.
 
 Finding: ${f.title}
 File: ${f.file}:${f.line}
@@ -271,7 +271,7 @@ Try to find evidence that this is NOT actually a performance problem:
 - Is the table provably small and bounded (e.g., a config table with 10 rows)?
 - Is the result set already bounded by business logic (e.g., only active users returned, and there are always < 100)?
 
-Read the file carefully before deciding. Default to confirmed=true if you cannot find a clear mitigation.`,
+Read the file before deciding. If no clear mitigation, return confirmed=true.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   )
 ))

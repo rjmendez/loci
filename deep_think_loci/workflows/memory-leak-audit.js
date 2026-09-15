@@ -383,8 +383,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this memory/resource leak finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm by reading the actual code.
+    `Refute this memory/resource-leak finding if you can.
+If the actual code doesn't confirm it, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 File: ${f.file || 'unknown'} (${f.line_hint || '?'})
@@ -399,7 +399,7 @@ Steps:
 4. For caches: is the maxsize present but on a separate decorator line the hunter didn't see?
 5. For listeners: is there a cleanup function called from a teardown/shutdown hook?
 
-Return is_real=true only if the resource leak is confirmed unmitigated.`,
+Return is_real=true only for a confirmed unmitigated resource leak.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)
