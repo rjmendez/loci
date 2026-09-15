@@ -226,6 +226,7 @@ from inv_store import (  # noqa: E402,F401
     _load_resolution_overrides, _load_retracted_ids, _make_ref, _tag_finding_ids,
     _summarise_finding, _safe_float, _CONFIDENCE_RANK, _RESOLUTION_STATES,
     _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
+    StoreBusyError, _locked_file,
 )
 
 
@@ -2388,19 +2389,15 @@ def _store_commit(investigation_id: str, manifest: dict, finding: dict,
                   finding_type: str, text: str, tier: str) -> None:
     """Append the finding and update the manifest under the per-investigation lock."""
     lock_path = _inv_dir(investigation_id) / ".lock"
-    with open(lock_path, "w") as lock_fh:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        try:
-            _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
-            manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
-            # Update hot-tier manifest notes
-            if tier == "hot":
-                snippet = text[:200]
-                notes = manifest.get("notes") or ""
-                manifest["notes"] = (notes + "; " + snippet) if notes else snippet
-            _save_manifest(manifest)
-        finally:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    with _locked_file(lock_path, "a+", exclusive=True):
+        _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
+        manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
+        # Update hot-tier manifest notes
+        if tier == "hot":
+            snippet = text[:200]
+            notes = manifest.get("notes") or ""
+            manifest["notes"] = (notes + "; " + snippet) if notes else snippet
+        _save_manifest(manifest)
 
 
 def _store_index(investigation_id: str, finding: dict, finding_type: str,
@@ -2562,7 +2559,15 @@ def investigation_store(
     if invalid:
         return invalid
 
-    _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
+    try:
+        _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
+    except StoreBusyError as exc:
+        return json.dumps({
+            "error": "busy",
+            "detail": str(exc),
+            "retryable": True,
+            "investigation_id": investigation_id,
+        })
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
@@ -2641,6 +2646,16 @@ def finding_resolve(
     }
     try:
         _append_jsonl(_finding_updates_path(investigation_id), record)
+    except StoreBusyError as exc:
+        logger.info("finding_resolve busy for %s/%s: %s", investigation_id, finding_id, exc)
+        return json.dumps({
+            "error": "busy",
+            "detail": str(exc),
+            "retryable": True,
+            "investigation_id": investigation_id,
+            "finding_id": str(finding_id),
+            "resolution": res,
+        })
     except Exception as exc:  # noqa: BLE001 — fail-open: never raise out of a tool
         logger.warning("finding_resolve append failed (fail-open): %r", exc)
         return json.dumps({"error": f"Could not record resolution: {exc}"})
@@ -7550,17 +7565,13 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
     # Atomically rewrite the JSONL file
     _lock_path = _inv_dir(investigation_id) / ".lock"
     try:
-        with open(_lock_path, "w") as _lock_fh:
-            fcntl.flock(_lock_fh, fcntl.LOCK_EX)
-            try:
-                dir_ = findings_path.parent
-                with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
-                    for f in findings:
-                        tf.write(json.dumps(f) + "\n")
-                    tmp_path = Path(tf.name)
-                tmp_path.replace(findings_path)
-            finally:
-                fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+        with _locked_file(_lock_path, "a+", exclusive=True):
+            dir_ = findings_path.parent
+            with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
+                for f in findings:
+                    tf.write(json.dumps(f) + "\n")
+                tmp_path = Path(tf.name)
+            tmp_path.replace(findings_path)
     except Exception as exc:
         return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
 

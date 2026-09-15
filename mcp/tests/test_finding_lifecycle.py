@@ -11,15 +11,19 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
+import fcntl
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
 if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
 
 import server  # noqa: E402
+import inv_store  # noqa: E402
 
 
 def _json(result: str) -> dict:
@@ -106,6 +110,68 @@ class FindingLifecycleTest(unittest.TestCase):
         inv_id = self._start()
         res = _json(server.finding_resolve(inv_id, "no-such-id", "fixed"))
         self.assertIn("error", res)
+
+    def test_resolve_contention_is_bounded_and_explicit(self):
+        """Contended resolution writes must finish promptly with success or retryable busy."""
+        orig_timeout = inv_store._STORE_LOCK_TIMEOUT_S
+        orig_initial = inv_store._STORE_LOCK_INITIAL_BACKOFF_S
+        orig_max = inv_store._STORE_LOCK_MAX_BACKOFF_S
+        inv_store._STORE_LOCK_TIMEOUT_S = 0.15
+        inv_store._STORE_LOCK_INITIAL_BACKOFF_S = 0.01
+        inv_store._STORE_LOCK_MAX_BACKOFF_S = 0.02
+        try:
+            inv_busy = self._start("busy")
+            busy_fids = [self._store(inv_busy, f"busy finding {i}") for i in range(3)]
+            updates_path = server._finding_updates_path(inv_busy)
+            held = os.open(updates_path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                results: dict[str, dict] = {}
+
+                def _resolve(fid: str) -> None:
+                    results[fid] = _json(server.finding_resolve(inv_busy, fid, "fixed"))
+
+                threads = [threading.Thread(target=_resolve, args=(fid,)) for fid in busy_fids]
+                started = time.monotonic()
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=1.0)
+                elapsed = time.monotonic() - started
+
+                self.assertTrue(all(not t.is_alive() for t in threads), "contended writers must not hang")
+                self.assertLess(elapsed, 0.8, f"contention should fail fast, took {elapsed:.3f}s")
+                self.assertEqual(set(results), set(busy_fids))
+                for row in results.values():
+                    self.assertEqual(row.get("error"), "busy", row)
+                    self.assertTrue(row.get("retryable"), row)
+                self.assertEqual(server._read_jsonl(updates_path), [])
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                os.close(held)
+
+            inv_ok = self._start("ok")
+            ok_fids = [self._store(inv_ok, f"ok finding {i}") for i in range(3)]
+            ok_results: dict[str, dict] = {}
+
+            def _resolve_ok(fid: str) -> None:
+                ok_results[fid] = _json(server.finding_resolve(inv_ok, fid, "fixed"))
+
+            threads = [threading.Thread(target=_resolve_ok, args=(fid,)) for fid in ok_fids]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=1.0)
+
+            self.assertTrue(all(not t.is_alive() for t in threads), "unblocked writers must finish")
+            self.assertEqual(set(ok_results), set(ok_fids))
+            for row in ok_results.values():
+                self.assertTrue(row.get("resolved"), row)
+            self.assertEqual(len(server._read_jsonl(server._finding_updates_path(inv_ok))), len(ok_fids))
+        finally:
+            inv_store._STORE_LOCK_TIMEOUT_S = orig_timeout
+            inv_store._STORE_LOCK_INITIAL_BACKOFF_S = orig_initial
+            inv_store._STORE_LOCK_MAX_BACKOFF_S = orig_max
 
     # -- #3 staleness --------------------------------------------------------
 

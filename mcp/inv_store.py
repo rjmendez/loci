@@ -19,12 +19,46 @@ import logging
 import os
 import re
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("loci-mcp")
 
 _get_memory_dir = None  # injected by register(); returns the memory root Path
+
+
+def _parse_lock_timeout() -> float:
+    raw = str(os.environ.get("LOCI_STORE_LOCK_TIMEOUT_S", "1.5") or "").strip()
+    try:
+        value = float(raw)
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return 1.5
+
+
+_STORE_LOCK_TIMEOUT_S = _parse_lock_timeout()
+_STORE_LOCK_INITIAL_BACKOFF_S = 0.01
+_STORE_LOCK_MAX_BACKOFF_S = 0.1
+
+
+class StoreBusyError(TimeoutError):
+    """Bounded advisory-lock acquisition timed out; caller should retry."""
+
+    def __init__(self, path: Path, *, timeout_s: float, operation: str):
+        self.path = Path(path)
+        self.timeout_s = float(timeout_s)
+        self.operation = str(operation)
+        super().__init__(
+            f"{self.operation} lock busy for {self.path.name}; retry "
+            f"(waited {self.timeout_s:.2f}s)"
+        )
+
+
+_MAX_INVESTIGATION_ID_BYTES = 255
 
 
 def _root() -> Path:
@@ -138,7 +172,9 @@ def _inv_dir(investigation_id: str) -> Path:
     investigation_id = _validated_investigation_id(investigation_id)
     root = _root().resolve()
     candidate = (root / investigation_id).resolve()
-    if not str(candidate).startswith(str(root)):
+    try:
+        candidate.relative_to(root)
+    except ValueError:
         raise ValueError('Path escape detected in investigation_id')
     candidate.mkdir(parents=True, exist_ok=True)
     return candidate
@@ -198,21 +234,56 @@ def _save_manifest(manifest: dict) -> None:
     _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
 
 
+def _acquire_file_lock(fd: int, path: Path, *, exclusive: bool, timeout_s: float | None = None) -> None:
+    """Bounded advisory lock with short exponential backoff.
+
+    Raises StoreBusyError when the lease stays contended past the timeout so the
+    caller can return a retryable "busy" result instead of hanging until the
+    transport dies.
+    """
+    timeout = _STORE_LOCK_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    deadline = time.monotonic() + timeout
+    wait_s = _STORE_LOCK_INITIAL_BACKOFF_S
+    mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+    while True:
+        try:
+            fcntl.flock(fd, mode)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise StoreBusyError(
+                    path,
+                    timeout_s=timeout,
+                    operation="exclusive" if exclusive else "shared",
+                ) from None
+            time.sleep(wait_s)
+            wait_s = min(wait_s * 2, _STORE_LOCK_MAX_BACKOFF_S)
+
+
+@contextmanager
+def _locked_file(path: Path, mode: str, *, exclusive: bool = True, timeout_s: float | None = None):
+    """Open ``path`` and hold a bounded advisory lock for the caller's critical section."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, mode) as fh:
+        _acquire_file_lock(fh.fileno(), path, exclusive=exclusive, timeout_s=timeout_s)
+        try:
+            yield fh
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception as exc:
+                logger.debug("_locked_file: fail-open swallow: %r", exc)
+
+
 def _append_jsonl(path: Path, entry: dict) -> None:
     # Exclusive advisory lock around the append so concurrent writers (e.g. parallel
     # workflow agents recording to the same investigation) can't interleave a >PIPE_BUF
-    # line and corrupt the file. flock is POSIX-only; degrade to a bare append elsewhere.
+    # line and corrupt the file. Bound the wait so a contended writer returns a
+    # retryable busy signal before the MCP transport times out and drops the response.
     line = json.dumps(entry) + "\n"
-    with open(path, "a") as f:
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.write(line)
-            f.flush()
-        finally:
-            try:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            except Exception as exc:
-                logger.debug("_append_jsonl: fail-open swallow: %r", exc)
+    with _locked_file(path, "a", exclusive=True) as f:
+        f.write(line)
+        f.flush()
 
 
 def _read_jsonl(path: Path) -> list[dict]:
