@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""
-a2a_context_bridge.py — push recent Mnemosyne memories to all mesh peers via A2A.
+"""Push recent Mnemosyne memories to mesh peers via A2A.
 
-Run as a cron job (every 15-30 min) to keep the mesh in sync.
-Uses the Loci A2A server's context_broadcast skill so local storage
-and peer fanout happen atomically server-side.
+Run from cron every 15-30 minutes. Uses the local server's
+`context_broadcast` skill so local storage and peer fan-out happen atomically.
 
 Env vars (from ~/.hermes/.env or ~/.hermes/profiles/{HERMES_PROFILE}/.env):
-  LOCI_A2A_URL      Local A2A server endpoint (default: http://127.0.0.1:8201)
-  LOCI_A2A_TOKEN    Bearer token for the local server
-                    (the legacy HERMES_* spelling is still accepted for both)
-  BRIDGE_LOOKBACK_MIN How many minutes back to look for new memories (default: 30)
-  BRIDGE_MIN_IMP      Minimum importance to bridge (default: 0.5)
-  BRIDGE_MAX_ITEMS    Max memories to push per run (default: 20)
-  MNEMOSYNE_DATA_DIR  Mnemosyne SQLite dir (default: ~/.hermes/mnemosyne/data)
-  BRIDGE_STATE_FILE   Path to state file tracking last-synced timestamp
-                      (default: ~/.hermes/bridge_state.json)
-  PEER_A2A_URLS       Comma-separated peer endpoints (passed through to server)
-  PEER_A2A_TOKEN      Shared peer token (passed through to server)
+  LOCI_A2A_URL / HERMES_A2A_URL local A2A endpoint (default: http://127.0.0.1:8201)
+  LOCI_A2A_TOKEN / HERMES_A2A_TOKEN local server ******
+  BRIDGE_LOOKBACK_MIN minutes to scan back on first run (default: 30)
+  BRIDGE_MIN_IMP minimum importance to bridge (default: 0.5)
+  BRIDGE_MAX_ITEMS max memories to push per run (default: 20)
+  MNEMOSYNE_DATA_DIR Mnemosyne SQLite dir (default: ~/.hermes/mnemosyne/data)
+  BRIDGE_STATE_FILE watermark state path (default: ~/.hermes/bridge_state.json)
+  PEER_A2A_URLS comma-separated peer endpoints passed through to the server
+  PEER_A2A_TOKEN shared peer token passed through to the server
 
 Usage:
   python3 a2a_context_bridge.py [--dry-run] [--verbose]
@@ -56,14 +52,13 @@ if os.path.exists(_ENV):
             os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── config ───────────────────────────────────────────────────────────────────────
-# The legacy spelling is read directly rather than through legacy_env.apply(): this
-# script runs standalone from systemd and has no import path to mcp/. The unit this
-# repo ships points EnvironmentFile= at a profile that supplies only HERMES_A2A_*,
-# so reading the new name alone silently produced an empty token and no TOTP header.
+# Read legacy names directly, not via legacy_env.apply(): this script runs
+# standalone from systemd, has no import path to mcp/, and the shipped unit may
+# supply only HERMES_A2A_* values.
 LOCAL_A2A_URL  = (os.environ.get("LOCI_A2A_URL")
                   or os.environ.get("HERMES_A2A_URL")
                   or "http://127.0.0.1:8201")
-# Empty, not "changeme": the server defaults the same variable to '' so an unset token fails closed.
+# Empty, not "changeme": the server uses the same default, so unset fails closed.
 LOCAL_A2A_TOKEN = (os.environ.get("LOCI_A2A_TOKEN")
                    or os.environ.get("HERMES_A2A_TOKEN") or "")
 if not LOCAL_A2A_TOKEN:
@@ -75,7 +70,7 @@ MIN_IMP        = float(os.environ.get("BRIDGE_MIN_IMP", "0.5"))
 MAX_ITEMS      = int(os.environ.get("BRIDGE_MAX_ITEMS", "20"))
 AGENT_ID       = os.environ.get("HERMES_AGENT_ID", "hermes")
 
-# The local server may enforce TOTP on /a2a, where the bearer alone 401s; empty seed sends no header.
+# The local server may require TOTP on /a2a; empty seed means no X-TOTP header.
 LOCAL_A2A_TOTP_SEED = (os.environ.get("LOCI_A2A_TOTP_SEED")
                        or os.environ.get("HERMES_A2A_TOTP_SEED") or "").strip()
 
@@ -97,9 +92,12 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
-    """Same-directory temp + os.replace. This runs on a 10-minute timer, and a
-    truncated state file reads back as {}: sent_ids empty re-broadcasts the whole
-    lookback window to every peer, and a lost last_run drops the held watermark."""
+    """Write state via same-directory temp + `os.replace()`.
+
+    This runs every 10 minutes. A truncated state file reloads as `{}`:
+    empty `sent_ids` rebroadcast the whole window, and a lost `last_run`
+    drops the held watermark.
+    """
     p = Path(STATE_FILE)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.parent / (p.name + ".tmp")
@@ -108,7 +106,7 @@ def _save_state(state: dict):
 
 
 # ── Mnemosyne query ───────────────────────────────────────────────────────────────
-# Re-bridging a memory already in flight through the mesh is what turns two nodes into a loop.
+# Re-bridging in-flight memories is how two nodes turn into a loop.
 ECHO_SOURCE_PREFIXES = [
     p.strip() for p in os.environ.get(
         "BRIDGE_EXCLUDE_SOURCES", "bridge:,broadcast:,context_broadcast"
@@ -117,25 +115,20 @@ ECHO_SOURCE_PREFIXES = [
 
 
 def _fetch_recent_memories(since: str, min_importance: float, max_items: int) -> list[dict] | None:
-    """
-    Fetch memories newer than `since` (ISO timestamp) with importance >= min_importance,
-    excluding anything that arrived through the mesh (see ECHO_SOURCE_PREFIXES).
+    """Fetch memories newer than `since` with `importance >= min_importance`.
 
-    Returns None -- NOT [] -- when the DB could not be read at all (file absent, or no
-    queryable table). An empty list means "the window really was quiet" and lets the
-    caller advance its watermark; None must not, because everything written during the
-    outage would fall behind the new watermark and never be bridged.
+    Excludes mesh-delivered rows (`ECHO_SOURCE_PREFIXES`). Returns `None`, not
+    `[]`, when the DB is unreadable or has no queryable table: `[]` means the
+    window was truly quiet and allows the caller to advance its watermark,
+    while `None` must hold it so outage-era writes are not skipped forever.
 
-    Reads BOTH tiers. This used to read working_memory and fall back to `memories` only on
-    OperationalError -- i.e. only if the table did not exist. working_memory does exist, and
-    it is the small staging tier (2 rows on hugbot5000-jetson against 139 in `memories`), so
-    the fallback was unreachable and the real corpus was never bridged at all.
+    Read both tiers. The old working_memory-first fallback to `memories` only on
+    `OperationalError` missed the real corpus because `working_memory` existed
+    but held only the small staging tier.
 
-    created_at is normalised before comparison. Mnemosyne writes mostly ISO-with-T but not
-    exclusively (138 T-separated vs 1 space-separated on that same host), and a raw string
-    compare puts every space-separated row below every T-separated one, because ' ' (0x20)
-    sorts under 'T' (0x54). Those rows would be silently skipped forever once `since` is a
-    T-format timestamp.
+    Normalize `created_at` before comparing. Mnemosyne mixes `T`-separated and
+    space-separated timestamps; raw string ordering puts space-separated rows
+    below every `T` row and would skip them forever once `since` uses `T`.
     """
     if not os.path.exists(MNEMOSYNE_DB):
         log.warning("Mnemosyne DB not found: %s", MNEMOSYNE_DB)
@@ -147,7 +140,7 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
         echo_clause = " AND source IS NOT NULL AND " + " AND ".join(
             ["source NOT LIKE ?"] * len(ECHO_SOURCE_PREFIXES)
         )
-        # An exact name like context_broadcast needs no wildcard; a prefix like bridge: does.
+        # Exact names like context_broadcast need no wildcard; prefixes like bridge: do.
         params_tail = [p + "%" if p.endswith(":") else p for p in ECHO_SOURCE_PREFIXES]
 
     conn = sqlite3.connect(MNEMOSYNE_DB, timeout=10)
@@ -194,12 +187,10 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
 
 # ── A2A call ──────────────────────────────────────────────────────────────────────
 def _totp_now() -> str:
-    """
-    Current TOTP code for the local A2A server, or "" when no seed is configured.
+    """Return the current local-server TOTP code, or `""` when disabled.
 
-    Fails loud rather than silently sending an unauthenticated request: if a seed IS set
-    but pyotp is missing, every send would 401 and the only symptom would be a fail count
-    in the log, which is the failure mode this helper exists to remove.
+    Fail loudly when a seed is configured but `pyotp` is missing; otherwise the
+    bridge would quietly send bearer-only requests that all 401.
     """
     if not LOCAL_A2A_TOTP_SEED:
         return ""
@@ -226,11 +217,11 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
             "message":  mem["content"],
             "input": {
                 "content":    mem["content"],
-                # Unstamped, a bridged memory looks locally-authored at the peer and bounces back.
+                # Without a bridge:* source stamp, the peer treats it as local and bounces it back.
                 "source":     f"bridge:{AGENT_ID}",
                 "importance": float(mem.get("importance") or 0.5),
                 "bank":       "default",
-                # context_broadcast stores before it fans out, and we relay through our OWN server.
+                # context_broadcast stores before fan-out, and we relay through our own server.
                 "store_local": False,
             },
             "sender": AGENT_ID,
@@ -240,7 +231,7 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
         "Authorization": f"Bearer {LOCAL_A2A_TOKEN}",
         "Content-Type":  "application/json",
     }
-    # Per send, not per run: a run spanning a 30s TOTP step would start failing halfway through.
+    # Per send, not per run: a 30s TOTP step can flip during one run.
     totp_code = _totp_now()
     if totp_code:
         headers["X-TOTP"] = totp_code
@@ -260,11 +251,9 @@ async def _broadcast_memory(session: aiohttp.ClientSession, mem: dict, dry_run: 
                 if ok_peers:
                     return {"status": "ok", "id": mem["id"],
                             "peers_ok": ok_peers, "peers_count": peers_count}
-                # 200 from our OWN server means the request parsed, not that the memory
-                # left the node: store_local is False above, so a run where every peer
-                # was skipped (no PEER_A2A_URLS, no token, bad TOTP seed) or 401'd
-                # delivered it nowhere. Reporting that as ok stamps the id into sent_ids
-                # and advances the watermark, and no later tick ever retries it.
+                # 200 from our own server means the request parsed, not that any
+                # peer accepted it. With store_local=False, skipped/401'd peers would
+                # otherwise stamp sent_ids, advance the watermark, and suppress retries.
                 reasons = ", ".join(sorted({str(p.get("status")) for p in peers})) or "no result"
                 return {"status": "no_peers" if peers_count == 0 else "peers_failed",
                         "id": mem["id"], "peers_ok": 0, "peers_count": peers_count,
@@ -310,7 +299,7 @@ async def run(dry_run: bool, verbose: bool):
             _save_state(state)
         return
 
-    # Ids already delivered, so holding the watermark back to retry does not re-send.
+    # Ids already delivered are tracked separately, so retrying does not resend them.
     sent_ids = list(state.get("sent_ids") or [])
     sent_set = set(sent_ids)
 
@@ -338,7 +327,7 @@ async def run(dry_run: bool, verbose: bool):
     log.info("Bridge complete — ok=%d fail=%d skipped=%d dry_run=%s", ok, fail, skipped, dry_run)
 
     if not dry_run:
-        # Clean runs only: advancing past a failed send drops those memories for good.
+        # Advance the watermark only on clean runs; otherwise failed sends are lost.
         if fail == 0:
             state["last_run"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         else:

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""
-Loci A2A Client — helper for calling the Loci memory server from other agents.
+"""Loci A2A client for agents and CLI callers.
 
-Usage from other agents (Python):
+Python:
     from client import LociClient
     c = LociClient()
     results = await c.memory_recall("DAMA ant colony telemetry")
     await c.memory_remember("Resolved the k3s issue at 03:00 UTC", sender="hermes-agent")
 
-Or from CLI:
+CLI:
     python3 client.py recall "DAMA"
     python3 client.py stats
     python3 client.py sessions "A2A"
@@ -17,7 +16,7 @@ Or from CLI:
 
 import os, sys, json, asyncio, uuid
 
-# Load .env
+# Load ~/.hermes/.env if present.
 _ENV = os.path.expanduser('~/.hermes/.env')
 if os.path.exists(_ENV):
     for _l in open(_ENV):
@@ -31,7 +30,7 @@ try:
 except ImportError:
     sys.exit('aiohttp required: pip install aiohttp')
 
-# Optionally import pyotp
+# Optional TOTP support.
 try:
     import pyotp
     _PYOTP = True
@@ -40,12 +39,11 @@ except ImportError:
 
 
 class LociClient:
-    """
-    Async A2A client for the Loci A2A memory server.
+    """Async client for the Loci A2A memory server.
 
-    Auth conventions:
-      - Bearer token in Authorization header
-      - Optional X-TOTP header if TOTP seed is configured
+    Auth:
+      - ****** in Authorization
+      - X-TOTP only when a TOTP seed is configured
     """
 
     def __init__(
@@ -163,7 +161,7 @@ async def _cli_main(args: list[str]):
         if not content:
             print('Usage: client.py remember <content> [--sender name]')
             return
-        # parse --sender
+        # Parse --sender flag.
         sender = None
         if '--sender' in args:
             idx = args.index('--sender')
