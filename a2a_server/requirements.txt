@@ -11,11 +11,11 @@
 # ── HTTP server ────────────────────────────────────────────────────────────────
 fastapi==0.133.1          # JSON-RPC 2.0 routes, dependency injection (Bearer/TOTP)
 uvicorn==0.41.0           # ASGI server; uvloop extra recommended for production
-starlette==1.0.1          # fastapi dep — Request, JSONResponse, HTTPException
+starlette==1.3.1          # fastapi dep — Request, JSONResponse, HTTPException
 pydantic==2.13.4          # fastapi dep — request/response validation
 
 # ── Async HTTP client (Qdrant + Ollama embed calls) ───────────────────────────
-aiohttp==3.13.4           # async POST to Qdrant /collections/.../points/search
+aiohttp==3.14.3           # async POST to Qdrant /collections/.../points/search
                           # async POST to Ollama /v1/embeddings
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
