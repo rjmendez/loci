@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "."
+          pip install -e ".[test]"
           pip install pytest pytest-asyncio pytest-timeout
 
       - name: Run tests
@@ -299,7 +299,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -e "."
+          pip install -e ".[test]"
           pip install pytest pytest-asyncio pytest-timeout
 
       - name: Run MCP integration tests

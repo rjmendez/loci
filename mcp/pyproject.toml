@@ -27,6 +27,9 @@ dependencies = [
 mnemosyne = [
     "mnemosyne-memory[mcp]",
 ]
+test = [
+    "hypothesis>=6.0",
+]
 
 [project.scripts]
 loci-mcp = "server:main"
