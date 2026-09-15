@@ -7,7 +7,7 @@ would shadow the sibling module at module scope.
 """
 import json
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 logger = logging.getLogger("loci-mcp")
 
@@ -162,6 +162,7 @@ def ground(
     budget_chars: int = 4000,
     allow_keyword: bool = False,
     graph_available: bool = False,
+    mode: Literal["normal", "compact"] = "normal",
 ) -> str:
     """
     Build a compact, provenance-tagged grounding block for a task. Call it once
@@ -189,6 +190,7 @@ def ground(
         allow_keyword: Enable the noisy keyword/FTS fallback lane (default off).
         graph_available: Enable the code-graph lane (default off; requires the
             LadybugDB graph).
+        mode: "normal" (default) for the legacy block, or "compact" for terse tagged lines.
 
     Returns:
         JSON ``{block, sources, chars, degraded}``.
@@ -207,6 +209,8 @@ def ground(
         "allowKeyword": allow_keyword,
         "graphAvailable": graph_available,
     }
+    if mode == "compact":
+        opts["mode"] = "compact"
     return json.dumps(grounding.ground(task, opts), indent=2)
 
 

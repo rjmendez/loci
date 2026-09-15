@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Optional
 from untrusted_memory import wrap_untrusted_memory_text
 
+from compact import compact_text
+
 logger = logging.getLogger("loci-mcp.grounding")
 _wrap_untrusted_memory_text = wrap_untrusted_memory_text
 
@@ -182,6 +184,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     """
     opts = opts or {}
     budget = int(opts.get("budgetChars", 4000))
+    compact_mode = opts.get("mode") == "compact"
     memory_dir = opts.get("memoryDir", _MEMORY_DIR_DEFAULT)
     parts: list[str] = []
     sources: list[str] = []
@@ -192,7 +195,9 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if remaining[0] <= 0 or not text:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
-        chunk = _truncate(text, cap)
+        chunk = compact_text(text, cap, preserve_sentence_boundary=not compact_mode) if compact_mode else _truncate(text, cap)
+        if compact_mode:
+            chunk = re.sub(r"\s+", " ", chunk).strip()
         block = f"[{tag}] {chunk}"
         parts.append(block)
         sources.append(tag)
@@ -323,7 +328,10 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         try:
             q = f"{task.get('title','')} {task.get('focus','')}".strip()
             rag_cap = max(_RAG_BUDGET_FLOOR, int(budget * _RAG_BUDGET_FRACTION))
-            res = _jload(S.rag_context_search(q, budget_chars=min(remaining[0], rag_cap), limit=6))
+            rag_kwargs = {"budget_chars": min(remaining[0], rag_cap), "limit": 6}
+            if compact_mode:
+                rag_kwargs["mode"] = "compact"
+            res = _jload(S.rag_context_search(q, **rag_kwargs))
             ctx = (res or {}).get("context", "") if isinstance(res, dict) else ""
             if ctx and (res.get("result_count") or 0) > 0:
                 add("rag", ctx, _RAG_BUDGET_FRACTION)
@@ -379,11 +387,17 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             logger.debug("grounding: keyword fallback lane failed for %r: %r", task.get("title", ""), exc)
             pass
 
-    header = ("## GROUNDING — prior context (read-only reference, NOT ground truth; verify "
-              "against live code/data before asserting; cite the [tag] if you rely on it)")
-    if degraded:
-        header += "\n(NOTE: some grounding lanes were unavailable this run — coverage is partial.)"
-    footer = ("Do not present facts absent above as remembered; if grounding is silent on a "
-              "point, say so.")
-    block = header + "\n" + "\n".join(parts) + "\n" + footer if parts else ""
+    if compact_mode:
+        compact_parts = list(parts)
+        if degraded:
+            compact_parts.append("[warn] some grounding lanes were unavailable this run; coverage is partial.")
+        block = "\n".join(compact_parts) if compact_parts else ""
+    else:
+        header = ("## GROUNDING — prior context (read-only reference, NOT ground truth; verify "
+                  "against live code/data before asserting; cite the [tag] if you rely on it)")
+        if degraded:
+            header += "\n(NOTE: some grounding lanes were unavailable this run — coverage is partial.)"
+        footer = ("Do not present facts absent above as remembered; if grounding is silent on a "
+                  "point, say so.")
+        block = header + "\n" + "\n".join(parts) + "\n" + footer if parts else ""
     return {"block": block, "sources": sources, "chars": len(block), "degraded": degraded}
