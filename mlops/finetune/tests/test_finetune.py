@@ -31,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import mlops.finetune.collect as C  # noqa: E402
 import mlops.finetune.format_sft as F  # noqa: E402
 import mlops.finetune.train_lora as T  # noqa: E402
-import scripts.score_trace_collector as STC  # noqa: E402
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -180,59 +179,44 @@ def test_load_agentHER_lets_non_sqlite_errors_propagate(tmp_path, monkeypatch):
 # collect.build_unified_records
 # ══════════════════════════════════════════════════════════════════════════════════
 
-def test_build_unified_records_order_is_neg_pos_corr_her_and_nothing_is_dropped():
+def test_build_unified_records_preserves_agenther_order_and_count():
     recs = C.build_unified_records(
-        negatives=[{"content": "n1"}, {"content": "n2"}],
-        positives=[{"content": "p1"}],
-        corrections=[{"failed_content": "f", "corrected_content": "c"}],
-        agentHER=[{"content": "h1"}],
+        agentHER=[{"content": "h1"}, {"content": "h2"}],
         collected_at="T0",
     )
-    assert [r["type"] for r in recs] == [
-        "negative", "negative", "positive", "correction", "agentHER"
-    ]
-    assert len(recs) == 5
+    assert [r["type"] for r in recs] == ["agentHER", "agentHER"]
+    assert len(recs) == 2
 
 
-def test_build_unified_records_field_shape_and_sources():
+def test_build_unified_records_field_shape_and_source():
     recs = C.build_unified_records(
-        [{"content": "n1", "session_id": "sn"}],
-        [{"content": "p1", "session_id": "sp"}],
-        [{"failed_content": "f", "corrected_content": "c", "session_id": "sc"}],
         [{"content": "h1", "session_id": "sh"}],
         "2026-01-01T00:00:00Z",
     )
-    for r in recs:
-        assert set(r) == {"id", "type", "content", "source", "session_id", "collected_at"}
-        assert r["collected_at"] == "2026-01-01T00:00:00Z"
-        assert r["id"] == _sha(r["content"])
-    assert [r["source"] for r in recs] == [
-        "guard_log", "guard_log", "guard_log", "mnemosyne"
-    ]
-    assert [r["session_id"] for r in recs] == ["sn", "sp", "sc", "sh"]
-
-
-def test_build_unified_records_correction_content_is_json_failed_then_corrected():
-    recs = C.build_unified_records([], [], [
-        {"failed_content": "F", "corrected_content": "C"},
-    ], [], "T")
-    # Exact serialization matters: it is the dedup key AND format_sft parses it back.
-    assert recs[0]["content"] == '{"failed": "F", "corrected": "C"}'
-    assert json.loads(recs[0]["content"]) == {"failed": "F", "corrected": "C"}
+    assert recs == [{
+        "id": _sha("h1"),
+        "type": "agentHER",
+        "content": "h1",
+        "source": "mnemosyne",
+        "session_id": "sh",
+        "collected_at": "2026-01-01T00:00:00Z",
+    }]
 
 
 def test_build_unified_records_defaults_missing_fields_to_empty_string():
-    recs = C.build_unified_records([{}], [{}], [{}], [{}], "T")
-    assert [r["content"] for r in recs] == [
-        "", "", '{"failed": "", "corrected": ""}', ""
-    ]
-    assert all(r["session_id"] == "" for r in recs)
-    # empty content still gets a (constant) id — no record is filtered out
-    assert recs[0]["id"] == _sha("")
+    recs = C.build_unified_records([{}], "T")
+    assert recs == [{
+        "id": _sha(""),
+        "type": "agentHER",
+        "content": "",
+        "source": "mnemosyne",
+        "session_id": "",
+        "collected_at": "T",
+    }]
 
 
 def test_build_unified_records_all_empty_inputs_gives_empty_list():
-    assert C.build_unified_records([], [], [], [], "T") == []
+    assert C.build_unified_records([], "T") == []
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -255,16 +239,14 @@ def test_deduplicate_empty_input():
     assert C.deduplicate([]) == ([], 0)
 
 
-def test_deduplicate_collapses_across_types_because_id_is_content_only():
-    """BUG: a negative and a positive with identical text share an id, so the
-    positive is silently discarded and the pair is mislabelled as a negative."""
+def test_deduplicate_collapses_duplicate_agenther_content():
     recs = C.build_unified_records(
-        [{"content": "ls -la"}], [{"content": "ls -la"}], [], [], "T"
+        [{"content": "same"}, {"content": "same"}], "T"
     )
     unique, n_removed = C.deduplicate(recs)
     assert n_removed == 1
     assert len(unique) == 1
-    assert unique[0]["type"] == "negative"  # the positive lost
+    assert unique[0]["type"] == "agentHER"
 
 
 def test_deduplicate_raises_keyerror_when_a_record_has_no_id():
@@ -281,92 +263,54 @@ def test_collect_parse_args_defaults(monkeypatch):
     args = C.parse_args()
     assert args.out == "mlops/finetune/data/"
     assert args.db == C._DEFAULT_DB
-    assert args.hook_state == C._DEFAULT_STATE_DIR
-    assert args.ollama  # defaults from OLLAMA_URL or localhost:11434
 
 
-def test_collect_parse_args_hook_state_flag_maps_to_hook_state_attr(monkeypatch):
+def test_collect_parse_args_only_accepts_out_and_db(monkeypatch):
     monkeypatch.setattr(
         sys, "argv",
-        ["collect.py", "--out", "/o", "--db", "/d.db", "--hook-state", "/hs",
-         "--ollama", "http://x:1"],
+        ["collect.py", "--out", "/o", "--db", "/d.db"],
     )
     args = C.parse_args()
-    assert (args.out, args.db, args.hook_state, args.ollama) == (
-        "/o", "/d.db", "/hs", "http://x:1"
-    )
-
-
-def _guard_logs(state_dir: Path, failures, successes):
-    state_dir.mkdir(parents=True, exist_ok=True)
-    _write_jsonl(state_dir / "guard_bash_failures.log", failures)
-    _write_jsonl(state_dir / "guard_bash_successes.log", successes)
+    assert (args.out, args.db) == ("/o", "/d.db")
 
 
 def test_collect_main_end_to_end_writes_raw_traces_jsonl(tmp_path, monkeypatch, capsys):
-    state = tmp_path / "hook-state"
-    _guard_logs(
-        state,
-        failures=[
-            {"canonical_command": "bad cmd", "count": 2, "session_id": "s1"},
-            {"canonical_command": "ignored, count too low", "count": 1,
-             "session_id": "s1"},
-        ],
-        successes=[{"command": "good cmd", "session_id": "s1"}],
-    )
     db = _make_wm_db(tmp_path / "m.db", [("her row", "s9", "agentHER")])
     out = tmp_path / "data"
 
-    # main() mutates score_trace_collector module globals; monkeypatch restores them.
-    monkeypatch.setattr(STC, "STATE_DIR", STC.STATE_DIR)
-    monkeypatch.setattr(STC, "MNEMOSYNE_DB", STC.MNEMOSYNE_DB)
-    monkeypatch.setattr(STC, "OLLAMA_URL", STC.OLLAMA_URL, raising=False)
     monkeypatch.setattr(
         sys, "argv",
-        ["collect.py", "--out", str(out), "--db", str(db),
-         "--hook-state", str(state), "--ollama", "http://ollama.invalid:11434"],
+        ["collect.py", "--out", str(out), "--db", str(db)],
     )
 
     C.main()
 
-    # the --hook-state / --db / --ollama flags are applied by patching the
-    # collector's module globals
-    assert STC.STATE_DIR == str(state)
-    assert STC.MNEMOSYNE_DB == str(db)
-    assert STC.OLLAMA_URL == "http://ollama.invalid:11434"
-
     written = _read_jsonl(out / "raw_traces.jsonl")
-    assert [r["type"] for r in written] == [
-        "negative", "positive", "correction", "agentHER"
-    ]
-    assert written[0]["content"] == "bad cmd"
-    assert written[1]["content"] == "good cmd"
-    assert json.loads(written[2]["content"]) == {
-        "failed": "bad cmd", "corrected": "good cmd"
-    }
-    assert written[3]["content"] == "her row"
+    assert written == [{
+        "id": _sha("her row"),
+        "type": "agentHER",
+        "content": "her row",
+        "source": "mnemosyne",
+        "session_id": "s9",
+        "collected_at": written[0]["collected_at"],
+    }]
     # one shared timestamp for the whole batch
     assert len({r["collected_at"] for r in written}) == 1
 
     outp = capsys.readouterr().out
-    assert "negatives=1" in outp and "positives=1" in outp
-    assert "corrections=1" in outp and "agentHER=1" in outp
+    assert "negatives=0" in outp and "positives=0" in outp
+    assert "corrections=0" in outp and "agentHER=1" in outp
     assert "deduped=0" in outp
-    assert "wrote 4 records" in outp
+    assert "wrote 1 records" in outp
 
 
 def test_collect_main_creates_out_dir_and_survives_empty_sources(
     tmp_path, monkeypatch, capsys
 ):
     out = tmp_path / "deep" / "nested" / "data"
-    monkeypatch.setattr(STC, "STATE_DIR", STC.STATE_DIR)
-    monkeypatch.setattr(STC, "MNEMOSYNE_DB", STC.MNEMOSYNE_DB)
-    monkeypatch.setattr(STC, "OLLAMA_URL", STC.OLLAMA_URL, raising=False)
     monkeypatch.setattr(
         sys, "argv",
-        ["collect.py", "--out", str(out),
-         "--db", str(tmp_path / "missing.db"),
-         "--hook-state", str(tmp_path / "missing-state")],
+        ["collect.py", "--out", str(out), "--db", str(tmp_path / "missing.db")],
     )
 
     C.main()
@@ -380,33 +324,16 @@ def test_collect_main_creates_out_dir_and_survives_empty_sources(
 def test_collect_main_dedup_counter_reflects_content_collisions(
     tmp_path, monkeypatch, capsys
 ):
-    state = tmp_path / "hs"
-    # identical text on both sides of the guard logs
-    _guard_logs(
-        state,
-        failures=[{"canonical_command": "same", "count": 2, "session_id": "s1"}],
-        successes=[{"command": "same", "session_id": "s1"}],
-    )
-    monkeypatch.setattr(STC, "STATE_DIR", STC.STATE_DIR)
-    monkeypatch.setattr(STC, "MNEMOSYNE_DB", STC.MNEMOSYNE_DB)
-    monkeypatch.setattr(STC, "OLLAMA_URL", STC.OLLAMA_URL, raising=False)
+    db = _make_wm_db(tmp_path / "m.db", [("same", "s1", "agentHER"), ("same", "s2", "agentHER")])
     monkeypatch.setattr(
         sys, "argv",
-        ["collect.py", "--out", str(tmp_path / "o"),
-         "--db", str(tmp_path / "none.db"), "--hook-state", str(state)],
+        ["collect.py", "--out", str(tmp_path / "o"), "--db", str(db)],
     )
     C.main()
     outp = capsys.readouterr().out
     assert "deduped=1" in outp
-    assert "positives=0" in outp  # BUG: swallowed by the negative with the same text
-    assert "wrote 2 records" in outp
-
-
-def test_collect_reexports_unused_agenthr_loader():
-    """load_agenthr_positives is imported but never called — dead import, kept
-    here so a refactor that removes it is a deliberate choice."""
-    assert callable(C.load_agenthr_positives)
-    assert C.load_agenthr_positives is STC.load_agenthr_positives
+    assert "agentHER=1" in outp
+    assert "wrote 1 records" in outp
 
 
 # ══════════════════════════════════════════════════════════════════════════════════
@@ -1116,9 +1043,11 @@ def test_correction_content_round_trips_from_collect_into_sft_pairs(tmp_path):
     """The three stages agree on the correction envelope: collect json-encodes
     {failed, corrected} into `content`, format_sft decodes it, train_lora bakes it."""
     failed, corrected = _long("f"), _long("c")
-    recs = C.build_unified_records(
-        [], [], [{"failed_content": failed, "corrected_content": corrected,
-                  "session_id": "s1"}], [], "T")
+    recs = [{
+        "type": "correction",
+        "content": json.dumps({"failed": failed, "corrected": corrected}),
+        "session_id": "s1",
+    }]
     pairs = F.pairs_from_corrections(recs)
     assert pairs[0]["messages"][0]["content"] == failed
     assert pairs[0]["messages"][1]["content"] == corrected
@@ -1131,7 +1060,9 @@ def test_correction_content_round_trips_from_collect_into_sft_pairs(tmp_path):
 def test_short_guard_commands_are_dropped_by_the_formatter(tmp_path):
     """Real guard-log commands are usually shorter than MIN_CONTENT_LEN, so the
     pipeline silently produces zero pairs from them."""
-    recs = C.build_unified_records(
-        [], [], [{"failed_content": "ls -la", "corrected_content": "ls -l"}], [], "T")
+    recs = [{
+        "type": "correction",
+        "content": json.dumps({"failed": "ls -la", "corrected": "ls -l"}),
+    }]
     assert F.pairs_from_corrections(recs) == []
     assert F.pairs_from_corrections_dpo(recs) == []

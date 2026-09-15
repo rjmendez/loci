@@ -1,8 +1,8 @@
 """
-skill_annotation_updater.py — Nightly SKILL.md self-annotation from PostToolUse failure logs.
+skill_annotation_updater.py — Nightly SKILL.md self-annotation from tool reflections.
 
-Reads guard_tool_reflections.log (and optionally guard_bash_failures.log) from STATE_DIR,
-then appends/replaces "## Learned constraints" sections in matching SKILL.md files.
+Reads guard_tool_reflections.log from STATE_DIR, then appends/replaces
+"## Learned constraints" sections in matching SKILL.md files.
 """
 
 import collections
@@ -124,7 +124,6 @@ def main():
     today_str = datetime.date.today().isoformat()
 
     reflections_log = os.path.join(state_dir, "guard_tool_reflections.log")
-    bash_failures_log = os.path.join(state_dir, "guard_bash_failures.log")
 
     # Primary log must exist
     if not os.path.exists(reflections_log):
@@ -135,9 +134,6 @@ def main():
 
     tool_records = load_jsonl(reflections_log)
     aggregate_failures(tool_records, failures_by_tool)
-
-    bash_records = load_jsonl(bash_failures_log)
-    aggregate_failures(bash_records, failures_by_tool)
 
     total_events = sum(len(v) for v in failures_by_tool.values())
 

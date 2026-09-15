@@ -287,9 +287,6 @@ DEFAULT_FINDINGS = os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findi
 DEFAULT_DB = os.path.expanduser(
     os.environ.get("MNEMOSYNE_DB", "~/.hermes/mnemosyne/data/mnemosyne.db")
 )
-DEFAULT_HOOK_STATE = os.path.expanduser(
-    os.environ.get("CLAUDE_HOOK_STATE", "~/.claude/hook-state")
-)
 
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
@@ -454,7 +451,7 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
 
     for cmd in [
         [sys.executable, str(MLOPS / "finetune" / "collect.py"),
-         "--out", str(collect_out), "--ollama", ollama],
+         "--out", str(collect_out)],
         [sys.executable, str(MLOPS / "finetune" / "format_sft.py"),
          "--traces", str(traces), "--out", str(sft), "--mode", "both"],
     ]:
@@ -496,20 +493,6 @@ def _run_decay(db_path: str, dry_run: bool) -> dict:
         return stats
     except Exception as exc:
         _fail("decay", f"decay step failed: {exc}")
-        return {}
-
-
-# ── Live-Evo memory adaptation ────────────────────────────────────────────────
-
-def _run_live_evo(db_path: str, hook_state: str, dry_run: bool) -> dict:
-    try:
-        from memory.live_evo import adapt
-        stats = adapt(db_path=db_path, hook_state_dir=hook_state, dry_run=dry_run)
-        print(f"[loop] live_evo: failures={stats.get('n_failures')} "
-              f"correlated={stats.get('n_correlated')} penalized={stats.get('n_penalized')}")
-        return stats
-    except Exception as exc:
-        _fail("live_evo", f"live_evo step failed: {exc}")
         return {}
 
 
@@ -705,8 +688,6 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="Skip new-data thresholds and retrain unconditionally")
     ap.add_argument("--db", default=DEFAULT_DB, help="Path to Mnemosyne SQLite database")
-    ap.add_argument("--hook-state", default=DEFAULT_HOOK_STATE,
-                    help="Directory containing guard_bash_*.log files for Live-Evo")
     ap.add_argument("--decay-every", type=int, default=1,
                     help="Evaluate Weibull decay every N loop runs (default: every run)")
     ap.add_argument("--decay-apply", action="store_true",
@@ -831,10 +812,7 @@ def main() -> int:
     else:
         print(f"[loop] decay skipped (run {loop_count}, cadence={args.decay_every})")
 
-    # ── 7b. Live-Evo memory adaptation ───────────────────────────────────────
-    _run_live_evo(args.db, args.hook_state, args.dry_run)
-
-    # ── 7c. Post-promotion online monitoring ──────────────────────────────────
+    # ── 7b. Post-promotion online monitoring ──────────────────────────────────
     _run_monitor(args.findings, args.ollama, args.dry_run)
 
     # ── 7d. Embedding drift detection ─────────────────────────────────────────

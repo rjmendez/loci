@@ -580,7 +580,7 @@ def test_sft_bake_argv_of_real_bake(env):
     env.run.on_call("format_sft.py", lambda: _good_sft(env))
     loop._run_sft_bake("http://o", dry_run=False)
     data = env.mlops / "finetune" / "data"
-    assert env.run.calls[0][2:] == ["--out", str(data), "--ollama", "http://o"]
+    assert env.run.calls[0][2:] == ["--out", str(data)]
     assert env.run.calls[1][2:] == ["--traces", str(data / "raw_traces.jsonl"),
                                     "--out", str(data / "sft_pairs.jsonl"),
                                     "--mode", "both"]
@@ -669,44 +669,6 @@ def test_run_decay_null_mean_retention_discards_successful_result(env, monkeypat
 def test_run_decay_non_dict_return_is_swallowed(env, monkeypatch):
     install_fake(monkeypatch, "memory.decay", apply_decay=lambda **k: None)
     assert loop._run_decay("/db", False) == {}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _run_live_evo
-# ══════════════════════════════════════════════════════════════════════════════
-
-def test_run_live_evo_returns_stats_and_forwards_kwargs(env, monkeypatch, capsys):
-    seen = {}
-
-    def adapt(db_path, hook_state_dir, dry_run):
-        seen.update(db_path=db_path, hook_state_dir=hook_state_dir, dry_run=dry_run)
-        return {"n_failures": 2, "n_correlated": 1, "n_penalized": 1}
-
-    install_fake(monkeypatch, "memory.live_evo", adapt=adapt)
-    out = loop._run_live_evo("/db", "/hooks", dry_run=False)
-    assert out == {"n_failures": 2, "n_correlated": 1, "n_penalized": 1}
-    assert seen == {"db_path": "/db", "hook_state_dir": "/hooks", "dry_run": False}
-    assert "failures=2 correlated=1 penalized=1" in capsys.readouterr().out
-
-
-def test_run_live_evo_swallows_adapt_exception(env, monkeypatch, capsys):
-    def boom(**kw):
-        raise ValueError("no hook state")
-
-    install_fake(monkeypatch, "memory.live_evo", adapt=boom)
-    assert loop._run_live_evo("/db", "/h", False) == {}
-    assert "live_evo step failed: no hook state" in capsys.readouterr().out
-
-
-def test_run_live_evo_does_not_extend_sys_path_itself(env, monkeypatch):
-    """BUG pinned: _run_live_evo imports the top-level ``memory`` package but,
-    unlike _run_decay, never puts MLOPS on sys.path. It only works as a side
-    effect of _run_decay having run first; with --decay-every > 1 the import
-    fails and Live-Evo silently degrades to {}."""
-    monkeypatch.setitem(sys.modules, "memory", None)
-    before = list(sys.path)
-    assert loop._run_live_evo("/db", "/h", False) == {}
-    assert sys.path == before
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -997,7 +959,7 @@ def mainenv(env, monkeypatch):
     """env + every side-effecting step stubbed, so main()'s *decisions* are what
     is under test."""
     calls = {k: [] for k in (
-        "rebuild", "retrain", "canary", "decay", "live_evo", "monitor",
+        "rebuild", "retrain", "canary", "decay", "monitor",
         "drift", "sft", "active_learn", "emit",
     )}
     rv = {
@@ -1031,7 +993,6 @@ def mainenv(env, monkeypatch):
     monkeypatch.setattr(loop, "_run_canary", lambda *a, **k: (
         calls["canary"].append((a, k)), rv["canary"])[1])
     monkeypatch.setattr(loop, "_run_decay", rec("decay", {}))
-    monkeypatch.setattr(loop, "_run_live_evo", rec("live_evo", {}))
     monkeypatch.setattr(loop, "_run_monitor", rec("monitor", {}))
     monkeypatch.setattr(loop, "_run_embedding_drift", rec("drift", {}))
     monkeypatch.setattr(loop, "_run_sft_bake", lambda *a, **k: (
@@ -1412,11 +1373,10 @@ def test_main_decay_receives_db_and_dry_run(mainenv):
 
 # --- always-on steps ----------------------------------------------------------
 
-def test_main_live_evo_monitor_always_run_regardless_of_ollama(mainenv):
+def test_main_monitor_always_runs_regardless_of_ollama(mainenv):
     e = mainenv
     e.rv["ollama_ok"] = False
-    e.main("--hook-state", "/hooks")
-    assert e.calls["live_evo"][0][0] == (loop.DEFAULT_DB, "/hooks", False)
+    e.main()
     assert len(e.calls["monitor"]) == 1
 
 
@@ -1666,13 +1626,11 @@ def test_main_argparse_defaults(mainenv, monkeypatch):
     assert captured["ollama"] is None
     assert namespaces[0].ollama, "main() must fill in an Ollama URL"
     assert captured["db"] == loop.DEFAULT_DB
-    assert captured["hook_state"] == loop.DEFAULT_HOOK_STATE
 
 
 def test_module_level_defaults_are_expanded_paths():
     assert loop.DEFAULT_FINDINGS.endswith("/dt-loci-*/findings.jsonl")
     assert "~" not in loop.DEFAULT_DB
-    assert "~" not in loop.DEFAULT_HOOK_STATE
     assert not loop.DEFAULT_OLLAMA.endswith("/")
 
 
