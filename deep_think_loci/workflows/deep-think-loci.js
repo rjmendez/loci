@@ -10,10 +10,42 @@ export const meta = {
   ],
 }
 
+const INVALID_INVESTIGATION_ID_SENTINELS = new Set(['undefined', 'null', 'none'])
+
+function _invalidInvestigationId(fieldName, value) {
+  const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value)
+  return new Error(`${meta.name}: invalid ${fieldName}: expected a non-empty [A-Za-z0-9_-]+ investigation id, got ${rendered}`)
+}
+
+function optionalInvestigationId(value, fieldName = 'loci_investigation') {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string') throw _invalidInvestigationId(fieldName, value)
+  const trimmed = value.trim()
+  if (!trimmed) throw _invalidInvestigationId(fieldName, value)
+  if (INVALID_INVESTIGATION_ID_SENTINELS.has(trimmed.toLowerCase())) {
+    throw _invalidInvestigationId(fieldName, value)
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) throw _invalidInvestigationId(fieldName, value)
+  return trimmed
+}
+
+function requiredInvestigationId(value, fieldName = 'investigation_id') {
+  const resolved = optionalInvestigationId(value, fieldName)
+  if (!resolved) throw _invalidInvestigationId(fieldName, value)
+  return resolved
+}
+
+function investigationIdOrDefault(value, fallback, fieldName = 'run_id') {
+  if (value === undefined || value === null) {
+    return requiredInvestigationId(fallback, fieldName)
+  }
+  return requiredInvestigationId(value, fieldName)
+}
+
 // ── parameters ──
 // The Workflow tool delivers `args` as a JSON STRING, not a parsed object — normalize it.
 const A = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
-const RUN = A.run_id || 'dt-loci-005'
+const RUN = investigationIdOrDefault(A.run_id, 'dt-loci-005', 'run_id')
 const TITLE = A.title || 'deep-think-loci v3 run'
 const CODE_COLLS = JSON.stringify(A.rag_collections || ['dama_gotchi_code'])
 const N_IDEAS = A.ideas_per_agent || 10

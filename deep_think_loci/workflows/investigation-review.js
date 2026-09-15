@@ -9,6 +9,38 @@ export const meta = {
   ],
 }
 
+const INVALID_INVESTIGATION_ID_SENTINELS = new Set(['undefined', 'null', 'none'])
+
+function _invalidInvestigationId(fieldName, value) {
+  const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value)
+  return new Error(`${meta.name}: invalid ${fieldName}: expected a non-empty [A-Za-z0-9_-]+ investigation id, got ${rendered}`)
+}
+
+function optionalInvestigationId(value, fieldName = 'loci_investigation') {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string') throw _invalidInvestigationId(fieldName, value)
+  const trimmed = value.trim()
+  if (!trimmed) throw _invalidInvestigationId(fieldName, value)
+  if (INVALID_INVESTIGATION_ID_SENTINELS.has(trimmed.toLowerCase())) {
+    throw _invalidInvestigationId(fieldName, value)
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) throw _invalidInvestigationId(fieldName, value)
+  return trimmed
+}
+
+function requiredInvestigationId(value, fieldName = 'investigation_id') {
+  const resolved = optionalInvestigationId(value, fieldName)
+  if (!resolved) throw _invalidInvestigationId(fieldName, value)
+  return resolved
+}
+
+function investigationIdOrDefault(value, fallback, fieldName = 'run_id') {
+  if (value === undefined || value === null) {
+    return requiredInvestigationId(fallback, fieldName)
+  }
+  return requiredInvestigationId(value, fieldName)
+}
+
 // ── Parameters ────────────────────────────────────────────────────────────────
 // Required:
 //   investigation_id — the Loci investigation to review
@@ -22,11 +54,11 @@ export const meta = {
 //   last_n_findings — how many findings to load (default 70)
 // ─────────────────────────────────────────────────────────────────────────────
 const A      = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
-const INV_ID = A.investigation_id
+const INV_ID = requiredInvestigationId(A.investigation_id, 'investigation_id')
 const REPO   = A.repo_path
 
-if (!INV_ID || !REPO) {
-  log('args.investigation_id and args.repo_path are both required.')
+if (!REPO) {
+  log('args.repo_path is required.')
   return { error: 'missing_required_args' }
 }
 

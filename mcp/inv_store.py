@@ -108,9 +108,34 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _inv_dir(investigation_id: str) -> Path:
-    if not re.match(r'^[A-Za-z0-9_\-]+$', investigation_id):
+_INVALID_INVESTIGATION_ID_SENTINELS = frozenset({"undefined", "null", "none"})
+
+# Most filesystems (ext4, APFS, NTFS) cap a single path component at 255 bytes;
+# an id at or beyond that raises an OS-level ENAMETOOLONG from Path.mkdir()
+# instead of our own clean ValueError. Reject it up front so every caller sees
+# the same validation error regardless of the underlying filesystem.
+_MAX_INVESTIGATION_ID_BYTES = 255
+
+
+def _validated_investigation_id(investigation_id: str) -> str:
+    if not isinstance(investigation_id, str):
+        raise ValueError(f"Invalid investigation_id: {investigation_id!r}")
+    trimmed = investigation_id.strip()
+    if not trimmed:
+        raise ValueError("Invalid investigation_id: empty string")
+    if trimmed.lower() in _INVALID_INVESTIGATION_ID_SENTINELS:
+        raise ValueError(
+            f"Invalid investigation_id: {investigation_id!r} is a missing-value sentinel"
+        )
+    if not re.match(r'^[A-Za-z0-9_\-]+$', trimmed):
         raise ValueError(f'Invalid investigation_id: {investigation_id!r}')
+    if len(os.fsencode(trimmed)) > _MAX_INVESTIGATION_ID_BYTES:
+        raise ValueError(f"Invalid investigation_id: {investigation_id!r} exceeds {_MAX_INVESTIGATION_ID_BYTES} bytes")
+    return trimmed
+
+
+def _inv_dir(investigation_id: str) -> Path:
+    investigation_id = _validated_investigation_id(investigation_id)
     root = _root().resolve()
     candidate = (root / investigation_id).resolve()
     if not str(candidate).startswith(str(root)):
@@ -124,6 +149,7 @@ _MANIFEST_CACHE_MAXSIZE = 256
 
 
 def _load_manifest(investigation_id: str) -> dict | None:
+    investigation_id = _validated_investigation_id(investigation_id)
     raw = _manifest_cache.get(investigation_id)
     if raw is None:
         p = _root() / investigation_id / "manifest.json"
