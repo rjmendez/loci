@@ -251,6 +251,24 @@ def _investigation_lock(investigation_id: str) -> threading.Lock:
             _investigation_locks[investigation_id] = lock
         return lock
 
+
+def _busy_payload(exc: StoreBusyError, *, investigation_id: Optional[str] = None, **extra) -> dict:
+    payload = {
+        "error": "busy",
+        "detail": str(exc),
+        "retryable": True,
+    }
+    if investigation_id is not None:
+        payload["investigation_id"] = investigation_id
+    for key, value in extra.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _busy_result(exc: StoreBusyError, *, investigation_id: Optional[str] = None, **extra) -> str:
+    return json.dumps(_busy_payload(exc, investigation_id=investigation_id, **extra))
+
 # ---------------------------------------------------------------------------
 # LadybugDB graph store (primary relationship/graph backend) — fail-open like Qdrant.
 # ---------------------------------------------------------------------------
@@ -2561,12 +2579,7 @@ def investigation_store(
     try:
         _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
     except StoreBusyError as exc:
-        return json.dumps({
-            "error": "busy",
-            "detail": str(exc),
-            "retryable": True,
-            "investigation_id": investigation_id,
-        })
+        return _busy_result(exc, investigation_id=investigation_id)
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
@@ -2647,14 +2660,12 @@ def finding_resolve(
         _append_jsonl(_finding_updates_path(investigation_id), record)
     except StoreBusyError as exc:
         logger.info("finding_resolve busy for %s/%s: %s", investigation_id, finding_id, exc)
-        return json.dumps({
-            "error": "busy",
-            "detail": str(exc),
-            "retryable": True,
-            "investigation_id": investigation_id,
-            "finding_id": str(finding_id),
-            "resolution": res,
-        })
+        return _busy_result(
+            exc,
+            investigation_id=investigation_id,
+            finding_id=str(finding_id),
+            resolution=res,
+        )
     except Exception as exc:  # noqa: BLE001 — fail-open: never raise out of a tool
         logger.warning("finding_resolve append failed (fail-open): %r", exc)
         return json.dumps({"error": f"Could not record resolution: {exc}"})
@@ -4308,11 +4319,20 @@ def audit_log(
     audit_dir = MEMORY_DIR.parent / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    _append_jsonl(audit_dir / f"{date_str}.jsonl", entry)
+    try:
+        _append_jsonl(audit_dir / f"{date_str}.jsonl", entry)
+    except StoreBusyError as exc:
+        logger.info("audit_log busy for global audit entry: %s", exc)
+        return _busy_result(exc, investigation_id=investigation_id, tool=tool_name)
 
     # Investigation-scoped audit log
+    investigation_logged = False
     if investigation_id and _load_manifest(investigation_id):
-        _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
+        try:
+            _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
+            investigation_logged = True
+        except StoreBusyError as exc:
+            logger.info("audit_log busy for investigation %s: %s", investigation_id, exc)
 
     embed_text = embedding_text or f"{tool_name}: {output[:2000]}"
     mnemo_stored = _mnemo_remember(
@@ -4342,6 +4362,7 @@ def audit_log(
         "ts": entry["ts"],
         "mnemo_stored": mnemo_stored,
         "qdrant_indexed": qdrant_indexed,
+        "investigation_logged": investigation_logged if investigation_id else None,
     })
 
 
@@ -5772,24 +5793,29 @@ def memory_retract(
     # Per-investigation lock: no window where a retraction exists without its audit record.
     inv_lock = _investigation_lock(investigation_id)
 
-    with inv_lock:
-        retracted_records, verdicts_forgotten = _retract_write_tombstones(
-            retractions_path, contaminated_ids, by_id, reasons, seed_anchor, reason, ts
-        )
+    try:
+        with inv_lock:
+            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
+                retracted_records, verdicts_forgotten = _retract_write_tombstones(
+                    retractions_path, contaminated_ids, by_id, reasons, seed_anchor, reason, ts
+                )
 
-        _retract_stamp_valid_until(investigation_id, contaminated_ids, ts)
+                _retract_stamp_valid_until(investigation_id, contaminated_ids, ts)
 
-        _append_jsonl(audit_path, {
-            "action": "retract",
-            "ts": ts,
-            "target": target,
-            "seed_ids": seed_ids,
-            "reason": reason or "hallucination retraction",
-            "retracted_finding_ids": list(contaminated_ids),
-            "count": len(contaminated_ids),
-            "verdicts_forgotten": verdicts_forgotten,
-            "scope_semantic": scope_semantic,
-        })
+                _append_jsonl(audit_path, {
+                    "action": "retract",
+                    "ts": ts,
+                    "target": target,
+                    "seed_ids": seed_ids,
+                    "reason": reason or "hallucination retraction",
+                    "retracted_finding_ids": list(contaminated_ids),
+                    "count": len(contaminated_ids),
+                    "verdicts_forgotten": verdicts_forgotten,
+                    "scope_semantic": scope_semantic,
+                })
+    except StoreBusyError as exc:
+        logger.info("memory_retract busy for %s/%s: %s", investigation_id, target, exc)
+        return _busy_result(exc, investigation_id=investigation_id, target=str(target).strip())
 
     quarantine_recorded = _retract_quarantine_verdict(seeds, seed_anchor, reason, contaminated_ids)
 
@@ -5867,20 +5893,26 @@ def memory_restore(
         })
 
     ts = _now()
-    _append_jsonl(retractions_path, {
-        "retraction_id": str(uuid.uuid4()),
-        "finding_id": target_fid,
-        "seed_id": None,
-        "reason": reason or "restore",
-        "ts": ts,
-        "active": False,
-    })
-    _append_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl", {
-        "action": "restore",
-        "ts": ts,
-        "finding_id": target_fid,
-        "reason": reason or "restore",
-    })
+    try:
+        with _investigation_lock(investigation_id):
+            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
+                _append_jsonl(retractions_path, {
+                    "retraction_id": str(uuid.uuid4()),
+                    "finding_id": target_fid,
+                    "seed_id": None,
+                    "reason": reason or "restore",
+                    "ts": ts,
+                    "active": False,
+                })
+                _append_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl", {
+                    "action": "restore",
+                    "ts": ts,
+                    "finding_id": target_fid,
+                    "reason": reason or "restore",
+                })
+    except StoreBusyError as exc:
+        logger.info("memory_restore busy for %s/%s: %s", investigation_id, target_fid, exc)
+        return _busy_result(exc, investigation_id=investigation_id, finding_id=target_fid)
 
     return json.dumps({
         "finding_id": target_fid,
@@ -5957,10 +5989,15 @@ def contract_declare(
         "derived_from": [],
         "entities": {},
     }
-    _append_jsonl(inv_dir / "findings.jsonl", finding)
-    manifest.setdefault("finding_counts", {})
-    manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
-    _save_manifest(manifest)
+    try:
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            _append_jsonl(inv_dir / "findings.jsonl", finding)
+            manifest.setdefault("finding_counts", {})
+            manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
+            _save_manifest(manifest)
+    except StoreBusyError as exc:
+        logger.info("contract_declare busy for %s/%s: %s", investigation_id, entity, exc)
+        return _busy_result(exc, investigation_id=investigation_id, entity=entity, role=role)
 
     _mnemo_remember(
         f"Contract declaration — {entity} ({role}): {fields}",
@@ -6162,10 +6199,21 @@ def wiring_obligation_declare(
         "derived_from": [],
         "entities": {},
     }
-    _append_jsonl(inv_dir / "findings.jsonl", finding)
-    manifest.setdefault("finding_counts", {})
-    manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
-    _save_manifest(manifest)
+    try:
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            _append_jsonl(inv_dir / "findings.jsonl", finding)
+            manifest.setdefault("finding_counts", {})
+            manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
+            _save_manifest(manifest)
+    except StoreBusyError as exc:
+        logger.info("wiring_obligation_declare busy for %s/%s.%s: %s",
+                    investigation_id, class_name, method_name, exc)
+        return _busy_result(
+            exc,
+            investigation_id=investigation_id,
+            class_name=class_name,
+            method_name=method_name,
+        )
     _event_log_append({
         "event": "wiring_obligation_declare", "investigation_id": investigation_id,
         "finding_id": fid, "class": class_name, "method": method_name,
@@ -6272,12 +6320,17 @@ def wiring_obligation_resolve(
         "ts": _now(),
         "tags": [t for t in tags if t != "wiring_obligation"] + ["wiring_obligation", "wiring_obligation_resolved"],
     }
-    _append_jsonl(jsonl_path, resolved_finding)
+    try:
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            _append_jsonl(jsonl_path, resolved_finding)
 
-    counts = manifest.setdefault("finding_counts", {})
-    counts["gap"] = max(0, counts.get("gap", 1) - 1)
-    counts["observed"] = counts.get("observed", 0) + 1
-    _save_manifest(manifest)
+            counts = manifest.setdefault("finding_counts", {})
+            counts["gap"] = max(0, counts.get("gap", 1) - 1)
+            counts["observed"] = counts.get("observed", 0) + 1
+            _save_manifest(manifest)
+    except StoreBusyError as exc:
+        logger.info("wiring_obligation_resolve busy for %s/%s: %s", investigation_id, finding_id, exc)
+        return _busy_result(exc, investigation_id=investigation_id, finding_id=finding_id)
 
     _event_log_append({
         "event": "wiring_obligation_resolve", "investigation_id": investigation_id,
@@ -7571,6 +7624,8 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
                     tf.write(json.dumps(f) + "\n")
                 tmp_path = Path(tf.name)
             tmp_path.replace(findings_path)
+    except StoreBusyError as exc:
+        return _busy_payload(exc, investigation_id=investigation_id, finding_id=finding_id)
     except Exception as exc:
         return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
 

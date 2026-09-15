@@ -77,3 +77,26 @@ def test_inv_dir_accepts_ids_right_at_the_byte_limit(tmp_path, monkeypatch):
     d = inv_store._inv_dir("a" * 255)
     assert d == tmp_path / ("a" * 255)
     assert d.is_dir()
+
+
+def test_validated_investigation_id_strips_before_boundary_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    d = inv_store._inv_dir(f"  {'a' * 255}  ")
+    assert d == tmp_path / ("a" * 255)
+    assert d.is_dir()
+
+
+@pytest.mark.parametrize("bad_id", [None, 123, ["case-x"]])
+def test_validated_investigation_id_rejects_non_strings(tmp_path, monkeypatch, bad_id):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    with pytest.raises(ValueError, match="Invalid investigation_id"):
+        inv_store._validated_investigation_id(bad_id)
+
+
+@pytest.mark.parametrize("bad_id", ["é" * 127, "é" * 128, "Ａ" * 90, "𝖆" * 70])
+def test_unicode_investigation_ids_near_byte_limit_fail_validation_cleanly(tmp_path, monkeypatch, bad_id):
+    """Unicode can hit the byte cap before the char cap, but the current id contract is
+    ASCII-only, so these must fail validation explicitly rather than reaching mkdir()."""
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    with pytest.raises(ValueError, match="Invalid investigation_id"):
+        inv_store._inv_dir(bad_id)
