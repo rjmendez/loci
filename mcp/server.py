@@ -44,7 +44,6 @@ Tools:
 from __future__ import annotations
 
 import asyncio  # noqa: F401  (kept on the module namespace; live users import it function-locally)
-import fcntl
 import hashlib
 import html
 import hmac
