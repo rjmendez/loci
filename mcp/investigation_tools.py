@@ -31,6 +31,7 @@ from inv_store import (
     _node_numeric_confidence,
     _NEUTRAL_NUMERIC_CONFIDENCE,
 )
+from untrusted_memory import wrap_untrusted_memory_text
 
 logger = logging.getLogger("loci-mcp")
 
@@ -45,6 +46,23 @@ _qdrant_upsert = None
 def _root():
     """The investigation memory root, resolved through the injected accessor."""
     return _get_memory_dir()
+
+
+def _wrap_finding_text(finding: dict, *, text_key: str = "text") -> dict:
+    """Return a shallow copy with the primary free-text field wrapped for LLM safety."""
+    wrapped = dict(finding or {})
+    text = str(wrapped.get(text_key) or "").strip()
+    if not text:
+        return wrapped
+    wrapped[text_key] = wrap_untrusted_memory_text(
+        text,
+        origin="loci_memory",
+        investigation_id=wrapped.get("investigation_id"),
+        finding_id=wrapped.get("id") or wrapped.get("finding_id"),
+        kind=wrapped.get("record_type") or wrapped.get("type") or "finding",
+        source=wrapped.get("source"),
+    )
+    return wrapped
 
 
 def investigation_start(
@@ -391,7 +409,7 @@ def investigation_load(
         "manifest": manifest,
         "fidelity": "full",
         "total_findings": len(findings),
-        "recent_findings": recent,
+        "recent_findings": [_wrap_finding_text(f) for f in recent],
         # Computed over every finding that survived filtering, not over the
         # last_n_findings slice: its job is to describe the set the caller is
         # being given a count of, including the part the slice left out.
@@ -538,7 +556,7 @@ def investigation_as_of(
         return json.dumps({
             "investigation_id": investigation_id,
             "as_of": as_of_timestamp,
-            "findings": result_findings,
+            "findings": [_wrap_finding_text(f) for f in result_findings],
             "count": len(result_findings),
         }, indent=2)
     except Exception as exc:
@@ -695,7 +713,8 @@ def investigation_reflect(investigation_id: str) -> str:
             from memcheck import llm as _llm
             if _llm.llm_available() and last_20:
                 context_bullets = "\n".join(
-                    f"- [{f.get('type', '?')}] {str(f.get('text', ''))[:300]}"
+                    f"- [{f.get('type', '?')}] "
+                    f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], origin='loci_memory', investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type') or f.get('record_type') or 'finding'), source=str(f.get('source') or 'investigation_reflect'))}"
                     for f in last_20
                 )
                 l1_prompt = (
@@ -767,8 +786,21 @@ def investigation_reflect(investigation_id: str) -> str:
         "finding_counts": {t: len(v) for t, v in by_type.items()},
         "open_questions": manifest["open_questions"],
         "checked_sources": manifest["checked_sources"],
-        "gaps": [f["text"] for f in by_type.get("gap", [])],
-        "recent_per_type": {t: entries[-3:] for t, entries in by_type.items() if entries},
+        "gaps": [
+            wrap_untrusted_memory_text(
+                f["text"],
+                origin="loci_memory",
+                investigation_id=investigation_id,
+                finding_id=f.get("id", ""),
+                kind=f.get("type") or f.get("record_type") or "gap",
+                source=f.get("source", ""),
+            )
+            for f in by_type.get("gap", [])
+        ],
+        "recent_per_type": {
+            t: [_wrap_finding_text(entry) for entry in entries[-3:]]
+            for t, entries in by_type.items() if entries
+        },
         "key_entities": key_entities,
         "excluded_retracted": excluded_retracted,
         "self_check": self_check,
@@ -834,7 +866,14 @@ def investigation_finding_provenance(
             "confidence": node.get("confidence"),
             "numeric_confidence": _node_numeric_confidence(node),
             "source": node.get("source"),
-            "text": str(node.get("text", ""))[:400],
+            "text": wrap_untrusted_memory_text(
+                str(node.get("text", ""))[:400],
+                origin="loci_memory",
+                investigation_id=investigation_id,
+                finding_id=current_id,
+                kind=node.get("record_type") or node.get("type") or "finding",
+                source=node.get("source"),
+            ),
             "derived_from": node.get("derived_from", []),
         })
         # Only the first parent is followed: grounded_in_observed reflects the first-listed branch only.

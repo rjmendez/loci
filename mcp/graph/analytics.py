@@ -18,6 +18,7 @@ import logging
 from typing import Any
 
 from . import queries as Q
+from untrusted_memory import wrap_untrusted_memory_text
 
 logger = logging.getLogger("loci-mcp.analytics")
 
@@ -164,7 +165,17 @@ def finding_code_context(ks: Any, finding_id: str, neighbours: int = 6) -> dict:
             "MATCH (s:CodeSymbol {id:$i})-[:CALLS]->(c:CodeSymbol) RETURN DISTINCT c.name LIMIT $n",
             {"i": sid, "n": int(neighbours)})]
         out.append({**s, "callers": callers, "callees": callees})
-    return {"finding_id": finding_id, "text": (text or "")[:400], "symbols": out}
+    return {
+        "finding_id": finding_id,
+        "text": wrap_untrusted_memory_text(
+            (text or "")[:400],
+            origin="loci_memory",
+            finding_id=finding_id,
+            kind="finding_code_context",
+            source="finding_code_context",
+        ),
+        "symbols": out,
+    }
 
 
 def investigation_code_briefing(ks: Any, investigation_id: str, top: int = 3) -> dict:

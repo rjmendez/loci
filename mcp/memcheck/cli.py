@@ -211,8 +211,9 @@ def _append_loci_audit_receipt(payload: dict) -> bool:
 
     raw_investigation_id = tool_input.get("investigation_id")
     investigation_id = str(raw_investigation_id or "").strip()
-    if not investigation_id or not _INVESTIGATION_ID_RE.match(investigation_id):
-        return False
+    scoped_investigation_id = (
+        investigation_id if investigation_id and _INVESTIGATION_ID_RE.match(investigation_id) else ""
+    )
 
     tool_name = str(payload.get("tool_name", "") or "")
     if "audit_log" in tool_name.lower():
@@ -231,7 +232,7 @@ def _append_loci_audit_receipt(payload: dict) -> bool:
         "ts": _now_iso(),
         "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
         "tool": tool_name,
-        "investigation_id": investigation_id,
+        "investigation_id": scoped_investigation_id,
         "inputs": _compact_json(redact_tool_input(tool_input)),
         "output": output,
     }
@@ -241,7 +242,7 @@ def _append_loci_audit_receipt(payload: dict) -> bool:
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _append_jsonl_locked(audit_dir / f"{date_str}.jsonl", record)
 
-    manifest = memory_dir / investigation_id / "manifest.json"
+    manifest = memory_dir / scoped_investigation_id / "manifest.json"
     if manifest.exists():
         _append_jsonl_locked(manifest.parent / "audit.jsonl", record)
     return True

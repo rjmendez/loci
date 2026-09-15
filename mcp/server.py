@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import asyncio  # noqa: F401  (kept on the module namespace; live users import it function-locally)
 import hashlib
-import html
 import hmac
 import json
 import math
@@ -78,6 +77,7 @@ from memcheck.checks import (  # noqa: E402
     run_provenance,
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
+from untrusted_memory import wrap_untrusted_memory_text  # noqa: E402
 
 # Accept the legacy HERMES_* spelling of Loci's own variables.
 try:
@@ -479,20 +479,6 @@ def context_assemble(
       sources  - list of {n, id, title, origin, score}
       query, total_chars, truncated, result_count
     """
-    def _wrap_untrusted_memory_text(text: str, row: dict) -> str:
-        body = str(text or "")
-        attrs = []
-        for key in ("origin", "investigation_id", "finding_id", "memory_id", "id", "source"):
-            val = row.get(key)
-            if val:
-                attrs.append(f'{key}="{html.escape(str(val), quote=True)}"')
-        attr_blob = f" {' '.join(attrs)}" if attrs else ""
-        return (
-            f"<untrusted_memory_content{attr_blob}>\n"
-            f"{body}\n"
-            "</untrusted_memory_content>"
-        )
-
     lines = [f"## Retrieved Context\nQuery: {query}\n"]
     sources = []
     total = 0
@@ -514,11 +500,15 @@ def context_assemble(
             or r.get("finding_id")
             or r.get("memory_id")
         ):
-            text = _wrap_untrusted_memory_text(text, {
-                **r,
-                "origin": origin,
-                "finding_id": r.get("finding_id") or mem_id,
-            })
+            text = wrap_untrusted_memory_text(
+                text,
+                origin=origin,
+                investigation_id=r.get("investigation_id"),
+                finding_id=r.get("finding_id") or mem_id,
+                memory_id=r.get("memory_id"),
+                id=r.get("id"),
+                source=r.get("source"),
+            )
 
         meta = f"  [score={score:.3f}, origin={origin}]" if include_metadata else ""
         block = f"[SOURCE {i}]{meta}\nTitle: {title}\n{text}\n---\n"
@@ -3633,6 +3623,18 @@ def investigation_search(
     _search_annotate_rows(deduped)
     if resolution is not None:
         deduped = [r for r in deduped if r.get("resolution") == resolution]
+    for row in deduped:
+        text = str(row.get("text") or "")
+        if not text:
+            continue
+        row["text"] = wrap_untrusted_memory_text(
+            text,
+            origin=row.get("origin") or "loci_memory",
+            investigation_id=row.get("investigation_id"),
+            finding_id=row.get("finding_id") or row.get("id"),
+            kind=row.get("record_type") or row.get("type") or "finding",
+            source=row.get("source"),
+        )
 
     if not deduped:
         return _search_empty_response(qdrant, mnemo_enabled)
@@ -6801,7 +6803,13 @@ def _surface_rows(top_results: list[dict], ctx_prefix: str, investigation_id: Op
 
         surfaced.append({
             "finding_id": finding_id,
-            "text": text[:300] if len(text) > 300 else text,
+            "text": wrap_untrusted_memory_text(
+                text[:300] if len(text) > 300 else text,
+                origin="loci_memory",
+                investigation_id=inv_id,
+                finding_id=finding_id,
+                source=source,
+            ),
             "source": source,
             "relevance_note": relevance_note,
             "score": score,
@@ -7074,7 +7082,8 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
         from memcheck import llm as _llm  # type: ignore
         if _llm.llm_available():
             numbered = "\n".join(
-                f"{idx + 1}. [{f.get('id', '?')}] {str(f.get('text', ''))[:300]}"
+                f"{idx + 1}. [{f.get('id', '?')}] "
+                f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('record_type') or f.get('type') or 'finding'), source=str(f.get('source') or 'causal_infer'))}"
                 for idx, f in enumerate(findings)
             )
             prompt = (
@@ -7771,7 +7780,8 @@ def investigation_reason(
             gate_applied = True
 
     evidence = "\n".join(
-        f"- [{f.get('type', f.get('record_type', '?'))}] {str(f['text'])[:300]}"
+        f"- [{f.get('type', f.get('record_type', '?'))}] "
+        f"{wrap_untrusted_memory_text(str(f['text'])[:300], investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type', f.get('record_type', 'finding'))), source=str(f.get('source') or 'investigation_reason'))}"
         for f in gated[:12]
     ) or "(no on-topic findings in this investigation — reason from the question alone)"
 
@@ -8002,7 +8012,14 @@ def _compute_hints(investigation_id: str, limit: int, since_ts: Optional[str]) -
     for h in reversed(recent):  # most-recent first in output
         hints.append({
             "finding_id": h.get("finding_id", ""),
-            "text": h.get("text", ""),
+            "text": wrap_untrusted_memory_text(
+                h.get("text", ""),
+                origin="loci_memory",
+                investigation_id=investigation_id,
+                finding_id=h.get("finding_id", ""),
+                kind=h.get("record_type", "observed"),
+                source=h.get("source", ""),
+            ),
             "source": h.get("source", ""),
             "record_type": h.get("record_type", "observed"),
             "recency_score": _recency(h.get("created_at_ts", 0)),
