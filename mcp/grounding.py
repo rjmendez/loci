@@ -21,6 +21,7 @@ does not create an import cycle.
 from __future__ import annotations
 
 import json
+import html
 import logging
 import os
 import re
@@ -28,6 +29,35 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("loci-mcp.grounding")
+
+
+def _wrap_untrusted_memory_text(
+    text: str,
+    *,
+    investigation_id: str = "",
+    finding_id: str = "",
+    kind: str = "",
+    source: str = "",
+) -> str:
+    """Frame stored memory as data, not executable instructions."""
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    attrs = []
+    for key, val in (
+        ("investigation_id", investigation_id),
+        ("finding_id", finding_id),
+        ("kind", kind),
+        ("source", source),
+    ):
+        if val:
+            attrs.append(f'{key}="{html.escape(str(val), quote=True)}"')
+    attr_blob = f" {' '.join(attrs)}" if attrs else ""
+    return (
+        f"<untrusted_memory_content{attr_blob}>\n"
+        f"{body}\n"
+        "</untrusted_memory_content>"
+    )
 
 
 def _default_memory_dir() -> str:
@@ -218,10 +248,29 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             if isinstance(data, dict) and not data.get("error"):
                 man = data.get("manifest", {})
                 summary = f"{cid} :: hypothesis={man.get('hypothesis')} | next={man.get('next_step')}"
-                add(f"case:{cid}", summary, 0.12)
+                add(
+                    f"case:{cid}",
+                    _wrap_untrusted_memory_text(
+                        summary,
+                        investigation_id=cid,
+                        kind="manifest_summary",
+                        source="investigation_load",
+                    ),
+                    0.12,
+                )
                 for f in (data.get("recent_findings") or [])[:3]:
                     if isinstance(f, dict):
-                        add(f"case:{cid}:finding", str(f.get("text", "")), 0.08)
+                        add(
+                            f"case:{cid}:finding",
+                            _wrap_untrusted_memory_text(
+                                str(f.get("text", "")),
+                                investigation_id=cid,
+                                finding_id=str(f.get("id") or ""),
+                                kind=str(f.get("record_type") or f.get("type") or "finding"),
+                                source=str(f.get("source") or "investigation_load"),
+                            ),
+                            0.08,
+                        )
         except Exception as exc:
             logger.debug("grounding: case lane failed for %r: %r", cid, exc)
             continue
@@ -253,7 +302,15 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                 if h in _seen_known:
                     continue
                 _seen_known.add(h)
-                resolved_known.append(f"[{res}] {txt[:180]}")
+                resolved_known.append(
+                    f"[{res}] " + _wrap_untrusted_memory_text(
+                        txt[:180],
+                        investigation_id=cid,
+                        finding_id=str(f.get("id") or ""),
+                        kind=f"resolved_{res}",
+                        source=str(f.get("source") or "investigation_load"),
+                    )
+                )
         except Exception as exc:
             logger.debug("grounding: resolved-findings lane failed for %r: %r", cid, exc)
             continue
@@ -335,7 +392,15 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         try:
             res = _jload(S.investigation_search(f"{task.get('title','')} {task.get('focus','')}", limit=8))
             items = (res or {}).get("results", []) if isinstance(res, dict) else []
-            for it in filter_noise([{"text": r.get("text"), "source": r.get("source")} for r in items])[:3]:
+            for r in items[:8]:
+                r["_wrapped_text"] = _wrap_untrusted_memory_text(
+                    str(r.get("text") or ""),
+                    investigation_id=str(r.get("investigation_id") or ""),
+                    finding_id=str(r.get("finding_id") or r.get("id") or ""),
+                    kind=str(r.get("record_type") or r.get("type") or "finding"),
+                    source=str(r.get("source") or "investigation_search"),
+                )
+            for it in filter_noise([{"text": r.get("_wrapped_text"), "source": r.get("source")} for r in items])[:3]:
                 add("recall", str(it.get("text", "")), 0.10)
         except Exception as exc:
             logger.debug("grounding: keyword fallback lane failed for %r: %r", task.get("title", ""), exc)
