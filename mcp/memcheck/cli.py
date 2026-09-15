@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -166,6 +167,84 @@ def _append_audit_line(record: dict) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+_INVESTIGATION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _memory_dir() -> Path:
+    """Resolve Loci's investigation memory root without importing server.py."""
+    try:
+        try:
+            from legacy_env import apply as _apply_legacy_env, memory_dir as _legacy_memory_dir
+        except ImportError:
+            from mcp.legacy_env import apply as _apply_legacy_env, memory_dir as _legacy_memory_dir
+    except ImportError:
+        _apply_legacy_env = _legacy_memory_dir = None
+    if _apply_legacy_env is not None:
+        _apply_legacy_env()
+    if _legacy_memory_dir is not None:
+        return Path(_legacy_memory_dir()).expanduser()
+    return Path(os.environ.get("LOCI_MEMORY_DIR", Path.home() / ".loci" / "memory-sessions")).expanduser()
+
+
+def _append_jsonl_locked(path: Path, entry: dict) -> None:
+    """Append one JSON line with an advisory lock; fail-open at the caller."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(entry, default=str) + "\n"
+    with path.open("a", encoding="utf-8") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            fh.write(line)
+            fh.flush()
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _append_loci_audit_receipt(payload: dict) -> bool:
+    """Mirror a PostToolUse payload into Loci's investigation/global audit logs."""
+    tool_input = payload.get("tool_input", {})
+    if not isinstance(tool_input, dict):
+        return False
+
+    raw_investigation_id = tool_input.get("investigation_id")
+    investigation_id = str(raw_investigation_id or "").strip()
+    if not investigation_id or not _INVESTIGATION_ID_RE.match(investigation_id):
+        return False
+
+    tool_name = str(payload.get("tool_name", "") or "")
+    if "audit_log" in tool_name.lower():
+        return False
+
+    tool_response = payload.get("tool_response") or {}
+    if not isinstance(tool_response, dict):
+        tool_response = {}
+    content = str(tool_response.get("content") or "")
+    error = str(tool_response.get("error") or "")
+    if not content and not error:
+        return False
+
+    output = content if not error else (f"{content}\nERROR: {error}".strip() if content else f"ERROR: {error}")
+    record = {
+        "ts": _now_iso(),
+        "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
+        "tool": tool_name,
+        "investigation_id": investigation_id,
+        "inputs": _compact_json(redact_tool_input(tool_input)),
+        "output": output,
+    }
+
+    memory_dir = _memory_dir()
+    audit_dir = memory_dir.parent / "audit"
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _append_jsonl_locked(audit_dir / f"{date_str}.jsonl", record)
+
+    manifest = memory_dir / investigation_id / "manifest.json"
+    if manifest.exists():
+        _append_jsonl_locked(manifest.parent / "audit.jsonl", record)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -360,6 +439,12 @@ def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> d
         getattr(engine, "backend", None) if engine is not None else None
     )
 
+    loci_audit_logged = False
+    try:
+        loci_audit_logged = _append_loci_audit_receipt(payload)
+    except Exception as exc:  # noqa: BLE001 — audit mirroring must stay fail-open
+        logger.debug("_append_loci_audit_receipt: fail-open swallow: %r", exc)
+
     tool_name = str(payload.get("tool_name", "") or "")
     tool_input = payload.get("tool_input", {})
     if not isinstance(tool_input, dict):
@@ -391,6 +476,7 @@ def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> d
             "tool_name": tool_name,
             "file": _audit_relpath(),
             "skipped": True,
+            "loci_audit_logged": loci_audit_logged,
             "qdrant": "ok" if backend is not None else "unavailable",
         }
         _append_audit_line(record)
@@ -419,6 +505,7 @@ def process_code(payload: dict, engine, *, repo_root: Optional[str] = None) -> d
         "file": relpath,
         "n_issues": len(verdicts),
         "codes": [v.verdict_type for v in verdicts],
+        "loci_audit_logged": loci_audit_logged,
         "qdrant": qdrant_status,
     }
     _append_audit_line(record)

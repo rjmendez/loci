@@ -6,6 +6,7 @@ QdrantBackend but without any network dependency.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -146,6 +147,7 @@ class TestProcessCode(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         os.environ["MEMCHECK_AUDIT_LOG"] = os.path.join(self._tmp.name, "audit.jsonl")
+        os.environ["LOCI_MEMORY_DIR"] = os.path.join(self._tmp.name, "memory-sessions")
         # Write a trivial Python file for the PostToolUse path to check
         self._py_file = os.path.join(self._tmp.name, "example.py")
         with open(self._py_file, "w") as f:
@@ -153,6 +155,7 @@ class TestProcessCode(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("MEMCHECK_AUDIT_LOG", None)
+        os.environ.pop("LOCI_MEMORY_DIR", None)
         self._tmp.cleanup()
 
     def test_returns_dict_for_py_file(self):
@@ -184,6 +187,35 @@ class TestProcessCode(unittest.TestCase):
         }
         record = cli.process_code(payload, None, repo_root=self._tmp.name)
         self.assertIsInstance(record, dict)
+
+    def test_posttooluse_writes_loci_audit_receipt_when_investigation_known(self):
+        memory_root = Path(os.environ["LOCI_MEMORY_DIR"])
+        inv_id = "audit-hook-test"
+        inv_dir = memory_root / inv_id
+        inv_dir.mkdir(parents=True, exist_ok=True)
+        (inv_dir / "manifest.json").write_text(json.dumps({"id": inv_id, "title": "t"}))
+
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "mcp__loci__investigation_store",
+            "tool_input": {
+                "investigation_id": inv_id,
+                "file_path": self._py_file,
+                "text": "stored finding",
+            },
+            "tool_response": {"content": '{"stored":true}', "error": ""},
+        }
+        record = cli.process_code(payload, None, repo_root=self._tmp.name)
+
+        self.assertTrue(record["loci_audit_logged"])
+        scoped_audit = (inv_dir / "audit.jsonl").read_text().splitlines()
+        global_audit_files = list((memory_root.parent / "audit").glob("*.jsonl"))
+        self.assertEqual(len(scoped_audit), 1)
+        self.assertEqual(len(global_audit_files), 1)
+        scoped_entry = json.loads(scoped_audit[0])
+        self.assertEqual(scoped_entry["tool"], "mcp__loci__investigation_store")
+        self.assertEqual(scoped_entry["investigation_id"], inv_id)
+        self.assertIn("stored", scoped_entry["output"])
 
 
 class TestStatsDegradation(unittest.TestCase):

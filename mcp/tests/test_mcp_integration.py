@@ -2792,3 +2792,29 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
             record=False,
         ))
         self.assertIn("claim_results", result)
+
+    def test_stale_audit_lane_is_reported_and_not_used_as_evidence(self):
+        inv_id = self._setup_investigation("A recent finding unrelated to the stale receipt.")
+        stale_audit = {
+            "ts": "2026-06-20T02:31:23Z",
+            "created_at_ts": 1750386683,
+            "tool": "Read",
+            "investigation_id": inv_id,
+            "inputs": '{"file_path":"evidence.txt"}',
+            "output": "Database password rotation completed successfully.",
+        }
+        (server.MEMORY_DIR / inv_id / "audit.jsonl").write_text(json.dumps(stale_audit) + "\n")
+
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="Database password rotation completed successfully.",
+            record=False,
+        ))
+
+        lane = result["evidence_lanes"]["audit"]
+        self.assertEqual(lane["status"], "stale")
+        self.assertFalse(lane["usable"])
+        first = result["claim_results"][0]
+        self.assertFalse(first["supported"])
+        self.assertEqual(first["support_basis"], "none")
+        self.assertEqual(first["support_refs"], [])
