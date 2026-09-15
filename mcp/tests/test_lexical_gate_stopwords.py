@@ -38,6 +38,14 @@ class LexicalGateTest(unittest.TestCase):
         return server._lexical_match_score(server.tokenize(claim),
                                            server.tokenize(evidence))
 
+    def test_raw_stopword_overlap_does_not_count_as_evidence(self):
+        """The scorer must reject function-word overlap even on raw token sets."""
+        score = server._lexical_match_score(
+            {"the", "breach"},
+            {"the", "audit", "bucket"},
+        )
+        self.assertEqual(score, 0.0)
+
     def test_unrelated_evidence_no_longer_clears_the_gate(self):
         """The measured regression: shared stopwords declared support.
 
@@ -54,6 +62,13 @@ class LexicalGateTest(unittest.TestCase):
         """It should be unassessable lexically, not trivially supported."""
         self.assertEqual(server.tokenize("it was the result"), set())
         self.assertEqual(self._score("it was the result", "anything at all here"), 0.0)
+
+    def test_two_token_claim_overlapping_only_on_the_is_not_supported(self):
+        score = self._score(
+            "the breach",
+            "the audit bucket allowed unrestricted s3:GetObject access",
+        )
+        self.assertLess(score, self.GATE)
 
     def test_genuinely_matching_evidence_still_clears_the_gate(self):
         """The false-negative control: the fix must not break real matches."""

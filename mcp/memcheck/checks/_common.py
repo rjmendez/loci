@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-# Mirrors server.py's _TOKEN_RE / _GENERIC_MATCH_TOKENS so the internal
+# Mirrors server.py's _TOKEN_RE / non-evidence token sets so the internal
 # fallback tokenizer behaves like the server's when no tokenizer is injected.
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:/-]{2,}", re.I)
 _GENERIC_MATCH_TOKENS = {
@@ -24,13 +24,25 @@ _GENERIC_MATCH_TOKENS = {
     "found", "seen", "shows", "reported", "detected", "contacted", "event", "events",
     "record", "records", "row", "rows",
 }
+_STOPWORD_MATCH_TOKENS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+    "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "his",
+    "how", "i", "if", "in", "into", "is", "it", "its", "may", "might", "must", "no",
+    "not", "of", "on", "or", "our", "out", "over", "own", "she", "should", "so",
+    "some", "such", "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "to", "too", "under", "up", "was", "we", "were", "what",
+    "when", "where", "which", "while", "who", "why", "will", "with", "would", "you",
+    "your", "am", "being", "both", "each", "few", "more", "most", "only", "other",
+    "same", "very", "just", "also", "any", "all", "about", "after", "before",
+}
+_NON_EVIDENCE_TOKENS = _GENERIC_MATCH_TOKENS | _STOPWORD_MATCH_TOKENS
 
 
 def _default_tokenize(text: str) -> set[str]:
     return {
         token
         for token in (m.group(0).lower() for m in _TOKEN_RE.finditer(text or ""))
-        if token not in _GENERIC_MATCH_TOKENS
+        if token not in _NON_EVIDENCE_TOKENS
     }
 
 

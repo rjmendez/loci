@@ -1621,10 +1621,16 @@ def _median(values: list[float]) -> float:
 
 
 def _lexical_match_score(claim_tokens: set[str], evidence_tokens: set[str]) -> float:
-    if not claim_tokens or not evidence_tokens:
+    claim_content = {
+        token for token in (claim_tokens or set()) if token not in _NON_EVIDENCE_TOKENS
+    }
+    evidence_content = {
+        token for token in (evidence_tokens or set()) if token not in _NON_EVIDENCE_TOKENS
+    }
+    if not claim_content or not evidence_content:
         return 0.0
-    overlap = claim_tokens.intersection(evidence_tokens)
-    return len(overlap) / max(1, len(claim_tokens))
+    overlap = claim_content.intersection(evidence_content)
+    return len(overlap) / max(1, len(claim_content))
 
 
 
