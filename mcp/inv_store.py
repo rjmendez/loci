@@ -110,6 +110,12 @@ def _now() -> str:
 
 _INVALID_INVESTIGATION_ID_SENTINELS = frozenset({"undefined", "null", "none"})
 
+# Most filesystems (ext4, APFS, NTFS) cap a single path component at 255 bytes;
+# an id at or beyond that raises an OS-level ENAMETOOLONG from Path.mkdir()
+# instead of our own clean ValueError. Reject it up front so every caller sees
+# the same validation error regardless of the underlying filesystem.
+_MAX_INVESTIGATION_ID_BYTES = 255
+
 
 def _validated_investigation_id(investigation_id: str) -> str:
     if not isinstance(investigation_id, str):
@@ -123,6 +129,8 @@ def _validated_investigation_id(investigation_id: str) -> str:
         )
     if not re.match(r'^[A-Za-z0-9_\-]+$', trimmed):
         raise ValueError(f'Invalid investigation_id: {investigation_id!r}')
+    if len(os.fsencode(trimmed)) > _MAX_INVESTIGATION_ID_BYTES:
+        raise ValueError(f"Invalid investigation_id: {investigation_id!r} exceeds {_MAX_INVESTIGATION_ID_BYTES} bytes")
     return trimmed
 
 

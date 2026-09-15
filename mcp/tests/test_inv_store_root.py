@@ -62,3 +62,18 @@ def test_inv_dir_rejects_missing_value_sentinels(tmp_path, monkeypatch, bad_id, 
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     with pytest.raises(ValueError, match=expected):
         inv_store._inv_dir(bad_id)
+
+
+def test_inv_dir_rejects_overlong_ids_with_value_error(tmp_path, monkeypatch):
+    """An id at/beyond the filesystem's 255-byte path-component cap must raise our
+    own ValueError, not let Path.mkdir() surface a raw OSError(ENAMETOOLONG)."""
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    with pytest.raises(ValueError, match="exceeds 255 bytes"):
+        inv_store._inv_dir("a" * 256)
+
+
+def test_inv_dir_accepts_ids_right_at_the_byte_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    d = inv_store._inv_dir("a" * 255)
+    assert d == tmp_path / ("a" * 255)
+    assert d.is_dir()
