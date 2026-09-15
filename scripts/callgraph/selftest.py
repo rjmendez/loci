@@ -309,7 +309,7 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 127, result.meta.file_count  # 126 -> 127: scripts/hermes_cron_runner.py (issue #205)
+    assert result.meta.file_count == 128, result.meta.file_count  # 127 -> 128: mcp/tests/test_untrusted_memory_and_audit.py
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]

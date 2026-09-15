@@ -17,43 +17,15 @@ an import cycle.
 from __future__ import annotations
 
 import json
-import html
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Optional
+from untrusted_memory import wrap_untrusted_memory_text
 
 logger = logging.getLogger("loci-mcp.grounding")
-
-
-def _wrap_untrusted_memory_text(
-    text: str,
-    *,
-    investigation_id: str = "",
-    finding_id: str = "",
-    kind: str = "",
-    source: str = "",
-) -> str:
-    """Frame stored memory as data, not executable instructions."""
-    body = str(text or "").strip()
-    if not body:
-        return ""
-    attrs = []
-    for key, val in (
-        ("investigation_id", investigation_id),
-        ("finding_id", finding_id),
-        ("kind", kind),
-        ("source", source),
-    ):
-        if val:
-            attrs.append(f'{key}="{html.escape(str(val), quote=True)}"')
-    attr_blob = f" {' '.join(attrs)}" if attrs else ""
-    return (
-        f"<untrusted_memory_content{attr_blob}>\n"
-        f"{body}\n"
-        "</untrusted_memory_content>"
-    )
+_wrap_untrusted_memory_text = wrap_untrusted_memory_text
 
 
 def _default_memory_dir() -> str:

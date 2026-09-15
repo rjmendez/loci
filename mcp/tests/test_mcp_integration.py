@@ -15,6 +15,7 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -34,6 +35,18 @@ def _json(result: str) -> dict:
         return json.loads(result)
     except json.JSONDecodeError as exc:
         raise AssertionError(f"Tool returned non-JSON: {result!r}") from exc
+
+
+_UNTRUSTED_RE = re.compile(
+    r'^<untrusted_memory_content[^>]*>\n(.*)\n</untrusted_memory_content>$', re.S
+)
+
+
+def _unwrap(text: str) -> str:
+    """Strip the <untrusted_memory_content> safety wrapper findings are now
+    surfaced in, so tests can assert on the original stored text."""
+    m = _UNTRUSTED_RE.match(text or "")
+    return m.group(1) if m else text
 
 
 # investigation_start is idempotent on an id (it resumes), so each test needs a unique one.
@@ -1284,7 +1297,7 @@ class TestInvestigationACL(unittest.TestCase):
             investigation_id=inv_id,
             requesting_agent_id="agent-bob",
         ))
-        texts = [f.get("text", "") for f in bob_loaded.get("recent_findings", [])]
+        texts = [_unwrap(f.get("text", "")) for f in bob_loaded.get("recent_findings", [])]
         self.assertIn("Finding by bob", texts)
         self.assertIn("Finding by alice", texts)   # alice is in ACL
         self.assertNotIn("Finding by nobody", texts)  # no author, not in ACL
@@ -1294,7 +1307,7 @@ class TestInvestigationACL(unittest.TestCase):
             investigation_id=inv_id,
             requesting_agent_id="agent-alice",
         ))
-        texts = [f.get("text", "") for f in alice_loaded.get("recent_findings", [])]
+        texts = [_unwrap(f.get("text", "")) for f in alice_loaded.get("recent_findings", [])]
         self.assertIn("Finding by alice", texts)   # alice == requesting_agent_id
         self.assertNotIn("Finding by bob", texts)  # bob not in ACL
         self.assertNotIn("Finding by nobody", texts)
@@ -2550,7 +2563,7 @@ class TestFindingResolution(unittest.TestCase):
         server._append_jsonl(server.MEMORY_DIR / inv_id / "findings.jsonl", legacy)
 
         loaded = _json(server.investigation_load(investigation_id=inv_id))
-        by_text = {f["text"]: f for f in loaded["recent_findings"]}
+        by_text = {_unwrap(f["text"]): f for f in loaded["recent_findings"]}
         self.assertEqual(by_text["Fixed thing."]["resolution"], "fixed")
         # A record stored before the field existed must read as "open".
         self.assertEqual(by_text["Legacy finding without resolution."]["resolution"], "open")
@@ -2581,21 +2594,21 @@ class TestFindingResolution(unittest.TestCase):
         try:
             # Default (no filter): both returned, each with resolution surfaced.
             res_all = _json(server.investigation_search("bug", investigation_id=inv_id))
-            res_by_text = {r["text"]: r for r in res_all["results"]}
+            res_by_text = {_unwrap(r["text"]): r for r in res_all["results"]}
             self.assertEqual(res_by_text["Open bug in the retry loop."]["resolution"], "open")
             self.assertEqual(res_by_text["Fixed the CORS misconfig."]["resolution"], "fixed")
 
             # Filter open -> only the open finding.
             res_open = _json(server.investigation_search(
                 "bug", investigation_id=inv_id, resolution="open"))
-            texts_open = [r["text"] for r in res_open["results"]]
+            texts_open = [_unwrap(r["text"]) for r in res_open["results"]]
             self.assertIn("Open bug in the retry loop.", texts_open)
             self.assertNotIn("Fixed the CORS misconfig.", texts_open)
 
             # Filter fixed -> only the fixed finding.
             res_fixed = _json(server.investigation_search(
                 "bug", investigation_id=inv_id, resolution="fixed"))
-            texts_fixed = [r["text"] for r in res_fixed["results"]]
+            texts_fixed = [_unwrap(r["text"]) for r in res_fixed["results"]]
             self.assertIn("Fixed the CORS misconfig.", texts_fixed)
             self.assertNotIn("Open bug in the retry loop.", texts_fixed)
         finally:
