@@ -157,6 +157,25 @@ class TestA2ADispatch(unittest.TestCase):
         self.assertEqual(data["result"]["output"]["error"], "Internal task error")
         self.assertNotIn("/home/rjmendez/.ssh", str(data))
 
+    def test_handled_skill_exception_is_sanitized(self):
+        fake_qdrant = mock.Mock()
+        fake_qdrant.get.side_effect = RuntimeError("qdrant secret /home/rjmendez/qdrant.key")
+        with mock.patch.object(
+            a2a_server,
+            "_db",
+            side_effect=RuntimeError("sqlite blew up at /home/rjmendez/private.db"),
+        ), mock.patch.object(a2a_server, "_get_http_session", return_value=fake_qdrant):
+            data = self._post(rpc("tasks/send", {
+                "skill_id": "memory_stats",
+                "message": "",
+                "sender": "test",
+                "input": {},
+            }))
+        output = data["result"]["output"]
+        self.assertEqual(output["sqlite"]["error"], "sqlite unavailable")
+        self.assertEqual(output["qdrant"]["mnemosyne"], "unavailable")
+        self.assertNotIn("/home/rjmendez", str(output))
+
 
 class TestTasksGetHTTP(unittest.TestCase):
     """GET /a2a/tasks/{task_id} — separate HTTP endpoint."""
