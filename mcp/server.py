@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401  (kept on the module namespace; live users import it function-locally)
 import fcntl
 import hashlib
+import html
 import hmac
 import json
 import math
@@ -478,6 +479,20 @@ def context_assemble(
       sources  - list of {n, id, title, origin, score}
       query, total_chars, truncated, result_count
     """
+    def _wrap_untrusted_memory_text(text: str, row: dict) -> str:
+        body = str(text or "")
+        attrs = []
+        for key in ("origin", "investigation_id", "finding_id", "memory_id", "id", "source"):
+            val = row.get(key)
+            if val:
+                attrs.append(f'{key}="{html.escape(str(val), quote=True)}"')
+        attr_blob = f" {' '.join(attrs)}" if attrs else ""
+        return (
+            f"<untrusted_memory_content{attr_blob}>\n"
+            f"{body}\n"
+            "</untrusted_memory_content>"
+        )
+
     lines = [f"## Retrieved Context\nQuery: {query}\n"]
     sources = []
     total = 0
@@ -493,6 +508,17 @@ def context_assemble(
         score = float(r.get("score") or r.get("relevance_score") or 0.0)
         origin = r.get("origin") or r.get("collection") or "loci_memory"
         mem_id = str(r.get("memory_id") or r.get("finding_id") or r.get("id") or "")
+        if text and (
+            origin == QDRANT_COLLECTION_PREFIX
+            or r.get("investigation_id")
+            or r.get("finding_id")
+            or r.get("memory_id")
+        ):
+            text = _wrap_untrusted_memory_text(text, {
+                **r,
+                "origin": origin,
+                "finding_id": r.get("finding_id") or mem_id,
+            })
 
         meta = f"  [score={score:.3f}, origin={origin}]" if include_metadata else ""
         block = f"[SOURCE {i}]{meta}\nTitle: {title}\n{text}\n---\n"
