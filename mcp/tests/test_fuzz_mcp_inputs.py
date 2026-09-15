@@ -1,10 +1,13 @@
+import json
 import string
 
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
 import inv_store
+import llm_tools
 import model_json
+import server
 import text_ops
 
 
@@ -36,6 +39,33 @@ _MALFORMED_UNICODE_TEXT = st.text(
     max_size=4096,
 )
 _NESTING_DEPTH = st.integers(min_value=0, max_value=200)
+_SCALAR_OR_TEXT = st.one_of(
+    _ADVERSARIAL_TEXT,
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(2 ** 31), max_value=(2 ** 31) - 1),
+)
+_LABEL_INPUT = st.one_of(
+    st.lists(_SCALAR_OR_TEXT, min_size=0, max_size=5),
+    _SCALAR_OR_TEXT,
+    st.tuples(_SCALAR_OR_TEXT, _SCALAR_OR_TEXT),
+    st.dictionaries(_ADVERSARIAL_TEXT, _SCALAR_OR_TEXT, min_size=0, max_size=3),
+)
+_MAX_CHARS_INPUT = st.one_of(
+    st.integers(min_value=-(2 ** 31), max_value=(2 ** 31) - 1),
+    _ADVERSARIAL_TEXT,
+    st.none(),
+    st.booleans(),
+)
+_INVESTIGATION_NOTE_FIELD = st.sampled_from([
+    "context",
+    "hypothesis",
+    "next_step",
+    "open_question_add",
+    "open_question_remove",
+    "checked_source",
+    "closed_summary",
+])
 
 
 def _jsonl_roundtrip_entry(field: str, text: str) -> dict:
@@ -57,6 +87,18 @@ def _assert_inside(root, candidate):
     resolved_candidate = candidate.resolve()
     assert resolved_candidate.is_dir()
     assert resolved_candidate.is_relative_to(resolved_root)
+
+
+def _canonical_labels(labels) -> list[str]:
+    if labels is None:
+        seq = []
+    elif isinstance(labels, list):
+        seq = labels
+    elif isinstance(labels, (tuple, set)):
+        seq = list(labels)
+    else:
+        seq = [labels]
+    return [str(item) for item in seq]
 
 
 @settings(
@@ -160,7 +202,108 @@ def test_text_ops_fuzz_never_raises(text, labels, max_chars):
         assert len(compress_result["text"]) <= max_chars
 
 
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    text=_MALFORMED_UNICODE_TEXT,
+    labels=_LABEL_INPUT,
+    reply=_MALFORMED_UNICODE_TEXT,
+)
+def test_classify_text_tool_fuzz_never_raises(monkeypatch, text, labels, reply):
+    monkeypatch.setattr(
+        text_ops,
+        "_resolve_gen_fn",
+        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": reply, "ok": True}),
+    )
+    result = llm_tools.classify_text(text, labels)
+    parsed = json.loads(result)
+    assert set(parsed) == {"label", "degraded"}
+    assert parsed["label"] is None or parsed["label"] in _canonical_labels(labels)
+
+
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    text=_MALFORMED_UNICODE_TEXT,
+    max_chars=_MAX_CHARS_INPUT,
+)
+def test_compress_text_tool_fuzz_never_raises(monkeypatch, text, max_chars):
+    monkeypatch.setattr(
+        text_ops,
+        "_resolve_gen_fn",
+        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": text, "ok": True}),
+    )
+    parsed = json.loads(llm_tools.compress_text(text, max_chars=max_chars))
+    assert set(parsed) == {"text", "degraded"}
+    assert isinstance(parsed["text"], str)
+    try:
+        budget = int(max_chars)
+    except Exception:
+        budget = 600
+    if budget > 0:
+        assert len(parsed["text"]) <= budget
+    else:
+        assert parsed["text"] == ""
+
+
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(field=_INVESTIGATION_NOTE_FIELD, value=_SCALAR_OR_TEXT)
+def test_investigation_note_tool_fuzz_never_raises(tmp_path, monkeypatch, field, value):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    server.investigation_start("case-note-fuzz", "fuzz note", "ctx")
+
+    note_value = value
+    if field == "checked_source" and isinstance(value, str) and ":" not in value:
+        note_value = f"tool: {value}"
+
+    parsed = json.loads(
+        server.investigation_note("case-note-fuzz", field, note_value)
+    )
+    assert isinstance(parsed, dict)
+    if "error" in parsed:
+        assert isinstance(parsed["error"], str)
+        return
+
+    manifest = parsed["manifest"]
+    assert parsed["updated"] == field
+    assert all(isinstance(item, str) and item.strip() for item in manifest["open_questions"])
+    assert manifest["closed_summary"] is None or (
+        isinstance(manifest["closed_summary"], str) and manifest["closed_summary"].strip()
+    )
+    for tool_name, rows in manifest["checked_sources"].items():
+        assert isinstance(tool_name, str) and tool_name.strip()
+        for row in rows:
+            assert isinstance(row["summary"], str) and row["summary"].strip()
+
+
 def test_inv_dir_rejects_overlong_ids_with_value_error(tmp_path, monkeypatch):
     monkeypatch.setattr(inv_store, "_get_memory_dir", lambda: tmp_path)
     with pytest.raises(ValueError):
         inv_store._inv_dir("a" * 256)
+
+
+def test_classify_text_scalar_labels_degrade_instead_of_raising(monkeypatch):
+    monkeypatch.setattr(
+        text_ops,
+        "_resolve_gen_fn",
+        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": "anything", "ok": True}),
+    )
+    parsed = json.loads(llm_tools.classify_text("hello", 5))
+    assert parsed == {"label": None, "degraded": True}
+
+
+def test_investigation_note_rejects_none_checked_source_instead_of_crashing(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    server.investigation_start("case-note-regression", "fuzz note", "ctx")
+    parsed = json.loads(server.investigation_note("case-note-regression", "checked_source", None))
+    assert "error" in parsed
