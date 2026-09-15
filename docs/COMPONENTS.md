@@ -307,8 +307,8 @@ how to..."), stores synthetic positives back to both Mnemosyne SQLite and the Qd
 ---
 
 ### `scripts/skill_annotation_updater.py`
-**Purpose:** DRAFT self-annotation. Reads `guard_tool_reflections.log` (and optionally
-`guard_bash_failures.log`) from hook state, aggregates failures by tool_name, finds
+**Purpose:** DRAFT self-annotation. Reads `guard_tool_reflections.log` from hook state,
+aggregates failures by tool_name, finds
 matching SKILL.md files, writes or updates "## Learned constraints" sections with
 top-3 failure patterns.
 

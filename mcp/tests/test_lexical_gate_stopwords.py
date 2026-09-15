@@ -19,6 +19,10 @@ class TokenizeDropsNonEvidenceTest(unittest.TestCase):
     def test_stopwords_are_not_evidence(self):
         self.assertEqual(server.tokenize("the and of is was it this"), set())
 
+    def test_multilingual_function_words_are_not_evidence(self):
+        self.assertEqual(server.tokenize("el y de la que en"), set())
+        self.assertEqual(server.tokenize("les des avec pour sur dans"), set())
+
     def test_domain_generic_words_are_still_dropped(self):
         self.assertEqual(server.tokenize("the host reported a result"), set())
 
@@ -62,6 +66,10 @@ class LexicalGateTest(unittest.TestCase):
         """It should be unassessable lexically, not trivially supported."""
         self.assertEqual(server.tokenize("it was the result"), set())
         self.assertEqual(self._score("it was the result", "anything at all here"), 0.0)
+
+    def test_multilingual_stopword_only_claims_cannot_be_supported(self):
+        self.assertEqual(self._score("el y de la que en", "que el servicio sigue activo"), 0.0)
+        self.assertEqual(self._score("les des avec pour sur dans", "avec les journaux sur disque"), 0.0)
 
     def test_two_token_claim_overlapping_only_on_the_is_not_supported(self):
         score = self._score(

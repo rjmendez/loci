@@ -11,3 +11,8 @@ def test_issue_216_guard_bash_references_removed_from_production_consumers():
         "mlops/loop.py",
     ]:
         assert "guard_bash" not in (repo / rel).read_text(encoding="utf-8")
+
+
+def test_issue_216_guard_bash_stale_doc_reference_removed():
+    repo = Path(__file__).resolve().parents[1]
+    assert "guard_bash" not in (repo / "docs/COMPONENTS.md").read_text(encoding="utf-8")

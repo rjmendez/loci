@@ -1397,6 +1397,13 @@ _STOPWORD_MATCH_TOKENS = {
     "when", "where", "which", "while", "who", "why", "will", "with", "would", "you",
     "your", "am", "being", "both", "each", "few", "more", "most", "only", "other",
     "same", "very", "just", "also", "any", "all", "about", "after", "before",
+    # High-frequency function words that still tokenize under _TOKEN_RE in the
+    # multilingual reports this lane sees; without them, stopword-only claims
+    # like "el y de la que en" or "les des avec pour sur dans" can clear the
+    # lexical gate on a single shared function word.
+    "avec", "como", "con", "dans", "del", "des", "dos", "elle", "elles", "ellos",
+    "esta", "este", "esto", "las", "les", "los", "para", "pas", "plus", "por", "pour",
+    "que", "qui", "sans", "ses", "son", "sur", "una", "uno", "unos", "vous",
 }
 
 _NON_EVIDENCE_TOKENS = _GENERIC_MATCH_TOKENS | _STOPWORD_MATCH_TOKENS

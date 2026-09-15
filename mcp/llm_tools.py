@@ -16,6 +16,17 @@ from typing import Optional
 logger = logging.getLogger("loci-mcp")
 
 
+def _coerce_labels(labels) -> list:
+    """Normalize malformed tool input to a safe list without raising."""
+    if labels is None:
+        return []
+    if isinstance(labels, list):
+        return labels
+    if isinstance(labels, (tuple, set)):
+        return list(labels)
+    return [labels]
+
+
 def llm_local(prompt: str, model: str = "qwen2.5:3b", fmt: Optional[str] = None,
               max_tokens: int = 256, temperature: float = 0.2, keep_alive: str = "30m") -> str:
     """
@@ -80,7 +91,7 @@ def classify_text(text: str, labels: list) -> str:
     model is down or returns an out-of-set label. Returns JSON {label, degraded}.
     """
     import text_ops as _to
-    return json.dumps(_to.classify(text, list(labels or [])), indent=2)
+    return json.dumps(_to.classify(text, _coerce_labels(labels)), indent=2)
 
 
 def compress_text(text: str, max_chars: int = 600) -> str:

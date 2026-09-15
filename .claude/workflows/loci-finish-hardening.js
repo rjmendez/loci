@@ -124,15 +124,10 @@ outcome and better than a hook nobody wants.`,
   },
   {
     id: 'guard-log-216',
-    title: 'four consumers, zero producers',
-    brief: `guard_bash_failures.log / guard_bash_successes.log / guard_tool_reflections.log
-in STATE_DIR (~/.claude/hook-state) have FOUR production consumers:
-  scripts/score_trace_collector.py   - SCoRe fine-tuning dataset
-  scripts/skill_annotation_updater.py
-  mlops/memory/live_evo.py           - confidence penalties from guard failures
-  mlops/loop.py                      - passes hook_state_dir through
-and ZERO producers. A repo-wide grep for a write to guard_*.log returns only two
-TEST files, which create the fixture themselves.
+    title: 'resolved dead guard-log consumers',
+    brief: `Issue #216 removed the dead guard-log consumers. The only remaining
+hook-state input for this area is guard_tool_reflections.log; production code
+should not still depend on the removed bash-guard logs.
 
 Measured: ~/.claude/hook-state exists and is EMPTY; the SCoRe OUTPUT_DIR
 (~/.hermes/mnemosyne/data/score_traces) is absent; positives/negatives/corrections

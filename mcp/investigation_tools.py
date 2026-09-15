@@ -575,26 +575,38 @@ def investigation_note(
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
+    raw_value = value if isinstance(value, str) else ("" if value is None else str(value))
     if field in ("context", "hypothesis", "next_step"):
-        stripped = value.strip() if value else ""
+        stripped = raw_value.strip()
         if not stripped:
             return json.dumps({"error": f"Field '{field}' must not be empty or whitespace-only."})
         manifest[field] = stripped
         manifest[f"{field}_ts"] = _now()
     elif field == "open_question_add":
-        if value not in manifest["open_questions"]:
-            manifest["open_questions"].append(value)
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "open_question_add value must not be empty"})
+        if stripped not in manifest["open_questions"]:
+            manifest["open_questions"].append(stripped)
     elif field == "open_question_remove":
-        manifest["open_questions"] = [q for q in manifest["open_questions"] if q != value]
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "open_question_remove value must not be empty"})
+        manifest["open_questions"] = [q for q in manifest["open_questions"] if q != stripped]
     elif field == "checked_source":
-        parts = value.rsplit(":", 1)
+        parts = raw_value.rsplit(":", 1)
         tool = parts[0].strip()
         summary = parts[1].strip() if len(parts) > 1 else ""
+        if not tool:
+            return json.dumps({"error": "checked_source tool name must not be empty"})
         if not summary:
             return json.dumps({"error": "checked_source summary must not be empty"})
         manifest["checked_sources"].setdefault(tool, []).append({"summary": summary, "ts": _now()})
     elif field == "closed_summary":
-        manifest["closed_summary"] = value
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "closed_summary must not be empty or whitespace-only."})
+        manifest["closed_summary"] = stripped
         manifest["status"] = "closed"
         manifest["closed_at"] = _now()
     else:
