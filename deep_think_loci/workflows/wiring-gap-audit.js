@@ -256,8 +256,8 @@ log(`Verifying ${highPriority.length} critical/high findings`)
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this wiring-gap finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the method is actually a stub.
+    `Refute this wiring-gap finding if you can.
+If you can't confirm the method is a stub, return is_real=false.
 
 Finding ID: ${f.id}
 Category: ${f.category}

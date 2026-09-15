@@ -240,7 +240,7 @@ log(`Adversarially verifying ${criticalAndHigh.length} critical/high clusters`)
 
 const verifications = await parallel(
   criticalAndHigh.map(review => () => agent(
-    `You are an adversarial verifier. Your job is to CHALLENGE and attempt to REFUTE this finding cluster review.
+    `You are an adversarial verifier. CHALLENGE and REFUTE this finding-cluster review if you can.
 
 Cluster: ${review.cluster}
 Severity claimed: ${review.severity}

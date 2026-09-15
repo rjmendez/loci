@@ -320,8 +320,8 @@ log(`Verifying ${highPriority.length} critical/high findings`)
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this boundary-blindness finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the evidence by reading the actual files.
+    `Refute this boundary-blindness finding if you can.
+If the actual files don't confirm it, return is_real=false.
 
 Finding ID: ${f.id}
 Category: ${f.category}
@@ -338,7 +338,7 @@ Steps:
 3. Do they actually mismatch? Is the other side genuinely missing?
    Consider: could an alias, interface, or framework adapter reconcile the mismatch?
 
-Return is_real=true only if you can confirm the mismatch by reading both files.`,
+Return is_real=true only if both files confirm the mismatch.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

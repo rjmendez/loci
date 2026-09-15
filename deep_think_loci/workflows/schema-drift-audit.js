@@ -270,7 +270,7 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this schema-drift finding. Try to REFUTE it.
+    `Refute this schema-drift finding if you can.
 
 Finding ID: ${f.id} | Category: ${f.category}
 Title: ${f.title}
@@ -285,7 +285,7 @@ Steps:
 3. Is there a serializer/deserializer adapter between them that reconciles the difference?
 4. Is there a migration or compatibility shim already in place?
 
-Return is_real=true only if the mismatch is confirmed and unmitigated.`,
+Return is_real=true only for a confirmed unmitigated mismatch.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

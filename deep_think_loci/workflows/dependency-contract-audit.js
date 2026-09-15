@@ -282,8 +282,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this dependency contract finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm the API actually changed.
+    `Refute this dependency-contract finding if you can.
+If the installed API didn't actually change, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 Package: ${f.package_name || 'unknown'}
@@ -299,7 +299,7 @@ Steps:
 4. Is there a compatibility shim or deprecation warning that keeps the old API working?
 5. Is there a wrapper in the codebase that abstracts the breaking change?
 
-Return is_real=true only if the API contract break is confirmed in the installed version.`,
+Return is_real=true only if the installed version confirms the contract break.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

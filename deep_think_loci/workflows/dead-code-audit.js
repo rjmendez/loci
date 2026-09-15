@@ -102,7 +102,7 @@ Codebase root: ${ROOT}
 
 Hunt for exported functions, classes, types, and constants that are never imported or called anywhere in the codebase.
 
-Search approach:
+Search:
 1. List all exports:
    TypeScript: \`grep -rn "^export function\\|^export class\\|^export const\\|^export type\\|^export interface\\|^export enum" ${ROOT} --include="*.ts" --include="*.tsx" | grep -v "node_modules\\|dist\\|.next" | head -50\`
    Python: \`grep -rn "^def \\|^class \\|^[A-Z_]\\+ = " ${ROOT} --include="*.py" | grep -v "__pycache__\\|test_\\|_test.py" | head -50\`
@@ -121,7 +121,7 @@ Search approach:
 
 Severity: high if the dead export is in a security-sensitive or auth-related module (dead auth helper is confusing); medium otherwise.
 
-Return findings with: file, line, severity, title (include symbol name), detail (how you verified it has no callers), fix (delete or unexport).`,
+Return: file, line, severity, title (include symbol name), detail (how you verified it has no callers), fix (delete or unexport).`,
   },
   {
     key: 'always_on_off_flag',
@@ -133,7 +133,7 @@ Codebase root: ${ROOT}
 
 Hunt for feature flags, environment variable checks, and conditional branches that always evaluate to the same value — effectively dead code on one branch.
 
-Search approach:
+Search:
 1. Find feature flag patterns:
    \`grep -rn "FEATURE_\\|FF_\\|ENABLE_\\|DISABLE_\\|FLAG_\\|isEnabled\\|featureFlag\\|getFeature" ${ROOT} --include="*.ts" --include="*.tsx" --include="*.py" | grep -v "node_modules\\|test\\|__pycache__" | head -40\`
 2. Check if env var defaults make a branch always-true or always-false:
@@ -146,7 +146,7 @@ Search approach:
 
 Severity: high if the always-false branch contains security logic (bypassed auth check) or the always-true branch removes a safety guard; medium for product feature flags; low for debug flags.
 
-Return findings with: file, line, severity, title (flag name and which branch is dead), detail (explain why the branch is always on/off), fix (delete the dead branch and clean up the flag).`,
+Return: file, line, severity, title (flag name and which branch is dead), detail (explain why the branch is always on/off), fix (delete the dead branch and clean up the flag).`,
   },
   {
     key: 'unreachable_branch',
@@ -158,7 +158,7 @@ Codebase root: ${ROOT}
 
 Hunt for code that can never execute: statements after return/throw, conditions that are always true/false due to type constraints, and exhaustive switch cases with a dead default.
 
-Search approach:
+Search:
 1. Code after return/throw/break in the same block:
    \`grep -rn "return\\|throw\\|break" ${ROOT} --include="*.ts" --include="*.tsx" --include="*.py" | grep -v "node_modules\\|test\\|__pycache__" | head -30\`
    For each, check if there are non-comment statements on the next line(s) before the closing brace
@@ -173,7 +173,7 @@ Search approach:
 
 Severity: high if the unreachable code contains error handling (the error path is silently disabled); medium for dead feature code; low for style issues.
 
-Return findings with: file, line, severity, title, detail (why the code is unreachable), fix (delete the unreachable block).`,
+Return: file, line, severity, title, detail (why the code is unreachable), fix (delete the unreachable block).`,
   },
   {
     key: 'unused_dependency',
@@ -185,7 +185,7 @@ Codebase root: ${ROOT}
 
 Hunt for packages declared in package.json / requirements.txt / pyproject.toml that are never imported or used in the codebase.
 
-Search approach:
+Search:
 1. List all declared dependencies:
    \`cat ${ROOT}/package.json 2>/dev/null | grep -A 200 '"dependencies"' | grep '"@\\|"[a-z]' | head -40\`
    \`cat ${ROOT}/requirements.txt 2>/dev/null | grep -v "^#\\|^$" | head -40\`
@@ -203,7 +203,7 @@ Search approach:
 
 Severity: high if the unused package has known CVEs or is a large transitive dependency chain; medium otherwise (unused deps still enlarge the attack surface and slow installs).
 
-Return findings with: file (package.json or requirements.txt), line (approximate), severity, title (package name), detail (verified 0 imports, note any false-positive check performed), fix (remove from dependency list, run install to verify).`,
+Return: file (package.json or requirements.txt), line (approximate), severity, title (package name), detail (verified 0 imports, note any false-positive check performed), fix (remove from dependency list, run install to verify).`,
   },
   {
     key: 'tombstoned_comment',
@@ -215,7 +215,7 @@ Codebase root: ${ROOT}
 
 Hunt for comments that indicate technical debt that was meant to be resolved but has been left in place, and code blocks that are commented-out rather than deleted.
 
-Search approach:
+Search:
 1. Find all TODO/FIXME/HACK/DEPRECATED/XXX/TEMP comments:
    \`grep -rn "TODO\\|FIXME\\|HACK\\|DEPRECATED\\|XXX\\|TEMP:\\|REMOVE\\|DELETE ME\\|\\\\btemp\\b" ${ROOT} --include="*.ts" --include="*.tsx" --include="*.py" --include="*.js" | grep -v "node_modules\\|dist\\|\\.next\\|__pycache__" | head -50\`
 2. For each, check the git log to estimate age:
@@ -230,7 +230,7 @@ Search approach:
 
 Severity: high if the TODO marks a security gap ("TODO: add auth check") or a data correctness issue ("FIXME: this gives wrong results for edge case X"); medium for missing features; low for cleanup items.
 
-Return findings with: file, line, severity, title (include the comment text), detail (age if determinable, what it was blocking on), fix (either implement what the comment describes or delete the dead code/comment).`,
+Return: file, line, severity, title (include the comment text), detail (age if determinable, what it was blocking on), fix (either implement what the comment describes or delete the dead code/comment).`,
   },
 ]
 
@@ -260,7 +260,7 @@ phase('Triage')
 const highCritical = allFindings.filter(f => f.severity === 'critical' || f.severity === 'high')
 
 const triageResults = await parallel(highCritical.map(f => () =>
-  agent(`You are an adversarial code reviewer. Your job is to REFUTE this dead-code finding if possible.
+  agent(`You are an adversarial code reviewer. REFUTE this dead-code finding if you can.
 
 Finding: ${f.title}
 File: ${f.file}:${f.line}

@@ -138,7 +138,7 @@ Mechanism (CD5): A config value has a default that is convenient locally but ins
 or incorrect in production. LLMs generate the default as convenient for local use;
 the production deployment inherits it silently if the env var is not set.
 
-Dangerous patterns:
+Danger patterns:
 - DEBUG = True (default)
 - SECRET_KEY = "dev-key" (hardcoded, weak)
 - CORS_ALLOW_ALL = True (default)
@@ -293,8 +293,8 @@ const highPriority = allFindings.filter(f => f.severity === 'critical' || f.seve
 
 const verdicts = (await parallel(highPriority.map(f => () =>
   agent(
-    `Adversarially verify this config-drift finding. Try to REFUTE it.
-Default to is_real=false if you cannot confirm by checking the actual manifests/code.
+    `Refute this config-drift finding if you can.
+If manifests/code don't confirm it, return is_real=false.
 
 Finding ID: ${f.id} | Category: ${f.category}
 Variable/Setting: ${f.var_name || 'unknown'}
@@ -311,7 +311,7 @@ Steps:
 4. For missing manifest: is the service actually deployed via a different mechanism
    (Helm chart, Terraform, external script) not in the checked files?
 
-Return is_real=true only if the config mismatch is confirmed and would affect production.`,
+Return is_real=true only for a confirmed prod-impacting config mismatch.`,
     { label: `triage:${f.id}`, phase: 'Triage', schema: VERDICT_SCHEMA }
   ).then(v => v ? { finding: f, verdict: v } : null)
 ))).filter(Boolean)

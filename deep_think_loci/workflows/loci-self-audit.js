@@ -209,7 +209,7 @@ const FINAL_SCHEMA = {
 // ── Phase 0: Init ─────────────────────────────────────────────────────────────
 phase('Init')
 await agent(
-  `Call mcp__loci__investigation_start(investigation_id="${RUN}", title="Loci self-audit: bugs and improvements", context="Deep-think workflow applied to the Loci codebase itself. Targets: ${TARGETS.map(t => t.name).join(', ')}. Run ${RUN}"). Return one line confirming.`,
+  `Call mcp__loci__investigation_start(investigation_id="${RUN}", title="Loci self-audit: bugs and improvements", context="Deep-think workflow applied to the Loci codebase itself. Targets: ${TARGETS.map(t => t.name).join(', ')}. Run ${RUN}"). Return one confirmation line.`,
   { label: 'init', phase: 'Init', model: 'haiku' }
 )
 
