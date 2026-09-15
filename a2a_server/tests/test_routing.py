@@ -9,6 +9,7 @@ import importlib.util
 import os
 import pathlib
 import unittest
+from unittest import mock
 
 # Set required env vars before importing server (server exits at load if unset)
 os.environ.setdefault("LOCI_A2A_TOKEN", "test-token-abc123")
@@ -141,13 +142,35 @@ class TestA2ADispatch(unittest.TestCase):
         data = self._post(rpc("tasks/list"))
         self.assertEqual(data.get("jsonrpc"), "2.0")
 
+    def test_unhandled_skill_exception_is_sanitized(self):
+        with mock.patch.object(
+            a2a_server,
+            "_dispatch",
+            side_effect=RuntimeError("sensitive path /home/rjmendez/.ssh/id_ed25519"),
+        ):
+            data = self._post(rpc("tasks/send", {
+                "skill_id": "memory_stats",
+                "message": "",
+                "sender": "test",
+                "input": {},
+            }))
+        self.assertEqual(data["result"]["output"]["error"], "Internal task error")
+        self.assertNotIn("/home/rjmendez/.ssh", str(data))
+
 
 class TestTasksGetHTTP(unittest.TestCase):
     """GET /a2a/tasks/{task_id} — separate HTTP endpoint."""
 
-    def test_unknown_task_returns_404(self):
+    def test_sender_is_required(self):
         resp = client.get(
             "/a2a/tasks/00000000-0000-0000-0000-000000000000",
+            headers=AUTH,
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_task_returns_404(self):
+        resp = client.get(
+            "/a2a/tasks/00000000-0000-0000-0000-000000000000?sender=test",
             headers=AUTH,
         )
         self.assertEqual(resp.status_code, 404)

@@ -417,6 +417,7 @@ def _store_task(task_id: str, task: dict) -> None:
 
 # session tokens issued by /bootstrap — token → expiry (UTC)
 _session_tokens: dict[str, datetime.datetime] = {}
+_session_token_agents: dict[str, str] = {}
 
 # ── FastAPI app + auth ──────────────────────────────────────────────────────────
 app = FastAPI(title=f'{AGENT_ID} A2A', version='0.1.0')
@@ -434,9 +435,9 @@ def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bear
         raise HTTPException(status_code=401, detail='Unauthorized — missing bearer token')
     tok = creds.credentials
     if hmac.compare_digest(tok, A2A_TOKEN):
-        return
+        return {'token_type': 'primary', 'sender': None}
     if _is_live_session_token(tok):
-        return
+        return {'token_type': 'session', 'sender': _session_token_agents.get(tok, 'unknown')}
     raise HTTPException(status_code=401, detail='Unauthorized — invalid or expired token')
 
 
@@ -448,6 +449,26 @@ _totp_attempts: dict = collections.defaultdict(list)
 # plausible concurrent-client count so the sweep is rare and its cost amortised.
 _TOTP_SWEEP_AFTER = 1024
 _totp_attempts_lock = threading.Lock()
+
+# Bootstrap rate limiter: max 5 failed attempts per 5 minutes per client IP.
+_BOOTSTRAP_WINDOW = 300
+_BOOTSTRAP_MAX_ATTEMPTS = 5
+_bootstrap_attempts: dict = collections.defaultdict(list)
+_BOOTSTRAP_SWEEP_AFTER = 1024
+_bootstrap_attempts_lock = threading.Lock()
+
+
+def _bound_sender(requested_sender: Optional[str], auth: dict) -> str:
+    """Bind bootstrap-issued session tokens to their issuing agent_id."""
+    if auth.get('token_type') == 'session':
+        sender = auth.get('sender') or 'unknown'
+        if requested_sender and requested_sender != sender:
+            raise HTTPException(
+                status_code=403,
+                detail='Bootstrap session tokens are bound to their issuing agent_id',
+            )
+        return sender
+    return requested_sender or 'unknown'
 
 
 def _verify_totp(request: Request,
@@ -1546,21 +1567,38 @@ async def bootstrap(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail='Invalid JSON')
     presented = body.get('bootstrap_key', '')
+    client_ip = request.client.host if request.client else 'unknown'
+    now_mono = time.monotonic()
+    with _bootstrap_attempts_lock:
+        fresh = [t for t in _bootstrap_attempts[client_ip] if now_mono - t < _BOOTSTRAP_WINDOW]
+        if len(fresh) >= _BOOTSTRAP_MAX_ATTEMPTS:
+            _bootstrap_attempts[client_ip] = fresh
+            raise HTTPException(status_code=429, detail='Too many bootstrap attempts — try again later')
     if not secrets.compare_digest(presented, BOOTSTRAP_KEY):
+        with _bootstrap_attempts_lock:
+            fresh.append(now_mono)
+            _bootstrap_attempts[client_ip] = fresh
+            if len(_bootstrap_attempts) > _BOOTSTRAP_SWEEP_AFTER:
+                for ip in [k for k, v in _bootstrap_attempts.items()
+                           if not v or now_mono - v[-1] >= _BOOTSTRAP_WINDOW]:
+                    del _bootstrap_attempts[ip]
         raise HTTPException(status_code=401, detail='Invalid bootstrap key')
+    with _bootstrap_attempts_lock:
+        _bootstrap_attempts.pop(client_ip, None)
 
     ttl_hours = min(int(body.get('ttl_hours', 24)), 168)  # cap at 7 days
     now = datetime.datetime.now(datetime.timezone.utc)
     expires_at = now + datetime.timedelta(hours=ttl_hours)
     session_token = secrets.token_hex(32)
     _session_tokens[session_token] = expires_at
+    agent_id = body.get('agent_id', 'unknown')
+    _session_token_agents[session_token] = agent_id
 
     # Prune expired sessions
     expired = [t for t, exp in list(_session_tokens.items()) if exp <= now]
     for t in expired:
         _session_tokens.pop(t, None)
-
-    agent_id = body.get('agent_id', 'unknown')
+        _session_token_agents.pop(t, None)
     log.info(f'Bootstrap: issued session token for agent_id={agent_id} ttl={ttl_hours}h expires={expires_at.isoformat()}')
     return JSONResponse({
         'session_token': session_token,
@@ -1569,8 +1607,10 @@ async def bootstrap(request: Request):
     })
 
 
-@app.post('/a2a', dependencies=[Depends(_verify_bearer), Depends(_verify_totp)])
-async def a2a_endpoint(request: Request):
+@app.post('/a2a')
+async def a2a_endpoint(request: Request,
+                       auth: dict = Depends(_verify_bearer),
+                       _: None = Depends(_verify_totp)):
     """Main JSON-RPC 2.0 dispatch."""
     try:
         body = await request.json()
@@ -1583,11 +1623,15 @@ async def a2a_endpoint(request: Request):
     params = body.get('params', {})
 
     if method == 'tasks/send':
+        params = dict(params)
+        params['sender'] = _bound_sender(params.get('sender'), auth)
         return await _handle_task_send(rpc_id, params)
     if method == 'tasks/get':
+        params = dict(params)
+        params['sender'] = _bound_sender(params.get('sender'), auth)
         return await _handle_task_get(rpc_id, params)
     if method == 'tasks/list':
-        caller_id = params.get('sender', 'unknown')
+        caller_id = _bound_sender(params.get('sender'), auth)
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
             'result': {'tasks': list(_tasks.get(caller_id, {}).values())}
@@ -1598,16 +1642,13 @@ async def a2a_endpoint(request: Request):
     })
 
 
-@app.get('/a2a/tasks/{task_id}', dependencies=[Depends(_verify_bearer), Depends(_verify_totp)])
-async def get_task(task_id: str, sender: Optional[str] = None):
-    if sender:
-        task = _tasks.get(sender, {}).get(task_id)
-    else:
-        log.warning('GET /a2a/tasks/%s called without ?sender= — searching all buckets (deprecated)', task_id)
-        task = next(
-            (b[task_id] for b in _tasks.values() if task_id in b),
-            None,
-        )
+@app.get('/a2a/tasks/{task_id}')
+async def get_task(task_id: str, sender: Optional[str] = None,
+                   auth: dict = Depends(_verify_bearer),
+                   _: None = Depends(_verify_totp)):
+    if auth.get('token_type') == 'primary' and not sender:
+        raise HTTPException(status_code=400, detail='sender query parameter required')
+    task = _tasks.get(_bound_sender(sender, auth), {}).get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail='Task not found')
     return JSONResponse(task)
@@ -1642,9 +1683,9 @@ async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
 
     try:
         result = await _dispatch(skill_id, task)
-    except Exception as e:
+    except Exception:
         log.exception(f'Skill {skill_id} raised')
-        result = {'error': str(e)}
+        result = {'error': 'Internal task error'}
 
     task['status'] = 'completed'
     task['result'] = result
@@ -1682,4 +1723,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
