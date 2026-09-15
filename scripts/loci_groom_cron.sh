@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Cron entrypoint for the passive grooming tier.
 #
-# Not scheduled into cron/jobs.json: that file lists five jobs marked
-# "enabled": true, every one with last_run_at: None, and nothing on this host
-# reads it (see issue #205). The live substrate is the user crontab.
+# Not scheduled into cron/jobs.json: Hermes jobs use hermes_cron_runner.py on
+# their own minute tick; the grooming tier still lives directly on the user
+# crontab.
 #
 # Exit codes come from loci_groom.py and are the point of this wrapper:
 #   0  ok

@@ -68,10 +68,19 @@ themselves. The older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py
 `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled
 and is omitted from the table.
 
-These jobs need an agent runner that reads `cron/jobs.json`. Nothing in this repo
-does, and on the reference host every one of the five has `last_run_at: null`
-(issue #205) — check that before assuming they fire. The grooming tier below runs
-from the user crontab instead, and does fire.
+These jobs are driven by `scripts/hermes_cron_runner.py`, intended to be ticked
+from a 1-minute user timer or crontab entry. Issue #205 was a stale
+`next_run_at` loop in the live gateway scheduler: it kept fast-forwarding
+overdue runs in memory, never persisted the new time, and therefore never
+executed the job. The runner here collapses backlog to one catch-up run, then
+writes the next run back to `jobs.json` on the same tick. The grooming tier
+below still runs from the user crontab separately.
+
+Reference crontab line for the live profile copy:
+
+```cron
+* * * * * /home/rjmendez/development/loci/scripts/hermes_cron_runner.py --jobs-file ~/.hermes/profiles/mrpink/cron/jobs.json
+```
 
 | ID | Name | Interval | Script |
 |---|---|---|---|
@@ -368,6 +377,6 @@ the first Qdrant call of every process delete findings.
 | MemGAS index takes ~5min for 500+ entries (sequential embed) | MED | Run `--index` in off-hours; add batch embedding |
 | agentHER requires a generative Ollama model to be available | MED | Set `AGENTHER_GEN_MODEL` to your installed model (default: `llama3.2:latest`) |
 | The `verify` groom pass false-refutes 22% of true claims | HIGH | Do not schedule it. Measured by `eval/verify_skeptic_eval.py`; five prompt/guard variants were neutral or worse (#231) |
-| `cron/jobs.json` is not read by anything in this repo | MED | The five enabled jobs there have never run on the reference host (#205). Schedule from the user crontab, as the grooming tier does |
+| Hermes cron jobs can fast-forward forever if a stale `next_run_at` is never persisted | MED | Use `scripts/hermes_cron_runner.py`, which executes one catch-up run and writes the future `next_run_at` on the same tick (#205) |
 | `backends.toml.example` has no `[qdrant] retention_days` key | LOW | The key is read (`qdrant_ops._retention_days`) but not shown in the example; the code default of 0 applies |
 | SCoRe `corrections=0` until sessions accumulate overlap | INFO | Corrections require same-session failure→success pairs; grow naturally |
