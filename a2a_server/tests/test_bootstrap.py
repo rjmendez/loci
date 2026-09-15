@@ -10,6 +10,7 @@ import datetime
 import importlib.util
 import os
 import pathlib
+import time
 import unittest
 
 import pyotp
@@ -52,7 +53,14 @@ def _bootstrap(key="test-bootstrap-key", **extra):
     return client.post("/bootstrap", json={"bootstrap_key": key, **extra})
 
 
+def _session_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+
 class TestBootstrapIssuance(unittest.TestCase):
+    def setUp(self):
+        a2a_server._bootstrap_attempts.clear()
+
     def test_correct_key_issues_token(self):
         r = _bootstrap()
         self.assertEqual(r.status_code, 200)
@@ -79,15 +87,33 @@ class TestBootstrapIssuance(unittest.TestCase):
     def test_response_advertises_no_totp_required(self):
         self.assertFalse(_bootstrap().json()["totp_required"])
 
+    def test_rate_limits_after_too_many_failed_attempts(self):
+        now = time.monotonic()
+        a2a_server._bootstrap_attempts["testclient"] = [
+            now - i for i in range(a2a_server._BOOTSTRAP_MAX_ATTEMPTS)
+        ]
+        r = _bootstrap(key="still-wrong")
+        self.assertEqual(r.status_code, 429)
+        self.assertIn("Too many bootstrap attempts", r.json()["detail"])
+
+    def test_successful_bootstrap_clears_failed_attempts(self):
+        a2a_server._bootstrap_attempts["testclient"] = [time.monotonic()]
+        r = _bootstrap()
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("testclient", a2a_server._bootstrap_attempts)
+
 
 class TestSessionTokenAuth(unittest.TestCase):
     """TOTP is enabled in this module, so these assert the actual feature."""
 
+    def setUp(self):
+        a2a_server._tasks.clear()
+
     def test_session_token_works_without_totp(self):
-        tok = _bootstrap().json()["session_token"]
+        tok = _bootstrap(agent_id="test").json()["session_token"]
         r = client.post(
             "/a2a", json=RPC,
-            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"},
+            headers=_session_headers(tok),
         )
         self.assertEqual(r.status_code, 200, r.text)
 
@@ -114,7 +140,7 @@ class TestSessionTokenAuth(unittest.TestCase):
 
     def test_expired_session_token_401s(self):
         tok = _bootstrap(ttl_hours=0).json()["session_token"]
-        r = client.post("/a2a", json=RPC, headers={"Authorization": f"Bearer {tok}"})
+        r = client.post("/a2a", json=RPC, headers=_session_headers(tok))
         self.assertEqual(r.status_code, 401)
 
     def test_expired_session_token_does_not_bypass_totp(self):
@@ -123,17 +149,33 @@ class TestSessionTokenAuth(unittest.TestCase):
         a2a_server._session_tokens[tok] = (
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
         )
-        r = client.post("/a2a", json=RPC, headers={"Authorization": f"Bearer {tok}"})
+        r = client.post("/a2a", json=RPC, headers=_session_headers(tok))
         self.assertEqual(r.status_code, 401)
 
     def test_session_token_works_on_tasks_get_route(self):
-        tok = _bootstrap().json()["session_token"]
+        tok = _bootstrap(agent_id="bootstrap-agent").json()["session_token"]
         r = client.get(
             "/a2a/tasks/00000000-0000-0000-0000-000000000000",
             headers={"Authorization": f"Bearer {tok}"},
         )
         # 404 (unknown task) proves auth passed; 401 would mean it did not.
         self.assertEqual(r.status_code, 404)
+
+    def test_session_token_cannot_impersonate_another_sender(self):
+        tok = _bootstrap(agent_id="bootstrap-agent").json()["session_token"]
+        r = client.post(
+            "/a2a",
+            json={
+                "jsonrpc": "2.0",
+                "id": "x",
+                "method": "tasks/list",
+                "params": {"sender": "other-agent"},
+            },
+            headers=_session_headers(tok),
+        )
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("bound to their issuing agent_id", r.json()["detail"])
+
 
 
 class TestHealthReporting(unittest.TestCase):
