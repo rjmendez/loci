@@ -36,6 +36,7 @@ Tools:
     memory_restore               — undo a retraction
     memory_health                — substrate self-check (qdrant / embedders / mirror / integrity)
     code_memory_correlate        — link code-hallucination flags to contaminated investigation findings
+    wiring_obligation_scan       — advisory-only scan for implicit obligations that may merit manual declaration
     reflection_loop_seed         — enqueue Copilot artifacts for bounded self-reflection
     reflection_loop_tick         — process small queued batches and store findings
     reflection_loop_status       — inspect reflection queue and aggregate loop stats
@@ -6390,6 +6391,35 @@ def contract_check(
 
 
 # ── Wiring Obligation Tracker ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+def wiring_obligation_scan(
+    content: str,
+    path: str = "",
+    context: str = "",
+) -> str:
+    """Advisory-only scan for undeclared implicit wiring obligations.
+
+    This is a suggestion generator only: it inspects a snippet, diff hunk, or
+    full file body and returns candidate obligations that MAY merit an explicit
+    ``wiring_obligation_declare`` later. It never writes investigation state,
+    never auto-declares, and never auto-resolves.
+
+    Args:
+        content: Code snippet, diff hunk, or full file content to scan.
+        path: Optional path label for the scanned text.
+        context: Optional extra operator context (for example "PR diff" or
+            "new helper extracted from notifier.py").
+
+    Returns:
+        JSON with ``{"candidates": [...], "degraded": bool, "error": str|None}``.
+        Fail-open: model/backend errors return an empty candidate list with
+        ``degraded=True`` instead of raising.
+    """
+    import wiring_obligation_scan as _scan
+
+    return json.dumps(_scan.scan(content, path=path, context=context), indent=2)
 
 
 @mcp.tool()

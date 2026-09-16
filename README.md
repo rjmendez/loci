@@ -86,12 +86,12 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 
 ---
 
-## MCP tools (73)
+## MCP tools (74)
 
 ![Tool groups](docs/img/loci-tools.svg)
 
 *This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds,
-but the surface is now 73 tools: 42 in `mcp/server.py`, plus 11 investigation tools
+but the surface is now 74 tools: 43 in `mcp/server.py`, plus 11 investigation tools
 from `mcp/investigation_tools.py`, 11 code-graph tools from `mcp/graph_tools.py`,
 and 9 local-model tools from `mcp/llm_tools.py`, all registered onto the shared
 FastMCP instance at import time. See the table below for the current inventory.*
@@ -148,6 +148,7 @@ FastMCP instance at import time. See the table below for the current inventory.*
 | `contract_declare` | Store a cross-boundary contract declaration for an entity |
 | `contract_query` | Query stored contract declarations for an entity |
 | `contract_check` | Check whether a field name conflicts with stored contract declarations |
+| `wiring_obligation_scan` | Advisory-only scan for implicit obligations that may merit manual declaration |
 | `wiring_obligation_declare` | Declare a wiring obligation — a method that should integrate but is unverified |
 | `wiring_obligation_list` | List wiring obligations for an investigation |
 | `wiring_obligation_resolve` | Resolve a wiring obligation with evidence of fulfilment |

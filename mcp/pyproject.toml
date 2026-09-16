@@ -64,4 +64,5 @@ py-modules = [
     "text_ops",
     "verdict_ops",
     "verify",
+    "wiring_obligation_scan",
 ]
