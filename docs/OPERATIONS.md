@@ -51,6 +51,9 @@ scripts/deploy_abliterated_model.py 26b-gemma4
 The script downloads one researched GGUF quant into `~/.loci/models/ollama/`,
 rewrites the matching `ollama/Modelfile.*` to that local path, runs `ollama create`,
 then does a tiny `/api/generate` smoke test and prints `/api/ps` / GPU state.
+It now also verifies each downloaded GGUF against a pinned SHA256 manifest before
+`ollama create`; if you change repos/quants, update the manifest in
+`scripts/deploy_abliterated_model.py` first or the deploy will fail closed.
 
 The new Qwen3.8-27B option is still opt-in and keeps the code default unchanged, but
 it rides llama.cpp's `qwen3_5` hybrid linear-attention path, where
