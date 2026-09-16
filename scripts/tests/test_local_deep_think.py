@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pathlib
 import sys
 
@@ -155,6 +156,176 @@ def test_dead_tier_fails_open():
     assert any(not report["ok"] for report in reports)
     assert result["ideate"]["stored_count"] == 1
     assert result["verify"]["survivor_count"] == 1
+
+
+def test_verified_high_confidence_finding_calls_procedure_learning():
+    learn_calls = []
+    config = _config(self_reflect=False)
+    config.ideate_models = ["fast-model:latest"]
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        if "IDEATE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"ideas":[{"claim":"Restart the worker to clear the stuck queue.",'
+                        '"rationale":"It restores progress.","confidence":"high","evidence_ids":["seed-1"]}]}',
+            }
+        if "SYNTHESIZE tier" in prompt:
+            return {"ok": True, "text": '{"summary":"Use the verified restart path.","supporting_finding_ids":["vf1"]}'}
+        raise AssertionError(f"unexpected prompt: {prompt[:80]}")
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.91, "degraded": False}
+
+    def _learn_procedure(*, investigation_id, finding_id, verify_verdict, gen_fn=None):
+        learn_calls.append({
+            "investigation_id": investigation_id,
+            "finding_id": finding_id,
+            "verify_verdict": verify_verdict,
+            "gen_fn": gen_fn,
+        })
+        return {"promoted": True, "reason": "promoted", "degraded": False}
+
+    def _store(**kwargs):  # noqa: ARG001
+        counter = getattr(_store, "counter", 0) + 1
+        _store.counter = counter
+        fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    result = L.run_chain(config, deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+        "learn_procedure": _learn_procedure,
+    })
+
+    assert len(learn_calls) == 1
+    assert learn_calls[0]["investigation_id"] == config.investigation_id
+    assert learn_calls[0]["finding_id"] == "f1"
+    assert learn_calls[0]["verify_verdict"] == {
+        "verdict": "confirmed",
+        "refutation": "",
+        "confidence": 0.91,
+        "degraded": False,
+    }
+    assert callable(learn_calls[0]["gen_fn"])
+    report = result["verify"]["reports"][0]["procedure_learning"]
+    assert report["attempted"] is True
+    assert report["promoted"] is True
+
+
+def test_low_confidence_or_unverified_findings_skip_procedure_learning():
+    config = _config(self_reflect=False)
+    config.ideate_models = ["fast-model:latest"]
+    learn_calls = []
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        if "IDEATE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"ideas":[{"claim":"Restart the worker to clear the stuck queue.",'
+                        '"rationale":"It restores progress.","confidence":"high","evidence_ids":["seed-1"]}]}',
+            }
+        if "SYNTHESIZE tier" in prompt:
+            return {"ok": True, "text": '{"summary":"Synth","supporting_finding_ids":["vf1"]}'}
+        raise AssertionError(f"unexpected prompt: {prompt[:80]}")
+
+    def _store(**kwargs):  # noqa: ARG001
+        counter = getattr(_store, "counter", 0) + 1
+        _store.counter = counter
+        fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    def _learn_procedure(*, investigation_id, finding_id, verify_verdict, gen_fn=None):  # noqa: ARG001
+        learn_calls.append((investigation_id, finding_id, verify_verdict, gen_fn))
+        return {"promoted": True, "reason": "promoted", "degraded": False}
+
+    def _verify_low_confidence(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.41, "degraded": False}
+
+    low_confidence = L.run_chain(config, deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify_low_confidence,
+        "learn_procedure": _learn_procedure,
+    })
+    assert not learn_calls
+    assert low_confidence["verify"]["reports"][0]["procedure_learning"]["reason"] == "confidence_below_threshold"
+
+    _store.counter = 0
+
+    def _verify_unrefuted(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "refuted", "refutation": "counterexample", "confidence": 0.97, "degraded": False}
+
+    unverified = L.run_chain(config, deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify_unrefuted,
+        "learn_procedure": _learn_procedure,
+    })
+    assert not learn_calls
+    assert unverified["verify"]["reports"][0]["procedure_learning"]["reason"] == "verdict_not_confirmed"
+    assert unverified["verify"]["survivor_count"] == 0
+
+
+def test_procedure_learning_errors_fail_open(caplog):
+    config = _config(self_reflect=False)
+    config.ideate_models = ["fast-model:latest"]
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        if "IDEATE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"ideas":[{"claim":"Restart the worker to clear the stuck queue.",'
+                        '"rationale":"It restores progress.","confidence":"high","evidence_ids":["seed-1"]}]}',
+            }
+        if "SYNTHESIZE tier" in prompt:
+            return {"ok": True, "text": '{"summary":"Synth","supporting_finding_ids":["vf1"]}'}
+        raise AssertionError(f"unexpected prompt: {prompt[:80]}")
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.88, "degraded": False}
+
+    def _learn_procedure(*, investigation_id, finding_id, verify_verdict, gen_fn=None):  # noqa: ARG001
+        raise RuntimeError("procedure backend down")
+
+    def _store(**kwargs):  # noqa: ARG001
+        counter = getattr(_store, "counter", 0) + 1
+        _store.counter = counter
+        fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    caplog.set_level(logging.WARNING)
+    result = L.run_chain(config, deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+        "learn_procedure": _learn_procedure,
+    })
+
+    assert result["synthesis"]["finding_id"] == "sf1"
+    report = result["verify"]["reports"][0]["procedure_learning"]
+    assert report["attempted"] is True
+    assert report["promoted"] is False
+    assert report["reason"] == "unexpected_error"
+    assert report["degraded"] is True
+    assert "procedure learning failed open for f1" in caplog.text
 
 
 def test_self_reflection_fail_open_returns_original_synthesis():

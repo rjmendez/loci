@@ -19,6 +19,7 @@ Usage:
   python3 scripts/local_deep_think.py "topic here" --collections loci_memory --red-team
   python3 scripts/local_deep_think.py "topic here" --ideate-models llama3.1-agent:latest,qwen3.8:latest
   python3 scripts/local_deep_think.py "topic here" --no-self-reflect
+  python3 scripts/local_deep_think.py "topic here" --no-learn-procedures
 """
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ _DEFAULT_IDEATE_MODELS = "llama3.1-agent:latest,qwen3.8:latest"
 _DEFAULT_VERIFY_MODEL = "qwen3.8:latest"
 _DEFAULT_SYNTH_MODEL = "qwen3.8:latest"
 _DEFAULT_REFLECT_MODEL = "qwen3.8:latest"
+_PROCEDURE_LEARNING_MIN_CONFIDENCE = 0.75
 
 
 @dataclass
@@ -56,6 +58,7 @@ class ChainConfig:
     synthesize_model: str
     self_reflect_model: str
     redteam_model: str
+    learn_procedures: bool = True
     self_reflect: bool = True
     red_team: bool = False
     ideas_per_model: int = 3
@@ -211,6 +214,7 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         synthesize_model=synthesize_model,
         self_reflect_model=self_reflect_model,
         redteam_model=redteam_model,
+        learn_procedures=not bool(args.no_learn_procedures),
         self_reflect=not bool(args.no_self_reflect),
         red_team=bool(args.red_team),
         ideas_per_model=max(1, int(args.ideas_per_model)),
@@ -426,6 +430,18 @@ def _normalize_confidence(value: str, default: str = "medium") -> str:
     return cooked if cooked in {"low", "medium", "high"} else default
 
 
+def _coerce_score(value, default: float = 0.0) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return default
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+
 def _normalize_ideas(obj: dict, model: str, limit: int) -> list[Idea]:
     ideas = obj.get("ideas") if isinstance(obj, dict) else None
     if not isinstance(ideas, list):
@@ -554,10 +570,73 @@ def _bind_model(gen_fn: Callable, model: str) -> Callable[..., dict]:
     return _wrapped
 
 
+def _procedure_learning_gate(verdict: dict, *, enabled: bool) -> dict:
+    confidence = _coerce_score(verdict.get("confidence"))
+    status = str(verdict.get("verdict") or "uncertain")
+    degraded = bool(verdict.get("degraded"))
+    report = {
+        "enabled": enabled,
+        "eligible": False,
+        "attempted": False,
+        "verdict": status,
+        "confidence": confidence,
+        "threshold": _PROCEDURE_LEARNING_MIN_CONFIDENCE,
+        "degraded": degraded,
+    }
+    if not enabled:
+        report["reason"] = "disabled"
+        return report
+    if status != "confirmed":
+        report["reason"] = "verdict_not_confirmed"
+        return report
+    if degraded:
+        report["reason"] = "verification_degraded"
+        return report
+    if confidence < _PROCEDURE_LEARNING_MIN_CONFIDENCE:
+        report["reason"] = "confidence_below_threshold"
+        return report
+    report["eligible"] = True
+    report["reason"] = "eligible"
+    return report
+
+
+def maybe_learn_procedure(*, investigation_id: str, finding_id: str, verify_verdict: dict,
+                          gen_fn: Callable, learn_fn: Optional[Callable[..., dict]] = None) -> dict:
+    """Fail-open wrapper around procedure-learning promotion for verified findings."""
+    hook = learn_fn
+    if hook is None:
+        try:
+            hook = importlib.import_module("procedure_learning").maybe_promote_to_procedure
+        except Exception as exc:
+            LOG.warning("procedure learning unavailable for %s: %s", finding_id, exc)
+            return {"promoted": False, "reason": "procedure_learning_unavailable", "degraded": True}
+    try:
+        result = hook(
+            investigation_id=investigation_id,
+            finding_id=finding_id,
+            verify_verdict=verify_verdict,
+            gen_fn=gen_fn,
+        )
+    except Exception as exc:
+        LOG.warning("procedure learning failed open for %s: %s", finding_id, exc)
+        return {"promoted": False, "reason": "unexpected_error", "degraded": True}
+    if not isinstance(result, dict):
+        LOG.warning("procedure learning returned non-dict for %s", finding_id)
+        return {"promoted": False, "reason": "non_dict_result", "degraded": True}
+    if result.get("degraded"):
+        LOG.warning(
+            "procedure learning degraded for %s: %s",
+            finding_id,
+            result.get("reason") or "degraded",
+        )
+    return result
+
+
 def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: ChainConfig,
                     search_fn: Callable[..., list[dict]], gate_fn: Callable[..., dict],
                     verify_fn: Callable[..., dict], gen_fn: Callable,
-                    store_fn: Callable[..., str]) -> tuple[list[StoredFinding], list[dict]]:
+                    store_fn: Callable[..., str],
+                    learn_fn: Optional[Callable[..., dict]] = None) -> tuple[list[StoredFinding], list[dict]]:
     survivors: list[StoredFinding] = []
     reports: list[dict] = []
     verify_gen = _bind_model(gen_fn, config.verify_model)
@@ -569,6 +648,20 @@ def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: Ch
         verdict = verify_fn(item.text, context=context, gen_fn=verify_gen)
         status = str(verdict.get("verdict") or "uncertain")
         degraded = bool(verdict.get("degraded"))
+        procedure_learning = _procedure_learning_gate(verdict, enabled=config.learn_procedures)
+        if procedure_learning["eligible"]:
+            learn_result = maybe_learn_procedure(
+                investigation_id=config.investigation_id,
+                finding_id=item.finding_id,
+                verify_verdict=verdict,
+                gen_fn=verify_gen,
+                learn_fn=learn_fn,
+            )
+            procedure_learning = {
+                **procedure_learning,
+                **learn_result,
+                "attempted": True,
+            }
         reports.append({
             "finding_id": item.finding_id,
             "claim": item.text,
@@ -577,6 +670,7 @@ def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: Ch
             "retrieval": retrieval,
             "gate": gate,
             "context_ids": used_ids,
+            "procedure_learning": procedure_learning,
         })
         if status != "confirmed":
             continue
@@ -862,6 +956,7 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
         context=(
             "Standalone local deep-think chain: ideate with diverse local models, "
             "persist through a dedicated writer, verify with mcp/verify.py, "
+            "optionally auto-learn procedures from confirmed findings, "
             "optionally red-team with an abliterated model, synthesize, then run "
             "one bounded critique+revise self-reflection pass."
         ),
@@ -876,7 +971,8 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
     ground_truth = load_ground_truth(deps["load"], config.investigation_id, [item.finding_id for item in stored_ideas])
     survivors, verify_reports = verify_findings(
         stored_ideas, topic=config.topic, config=config, search_fn=deps["search_collection"],
-        gate_fn=deps["gate"], verify_fn=deps["verify"], gen_fn=deps["generate"], store_fn=deps["store"]
+        gate_fn=deps["gate"], verify_fn=deps["verify"], gen_fn=deps["generate"], store_fn=deps["store"],
+        learn_fn=deps.get("learn_procedure"),
     )
     critiques, redteam_report = red_team_findings(
         survivors, config=config, gen_fn=deps["generate"], store_fn=deps["store"]
@@ -904,6 +1000,7 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
             "reports": verify_reports,
             "survivor_count": len(survivors),
             "survivor_finding_ids": [item.finding_id for item in survivors],
+            "procedure_learning_enabled": config.learn_procedures,
         },
         "red_team": redteam_report,
         "synthesis": synthesis,
@@ -913,7 +1010,9 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Local-Ollama deep-think chain for Loci.")
+    ap = argparse.ArgumentParser(
+        description="Local-Ollama deep-think chain for Loci with fail-open procedure auto-learning."
+    )
     ap.add_argument("topic", help="Topic/question to reason over.")
     ap.add_argument("--investigation-id")
     ap.add_argument("--title")
@@ -931,6 +1030,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Disable the bounded critique+revise pass after synthesis.",
     )
     ap.add_argument("--redteam-model")
+    ap.add_argument(
+        "--no-learn-procedures",
+        action="store_true",
+        help="Disable auto-promotion of confirmed high-confidence action-shaped findings.",
+    )
     ap.add_argument("--red-team", action="store_true", help="Enable the adversarial red-team tier.")
     ap.add_argument("--ideas-per-model", type=int, default=3)
     ap.add_argument("--retrieval-limit", type=int, default=8)
