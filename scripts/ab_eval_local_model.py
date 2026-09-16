@@ -134,43 +134,47 @@ VERIFY_CASES = [
 # model actually has to reason rather than pattern-match on a single obvious cue.
 HARD_CLASSIFY_CASES = [
     {
+        # Keyword decoy: "broken" strongly cues bug, but the content is a pagination limit --
+        # asking for a larger/configurable page size is a feature request, not a defect.
         "text": (
-            "Users report the export command is slow, and while investigating we noticed it "
-            "also silently drops findings older than 30 days without any warning. Should we "
-            "file this as the thing to fix, or treat it as a request for a new archival mode?"
-        ),
-        "labels": ["bug", "feature", "question"],
-        # Silent data loss is a defect even though the message also proposes a feature-shaped fix.
-        "expected": "bug",
-    },
-    {
-        "text": (
-            "Loving the new investigation_reflect output, but I'm not sure if I'm supposed to "
-            "call it before or after verify_finding for it to pick up unresolved conflicts -- "
-            "the docs mention both orders in different places."
-        ),
-        "labels": ["bug", "feature", "question"],
-        "expected": "question",
-    },
-    {
-        "text": (
-            "It would help operators a lot if the audit_log had a machine-readable --since "
-            "timestamp filter instead of forcing us to grep the whole file every time we page "
-            "someone at 3am for a suspected token-binding regression."
+            "Search results are broken -- it only ever shows 10 items no matter how many match. "
+            "Can we get a --page-size flag so I can pull more results per call?"
         ),
         "labels": ["bug", "feature", "question"],
         "expected": "feature",
     },
     {
+        # Keyword decoy: phrased exactly like a feature request ("it would be great if X "
+        # didn't happen"), but the content describes a crash -- that's a bug.
         "text": (
-            "The dry-run flag on memory_demote works fine for a single entity, but running it "
-            "against a batch silently no-ops after the first item -- no error, no log line, "
-            "the rest just never get evaluated."
+            "It would be great if verify_finding didn't throw a KeyError every time code_refs "
+            "is left empty -- right now it just dies instead of falling back to uncertain."
+        ),
+        "labels": ["bug", "feature", "question"],
+        "expected": "bug",
+    },
+    {
+        # Keyword decoy: contains "error", but the person is asking whether documented behavior
+        # is expected/where the docs are, not reporting a new defect -- that's a question.
+        "text": (
+            "I get an error running investigation_export without --format. Is a format supposed "
+            "to be required, or is there a default value I'm missing in the docs somewhere?"
+        ),
+        "labels": ["bug", "feature", "question"],
+        "expected": "question",
+    },
+    {
+        # Keyword decoy: phrased as a yes/no question ("is it expected...?"), but it's reporting
+        # a concrete, reproducible failure under load -- that's a bug regardless of phrasing.
+        "text": (
+            "Is it expected that reflection_loop_tick returns a 500 on roughly every third call "
+            "once we put it under load? It's fully reproducible in our staging cluster."
         ),
         "labels": ["bug", "feature", "question"],
         "expected": "bug",
     },
 ]
+
 
 HARD_COMPRESS_CASES = [
     {
@@ -225,43 +229,51 @@ HARD_COMPRESS_CASES = [
 
 HARD_VERIFY_CASES = [
     {
-        "claim": "The retry logic guarantees at-most-once delivery.",
+        # Requires counting across the described sequence, not sentiment/keyword matching:
+        # attempt 1 mints key A, retry after timeout reuses A, retry after a connection reset
+        # mints a fresh key B -- so not all three attempts share one key.
+        "claim": "All three attempts used the same idempotency key.",
         "context": (
-            "The client retries on timeout, but the server does not deduplicate by request id -- "
-            "it only logs a warning if the same id is seen twice. A retried request that actually "
-            "succeeded server-side but timed out on the response would be re-applied."
+            "The client mints a fresh idempotency key on the first attempt. A retry after a "
+            "timeout reuses that same key. A second retry, triggered by a connection reset "
+            "rather than a timeout, mints a brand-new key because the client treats connection "
+            "resets differently from timeouts."
         ),
-        # Contradicts the claim: no dedup means retries can double-apply, so it's at-least-once, not at-most-once.
         "expected": "refuted",
     },
     {
-        "claim": "Increasing the lock timeout fixed the transport deadlock.",
+        # Requires arithmetic: max attempts actually used across the batch (3) sits exactly at
+        # the stated budget (3), so nothing exceeded it -- a naive "sounds risky" read could
+        # wrongly flag this as refuted just because retries happened at all.
+        "claim": "No item exceeded its retry budget during the batch run.",
         "context": (
-            "The team increased the lock timeout from 2s to 10s and the deadlock reports stopped "
-            "for two weeks. Separately, that same release also changed the retry backoff curve "
-            "and disabled a health-check that had been holding a read lock during probes."
-        ),
-        # Two other simultaneous changes could equally explain it; can't attribute to the timeout alone.
-        "expected": "uncertain",
-    },
-    {
-        "claim": "The bounded lock wait change (#295) resolved the root cause reported in issue #294.",
-        "context": (
-            "Issue #294 described leases never releasing under contention. #295's changelog "
-            "states it adds a bounded wait so a lock acquisition attempt fails fast instead of "
-            "blocking forever, and includes a regression test that reproduces #294's exact "
-            "contention pattern and asserts the lease is released within the bound."
+            "The batch processed 12 items with a per-item retry budget of 3 attempts. Nine "
+            "items succeeded on the first try. Two items needed a second attempt after "
+            "transient errors. One item needed a third attempt, which then succeeded."
         ),
         "expected": "confirmed",
     },
     {
-        "claim": "The hermes cron runner only ever processes jobs that are exactly on schedule.",
+        # Requires temporal overlap reasoning: the nightly job typically finishes after the
+        # backup already starts, so it does not reliably run strictly before it.
+        "claim": "The nightly job reliably finishes before the morning backup starts.",
         "context": (
-            "The runner was extended to also catch up on overdue jobs missed during downtime, "
-            "running them once on the next tick with their original scheduled time preserved "
-            "in the log entry rather than being skipped."
+            "The nightly job kicks off at 11:59 PM and typically finishes around 12:15 AM. The "
+            "morning backup starts at 12:00 AM sharp regardless of whether the nightly job has "
+            "finished."
         ),
         "expected": "refuted",
+    },
+    {
+        # Requires matching an exact count against a description that lists one exception, not
+        # keyword sentiment -- only 3 of the 4 named services were actually affected.
+        "claim": "Two of the four services affected by the outage have already been patched.",
+        "context": (
+            "auth-service and billing-service were patched on Monday. gateway-service's patch "
+            "is still in code review. notification-service was not affected by the outage at "
+            "all -- it was included in the incident channel by mistake."
+        ),
+        "expected": "uncertain",
     },
 ]
 
