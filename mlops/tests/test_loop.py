@@ -970,6 +970,7 @@ def mainenv(env, monkeypatch):
         "sft": True,
         "active_learn": {},
         "rebuild": None,   # None → keep current dataset size
+        "honesty": {"consistent": None, "unsupported_claims": [], "ok": False, "error": "stubbed"},
     }
 
     def rec(name, ret=None):
@@ -1000,6 +1001,8 @@ def mainenv(env, monkeypatch):
     monkeypatch.setattr(loop, "_run_active_learn", lambda *a, **k: (
         calls["active_learn"].append((a, k)), rv["active_learn"])[1])
     monkeypatch.setattr(loop, "_emit_embedding_trigger", rec("emit"))
+    monkeypatch.setattr(loop, "check_summary_consistency",
+                        lambda *a, **k: dict(rv["honesty"]))
 
     env.calls = calls
     env.rv = rv
@@ -1335,6 +1338,90 @@ def test_main_history_carries_train_metrics_verbatim(mainenv):
     e.main("--force")
     assert read_history(e)[0]["train_metrics"] == {"decision": "HOLD", "model": "svm",
                                                   "cv_f1_mean": 0.4}
+
+
+def test_redacted_honesty_payload_bounds_and_redacts_verbose_fields(env):
+    payload = loop._redacted_honesty_payload(
+        "S" * 2000,
+        {
+            "run_at": "2026-09-16T00:00:00+00:00",
+            "new_runs": 2,
+            "dataset_size": 42,
+            "retrained": True,
+            "promoted": False,
+            "train_metrics": {
+                "decision": "PROMOTE",
+                "model": "lr",
+                "cv_f1_mean": 0.9,
+                "cosine_baseline_cv_f1": 0.7,
+                "roc_auc": 0.99,
+            },
+            "dry_run": False,
+            "failed_steps": [],
+            "alerts": [],
+        },
+        {
+            "ollama_reachable": True,
+            "dataset_pairs_before_rebuild": 10,
+            "dataset_pairs_after_run": 42,
+            "step_results": {
+                "monitor": {"rollback_recommended": False, "stdout": "X" * 1000},
+                "dataset_rebuild": {"stderr": "secret", "completed": True},
+            },
+            "artifacts": {"dataset": {"exists": True, "mtime": 123}},
+        },
+    )
+    assert len(payload["summary"]) == loop._HONESTY_SUMMARY_MAX_CHARS
+    assert payload["history"]["train_metrics"] == {
+        "decision": "PROMOTE",
+        "model": "lr",
+        "cv_f1_mean": 0.9,
+        "cosine_baseline_cv_f1": 0.7,
+    }
+    dumped = json.dumps(payload)
+    assert "roc_auc" not in dumped
+    assert "stdout" not in dumped
+    assert "stderr" not in dumped
+
+
+def test_check_summary_consistency_uses_mocked_model_and_parses_json(env, monkeypatch):
+    install_fake(monkeypatch, "backends", ollama_verify_model=lambda: "mock-verify")
+    seen = {}
+
+    def fake_gen(prompt, **kwargs):
+        seen["prompt"] = prompt
+        seen["kwargs"] = kwargs
+        return {"text": '{"consistent": false, "unsupported_claims": ["claimed promotion"]}',
+                "ok": True}
+
+    out = loop.check_summary_consistency(
+        "done. promoted=True dataset=42 total_promotions=1",
+        {"run_at": "x", "new_runs": 0, "dataset_size": 42, "retrained": False,
+         "promoted": True, "train_metrics": None, "dry_run": False,
+         "failed_steps": [], "alerts": []},
+        {"dataset_pairs_before_rebuild": 42, "dataset_pairs_after_run": 42,
+         "step_results": {}, "artifacts": {}},
+        gen_fn=fake_gen,
+    )
+    assert out == {"consistent": False, "unsupported_claims": ["claimed promotion"],
+                   "ok": True, "error": None}
+    assert seen["kwargs"]["model"] == "mock-verify"
+    assert seen["kwargs"]["fmt"] == "json"
+    assert seen["kwargs"]["temperature"] == 0.0
+    assert '"summary": "done. promoted=True dataset=42 total_promotions=1"' in seen["prompt"]
+
+
+def test_check_summary_consistency_fails_open_when_model_raises(env, monkeypatch):
+    install_fake(monkeypatch, "backends", ollama_verify_model=lambda: "mock-verify")
+
+    def boom(*a, **k):
+        raise RuntimeError("ollama down")
+
+    out = loop.check_summary_consistency("done", {}, {}, gen_fn=boom)
+    assert out["ok"] is False
+    assert out["consistent"] is None
+    assert out["unsupported_claims"] == []
+    assert "ollama down" in out["error"]
 
 
 # --- decay cadence ------------------------------------------------------------
@@ -1833,3 +1920,52 @@ def test_alerts_are_reported_separately_from_failures(mainenv, monkeypatch, caps
     assert rec["failed_steps"] == [], "an alert is not a failure"
     assert rc == 0, "an alert alone must not fail the run"
     assert "1 alert(s): canary" in capsys.readouterr().out
+
+
+def test_summary_honesty_alert_does_not_change_a_clean_exit_or_promotion(mainenv):
+    e = mainenv
+    e.rv["retrain"] = {"decision": "PROMOTE", "model": "lr", "cv_f1_mean": 0.9,
+                       "cosine_baseline_cv_f1": 0.7}
+    e.rv["canary"] = {"exit_code": 0}
+    e.rv["honesty"] = {
+        "consistent": False,
+        "unsupported_claims": ["claimed promotion without support"],
+        "ok": True,
+        "error": None,
+    }
+    rc = e.main("--force")
+    rec = read_history(e)[0]
+    assert rc == 0, "summary corroboration must not flip a clean run nonzero"
+    assert rec["promoted"] is True
+    assert state_of(e)["total_promotions"] == 1
+    assert "summary honesty" in rec["alerts"]
+    assert rec["failed_steps"] == []
+
+
+def test_summary_honesty_alert_does_not_clear_an_existing_failure(mainenv):
+    e = mainenv
+    e.rv["retrain"] = None
+    e.rv["rebuild"] = None
+    e.rv["honesty"] = {
+        "consistent": False,
+        "unsupported_claims": ["claimed success"],
+        "ok": True,
+        "error": None,
+    }
+    loop._fail("train.py", "boom")
+    rc = loop._finish(
+        state=dict(DEFAULT_STATE),
+        args=types.SimpleNamespace(dry_run=True),
+        now_iso="2026-09-16T00:00:00+00:00",
+        loop_count=1,
+        new_runs=[],
+        current_size=0,
+        should_retrain=False,
+        promoted=False,
+        train_metrics=None,
+        run_evidence={},
+    )
+    rec = read_history(e)[0]
+    assert rc == 1, "summary corroboration must not mask pre-existing FAILED_STEPS"
+    assert rec["failed_steps"] == ["train.py"]
+    assert "summary honesty" in rec["alerts"]
