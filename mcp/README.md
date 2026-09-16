@@ -107,12 +107,12 @@ server twice under two names publishes every tool twice:
 }
 ```
 
-## Tools (71)
+## Tools (72)
 
-71 tools are registered at runtime: 60 defined in `server.py`, plus 11 code-graph
+72 tools are registered at runtime: 61 defined in `server.py`, plus 11 code-graph
 tools registered from `graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)` at
 server startup — which is why they do not appear as `@mcp.tool()` in `server.py`.
-The same inventory is listed in the [top-level README](../README.md#mcp-tools-71).
+The same inventory is listed in the [top-level README](../README.md#mcp-tools-74).
 
 **Session management:**
 - `investigation_start(investigation_id, title, context?)` — create or resume a session
@@ -168,6 +168,7 @@ The same inventory is listed in the [top-level README](../README.md#mcp-tools-71
 - `contract_declare(investigation_id, entity, role, fields, protocol?)` — store a cross-boundary contract declaration
 - `contract_query(investigation_id, entity, role?)` — query stored contract declarations
 - `contract_check(investigation_id, field_name, entity?)` — check a field name against stored contracts
+- `wiring_obligation_scan(content, path?, context?)` — advisory-only scan for implicit obligations that may merit manual declaration
 - `wiring_obligation_declare(investigation_id, class_name, method_name, expected_effect)` — declare an unverified integration point
 - `wiring_obligation_list(investigation_id, resolved?)` — list wiring obligations
 - `wiring_obligation_resolve(investigation_id, finding_id, evidence)` — resolve one with evidence of fulfillment

@@ -206,14 +206,14 @@ $LOCI_MEMORY_DIR/
 - `procedure` — a reusable step-by-step runbook/playbook entry; takes
   `procedure_preconditions`, `procedure_steps`, `procedure_postconditions`
 
-**71 MCP tools provided by loci-mcp** — 60 decorated `@mcp.tool()` in `mcp/server.py`
+**72 MCP tools provided by loci-mcp** — 61 decorated `@mcp.tool()` in `mcp/server.py`
 plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)`.
 The tables below cover the 24 most-used ones. The rest are:
 `investigation_as_of`, `investigation_share`, `investigation_unshare`,
 `investigation_verify_all`, `investigation_reason`, `investigation_export`,
 `investigation_import`, `finding_resolve`, `procedure_attempt`, `procedure_search`,
 `entity_list`, `entity_timeline`, `contract_declare`, `contract_query`,
-`contract_check`, `wiring_obligation_declare`, `wiring_obligation_list`,
+`contract_check`, `wiring_obligation_scan`, `wiring_obligation_declare`, `wiring_obligation_list`,
 `wiring_obligation_resolve`, `llm_local`, `generate_batch`, `query_expand`,
 `verify_finding`, `classify_text`, `compress_text`, `semantic_dedup`,
 `semantic_relevance`, `loci_health`, `ground`, `memory_surface`, `memory_promote`,

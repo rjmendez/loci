@@ -309,13 +309,13 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 138, result.meta.file_count  # 128 -> ... -> 137 -> 138: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage
+    assert result.meta.file_count == 139, result.meta.file_count  # 128 -> ... -> 138 -> 139: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]
     from collections import Counter
     by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    assert by_rule["DEC-tool"] == 43, dict(by_rule)
+    assert by_rule["DEC-tool"] == 44, dict(by_rule)
     assert by_rule["DEC-route"] == 6, dict(by_rule)
     assert by_rule["DEC-mcp-route"] == 1, dict(by_rule)
     assert by_rule["MAN-LOOP"] == 31, dict(by_rule)
