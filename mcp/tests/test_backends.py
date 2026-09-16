@@ -129,6 +129,33 @@ def test_guardian_model_env_wins_over_config(tmp_path, monkeypatch):
     assert B.ollama_guardian_model() == "env-guardian:latest"
 
 
+def test_redteam_model_defaults_to_heretic_qwen38(monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    B._reset_cache()
+    assert B.ollama_redteam_model() == (
+        "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+    )
+
+
+def test_redteam_model_config_key_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nredteam_model = "heretic-gemma3-4b-it:latest"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.ollama_redteam_model() == "heretic-gemma3-4b-it:latest"
+
+
+def test_redteam_model_env_wins_over_config(tmp_path, monkeypatch):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nredteam_model = "cfg-heretic:latest"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    monkeypatch.setenv("LOCI_OLLAMA_REDTEAM_MODEL", "env-heretic:latest")
+    assert B.ollama_redteam_model() == "env-heretic:latest"
+
+
 def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "OLLAMA_BASE_URL", "OLLAMA_URL"):
         monkeypatch.delenv(k, raising=False)

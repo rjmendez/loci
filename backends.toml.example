@@ -36,6 +36,13 @@
                                             # LOCI_OLLAMA_GUARDIAN_MODEL / OLLAMA_BASE_URL /
                                             # OLLAMA_GEN_URL env vars, since the hook is a
                                             # standalone stdlib script and doesn't import mcp/).
+# redteam_model = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+                                            # optional: explicitly adversarial model for
+                                            # scripts/local_deep_think.py's --red-team tier.
+                                            # Defaults to a heretic/abliterated Qwen3.8 build
+                                            # because aligned models often refuse or soften the
+                                            # "attack this proposal as an adversary would"
+                                            # framing used there.
 #
 # Gotcha on Windows+WSL2 (NAT networking, the default — no networkingMode=mirrored
 # in .wslconfig): WSL cannot reach a Windows-bound Ollama via 127.0.0.1, the WSL
