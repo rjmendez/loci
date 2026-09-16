@@ -11,6 +11,8 @@ new tag is a separate explicit step via LOCI_OLLAMA_GEN_MODEL or ~/.loci/backend
 from __future__ import annotations
 
 import argparse
+import errno
+import hashlib
 import json
 import os
 import shutil
@@ -26,6 +28,7 @@ _REPO = _HERE.parent
 _MODELS_DIR = Path.home() / ".loci" / "models" / "ollama"
 _RESERVE_BYTES = 2 * 1024 ** 3
 _TIMEOUT = 30.0
+_PART_SUFFIX = ".part"
 
 
 @dataclass(frozen=True)
@@ -37,8 +40,8 @@ class ModelSpec:
     tag_prefix: str
     allowed_quants: tuple[str, ...]
     default_quant: str
-    prompt: str
     expected_bytes: dict[str, int]
+    expected_sha256: dict[str, str]
 
     def filename(self, quant: str) -> str:
         return f"{self.filename_prefix}-{quant.upper()}.gguf"
@@ -56,6 +59,7 @@ class Plan:
     gguf_path: Path
     local_modelfile: Path
     expected_bytes: int
+    expected_sha256: str | None
 
 
 _SPECS: dict[str, ModelSpec] = {
@@ -67,10 +71,13 @@ _SPECS: dict[str, ModelSpec] = {
         tag_prefix="loci-qwen25-coder-14b-abliterated",
         allowed_quants=("q4_k_m", "q5_k_m"),
         default_quant="q4_k_m",
-        prompt="Reply with exactly: ready",
         expected_bytes={
             "q4_k_m": 8988111200,
             "q5_k_m": 10508874080,
+        },
+        expected_sha256={
+            "q4_k_m": "e89a7ae4e2b456bf33c75cff35664751df20ff273e551d7cf7640aa9e84d3b79",
+            "q5_k_m": "dd5d9d157919fdedacfd42ed7095d818fc5dc76cf8084fb3393f17fbe7cd5038",
         },
     ),
     "27b-qwen38": ModelSpec(
@@ -81,10 +88,13 @@ _SPECS: dict[str, ModelSpec] = {
         tag_prefix="loci-qwen38-27b-abliterated",
         allowed_quants=("q5_k", "q6_k"),
         default_quant="q5_k",
-        prompt="Reply with exactly: ready",
         expected_bytes={
             "q5_k": 19535701280,
             "q6_k": 22430999840,
+        },
+        expected_sha256={
+            "q5_k": "917453854fc640903f89bda0b29eb7ea661cb13b9c5c9efd20a68f3ff2e9277f",
+            "q6_k": "a5c159519d7bdba523578977d649dbfc48f2e47277ec77edd77670003b5b2492",
         },
     ),
     "24b-mistral": ModelSpec(
@@ -95,10 +105,13 @@ _SPECS: dict[str, ModelSpec] = {
         tag_prefix="loci-mistral-small-24b-abliterated",
         allowed_quants=("q5_k_m", "q6_k"),
         default_quant="q5_k_m",
-        prompt="Reply with exactly: ready",
         expected_bytes={
             "q5_k_m": 16763984896,
             "q6_k": 19345939456,
+        },
+        expected_sha256={
+            "q5_k_m": "d52d5394c5364ea8bfa82109ce8fd837235d8d83aa636fc66403f4c9709a3a17",
+            "q6_k": "224ee68e5914951a096ceb41fe2f4dcb974101c584836e693f93bb4ad95165ec",
         },
     ),
     "26b-gemma4": ModelSpec(
@@ -109,10 +122,13 @@ _SPECS: dict[str, ModelSpec] = {
         tag_prefix="loci-gemma4-26b-a4b-abliterated",
         allowed_quants=("q4_k_m", "q5_k_m"),
         default_quant="q4_k_m",
-        prompt="Reply with exactly: ready",
         expected_bytes={
             "q4_k_m": 16868236224,
             "q5_k_m": 21150358464,
+        },
+        expected_sha256={
+            "q4_k_m": "e049f67e6d4f22700f39b8018f7612d455151891dd4e5cbac06f13ce3b6e83f5",
+            "q5_k_m": "03d1774ee1756ca6226a415a09ca8b5fd863e46733b79fb38b1aad2991d477d8",
         },
     ),
 }
@@ -159,6 +175,7 @@ def build_plan(model: str, *, quant: str | None, models_dir: Path, tag: str | No
         gguf_path=root / spec.filename(chosen),
         local_modelfile=root / f"{spec.template}.local",
         expected_bytes=expected,
+        expected_sha256=spec.expected_sha256.get(chosen),
     )
 
 
@@ -181,6 +198,15 @@ def _human_bytes(n: int) -> str:
             return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
         size /= 1024
     return f"{n}B"
+
+
+def _smoke_marker(plan: Plan) -> str:
+    token = f"loci-smoke-{plan.spec.choice}-{plan.quant}"
+    return token.replace("_", "").lower()
+
+
+def _smoke_prompt(plan: Plan) -> str:
+    return f"Repeat exactly this token with no extra words: {_smoke_marker(plan)}"
 
 
 def _require_tool(names: tuple[str, ...], label: str) -> str:
@@ -221,6 +247,59 @@ def _existing_file_state(path: Path, expected_bytes: int) -> str:
     return "mismatch"
 
 
+def _part_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}{_PART_SUFFIX}")
+
+
+def _stage_dir(path: Path) -> Path:
+    return path.with_name(f".{path.name}.download")
+
+
+def _cleanup_download_artifacts(*paths: Path) -> None:
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_checksum(plan: Plan, path: Path | None = None) -> None:
+    target = path or plan.gguf_path
+    expected = plan.expected_sha256
+    if not expected:
+        raise RuntimeError(
+            f"missing SHA256 manifest entry for {plan.spec.choice}/{plan.quant}. "
+            "Populate scripts/deploy_abliterated_model.py with the real GGUF hash before deploy.")
+    actual = _file_sha256(target)
+    if actual != expected:
+        raise RuntimeError(
+            f"SHA256 mismatch for {target}: expected {expected}, got {actual}. "
+            "Aborting before ollama create.")
+
+
+def _download_detail(result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout or "").strip()
+    if not detail:
+        return ""
+    return f": {detail.splitlines()[0][:200]}"
+
+
+def _raise_enospc(part_path: Path, exc: OSError | None = None) -> None:
+    msg = (f"download ran out of disk space while writing {part_path}; "
+           "cleaned up the partial download. Free space and retry.")
+    if exc is None:
+        raise RuntimeError(msg)
+    raise RuntimeError(msg) from exc
+
+
 def _disk_usage_path(path: Path) -> Path:
     probe = path
     while not probe.exists() and probe != probe.parent:
@@ -254,15 +333,36 @@ def _ensure_space(plan: Plan) -> None:
 
 def _download(hf_cli: str, plan: Plan) -> None:
     plan.gguf_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path = _part_path(plan.gguf_path)
+    stage_dir = _stage_dir(plan.gguf_path)
+    _cleanup_download_artifacts(part_path, stage_dir)
     cmd = [hf_cli, "download", plan.spec.repo, "--include", plan.gguf_path.name,
-           "--local-dir", str(plan.gguf_path.parent)]
+           "--local-dir", str(stage_dir)]
     print("[deploy] downloading:", " ".join(cmd))
-    result = subprocess.run(cmd, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"download failed (exit {result.returncode})")
-    state = _existing_file_state(plan.gguf_path, plan.expected_bytes)
-    if state != "ready":
-        raise RuntimeError(f"download finished but {plan.gguf_path.name} is {state}, not complete")
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True)
+        if result.returncode != 0:
+            detail = _download_detail(result).lower()
+            if "no space left on device" in detail:
+                _raise_enospc(part_path)
+            raise RuntimeError(f"download failed (exit {result.returncode}){_download_detail(result)}")
+        staged = stage_dir / plan.gguf_path.name
+        state = _existing_file_state(staged, plan.expected_bytes)
+        if state != "ready":
+            raise RuntimeError(f"download finished but {plan.gguf_path.name} is {state}, not complete")
+        os.replace(staged, part_path)
+        _verify_checksum(plan, part_path)
+        os.replace(part_path, plan.gguf_path)
+    except OSError as exc:
+        _cleanup_download_artifacts(part_path, stage_dir)
+        if exc.errno == errno.ENOSPC:
+            _raise_enospc(part_path, exc)
+        raise
+    except Exception:
+        _cleanup_download_artifacts(part_path, stage_dir)
+        raise
+    finally:
+        _cleanup_download_artifacts(stage_dir)
 
 
 def _write_modelfile(plan: Plan) -> None:
@@ -288,7 +388,7 @@ def _create_model(plan: Plan, *, base_url: str) -> None:
 def _smoke_test(plan: Plan, *, base_url: str, keep_alive: str) -> dict:
     body = {
         "model": plan.tag,
-        "prompt": plan.spec.prompt,
+        "prompt": _smoke_prompt(plan),
         "stream": False,
         "keep_alive": keep_alive,
         "options": {"num_predict": 16, "temperature": 0.0},
@@ -297,6 +397,10 @@ def _smoke_test(plan: Plan, *, base_url: str, keep_alive: str) -> dict:
     text = (out.get("response") or "").strip()
     if not text:
         raise RuntimeError("smoke test returned an empty response")
+    marker = _smoke_marker(plan)
+    if marker not in text.lower():
+        raise RuntimeError(
+            f"smoke test did not echo expected marker {marker!r}; got {text!r}")
     return out
 
 
@@ -374,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         if _existing_file_state(plan.gguf_path, plan.expected_bytes) != "ready":
             _download(hf_cli, plan)
         else:
+            _verify_checksum(plan)
             print(f"[deploy] reusing existing GGUF: {plan.gguf_path}")
         _write_modelfile(plan)
         _create_model(plan, base_url=args.ollama_url)
