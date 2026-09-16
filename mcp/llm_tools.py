@@ -23,11 +23,16 @@ def _coerce_labels(labels) -> list:
     return [labels]
 
 
-def llm_local(prompt: str, model: str = "qwen2.5:3b", fmt: Optional[str] = None,
+def llm_local(prompt: str, model: str = "", fmt: Optional[str] = None,
               max_tokens: int = 256, temperature: float = 0.2, keep_alive: str = "30m") -> str:
     """
     Generate with a local Ollama model for cheap high-volume work that should
-    avoid Claude tokens. Verified-good model: ``qwen2.5:3b``.
+    avoid Claude tokens. Leave ``model`` unset to use the configured generation
+    model (``backends.ollama_gen_model()`` / ``[ollama].gen_model``) — hard-coding
+    a specific tag here previously caused every unset-model call to silently
+    request a tag that may not exist on the configured generation host, which
+    fails open by falling through to a different (weaker/slower) tier instead
+    of the one actually intended.
 
     ``keep_alive`` keeps the model resident (default ``'30m'``) to avoid the
     ~70s cold load; keep it long on hot paths. ``fmt='json'`` constrains and
