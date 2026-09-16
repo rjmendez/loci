@@ -23,6 +23,8 @@ import logging
 import os
 import sys
 from dataclasses import asdict, dataclass
+from importlib import util as importlib_util
+from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mcp"))
@@ -31,6 +33,19 @@ import llm_tools  # noqa: E402
 from model_json import extract_json_object  # noqa: E402
 
 logger = logging.getLogger("loci-mcp.agent_output_prefilter")
+_MCP_TEXT_OPS_PATH = Path(__file__).resolve().parents[1] / "mcp" / "text_ops.py"
+
+
+def _load_mcp_text_ops():
+    spec = importlib_util.spec_from_file_location("_loci_mcp_text_ops", _MCP_TEXT_OPS_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load {_MCP_TEXT_OPS_PATH}")
+    module = importlib_util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_mcp_text_ops = _load_mcp_text_ops()
 
 
 @dataclass
@@ -292,10 +307,7 @@ def prefilter_agent_output(
             deduped_texts = [item if isinstance(item, str) else str(item) for item in kept]
 
     try:
-        compress_obj = _tool_json(
-            llm_tools.compress_text("\n\n".join(deduped_texts), max_chars=max_chars),
-            "compress_text",
-        )
+        compress_obj = _mcp_text_ops.compress("\n\n".join(deduped_texts), max_chars=max_chars)
     except Exception as exc:
         return _fallback(
             text,
