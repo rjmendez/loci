@@ -36,6 +36,24 @@ themselves. Older standalone scripts read `OLLAMA_URL`: `memgas_hierarchy.py`,
 `swr_replay.py`, `ua-ingest.py`, `gpu_warm.py`, and `eval/harness.py`.
 `mcp/embed_ops.py` and `mcp/backends.py` read both.
 
+### Opt-in heavier Ollama generation tags
+
+The checked-in default stays `qwen2.5:3b`. If you want a local abliterated tier,
+deploy one explicitly:
+
+```bash
+scripts/deploy_abliterated_model.py 14b-coder
+scripts/deploy_abliterated_model.py 24b-mistral
+```
+
+The script downloads one researched GGUF quant into `~/.loci/models/ollama/`,
+rewrites the matching `ollama/Modelfile.*` to that local path, runs `ollama create`,
+then does a tiny `/api/generate` smoke test and prints `/api/ps` / GPU state.
+
+After that, switch Loci yourself with `LOCI_OLLAMA_GEN_MODEL=<the-created-tag>`.
+See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →
+`~/.loci/backends.toml` `[ollama].gen_model` → code default) rather than changing code.
+
 ### Memory store paths
 
 | Variable | Default | Used by |
