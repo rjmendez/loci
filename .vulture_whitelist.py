@@ -42,7 +42,6 @@ _ = procedure_search
 _ = contract_declare
 _ = contract_query
 _ = contract_check
-_ = wiring_obligation_scan
 _ = wiring_obligation_declare
 _ = wiring_obligation_list
 _ = wiring_obligation_resolve
