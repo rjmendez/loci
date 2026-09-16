@@ -6,7 +6,25 @@
 # The hosts below are PLACEHOLDERS — replace with your own.
 
 [ollama]
-# url = "http://gpu-host:11434"        # remote Ollama / local GPU host (omit to use local :11434)
+# url = "http://gpu-host:11434"        # EMBEDDING endpoint (omit to use local :11434)
+# gen_url = "http://gpu-host:11434"    # GENERATION endpoint — resolved SEPARATELY from `url`
+                                        # (mcp/llm_local.py). These are often different hosts:
+                                        # a shared/cluster Ollama may serve embeddings only, while
+                                        # your own GPU box serves generation with a richer model
+                                        # library. Omit gen_url to fall back to `url`.
+# gen_model = "your-pulled-model:tag"  # must be a tag `ollama list` actually shows on gen_url —
+                                        # an unpulled/misspelled tag fails EVERY generate() call
+                                        # silently (fail-open -> degraded=True everywhere upstream:
+                                        # compress_text, classify_text, query_expand, verify_finding)
+#
+# Gotcha on Windows+WSL2 (NAT networking, the default — no networkingMode=mirrored
+# in .wslconfig): WSL cannot reach a Windows-bound Ollama via 127.0.0.1, the WSL
+# default-route gateway IP, or any other Windows adapter IP, even with matching
+# Windows Firewall allow rules already in place — NAT mode simply doesn't bridge
+# WSL to arbitrary Windows-side ports that way. The one address that reliably
+# works is the Windows host's OWN Tailscale (or other VPN mesh) IP, if it has one
+# on the same tailnet as the WSL/Loci side. Confirm with a direct
+# `curl http://<candidate-ip>:11434/api/tags` before trusting any IP guess.
 
 [embed]
 # model = "nomic-embed-text"
