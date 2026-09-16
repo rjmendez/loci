@@ -19,6 +19,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # Ensure the mcp/ directory is on the path so `import server` resolves correctly.
@@ -1362,6 +1363,60 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
         # Call reflect to compute and persist L1/L2 summaries
         server.investigation_reflect(investigation_id=inv_id)
 
+    def _setup_investigation_for_reflect(self, inv_id):
+        server.investigation_start(investigation_id=inv_id, title="Reflect critique test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="Primary DB host 10.0.0.9 returns timeout errors during failover.",
+            source="test:db",
+            confidence="high",
+        )
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="assumed",
+            text="Traffic likely shifted to a stale replica after the timeout spike.",
+            source="test:hypothesis",
+            confidence="medium",
+        )
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="gap",
+            text="Replica routing logs have not yet been collected.",
+            source="test:gap",
+            confidence="low",
+        )
+
+    def _patched_memcheck_llm(self, *, available, responses=None):
+        import memcheck
+
+        fake = mock.MagicMock()
+        fake.llm_available.return_value = available
+        if responses is not None:
+            fake.call_llm.side_effect = list(responses)
+        return mock.patch.object(memcheck, "llm", fake, create=True), \
+            mock.patch.dict("sys.modules", {"memcheck.llm": fake}), fake
+
+    def _assert_reflect_core_fields(self, result):
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["finding_counts"]["observed"], 1)
+        self.assertEqual(result["finding_counts"]["assumed"], 1)
+        self.assertEqual(result["finding_counts"]["gap"], 1)
+        self.assertEqual(result["key_entities"]["ips"], [["10.0.0.9", 1]])
+        self.assertEqual(len(result["self_check"]["unsupported_observed"]), 1)
+        self.assertEqual(
+            result["self_check"]["unsupported_observed"][0]["rationale"],
+            "observed finding has no matching audit receipt",
+        )
+        self.assertEqual(result["self_check"]["contradictions"], [])
+        self.assertEqual(result["self_check"]["hallucination_candidates"], [])
+        self.assertEqual(len(result["gaps"]), 1)
+        self.assertEqual(
+            _unwrap(result["gaps"][0]),
+            "Replica routing logs have not yet been collected.",
+        )
+        self.assertIn("recent_per_type", result)
+
     def test_investigation_load_fidelity_full_returns_recent_findings(self):
         """fidelity='full' (default) returns recent_findings and manifest."""
         inv_id = _new_id("fid-full")
@@ -1433,6 +1488,121 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
         manifest = load_result["manifest"]
         self.assertIn("summary_l1", manifest)
         self.assertIn("summary_l2", manifest)
+
+    def test_investigation_reflect_populates_self_critique_when_model_available(self):
+        inv_id = _new_id("ref-critique")
+        self._setup_investigation_for_reflect(inv_id)
+        patches = self._patched_memcheck_llm(
+            available=True,
+            responses=[
+                json.dumps([
+                    "DB timeout observed on 10.0.0.9.",
+                    "Replica routing remains hypothetical.",
+                ]),
+                "DB timeouts are established, but replica routing is still unverified.",
+                "- finding-2 looks weakest: replica routing is inferred from timing, not logs.\n"
+                "- finding-3 marks the biggest gap: routing logs are still missing.",
+            ],
+        )
+
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+
+        self._assert_reflect_core_fields(reflect_result)
+        self.assertEqual(
+            reflect_result["summary_l1"],
+            ["DB timeout observed on 10.0.0.9.", "Replica routing remains hypothetical."],
+        )
+        self.assertEqual(
+            reflect_result["summary_l2"],
+            "DB timeouts are established, but replica routing is still unverified.",
+        )
+        self.assertIn("self_critique", reflect_result)
+        self.assertIn("replica routing is inferred from timing", reflect_result["self_critique"])
+        self.assertIn("routing logs are still missing", reflect_result["self_critique"])
+
+    def test_investigation_reflect_omits_self_critique_when_model_unavailable(self):
+        inv_id = _new_id("ref-critique-off")
+        self._setup_investigation_for_reflect(inv_id)
+        patches = self._patched_memcheck_llm(available=False)
+
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+
+        self._assert_reflect_core_fields(reflect_result)
+        self.assertNotIn("self_critique", reflect_result)
+        self.assertEqual(
+            reflect_result["summary_l1"],
+            [
+                "Primary DB host 10.0.0.9 returns timeout errors during failover.",
+                "Traffic likely shifted to a stale replica after the timeout spike.",
+                "Replica routing logs have not yet been collected.",
+            ],
+        )
+        self.assertEqual(
+            reflect_result["summary_l2"],
+            "Investigation with 3 findings. Latest: Replica routing logs have not yet been collected.",
+        )
+
+    def test_investigation_reflect_core_fields_are_unchanged_with_or_without_self_critique(self):
+        base_inv = _new_id("ref-critique-base")
+        llm_inv = _new_id("ref-critique-llm")
+        self._setup_investigation_for_reflect(base_inv)
+        self._setup_investigation_for_reflect(llm_inv)
+
+        unavailable_patches = self._patched_memcheck_llm(available=False)
+        with unavailable_patches[0], unavailable_patches[1]:
+            without_critique = _json(server.investigation_reflect(investigation_id=base_inv))
+
+        available_patches = self._patched_memcheck_llm(
+            available=True,
+            responses=[
+                json.dumps(["A", "B"]),
+                "C",
+                "- Weakest: the stale-replica claim still lacks routing logs.",
+            ],
+        )
+        with available_patches[0], available_patches[1]:
+            with_critique = _json(server.investigation_reflect(investigation_id=llm_inv))
+
+        for key in (
+            "title",
+            "status",
+            "hypothesis",
+            "next_step",
+            "finding_counts",
+            "open_questions",
+            "checked_sources",
+            "key_entities",
+            "excluded_retracted",
+        ):
+            self.assertEqual(without_critique[key], with_critique[key], key)
+        self.assertEqual(
+            [
+                {k: v for k, v in item.items() if k != "refs"}
+                for item in without_critique["self_check"]["unsupported_observed"]
+            ],
+            [
+                {k: v for k, v in item.items() if k != "refs"}
+                for item in with_critique["self_check"]["unsupported_observed"]
+            ],
+        )
+        self.assertEqual(without_critique["self_check"]["contradictions"],
+                         with_critique["self_check"]["contradictions"])
+        self.assertEqual(without_critique["self_check"]["hallucination_candidates"],
+                         with_critique["self_check"]["hallucination_candidates"])
+        self.assertEqual([_unwrap(v) for v in without_critique["gaps"]],
+                         [_unwrap(v) for v in with_critique["gaps"]])
+        self.assertEqual(
+            {
+                t: [_unwrap(entry["text"]) for entry in entries]
+                for t, entries in without_critique["recent_per_type"].items()
+            },
+            {
+                t: [_unwrap(entry["text"]) for entry in entries]
+                for t, entries in with_critique["recent_per_type"].items()
+            },
+        )
 
     def test_investigation_start_includes_summary_fields(self):
         """Newly created investigations have summary_l1 and summary_l2 initialized."""
