@@ -18,6 +18,7 @@ Usage:
   python3 scripts/local_deep_think.py "topic here"
   python3 scripts/local_deep_think.py "topic here" --collections loci_memory --red-team
   python3 scripts/local_deep_think.py "topic here" --ideate-models llama3.1-agent:latest,qwen3.8:latest
+  python3 scripts/local_deep_think.py "topic here" --no-self-reflect
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ _TEXT_KEYS = ("text", "snippet", "content", "chunk_text", "summary", "body", "pa
 _DEFAULT_IDEATE_MODELS = "llama3.1-agent:latest,qwen3.8:latest"
 _DEFAULT_VERIFY_MODEL = "qwen3.8:latest"
 _DEFAULT_SYNTH_MODEL = "qwen3.8:latest"
+_DEFAULT_REFLECT_MODEL = "qwen3.8:latest"
 
 
 @dataclass
@@ -52,7 +54,9 @@ class ChainConfig:
     ideate_models: list[str]
     verify_model: str
     synthesize_model: str
+    self_reflect_model: str
     redteam_model: str
+    self_reflect: bool = True
     red_team: bool = False
     ideas_per_model: int = 3
     retrieval_limit: int = 8
@@ -172,6 +176,12 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         or os.environ.get("LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL")
         or _cfg_value("deep_think_synthesize_model", _DEFAULT_SYNTH_MODEL)
     )
+    self_reflect_model = (
+        args.self_reflect_model
+        or os.environ.get("LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL")
+        or _cfg_value("deep_think_self_reflect_model", _DEFAULT_REFLECT_MODEL)
+        or synthesize_model
+    )
     try:
         redteam_model = (
             args.redteam_model
@@ -199,7 +209,9 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         ideate_models=ideate_models or _split_csv(_DEFAULT_IDEATE_MODELS),
         verify_model=verify_model,
         synthesize_model=synthesize_model,
+        self_reflect_model=self_reflect_model,
         redteam_model=redteam_model,
+        self_reflect=not bool(args.no_self_reflect),
         red_team=bool(args.red_team),
         ideas_per_model=max(1, int(args.ideas_per_model)),
         retrieval_limit=max(1, int(args.retrieval_limit)),
@@ -698,6 +710,82 @@ def _normalize_synthesis(obj: dict) -> dict:
     }
 
 
+def _render_synthesis_text(synthesis: dict) -> str:
+    text = synthesis["summary"]
+    if synthesis["key_findings"]:
+        text += "\n\nKey findings:\n" + "\n".join(
+            f"- {entry['finding_id']}: {entry['why']}" for entry in synthesis["key_findings"] if entry["finding_id"]
+        )
+    if synthesis["risks"]:
+        text += "\n\nRisks:\n" + "\n".join(f"- {item}" for item in synthesis["risks"])
+    if synthesis["next_steps"]:
+        text += "\n\nNext steps:\n" + "\n".join(f"- {item}" for item in synthesis["next_steps"])
+    return text
+
+
+def _normalize_critique_lines(text: str) -> list[str]:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    bullet_lines = [line for line in lines if line.lstrip().startswith(("-", "*"))]
+    return (bullet_lines or lines)[:4]
+
+
+def _self_reflect_synthesis(topic: str, *, synthesis: dict, evidence: list[dict],
+                            config: ChainConfig, gen_fn: Callable) -> tuple[dict, dict]:
+    report = {
+        "enabled": True,
+        "model": config.self_reflect_model,
+        "iterations": 1,
+        "revised": False,
+    }
+    critique_prompt = (
+        "You are the CRITIQUE step in a bounded self-reflection loop.\n"
+        f"Topic: {topic}\n"
+        f"Synthesized answer:\n{_render_synthesis_text(synthesis)}\n\n"
+        "Available evidence:\n"
+        f"{json.dumps(evidence, indent=2)}\n\n"
+        "What in this synthesized answer is weakest, least verified, most likely to be "
+        "an unsupported claim, most likely to have a logical gap, or most likely to "
+        "miss an important constraint? Be specific and cite finding_id values when visible. "
+        "Reply with ONLY 2-4 short bullet lines of plain text, one concern per line."
+    )
+    critique_raw = _call_generate(
+        gen_fn, critique_prompt, model=config.self_reflect_model, fmt="text", max_tokens=500
+    )
+    if not critique_raw.get("ok"):
+        report["error"] = critique_raw.get("why") or "critique call failed"
+        return synthesis, report
+    critique_lines = _normalize_critique_lines(critique_raw.get("text", ""))
+    if not critique_lines:
+        report["error"] = "empty critique"
+        return synthesis, report
+    critique_text = "\n".join(critique_lines)
+    report["critique"] = critique_text
+
+    revise_prompt = (
+        "You are the REVISE step in the same bounded self-reflection loop.\n"
+        f"Topic: {topic}\n"
+        "Revise the synthesized answer to fix the concrete problems in the critique while "
+        "staying grounded in the available evidence. Do not invent new evidence, and keep "
+        "the answer direct.\n"
+        "Cite lineage by referencing finding_id, tier, and model in the summary itself.\n"
+        'Return ONLY JSON: {"summary":"...","supporting_finding_ids":["id"],'
+        '"key_findings":[{"finding_id":"id","why":"..."}],"risks":["..."],"next_steps":["..."]}\n\n'
+        f"ORIGINAL SYNTHESIS:\n{json.dumps(synthesis, indent=2)}\n\n"
+        f"CRITIQUE:\n{critique_text}\n\n"
+        f"AVAILABLE EVIDENCE:\n{json.dumps(evidence, indent=2)}"
+    )
+    revise_raw = _call_generate(
+        gen_fn, revise_prompt, model=config.self_reflect_model, max_tokens=1400
+    )
+    revised_obj = _extract_json_object(str(revise_raw.get("text", ""))) if revise_raw.get("ok") else None
+    revised = _normalize_synthesis(revised_obj or {})
+    if not revised:
+        report["error"] = revise_raw.get("why") or "unparseable revise output"
+        return synthesis, report
+    report["revised"] = True
+    return revised, report
+
+
 def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[StoredFinding],
                config: ChainConfig, gen_fn: Callable, store_fn: Callable[..., str]) -> dict:
     evidence = [
@@ -718,30 +806,41 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
     synthesis = _normalize_synthesis(obj or {})
     if not synthesis:
         summary = "No synthesis produced; synthesis tier degraded."
-        return {"summary": summary, "finding_id": None, "supporting_finding_ids": []}
+        return {
+            "summary": summary,
+            "finding_id": None,
+            "supporting_finding_ids": [],
+            "self_reflection": {"enabled": config.self_reflect, "revised": False},
+        }
+
+    reflection_report = {"enabled": False, "revised": False}
+    source_suffix = f"synthesize/{config.synthesize_model}"
+    if config.self_reflect:
+        synthesis, reflection_report = _self_reflect_synthesis(
+            topic, synthesis=synthesis, evidence=evidence, config=config, gen_fn=gen_fn
+        )
+        if reflection_report.get("revised"):
+            source_suffix = f"self-reflect/{config.self_reflect_model}"
+    final_model = config.self_reflect_model if reflection_report.get("revised") else config.synthesize_model
+    tags = ["local-deep-think", "synthesize", f"model:{_safe_model_tag(final_model)}"]
+    if reflection_report.get("revised"):
+        tags.append("self-reflect")
 
     derived = synthesis["supporting_finding_ids"][:config.max_lineage]
     if not derived:
         derived = [item.finding_id for item in survivors[:config.max_lineage]]
-    text = synthesis["summary"]
-    if synthesis["key_findings"]:
-        text += "\n\nKey findings:\n" + "\n".join(
-            f"- {entry['finding_id']}: {entry['why']}" for entry in synthesis["key_findings"] if entry["finding_id"]
-        )
-    if synthesis["risks"]:
-        text += "\n\nRisks:\n" + "\n".join(f"- {item}" for item in synthesis["risks"])
-    if synthesis["next_steps"]:
-        text += "\n\nNext steps:\n" + "\n".join(f"- {item}" for item in synthesis["next_steps"])
+    text = _render_synthesis_text(synthesis)
     fid = persist_record(
         store_fn,
         investigation_id=config.investigation_id,
         text=text,
-        source=f"scripts/local_deep_think.py#synthesize/{config.synthesize_model}",
+        source=f"scripts/local_deep_think.py#{source_suffix}",
         confidence="high",
-        tags=["local-deep-think", "synthesize", f"model:{_safe_model_tag(config.synthesize_model)}"],
+        tags=tags,
         derived_from=derived,
     )
     synthesis["finding_id"] = fid
+    synthesis["self_reflection"] = reflection_report
     return synthesis
 
 
@@ -763,7 +862,8 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
         context=(
             "Standalone local deep-think chain: ideate with diverse local models, "
             "persist through a dedicated writer, verify with mcp/verify.py, "
-            "optionally red-team with an abliterated model, then synthesize."
+            "optionally red-team with an abliterated model, synthesize, then run "
+            "one bounded critique+revise self-reflection pass."
         ),
     ))
 
@@ -821,6 +921,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--ideate-models", help="Comma-separated ideation models.")
     ap.add_argument("--verify-model")
     ap.add_argument("--synthesize-model")
+    ap.add_argument(
+        "--self-reflect-model",
+        help="Model for the bounded critique+revise pass. Default: qwen3.8:latest",
+    )
+    ap.add_argument(
+        "--no-self-reflect",
+        action="store_true",
+        help="Disable the bounded critique+revise pass after synthesis.",
+    )
     ap.add_argument("--redteam-model")
     ap.add_argument("--red-team", action="store_true", help="Enable the adversarial red-team tier.")
     ap.add_argument("--ideas-per-model", type=int, default=3)
