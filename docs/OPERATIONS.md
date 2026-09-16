@@ -343,6 +343,16 @@ $LOCI_PY $LOCI/scripts/agent_output_prefilter.py \
   --threshold 0.6
 ```
 
+### Swarm reasoning tool
+
+`scripts/swarm_escalate.py` is now also exposed directly as the MCP tool
+`swarm_reason`, so downstream MCP clients can invoke the 4-stage fan-out →
+triage → selective escalation → synthesis chain without shelling out. The tool
+returns one structured JSON object with `schema_version`, `topic`, `findings`,
+`summary`, `stats`, plus diagnostic fields (`decomposition`, `triage`, `tiers`,
+`lineage`). Like the script, it is fail-open: import/runtime errors degrade into
+well-formed JSON instead of raising across the MCP boundary.
+
 Output shape:
 
 ```json
