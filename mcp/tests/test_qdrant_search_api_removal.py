@@ -130,18 +130,81 @@ class TestConflictNegationHeuristic(unittest.TestCase):
 
 
 class TestMemoryConfidence(unittest.TestCase):
-    def test_it_reports_a_trace_when_the_store_has_one(self):
+    def _payload(self, *, llm_note=None):
         points = [
             _Point("p1", 0.81, {"text": "ryan was granted contractor access", "investigation_id": "i1", "confidence": "high"}),
             _Point("p2", 0.74, {"text": "contractor access was reviewed", "investigation_id": "i2", "confidence": "medium"}),
         ]
         client = _Client(points)
         p1, p2 = _patch(client)
-        with p1, p2:
-            payload = json.loads(server.memory_confidence("contractor access"))
+        if llm_note is None:
+            with p1, p2:
+                return json.loads(server.memory_confidence("contractor access"))
+        with p1, p2, mock.patch.object(server, "_confidence_llm_entailment", return_value=llm_note):
+            return json.loads(server.memory_confidence("contractor access"))
+
+    def test_it_reports_a_trace_when_the_store_has_one(self):
+        payload = self._payload()
         self.assertNotEqual(payload["basis"], "no_trace")
         self.assertGreater(payload["confidence"], 0.0)
         self.assertEqual(payload["cues"]["fluency"], 0.81)
+
+    def test_it_adds_an_advisory_llm_entailment_note_on_success(self):
+        payload = self._payload(llm_note={
+            "available": True,
+            "verdict": "confirmed",
+            "rationale": "The top hit directly states contractor access was granted.",
+            "confidence": 0.93,
+            "degraded": False,
+            "error": "",
+        })
+        self.assertEqual(payload["llm_entailment_note"]["verdict"], "confirmed")
+        self.assertEqual(payload["llm_entailment_note"]["confidence"], 0.93)
+        self.assertFalse(payload["llm_entailment_note"]["degraded"])
+
+    def test_llm_entailment_failure_is_fail_open(self):
+        payload = self._payload(llm_note={
+            "available": False,
+            "verdict": None,
+            "rationale": "",
+            "confidence": 0.0,
+            "degraded": True,
+            "error": "model unavailable",
+        })
+        self.assertTrue(payload["llm_entailment_note"]["degraded"])
+        self.assertEqual(payload["llm_entailment_note"]["error"], "model unavailable")
+        self.assertGreater(payload["confidence"], 0.0)
+        self.assertEqual(payload["basis"], "recollection")
+
+    def test_llm_entailment_does_not_change_formula_verdict(self):
+        confirmed = self._payload(llm_note={
+            "available": True,
+            "verdict": "confirmed",
+            "rationale": "Direct support.",
+            "confidence": 0.99,
+            "degraded": False,
+            "error": "",
+        })
+        refuted = self._payload(llm_note={
+            "available": True,
+            "verdict": "refuted",
+            "rationale": "Different subject.",
+            "confidence": 0.12,
+            "degraded": False,
+            "error": "",
+        })
+        self.assertEqual(
+            {
+                "confidence": confirmed["confidence"],
+                "basis": confirmed["basis"],
+                "recommendation": confirmed["recommendation"],
+            },
+            {
+                "confidence": refuted["confidence"],
+                "basis": refuted["basis"],
+                "recommendation": refuted["recommendation"],
+            },
+        )
 
     def test_a_broken_search_is_not_reported_as_no_trace(self):
         client = _RaisingClient([])
@@ -157,6 +220,21 @@ class TestMemoryConfidence(unittest.TestCase):
         with p1, p2:
             payload = json.loads(server.memory_confidence("contractor access"))
         self.assertEqual(payload["basis"], "no_trace")
+
+
+class TestMemoryConfidenceEntailmentHelper(unittest.TestCase):
+    def test_helper_fails_open_when_model_raises(self):
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("ollama down")
+
+        result = server._confidence_llm_entailment(
+            "contractor access was granted",
+            "Ryan was granted contractor access.",
+            gen_fn=_boom,
+        )
+        self.assertFalse(result["available"])
+        self.assertTrue(result["degraded"])
+        self.assertIn("generate() raised", result["error"])
 
 
 if __name__ == "__main__":

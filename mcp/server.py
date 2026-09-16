@@ -60,7 +60,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -78,6 +78,7 @@ from memcheck.checks import (  # noqa: E402
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
 from compact import compact_context_rows, compact_finding_row, compact_sources  # noqa: E402
+from model_json import extract_json_object  # noqa: E402
 from untrusted_memory import wrap_untrusted_memory_text  # noqa: E402
 
 # Accept the legacy HERMES_* spelling of Loci's own variables.
@@ -7537,6 +7538,115 @@ def _confidence_verdict(cues: dict) -> tuple[float, str, str]:
     return confidence, basis, recommendation
 
 
+_CONFIDENCE_ENTAILMENT_VALID_VERDICTS = ("confirmed", "refuted", "uncertain")
+_CONFIDENCE_ENTAILMENT_PROMPT_TMPL = (
+    "You are checking whether retrieved memory evidence REALLY supports an EXACT claim.\n"
+    "Judge only from the evidence shown. Consider subject identity, scope, time, modality,\n"
+    "uncertainty, and negation. Evidence about a related topic, weaker possibility, or\n"
+    "different subject does NOT confirm the claim.\n\n"
+    "Return ONLY a JSON object of this exact shape, with no prose outside it:\n"
+    '{{"verdict": "confirmed|refuted|uncertain", "rationale": "brief why", "confidence": 0.0}}\n\n'
+    'Use "confirmed" only when the evidence itself supports the exact claim.\n'
+    'Use "refuted" when the evidence points the other way or clearly mismatches scope.\n'
+    'Use "uncertain" when the evidence is relevant but insufficient or ambiguous.\n\n'
+    "CLAIM:\n{claim}\n\n"
+    "TOP MEMORY HIT:\n{evidence}\n"
+)
+
+
+def _confidence_llm_entailment(
+    query: str,
+    top_text: str,
+    *,
+    gen_fn: Optional[Callable[..., dict]] = None,
+) -> dict:
+    """Advisory exact-claim support check for memory_confidence. Never raises."""
+    claim = (query or "").strip()
+    evidence = (top_text or "").strip()
+    unavailable = {
+        "available": False,
+        "verdict": None,
+        "rationale": "",
+        "confidence": 0.0,
+        "degraded": True,
+        "error": "",
+    }
+    if not claim or not evidence:
+        return dict(unavailable)
+
+    if gen_fn is None:
+        try:
+            import llm_local
+            gen_fn = llm_local.generate
+        except Exception as exc:
+            out = dict(unavailable)
+            out["error"] = f"llm_local import failed: {exc}"[:200]
+            return out
+
+    try:
+        import backends
+        model = backends.ollama_verify_model()
+    except Exception:
+        model = ""
+
+    prompt = _CONFIDENCE_ENTAILMENT_PROMPT_TMPL.format(claim=claim, evidence=evidence[:1200])
+
+    try:
+        result = gen_fn(
+            prompt,
+            model=model,
+            fmt="json",
+            max_tokens=220,
+            temperature=0.0,
+        )
+    except Exception as exc:
+        out = dict(unavailable)
+        out["error"] = f"generate() raised: {exc}"[:200]
+        return out
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        out = dict(unavailable)
+        out["rationale"] = str((result or {}).get("text", "") or "") if isinstance(result, dict) else ""
+        out["error"] = (
+            str((result or {}).get("why", "") or "model unavailable")[:200]
+            if isinstance(result, dict)
+            else "model unavailable"
+        )
+        return out
+
+    obj = extract_json_object(str(result.get("text", "")) or "")
+    if obj is None:
+        out = dict(unavailable)
+        out["error"] = f"unparseable response: {str(result.get('text', ''))[:120]!r}"
+        return out
+
+    verdict = str(obj.get("verdict", "") or "").strip().lower()
+    if verdict not in _CONFIDENCE_ENTAILMENT_VALID_VERDICTS:
+        verdict = "uncertain"
+    rationale = obj.get("rationale")
+    if not isinstance(rationale, str) or not rationale.strip():
+        rationale = obj.get("reasoning")
+    if not isinstance(rationale, str) or not rationale.strip():
+        rationale = obj.get("refutation")
+    if not isinstance(rationale, str):
+        rationale = "" if rationale is None else str(rationale)
+    try:
+        llm_confidence = float(obj.get("confidence"))
+        if llm_confidence != llm_confidence:
+            raise ValueError("nan")
+    except (TypeError, ValueError):
+        llm_confidence = 0.0
+
+    return {
+        "available": True,
+        "verdict": verdict,
+        "rationale": rationale.strip(),
+        "confidence": max(0.0, min(1.0, llm_confidence)),
+        "degraded": False,
+        "error": "",
+    }
+
+
 @mcp.tool()
 def memory_confidence(
     query: str,
@@ -7552,6 +7662,12 @@ def memory_confidence(
       corroboration  — max occurrences across top hits (repeated evidence)
       trust          — mean confidence tier (high/medium/low) of top hits
 
+    It also MAY include ``llm_entailment_note``: an advisory local-model verdict
+    on whether the top memory hit actually supports the exact claim/query,
+    considering subject, scope, negation, and modality. This is additive only:
+    it NEVER changes the formula-based ``confidence``, ``basis``, or
+    ``recommendation`` fields in the default call path.
+
     Fluency is down-weighted relative to source_div and trust because it tracks
     retrieval ease, not correctness (Koriat 1993 over-confidence mechanism).
 
@@ -7563,7 +7679,9 @@ def memory_confidence(
         top_k: Number of results to base the estimate on (default 8).
 
     Returns:
-        JSON with {confidence, basis, cues, top_hit_preview, recommendation}.
+        JSON with {confidence, basis, cues, top_hit_preview, recommendation,
+        llm_entailment_note?}. When the model is unavailable/errors, the advisory
+        field is returned degraded or omitted; the numeric verdict is unchanged.
     """
     results, hard_stop_basis = _confidence_retrieve(query, top_k)
     if hard_stop_basis is not None:
@@ -7590,8 +7708,9 @@ def memory_confidence(
     top_text = cues["top_text"]
 
     confidence, basis, recommendation = _confidence_verdict(cues)
+    llm_entailment = _confidence_llm_entailment(query, top_text) if top_text else None
 
-    return json.dumps({
+    payload = {
         "confidence": round(confidence, 3),
         "basis": basis,
         "cues": {
@@ -7603,7 +7722,18 @@ def memory_confidence(
         },
         "top_hit_preview": top_text,
         "recommendation": recommendation,
-    }, indent=2)
+    }
+    if isinstance(llm_entailment, dict):
+        payload["llm_entailment_note"] = {
+            "available": bool(llm_entailment.get("available")),
+            "verdict": llm_entailment.get("verdict"),
+            "rationale": llm_entailment.get("rationale", ""),
+            "confidence": round(float(llm_entailment.get("confidence", 0.0) or 0.0), 3),
+            "degraded": bool(llm_entailment.get("degraded")),
+            "error": llm_entailment.get("error", ""),
+        }
+
+    return json.dumps(payload, indent=2)
 
 
 # ---------------------------------------------------------------------------
