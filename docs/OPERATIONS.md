@@ -23,7 +23,20 @@ not live in the repo.
 | `OLLAMA_URL` | _(none, required)_ | most embedding + generation scripts (memgas_hierarchy.py, ebbinghaus_consolidation.py, amem_consolidation.py, agentHER_relabeler.py, skillops_maintenance.py, exif_skill_discovery.py, score_trace_collector.py, eval/harness.py) |
 | `OLLAMA_BASE_URL` | _(none in code; `backends.ollama_url()` probes `http://localhost:11434`)_ | the **embedding** endpoint for 16 non-test files: `mcp/{qdrant_ops,embed_ops,backends,memcheck/llm}.py`, `scripts/hooks/{pre_llm_grounding,session_end_sync}.py`, `scripts/{loci_groom,glymphatic_sweep,gpu_warm}.py`, all of `mlops/`, `deep_think_loci/grounding/` |
 | `LOCI_OLLAMA_GEN_URL` / `OLLAMA_GEN_URL` | _(none; falls back to `backends.ollama_gen_url()` → `ollama_url()`)_ | the **generation** endpoint, resolved separately from embeddings (`mcp/llm_local.py`). `OLLAMA_BASE_URL` deliberately does **not** feed it |
-| `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`) |
+| `LOCI_OLLAMA_GEN_MODEL` | `qwen2.5:3b` | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). **Must be a tag `ollama list` actually shows on that host** — a misconfigured/unpulled tag fails every `generate()` call silently (fail-open, `degraded=True` everywhere upstream) with no error surfaced short of the `why` field in `llm_local.generate()`'s return dict |
+| `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
+
+**Diagnosed 2026-09-15, corrected in `~/.loci/backends.toml` (machine-specific,
+gitignored — not shown here):** this box's `[ollama].gen_url` had been pointed at a
+tailnet host that only ever carried the embedding model, and `gen_model` named a tag
+that was never actually pulled anywhere — so every single-shot generation call
+(`compress_text`, `classify_text`, `query_expand`, `verify_finding`) had been silently
+degraded, invisibly, for some time. Nothing raised or logged loudly because every layer
+here is deliberately fail-open. **If any of these tools report `degraded: true` more
+than occasionally, first re-verify `gen_url`/`gen_model` directly** — pick a real
+`ollama list` tag on a host you can `curl .../api/generate` successfully — before
+assuming the model itself is the problem. On Windows+WSL2 hosts specifically, see the
+NAT-networking gotcha in `backends.toml.example`.
 | `LOCI_QDRANT_RETENTION_DAYS` | `0` — purge **disabled** | `mcp/qdrant_ops.py:_retention_days`. Any value > 0 makes the first Qdrant call of every process delete findings older than that window. Also readable as `[qdrant].retention_days` in `~/.loci/backends.toml` |
 | `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | all embedding operations |
 
