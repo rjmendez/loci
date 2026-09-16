@@ -323,6 +323,12 @@ def call_ollama(base_url: str, model: str, prompt: str, *, max_tokens: int) -> C
         "stream": False,
         "keep_alive": "30m",
         "format": "json",
+        # Reasoning-mode models (e.g. Qwen3-family "thinking" variants) otherwise emit their
+        # entire JSON answer into the separate `thinking` field and leave `response` empty when
+        # `format=json` is set, which used to be scored as a hard failure. Disabling thinking
+        # keeps the answer in `response` where the rest of this harness (and production) expects
+        # it. Older Ollama builds that predate the `think` option simply ignore the field.
+        "think": False,
         "options": {
             "num_predict": max_tokens,
             "temperature": 0.2,
@@ -337,7 +343,15 @@ def call_ollama(base_url: str, model: str, prompt: str, *, max_tokens: int) -> C
         response.raise_for_status()
         payload = response.json()
         latency_ms = (time.perf_counter() - started) * 1000.0
-        return CallResult(text=str(payload.get("response") or ""), latency_ms=latency_ms, transport_ok=True)
+        text = str(payload.get("response") or "")
+        if not text.strip():
+            # Defensive fallback: some models/builds still route JSON output into `thinking`
+            # even with think=False honored on the transport but not fully suppressed by the
+            # model itself. Recover the answer from there rather than scoring a false failure.
+            thinking = str(payload.get("thinking") or "")
+            if thinking.strip():
+                text = thinking
+        return CallResult(text=text, latency_ms=latency_ms, transport_ok=True)
     except Exception as exc:
         latency_ms = (time.perf_counter() - started) * 1000.0
         return CallResult(text="", latency_ms=latency_ms, transport_ok=False, error=str(exc)[:200])

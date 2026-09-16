@@ -1,5 +1,6 @@
 import os
 import sys
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "mcp"))
@@ -95,6 +96,39 @@ def test_score_case_marks_wrong_but_well_formed_verify_answer_incorrect():
     assert score.json_ok is True
     assert score.schema_ok is True
     assert score.correct is False
+
+
+def test_call_ollama_disables_thinking_mode_in_request_body():
+    fake_response = mock.Mock()
+    fake_response.raise_for_status = mock.Mock()
+    fake_response.json.return_value = {"response": '{"label":"bug"}'}
+    with mock.patch("requests.post", return_value=fake_response) as post:
+        result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
+    assert result.transport_ok is True
+    assert result.text == '{"label":"bug"}'
+    sent_body = post.call_args.kwargs["json"]
+    assert sent_body["think"] is False
+    assert sent_body["format"] == "json"
+
+
+def test_call_ollama_falls_back_to_thinking_field_when_response_is_empty():
+    """Reasoning models sometimes still route JSON into `thinking` even with think=False."""
+    fake_response = mock.Mock()
+    fake_response.raise_for_status = mock.Mock()
+    fake_response.json.return_value = {"response": "", "thinking": '{"label":"bug"}'}
+    with mock.patch("requests.post", return_value=fake_response):
+        result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
+    assert result.transport_ok is True
+    assert result.text == '{"label":"bug"}'
+
+
+def test_call_ollama_prefers_response_over_thinking_when_both_present():
+    fake_response = mock.Mock()
+    fake_response.raise_for_status = mock.Mock()
+    fake_response.json.return_value = {"response": '{"label":"feature"}', "thinking": "some reasoning trace"}
+    with mock.patch("requests.post", return_value=fake_response):
+        result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
+    assert result.text == '{"label":"feature"}'
 
 
 def test_score_case_marks_compress_keyword_retention_as_correctness_proxy():
