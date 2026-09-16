@@ -73,6 +73,28 @@ def test_evaluate_task_uses_stubbed_calls_without_live_ollama():
     assert row.total == len(A.CLASSIFY_CASES)
     assert row.json_ok == len(A.CLASSIFY_CASES)
     assert row.correct == 1
+    assert row.task == "classify"
+
+
+def test_evaluate_task_uses_hard_case_set_and_labels_the_row():
+    def fake_call(base_url, model, prompt, max_tokens):
+        del base_url, model, prompt, max_tokens
+        return A.CallResult(text='{"label":"bug"}', latency_ms=9.0, transport_ok=True)
+
+    row = A.evaluate_task(
+        "classify", "candidate", "gemma4:26b", base_url="http://fake", call_fn=fake_call, difficulty="hard"
+    )
+    assert row.task == "classify+hard"
+    assert row.total == len(A.HARD_CLASSIFY_CASES)
+
+
+def test_hard_case_sets_are_nonempty_and_distinct_from_standard():
+    for task in A.TASKS:
+        standard_cases = A._task_cases(task, "standard")
+        hard_cases = A._task_cases(task, "hard")
+        assert standard_cases  # sanity: standard tier still populated
+        assert hard_cases  # hard tier must exist for every task
+        assert hard_cases != standard_cases
 
 
 def test_score_case_marks_wrong_but_well_formed_classify_answer_incorrect():
