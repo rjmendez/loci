@@ -7405,6 +7405,197 @@ def _run_causal_inference(investigation_id: str, findings: list[dict]) -> int:
     return len(edges)
 
 
+_consolidation_quality_audit_gen_fn = None
+_CONSOLIDATION_QUALITY_AUDIT_SAMPLE_LIMIT = 5
+
+
+def _load_mnemosyne_class():
+    from mnemosyne.core.memory import Mnemosyne
+    return Mnemosyne
+
+
+def _row_value(row, key: str, index: int = 0):
+    if row is None:
+        return None
+    if hasattr(row, "keys"):
+        return row[key]
+    return row[index]
+
+
+def _snapshot_sleep_consolidation_rowid(m) -> int | None:
+    """Best-effort baseline so the advisory audit can inspect only new summaries."""
+    try:
+        cursor = m.beam.conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(MAX(rowid), 0) AS max_rowid "
+            "FROM episodic_memory WHERE source = ?",
+            ("sleep_consolidation",),
+        )
+        row = cursor.fetchone()
+        return int(_row_value(row, "max_rowid") or 0)
+    except Exception as exc:
+        logger.debug("_snapshot_sleep_consolidation_rowid failed (fail-open): %r", exc)
+        return None
+
+
+def _session_consolidated_id_map(result: dict) -> dict[str, set[str]]:
+    session_map: dict[str, set[str]] = {}
+    if not isinstance(result, dict):
+        return session_map
+    for row in result.get("session_results", []) or []:
+        if not isinstance(row, dict):
+            continue
+        session_id = str(row.get("session_id") or "").strip()
+        consolidated_ids = {
+            str(mid).strip()
+            for mid in (row.get("consolidated_ids") or [])
+            if str(mid).strip()
+        }
+        if session_id and consolidated_ids:
+            session_map[session_id] = consolidated_ids
+    return session_map
+
+
+def _fetch_consolidation_quality_samples(
+    m,
+    result: dict,
+    baseline_rowid: int | None,
+    limit: int = _CONSOLIDATION_QUALITY_AUDIT_SAMPLE_LIMIT,
+) -> tuple[list[dict] | None, bool]:
+    """Return bounded merge samples plus whether merge details looked unavailable."""
+    if baseline_rowid is None:
+        return None, True
+
+    session_map = _session_consolidated_id_map(result)
+    if not session_map:
+        return [], False
+
+    session_ids = list(session_map)
+    placeholders = ",".join("?" * len(session_ids))
+    scan_limit = max(limit * 6, limit)
+    samples: list[dict] = []
+    undetermined = False
+
+    try:
+        cursor = m.beam.conn.cursor()
+        cursor.execute(
+            f"""
+            SELECT rowid, id, content, session_id, summary_of
+            FROM episodic_memory
+            WHERE source = ?
+              AND rowid > ?
+              AND session_id IN ({placeholders})
+            ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            ("sleep_consolidation", baseline_rowid, *session_ids, scan_limit),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return None, True
+
+        for row in rows:
+            session_id = str(_row_value(row, "session_id", 3) or "").strip()
+            raw_summary_of = str(_row_value(row, "summary_of", 4) or "")
+            source_ids = [part.strip() for part in raw_summary_of.split(",") if part.strip()]
+
+            if not source_ids:
+                undetermined = True
+                continue
+            if len(source_ids) < 2:
+                continue
+            if not set(source_ids).issubset(session_map.get(session_id, set())):
+                undetermined = True
+                continue
+
+            src_placeholders = ",".join("?" * len(source_ids))
+            cursor.execute(
+                f"""
+                SELECT id, content, source, timestamp
+                FROM working_memory
+                WHERE id IN ({src_placeholders})
+                """,
+                tuple(source_ids),
+            )
+            source_rows = cursor.fetchall()
+            by_id = {
+                str(_row_value(src, "id", 0)): {
+                    "id": str(_row_value(src, "id", 0) or ""),
+                    "content": str(_row_value(src, "content", 1) or ""),
+                    "source": str(_row_value(src, "source", 2) or ""),
+                    "timestamp": str(_row_value(src, "timestamp", 3) or ""),
+                }
+                for src in source_rows
+            }
+            if any(mid not in by_id or not by_id[mid]["content"].strip() for mid in source_ids):
+                undetermined = True
+                continue
+
+            samples.append({
+                "session_id": session_id,
+                "merged_summary": str(_row_value(row, "content", 2) or ""),
+                "source_entries": [by_id[mid] for mid in source_ids],
+            })
+            if len(samples) >= limit:
+                break
+    except Exception as exc:
+        logger.debug("_fetch_consolidation_quality_samples failed (fail-open): %r", exc)
+        return None, True
+
+    return samples, undetermined
+
+
+def _audit_summary_preview(text: str, limit: int = 240) -> str:
+    return " ".join(str(text or "").split())[:limit]
+
+
+def _run_consolidation_quality_audit(
+    m,
+    result: dict,
+    baseline_rowid: int | None,
+    *,
+    gen_fn=None,
+) -> dict | None:
+    """Best-effort advisory audit over a bounded sample of just-created merges."""
+    if not isinstance(result, dict):
+        return None
+    if int(result.get("items_consolidated", 0) or 0) <= 0:
+        return None
+
+    try:
+        import consolidation_quality_audit as _audit
+    except Exception as exc:
+        logger.debug("_run_consolidation_quality_audit import failed (fail-open): %r", exc)
+        return {"sampled": 0, "flagged": [], "degraded": True}
+
+    samples, undetermined = _fetch_consolidation_quality_samples(m, result, baseline_rowid)
+    if samples is None:
+        return {"sampled": 0, "flagged": [], "degraded": True}
+    if not samples:
+        return {"sampled": 0, "flagged": [], "degraded": bool(undetermined)}
+
+    flagged: list[dict] = []
+    sampled = 0
+    degraded = bool(undetermined)
+    for sample in samples:
+        verdict = _audit.audit_merge_quality(
+            sample.get("merged_summary", ""),
+            sample.get("source_entries", []),
+            gen_fn=gen_fn,
+        )
+        if not verdict.get("available"):
+            degraded = True
+            continue
+        sampled += 1
+        if verdict.get("verdict") == "lost_or_conflated":
+            flagged.append({
+                "summary": _audit_summary_preview(sample.get("merged_summary", "")),
+                "concern": str(verdict.get("concern") or "possible information loss"),
+            })
+
+    return {"sampled": sampled, "flagged": flagged, "degraded": degraded}
+
+
 @mcp.tool()
 def memory_consolidate(dry_run: bool = False) -> str:
     """
@@ -7421,12 +7612,18 @@ def memory_consolidate(dry_run: bool = False) -> str:
         dry_run: If True, preview consolidation without executing.
 
     Returns JSON with consolidation stats and causal_edges_inferred count.
+    On real (non-dry-run) consolidations, may also include an advisory-only
+    consolidation_quality_audit field summarizing a bounded local-model spot-check
+    of just-created multi-entry merges. This never changes what Mnemosyne writes.
     """
     import json as _json
     causal_edges_inferred = 0
     try:
-        from mnemosyne.core.memory import Mnemosyne
+        Mnemosyne = _load_mnemosyne_class()
         m = Mnemosyne()
+        audit_baseline_rowid = None
+        if not dry_run:
+            audit_baseline_rowid = _snapshot_sleep_consolidation_rowid(m)
         result = m.sleep_all_sessions(dry_run=dry_run)
         _event_log_append({"op": "consolidate", "dry_run": dry_run,
                            "result_summary": str(result)[:200] if result else ""})
@@ -7443,12 +7640,31 @@ def memory_consolidate(dry_run: bool = False) -> str:
                            "(fail-open, 0 edges): %r", exc)
             causal_edges_inferred = 0
 
-        return _json.dumps({
+        payload = {
             "status": "ok",
             "dry_run": dry_run,
             "result": result if isinstance(result, dict) else str(result),
             "causal_edges_inferred": causal_edges_inferred,
-        })
+        }
+        if not dry_run:
+            try:
+                quality_audit = _run_consolidation_quality_audit(
+                    m,
+                    result,
+                    audit_baseline_rowid,
+                    gen_fn=_consolidation_quality_audit_gen_fn,
+                )
+                if quality_audit is not None:
+                    payload["consolidation_quality_audit"] = quality_audit
+            except Exception as exc:
+                logger.debug("memory_consolidate advisory audit failed (fail-open): %r", exc)
+                payload["consolidation_quality_audit"] = {
+                    "sampled": 0,
+                    "flagged": [],
+                    "degraded": True,
+                }
+
+        return _json.dumps(payload)
     except Exception as e:
         return _json.dumps({
             "status": "error",
