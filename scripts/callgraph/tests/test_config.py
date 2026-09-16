@@ -1,15 +1,16 @@
 from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """config.py against the REAL repo: acceptance criterion is an exact file
-count (130), not a vibe. If this drifts, either the repo changed shape or
+count (131), not a vibe. If this drifts, either the repo changed shape or
 the exclusion rules regressed — both worth failing loudly on."""
 from .. import config
 
 
-def test_corpus_is_exactly_130_files():
-    """127 -> 128 -> 129 -> 130: memory-integrity audit test, then
-    mcp/compact.py (compact mode), then scripts/deploy_abliterated_model.py."""
+def test_corpus_is_exactly_131_files():
+    """127 -> 128 -> 129 -> 130 -> 131: memory-integrity audit test,
+    mcp/compact.py, scripts/deploy_abliterated_model.py, then
+    scripts/ab_eval_local_model.py."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 130, sorted(files)
+    assert len(files) == 131, sorted(files)
 
 
 def test_corpus_excludes_test_directories():
