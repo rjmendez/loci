@@ -2071,10 +2071,39 @@ def _query_points_compat(
         return client.query_points(**kwargs).points
 
 
+def _judge_conflict_pair(new_finding: dict, neighbor_finding: dict, *, gen_fn=None) -> dict:
+    """LLM-adjudicate whether a high-cosine neighbour directly contradicts the new finding.
+
+    Qdrant's cosine gate is the cheap candidate generator: two findings in the same
+    investigation are near each other, so they may concern the same subject. The
+    heuristics below only recognize a few structural cases and cannot tell "same topic"
+    from "same fact with opposite polarity". This asks the local reasoning model ONLY
+    after the cheap gate has produced a candidate pair, and it stays fail-open:
+    any import/backend/model issue returns ``verdict=None`` so the caller preserves the
+    prior heuristic-only behaviour exactly.
+    """
+    try:
+        from conflict_verify import judge_conflict
+
+        return judge_conflict(
+            str((new_finding or {}).get("text", "") or ""),
+            str((neighbor_finding or {}).get("text", "") or ""),
+            type_a=str((new_finding or {}).get("record_type")
+                       or (new_finding or {}).get("type", "") or ""),
+            type_b=str((neighbor_finding or {}).get("record_type")
+                       or (neighbor_finding or {}).get("type", "") or ""),
+            gen_fn=gen_fn,
+        )
+    except Exception as exc:
+        logger.debug("_judge_conflict_pair: fail-open on exception: %r", exc)
+        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200]}
+
+
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
     """
     Search Qdrant for near-neighbors of new_finding (same investigation, cosine
-    > 0.82, excluding the new finding itself) and apply simple conflict heuristics.
+    > 0.82, excluding the new finding itself), then add an LLM contradiction judge
+    on top of the existing heuristics.
 
     Returns a list of conflict dicts (may be empty). Fail-open — any exception
     returns an empty list so investigation_store is never blocked.
@@ -2130,25 +2159,31 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             neighbor_text = str(payload.get("text", ""))
             neighbor_neg = _has_negation(neighbor_text)
 
-            is_conflict = False
+            heuristic_conflict = False
 
             # Heuristic 1: gap now filled by an observed finding
             if neighbor_type == "gap" and new_type == "observed":
-                is_conflict = True
+                heuristic_conflict = True
 
             # Heuristic 2: assumption overridden by a non-assumed finding
             elif neighbor_type == "assumed" and new_type != "assumed":
-                is_conflict = True
+                heuristic_conflict = True
 
             # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
             elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
-                is_conflict = True
+                heuristic_conflict = True
 
-            if is_conflict:
+            llm = _judge_conflict_pair(new_finding, payload)
+            llm_contradict = llm.get("verdict") == "contradict"
+
+            if heuristic_conflict or llm_contradict:
                 conflicts.append({
                     "neighbor_id": neighbor_id,
                     "neighbor_type": neighbor_type,
                     "score": round(float(hit.score), 4),
+                    "heuristic_conflict": heuristic_conflict,
+                    "llm_verdict": llm.get("verdict"),
+                    "llm_reason": llm.get("reason", ""),
                 })
 
         return conflicts

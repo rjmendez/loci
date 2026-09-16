@@ -104,17 +104,63 @@ class TestDetectConflicts(unittest.TestCase):
                 [],
             )
 
+    def test_llm_contradiction_adds_conflict_when_heuristics_do_not_fire(self):
+        client = _Client([_Point("n1", 0.9, {
+            "id": "n1", "record_type": "observed", "text": "the service does not expose port 443",
+        })])
+        p1, p2 = _patch(client)
+        with p1, p2, mock.patch.object(server, "_judge_conflict_pair", return_value={
+            "verdict": "contradict", "reason": "same port, opposite polarity", "ok": True, "error": None,
+        }):
+            conflicts = server._detect_conflicts(
+                "inv-1", {"id": "f1", "record_type": "observed", "text": "the service exposes port 443"}
+            )
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["llm_verdict"], "contradict")
+        self.assertFalse(conflicts[0]["heuristic_conflict"])
+
+    def test_llm_agreement_does_not_suppress_existing_heuristic_conflict(self):
+        client = _Client([_Point("n1", 0.9, {
+            "id": "n1", "record_type": "gap", "text": "unknown whether the host phoned home",
+        })])
+        p1, p2 = _patch(client)
+        with p1, p2, mock.patch.object(server, "_judge_conflict_pair", return_value={
+            "verdict": "agree", "reason": "compatible", "ok": True, "error": None,
+        }):
+            conflicts = server._detect_conflicts(
+                "inv-1", {"id": "f1", "record_type": "observed", "text": "the host phoned home at 03:14"}
+            )
+        self.assertEqual(len(conflicts), 1)
+        self.assertTrue(conflicts[0]["heuristic_conflict"])
+
+    def test_llm_failure_preserves_previous_heuristic_only_behaviour(self):
+        client = _Client([_Point("n1", 0.9, {
+            "id": "n1", "record_type": "gap", "text": "unknown whether the host phoned home",
+        })])
+        p1, p2 = _patch(client)
+        with p1, p2, mock.patch.object(server, "_judge_conflict_pair", return_value={
+            "verdict": None, "reason": "", "ok": False, "error": "model down",
+        }):
+            conflicts = server._detect_conflicts(
+                "inv-1", {"id": "f1", "record_type": "observed", "text": "the host phoned home at 03:14"}
+            )
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["neighbor_id"], "n1")
+        self.assertIsNone(conflicts[0]["llm_verdict"])
+
 
 class TestConflictNegationHeuristic(unittest.TestCase):
     """Heuristic 3 is a token-presence scan, so it is off unless asked for."""
 
-    def _conflicts(self):
+    def _conflicts(self, llm_verdict="same_topic_no_conflict"):
         client = _Client([_Point("n1", 0.9, {
             "id": "n1", "record_type": "observed",
             "text": "no adverse records were found for the account",
         })])
         p1, p2 = _patch(client)
-        with p1, p2:
+        with p1, p2, mock.patch.object(server, "_judge_conflict_pair", return_value={
+            "verdict": llm_verdict, "reason": "", "ok": True, "error": None,
+        }):
             return server._detect_conflicts(
                 "inv-1", {"id": "f1", "record_type": "observed",
                           "text": "adverse records were found for the account"},
