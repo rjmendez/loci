@@ -525,7 +525,9 @@ def verify_finding(claim: str,
                    gen_fn: Optional[GenFn] = None,
                    rag_fn: Optional[RagFn] = None,
                    code_refs: Optional[list] = None,
-                   reader: Optional[ReaderFn] = None) -> dict:
+                   reader: Optional[ReaderFn] = None,
+                   finding_id: Optional[str] = None,
+                   auto_promote_procedures: bool = False) -> dict:
     """Adversarially verify a `claim`: run a skeptic that tries to refute it.
 
     Args:
@@ -533,6 +535,8 @@ def verify_finding(claim: str,
         context: optional grounding (code snippet, file refs, prior evidence).
         investigation_id: if given and `context` is empty, best-effort pull RAG grounding
             (fail-open) to give the skeptic something to attack with.
+        finding_id: when verifying a stored finding, its id. Required for optional
+            procedure auto-promotion because the promotion mutates findings.jsonl.
         gen_fn: injectable generation fn (shared contract). None -> lazy llm_local.generate.
         rag_fn: injectable grounding fn. None -> lazy rag_context_search.
         code_refs: optional list of ``file:line`` / ``file:start-end`` strings, or stored
@@ -541,6 +545,9 @@ def verify_finding(claim: str,
             automatically. A stamped hash selects the exact checkout to read from.
             Fail-open: unreadable and AMBIGUOUS refs alike contribute nothing.
         reader: injectable file reader ``reader(path) -> text``. None -> lazy FS read.
+        auto_promote_procedures: opt-in only. When True and the verdict is a
+            non-degraded ``confirmed``, try to promote an action-shaped stored finding
+            into procedure memory. Default False preserves existing write behavior.
 
     Returns:
         {"verdict": "confirmed"|"refuted"|"uncertain", "refutation": str, "reasoning": str,
@@ -603,5 +610,16 @@ def verify_finding(claim: str,
     reasoning = obj.get("reasoning")
     if not isinstance(reasoning, str) or not reasoning.strip():
         reasoning = raw if isinstance(raw, str) else ""
-    return {"verdict": verdict, "refutation": refutation.strip(),
-            "reasoning": reasoning.strip(), "confidence": confidence, "degraded": False}
+    result = {"verdict": verdict, "refutation": refutation.strip(),
+              "reasoning": reasoning.strip(), "confidence": confidence, "degraded": False}
+    if auto_promote_procedures and verdict == "confirmed" and investigation_id and finding_id:
+        try:
+            import procedure_learning as _pl
+            _pl.maybe_promote_to_procedure(
+                investigation_id=investigation_id,
+                finding_id=finding_id,
+                verify_verdict=result,
+            )
+        except Exception:
+            pass
+    return result
