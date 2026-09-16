@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -98,35 +99,44 @@ def test_score_case_marks_wrong_but_well_formed_verify_answer_incorrect():
     assert score.correct is False
 
 
-def test_call_ollama_disables_thinking_mode_in_request_body():
+def _fake_requests_module(json_payload):
+    """Build a stand-in `requests` module so tests don't need the real dependency installed.
+
+    call_ollama() lazily does `import requests` inside the function; injecting a fake module
+    into sys.modules lets us exercise that code path without requiring the `requests` package
+    to be present in every CI job that runs this test file.
+    """
     fake_response = mock.Mock()
     fake_response.raise_for_status = mock.Mock()
-    fake_response.json.return_value = {"response": '{"label":"bug"}'}
-    with mock.patch("requests.post", return_value=fake_response) as post:
+    fake_response.json.return_value = json_payload
+    fake_module = types.ModuleType("requests")
+    fake_module.post = mock.Mock(return_value=fake_response)
+    return fake_module
+
+
+def test_call_ollama_disables_thinking_mode_in_request_body():
+    fake_module = _fake_requests_module({"response": '{"label":"bug"}'})
+    with mock.patch.dict(sys.modules, {"requests": fake_module}):
         result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
     assert result.transport_ok is True
     assert result.text == '{"label":"bug"}'
-    sent_body = post.call_args.kwargs["json"]
+    sent_body = fake_module.post.call_args.kwargs["json"]
     assert sent_body["think"] is False
     assert sent_body["format"] == "json"
 
 
 def test_call_ollama_falls_back_to_thinking_field_when_response_is_empty():
     """Reasoning models sometimes still route JSON into `thinking` even with think=False."""
-    fake_response = mock.Mock()
-    fake_response.raise_for_status = mock.Mock()
-    fake_response.json.return_value = {"response": "", "thinking": '{"label":"bug"}'}
-    with mock.patch("requests.post", return_value=fake_response):
+    fake_module = _fake_requests_module({"response": "", "thinking": '{"label":"bug"}'})
+    with mock.patch.dict(sys.modules, {"requests": fake_module}):
         result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
     assert result.transport_ok is True
     assert result.text == '{"label":"bug"}'
 
 
 def test_call_ollama_prefers_response_over_thinking_when_both_present():
-    fake_response = mock.Mock()
-    fake_response.raise_for_status = mock.Mock()
-    fake_response.json.return_value = {"response": '{"label":"feature"}', "thinking": "some reasoning trace"}
-    with mock.patch("requests.post", return_value=fake_response):
+    fake_module = _fake_requests_module({"response": '{"label":"feature"}', "thinking": "some reasoning trace"})
+    with mock.patch.dict(sys.modules, {"requests": fake_module}):
         result = A.call_ollama("http://fake", "qwen3-thinking:latest", "prompt", max_tokens=32)
     assert result.text == '{"label":"feature"}'
 
