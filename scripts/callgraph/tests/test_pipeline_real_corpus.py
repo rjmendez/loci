@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 132  # 128 -> 129 -> 130 -> 131 -> 132: compact, deploy, A/B eval, prefilter
+    assert head_build.meta.file_count == 133  # 128 -> 129 -> 130 -> 131 -> 132 -> 133: compact, deploy, A/B eval, prefilter, guardian
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -43,7 +43,9 @@ def test_mcp_top_level_module_level_function_count(head_build):
     # docs/census.txt estimate was 297; mcp/openrouter.py moved it to ~334.
     # PR #295 (ladybug lease bounded-wait/backoff helpers) moved it to ~371.
     # 380 -> 390: mcp/compact.py adds 10 module-level compact-mode helpers.
-    assert 300 <= len(module_level) <= 390, len(module_level)
+    # 390 -> 400: mcp/guardian.py (Granite Guardian) adds check_injection_risk +
+    # backends.py adds ollama_guardian_model.
+    assert 300 <= len(module_level) <= 400, len(module_level)
 
 
 def test_every_mcp_tool_decorator_is_classified_registering(head_build):

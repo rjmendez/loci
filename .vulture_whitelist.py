@@ -108,3 +108,9 @@ _ = recall_decision
 # `conn.row_factory = sqlite3.Row` is a write the stdlib reads back; there is
 # no root model that makes this resolvable, so it is suppressed by name.
 _ = row_factory
+
+# ── http.server.BaseHTTPRequestHandler dispatch hook
+# scripts/hooks/tests/test_pre_tool_grounding.py's _StubGuardianServer subclasses
+# BaseHTTPRequestHandler; do_POST is called by the base class's request dispatch
+# by name convention (do_<METHOD>), never directly in our code.
+_ = do_POST

@@ -24,6 +24,18 @@
                                             # specifically, falls back to gen_model when unset.
                                             # Compress correctness varies far more across models
                                             # than classify does — worth tuning independently.
+# guardian_model = "granite3-guardian:2b"  # optional: model for guardian.check_injection_risk's
+                                            # jailbreak/prompt-injection classification. Does NOT
+                                            # fall back to gen_model when unset (defaults to
+                                            # "granite3-guardian:2b" instead) — Granite Guardian is
+                                            # a purpose-built safety classifier tuned on a specific
+                                            # risk-definition prompt shape, and routing this check
+                                            # through an arbitrary chat model would produce
+                                            # meaningless Yes/No output. Also consulted by
+                                            # scripts/hooks/pre_tool_grounding.py (via
+                                            # LOCI_OLLAMA_GUARDIAN_MODEL / OLLAMA_BASE_URL /
+                                            # OLLAMA_GEN_URL env vars, since the hook is a
+                                            # standalone stdlib script and doesn't import mcp/).
 #
 # Gotcha on Windows+WSL2 (NAT networking, the default — no networkingMode=mirrored
 # in .wslconfig): WSL cannot reach a Windows-bound Ollama via 127.0.0.1, the WSL

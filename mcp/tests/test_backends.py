@@ -100,6 +100,35 @@ def test_compress_model_env_wins_over_config(tmp_path, monkeypatch):
     assert B.ollama_compress_model() == "env-model:latest"
 
 
+def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, monkeypatch):
+    # Unlike verify/compress, guardian must NOT fall back to a general gen_model:
+    # routing a safety classification through an arbitrary chat model would produce
+    # meaningless Yes/No output rather than a degraded-but-sane answer.
+    monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    B._reset_cache()
+    monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "some-other-chat-model:latest")
+    assert B.ollama_guardian_model() == "granite3-guardian:2b"
+
+
+def test_guardian_model_config_key_overrides_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nguardian_model = "granite3-guardian:8b"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.ollama_guardian_model() == "granite3-guardian:8b"
+
+
+def test_guardian_model_env_wins_over_config(tmp_path, monkeypatch):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nguardian_model = "cfg-guardian:latest"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    monkeypatch.setenv("LOCI_OLLAMA_GUARDIAN_MODEL", "env-guardian:latest")
+    assert B.ollama_guardian_model() == "env-guardian:latest"
+
+
 def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "OLLAMA_BASE_URL", "OLLAMA_URL"):
         monkeypatch.delenv(k, raising=False)
