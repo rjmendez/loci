@@ -10,7 +10,7 @@ def test_corpus_is_exactly_133_files():
     mcp/compact.py, deploy script, A/B eval script, prefilter script, then
     mcp/guardian.py (Granite Guardian semantic injection-risk classification)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 135, sorted(files)
+    assert len(files) == 136, sorted(files)
 
 
 def test_corpus_excludes_test_directories():
