@@ -10,7 +10,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import local_deep_think as L  # noqa: E402
 
 
-def _config(*, red_team: bool = False) -> L.ChainConfig:
+def _config(*, red_team: bool = False, self_reflect: bool = True) -> L.ChainConfig:
     return L.ChainConfig(
         topic="fail-open local reasoning",
         investigation_id="local-deep-think-test",
@@ -19,7 +19,9 @@ def _config(*, red_team: bool = False) -> L.ChainConfig:
         ideate_models=["fast-model:latest", "strong-model:latest"],
         verify_model="verify-model:latest",
         synthesize_model="synth-model:latest",
+        self_reflect_model="reflect-model:latest",
         redteam_model="heretic-model:latest",
+        self_reflect=self_reflect,
         red_team=red_team,
         ideas_per_model=1,
         retrieval_limit=3,
@@ -68,6 +70,23 @@ def test_normal_chain_completion():
                         '"risks":["Retrieval can still degrade."],'
                         '"next_steps":["Run the red-team tier when needed."]}',
             }
+        if "CRITIQUE step" in prompt:
+            assert model == "reflect-model:latest"
+            return {
+                "ok": True,
+                "text": "- [vf1] The summary omits that dedicated writer persistence prevents fabricated confirmations.\n"
+                        "- [vf1] It should keep the verify gate explicit.",
+            }
+        if "REVISE step" in prompt:
+            return {
+                "ok": True,
+                "text": '{"summary":"Best path is dedicated writer persistence plus the verify gate '
+                        '[vf1|verify|verify-model:latest].",'
+                        '"supporting_finding_ids":["vf1"],'
+                        '"key_findings":[{"finding_id":"vf1","why":"Verified and grounded."}],'
+                        '"risks":["Retrieval can still degrade."],'
+                        '"next_steps":["Run the red-team tier when needed."]}',
+            }
         raise AssertionError(f"unexpected prompt: {prompt[:80]}")
 
     def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
@@ -76,7 +95,7 @@ def test_normal_chain_completion():
 
     def _store(**kwargs):
         store_calls.append(kwargs)
-        fid = f"f{len(store_calls)}" if len(store_calls) <= 2 else ("vf1" if len(store_calls) == 3 else "sf1")
+        fid = {1: "f1", 2: "f2", 3: "vf1", 4: "vf2", 5: "sf1"}[len(store_calls)]
         return f'{{"stored": true, "finding_id": "{fid}"}}'
 
     result = L.run_chain(_config(), deps={
@@ -92,7 +111,10 @@ def test_normal_chain_completion():
     assert result["ideate"]["stored_count"] == 2
     assert result["verify"]["survivor_count"] == 2
     assert result["synthesis"]["finding_id"] == "sf1"
+    assert result["synthesis"]["self_reflection"]["revised"] is True
+    assert "dedicated writer persistence" in result["synthesis"]["summary"]
     assert store_calls[0]["source"].endswith("#ideate/fast-model:latest")
+    assert store_calls[4]["source"].endswith("#self-reflect/reflect-model:latest")
     assert store_calls[2]["derived_from"] == ["f1"]
 
 
@@ -119,7 +141,7 @@ def test_dead_tier_fails_open():
         fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
         return f'{{"stored": true, "finding_id": "{fid}"}}'
 
-    result = L.run_chain(_config(), deps={
+    result = L.run_chain(_config(self_reflect=False), deps={
         "generate": _generate,
         "search_collection": _search_collection,
         "gate": _gate,
@@ -133,6 +155,89 @@ def test_dead_tier_fails_open():
     assert any(not report["ok"] for report in reports)
     assert result["ideate"]["stored_count"] == 1
     assert result["verify"]["survivor_count"] == 1
+
+
+def test_self_reflection_fail_open_returns_original_synthesis():
+    prompts = []
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        prompts.append(prompt)
+        if "IDEATE tier" in prompt:
+            return {"ok": True, "text": '{"ideas":[{"claim":"Idea","rationale":"why","confidence":"medium","evidence_ids":["seed-1"]}]}'}
+        if "SYNTHESIZE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"summary":"Original synthesis [vf1|verify|verify-model:latest].",'
+                        '"supporting_finding_ids":["vf1"]}',
+            }
+        if "CRITIQUE step" in prompt:
+            return {"ok": False, "text": "", "why": "connection refused"}
+        raise AssertionError(f"unexpected prompt: {prompt[:80]}")
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.7, "degraded": False}
+
+    def _store(**kwargs):  # noqa: ARG001
+        counter = getattr(_store, "counter", 0) + 1
+        _store.counter = counter
+        fid = {1: "f1", 2: "f2", 3: "vf1", 4: "vf2", 5: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    result = L.run_chain(_config(), deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+    })
+
+    assert result["synthesis"]["summary"] == "Original synthesis [vf1|verify|verify-model:latest]."
+    assert result["synthesis"]["self_reflection"]["revised"] is False
+    assert result["synthesis"]["self_reflection"]["error"] == "connection refused"
+    assert sum("CRITIQUE step" in prompt for prompt in prompts) == 1
+    assert not any("REVISE step" in prompt for prompt in prompts)
+
+
+def test_self_reflection_runs_exactly_once():
+    prompts = []
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        prompts.append(prompt)
+        if "IDEATE tier" in prompt:
+            return {"ok": True, "text": '{"ideas":[{"claim":"Idea","rationale":"why","confidence":"medium","evidence_ids":["seed-1"]}]}'}
+        if "SYNTHESIZE tier" in prompt:
+            return {"ok": True, "text": '{"summary":"Synth","supporting_finding_ids":["vf1"]}'}
+        if "CRITIQUE step" in prompt:
+            return {"ok": True, "text": "- [vf1] Tighten the answer."}
+        if "REVISE step" in prompt:
+            return {"ok": True, "text": '{"summary":"Revised synth","supporting_finding_ids":["vf1"]}'}
+        raise AssertionError(f"unexpected prompt: {prompt[:80]}")
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.7, "degraded": False}
+
+    def _store(**kwargs):  # noqa: ARG001
+        counter = getattr(_store, "counter", 0) + 1
+        _store.counter = counter
+        fid = {1: "f1", 2: "f2", 3: "vf1", 4: "vf2", 5: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    result = L.run_chain(_config(), deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+    })
+
+    assert result["synthesis"]["summary"] == "Revised synth"
+    assert result["synthesis"]["self_reflection"]["iterations"] == 1
+    assert sum("CRITIQUE step" in prompt for prompt in prompts) == 1
+    assert sum("REVISE step" in prompt for prompt in prompts) == 1
 
 
 def test_red_team_flag_controls_critique_tier():
@@ -157,7 +262,7 @@ def test_red_team_flag_controls_critique_tier():
         fid = {1: "f1", 2: "f2", 3: "vf1", 4: "rf1", 5: "sf1"}[counter]
         return f'{{"stored": true, "finding_id": "{fid}"}}'
 
-    off = L.run_chain(_config(red_team=False), deps={
+    off = L.run_chain(_config(red_team=False, self_reflect=False), deps={
         "generate": _generate,
         "search_collection": _search_collection,
         "gate": _gate,
@@ -171,7 +276,7 @@ def test_red_team_flag_controls_critique_tier():
 
     prompts.clear()
     _store.counter = 0
-    on = L.run_chain(_config(red_team=True), deps={
+    on = L.run_chain(_config(red_team=True, self_reflect=False), deps={
         "generate": _generate,
         "search_collection": _search_collection,
         "gate": _gate,
@@ -204,7 +309,7 @@ def test_dedicated_writer_owns_persistence_calls():
         fid = {1: "f1", 2: "f2", 3: "vf1"}[counter]
         return f'{{"stored": true, "finding_id": "{fid}"}}'
 
-    L.run_chain(_config(), deps={
+    L.run_chain(_config(self_reflect=False), deps={
         "generate": _generate,
         "search_collection": _search_collection,
         "gate": _gate,
