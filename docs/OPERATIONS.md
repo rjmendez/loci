@@ -54,12 +54,26 @@ then does a tiny `/api/generate` smoke test and prints `/api/ps` / GPU state.
 
 The new Qwen3.8-27B option is still opt-in and keeps the code default unchanged, but
 it rides llama.cpp's `qwen3_5` hybrid linear-attention path, where
-`ggml-org/llama.cpp#28879` tracks unresolved non-monotonic quant-precision behavior.
-Treat Q5_K_M or higher as the safe starting point when you can, expect roughly
-16-20GB VRAM at Q4/Q5, and verify outputs empirically before precision-sensitive use
-(for example with `scripts/ab_eval_local_model.py` if/when that lands in your checkout).
+`ggml-org/llama.cpp#28879` tracks unresolved non-monotonic quant-precision behavior,
+and the still-open draft `ggml-org/llama.cpp#27132` covers a distinct qwen3_5
+tensor-layout conversion-correctness bug. Treat Q5_K_M or higher as the safe
+starting point when you can, expect roughly 16-20GB VRAM at Q4/Q5, and verify
+outputs empirically before precision-sensitive use.
 The Gemma4 A4B option is an MoE with only ~4B active params; Google also publishes
 official QAT GGUFs of the non-abliterated base as a more-trusted comparison baseline.
+
+For the abliterated deployments above:
+
+- The GGUF artifacts come from third-party/community Hugging Face repos, not
+  first-party model publishers or other verified upstream release channels.
+- Abliteration removes built-in safety training, so outputs may be more permissive
+  or less filtered than the original instruct models; restrict access accordingly.
+- Local hosting does not make prompt contents private by default: treat the Ollama
+  endpoint like any other inference service and apply appropriate host, network,
+  and access controls for sensitive data.
+- The deploy smoke test and current `scripts/ab_eval_local_model.py` checks only
+  cover endpoint reachability plus JSON/schema-format conformance, not adversarial
+  robustness, policy compliance, or broader security properties.
 
 After that, switch Loci yourself with `LOCI_OLLAMA_GEN_MODEL=<the-created-tag>`.
 See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →
