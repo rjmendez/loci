@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 133  # 128 -> 129 -> 130 -> 131 -> 132 -> 133: compact, deploy, A/B eval, prefilter, guardian
+    assert head_build.meta.file_count == 134  # 128 -> 129 -> 130 -> 131 -> 132 -> 133 -> 134: compact, deploy, A/B eval, prefilter, guardian, procedure-learning
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -31,7 +31,10 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     ]
     # Band is the 1060 measured count +-10%; helper scripts add a handful of
     # module-level functions, but large swings still catch corpus regressions.
-    assert 954 <= len(module_level) <= 1166, len(module_level)
+    # Raised ceiling: the local-model fleet batch (verify/guardian follow-ons —
+    # conflict/reflection/pre-answer/procedure-learning/mnemosyne/wiring-obligation
+    # corroboration modules) adds several small new modules at once.
+    assert 954 <= len(module_level) <= 1220, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
@@ -45,7 +48,9 @@ def test_mcp_top_level_module_level_function_count(head_build):
     # 380 -> 390: mcp/compact.py adds 10 module-level compact-mode helpers.
     # 390 -> 400: mcp/guardian.py (Granite Guardian) adds check_injection_risk +
     # backends.py adds ollama_guardian_model.
-    assert 300 <= len(module_level) <= 400, len(module_level)
+    # 400 -> 420: mcp/procedure_learning.py adds the auto-promotion/execution-
+    # outcome feedback loop helpers.
+    assert 300 <= len(module_level) <= 420, len(module_level)
 
 
 def test_every_mcp_tool_decorator_is_classified_registering(head_build):
