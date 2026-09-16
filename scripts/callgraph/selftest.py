@@ -309,7 +309,7 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 130, result.meta.file_count  # 128 -> 129 -> 130: mcp/compact.py, then scripts/deploy_abliterated_model.py
+    assert result.meta.file_count == 131, result.meta.file_count  # 128 -> 129 -> 130 -> 131: mcp/compact.py, deploy script, A/B eval script
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]
