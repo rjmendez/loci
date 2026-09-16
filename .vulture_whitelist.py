@@ -21,7 +21,6 @@ _ = investigation_entity_lookup
 _ = investigation_related_cases
 _ = entity_list
 _ = entity_timeline
-_ = investigation_pre_answer_check
 _ = investigation_reason
 _ = audit_log
 _ = code_memory_correlate
@@ -53,7 +52,6 @@ _ = rag_context_search
 _ = reflection_loop_status
 _ = causal_infer
 _ = conflict_list
-_ = conflict_resolve
 
 # ── Public API exported by memcheck modules
 
