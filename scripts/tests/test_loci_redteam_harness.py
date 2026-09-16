@@ -7,6 +7,14 @@ import shutil
 import sys
 import uuid
 
+import pytest
+
+# This harness imports mcp/server.py, which needs the mcp package's own
+# dependencies (dotenv, etc). The lightweight "Sync script tests" CI job only
+# installs pytest/pytest-timeout/aiohttp for scripts/, so skip here rather
+# than fail when those deps aren't present; see scripts/redteam/README.md for
+# the intended install (mcp/.venv) that exercises this for real.
+pytest.importorskip("dotenv", reason="mcp/server.py dependency not installed in this environment")
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 MOD_PATH = REPO / "scripts" / "redteam" / "loci_adversarial_harness.py"

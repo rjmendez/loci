@@ -114,3 +114,24 @@ _ = row_factory
 # BaseHTTPRequestHandler; do_POST is called by the base class's request dispatch
 # by name convention (do_<METHOD>), never directly in our code.
 _ = do_POST
+
+# ── scripts/redteam/loci_adversarial_harness.py dataclass fields
+# AttackCase/CaseResult fields are populated positionally/by keyword and read
+# via attribute access (case.attack_objective, result.payload_rationale, ...)
+# and via dataclasses.asdict() for report serialization; vulture only sees the
+# class-body assignment, not the later attribute reads.
+_ = attack_objective
+_ = atlas_technique
+_ = case_name
+_ = defender_triage
+_ = owasp_category
+_ = payload_arguments
+_ = payload_rationale
+_ = redteam_observation
+
+# ── pyrit.prompt_target.common.prompt_target.PromptTarget interface hooks
+# _OllamaPromptTarget in scripts/redteam/loci_adversarial_harness.py subclasses
+# PyRIT's PromptTarget; both methods are invoked by the PyRIT orchestrator
+# through the base class, never called directly in this repo.
+_ = _send_prompt_to_target_async
+_ = cleanup_target_async
