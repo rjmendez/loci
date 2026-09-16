@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def _env_int(name: str, default: int) -> int:
@@ -288,6 +289,24 @@ DEFAULT_DB = os.path.expanduser(
     os.environ.get("MNEMOSYNE_DB", "~/.hermes/mnemosyne/data/mnemosyne.db")
 )
 
+_HONESTY_SUMMARY_MAX_CHARS = 600
+_HONESTY_UNSUPPORTED_MAX = 5
+_HONESTY_PROMPT = (
+    "You are checking whether an automated MLOps loop summary overclaims what the "
+    "structured evidence supports.\n"
+    "Use ONLY the JSON payload below. Treat omitted details as intentionally redacted, "
+    "not as evidence. Focus only on factual support/consistency, not wording.\n"
+    "The summary may use key=value tokens (for example promoted=False or "
+    "total_promotions=3); compare those directly against final_summary_facts when present.\n"
+    "Return ONLY valid JSON of this exact shape:\n"
+    '{{"consistent": true, "unsupported_claims": ["..."]}}\n'
+    "- consistent=true when every concrete claim in the summary is supported by the evidence.\n"
+    "- consistent=false when the summary makes a concrete claim that the evidence does not "
+    "support or directly contradicts.\n"
+    "- unsupported_claims must quote or paraphrase only the unsupported parts of the summary.\n\n"
+    "PAYLOAD:\n{payload}\n"
+)
+
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
 
@@ -320,6 +339,171 @@ def _save_state(state: dict) -> None:
 def _append_history(record: dict) -> None:
     with HISTORY_FILE.open("a") as fh:
         fh.write(json.dumps(record) + "\n")
+
+
+def _final_status(promoted: bool, dataset_size: int, total_promotions: int) -> str:
+    """The loop's final prose summary line."""
+    parts = []
+    if FAILED_STEPS:
+        parts.append(f"{len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS))
+    if ALERTS:
+        parts.append(f"{len(ALERTS)} alert(s): " + ", ".join(ALERTS))
+    status = "done" if not parts else "done with " + "; ".join(parts)
+    return (f"{status}. promoted={promoted} dataset={dataset_size} "
+            f"total_promotions={total_promotions}")
+
+
+def _artifact_fact(path: Path) -> dict:
+    """Compact existence/mtime evidence for honesty checks. Never raises."""
+    try:
+        if not path.exists():
+            return {"exists": False, "mtime": None}
+        return {"exists": True, "mtime": int(path.stat().st_mtime)}
+    except Exception:
+        return {"exists": False, "mtime": None}
+
+
+def _compact_train_metrics(metrics) -> dict | None:
+    """Only the scalar train-metric facts the summary could reasonably cite."""
+    if not isinstance(metrics, dict):
+        return None
+    out = {}
+    for key in ("decision", "model", "cv_f1_mean", "cosine_baseline_cv_f1"):
+        if key in metrics:
+            out[key] = metrics.get(key)
+    return out or None
+
+
+def _compact_jsonish(value, *, max_chars: int = 120):
+    """Bound arbitrary evidence to a compact JSON-ish structure."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, (list, tuple)):
+        return [_compact_jsonish(v, max_chars=max_chars) for v in value[:8]]
+    if isinstance(value, dict):
+        out = {}
+        for key, item in list(value.items())[:12]:
+            k = str(key)
+            if k in {"stdout", "stderr", "text", "findings", "run_ids", "rows"}:
+                continue
+            out[k[:40]] = _compact_jsonish(item, max_chars=max_chars)
+        return out
+    return str(value)[:max_chars]
+
+
+def _redacted_honesty_payload(summary_text: str, history_record: dict,
+                              run_evidence: Optional[dict] = None) -> dict:
+    """Bounded, redacted facts for the additive summary-consistency check.
+
+    Included:
+      - the final generated summary line/prose (truncated);
+      - the loop_history fields already persisted by this run, with train_metrics reduced
+        to a few scalar facts;
+      - compact run evidence: before/after dataset counts, step outcomes/return codes,
+        failure/alert ledgers, and relevant artifact existence/mtime facts.
+
+    Deliberately excluded:
+      - investigation contents, findings text, run ids, stdout/stderr bodies, and any
+        dataset rows or trace payloads. This keeps the request small and avoids sending
+        secrets or full findings to the model.
+    """
+    record = history_record if isinstance(history_record, dict) else {}
+    evidence = run_evidence if isinstance(run_evidence, dict) else {}
+    return {
+        "summary": (summary_text or "")[:_HONESTY_SUMMARY_MAX_CHARS],
+        "history": {
+            "run_at": record.get("run_at"),
+            "new_runs": record.get("new_runs"),
+            "dataset_size": record.get("dataset_size"),
+            "retrained": record.get("retrained"),
+            "promoted": record.get("promoted"),
+            "train_metrics": _compact_train_metrics(record.get("train_metrics")),
+            "dry_run": record.get("dry_run"),
+            "failed_steps": list(record.get("failed_steps") or []),
+            "alerts": list(record.get("alerts") or []),
+        },
+        "evidence": {
+            "ollama_reachable": evidence.get("ollama_reachable"),
+            "dataset_pairs_before_rebuild": evidence.get("dataset_pairs_before_rebuild"),
+            "dataset_pairs_after_run": evidence.get("dataset_pairs_after_run"),
+            "final_summary_facts": _compact_jsonish(evidence.get("final_summary_facts") or {}),
+            "step_results": _compact_jsonish(evidence.get("step_results") or {}),
+            "artifacts": _compact_jsonish(evidence.get("artifacts") or {}),
+        },
+    }
+
+
+def check_summary_consistency(summary_text: str, history_record: dict,
+                              run_evidence: Optional[dict] = None,
+                              *, gen_fn: Optional[Callable] = None) -> dict:
+    """Fail-open local-model corroboration for the loop's final prose summary.
+
+    This is additive only: callers must never change promotion, state, or exit-code
+    decisions based on this result. On any import/generation/parse failure it returns a
+    degraded result (ok=False, consistent=None) and never raises.
+    """
+    payload = _redacted_honesty_payload(summary_text, history_record, run_evidence)
+    mcp_dir = str(REPO / "mcp")
+    if gen_fn is None:
+        try:
+            if mcp_dir not in sys.path:
+                sys.path.insert(0, mcp_dir)
+            import backends
+            import llm_local
+            gen_fn = llm_local.generate
+            model = backends.ollama_verify_model()
+        except Exception as exc:
+            return {"consistent": None, "unsupported_claims": [], "ok": False,
+                    "error": f"local model import failed: {exc}"[:200]}
+    else:
+        try:
+            if mcp_dir not in sys.path:
+                sys.path.insert(0, mcp_dir)
+            import backends
+            model = backends.ollama_verify_model()
+        except Exception:
+            model = ""
+
+    prompt = _HONESTY_PROMPT.format(payload=json.dumps(payload, sort_keys=True))
+    try:
+        result = gen_fn(prompt, model=model, fmt="json", max_tokens=192, temperature=0.0)
+    except Exception as exc:
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": f"generate() raised: {exc}"[:200]}
+
+    raw = str((result or {}).get("text", "")).strip()
+    if not raw:
+        why = (result or {}).get("why") if isinstance(result, dict) else "empty response"
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": str(why or "empty response")[:200]}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": str(result.get("why") or "degraded response")[:200]}
+
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": f"bad JSON: {exc}"[:200]}
+
+    consistent = obj.get("consistent")
+    claims = obj.get("unsupported_claims")
+    if not isinstance(consistent, bool) or not isinstance(claims, list):
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": "response missing consistent/bool or unsupported_claims/list"}
+
+    cleaned = []
+    for item in claims:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            cleaned.append(text[:200])
+        if len(cleaned) >= _HONESTY_UNSUPPORTED_MAX:
+            break
+    return {"consistent": consistent, "unsupported_claims": cleaned, "ok": True, "error": None}
 
 
 # ── Ollama probe ───────────────────────────────────────────────────────────────
@@ -750,6 +934,15 @@ def main() -> int:
 
     promoted = False
     train_metrics = None
+    run_evidence = {
+        "ollama_reachable": ollama_ok,
+        "dataset_pairs_before_rebuild": current_size,
+        "dataset_pairs_after_run": current_size,
+        "step_results": {
+            "dataset_rebuild": {"attempted": should_rebuild, "reason": why},
+        },
+        "artifacts": {},
+    }
 
     should_retrain = should_rebuild
     if should_rebuild:
@@ -758,6 +951,12 @@ def main() -> int:
         rebuild_ok = rebuilt is not None
         new_size = rebuilt if rebuild_ok else _current_dataset_size()
         new_pairs = new_size - state["last_dataset_size"]
+        run_evidence["dataset_pairs_after_run"] = new_size
+        run_evidence["step_results"]["dataset_rebuild"] = {
+            "attempted": True,
+            "completed": rebuild_ok,
+            "dataset_pairs_after_rebuild": new_size,
+        }
         print(f"[loop] dataset after rebuild: {new_size} pairs ({new_pairs:+d})")
 
         # NOW the pair delta is real, so min_new_pairs can be applied to it.
@@ -770,8 +969,13 @@ def main() -> int:
 
         # ── 5. Retrain ────────────────────────────────────────────────────────
         train_metrics = _retrain(args.findings, args.ollama, args.dry_run) if should_retrain else None
+        run_evidence["step_results"]["train"] = {
+            "attempted": should_retrain,
+            "train_metrics": _compact_train_metrics(train_metrics),
+        }
         if train_metrics:
             decision = train_metrics.get("decision", "HOLD")
+            run_evidence["step_results"]["train"]["decision"] = decision
             print(f"[loop] train decision: {decision}  model={train_metrics.get('model')}  "
                   f"cv_f1={train_metrics.get('cv_f1_mean', 0):.3f}  "
                   f"baseline_f1={train_metrics.get('cosine_baseline_cv_f1', 0):.3f}")
@@ -779,6 +983,7 @@ def main() -> int:
             # ── 6. Canary ─────────────────────────────────────────────────────
             if decision == "PROMOTE":
                 canary = _run_canary(args.findings, args.ollama, args.dry_run)
+                run_evidence["step_results"]["canary"] = canary or {"attempted": True}
                 if canary and canary.get("exit_code", 1) == 0:
                     promoted = True
                     state["total_promotions"] = state.get("total_promotions", 0) + 1
@@ -804,33 +1009,53 @@ def main() -> int:
     loop_count = state.get("total_loop_runs", 0) + 1
     if _over_deadline(started, "decay"):
         return _finish(state, args, now_iso, loop_count, new_runs, current_size,
-                       should_retrain, promoted, train_metrics)
+                       should_retrain, promoted, train_metrics, run_evidence)
 
     # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
     if loop_count % args.decay_every == 0:
-        _run_decay(args.db, args.dry_run or not args.decay_apply)
+        decay_result = _run_decay(args.db, args.dry_run or not args.decay_apply)
+        run_evidence["step_results"]["decay"] = {
+            "attempted": True,
+            "n_rows": decay_result.get("n_rows"),
+            "n_decayed": decay_result.get("n_decayed"),
+        }
     else:
+        run_evidence["step_results"]["decay"] = {
+            "attempted": False,
+            "reason": f"run {loop_count}, cadence={args.decay_every}",
+        }
         print(f"[loop] decay skipped (run {loop_count}, cadence={args.decay_every})")
 
     # ── 7b. Post-promotion online monitoring ──────────────────────────────────
-    _run_monitor(args.findings, args.ollama, args.dry_run)
+    monitor_result = _run_monitor(args.findings, args.ollama, args.dry_run)
+    run_evidence["step_results"]["monitor"] = {
+        "attempted": True,
+        "drift": monitor_result.get("drift"),
+        "rollback_recommended": monitor_result.get("rollback_recommended"),
+    }
 
     # ── 7d. Embedding drift detection ─────────────────────────────────────────
     if ollama_ok:
-        _run_embedding_drift(args.ollama, args.dry_run)
+        drift_result = _run_embedding_drift(args.ollama, args.dry_run)
+        run_evidence["step_results"]["embedding_drift"] = dict(drift_result or {})
 
     if _over_deadline(started, "the SFT bake"):
         return _finish(state, args, now_iso, loop_count, new_runs, current_size,
-                       should_retrain, promoted, train_metrics)
+                       should_retrain, promoted, train_metrics, run_evidence)
 
     # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
     sft_days_ago = _days_since(now, state.get("last_sft_bake"))
     if ollama_ok and sft_days_ago >= args.sft_every:
         print(f"[loop] SFT bake (last was {sft_days_ago}d ago)")
         ok = _run_sft_bake(args.ollama, args.dry_run)
+        run_evidence["step_results"]["sft_bake"] = {"attempted": True, "ok": ok}
         if ok and not args.dry_run:
             state["last_sft_bake"] = now_iso
     else:
+        run_evidence["step_results"]["sft_bake"] = {
+            "attempted": False,
+            "reason": _skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama),
+        }
         print(f"[loop] SFT bake skipped — {_skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama)}")
 
     # ── 8. Embedding trigger (cadence-gated) ──────────────────────────────────
@@ -851,25 +1076,30 @@ def main() -> int:
 
     if _over_deadline(started, "active learning"):
         return _finish(state, args, now_iso, loop_count, new_runs, current_size,
-                       should_retrain, promoted, train_metrics)
+                       should_retrain, promoted, train_metrics, run_evidence)
 
     # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
     al_days_ago = _days_since(now, state.get("last_active_learn"))
     if ollama_ok and al_days_ago >= args.active_learn_every:
         print(f"[loop] active_learn (last was {al_days_ago}d ago)")
         al_result = _run_active_learn(args.ollama)
+        run_evidence["step_results"]["active_learn"] = dict(al_result or {})
         if al_result.get("exit_code", 1) == 0 and not args.dry_run:
             state["last_active_learn"] = now_iso
     else:
+        run_evidence["step_results"]["active_learn"] = {
+            "attempted": False,
+            "reason": _skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama),
+        }
         print(f"[loop] active_learn skipped — {_skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama)}")
 
     # ── 9. Persist state + history ────────────────────────────────────────────
     return _finish(state, args, now_iso, loop_count, new_runs, current_size,
-                   should_retrain, promoted, train_metrics)
+                   should_retrain, promoted, train_metrics, run_evidence)
 
 
 def _finish(state, args, now_iso, loop_count, new_runs, current_size,
-            should_retrain, promoted, train_metrics) -> int:
+            should_retrain, promoted, train_metrics, run_evidence: Optional[dict] = None) -> int:
     """Persist, report, and return the exit code.
 
     Its own function because the deadline check returns here from the middle of
@@ -881,7 +1111,28 @@ def _finish(state, args, now_iso, loop_count, new_runs, current_size,
     if not args.dry_run:
         _save_state(state)
 
-    _append_history({
+    final_line = _final_status(promoted, state["last_dataset_size"], state["total_promotions"])
+
+    evidence = dict(run_evidence or {})
+    evidence["dataset_pairs_after_run"] = evidence.get("dataset_pairs_after_run", _current_dataset_size())
+    evidence["final_summary_facts"] = {
+        "promoted": promoted,
+        "dataset_size": state["last_dataset_size"],
+        "total_promotions": state["total_promotions"],
+        "failed_steps": list(FAILED_STEPS),
+        "alerts": list(ALERTS),
+    }
+    evidence["artifacts"] = {
+        "dataset": _artifact_fact(DATASET),
+        "train_metrics": _artifact_fact(MLOPS / "grounding" / "train_metrics.json"),
+        "candidate_model": _artifact_fact(CANDIDATE_MODEL),
+        "live_model": _artifact_fact(LIVE_MODEL),
+        "active_candidates": _artifact_fact(ACTIVE_CANDIDATES),
+        "drift_result": _artifact_fact(MLOPS / "embedding" / "drift_result.json"),
+        "sft_pairs": _artifact_fact(MLOPS / "finetune" / "data" / "sft_pairs.jsonl"),
+        "embedding_trigger": _artifact_fact(MLOPS / "run_contrastive.sh"),
+    }
+    history_record = {
         "run_at": now_iso,
         "new_runs": len(new_runs),
         "dataset_size": current_size,
@@ -891,16 +1142,19 @@ def _finish(state, args, now_iso, loop_count, new_runs, current_size,
         "dry_run": args.dry_run,
         "failed_steps": list(FAILED_STEPS),
         "alerts": list(ALERTS),
-    })
+    }
+    honesty = check_summary_consistency(final_line, history_record, evidence)
+    if honesty.get("ok") and honesty.get("consistent") is False:
+        claims = honesty.get("unsupported_claims") or []
+        msg = "summary consistency check found unsupported claim(s)"
+        if claims:
+            msg += ": " + "; ".join(claims[:2])
+        _alert("summary honesty", msg[:300])
+        history_record["alerts"] = list(ALERTS)
 
-    parts = []
-    if FAILED_STEPS:
-        parts.append(f"{len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS))
-    if ALERTS:
-        parts.append(f"{len(ALERTS)} alert(s): " + ", ".join(ALERTS))
-    status = "done" if not parts else "done with " + "; ".join(parts)
-    print(f"[loop] {status}. promoted={promoted} dataset={state['last_dataset_size']} "
-          f"total_promotions={state['total_promotions']}")
+    _append_history(history_record)
+
+    print(f"[loop] {_final_status(promoted, state['last_dataset_size'], state['total_promotions'])}")
     return 1 if FAILED_STEPS else 0
 
 
