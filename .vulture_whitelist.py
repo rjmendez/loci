@@ -94,7 +94,6 @@ _ = retrieval_selftest
 # ── socketserver hooks and tuning attributes, read by the stdlib base class
 # MemcheckDaemon subclasses ThreadingUnixStreamServer; _Handler subclasses
 # BaseRequestHandler. Both names are called through the base, never directly.
-_ = handle
 _ = handle_error
 _ = daemon_threads
 _ = request_queue_size
@@ -109,4 +108,3 @@ _ = recall_decision
 # `conn.row_factory = sqlite3.Row` is a write the stdlib reads back; there is
 # no root model that makes this resolvable, so it is suppressed by name.
 _ = row_factory
-

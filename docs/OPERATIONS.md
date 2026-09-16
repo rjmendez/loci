@@ -287,6 +287,46 @@ Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`, and
 > optimistic by roughly 2/3 of its margin over cosine. See
 > [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
 > numbers and what more findings are actually worth.
+
+### Prefilter bulky agent output before cloud synthesis
+
+`scripts/agent_output_prefilter.py` is an **opt-in** helper for workflows that
+fan out to local/background agents, collect long result blobs, then hand those
+results to an expensive cloud model for the final synthesis.
+
+It composes the existing local-model tier:
+
+- `semantic_relevance` keeps the chunks that best match the task context
+- `semantic_dedup` collapses repeated chunks when embeddings are available
+- `compress_text` condenses the kept span under a character budget
+
+It always preserves the original text in the returned JSON. If the local tier
+degrades, errors, times out, or produces a confidence score below the threshold,
+the script fails open and returns the original text unchanged with
+`fallback_used: true`.
+
+```bash
+cat agent-output.txt | \
+$LOCI_PY $LOCI/scripts/agent_output_prefilter.py \
+  --context "summarize the build blockers for PR review" \
+  --threshold 0.6
+```
+
+Output shape:
+
+```json
+{
+  "compressed_text": "...candidate condensed view...",
+  "original_text": "...full agent output...",
+  "confidence": 0.83,
+  "coverage": 0.58,
+  "fallback_used": false,
+  "fallback_reason": ""
+}
+```
+
+Callers decide which field to forward. The helper does **not** change any
+default fleet-dispatch path on its own.
 >
 > Scores are upserted to the Qdrant `eval_scores` collection with `run_date` in
 > the payload.
