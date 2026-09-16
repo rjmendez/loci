@@ -26,8 +26,8 @@ def test_validate_verify_schema_limits_verdict_set():
 
 def test_summarize_scores_marks_transport_failures_unavailable():
     scores = [
-        A.CaseScore(latency_ms=12.0, json_ok=False, schema_ok=False, transport_ok=False),
-        A.CaseScore(latency_ms=15.0, json_ok=False, schema_ok=False, transport_ok=False),
+        A.CaseScore(latency_ms=12.0, json_ok=False, schema_ok=False, correct=False, transport_ok=False),
+        A.CaseScore(latency_ms=15.0, json_ok=False, schema_ok=False, correct=False, transport_ok=False),
     ]
     row = A.summarize_scores("classify", "candidate", "abliterated:latest", scores, note="connection refused")
     assert row.available is False
@@ -38,8 +38,8 @@ def test_summarize_scores_marks_transport_failures_unavailable():
 
 def test_aggregate_rows_combines_available_task_metrics():
     rows = [
-        A.SummaryRow(task="classify", arm="baseline", model="qwen2.5:3b", total=2, json_ok=2, schema_ok=1, latencies_ms=[10.0, 20.0], available=True),
-        A.SummaryRow(task="compress", arm="baseline", model="qwen2.5:3b", total=1, json_ok=1, schema_ok=1, latencies_ms=[30.0], available=True),
+        A.SummaryRow(task="classify", arm="baseline", model="qwen2.5:3b", total=2, json_ok=2, schema_ok=1, correct=1, latencies_ms=[10.0, 20.0], available=True),
+        A.SummaryRow(task="compress", arm="baseline", model="qwen2.5:3b", total=1, json_ok=1, schema_ok=1, correct=1, latencies_ms=[30.0], available=True),
     ]
     agg = A.aggregate_rows(rows, arm="baseline", model="qwen2.5:3b")
     assert agg.task == "all"
@@ -47,15 +47,17 @@ def test_aggregate_rows_combines_available_task_metrics():
     assert agg.total == 3
     assert agg.json_ok == 3
     assert agg.schema_ok == 2
+    assert agg.correct == 2
     assert agg.avg_latency_ms() == 20.0
 
 
 def test_format_table_renders_na_for_unavailable_rows():
-    row = A.SummaryRow(task="verify", arm="candidate", model="abliterated:latest", total=3, json_ok=0, schema_ok=0, latencies_ms=[], available=False, note="endpoint unavailable")
+    row = A.SummaryRow(task="verify", arm="candidate", model="abliterated:latest", total=3, json_ok=0, schema_ok=0, correct=0, latencies_ms=[], available=False, note="endpoint unavailable")
     table = A.format_table([row])
     assert "verify" in table
     assert "candidate" in table
     assert "N/A" in table
+    assert "correct" in table
     assert "endpoint unavailable" in table
 
 
@@ -68,3 +70,46 @@ def test_evaluate_task_uses_stubbed_calls_without_live_ollama():
     assert row.available is True
     assert row.total == len(A.CLASSIFY_CASES)
     assert row.json_ok == len(A.CLASSIFY_CASES)
+    assert row.correct == 1
+
+
+def test_score_case_marks_wrong_but_well_formed_classify_answer_incorrect():
+    case = A.CLASSIFY_CASES[0]
+    score = A.score_case("classify", case, A.CallResult(text='{"label":"feature"}', latency_ms=5.0, transport_ok=True))
+    assert score.json_ok is True
+    assert score.schema_ok is True
+    assert score.correct is False
+
+
+def test_score_case_marks_right_classify_answer_correct():
+    case = A.CLASSIFY_CASES[0]
+    score = A.score_case("classify", case, A.CallResult(text='{"label":"bug"}', latency_ms=5.0, transport_ok=True))
+    assert score.json_ok is True
+    assert score.schema_ok is True
+    assert score.correct is True
+
+
+def test_score_case_marks_wrong_but_well_formed_verify_answer_incorrect():
+    case = A.VERIFY_CASES[1]
+    score = A.score_case("verify", case, A.CallResult(text='{"verdict":"confirmed","reasoning":"wrong"}', latency_ms=5.0, transport_ok=True))
+    assert score.json_ok is True
+    assert score.schema_ok is True
+    assert score.correct is False
+
+
+def test_score_case_marks_compress_keyword_retention_as_correctness_proxy():
+    case = A.COMPRESS_CASES[0]
+    wrong = A.score_case("compress", case, A.CallResult(text='{"text":"Short summary about budget only."}', latency_ms=5.0, transport_ok=True))
+    right = A.score_case(
+        "compress",
+        case,
+        A.CallResult(
+            text='{"text":"Keep findings reloadable with claim, context, timestamps, and file:line references."}',
+            latency_ms=5.0,
+            transport_ok=True,
+        ),
+    )
+    assert wrong.schema_ok is True
+    assert wrong.correct is False
+    assert right.schema_ok is True
+    assert right.correct is True
