@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 139  # 128 -> ... -> 138 -> 139: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation
+    assert head_build.meta.file_count == 140  # 128 -> ... -> 139 -> 140: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -115,7 +115,7 @@ def test_unresolved_imports_are_all_genuinely_optional_third_party(head_build):
     # would still be the regression this gate is for.
     assert modules <= {
         "cy_ioc_extract", "mnemosyne", "mnemosyne.core.memory", "mnemosyne.core.beam",
-        "psycopg2", "psutil", "features",
+        "psycopg2", "psutil", "features", "ground_gate",
     }
     assert len(unresolved) < 20, "the unresolved list must fit on one screen"
 

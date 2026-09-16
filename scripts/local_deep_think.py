@@ -106,9 +106,32 @@ def _runtime() -> SimpleNamespace:
     )
 
 
+def _backends_module() -> SimpleNamespace:
+    """Import just ``backends``, not the full runtime.
+
+    ``_runtime()`` eagerly imports ``server``/``verify``/``ground_gate`` etc.
+    for the production dependency-injection path in ``run_chain``. Config
+    lookups only need ``backends`` and must not drag in unrelated modules
+    (``mcp/server.py`` requires ``python-dotenv``, which isn't installed in
+    every environment this script's config helpers run in, e.g. minimal
+    CI/test environments) or trip the broad ``except Exception`` below into
+    silently returning the default.
+    """
+    _ensure_paths()
+    mod = importlib.import_module("backends")
+    mod.load_env(_repo_root())
+    return mod
+
+
+def _model_json_module():
+    """Import just ``model_json``, for the same reason as ``_backends_module``."""
+    _ensure_paths()
+    return importlib.import_module("model_json")
+
+
 def _cfg_value(key: str, default: str = "") -> str:
     try:
-        return str(_runtime().backends._cfg("ollama", key, default) or default)
+        return str(_backends_module()._cfg("ollama", key, default) or default)
     except Exception:
         return default
 
@@ -153,7 +176,7 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         redteam_model = (
             args.redteam_model
             or os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
-            or _runtime().backends.ollama_redteam_model()
+            or _backends_module().ollama_redteam_model()
         )
     except Exception:
         redteam_model = (
@@ -218,7 +241,7 @@ def _call_generate(gen_fn: Callable, prompt: str, *, model: str,
 
 def _extract_json_object(text: str):
     try:
-        return _runtime().model_json.extract_json_object(text)
+        return _model_json_module().extract_json_object(text)
     except Exception:
         return None
 
