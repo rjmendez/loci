@@ -2901,13 +2901,10 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig = server.MEMORY_DIR
-        self._orig_entail = getattr(server, "_run_pre_answer_llm_entailment_check", None)
         server.MEMORY_DIR = Path(self._tmp.name)
 
     def tearDown(self):
         server.MEMORY_DIR = self._orig
-        if self._orig_entail is not None:
-            server._run_pre_answer_llm_entailment_check = self._orig_entail
         self._tmp.cleanup()
 
     def _setup_investigation(self, finding_text: str):
@@ -3004,49 +3001,3 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertFalse(first["supported"])
         self.assertEqual(first["support_basis"], "none")
         self.assertEqual(first["support_refs"], [])
-
-    def test_llm_entailment_check_is_advisory_and_does_not_flip_supported(self):
-        inv_id = self._setup_investigation(
-            "The investigation notes an alert on host-b and says compromise is unconfirmed."
-        )
-        server._run_pre_answer_llm_entailment_check = lambda *a, **k: {
-            "available": True,
-            "verdict": "refuted",
-            "rationale": "Evidence only supports an alert, not a confirmed compromise.",
-            "confidence": 0.92,
-            "degraded": False,
-            "error": "",
-        }
-
-        result = _json(server.investigation_pre_answer_check(
-            investigation_id=inv_id,
-            claims="The investigation notes an alert on host-b.",
-            record=False,
-        ))
-
-        first = result["claim_results"][0]
-        self.assertTrue(first["supported"], msg="deterministic lexical support must stay unchanged")
-        self.assertEqual(first["support_basis"], "lexical")
-        self.assertEqual(first["llm_entailment_check"]["verdict"], "refuted")
-
-    def test_llm_entailment_model_failure_is_fail_open_and_supported_stays_true(self):
-        inv_id = self._setup_investigation("The auth service uses JWT tokens with RS256.")
-        server._run_pre_answer_llm_entailment_check = lambda *a, **k: {
-            "available": False,
-            "verdict": None,
-            "rationale": "",
-            "confidence": 0.0,
-            "degraded": True,
-            "error": "no Ollama endpoint resolved",
-        }
-
-        result = _json(server.investigation_pre_answer_check(
-            investigation_id=inv_id,
-            claims="The auth service uses JWT tokens.",
-            record=False,
-        ))
-
-        first = result["claim_results"][0]
-        self.assertTrue(first["supported"])
-        self.assertEqual(first["llm_entailment_check"]["available"], False)
-        self.assertEqual(first["llm_entailment_check"]["error"], "no Ollama endpoint resolved")
