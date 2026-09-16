@@ -73,6 +73,20 @@ _SPECS: dict[str, ModelSpec] = {
             "q5_k_m": 10508874080,
         },
     ),
+    "27b-qwen38": ModelSpec(
+        choice="27b-qwen38",
+        repo="huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF",
+        template="Modelfile.qwen3.8-27b-abliterated",
+        filename_prefix="Huihui-Qwen3.8-27B-abliterated",
+        tag_prefix="loci-qwen38-27b-abliterated",
+        allowed_quants=("q5_k", "q6_k"),
+        default_quant="q5_k",
+        prompt="Reply with exactly: ready",
+        expected_bytes={
+            "q5_k": 19535701280,
+            "q6_k": 22430999840,
+        },
+    ),
     "24b-mistral": ModelSpec(
         choice="24b-mistral",
         repo="bartowski/huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-GGUF",
@@ -87,6 +101,20 @@ _SPECS: dict[str, ModelSpec] = {
             "q6_k": 19345939456,
         },
     ),
+    "26b-gemma4": ModelSpec(
+        choice="26b-gemma4",
+        repo="groxaxo/Huihui-gemma-4-26B-A4B-it-abliterated-GGUF",
+        template="Modelfile.gemma4-26b-a4b-abliterated",
+        filename_prefix="gemma-4-26B-A4B-it-UD",
+        tag_prefix="loci-gemma4-26b-a4b-abliterated",
+        allowed_quants=("q4_k_m", "q5_k_m"),
+        default_quant="q4_k_m",
+        prompt="Reply with exactly: ready",
+        expected_bytes={
+            "q4_k_m": 16868236224,
+            "q5_k_m": 21150358464,
+        },
+    ),
 }
 
 
@@ -94,8 +122,10 @@ def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Download and register one opt-in abliterated Ollama model for Loci.")
     ap.add_argument("model", choices=sorted(_SPECS),
-                    help="14b-coder (12-16GB VRAM pick) or 24b-mistral (24GB+ VRAM pick)")
-    ap.add_argument("--quant", choices=("q4_k_m", "q5_k_m", "q6_k"),
+                    help=("14b-coder (12-16GB VRAM), 24b-mistral (24GB+ VRAM), "
+                          "27b-qwen38 (~20GB VRAM; prefer Q5+), or "
+                          "26b-gemma4 (A4B MoE; cheaper dense-equivalent pick)"))
+    ap.add_argument("--quant", choices=("q4_k_m", "q5_k", "q5_k_m", "q6_k"),
                     help="override the default researched quant for the chosen model")
     ap.add_argument("--models-dir", type=Path, default=_MODELS_DIR,
                     help=f"where GGUFs and rewritten Modelfiles live (default: {_MODELS_DIR})")
@@ -134,9 +164,12 @@ def build_plan(model: str, *, quant: str | None, models_dir: Path, tag: str | No
 
 def _render_modelfile(template_text: str, gguf_path: Path) -> str:
     lines = template_text.splitlines()
-    if not lines or not lines[0].startswith("FROM "):
-        raise ValueError("Modelfile template must start with FROM")
-    lines[0] = f"FROM {gguf_path}"
+    for i, line in enumerate(lines):
+        if line.startswith("FROM "):
+            lines[i] = f"FROM {gguf_path}"
+            break
+    else:
+        raise ValueError("Modelfile template must contain FROM")
     return "\n".join(lines) + "\n"
 
 

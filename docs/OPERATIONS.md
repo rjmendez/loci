@@ -44,11 +44,22 @@ deploy one explicitly:
 ```bash
 scripts/deploy_abliterated_model.py 14b-coder
 scripts/deploy_abliterated_model.py 24b-mistral
+scripts/deploy_abliterated_model.py 27b-qwen38
+scripts/deploy_abliterated_model.py 26b-gemma4
 ```
 
 The script downloads one researched GGUF quant into `~/.loci/models/ollama/`,
 rewrites the matching `ollama/Modelfile.*` to that local path, runs `ollama create`,
 then does a tiny `/api/generate` smoke test and prints `/api/ps` / GPU state.
+
+The new Qwen3.8-27B option is still opt-in and keeps the code default unchanged, but
+it rides llama.cpp's `qwen3_5` hybrid linear-attention path, where
+`ggml-org/llama.cpp#28879` tracks unresolved non-monotonic quant-precision behavior.
+Treat Q5_K_M or higher as the safe starting point when you can, expect roughly
+16-20GB VRAM at Q4/Q5, and verify outputs empirically before precision-sensitive use
+(for example with `scripts/ab_eval_local_model.py` if/when that lands in your checkout).
+The Gemma4 A4B option is an MoE with only ~4B active params; Google also publishes
+official QAT GGUFs of the non-abliterated base as a more-trusted comparison baseline.
 
 After that, switch Loci yourself with `LOCI_OLLAMA_GEN_MODEL=<the-created-tag>`.
 See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →

@@ -30,11 +30,29 @@ def test_build_plan_uses_researched_defaults():
     assert plan.gguf_path.name == "Qwen2.5-Coder-14B-Instruct-abliterated-Q4_K_M.gguf"
 
 
+def test_build_plan_includes_qwen38_defaults():
+    mod = _load()
+    plan = mod.build_plan("27b-qwen38", quant=None, models_dir=pathlib.Path("/models"), tag=None)
+    assert plan.quant == "q5_k"
+    assert plan.tag == "loci-qwen38-27b-abliterated:q5k"
+    assert plan.expected_bytes == 19535701280
+    assert plan.gguf_path.name == "Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf"
+
+
+def test_build_plan_includes_gemma4_defaults():
+    mod = _load()
+    plan = mod.build_plan("26b-gemma4", quant=None, models_dir=pathlib.Path("/models"), tag=None)
+    assert plan.quant == "q4_k_m"
+    assert plan.tag == "loci-gemma4-26b-a4b-abliterated:q4km"
+    assert plan.expected_bytes == 16868236224
+    assert plan.gguf_path.name == "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
+
+
 def test_render_modelfile_rewrites_from_line_only():
     mod = _load()
-    rendered = mod._render_modelfile("FROM ./old.gguf\nPARAMETER temperature 0.2\n",
+    rendered = mod._render_modelfile("# comment\nFROM ./old.gguf\nPARAMETER temperature 0.2\n",
                                      pathlib.Path("/weights/model.gguf"))
-    assert rendered.startswith("FROM /weights/model.gguf\n")
+    assert rendered.startswith("# comment\nFROM /weights/model.gguf\n")
     assert "PARAMETER temperature 0.2" in rendered
 
 
@@ -45,6 +63,19 @@ def test_main_dry_run_parses_and_prints_plan(capsys):
     out = capsys.readouterr().out
     assert "loci-mistral-small-24b-abliterated:q5km" in out
     assert "LOCI_OLLAMA_GEN_MODEL" in out
+
+
+def test_main_dry_run_supports_new_registry_entries(capsys):
+    mod = _load()
+    rc = mod.main(["27b-qwen38", "--dry-run", "--models-dir", "/models"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "loci-qwen38-27b-abliterated:q5k" in out
+
+    rc = mod.main(["26b-gemma4", "--dry-run", "--models-dir", "/models"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "loci-gemma4-26b-a4b-abliterated:q4km" in out
 
 
 def test_main_refuses_cleanly_on_low_disk(monkeypatch, capsys):
