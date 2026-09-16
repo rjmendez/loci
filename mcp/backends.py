@@ -156,6 +156,23 @@ def ollama_compress_model() -> str:
     return _task_model("LOCI_OLLAMA_COMPRESS_MODEL", "compress_model")
 
 
+def ollama_guardian_model() -> str:
+    """Model for guardian.check_injection_risk's safety classification.
+
+    Deliberately does NOT fall back to ollama_gen_model() like the other per-task
+    resolvers: Granite Guardian is a purpose-built safety classifier tuned on a
+    specific risk-definition prompt shape, not a general chat/reasoning model.
+    Routing this check to an arbitrary general model would produce meaningless
+    Yes/No output rather than a degraded-but-sane answer, so the default is the
+    verified-good granite3-guardian tag itself.
+
+    Env -> [ollama].guardian_model -> "granite3-guardian:2b".
+    """
+    return (os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
+            or _cfg("ollama", "guardian_model", "")
+            or "granite3-guardian:2b")
+
+
 @functools.lru_cache(maxsize=8)
 def vllm_url(probe_timeout: float = 1.0) -> str:
     """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).

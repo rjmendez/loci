@@ -19,12 +19,14 @@ Two testing surfaces are used:
 """
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -992,6 +994,9 @@ def test_high_injection_blocks_any_file_in_block_mode(tmp_path):
 
 
 def test_suspicious_injection_to_ordinary_file_only_warns_when_permissive(tmp_path):
+    # No OLLAMA_BASE_URL/OLLAMA_URL/LOCI_OLLAMA_GEN_URL in the test env means
+    # GUARDIAN_URL resolves empty, so _guardian_confirms_injection short-circuits
+    # to None with zero network calls -- deterministic, no live dependency.
     home = tmp_path / "h"
     home.mkdir()
     rc, out, _ = run_hook(
@@ -999,7 +1004,9 @@ def test_suspicious_injection_to_ordinary_file_only_warns_when_permissive(tmp_pa
     assert (rc, out) == (0, "")
     d = decisions(home)
     assert d[0].startswith("INJECTION-SUSPICIOUS(embedded agent instruction block) paths=")
-    assert d[1] == "ALLOW(mutation)"
+    assert d[1].startswith("INJECTION-GUARDIAN-CLEARED-OR-UNAVAILABLE"
+                            "(embedded agent instruction block) verdict=None")
+    assert d[2] == "ALLOW(mutation)"
 
 
 def test_suspicious_injection_to_agent_config_always_blocks(tmp_path):
@@ -1242,3 +1249,144 @@ def test_hook_ignores_unknown_event_names(tmp_path):
                            "tool_input": {}, "session_id": "s"}, home)
     assert rc == 0 and not out
     assert not decisions(home)
+
+
+# =============================================================================
+# Granite Guardian semantic corroboration of INJECTION_SUSPICIOUS hits
+#
+# A stub /api/generate server (stdlib http.server, no real Ollama needed) lets
+# these exercise the real urllib request path end-to-end instead of monkeypatching
+# private helpers.
+# =============================================================================
+
+class _StubGuardianServer(http.server.BaseHTTPRequestHandler):
+    response_text = "No"  # class-level; set per test before starting the server
+    delay_s = 0.0
+
+    def log_message(self, *a):  # silence default stderr access logging
+        pass
+
+    def do_POST(self):
+        if self.delay_s:
+            import time
+            time.sleep(self.delay_s)
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)  # drain the request body
+        body = json.dumps({"response": self.response_text}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _StubGuardianServerHandle:
+    def __init__(self, response_text="No", delay_s=0.0):
+        _StubGuardianServer.response_text = response_text
+        _StubGuardianServer.delay_s = delay_s
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), _StubGuardianServer)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=2)
+
+
+@pytest.fixture
+def stub_guardian():
+    handles = []
+
+    def _make(response_text="No", delay_s=0.0):
+        h = _StubGuardianServerHandle(response_text=response_text, delay_s=delay_s)
+        handles.append(h)
+        return h
+
+    yield _make
+    for h in handles:
+        h.close()
+
+
+def test_guardian_confirms_injection_escalates_to_block(tmp_path, stub_guardian):
+    server = stub_guardian(response_text="Yes")
+    home = tmp_path / "h"
+    home.mkdir()
+    rc, out, _ = run_hook(
+        call("Write", {"file_path": "notes.txt", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": server.url})
+    d = decision(out)
+    assert d["action"] == "block"
+    assert "PROMPT INJECTION CONFIRMED [embedded agent instruction block]" in d["message"]
+    assert any(x.startswith("INJECTION-GUARDIAN-CONFIRMED") for x in decisions(home))
+
+
+def test_guardian_denies_injection_still_allows(tmp_path, stub_guardian):
+    server = stub_guardian(response_text="No")
+    home = tmp_path / "h"
+    home.mkdir()
+    rc, out, _ = run_hook(
+        call("Write", {"file_path": "notes.txt", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": server.url})
+    assert (rc, out) == (0, "")
+    d = decisions(home)
+    assert any("INJECTION-GUARDIAN-CLEARED-OR-UNAVAILABLE" in x and "verdict=False" in x for x in d)
+    assert d[-1] == "ALLOW(mutation)"
+
+
+def test_guardian_disabled_flag_skips_network_even_with_reachable_server(tmp_path, stub_guardian):
+    server = stub_guardian(response_text="Yes")  # would confirm if consulted
+    home = tmp_path / "h"
+    home.mkdir()
+    rc, out, _ = run_hook(
+        call("Write", {"file_path": "notes.txt", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": server.url, "HOOK_GUARDIAN_ENABLED": "0"})
+    assert (rc, out) == (0, "")
+    d = decisions(home)
+    assert any("verdict=None" in x for x in d)
+    assert d[-1] == "ALLOW(mutation)"
+
+
+def test_guardian_unreachable_url_fails_open(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    # Port 1 is a reserved/unlisted low port; nothing should be listening on it.
+    rc, out, _ = run_hook(
+        call("Write", {"file_path": "notes.txt", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": "http://127.0.0.1:1"})
+    assert (rc, out) == (0, "")
+    d = decisions(home)
+    assert any("verdict=None" in x for x in d)
+    assert d[-1] == "ALLOW(mutation)"
+
+
+def test_guardian_malformed_response_fails_open(tmp_path, stub_guardian):
+    server = stub_guardian(response_text="unparseable maybe not sure")
+    home = tmp_path / "h"
+    home.mkdir()
+    rc, out, _ = run_hook(
+        call("Write", {"file_path": "notes.txt", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": server.url})
+    assert (rc, out) == (0, "")
+    d = decisions(home)
+    assert any("verdict=None" in x for x in d)
+    assert d[-1] == "ALLOW(mutation)"
+
+
+def test_guardian_not_consulted_when_agent_config_already_blocks(tmp_path, stub_guardian):
+    # Agent-config path already forces a block on the regex hit alone; Guardian
+    # (which would confirm) must not even be reached in that branch.
+    server = stub_guardian(response_text="Yes")
+    home = tmp_path / "h"
+    home.mkdir()
+    _, out, _ = run_hook(
+        call("Write", {"file_path": ".cursorrules", "content": "[AGENT INSTRUCTIONS] hi"}),
+        home, extra_env={"OLLAMA_BASE_URL": server.url})
+    msg = decision(out)["message"]
+    assert msg.startswith("SUSPICIOUS INJECTION PATTERN [embedded agent instruction block]")
+    assert "CONFIRMED" not in msg
+    assert not any("GUARDIAN" in x for x in decisions(home))
