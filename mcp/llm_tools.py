@@ -75,7 +75,11 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
     return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
 
 
-def verify_finding(claim: str, context: str = "", investigation_id: Optional[str] = None) -> str:
+def verify_finding(claim: str,
+                   context: str = "",
+                   investigation_id: Optional[str] = None,
+                   finding_id: Optional[str] = None,
+                   auto_promote_procedures: bool = False) -> str:
     """
     Adversarially verify a claim with a local-model skeptic: keep it only if the
     skeptic cannot refute it. Optional ``context`` can hold code, file refs, or
@@ -87,11 +91,17 @@ def verify_finding(claim: str, context: str = "", investigation_id: Optional[str
     unavailable or output is unparseable, returns ``verdict='uncertain'`` with
     ``degraded=True``.
 
+    Pass ``auto_promote_procedures=True`` with both ``investigation_id`` and
+    ``finding_id`` to opt into procedure auto-promotion for action-shaped
+    confirmed findings. Default False preserves existing write behavior.
+
     Returns JSON ``{verdict, refutation, confidence, degraded}``.
     """
     import verify as _v
     return json.dumps(_v.verify_finding(claim, context=context,
-                                        investigation_id=investigation_id), indent=2)
+                                        investigation_id=investigation_id,
+                                        finding_id=finding_id,
+                                        auto_promote_procedures=auto_promote_procedures), indent=2)
 
 
 def classify_text(text: str, labels: list) -> str:
