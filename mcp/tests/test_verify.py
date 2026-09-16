@@ -45,6 +45,52 @@ _CONFIRMED_REASONING = (
 )
 
 
+def test_lazy_generate_routes_through_verify_model(monkeypatch):
+    """The default gen_fn (used when verify_finding is called with no explicit gen_fn) must
+    resolve backends.ollama_verify_model() and pass it to llm_local.generate explicitly, so
+    an operator can point verify_finding at a stronger model independent of gen_model."""
+    calls = {}
+
+    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
+        calls["model"] = model
+        calls["fmt"] = fmt
+        return {"text": '{"verdict": "confirmed"}', "ok": True}
+
+    import llm_local
+    monkeypatch.setattr(llm_local, "generate", fake_generate)
+    import backends
+    monkeypatch.setattr(backends, "ollama_verify_model", lambda: "strong-verify-model:27b")
+
+    result = V._lazy_generate("some prompt", fmt="json", max_tokens=64)
+    assert result["ok"] is True
+    assert calls["model"] == "strong-verify-model:27b"
+    assert calls["fmt"] == "json"
+
+
+def test_lazy_generate_fails_open_when_backends_unresolvable(monkeypatch):
+    """If backends.ollama_verify_model() itself errors, _lazy_generate must still call
+    generate() with an empty model (which falls back to the shared gen_model) rather than
+    raising or silently no-oping."""
+    calls = {}
+
+    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
+        calls["model"] = model
+        return {"text": "{}", "ok": True}
+
+    import llm_local
+    monkeypatch.setattr(llm_local, "generate", fake_generate)
+
+    def _boom():
+        raise RuntimeError("no backends module")
+
+    import backends
+    monkeypatch.setattr(backends, "ollama_verify_model", _boom)
+
+    result = V._lazy_generate("prompt", fmt="json")
+    assert result["ok"] is True
+    assert calls["model"] == ""
+
+
 def test_refutation_yields_refuted():
     r = V.verify_finding("The base omits RTCM 1005", gen_fn=_ok(_REFUTED))
     assert r["verdict"] == "refuted"

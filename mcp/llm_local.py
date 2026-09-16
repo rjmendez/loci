@@ -99,6 +99,13 @@ def generate(prompt: str,
         "prompt": prompt,
         "stream": False,
         "keep_alive": keep_alive,  # critical: keep the model resident [substrate]
+        # Reasoning-mode models (e.g. Qwen3-family "thinking" variants) route their entire
+        # JSON answer into a separate `thinking` field and leave `response` empty when
+        # fmt="json" is set, which silently degraded every caller (compress_text,
+        # classify_text, verify_finding) to ok=False against such a model. Disabling
+        # thinking keeps the answer in `response`. Harmless no-op for non-thinking models
+        # (verified live) and ignored outright by Ollama builds that predate the option.
+        "think": False,
         "options": {
             "num_predict": max_tokens,
             "temperature": temperature,
@@ -111,7 +118,15 @@ def generate(prompt: str,
         import requests
         r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
-        text = (r.json().get("response") or "")
+        payload = r.json()
+        text = (payload.get("response") or "")
+        if not text.strip():
+            # Defensive fallback: some models/builds still route JSON output into
+            # `thinking` even with think=False sent. Recover the answer from there rather
+            # than scoring a false failure. Mirrors scripts/ab_eval_local_model.py.
+            thinking = payload.get("thinking")
+            if isinstance(thinking, str) and thinking.strip():
+                text = thinking
     except Exception as exc:
         fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
                              temperature=temperature)
