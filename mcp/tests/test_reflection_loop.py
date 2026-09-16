@@ -202,6 +202,227 @@ class ReflectionLoopTests(unittest.TestCase):
         self.assertIn("batched low-signal session_event files count=2", observed[0]["text"])
         self.assertIn("batched-low-signal", observed[0]["tags"])
 
+    def test_tick_attaches_llm_triage_metadata_when_enabled(self):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["queue"] = [{"kind": "process_log", "path": "/tmp/a.log"}]
+        summary = {
+            "status": "processed",
+            "kind": "process_log",
+            "path": "/tmp/a.log",
+            "lines_scanned": 7,
+            "bytes_scanned": 70,
+            "sampling_mode": "full",
+            "events": {},
+            "tools": {"pytest": 1},
+            "errors": {"assertion failed": 1},
+            "warnings": {},
+        }
+        stored_calls: list[dict] = []
+
+        def fake_store(**kwargs):
+            stored_calls.append(kwargs)
+            return json.dumps({"stored": True})
+
+        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+        ), patch.object(
+            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+        ), patch.object(
+            server, "_process_reflection_item", return_value=summary
+        ), patch.object(
+            server, "_reflection_llm_triage_metadata",
+            return_value={"llm_triage": {"category": "real_regression", "novelty": "novel_signal"}},
+        ) as triage_mock, patch.object(
+            server, "investigation_store", side_effect=fake_store
+        ):
+            server.reflection_loop_tick(
+                max_items=1,
+                max_lines_per_file=100,
+                store_item_findings=True,
+                enable_llm_triage=True,
+                max_llm_items=1,
+            )
+
+        observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0]["metadata"],
+            {"llm_triage": {"category": "real_regression", "novelty": "novel_signal"}},
+        )
+        triage_mock.assert_called_once()
+
+    def test_tick_llm_triage_fail_open_marks_degraded(self):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["queue"] = [{"kind": "process_log", "path": "/tmp/a.log"}]
+        summary = {
+            "status": "processed",
+            "kind": "process_log",
+            "path": "/tmp/a.log",
+            "lines_scanned": 7,
+            "bytes_scanned": 70,
+            "sampling_mode": "full",
+            "events": {},
+            "tools": {},
+            "errors": {"assertion failed": 1},
+            "warnings": {},
+        }
+        stored_calls: list[dict] = []
+
+        def fake_store(**kwargs):
+            stored_calls.append(kwargs)
+            return json.dumps({"stored": True})
+
+        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+        ), patch.object(
+            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+        ), patch.object(
+            server, "_process_reflection_item", return_value=summary
+        ), patch.object(
+            server, "_reflection_llm_triage_metadata",
+            return_value={"llm_triage": {"degraded": True}},
+        ), patch.object(
+            server, "investigation_store", side_effect=fake_store
+        ):
+            server.reflection_loop_tick(
+                max_items=1,
+                max_lines_per_file=100,
+                store_item_findings=True,
+                enable_llm_triage=True,
+                max_llm_items=1,
+            )
+
+        observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        self.assertEqual(observed[0]["metadata"], {"llm_triage": {"degraded": True}})
+
+    def test_tick_respects_max_llm_items_budget(self):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["queue"] = [
+            {"kind": "process_log", "path": "/tmp/a.log"},
+            {"kind": "process_log", "path": "/tmp/b.log"},
+            {"kind": "process_log", "path": "/tmp/c.log"},
+        ]
+        summary = {
+            "status": "processed",
+            "kind": "process_log",
+            "path": "/tmp/a.log",
+            "lines_scanned": 1,
+            "bytes_scanned": 10,
+            "sampling_mode": "full",
+            "events": {},
+            "tools": {},
+            "errors": {"repeatable failure": 1},
+            "warnings": {},
+        }
+        stored_calls: list[dict] = []
+
+        def fake_store(**kwargs):
+            stored_calls.append(kwargs)
+            return json.dumps({"stored": True})
+
+        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+        ), patch.object(
+            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+        ), patch.object(
+            server, "_process_reflection_item", side_effect=[summary, summary, summary]
+        ), patch.object(
+            server, "_reflection_llm_triage_metadata",
+            return_value={"llm_triage": {"category": "unknown", "novelty": "unclear"}},
+        ) as triage_mock, patch.object(
+            server, "investigation_store", side_effect=fake_store
+        ):
+            server.reflection_loop_tick(
+                max_items=3,
+                max_lines_per_file=100,
+                store_item_findings=True,
+                enable_llm_triage=True,
+                max_llm_items=2,
+            )
+
+        observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        self.assertEqual(triage_mock.call_count, 2)
+        self.assertEqual(sum("metadata" in call for call in observed), 2)
+
+    def test_tick_off_keeps_store_payload_and_stats_unchanged(self):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["queue"] = [{"kind": "process_log", "path": "/tmp/a.log"}]
+        summary = {
+            "status": "processed",
+            "kind": "process_log",
+            "path": "/tmp/a.log",
+            "lines_scanned": 10,
+            "bytes_scanned": 100,
+            "sampling_mode": "full",
+            "events": {},
+            "tools": {},
+            "errors": {"repeat-signature": 2},
+            "warnings": {"warn-signature": 1},
+        }
+        stored_calls: list[dict] = []
+
+        def fake_store(**kwargs):
+            stored_calls.append(kwargs)
+            return json.dumps({"stored": True})
+
+        expected_stats = {
+            "files_processed": 1,
+            "lines_scanned": 10,
+            "errors_seen": 2,
+            "warnings_seen": 1,
+            "bytes_scanned": 100,
+            "error_signatures_suppressed": 0,
+            "warning_signatures_suppressed": 0,
+            "error_signature_observations": {"repeat-signature": 1},
+            "warning_signature_observations": {"warn-signature": 1},
+            "last_error_signatures": [{"signature": "repeat-signature", "count": 2}],
+            "last_warning_signatures": [{"signature": "warn-signature", "count": 1}],
+        }
+
+        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+        ), patch.object(
+            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+        ), patch.object(
+            server, "_process_reflection_item", return_value=summary
+        ), patch.object(
+            server, "_reflection_llm_triage_metadata"
+        ) as triage_mock, patch.object(
+            server, "investigation_store", side_effect=fake_store
+        ):
+            result = json.loads(
+                server.reflection_loop_tick(
+                    max_items=1,
+                    max_lines_per_file=100,
+                    store_item_findings=True,
+                )
+            )
+
+        triage_mock.assert_not_called()
+        observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        self.assertEqual(len(observed), 1)
+        self.assertNotIn("metadata", observed[0])
+        self.assertEqual(
+            observed[0],
+            {
+                "investigation_id": "test-inv",
+                "finding_type": "observed",
+                "text": (
+                    "reflection_loop_tick processed process_log target=/tmp/a.log; "
+                    "lines=10 bytes=100; sampling=full; top_events={}; top_tools={}; "
+                    "errors=repeat-signature (2); warnings=warn-signature (1)."
+                ),
+                "source": "reflection_loop_tick",
+                "confidence": "low",
+                "tags": "self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+            },
+        )
+        self.assertEqual(result["stats"], expected_stats)
+
 
 if __name__ == "__main__":
     unittest.main()

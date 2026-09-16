@@ -2400,10 +2400,25 @@ def _store_numeric_confidence(confidence: str, numeric_confidence: float | None)
         return _CONFIDENCE_TO_NUMERIC.get(confidence, 0.6)
 
 
+def _normalize_finding_metadata(metadata: Any) -> Optional[dict]:
+    """Best-effort normalize optional finding metadata to a dict; fail-open."""
+    if metadata in (None, "", {}):
+        return None
+    if isinstance(metadata, dict):
+        return metadata or None
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+            return parsed if isinstance(parsed, dict) and parsed else None
+        except Exception:
+            return {"value": metadata}
+    return {"value": metadata}
+
+
 def _store_build_finding(investigation_id, finding_type, text, source, confidence, tags,
                          derived_from, numeric_confidence, procedure_preconditions,
                          procedure_steps, procedure_postconditions, valid_from,
-                         valid_until, authored_by, tier, resolution, code_refs):
+                         valid_until, authored_by, tier, resolution, code_refs, metadata):
     """Build the finding record. Returns (finding, error_json); one is always None.
 
     The only failure mode is a derived_from id with no matching parent, which the
@@ -2438,6 +2453,9 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
         if unknown:
             return None, json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
+    normalized_metadata = _normalize_finding_metadata(metadata)
+    if normalized_metadata is not None:
+        finding["metadata"] = normalized_metadata
 
     finding["entities"] = _extract_entities(text)
 
@@ -2545,6 +2563,7 @@ def investigation_store(
     tier: str = "warm",
     resolution: str = "open",
     code_refs: str | list[str] | None = None,
+    metadata: Any | None = None,
 ) -> str:
     """
     Record a finding in an investigation.
@@ -2600,6 +2619,9 @@ def investigation_store(
             ``investigation_load`` and ``investigation_search`` can later flag
             the finding ``stale`` if the file changes. Fully optional and
             fail-open: unreadable paths are skipped.
+        metadata: Optional advisory metadata dict (or JSON string encoding one)
+            stored verbatim under ``finding["metadata"]``. Additive only; ignored
+            when empty/unparseable-to-dict.
 
     Returns:
         JSON ``{"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2622,7 +2644,7 @@ def investigation_store(
         investigation_id, finding_type, text, source, confidence, tags, derived_from,
         numeric_confidence, procedure_preconditions, procedure_steps,
         procedure_postconditions, valid_from, valid_until, authored_by, tier,
-        resolution, code_refs,
+        resolution, code_refs, metadata,
     )
     if invalid:
         return invalid
@@ -3131,27 +3153,63 @@ def _reflection_store_finding(
     text: str,
     confidence: str,
     tags: str,
+    metadata: Optional[dict] = None,
 ) -> bool:
     """Store one reflection-loop finding; True when it was actually written.
 
     ``source`` is always ``"reflection_loop_tick"``. No try/except on purpose —
     a failing store must propagate exactly as it does inline.
     """
-    return bool(json.loads(investigation_store(
-        investigation_id=investigation_id,
-        finding_type=finding_type,
-        text=text,
-        source="reflection_loop_tick",
-        confidence=confidence,
-        tags=tags,
-    )).get("stored"))
+    payload: dict[str, Any] = {
+        "investigation_id": investigation_id,
+        "finding_type": finding_type,
+        "text": text,
+        "source": "reflection_loop_tick",
+        "confidence": confidence,
+        "tags": tags,
+    }
+    if metadata is not None:
+        payload["metadata"] = metadata
+    return bool(json.loads(investigation_store(**payload)).get("stored"))
+
+
+def _reflection_llm_triage_metadata(
+    kind: str,
+    path: str,
+    summary: dict,
+    visible_errors: dict[str, int],
+    visible_warnings: dict[str, int],
+) -> Optional[dict]:
+    """Best-effort advisory semantic triage for one reflection finding."""
+    try:
+        import reflection_triage as _rt
+        triage = _rt.classify_reflection_observation(
+            kind,
+            path,
+            sampling_mode=str(summary.get("sampling_mode") or "full"),
+            events=summary.get("events") or {},
+            tools=summary.get("tools") or {},
+            errors=visible_errors,
+            warnings=visible_warnings,
+        )
+    except Exception:
+        triage = {"degraded": True}
+    llm_triage: dict[str, Any] = {}
+    if triage.get("category"):
+        llm_triage["category"] = triage["category"]
+    if triage.get("novelty"):
+        llm_triage["novelty"] = triage["novelty"]
+    if triage.get("degraded"):
+        llm_triage["degraded"] = True
+    return {"llm_triage": llm_triage} if llm_triage else None
 
 
 # ---- Tool: reflection_loop_tick ----
 
 def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
                              error_observations, warning_observations, stats,
-                             investigation_id, low_signal_session_events) -> bool:
+                             investigation_id, low_signal_session_events,
+                             enable_llm_triage=False, llm_triage_budget=None) -> bool:
     """Store one reflection finding for a processed queue item.
 
     Returns True when a finding was written. Session events with no errors or
@@ -3193,12 +3251,21 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
         f"top_events={summary.get('events', {})}; top_tools={summary.get('tools', {})}; "
         f"errors={top_error}; warnings={top_warning}."
     )
+    finding_metadata = None
+    remaining = int((llm_triage_budget or {}).get("remaining") or 0)
+    if enable_llm_triage and remaining > 0 and (visible_errors or visible_warnings):
+        if llm_triage_budget is not None:
+            llm_triage_budget["remaining"] = max(0, remaining - 1)
+        finding_metadata = _reflection_llm_triage_metadata(
+            kind, path, summary, visible_errors, visible_warnings
+        )
     return bool(_reflection_store_finding(
         investigation_id=investigation_id,
         finding_type="observed",
         text=finding_text,
         confidence="low",
         tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+        metadata=finding_metadata,
     ))
 
 
@@ -3289,17 +3356,21 @@ def reflection_loop_tick(
     max_items: int = 3,
     max_lines_per_file: int = 4000,
     store_item_findings: bool = True,
+    enable_llm_triage: bool = False,
+    max_llm_items: int = 3,
 ) -> str:
     """
     Process a small queue batch for self-reflection and store findings.
 
     Designed to avoid passive burn:
     - bounded by ``max_items`` and ``max_lines_per_file``
-    - deterministic parsing only (no LLM pass)
+    - deterministic parsing only by default (no LLM pass)
+    - optional bounded local-model advisory triage when ``enable_llm_triage=True``
     - writes findings through ``investigation_store`` (JSONL + Mnemosyne + Qdrant)
     """
     max_items = max(1, min(int(max_items), 20))
     max_lines_per_file = max(50, min(int(max_lines_per_file), 20000))
+    max_llm_items = max(0, min(int(max_llm_items), 20))
     state = _load_reflection_state()
     queue = list(state.get("queue") or [])
     if not queue:
@@ -3336,6 +3407,7 @@ def reflection_loop_tick(
     item_reports: list[dict] = []
     low_signal_session_events: list[dict[str, Any]] = []
     dropped_items: list[dict] = []
+    llm_triage_budget = {"remaining": max_llm_items} if enable_llm_triage else {"remaining": 0}
 
     for _ in range(min(max_items, len(queue))):
         next_index = min(
@@ -3376,6 +3448,8 @@ def reflection_loop_tick(
         if store_item_findings and _reflection_item_finding(
             kind, path, summary, raw_errors, raw_warnings, error_observations,
             warning_observations, stats, investigation_id, low_signal_session_events,
+            enable_llm_triage=enable_llm_triage,
+            llm_triage_budget=llm_triage_budget,
         ):
             findings_written += 1
 
