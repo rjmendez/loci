@@ -6,11 +6,13 @@ from .. import config
 
 
 def test_corpus_is_exactly_133_files():
-    """127 -> 128 -> 129 -> 130 -> 131 -> 132 -> 133: memory-integrity audit test,
-    mcp/compact.py, deploy script, A/B eval script, prefilter script, then
-    mcp/guardian.py (Granite Guardian semantic injection-risk classification)."""
+    """127 -> 128 -> 129 -> 130 -> 131 -> 132 -> 133 -> ... -> 140 -> 141:
+    memory-integrity audit test, mcp/compact.py, deploy script, A/B eval
+    script, prefilter script, mcp/guardian.py (Granite Guardian semantic
+    injection-risk classification), then scripts/redteam/loci_adversarial_harness.py
+    (sandboxed PyRIT red-team harness)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 140, sorted(files)
+    assert len(files) == 141, sorted(files)
 
 
 def test_corpus_excludes_test_directories():
