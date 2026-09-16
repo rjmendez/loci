@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -62,9 +63,12 @@ class PrefilterResult:
 
 def _clamp_01(value: object, default: float = 0.0) -> float:
     try:
-        return max(0.0, min(1.0, float(value)))
+        numeric_value = float(value)
     except Exception:
         return default
+    if math.isnan(numeric_value):
+        return default
+    return max(0.0, min(1.0, numeric_value))
 
 
 def _chunk_text(text: str, *, chunk_chars: int) -> list[str]:
@@ -351,9 +355,12 @@ def prefilter_agent_output(
 
 def _read_text(path: Optional[str]) -> str:
     if not path or path == "-":
-        return sys.stdin.read()
-    with open(path, "r", encoding="utf-8") as handle:
-        return handle.read()
+        stdin_buffer = getattr(sys.stdin, "buffer", None)
+        if stdin_buffer is None:
+            return sys.stdin.read()
+        return stdin_buffer.read().decode("utf-8", errors="replace")
+    with open(path, "rb") as handle:
+        return handle.read().decode("utf-8", errors="replace")
 
 
 def build_parser() -> argparse.ArgumentParser:

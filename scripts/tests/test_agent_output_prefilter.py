@@ -3,6 +3,7 @@ import json
 import pathlib
 import sys
 import types
+import builtins
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
@@ -136,6 +137,33 @@ def test_low_confidence_fails_open(monkeypatch):
     assert [call["url"].rsplit("/", 1)[-1] for call in calls] == ["embed"]
 
 
+def test_nan_relevance_score_fails_open(monkeypatch):
+    text = "Explore agent output. " * 120
+    monkeypatch.setattr(
+        A.llm_tools,
+        "semantic_relevance",
+        lambda chunks, context: '{"scores":[NaN],"degraded":false}',
+    )
+
+    def _unexpected_compress(*args, **kwargs):
+        raise AssertionError("compress should not run for NaN relevance")
+
+    monkeypatch.setattr(A._mcp_text_ops, "compress", _unexpected_compress)
+    result = A.prefilter_agent_output(
+        text,
+        "find the build failure",
+        threshold=0.6,
+        max_chars=160,
+        chunk_chars=5000,
+    )
+
+    assert result.fallback_used is True
+    assert result.compressed_text == text
+    assert result.original_text == text
+    assert result.confidence == 0.0
+    assert "no chunks cleared the semantic relevance cutoff" in result.fallback_reason
+
+
 def test_cli_reads_stdin_and_emits_json(monkeypatch, capsys):
     _install_fake_backends(monkeypatch)
     _install_requests(
@@ -171,3 +199,25 @@ def test_cli_reads_stdin_and_emits_json(monkeypatch, capsys):
         "fallback_used",
         "fallback_reason",
     }
+
+
+def test_cli_invalid_utf8_file_input_does_not_crash(monkeypatch, capsys):
+    class _BinaryFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"\xff\xfeBinary\x00text"
+
+    monkeypatch.setattr(builtins, "open", lambda *args, **kwargs: _BinaryFile())
+
+    rc = A.main(["--context", "summarize the bytes", "fake.bin"])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["compressed_text"] == out["original_text"]
+    assert out["original_text"].startswith("��Binary")
+    assert out["fallback_used"] is False
