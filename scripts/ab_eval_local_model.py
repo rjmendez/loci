@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import statistics
 import sys
 import time
@@ -65,6 +66,10 @@ COMPRESS_CASES = [
             "file:line references that must stay recognizable."
         ),
         "max_chars": 160,
+        "expected": (
+            "Keep findings reloadable by retaining the claim, supporting context, timestamps, "
+            "and recognizable file:line references."
+        ),
     },
     {
         "text": (
@@ -74,6 +79,10 @@ COMPRESS_CASES = [
             "gate purpose, the retrieval path, and the fact that regressions should block a flip."
         ),
         "max_chars": 180,
+        "expected": (
+            "The shadow eval gates flips by retrieving and reranking Qdrant findings, comparing "
+            "recall, MRR, and nDCG, and blocking regressions."
+        ),
     },
     {
         "text": (
@@ -84,6 +93,10 @@ COMPRESS_CASES = [
             "host is offline."
         ),
         "max_chars": 170,
+        "expected": (
+            "Fail open when Ollama is down: classify returns degraded label=None, compress "
+            "truncates to budget, verify returns uncertain, and scheduled jobs keep running."
+        ),
     },
 ]
 
@@ -128,6 +141,7 @@ class CaseScore:
     latency_ms: Optional[float]
     json_ok: bool
     schema_ok: bool
+    correct: bool
     transport_ok: bool
 
 
@@ -139,6 +153,7 @@ class SummaryRow:
     total: int
     json_ok: int
     schema_ok: int
+    correct: int
     latencies_ms: list[float]
     available: bool
     note: str = ""
@@ -148,6 +163,9 @@ class SummaryRow:
 
     def schema_rate(self) -> Optional[float]:
         return None if not self.available or not self.total else self.schema_ok / self.total
+
+    def correct_rate(self) -> Optional[float]:
+        return None if not self.available or not self.total else self.correct / self.total
 
     def avg_latency_ms(self) -> Optional[float]:
         return None if not self.available or not self.latencies_ms else sum(self.latencies_ms) / len(self.latencies_ms)
@@ -206,6 +224,53 @@ def _format_ms(value: Optional[float]) -> str:
     return "N/A" if value is None else f"{value:.1f}"
 
 
+_COMPRESS_STOPWORDS = {
+    "and",
+    "are",
+    "but",
+    "for",
+    "from",
+    "into",
+    "just",
+    "keep",
+    "must",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "they",
+    "this",
+    "when",
+    "with",
+}
+
+
+def _normalized_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+(?:[:=][a-z0-9]+)?", text.lower())
+
+
+def _compress_retains_key_facts(obj: Optional[dict], case: dict) -> bool:
+    """Proxy for compress correctness based on keyword retention, not semantic equivalence."""
+    if not isinstance(obj, dict):
+        return False
+    text = obj.get("text")
+    expected = case.get("expected")
+    if not isinstance(text, str) or not isinstance(expected, str):
+        return False
+    expected_terms = []
+    for word in _normalized_words(expected):
+        if len(word) < 4 or word in _COMPRESS_STOPWORDS or word in expected_terms:
+            continue
+        expected_terms.append(word)
+    if not expected_terms:
+        return False
+    summary_terms = set(_normalized_words(text))
+    matched = sum(1 for term in expected_terms if term in summary_terms)
+    required = max(1, (len(expected_terms) + 1) // 2)
+    return matched >= required
+
+
 def _validate_classify(obj: Optional[dict], case: dict) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -235,6 +300,16 @@ def validate_schema(task: str, obj: Optional[dict], case: dict) -> bool:
         return _validate_compress(obj, case)
     if task == "verify":
         return _validate_verify(obj, case)
+    raise ValueError(f"unknown task: {task}")
+
+
+def score_correctness(task: str, obj: Optional[dict], case: dict) -> bool:
+    if task == "classify":
+        return isinstance(obj, dict) and obj.get("label") == case.get("expected")
+    if task == "compress":
+        return _compress_retains_key_facts(obj, case)
+    if task == "verify":
+        return isinstance(obj, dict) and obj.get("verdict") == case.get("expected")
     raise ValueError(f"unknown task: {task}")
 
 
@@ -272,15 +347,44 @@ def score_case(task: str, case: dict, call: CallResult) -> CaseScore:
     obj = extract_json_object(call.text) if call.text else None
     json_ok = obj is not None
     schema_ok = validate_schema(task, obj, case) if json_ok else False
-    return CaseScore(latency_ms=call.latency_ms, json_ok=json_ok, schema_ok=schema_ok, transport_ok=call.transport_ok)
+    correct = score_correctness(task, obj, case) if json_ok else False
+    return CaseScore(
+        latency_ms=call.latency_ms,
+        json_ok=json_ok,
+        schema_ok=schema_ok,
+        correct=correct,
+        transport_ok=call.transport_ok,
+    )
 
 
 def summarize_scores(task: str, arm: str, model: str, scores: list[CaseScore], *, note: str = "") -> SummaryRow:
     if not scores:
-        return SummaryRow(task=task, arm=arm, model=model, total=0, json_ok=0, schema_ok=0, latencies_ms=[], available=False, note=note or "no cases")
+        return SummaryRow(
+            task=task,
+            arm=arm,
+            model=model,
+            total=0,
+            json_ok=0,
+            schema_ok=0,
+            correct=0,
+            latencies_ms=[],
+            available=False,
+            note=note or "no cases",
+        )
     available = any(score.transport_ok for score in scores)
     if not available:
-        return SummaryRow(task=task, arm=arm, model=model, total=len(scores), json_ok=0, schema_ok=0, latencies_ms=[], available=False, note=note or "endpoint unavailable")
+        return SummaryRow(
+            task=task,
+            arm=arm,
+            model=model,
+            total=len(scores),
+            json_ok=0,
+            schema_ok=0,
+            correct=0,
+            latencies_ms=[],
+            available=False,
+            note=note or "endpoint unavailable",
+        )
     latencies = [score.latency_ms for score in scores if score.latency_ms is not None]
     return SummaryRow(
         task=task,
@@ -289,6 +393,7 @@ def summarize_scores(task: str, arm: str, model: str, scores: list[CaseScore], *
         total=len(scores),
         json_ok=sum(1 for score in scores if score.json_ok),
         schema_ok=sum(1 for score in scores if score.schema_ok),
+        correct=sum(1 for score in scores if score.correct),
         latencies_ms=[float(ms) for ms in latencies],
         available=True,
         note=note,
@@ -299,7 +404,18 @@ def aggregate_rows(rows: list[SummaryRow], *, arm: str, model: str) -> SummaryRo
     available_rows = [row for row in rows if row.available]
     if not available_rows:
         note = next((row.note for row in rows if row.note), "endpoint unavailable")
-        return SummaryRow(task="all", arm=arm, model=model, total=sum(row.total for row in rows), json_ok=0, schema_ok=0, latencies_ms=[], available=False, note=note)
+        return SummaryRow(
+            task="all",
+            arm=arm,
+            model=model,
+            total=sum(row.total for row in rows),
+            json_ok=0,
+            schema_ok=0,
+            correct=0,
+            latencies_ms=[],
+            available=False,
+            note=note,
+        )
     return SummaryRow(
         task="all",
         arm=arm,
@@ -307,6 +423,7 @@ def aggregate_rows(rows: list[SummaryRow], *, arm: str, model: str) -> SummaryRo
         total=sum(row.total for row in available_rows),
         json_ok=sum(row.json_ok for row in available_rows),
         schema_ok=sum(row.schema_ok for row in available_rows),
+        correct=sum(row.correct for row in available_rows),
         latencies_ms=[ms for row in available_rows for ms in row.latencies_ms],
         available=True,
         note="",
@@ -333,7 +450,7 @@ def evaluate_task(
 
 
 def format_table(rows: list[SummaryRow]) -> str:
-    headers = ["task", "arm", "model", "calls", "json_ok", "schema_ok", "avg_ms", "p50_ms", "note"]
+    headers = ["task", "arm", "model", "calls", "json_ok", "schema_ok", "correct", "avg_ms", "p50_ms", "note"]
     formatted = []
     for row in rows:
         formatted.append([
@@ -343,6 +460,7 @@ def format_table(rows: list[SummaryRow]) -> str:
             str(row.total) if row.available else "N/A",
             _format_pct(row.json_rate(), row.json_ok, row.total if row.available else None),
             _format_pct(row.schema_rate(), row.schema_ok, row.total if row.available else None),
+            _format_pct(row.correct_rate(), row.correct, row.total if row.available else None),
             _format_ms(row.avg_latency_ms()),
             _format_ms(row.p50_latency_ms()),
             row.note,
@@ -394,6 +512,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("note: no Ollama generation endpoint resolved; rows reported as N/A", file=sys.stderr)
     else:
         print(f"note: endpoint {base_url}", file=sys.stderr)
+    print("note: compress correctness uses a keyword-retention proxy, not full semantic equivalence.", file=sys.stderr)
     print("note: live GPU-backed execution was not validated here; run against a real Ollama host to assess model quality.", file=sys.stderr)
     return 0
 
