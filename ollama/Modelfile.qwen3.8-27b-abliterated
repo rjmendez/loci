@@ -3,8 +3,10 @@ FROM ./Huihui-Qwen3.8-27B-abliterated-Q5_K.gguf
 
 # Qwen3.8 instruct is ChatML-style. Expect roughly 16-20GB VRAM at Q4/Q5.
 # ggml-org/llama.cpp#28879 tracks unresolved non-monotonic quant precision on
-# this qwen3_5 hybrid linear-attention architecture; prefer Q5_K_M or higher
-# where available and verify outputs empirically before precision-sensitive use.
+# this qwen3_5 hybrid linear-attention architecture, and the still-open draft
+# ggml-org/llama.cpp#27132 covers a distinct tensor-layout conversion-correctness
+# bug on the same path; prefer Q5_K_M or higher where available and verify
+# outputs empirically before precision-sensitive use.
 TEMPLATE """{{ if .System }}<|im_start|>system
 {{ .System }}<|im_end|>
 {{ end }}<|im_start|>user
