@@ -1,7 +1,8 @@
-from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 """config.py against the REAL repo: acceptance criterion is an exact file
 count (133), not a vibe. If this drifts, either the repo changed shape or
 the exclusion rules regressed — both worth failing loudly on."""
+
+from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 from .. import config
 
 
