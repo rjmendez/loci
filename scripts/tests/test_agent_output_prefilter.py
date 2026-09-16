@@ -206,7 +206,7 @@ def test_cli_invalid_utf8_file_input_does_not_crash(monkeypatch, capsys):
         def __enter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, tb):
+        def __exit__(self, *_args):
             return False
 
         def read(self):
