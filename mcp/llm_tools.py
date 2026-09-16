@@ -7,9 +7,15 @@ would shadow the sibling module at module scope.
 """
 import json
 import logging
+import sys
+from importlib import util as importlib_util
+from pathlib import Path
 from typing import Literal, Optional
 
 logger = logging.getLogger("loci-mcp")
+_SWARM_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "swarm_escalate.py"
+_SWARM_MODULE_NAME = "_loci_scripts_swarm_escalate"
+_SWARM_MODULE = None
 
 
 def _coerce_labels(labels) -> list:
@@ -21,6 +27,83 @@ def _coerce_labels(labels) -> list:
     if isinstance(labels, (tuple, set)):
         return list(labels)
     return [labels]
+
+
+def _load_swarm_escalate():
+    global _SWARM_MODULE
+    if _SWARM_MODULE is not None:
+        return _SWARM_MODULE
+    spec = importlib_util.spec_from_file_location(_SWARM_MODULE_NAME, _SWARM_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load {_SWARM_SCRIPT_PATH}")
+    module = importlib_util.module_from_spec(spec)
+    sys.modules[_SWARM_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    _SWARM_MODULE = module
+    return module
+
+
+def _degraded_swarm_result(topic: str, *, fanout_count: int, error: str) -> dict:
+    try:
+        requested = max(0, int(fanout_count))
+    except Exception:
+        requested = 0
+    cooked_topic = str(topic or "").strip() or "unknown topic"
+    finding = {
+        "subtask": cooked_topic,
+        "answer": "",
+        "confidence": "low",
+        "tier_reached": "synthesized",
+        "model": "",
+        "ok": False,
+        "why": "wrapper_exception",
+    }
+    return {
+        "schema_version": 1,
+        "topic": cooked_topic,
+        "findings": [finding],
+        "summary": f"Swarm reasoning degraded for '{cooked_topic}' before completion.",
+        "stats": {
+            "fanout_count": requested,
+            "escalated_count": 0,
+            "escalation_rate": 0.0,
+        },
+        "degraded": True,
+        "synthesis": {
+            "model": "",
+            "ok": False,
+            "degraded": True,
+            "error": str(error or "unknown swarm wrapper error"),
+        },
+        "decomposition": {
+            "source": "wrapper_fallback",
+            "requested": requested,
+            "degraded": True,
+            "error": str(error or "unknown swarm wrapper error"),
+        },
+        "triage": {
+            "flagged_indices": [0],
+            "flagged_count": 1,
+            "escalation_reasons": {"0": ["wrapper_exception"]},
+            "similar_pairs": [],
+        },
+        "tiers": {
+            "cheap": {"tier": "cheap", "model": "", "count": 1, "ok": 0, "degraded": 1},
+            "escalate": {"attempted": 0, "succeeded": 0, "failed_open": 0, "model": ""},
+        },
+        "lineage": [{
+            "subtask": cooked_topic,
+            "answer": "",
+            "confidence": "low",
+            "tier_reached": "synthesized",
+            "model": "",
+            "ok": False,
+            "parse_ok": False,
+            "why": "wrapper_exception",
+            "escalation_attempted": False,
+            "escalation_reasons": ["wrapper_exception"],
+        }],
+    }
 
 
 def llm_local(prompt: str, model: str = "", fmt: Optional[str] = None,
@@ -229,6 +312,51 @@ def ground(
     return json.dumps(grounding.ground(task, opts), indent=2)
 
 
+def swarm_reason(topic: str,
+                 fanout_count: int = 20,
+                 cheap_model: str = "",
+                 escalate_model: str = "",
+                 synthesize_model: str = "",
+                 decompose_model: str = "",
+                 subtasks: Optional[list] = None,
+                 escalate_confidences: Optional[list] = None) -> str:
+    """
+    Run the 4-stage local swarm reasoner: cheap fan-out, triage, selective
+    escalation, then synthesis. Returns the structured JSON result with
+    ``schema_version``, ``findings``, ``summary``, ``stats``, and diagnostics.
+
+    Fail-open: import/runtime/validation errors return degraded JSON instead of
+    raising, so downstream MCP clients can still inspect one well-formed result.
+    """
+    try:
+        swarm = _load_swarm_escalate()
+        config = swarm.SwarmConfig(
+            topic=str(topic or "").strip(),
+            cheap_model=str(cheap_model or "") or swarm._DEFAULT_CHEAP_MODEL,
+            escalate_model=str(escalate_model or "") or swarm._DEFAULT_ESCALATE_MODEL,
+            synthesize_model=str(synthesize_model or "") or swarm._DEFAULT_SYNTHESIZE_MODEL,
+            decompose_model=str(decompose_model or ""),
+            subtasks=_coerce_labels(subtasks) or None,
+            fanout_count=max(1, int(fanout_count)),
+            escalate_confidences=tuple(
+                str(item).strip().lower()
+                for item in _coerce_labels(escalate_confidences or ("low",))
+                if str(item).strip()
+            ) or ("low",),
+        )
+        result = swarm.run_swarm(config)
+        errors = list(swarm.validate_swarm_result(result))
+        if errors:
+            raise ValueError("; ".join(errors))
+        return json.dumps(result, indent=2)
+    except Exception as exc:
+        logger.warning("swarm_reason degraded for topic %r: %s", topic, exc)
+        return json.dumps(
+            _degraded_swarm_result(topic, fanout_count=fanout_count, error=str(exc)),
+            indent=2,
+        )
+
+
 def register(mcp):
     """Register every local-model passthrough tool on the shared FastMCP instance."""
     for fn in (
@@ -241,5 +369,6 @@ def register(mcp):
         semantic_dedup,
         semantic_relevance,
         ground,
+        swarm_reason,
     ):
         mcp.tool()(fn)

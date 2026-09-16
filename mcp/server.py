@@ -176,7 +176,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 import backends  # noqa: E402
 backends.load_env()
 
-import logging
+import logging  # noqa: E402
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -632,7 +632,7 @@ def _search_benign_context_qdrant(
 
     entity_field_map = {p: f"entities.{p}" for _, p in _ENTITY_TYPES}
 
-    for entity_type, field in entity_field_map.items():
+    for entity_type, entity_field in entity_field_map.items():
         for val in list(entities.get(entity_type, []))[:2]:
             if not val:
                 continue
@@ -641,7 +641,7 @@ def _search_benign_context_qdrant(
                 hits, _ = client.scroll(
                     col,
                     scroll_filter=Filter(must=[
-                        FieldCondition(key=field, match=MatchValue(value=val.lower())),
+                        FieldCondition(key=entity_field, match=MatchValue(value=val.lower())),
                         FieldCondition(
                             key="investigation_id",
                             match=MatchExcept(**{"except": [current_investigation_id]}),
@@ -9014,7 +9014,7 @@ llm_tools.register(mcp)
 # Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from llm_tools import (  # noqa: E402,F401
     llm_local, generate_batch, query_expand, verify_finding, classify_text,
-    compress_text, semantic_dedup, semantic_relevance, ground,
+    compress_text, semantic_dedup, semantic_relevance, ground, swarm_reason,
 )
 
 # Memory root injected as a lambda over MEMORY_DIR; collaborators are passed in so investigation_tools never imports server.
