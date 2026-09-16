@@ -173,6 +173,20 @@ def ollama_guardian_model() -> str:
             or "granite3-guardian:2b")
 
 
+def ollama_redteam_model() -> str:
+    """Model for explicitly adversarial red-team critique.
+
+    Unlike the normal generation/verify tiers, this one is deliberately biased toward an
+    uncensored or abliterated local model. The point of the red-team phase is to phrase
+    attacks the way an adversary would, without the softening/refusal behavior aligned
+    instruct models often introduce on "attack this" prompts. Resolution stays portable:
+    env -> [ollama].redteam_model -> a known-good heretic default.
+    """
+    return (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
+            or _cfg("ollama", "redteam_model", "")
+            or "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M")
+
+
 @functools.lru_cache(maxsize=8)
 def vllm_url(probe_timeout: float = 1.0) -> str:
     """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).
