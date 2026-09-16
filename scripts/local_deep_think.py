@@ -20,6 +20,7 @@ Usage:
   python3 scripts/local_deep_think.py "topic here" --ideate-models llama3.1-agent:latest,qwen3.8:latest
   python3 scripts/local_deep_think.py "topic here" --no-self-reflect
   python3 scripts/local_deep_think.py "topic here" --no-learn-procedures
+  python3 scripts/local_deep_think.py "topic here" --strict-grounding
 """
 from __future__ import annotations
 
@@ -61,6 +62,7 @@ class ChainConfig:
     learn_procedures: bool = True
     self_reflect: bool = True
     red_team: bool = False
+    strict_grounding: bool = False
     ideas_per_model: int = 3
     retrieval_limit: int = 8
     ground_threshold: float = 0.59
@@ -217,6 +219,7 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         learn_procedures=not bool(args.no_learn_procedures),
         self_reflect=not bool(args.no_self_reflect),
         red_team=bool(args.red_team),
+        strict_grounding=bool(args.strict_grounding),
         ideas_per_model=max(1, int(args.ideas_per_model)),
         retrieval_limit=max(1, int(args.retrieval_limit)),
         ground_threshold=float(args.ground_threshold),
@@ -880,8 +883,16 @@ def _self_reflect_synthesis(topic: str, *, synthesis: dict, evidence: list[dict]
     return revised, report
 
 
+_UNGROUNDED_CAVEAT = (
+    "\u26a0 UNGROUNDED (strict mode): no retrieved evidence passed the similarity "
+    "gate at any tier of this chain. Treat the following as an unverified local-model "
+    "hypothesis, not a grounded finding.\n\n"
+)
+
+
 def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[StoredFinding],
-               config: ChainConfig, gen_fn: Callable, store_fn: Callable[..., str]) -> dict:
+               config: ChainConfig, gen_fn: Callable, store_fn: Callable[..., str],
+               grounded: bool = True) -> dict:
     evidence = [
         {"finding_id": item.finding_id, "tier": item.tier, "model": item.model, "text": item.text,
          "derived_from": item.derived_from}
@@ -905,6 +916,7 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
             "finding_id": None,
             "supporting_finding_ids": [],
             "self_reflection": {"enabled": config.self_reflect, "revised": False},
+            "grounding_status": "grounded" if grounded else "ungrounded",
         }
 
     reflection_report = {"enabled": False, "revised": False}
@@ -920,6 +932,18 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
     if reflection_report.get("revised"):
         tags.append("self-reflect")
 
+    # Strict grounding: RAG/gate lanes are advisory and fail-open everywhere else in this
+    # chain (empty retrieval never halts a tier). --strict-grounding is the one place that
+    # turns "no evidence passed the gate" into an explicit, visible downgrade instead of a
+    # confidently-worded answer with nothing behind it: lower confidence, tag it, and put
+    # the caveat in the persisted text itself so it survives outside this JSON blob too.
+    synthesis["grounding_status"] = "grounded" if grounded else "ungrounded"
+    confidence = "high"
+    if config.strict_grounding and not grounded:
+        tags.append("ungrounded")
+        confidence = "low"
+        synthesis["summary"] = _UNGROUNDED_CAVEAT + synthesis["summary"]
+
     derived = synthesis["supporting_finding_ids"][:config.max_lineage]
     if not derived:
         derived = [item.finding_id for item in survivors[:config.max_lineage]]
@@ -929,12 +953,13 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
         investigation_id=config.investigation_id,
         text=text,
         source=f"scripts/local_deep_think.py#{source_suffix}",
-        confidence="high",
+        confidence=confidence,
         tags=tags,
         derived_from=derived,
     )
     synthesis["finding_id"] = fid
     synthesis["self_reflection"] = reflection_report
+    synthesis["tags"] = tags
     return synthesis
 
 
@@ -977,9 +1002,21 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
     critiques, redteam_report = red_team_findings(
         survivors, config=config, gen_fn=deps["generate"], store_fn=deps["store"]
     )
+    # "grounded" spans every gate this chain runs, not just the initial retrieval: a topic
+    # can miss the top-level gate yet still have per-claim evidence survive the verify
+    # tier's own gate (see verify_findings), so strict mode must check both before it
+    # downgrades. kept can arrive as an int (real callers) or a list (some test doubles);
+    # normalize with len() when it isn't already a count.
+    def _kept_count(gate_obj: dict) -> int:
+        kept = (gate_obj or {}).get("kept", 0)
+        return len(kept) if isinstance(kept, list) else int(kept or 0)
+
+    grounded = _kept_count(gate) > 0 or any(
+        _kept_count(report.get("gate")) > 0 for report in verify_reports
+    )
     synthesis = synthesize(
         config.topic, survivors=survivors, critiques=critiques,
-        config=config, gen_fn=deps["generate"], store_fn=deps["store"]
+        config=config, gen_fn=deps["generate"], store_fn=deps["store"], grounded=grounded
     )
     return {
         "investigation_id": config.investigation_id,
@@ -1036,6 +1073,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Disable auto-promotion of confirmed high-confidence action-shaped findings.",
     )
     ap.add_argument("--red-team", action="store_true", help="Enable the adversarial red-team tier.")
+    ap.add_argument(
+        "--strict-grounding",
+        action="store_true",
+        help=(
+            "Every other gate in this chain is advisory and fail-open (empty retrieval "
+            "never halts a tier). This flag is the one exception: if nothing survives the "
+            "similarity gate at either the top-level retrieval or any per-claim verify "
+            "call, the final synthesis is tagged 'ungrounded', downgraded to low "
+            "confidence, and prefixed with a visible caveat instead of reading as a "
+            "confident answer with no evidence behind it."
+        ),
+    )
     ap.add_argument("--ideas-per-model", type=int, default=3)
     ap.add_argument("--retrieval-limit", type=int, default=8)
     ap.add_argument("--ground-threshold", type=float, default=0.59)
