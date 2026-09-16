@@ -60,6 +60,15 @@ def _wrap_finding_text(finding: dict, *, text_key: str = "text") -> dict:
     return wrapped
 
 
+def _reflect_context_bullets(findings: list, investigation_id: str) -> str:
+    """Bounded, wrapped finding context shared by reflect's model-authored passes."""
+    return "\n".join(
+        f"- [{f.get('type', '?')}] "
+        f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], origin='loci_memory', investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type') or f.get('record_type') or 'finding'), source=str(f.get('source') or 'investigation_reflect'))}"
+        for f in findings
+    )
+
+
 def investigation_start(
     investigation_id: str,
     title: str,
@@ -597,7 +606,9 @@ def investigation_reflect(investigation_id: str) -> str:
 
     Returns:
         JSON reflection: finding breakdown, open questions, gaps, hypothesis,
-        checked vs unchecked sources, and most recent findings per type.
+        checked vs unchecked sources, most recent findings per type,
+        summary_l1/summary_l2, and an optional plain-text ``self_critique``
+        skeptical pass when the local model is available.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -660,16 +671,13 @@ def investigation_reflect(investigation_id: str) -> str:
     # Persisted to the manifest so investigation_load need not re-read findings; fail-open to the deterministic summary.
     summary_l1: list[str] = []
     summary_l2: str = ""
+    self_critique: Optional[str] = None
     try:
         last_20 = findings[-20:]
         try:
             from memcheck import llm as _llm
             if _llm.llm_available() and last_20:
-                context_bullets = "\n".join(
-                    f"- [{f.get('type', '?')}] "
-                    f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], origin='loci_memory', investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type') or f.get('record_type') or 'finding'), source=str(f.get('source') or 'investigation_reflect'))}"
-                    for f in last_20
-                )
+                context_bullets = _reflect_context_bullets(last_20, investigation_id)
                 l1_prompt = (
                     f"Investigation: {manifest['title']}\n"
                     f"Recent findings (up to 20):\n{context_bullets}\n\n"
@@ -705,6 +713,23 @@ def investigation_reflect(investigation_id: str) -> str:
                     l2_raw = _llm.call_llm(l2_prompt, timeout=60.0)
                     if l2_raw:
                         summary_l2 = l2_raw.strip()
+
+                critique_prompt = (
+                    f"Investigation: {manifest['title']}\n"
+                    f"Recent findings (up to 20):\n{context_bullets}\n\n"
+                    "What in this investigation's current state is weakest, least verified, "
+                    "most likely to be an unfounded assumption, or most likely to be wrong? "
+                    "Be specific and cite which findings/claims are weakest by finding id when visible. "
+                    "Reply with ONLY 2-4 short bullet lines of plain text, one concern per line."
+                )
+                critique_raw = _llm.call_llm(critique_prompt, timeout=60.0)
+                if critique_raw:
+                    critique_lines = [line.strip() for line in str(critique_raw).splitlines() if line.strip()]
+                    bullet_lines = [line for line in critique_lines if line.lstrip().startswith(("-", "*"))]
+                    if bullet_lines:
+                        critique_lines = bullet_lines
+                    if critique_lines:
+                        self_critique = "\n".join(critique_lines[:4])
         except Exception as exc:
             logger.debug("investigation_reflect: LLM summary ladder failed (fail-open): %r", exc)
 
@@ -730,7 +755,7 @@ def investigation_reflect(investigation_id: str) -> str:
     except Exception as exc:
         logger.debug("investigation_reflect: summary ladder persist failed (fail-open): %r", exc)  # fail-open: summary generation never breaks reflect
 
-    return json.dumps({
+    result = {
         "investigation_id": investigation_id,
         "title": manifest["title"],
         "status": manifest["status"],
@@ -759,7 +784,10 @@ def investigation_reflect(investigation_id: str) -> str:
         "self_check": self_check,
         "summary_l1": summary_l1,
         "summary_l2": summary_l2,
-    }, indent=2)
+    }
+    if self_critique:
+        result["self_critique"] = self_critique
+    return json.dumps(result, indent=2)
 
 
 def investigation_finding_provenance(
