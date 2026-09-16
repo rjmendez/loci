@@ -136,6 +136,33 @@ def test_payload_omits_format_when_not_json(monkeypatch):
     assert cap["json"]["keep_alive"] == "30m"  # default pin
 
 
+def test_payload_includes_think_false_always(monkeypatch):
+    """think:false must be sent regardless of fmt -- production classify/compress/verify
+    calls all use fmt in different ways, and any of them can hit a thinking-capable model."""
+    _ensure_base(monkeypatch)
+    cap = {}
+    _install_post(monkeypatch, resp=_FakeResp({"response": "hi"}), capture=cap)
+    L.generate("p")
+    assert cap["json"]["think"] is False
+
+
+def test_falls_back_to_thinking_field_when_response_empty(monkeypatch):
+    """Mirrors the ab_eval_local_model.py harness fix: a thinking-capable model can still
+    route its JSON answer into `thinking` even with think=False sent."""
+    _ensure_base(monkeypatch)
+    _install_post(monkeypatch, resp=_FakeResp({"response": "", "thinking": '{"a": 1}'}))
+    r = L.generate("give me json", fmt="json")
+    assert r["ok"] is True
+    assert json.loads(r["text"]) == {"a": 1}
+
+
+def test_prefers_response_over_thinking_when_both_present(monkeypatch):
+    _ensure_base(monkeypatch)
+    _install_post(monkeypatch, resp=_FakeResp({"response": '{"a": 2}', "thinking": "reasoning trace"}))
+    r = L.generate("give me json", fmt="json")
+    assert json.loads(r["text"]) == {"a": 2}
+
+
 def test_no_base_url_fails_open(monkeypatch):
     """No endpoint at all -- which means stubbing the RESOLVER too.
 

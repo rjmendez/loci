@@ -216,7 +216,7 @@ def test_classify_text_tool_fuzz_never_raises(monkeypatch, text, labels, reply):
     monkeypatch.setattr(
         text_ops,
         "_resolve_gen_fn",
-        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": reply, "ok": True}),
+        lambda gen_fn, model="": (lambda prompt, *, fmt=None, max_tokens=256: {"text": reply, "ok": True}),
     )
     result = llm_tools.classify_text(text, labels)
     parsed = json.loads(result)
@@ -237,7 +237,7 @@ def test_compress_text_tool_fuzz_never_raises(monkeypatch, text, max_chars):
     monkeypatch.setattr(
         text_ops,
         "_resolve_gen_fn",
-        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": text, "ok": True}),
+        lambda gen_fn, model="": (lambda prompt, *, fmt=None, max_tokens=256: {"text": text, "ok": True}),
     )
     parsed = json.loads(llm_tools.compress_text(text, max_chars=max_chars))
     assert set(parsed) == {"text", "degraded"}
@@ -296,7 +296,7 @@ def test_classify_text_scalar_labels_degrade_instead_of_raising(monkeypatch):
     monkeypatch.setattr(
         text_ops,
         "_resolve_gen_fn",
-        lambda gen_fn: (lambda prompt, *, fmt=None, max_tokens=256: {"text": "anything", "ok": True}),
+        lambda gen_fn, model="": (lambda prompt, *, fmt=None, max_tokens=256: {"text": "anything", "ok": True}),
     )
     parsed = json.loads(llm_tools.classify_text("hello", 5))
     assert parsed == {"label": None, "degraded": True}

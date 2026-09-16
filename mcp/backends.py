@@ -131,6 +131,31 @@ def ollama_gen_model() -> str:
             or "qwen2.5:3b")
 
 
+def _task_model(env_var: str, cfg_key: str) -> str:
+    """Per-task model override, falling back to the shared ollama_gen_model().
+
+    Adversarial live benchmarking (ab_eval_local_model.py --difficulty hard) showed the
+    single shared gen_model is not equally good at every task: classify is high-volume and
+    low-stakes, but verify_finding and dense compress_text calls need real reasoning under
+    a tighter budget, where a slower/stronger model measurably scores higher. This lets an
+    operator opt specific call sites into a different model without changing the default
+    that classify_text (and anything else unspecified) keeps using.
+    """
+    return (os.environ.get(env_var)
+            or _cfg("ollama", cfg_key, "")
+            or ollama_gen_model())
+
+
+def ollama_verify_model() -> str:
+    """Model for verify_finding's adversarial reasoning. Env -> [ollama].verify_model -> gen_model."""
+    return _task_model("LOCI_OLLAMA_VERIFY_MODEL", "verify_model")
+
+
+def ollama_compress_model() -> str:
+    """Model for compress_text's summarization. Env -> [ollama].compress_model -> gen_model."""
+    return _task_model("LOCI_OLLAMA_COMPRESS_MODEL", "compress_model")
+
+
 @functools.lru_cache(maxsize=8)
 def vllm_url(probe_timeout: float = 1.0) -> str:
     """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).

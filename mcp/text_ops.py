@@ -1,12 +1,17 @@
 """Generation-tier basic text ops for Loci-native workflows — the local-GPU offload.
 
 Two cheap generation-backed ops that trim what has to reach Claude, running on the
-local Ollama GPU (qwen2.5:3b) at ~zero token cost:
+local Ollama GPU (default qwen2.5:3b, or backends.ollama_gen_model()) at ~zero token cost:
 
 - classify(text, labels): pick the single best label from a caller-supplied set —
-  replaces a one-shot classifier/router agent.
+  replaces a one-shot classifier/router agent. Always uses the shared gen_model:
+  high call volume + low per-call stakes, so the fast default is the right tradeoff.
 - compress(text, max_chars): semantically condense text under a hard char budget —
-  shrink a bulky finding/context before it is forwarded.
+  shrink a bulky finding/context before it is forwarded. Independently routable via
+  backends.ollama_compress_model() (LOCI_OLLAMA_COMPRESS_MODEL / [ollama].compress_model)
+  since live adversarial benchmarking showed compress correctness varies far more across
+  models than classify does — an operator can opt this one call site into a
+  stronger/slower model without touching the shared default.
 
 Both fail-open (NEVER raise): on timeout / HTTP error / bad-JSON / not-ok generation,
 they return a well-formed degraded result. classify -> label=None, degraded=True;
@@ -28,20 +33,30 @@ from typing import Callable, Optional
 GenFn = Callable[..., dict]
 
 
-def _resolve_gen_fn(gen_fn: Optional[GenFn]) -> Optional[GenFn]:
+def _resolve_gen_fn(gen_fn: Optional[GenFn], model: str = "") -> Optional[GenFn]:
     """Return the injected gen_fn, else lazily import llm_local.generate.
 
     Lazy so that importing text_ops never requires llm_local to exist yet
     (it is written by a sibling agent in parallel). Returns None if it cannot
     be imported — callers treat that as the degraded path, never an exception.
+
+    `model`, when set, is bound into the returned callable so a specific op (e.g.
+    compress) can route to a model different from the shared gen_model without
+    changing the gen_fn contract callers/tests rely on.
     """
     if gen_fn is not None:
         return gen_fn
     try:
         from llm_local import generate  # type: ignore
-        return generate
     except Exception:
         return None
+    if not model:
+        return generate
+
+    def _bound(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 256) -> dict:
+        return generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens)
+
+    return _bound
 
 
 def _call_gen(gen_fn: GenFn, prompt: str, *, fmt: Optional[str] = None,
@@ -122,7 +137,7 @@ def compress(text: str, max_chars: int = 600, gen_fn: Optional[GenFn] = None) ->
     if len(text) <= max_chars:
         return {"text": text, "degraded": False}
 
-    gf = _resolve_gen_fn(gen_fn)
+    gf = _resolve_gen_fn(gen_fn, model=_compress_model())
     if gf is None:
         return {"text": text[:max_chars], "degraded": True}
 
@@ -145,3 +160,18 @@ def compress(text: str, max_chars: int = 600, gen_fn: Optional[GenFn] = None) ->
         return {"text": condensed, "degraded": False}
     # Model overran the budget -> clamp and flag degraded.
     return {"text": condensed[:max_chars], "degraded": True}
+
+
+def _compress_model() -> str:
+    """Best-effort model override for compress; "" means "use the shared gen_model".
+
+    Live adversarial benchmarking (ab_eval_local_model.py --difficulty hard) showed
+    compress correctness varies a lot more across models than classify does, so this is
+    independently configurable via LOCI_OLLAMA_COMPRESS_MODEL / [ollama].compress_model.
+    Never raises — any resolution failure just keeps the caller on the shared default.
+    """
+    try:
+        import backends
+        return backends.ollama_compress_model()
+    except Exception:
+        return ""

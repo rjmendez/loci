@@ -8,9 +8,14 @@ primitive so any caller gets the same discipline without re-implementing the pro
 
 Design mirrors mcp/query_expand.py:
 
-- Reasoning runs on the *generation* tier (Ollama qwen2.5:3b), injectable so a warm client
-  can be reused and tests can stub it. `gen_fn` defaults to None; when None we LAZILY import
-  ``llm_local.generate`` at call time, so importing this module never hard-requires llm_local.
+- Reasoning runs on the *generation* tier (Ollama), injectable so a warm client can be
+  reused and tests can stub it. `gen_fn` defaults to None; when None we LAZILY import
+  ``llm_local.generate`` at call time, so importing this module never hard-requires
+  llm_local. The default routes through backends.ollama_verify_model() rather than the
+  shared gen_model — live adversarial benchmarking (ab_eval_local_model.py --difficulty
+  hard) showed this reasoning task benefits from a stronger/slower model than the
+  high-volume classify path; independently configurable via LOCI_OLLAMA_VERIFY_MODEL /
+  [ollama].verify_model (falls back to gen_model when unset).
 
   gen_fn contract (shared): gen_fn(prompt, *, fmt=None, max_tokens=256) -> {"text": str,
   "ok": bool}. ok=False signals the caller should fall back — we treat it as degraded.
@@ -101,10 +106,22 @@ _PROMPT_TMPL = (
 
 
 def _lazy_generate(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 256) -> dict:
-    """Default gen_fn: import llm_local.generate only when actually called (fail-open)."""
+    """Default gen_fn: import llm_local.generate only when actually called (fail-open).
+
+    Uses backends.ollama_verify_model() rather than the shared gen model — live
+    adversarial benchmarking (ab_eval_local_model.py --difficulty hard) showed
+    verify_finding's reasoning task benefits from a stronger/slower model than the
+    high-volume classify path, so it is opt-in configurable independently via
+    LOCI_OLLAMA_VERIFY_MODEL / [ollama].verify_model (falls back to gen_model unset).
+    """
     try:
         from llm_local import generate  # imported lazily so module import never needs it
-        return generate(prompt, fmt=fmt, max_tokens=max_tokens)
+        try:
+            import backends
+            model = backends.ollama_verify_model()
+        except Exception:
+            model = ""
+        return generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens)
     except Exception:
         return {"text": "", "ok": False}
 

@@ -16,6 +16,14 @@
                                         # an unpulled/misspelled tag fails EVERY generate() call
                                         # silently (fail-open -> degraded=True everywhere upstream:
                                         # compress_text, classify_text, query_expand, verify_finding)
+# verify_model = "your-pulled-model:tag"   # optional: model for verify_finding's adversarial
+                                            # reasoning specifically, falls back to gen_model when
+                                            # unset. Live hard-tier benchmarking showed this task
+                                            # benefits from a stronger/slower model than classify.
+# compress_model = "your-pulled-model:tag" # optional: model for compress_text's summarization
+                                            # specifically, falls back to gen_model when unset.
+                                            # Compress correctness varies far more across models
+                                            # than classify does — worth tuning independently.
 #
 # Gotcha on Windows+WSL2 (NAT networking, the default — no networkingMode=mirrored
 # in .wslconfig): WSL cannot reach a Windows-bound Ollama via 127.0.0.1, the WSL
