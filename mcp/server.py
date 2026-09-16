@@ -1737,6 +1737,7 @@ def _search_qdrant_claim_evidence(
                 "origin": "qdrant",
                 "score": score,
                 # Computed here while the FULL payload text is in hand; the ref carries only a 260-char snippet.
+                "text": text,
                 "lexical_overlap": round(_lexical_match_score(claim_tokens, tokenize(text)), 4),
                 "pool_median": pool_median,
                 "pool_size": len(pool_scores),
@@ -3804,6 +3805,101 @@ def _pre_answer_chain_confidence(
     return (min_chain_confidence, confidence_summary)
 
 
+def _should_run_pre_answer_entailment_check(
+    support_refs: list[dict],
+    support_basis: str,
+    contradiction_refs: list[dict],
+    benign_context_refs: list[dict],
+) -> bool:
+    """When should the additive LLM entailment lane run?
+
+    The gap this lane closes is lexical-only or otherwise borderline support:
+    a finding can share enough words to look supportive while actually talking
+    about the wrong subject, timeframe, or certainty level. Stronger semantic
+    corroboration stays sufficient on its own unless the overall result is still
+    mixed (contradictions / benign baseline alongside support).
+    """
+    return bool(support_refs) and (
+        support_basis == "lexical"
+        or bool(contradiction_refs)
+        or bool(benign_context_refs)
+    )
+
+
+def _pre_answer_entailment_evidence(
+    refs: list[dict],
+    role: str,
+    evidence_by_id: dict[str, dict],
+    seen_ids: set[str],
+) -> list[dict]:
+    """Hydrate surfaced refs back to fuller evidence text for the advisory prompt.
+
+    The user-facing refs intentionally stay compact (snippet + metadata). The
+    entailment checker, however, should reason over the actual cited evidence
+    when we still have it locally (findings/audit text). Dense-only matches may
+    only have a snippet; that still degrades safely to a shorter prompt.
+    """
+    rows: list[dict] = []
+    for ref in refs or []:
+        if not isinstance(ref, dict):
+            continue
+        evidence_id = str(ref.get("evidence_id") or "").strip()
+        dedupe_key = evidence_id or f"{role}:{len(rows)}"
+        if dedupe_key in seen_ids:
+            continue
+        seen_ids.add(dedupe_key)
+        source = evidence_by_id.get(evidence_id, {}) if evidence_id else {}
+        text = str(source.get("text") or ref.get("text") or ref.get("snippet") or "").strip()
+        if not text:
+            continue
+        rows.append({
+            "role": role,
+            "evidence_id": evidence_id,
+            "record_type": ref.get("record_type") or source.get("record_type"),
+            "source": ref.get("source") or source.get("source"),
+            "ts": ref.get("ts") or source.get("ts"),
+            "text": text,
+            "snippet": ref.get("snippet", ""),
+        })
+    return rows
+
+
+def _run_pre_answer_llm_entailment_check(
+    claim: str,
+    support_refs: list[dict],
+    contradiction_refs: list[dict],
+    benign_context_refs: list[dict],
+    evidence_by_id: dict[str, dict],
+) -> dict:
+    """Best-effort advisory entailment corroboration for one claim. Never raises."""
+    try:
+        import pre_answer_entailment as _entailment
+    except Exception as exc:
+        return {
+            "available": False,
+            "verdict": None,
+            "rationale": "",
+            "confidence": 0.0,
+            "degraded": True,
+            "error": f"pre_answer_entailment import failed: {exc}"[:200],
+        }
+
+    seen_ids: set[str] = set()
+    evidence = []
+    evidence.extend(_pre_answer_entailment_evidence(support_refs, "support", evidence_by_id, seen_ids))
+    evidence.extend(
+        _pre_answer_entailment_evidence(
+            contradiction_refs, "contradiction", evidence_by_id, seen_ids
+        )
+    )
+    evidence.extend(
+        _pre_answer_entailment_evidence(
+            benign_context_refs, "benign_context", evidence_by_id, seen_ids
+        )
+    )
+    return _entailment.check_claim_entailment(claim, evidence)
+
+
 @mcp.tool()
 def investigation_pre_answer_check(
     investigation_id: str,
@@ -3827,6 +3923,14 @@ def investigation_pre_answer_check(
     ``semantic_candidates``. ``support_basis`` reports which lane decided:
     lexical / semantic_corroborated / semantic_candidate_only / none, and
     ``supported`` is True only for the first two.
+
+    For supported-but-lexical or otherwise borderline claims, ``claim_results``
+    may also include ``llm_entailment_check``: an advisory local-model verdict
+    (confirmed / refuted / uncertain) on whether the cited evidence actually
+    supports the EXACT claim, considering subject, scope, time, modality, and
+    negation. This NEVER flips ``supported``; it is additive corroboration only.
+    If the local verifier is unavailable the field stays fail-open as
+    ``available=False`` and deterministic results are unchanged.
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
@@ -3843,6 +3947,11 @@ def investigation_pre_answer_check(
     evidence_pool, evidence_lanes = build_validation_evidence(
         investigation_id, min_confidence=min_confidence
     )
+    evidence_by_id: dict[str, dict] = {
+        str(entry.get("evidence_id") or ""): entry
+        for entry in evidence_pool
+        if isinstance(entry, dict) and entry.get("evidence_id")
+    }
     claim_results: list[dict] = []
     matched_refs: list[dict] = []
     matched_ids: set[str] = set()
@@ -3870,6 +3979,10 @@ def investigation_pre_answer_check(
         elif qdrant_status.get("query_attempted"):
             qdrant_query_success = True
         qdrant_matches_total += len(qdrant_refs)
+        for ref in qdrant_refs:
+            ev_id = str(ref.get("evidence_id") or "")
+            if ev_id:
+                evidence_by_id[ev_id] = ref
         lexical_support = bool(claim_support_refs)
         semantic_candidates: list[dict] = []
         semantic_corroborated = False
@@ -3915,8 +4028,7 @@ def investigation_pre_answer_check(
             _search_benign_context_qdrant(claim, investigation_id)
             if claim_support_refs else []
         )
-
-        claim_results.append({
+        claim_result = {
             "claim": claim,
             "supported": bool(claim_support_refs),
             "contradicted": bool(claim_contradiction_refs),
@@ -3926,7 +4038,19 @@ def investigation_pre_answer_check(
             "semantic_candidates": semantic_candidates[:8],
             "contradiction_refs": claim_contradiction_refs[:8],
             "benign_context_refs": benign_context_refs,
-        })
+        }
+        if _should_run_pre_answer_entailment_check(
+            claim_support_refs, support_basis, claim_contradiction_refs, benign_context_refs
+        ):
+            claim_result["llm_entailment_check"] = _run_pre_answer_llm_entailment_check(
+                claim,
+                claim_support_refs[:8],
+                claim_contradiction_refs[:8],
+                benign_context_refs[:8],
+                evidence_by_id,
+            )
+
+        claim_results.append(claim_result)
 
     unique_errors = sorted(set(qdrant_errors))
     degraded_active, degraded_reason = _qdrant_degraded_mode(
