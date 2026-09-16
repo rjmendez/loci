@@ -11,7 +11,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 import local_deep_think as L  # noqa: E402
 
 
-def _config(*, red_team: bool = False, self_reflect: bool = True) -> L.ChainConfig:
+def _config(*, red_team: bool = False, self_reflect: bool = True, strict_grounding: bool = False) -> L.ChainConfig:
     return L.ChainConfig(
         topic="fail-open local reasoning",
         investigation_id="local-deep-think-test",
@@ -24,6 +24,7 @@ def _config(*, red_team: bool = False, self_reflect: bool = True) -> L.ChainConf
         redteam_model="heretic-model:latest",
         self_reflect=self_reflect,
         red_team=red_team,
+        strict_grounding=strict_grounding,
         ideas_per_model=1,
         retrieval_limit=3,
         ground_threshold=0.59,
@@ -41,6 +42,10 @@ def _search_collection(*, query, collection_name, limit):  # noqa: ARG001
 
 def _gate(query, candidates, threshold):  # noqa: ARG001
     return {"kept": candidates, "dropped": [], "mode": f"cosine>={threshold}"}
+
+
+def _gate_empty(query, candidates, threshold):  # noqa: ARG001
+    return {"kept": [], "dropped": candidates, "mode": f"cosine>={threshold}"}
 
 
 def _start(**kwargs):  # noqa: ARG001
@@ -493,3 +498,112 @@ def test_dedicated_writer_owns_persistence_calls():
     assert all(call["source"].startswith("scripts/local_deep_think.py#") for call in stores)
     assert stores[0]["derived_from"] is None
     assert stores[2]["derived_from"] == ["f1"]
+
+
+def _ungrounded_deps():
+    """generate/verify/store stack shared by the strict-grounding tests below.
+
+    Uses _gate_empty so every retrieval (top-level and per-claim verify) reports
+    kept=0 -- i.e. nothing in this run ever grounded against real evidence.
+    """
+    stores = []
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        if "IDEATE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"ideas":[{"claim":"Idea with no supporting evidence.",'
+                        '"rationale":"speculative","confidence":"medium","evidence_ids":[]}]}',
+            }
+        if "SYNTHESIZE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"summary":"Confident-sounding synthesis.","supporting_finding_ids":["vf1"]}',
+            }
+        return {"ok": False, "text": "", "why": "unexpected"}
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.6, "degraded": False}
+
+    def _store(**kwargs):
+        stores.append(kwargs)
+        counter = len(stores)
+        fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    deps = {
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate_empty,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+    }
+    return deps, stores
+
+
+def test_default_mode_unaffected_by_ungrounded_run():
+    deps, stores = _ungrounded_deps()
+    result = L.run_chain(_config(self_reflect=False, strict_grounding=False), deps=deps)
+
+    synthesis = result["synthesis"]
+    assert synthesis["grounding_status"] == "ungrounded"
+    assert synthesis["summary"] == "Confident-sounding synthesis."
+    assert "ungrounded" not in (synthesis.get("tags") or [])
+    synth_store = stores[-1]
+    assert synth_store["confidence"] == "high"
+
+
+def test_strict_grounding_downgrades_ungrounded_synthesis():
+    deps, stores = _ungrounded_deps()
+    result = L.run_chain(_config(self_reflect=False, strict_grounding=True), deps=deps)
+
+    synthesis = result["synthesis"]
+    assert synthesis["grounding_status"] == "ungrounded"
+    assert "ungrounded" in synthesis["tags"]
+    assert synthesis["summary"].startswith(L._UNGROUNDED_CAVEAT)
+    assert "Confident-sounding synthesis." in synthesis["summary"]
+    synth_store = stores[-1]
+    assert synth_store["confidence"] == "low"
+
+
+def test_strict_grounding_leaves_grounded_synthesis_untouched():
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        if "IDEATE tier" in prompt:
+            return {
+                "ok": True,
+                "text": '{"ideas":[{"claim":"Idea with real evidence.",'
+                        '"rationale":"grounded","confidence":"high","evidence_ids":["seed-1"]}]}',
+            }
+        if "SYNTHESIZE tier" in prompt:
+            return {"ok": True, "text": '{"summary":"Grounded synthesis.","supporting_finding_ids":["vf1"]}'}
+        return {"ok": False, "text": "", "why": "unexpected"}
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.8, "degraded": False}
+
+    stores = []
+
+    def _store(**kwargs):
+        stores.append(kwargs)
+        counter = len(stores)
+        fid = {1: "f1", 2: "vf1", 3: "sf1"}[counter]
+        return f'{{"stored": true, "finding_id": "{fid}"}}'
+
+    result = L.run_chain(_config(self_reflect=False, strict_grounding=True), deps={
+        "generate": _generate,
+        "search_collection": _search_collection,
+        "gate": _gate,
+        "start": _start,
+        "load": _load,
+        "store": _store,
+        "verify": _verify,
+    })
+
+    synthesis = result["synthesis"]
+    assert synthesis["grounding_status"] == "grounded"
+    assert synthesis["summary"] == "Grounded synthesis."
+    assert "ungrounded" not in synthesis["tags"]
+    assert stores[-1]["confidence"] == "high"
+
