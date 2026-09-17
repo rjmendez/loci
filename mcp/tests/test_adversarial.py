@@ -100,6 +100,16 @@ def test_unparseable_output_is_degraded():
     assert out["degraded"] is True
 
 
+def test_gaps_salvages_narrated_text():
+    # a chatty model that narrates instead of emitting JSON -> degraded, but the critique
+    # is preserved in summary rather than discarded.
+    prose = "The analysis never parsed persist.img and skipped the APK decompile entirely."
+    out = A.adversarial_review(["a", "b"], mode="gaps", gen_fn=_ok(prose))
+    assert out["degraded"] is True
+    assert out["gaps"] == []
+    assert "persist.img" in out["summary"]
+
+
 def test_json_in_prose_is_extracted():
     fenced = "Sure:\n```json\n" + _GAPS + "\n```\nhope that helps"
     out = A.adversarial_review(["a"], mode="gaps", gen_fn=_ok(fenced))

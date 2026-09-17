@@ -41,6 +41,9 @@ GenFn = Callable[..., dict]
 _MAX_FINDINGS = 50
 _MAX_FINDING_LEN = 2000
 _MAX_CONTEXT_LEN = 6000
+# When the gaps critic narrates instead of emitting parseable JSON, keep this much of its
+# raw text as the summary rather than losing the whole answer.
+_MAX_GAPS_SALVAGE = 4000
 _VALID_MODES = ("redteam", "gaps")
 
 _REDTEAM_TMPL = (
@@ -167,17 +170,24 @@ def _gaps(findings: list, context: str, domain: str, gen_fn: GenFn) -> dict:
     dom = _domain_clause(domain)
     listing = "\n".join(f"- {f}" for f in findings)
     prompt = _GAPS_TMPL.format(domain=dom, findings=listing, context=ctx or "(none)")
+    # A larger budget than the per-finding red-team pass: the whole-set critic reasons over
+    # every finding, and a chatty (e.g. abliterated) model can spend a lot of tokens getting
+    # to the JSON. Too small a budget truncates the object and loses the whole answer.
     try:
-        res = gen_fn(prompt, fmt="json", max_tokens=900)
+        res = gen_fn(prompt, fmt="json", max_tokens=1400)
     except Exception:
         res = {"text": "", "ok": False}
     if not isinstance(res, dict) or not res.get("ok"):
         return {"mode": "gaps", "model": _redteam_model_name(), "gaps": [],
                 "next_probes": [], "summary": "", "degraded": True}
-    obj = extract_json_object(res.get("text", ""))
+    raw = res.get("text", "")
+    obj = extract_json_object(raw)
     if obj is None:
+        # Salvage: a model that narrated instead of emitting clean JSON still produced a
+        # useful critique. Surface it as the summary (degraded) rather than discarding it.
+        salvage = raw.strip()[:_MAX_GAPS_SALVAGE] if isinstance(raw, str) else ""
         return {"mode": "gaps", "model": _redteam_model_name(), "gaps": [],
-                "next_probes": [], "summary": "", "degraded": True}
+                "next_probes": [], "summary": salvage, "degraded": True}
 
     def _strlist(v):
         if isinstance(v, list):
