@@ -493,6 +493,33 @@ def swarm_reason(topic: str,
         )
 
 
+def adversarial_review(findings: list,
+                       mode: Literal["redteam", "gaps"] = "redteam",
+                       context: str = "",
+                       domain: str = "") -> str:
+    """
+    Adversarially review a SET of findings with a local red-team model. Two modes:
+    ``redteam`` critiques each finding as an attacker (attack path, preconditions,
+    impact, how to confirm); ``gaps`` runs one completeness pass over the whole set
+    (missing attack surface, unverified claims, highest-value next probes).
+
+    Routes to ``backends.ollama_redteam_model()`` — an uncensored/abliterated local
+    model by default — because aligned models soften "attack this" prompts. For "is
+    this ONE claim true?" use ``verify_finding`` instead; this tool deliberately does
+    not reimplement refutation.
+
+    Fail-open: an empty set or an unavailable model returns a well-formed result with
+    ``degraded=True``; a single finding's failure never sinks the batch.
+
+    Returns JSON: redteam -> ``{mode, model, results:[{finding, exploitable, attack,
+    preconditions, impact, confirm, degraded}], degraded}``; gaps -> ``{mode, model,
+    gaps, next_probes, summary, degraded}``.
+    """
+    import adversarial as _adv
+    return json.dumps(_adv.adversarial_review(findings, mode=mode, context=context,
+                                              domain=domain), indent=2)
+
+
 def register(mcp):
     """Register every local-model passthrough tool on the shared FastMCP instance."""
     for fn in (
@@ -500,6 +527,7 @@ def register(mcp):
         generate_batch,
         query_expand,
         verify_finding,
+        adversarial_review,
         classify_text,
         compress_text,
         semantic_dedup,

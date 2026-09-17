@@ -9103,8 +9103,9 @@ import llm_tools  # noqa: E402
 llm_tools.register(mcp)
 # Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from llm_tools import (  # noqa: E402,F401
-    llm_local, generate_batch, query_expand, verify_finding, classify_text,
-    compress_text, semantic_dedup, semantic_relevance, ground, swarm_reason,
+    llm_local, generate_batch, query_expand, verify_finding, adversarial_review,
+    classify_text, compress_text, semantic_dedup, semantic_relevance, ground,
+    swarm_reason,
 )
 
 # Memory root injected as a lambda over MEMORY_DIR; collaborators are passed in so investigation_tools never imports server.
