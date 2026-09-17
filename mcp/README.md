@@ -205,7 +205,7 @@ representative paths are maintained in
 **Code graph** (registered from `graph_tools.py`):
 - `code_graph_ingest(path, max_files?, replace?)` — parse with tree-sitter and ingest the symbol graph
 - `code_graph_query(cypher, params?)` — read-only Cypher over the code + findings graph
-- `code_memory_relink()` — rebuild all Finding → CodeSymbol edges
+- `code_memory_relink()` — scan findings and idempotently `MERGE` matching Finding → CodeSymbol edges
 - `code_memory_map(anchor, anchor_type?, hops?)` — code↔memory neighbourhood around an anchor
 - `symbol_impact(symbol, hops?)` — blast radius of a symbol across code and memory
 - `impact_report(symbol, hops?)` — change blast radius: transitive callers plus co-referenced symbols/findings/investigations

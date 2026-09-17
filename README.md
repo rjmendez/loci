@@ -165,7 +165,7 @@ for registration anchors and call paths.*
 | `swarm_reason` | Run bounded local-model fan-out and synthesis reasoning |
 | `code_graph_ingest` | Parse source with tree-sitter and ingest its symbol graph |
 | `code_graph_query` | Run a read-only Cypher query over the code + memory graph |
-| `code_memory_relink` | Rebuild every finding → code-symbol `REFERENCES` edge |
+| `code_memory_relink` | Scan findings and idempotently `MERGE` matching code-symbol `REFERENCES` edges |
 | `code_memory_map` | Map the code/memory neighbourhood around an anchor node |
 | `symbol_impact` | Blast radius of a code symbol across code and memory |
 | `impact_report` | Change blast radius for a symbol or class, with the findings that reference it |
