@@ -40,7 +40,9 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog),
     # scripts/swarm_supervisor.py, and scripts/demo_swarm_supervisor.py
     # (advisory swarm supervisor + demo) add their module-level helpers.
-    assert 954 <= len(module_level) <= 1390, len(module_level)
+    # 1390 -> 1420: swarm-reasoning-tiers explicit-override fix (local_deep_think.py,
+    # swarm_escalate.py) adds per-field *_explicit tracking + regression tests.
+    assert 954 <= len(module_level) <= 1420, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
