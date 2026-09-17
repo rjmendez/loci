@@ -7,6 +7,7 @@ would shadow the sibling module at module scope.
 """
 import json
 import logging
+import os
 import sys
 from importlib import util as importlib_util
 from pathlib import Path
@@ -16,6 +17,13 @@ logger = logging.getLogger("loci-mcp")
 _SWARM_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "swarm_escalate.py"
 _SWARM_MODULE_NAME = "_loci_scripts_swarm_escalate"
 _SWARM_MODULE = None
+
+
+def _env_bool(name: str) -> bool:
+    """Mirror scripts/swarm_escalate.py's env-driven SwarmConfig defaults for
+    synthesize_think/safety_check so tier-gating decisions made here (before a
+    SwarmConfig even exists) match what the dataclass would resolve to on its own."""
+    return os.environ.get(name, "") not in ("", "0", "false", "False")
 
 
 def _coerce_labels(labels) -> list:
@@ -355,12 +363,18 @@ def ground(
 
 def swarm_reason(topic: str,
                  fanout_count: int = 20,
+                 seeds: int = 1,
                  cheap_model: str = "",
                  escalate_model: str = "",
                  synthesize_model: str = "",
                  decompose_model: str = "",
                  subtasks: Optional[list] = None,
                  escalate_confidences: Optional[list] = None,
+                 synthesize_think: Optional[bool] = None,
+                 safety_check: Optional[bool] = None,
+                 self_consistency_samples: int = 1,
+                 escalate_with_prior_context: bool = False,
+                 reduce_group_size: int = 0,
                  stigmergic_consensus: bool = False,
                  stigmergic_ttl_minutes: float = 60.0) -> str:
     """
@@ -368,27 +382,104 @@ def swarm_reason(topic: str,
     escalation, then synthesis. Returns the structured JSON result with
     ``schema_version``, ``findings``, ``summary``, ``stats``, and diagnostics.
 
+    seeds: opt-in number of independent decompose->cheap->triage->escalate rounds
+        to run concurrently before one merged synthesis. Default 1 preserves the
+        historic single-seed behavior exactly.
+
+    synthesize_think: opt-in "high-end" mode for the single synthesis call -- enables
+        Ollama reasoning at a much larger token budget, with automatic fallback to a
+        normal call if the reasoning attempt returns empty/unparseable (live-verified:
+        some thinking-capable models can burn an entire large budget on reasoning alone
+        for some prompts). None -> SwarmConfig's own env-driven default (off unless
+        LOCI_SWARM_SYNTHESIZE_THINK is set).
+
+    safety_check: opt-in advisory Granite Guardian annotation on the final summary.
+        It never blocks, drops, or rewrites findings. None -> SwarmConfig's own
+        env-driven default (off unless LOCI_SWARM_SAFETY_CHECK is set).
+
+    self_consistency_samples: opt-in cheap-tier majority sampling for low-confidence
+        subtasks before escalation. 1 preserves historic behavior.
+
+    escalate_with_prior_context: opt-in critique-and-improve escalation prompt that
+        includes the weaker cheap-tier answer. Default False preserves prompts.
+
+    reduce_group_size: opt-in hierarchical synthesis grouping for large fan-outs. 0
+        preserves the flat synthesis prompt.
+
+    stigmergic_consensus: opt-in cross-run stigmergic consensus gate over swarm
+        findings. Default False preserves the historic single-run result.
+
+    stigmergic_ttl_minutes: time-to-live for stigmergic consensus trail entries when
+        stigmergic_consensus is enabled. Ignored otherwise.
+
+    escalate_model / synthesize_model: leave empty ("") to use the existing default
+        model for the current opt-in tier -- an empty value here is never treated as
+        an explicit override, so it still upgrades correctly when seeds, self-
+        consistency, safety_check, synthesize_think, escalate_with_prior_context, or
+        reduce_group_size opt into the new reasoning tier (see swarm_escalate.py's
+        SwarmConfig for the exact gating). Passing a non-empty model name here always
+        wins over both the legacy default and the tier default.
+
     Fail-open: import/runtime/validation errors return degraded JSON instead of
     raising, so downstream MCP clients can still inspect one well-formed result.
     """
     try:
         swarm = _load_swarm_escalate()
-        config = swarm.SwarmConfig(
+        resolved_seeds = max(1, int(seeds))
+        resolved_samples = max(1, int(self_consistency_samples))
+        resolved_reduce_group_size = max(0, int(reduce_group_size))
+        resolved_prior_context = bool(escalate_with_prior_context)
+        resolved_synthesize_think = (
+            bool(synthesize_think) if synthesize_think is not None
+            else _env_bool("LOCI_SWARM_SYNTHESIZE_THINK")
+        )
+        resolved_safety_check = (
+            bool(safety_check) if safety_check is not None
+            else _env_bool("LOCI_SWARM_SAFETY_CHECK")
+        )
+        # Tier gating mirrors scripts/swarm_escalate.py's _resolve_config: the new 8B/27B
+        # models only replace the legacy qwen3.8:latest default when the caller opts into
+        # one of the new tier knobs, and an explicit escalate_model/synthesize_model
+        # (even if it equals the legacy default) always wins over both defaults.
+        tier_active = (
+            resolved_seeds > 1
+            or resolved_synthesize_think
+            or resolved_safety_check
+            or resolved_samples > 1
+            or resolved_reduce_group_size > 0
+            or resolved_prior_context
+        )
+        resolved_escalate_model = str(escalate_model or "").strip() or (
+            swarm._TIER_ESCALATE_MODEL if tier_active else swarm._DEFAULT_ESCALATE_MODEL
+        )
+        resolved_synthesize_model = str(synthesize_model or "").strip() or (
+            swarm._TIER_SYNTHESIZE_MODEL if tier_active else swarm._DEFAULT_SYNTHESIZE_MODEL
+        )
+        kwargs = dict(
             topic=str(topic or "").strip(),
             cheap_model=str(cheap_model or "") or swarm._DEFAULT_CHEAP_MODEL,
-            escalate_model=str(escalate_model or "") or swarm._DEFAULT_ESCALATE_MODEL,
-            synthesize_model=str(synthesize_model or "") or swarm._DEFAULT_SYNTHESIZE_MODEL,
+            escalate_model=resolved_escalate_model,
+            synthesize_model=resolved_synthesize_model,
             decompose_model=str(decompose_model or ""),
+            escalate_model_explicit=bool(str(escalate_model or "").strip()),
+            synthesize_model_explicit=bool(str(synthesize_model or "").strip()),
             subtasks=_coerce_labels(subtasks) or None,
             fanout_count=max(1, int(fanout_count)),
+            seeds=resolved_seeds,
             escalate_confidences=tuple(
                 str(item).strip().lower()
                 for item in _coerce_labels(escalate_confidences or ("low",))
                 if str(item).strip()
             ) or ("low",),
+            synthesize_think=resolved_synthesize_think,
+            safety_check=resolved_safety_check,
+            self_consistency_samples=resolved_samples,
+            escalate_with_prior_context=resolved_prior_context,
+            reduce_group_size=resolved_reduce_group_size,
             stigmergic_consensus=bool(stigmergic_consensus),
             stigmergic_ttl_minutes=max(0.0, float(stigmergic_ttl_minutes)),
         )
+        config = swarm.SwarmConfig(**kwargs)
         result = swarm.run_swarm(config)
         errors = list(swarm.validate_swarm_result(result))
         if errors:

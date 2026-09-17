@@ -53,7 +53,8 @@ def generate(prompt: str,
              fmt: Optional[str] = None,
              max_tokens: int = 256,
              temperature: float = 0.2,
-             keep_alive: str = "30m") -> dict:
+             keep_alive: str = "30m",
+             think: bool = False) -> dict:
     """Generate text from the local Ollama model. Fail-open, never raises.
 
     Args:
@@ -61,10 +62,20 @@ def generate(prompt: str,
         model: Ollama model tag. Defaults to the verified-good qwen2.5:3b [substrate].
         fmt: if 'json', request structured JSON output AND validate the body parses as
              JSON; a non-JSON body downgrades the result to ok=False.
-        max_tokens: mapped to Ollama options.num_predict.
+        max_tokens: mapped to Ollama options.num_predict. NOTE for think=True callers:
+             on thinking-capable models this budget is SHARED between the hidden
+             reasoning trace and the visible answer (live-verified 2026-09-16 against
+             gemma4:26b/qwen3.8: num_predict=220 with think=True spent the whole budget
+             on `thinking` and returned an EMPTY `response`). Pass a materially larger
+             max_tokens (~1000+) whenever think=True, or the answer will come back blank.
         temperature: mapped to Ollama options.temperature.
         keep_alive: pins the model resident to avoid the ~70s cold load [substrate].
                     Always included in the request body — this is the critical bit.
+        think: opt-in reasoning mode for thinking-capable models (default False, matching
+             every existing caller's expectation that `response` holds the whole answer).
+             Set True only for single, quality-critical calls (e.g. a deep-think synthesis
+             or self-reflection pass) where the extra latency and larger max_tokens are
+             worth the higher-quality result; do NOT enable for high-fanout/cheap tiers.
 
     Returns:
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
@@ -103,9 +114,11 @@ def generate(prompt: str,
         # JSON answer into a separate `thinking` field and leave `response` empty when
         # fmt="json" is set, which silently degraded every caller (compress_text,
         # classify_text, verify_finding) to ok=False against such a model. Disabling
-        # thinking keeps the answer in `response`. Harmless no-op for non-thinking models
-        # (verified live) and ignored outright by Ollama builds that predate the option.
-        "think": False,
+        # thinking (the default) keeps the answer in `response`. Harmless no-op for
+        # non-thinking models (verified live) and ignored outright by Ollama builds that
+        # predate the option. Callers that explicitly opt into think=True accept the
+        # response-may-land-in-`thinking` risk; the fallback below still recovers it.
+        "think": bool(think),
         "options": {
             "num_predict": max_tokens,
             "temperature": temperature,

@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib
 import json
 import logging
@@ -42,9 +43,23 @@ LOG = logging.getLogger("local_deep_think")
 _MODEL_SAFE_RE = re.compile(r"[^a-z0-9]+")
 _TEXT_KEYS = ("text", "snippet", "content", "chunk_text", "summary", "body", "passage")
 _DEFAULT_IDEATE_MODELS = "llama3.1-agent:latest,qwen3.8:latest"
+# Existing/default code path (no opt-in tier flags set): unchanged from before the
+# 2026-09-16 tier work. Do not change these without also changing the default behavior
+# for callers that pass no flags at all.
 _DEFAULT_VERIFY_MODEL = "qwen3.8:latest"
 _DEFAULT_SYNTH_MODEL = "qwen3.8:latest"
 _DEFAULT_REFLECT_MODEL = "qwen3.8:latest"
+# Opt-in "safety_check" tier: chosen from a live 12-model / 4-task benchmark on
+# 2026-09-16 (see swarm_escalate.py's tier comments for the full methodology/results).
+# These only apply when the caller explicitly sets safety_check=True (or
+# --safety-check / LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK); they must never change the
+# default code path used by every prior caller.
+_TIER_VERIFY_MODEL = "heretic-llama31-8b-instruct:latest"
+_TIER_SYNTH_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_REFLECT_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_REDTEAM_MAX_TOKENS = 1600
+_TIER_SELF_REFLECT_REVISE_MAX_TOKENS = 2200
+_TIER_SYNTHESIZE_MAX_TOKENS = 2200
 _PROCEDURE_LEARNING_MIN_CONFIDENCE = 0.75
 
 
@@ -59,15 +74,45 @@ class ChainConfig:
     synthesize_model: str
     self_reflect_model: str
     redteam_model: str
+    verify_model_explicit: bool = False
+    synthesize_model_explicit: bool = False
+    self_reflect_model_explicit: bool = False
     learn_procedures: bool = True
     self_reflect: bool = True
     red_team: bool = False
     strict_grounding: bool = False
+    safety_check: bool = field(
+        default_factory=lambda: os.environ.get("LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK", "") not in ("", "0", "false", "False")
+    )
     ideas_per_model: int = 3
     retrieval_limit: int = 8
     ground_threshold: float = 0.59
     evidence_chars: int = 4200
     max_lineage: int = 12
+    # Existing/default token budgets (pre-2026-09-16 tier work). Bumped only when
+    # safety_check is explicitly opted into; see __post_init__.
+    redteam_max_tokens: int = 900
+    self_reflect_revise_max_tokens: int = 1400
+    synthesize_max_tokens: int = 1400
+
+    def __post_init__(self) -> None:
+        if not self.safety_check:
+            return
+        # Opt-in tier upgrade: only takes effect once safety_check=True, and only for
+        # fields still at their un-overridden default (an explicit --verify-model/
+        # --synthesize-model/etc. always wins).
+        if not self.verify_model_explicit and self.verify_model == _DEFAULT_VERIFY_MODEL:
+            self.verify_model = _TIER_VERIFY_MODEL
+        if not self.synthesize_model_explicit and self.synthesize_model == _DEFAULT_SYNTH_MODEL:
+            self.synthesize_model = _TIER_SYNTH_MODEL
+        if not self.self_reflect_model_explicit and self.self_reflect_model == _DEFAULT_REFLECT_MODEL:
+            self.self_reflect_model = _TIER_REFLECT_MODEL
+        if self.redteam_max_tokens == 900:
+            self.redteam_max_tokens = _TIER_REDTEAM_MAX_TOKENS
+        if self.self_reflect_revise_max_tokens == 1400:
+            self.self_reflect_revise_max_tokens = _TIER_SELF_REFLECT_REVISE_MAX_TOKENS
+        if self.synthesize_max_tokens == 1400:
+            self.synthesize_max_tokens = _TIER_SYNTHESIZE_MAX_TOKENS
 
 
 @dataclass
@@ -149,6 +194,21 @@ def _split_csv(raw: Optional[str]) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "") not in ("", "0", "false", "False")
+
+
+def _resolve_model_input(cli_value: Optional[str], *, env_name: str, cfg_key: str,
+                         default: str) -> tuple[str, bool]:
+    cooked_cli = str(cli_value or "").strip()
+    if cooked_cli:
+        return cooked_cli, True
+    cooked_env = str(os.environ.get(env_name, "") or "").strip()
+    if cooked_env:
+        return cooked_env, True
+    return str(_cfg_value(cfg_key, default) or default), False
+
+
 def _safe_model_tag(model: str) -> str:
     text = _MODEL_SAFE_RE.sub("-", (model or "").lower()).strip("-")
     return text or "unknown-model"
@@ -171,21 +231,23 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         or os.environ.get("LOCI_LOCAL_DEEP_THINK_IDEATE_MODELS")
         or _cfg_value("deep_think_ideate_models", _DEFAULT_IDEATE_MODELS)
     )
-    verify_model = (
-        args.verify_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL")
-        or _cfg_value("deep_think_verify_model", _DEFAULT_VERIFY_MODEL)
+    verify_model, verify_model_explicit = _resolve_model_input(
+        args.verify_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        cfg_key="deep_think_verify_model",
+        default=_DEFAULT_VERIFY_MODEL,
     )
-    synthesize_model = (
-        args.synthesize_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL")
-        or _cfg_value("deep_think_synthesize_model", _DEFAULT_SYNTH_MODEL)
+    synthesize_model, synthesize_model_explicit = _resolve_model_input(
+        args.synthesize_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        cfg_key="deep_think_synthesize_model",
+        default=_DEFAULT_SYNTH_MODEL,
     )
-    self_reflect_model = (
-        args.self_reflect_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL")
-        or _cfg_value("deep_think_self_reflect_model", _DEFAULT_REFLECT_MODEL)
-        or synthesize_model
+    self_reflect_model, self_reflect_model_explicit = _resolve_model_input(
+        args.self_reflect_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+        cfg_key="deep_think_self_reflect_model",
+        default=_DEFAULT_REFLECT_MODEL,
     )
     try:
         redteam_model = (
@@ -216,10 +278,14 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         synthesize_model=synthesize_model,
         self_reflect_model=self_reflect_model,
         redteam_model=redteam_model,
+        verify_model_explicit=verify_model_explicit,
+        synthesize_model_explicit=synthesize_model_explicit,
+        self_reflect_model_explicit=self_reflect_model_explicit,
         learn_procedures=not bool(args.no_learn_procedures),
         self_reflect=not bool(args.no_self_reflect),
         red_team=bool(args.red_team),
         strict_grounding=bool(args.strict_grounding),
+        safety_check=bool(args.safety_check) if args.safety_check is not None else _env_flag("LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK"),
         ideas_per_model=max(1, int(args.ideas_per_model)),
         retrieval_limit=max(1, int(args.retrieval_limit)),
         ground_threshold=float(args.ground_threshold),
@@ -256,6 +322,29 @@ def _call_generate(gen_fn: Callable, prompt: str, *, model: str,
         except Exception as exc:
             return {"text": "", "ok": False, "why": str(exc)}
     return {"text": "", "ok": False, "why": "generate signature mismatch"}
+
+
+def _guardian_check(text: str) -> dict:
+    _ensure_paths()
+    from guardian import check_injection_risk
+    return check_injection_risk(text)
+
+
+def _safety_flag(text: str, guardian_fn: Callable[[str], dict]) -> dict:
+    try:
+        result = guardian_fn(text)
+    except Exception as exc:
+        return {"flagged": False, "why": f"guardian failed open: {exc}"[:200]}
+    if not isinstance(result, dict):
+        return {"flagged": False, "why": "guardian failed open: invalid result"}
+    flagged = bool(result.get("flagged"))
+    if flagged:
+        why = result.get("error") or f"guardian verdict {result.get('verdict') or 'Yes'}"
+    elif result.get("ok") is False:
+        why = f"guardian failed open: {result.get('error') or 'unknown error'}"
+    else:
+        why = f"guardian verdict {result.get('verdict') or 'No'}"
+    return {"flagged": flagged, "why": str(why)[:200]}
 
 
 def _extract_json_object(text: str):
@@ -482,33 +571,75 @@ def _normalize_ideas(obj: dict, model: str, limit: int) -> list[Idea]:
     return out
 
 
+def _ideate_one_model(topic: str, *, context: str, context_ids: list[str], model: str,
+                      ideas_per_model: int, gen_fn: Callable) -> tuple[list[Idea], dict]:
+    prompt = (
+        "You are the IDEATE tier in a grounded reasoning chain.\n"
+        f"Topic: {topic}\n"
+        f"Return exactly {ideas_per_model} candidate findings or hypotheses.\n"
+        "Use ONLY the evidence below. No persistence. No markdown.\n"
+        'Return ONLY JSON: {"ideas":[{"claim":"...","rationale":"...","confidence":"low|medium|high","evidence_ids":["id"]}]}\n\n'
+        f"EVIDENCE:\n{context}\n"
+    )
+    raw = _call_generate(gen_fn, prompt, model=model, max_tokens=900)
+    obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
+    ideas = _normalize_ideas(obj or {}, model, ideas_per_model)
+    if not ideas:
+        why = raw.get("why") or "unparseable or empty ideation output"
+        LOG.warning("ideate skipped for %s: %s", model, why)
+        return [], {"model": model, "ok": False, "ideas": 0, "error": why}
+    for item in ideas:
+        if not item.evidence_ids:
+            item.evidence_ids = list(context_ids)
+    return ideas, {"model": model, "ok": True, "ideas": len(ideas)}
+
+
 def ideate(topic: str, *, candidates: list[dict], config: ChainConfig,
            gen_fn: Callable) -> tuple[list[Idea], list[dict]]:
     context, context_ids = _render_context(candidates, config.evidence_chars)
     results: list[Idea] = []
     reports: list[dict] = []
-    for model in config.ideate_models:
-        prompt = (
-            "You are the IDEATE tier in a grounded reasoning chain.\n"
-            f"Topic: {topic}\n"
-            f"Return exactly {config.ideas_per_model} candidate findings or hypotheses.\n"
-            "Use ONLY the evidence below. No persistence. No markdown.\n"
-            'Return ONLY JSON: {"ideas":[{"claim":"...","rationale":"...","confidence":"low|medium|high","evidence_ids":["id"]}]}\n\n'
-            f"EVIDENCE:\n{context}\n"
-        )
-        raw = _call_generate(gen_fn, prompt, model=model, max_tokens=900)
-        obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
-        ideas = _normalize_ideas(obj or {}, model, config.ideas_per_model)
-        if not ideas:
-            why = raw.get("why") or "unparseable or empty ideation output"
-            LOG.warning("ideate skipped for %s: %s", model, why)
-            reports.append({"model": model, "ok": False, "ideas": 0, "error": why})
-            continue
-        for item in ideas:
-            if not item.evidence_ids:
-                item.evidence_ids = list(context_ids)
+    if len(config.ideate_models) <= 1:
+        for model in config.ideate_models:
+            ideas, report = _ideate_one_model(
+                topic,
+                context=context,
+                context_ids=context_ids,
+                model=model,
+                ideas_per_model=config.ideas_per_model,
+                gen_fn=gen_fn,
+            )
+            results.extend(ideas)
+            reports.append(report)
+        return results, reports
+
+    ordered: list[tuple[list[Idea], dict] | None] = [None] * len(config.ideate_models)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(config.ideate_models)) as ex:
+        futures = {
+            ex.submit(
+                _ideate_one_model,
+                topic,
+                context=context,
+                context_ids=context_ids,
+                model=model,
+                ideas_per_model=config.ideas_per_model,
+                gen_fn=gen_fn,
+            ): idx
+            for idx, model in enumerate(config.ideate_models)
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            idx = futures[fut]
+            try:
+                ordered[idx] = fut.result()
+            except Exception as exc:
+                model = config.ideate_models[idx]
+                LOG.warning("ideate skipped for %s: %s", model, exc)
+                ordered[idx] = ([], {"model": model, "ok": False, "ideas": 0, "error": str(exc)})
+
+    for entry in ordered:
+        ideas, report = entry or ([], {"model": "unknown", "ok": False, "ideas": 0, "error": "missing ideate result"})
         results.extend(ideas)
-        reports.append({"model": model, "ok": True, "ideas": len(ideas)})
+        reports.append(report)
     return results, reports
 
 
@@ -793,7 +924,10 @@ def red_team_findings(survivors: list[StoredFinding], *, config: ChainConfig,
         'Return ONLY JSON: {"critiques":[{"target_finding_id":"...","attack":"...","severity":"low|medium|high"}]}\n\n'
         f"TARGETS:\n{json.dumps(payload, indent=2)}"
     )
-    raw = _call_generate(gen_fn, prompt, model=config.redteam_model, max_tokens=900)
+    # red-team: ONE adversarial sweep over all surviving findings, not per-finding fan-out.
+    # Default budget (900) is unchanged from before the 2026-09-16 tier work; it only
+    # grows to 1600 when safety_check is explicitly opted into (see ChainConfig.__post_init__).
+    raw = _call_generate(gen_fn, prompt, model=config.redteam_model, max_tokens=config.redteam_max_tokens)
     obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
     critiques = _normalize_critiques(obj or {})
     if not critiques:
@@ -924,8 +1058,11 @@ def _self_reflect_synthesis(topic: str, *, synthesis: dict, evidence: list[dict]
         f"CRITIQUE:\n{critique_text}\n\n"
         f"AVAILABLE EVIDENCE:\n{json.dumps(evidence, indent=2)}"
     )
+    # revise: single quality-critical repair pass over the whole synthesis. Default budget
+    # (1400) is unchanged from before the 2026-09-16 tier work; it only grows to 2200 when
+    # safety_check is explicitly opted into (see ChainConfig.__post_init__).
     revise_raw = _call_generate(
-        gen_fn, revise_prompt, model=config.self_reflect_model, max_tokens=1400
+        gen_fn, revise_prompt, model=config.self_reflect_model, max_tokens=config.self_reflect_revise_max_tokens
     )
     revised_obj = _extract_json_object(str(revise_raw.get("text", ""))) if revise_raw.get("ok") else None
     revised = _normalize_synthesis(revised_obj or {})
@@ -959,7 +1096,10 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
         '"key_findings":[{"finding_id":"id","why":"..."}],"risks":["..."],"next_steps":["..."]}\n\n'
         f"TOPIC: {topic}\n\nEVIDENCE:\n{json.dumps(evidence, indent=2)}"
     )
-    raw = _call_generate(gen_fn, prompt, model=config.synthesize_model, max_tokens=1400)
+    # synthesize: ONE final answer for the whole run. Default budget (1400) is unchanged
+    # from before the 2026-09-16 tier work; it only grows to 2200 when safety_check is
+    # explicitly opted into (see ChainConfig.__post_init__).
+    raw = _call_generate(gen_fn, prompt, model=config.synthesize_model, max_tokens=config.synthesize_max_tokens)
     obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
     synthesis = _normalize_synthesis(obj or {})
     if not synthesis:
@@ -1076,6 +1216,12 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
         config.topic, survivors=survivors, critiques=critiques,
         config=config, gen_fn=deps["generate"], store_fn=deps["store"], grounded=grounded
     )
+    lineage = [asdict(item) for item in survivors + critiques]
+    if config.safety_check:
+        guardian_fn = deps.get("guardian_check") or _guardian_check
+        synthesis["safety_flag"] = _safety_flag(synthesis.get("summary", ""), guardian_fn)
+        for item in lineage:
+            item["safety_flag"] = _safety_flag(item.get("text", ""), guardian_fn)
     return {
         "investigation_id": config.investigation_id,
         "title": config.title,
@@ -1100,7 +1246,7 @@ def run_chain(config: ChainConfig, deps: Optional[dict] = None) -> dict:
         "red_team": redteam_report,
         "synthesis": synthesis,
         "ground_truth_found": sorted(ground_truth),
-        "lineage": [asdict(item) for item in survivors + critiques],
+        "lineage": lineage,
     }
 
 
@@ -1141,6 +1287,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "call, the final synthesis is tagged 'ungrounded', downgraded to low "
             "confidence, and prefixed with a visible caveat instead of reading as a "
             "confident answer with no evidence behind it."
+        ),
+    )
+    ap.add_argument(
+        "--safety-check",
+        action="store_true",
+        default=None,
+        help=(
+            "Opt into advisory Granite Guardian safety_flag annotations on stored findings "
+            "and final synthesis. Never blocks, drops, or rewrites findings. Default: env "
+            "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK, else off."
         ),
     )
     ap.add_argument("--ideas-per-model", type=int, default=3)
