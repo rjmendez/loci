@@ -48,12 +48,17 @@ _DEFAULT_CHEAP_MODEL = os.environ.get("LOCI_SWARM_CHEAP_MODEL", "qwen2.5:3b")
 _DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "qwen3.8:latest")
 _DEFAULT_SYNTHESIZE_MODEL = os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL", "qwen3.8:latest")
 _DEFAULT_DECOMPOSE_MODEL = os.environ.get("LOCI_SWARM_DECOMPOSE_MODEL", "")
+_DEFAULT_STIGMERGIC_CONSENSUS = os.environ.get("LOCI_SWARM_STIGMERGIC_CONSENSUS", "").strip().lower() in {"1", "true", "yes", "on"}
 # Opt-in tier: chosen from a live 12-model / 4-task (code, math, JSON, security) benchmark
 # on 2026-09-16 across the machine's full local Ollama library (see ~/.loci notes /
 # session history). These only apply once the caller explicitly opts into one of the new
 # tier flags (seeds>1, synthesize_think, safety_check, self_consistency_samples>1,
-# reduce_group_size>0, escalate_with_prior_context); they must never change the default
-# code path used by every prior caller. See SwarmConfig.__post_init__.
+# reduce_group_size>0, escalate_with_prior_context) AND does not explicitly pass their
+# own escalate_model/synthesize_model -- see compute_tier_active()/resolve_tier_models()
+# below, which _resolve_config() (CLI) and mcp/llm_tools.py's swarm_reason (MCP tool) both
+# call before a SwarmConfig even exists, so an explicit override is never second-guessed
+# even when it happens to equal the legacy default (e.g. --escalate-model qwen3.8:latest
+# --seeds 2).
 _TIER_ESCALATE_MODEL = "heretic-llama31-8b-instruct:latest"
 _TIER_SYNTHESIZE_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
 _TIER_DECOMPOSE_MAX_TOKENS = 2200
@@ -70,6 +75,41 @@ _POSITIVE_MARKERS = (
 _MULTI_SEED_SYNTHESIS_MAX_CHARS = 18000
 
 
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "") not in ("", "0", "false", "False")
+
+
+def compute_tier_active(*, seeds: int = 1, synthesize_think: bool = False, safety_check: bool = False,
+                        self_consistency_samples: int = 1, reduce_group_size: int = 0,
+                        escalate_with_prior_context: bool = False) -> bool:
+    """True once the caller has opted into any new reasoning-tier knob. Callers that
+    build a SwarmConfig indirectly (CLI, MCP tool) should call this BEFORE resolving
+    escalate_model/synthesize_model, so an explicit model override is never confused
+    with an implicit legacy default (see resolve_tier_models())."""
+    return (
+        int(seeds or 1) > 1
+        or bool(synthesize_think)
+        or bool(safety_check)
+        or int(self_consistency_samples or 1) > 1
+        or int(reduce_group_size or 0) > 0
+        or bool(escalate_with_prior_context)
+    )
+
+
+def resolve_tier_models(*, escalate_model: Optional[str], synthesize_model: Optional[str],
+                        tier_active: bool) -> tuple[str, str]:
+    """Resolve the effective escalate/synthesize models from explicit (possibly None
+    or empty) caller input plus tier_active. An explicit, non-empty value always wins
+    -- even if it equals the legacy default -- so it is never silently upgraded."""
+    resolved_escalate = str(escalate_model or "").strip() or (
+        _TIER_ESCALATE_MODEL if tier_active else _DEFAULT_ESCALATE_MODEL
+    )
+    resolved_synthesize = str(synthesize_model or "").strip() or (
+        _TIER_SYNTHESIZE_MODEL if tier_active else _DEFAULT_SYNTHESIZE_MODEL
+    )
+    return resolved_escalate, resolved_synthesize
+
+
 @dataclass
 class SwarmConfig:
     topic: str
@@ -77,6 +117,8 @@ class SwarmConfig:
     escalate_model: str = _DEFAULT_ESCALATE_MODEL
     synthesize_model: str = _DEFAULT_SYNTHESIZE_MODEL
     decompose_model: str = _DEFAULT_DECOMPOSE_MODEL
+    escalate_model_explicit: bool = False
+    synthesize_model_explicit: bool = False
     subtasks: Optional[list[str]] = None
     fanout_count: int = 20
     seeds: int = 1
@@ -84,11 +126,13 @@ class SwarmConfig:
     subtask_similarity_threshold: float = 0.50
     answer_similarity_threshold: float = 0.82
     # Existing/default token budget (pre-2026-09-16 tier work). Bumped only when an
-    # opt-in tier flag is set; see __post_init__.
+    # opt-in tier flag is set; see __post_init__. There is no CLI/MCP override for this
+    # field, so the equality check below can never conflate an explicit override with
+    # an implicit default.
     decompose_max_tokens: int = 1200
     answer_max_tokens: int = 320
-    # Existing/default token budget (pre-2026-09-16 tier work). Bumped only when an
-    # opt-in tier flag is set; see __post_init__.
+    # Existing/default token budget (pre-2026-09-16 tier work). Same note as
+    # decompose_max_tokens above: no CLI/MCP override exists for this field.
     synthesize_max_tokens: int = 1400
     subtask_prompt_chars: int = 1500
     synthesis_subtask_chars: int = 240
@@ -103,34 +147,37 @@ class SwarmConfig:
     # (matches every prior run); synthesize_swarm() also auto-retries with think=False at
     # the normal budget if a think=True attempt comes back unparseable/empty, so turning
     # this on can only add latency on a bad draw, never break the fail-open guarantee.
-    synthesize_think: bool = field(
-        default_factory=lambda: os.environ.get("LOCI_SWARM_SYNTHESIZE_THINK", "") not in ("", "0", "false", "False")
-    )
+    synthesize_think: bool = field(default_factory=lambda: _env_bool("LOCI_SWARM_SYNTHESIZE_THINK"))
     synthesize_think_max_tokens: int = 4000
-    safety_check: bool = field(
-        default_factory=lambda: os.environ.get("LOCI_SWARM_SAFETY_CHECK", "") not in ("", "0", "false", "False")
-    )
+    safety_check: bool = field(default_factory=lambda: _env_bool("LOCI_SWARM_SAFETY_CHECK"))
     self_consistency_samples: int = 1
     escalate_with_prior_context: bool = False
     reduce_group_size: int = 0
+    stigmergic_consensus: bool = _DEFAULT_STIGMERGIC_CONSENSUS
+    stigmergic_ttl_minutes: float = 60.0
 
     def __post_init__(self) -> None:
-        tier_active = (
-            int(self.seeds or 1) > 1
-            or bool(self.synthesize_think)
-            or bool(self.safety_check)
-            or int(self.self_consistency_samples or 1) > 1
-            or int(self.reduce_group_size or 0) > 0
-            or bool(self.escalate_with_prior_context)
+        # decompose_max_tokens/synthesize_max_tokens have no CLI/MCP override path (no
+        # --decompose-max-tokens/--synthesize-max-tokens flag exists), so an
+        # equality-based upgrade here cannot conflate an explicit caller override with
+        # an implicit default. escalate_model/synthesize_model ARE externally
+        # overridable, so CLI/MCP callers set the *_model_explicit flags during
+        # construction; direct SwarmConfig callers can set them too when pinning a
+        # legacy-default tag intentionally. See _resolve_config() and
+        # mcp/llm_tools.py's swarm_reason().
+        tier_active = compute_tier_active(
+            seeds=self.seeds,
+            synthesize_think=self.synthesize_think,
+            safety_check=self.safety_check,
+            self_consistency_samples=self.self_consistency_samples,
+            reduce_group_size=self.reduce_group_size,
+            escalate_with_prior_context=self.escalate_with_prior_context,
         )
         if not tier_active:
             return
-        # Opt-in tier upgrade: only takes effect once a new tier flag is set, and only
-        # for fields still at their un-overridden default (an explicit --escalate-model/
-        # --synthesize-model/etc. always wins).
-        if self.escalate_model == _DEFAULT_ESCALATE_MODEL:
+        if not self.escalate_model_explicit and self.escalate_model == _DEFAULT_ESCALATE_MODEL:
             self.escalate_model = _TIER_ESCALATE_MODEL
-        if self.synthesize_model == _DEFAULT_SYNTHESIZE_MODEL:
+        if not self.synthesize_model_explicit and self.synthesize_model == _DEFAULT_SYNTHESIZE_MODEL:
             self.synthesize_model = _TIER_SYNTHESIZE_MODEL
         if self.decompose_max_tokens == 1200:
             self.decompose_max_tokens = _TIER_DECOMPOSE_MAX_TOKENS
@@ -640,6 +687,27 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
     }
 
 
+def apply_consensus_gate(findings: list[SwarmFinding], triage: dict, config: SwarmConfig) -> tuple[dict, dict]:
+    if not config.stigmergic_consensus:
+        return triage, {"enabled": False}
+    try:
+        import stigmergic_consensus
+
+        gate_config = stigmergic_consensus.StigmergicConfig(
+            enabled=True,
+            ttl_minutes=float(config.stigmergic_ttl_minutes),
+        )
+        result = stigmergic_consensus.apply_stigmergic_consensus(
+            findings,
+            triage,
+            gate_config,
+        )
+        return result["triage"], result["consensus"]
+    except Exception as exc:
+        report = {"enabled": True, "degraded": True, "error": str(exc)[:300]}
+        return triage, report
+
+
 def _public_finding(finding: SwarmFinding, *, subtask_chars: int = 0, answer_chars: int = 0) -> dict:
     subtask = finding.subtask
     answer = finding.answer
@@ -857,6 +925,7 @@ def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *
         tier="cheap",
     )
     triage = triage_findings(cheap_findings, config)
+    triage, consensus_report = apply_consensus_gate(cheap_findings, triage, config)
     consistent_findings, triage, self_consistency_report = self_consistency_findings(
         cheap_findings,
         triage,
@@ -870,6 +939,7 @@ def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *
         "decomposition": decomposition,
         "cheap_report": cheap_report,
         "triage": triage,
+        "consensus_report": consensus_report,
         "self_consistency_report": self_consistency_report,
         "final_findings": final_findings,
         "escalate_report": escalate_report,
@@ -941,6 +1011,13 @@ def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
             for pair in (entry["triage"].get("similar_pairs") or [])
         ],
     }
+    result["stigmergic_consensus"] = {
+        "enabled": bool(config.stigmergic_consensus),
+        "per_seed": {
+            str(entry["seed"]): entry["consensus_report"]
+            for entry in completed
+        },
+    }
     result["tiers"] = {
         "cheap": {
             "tier": "cheap",
@@ -981,6 +1058,7 @@ def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
                 "decomposition": entry["decomposition"],
                 "cheap": entry["cheap_report"],
                 "triage": entry["triage"],
+                "consensus": entry["consensus_report"],
                 "self_consistency": entry["self_consistency_report"],
                 "escalate": entry["escalate_report"],
             }
@@ -1152,6 +1230,7 @@ def _run_single_seed_result(config: SwarmConfig, batch_fn: Callable[..., list[di
     decomposition = seed["decomposition"]
     cheap_report = seed["cheap_report"]
     triage = seed["triage"]
+    consensus_report = seed["consensus_report"]
     final_findings = seed["final_findings"]
     escalate_report = seed["escalate_report"]
     stats = {
@@ -1162,6 +1241,7 @@ def _run_single_seed_result(config: SwarmConfig, batch_fn: Callable[..., list[di
     result = synthesize_swarm(config, final_findings, stats, batch_fn, guardian_fn)
     result["decomposition"] = decomposition
     result["triage"] = triage
+    result["stigmergic_consensus"] = consensus_report
     result["tiers"] = {
         "cheap": cheap_report,
         "escalate": escalate_report,
@@ -1191,8 +1271,28 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("topic", help="Topic/question to reason over.")
     ap.add_argument("--cheap-model", default=_DEFAULT_CHEAP_MODEL)
-    ap.add_argument("--escalate-model", default=_DEFAULT_ESCALATE_MODEL)
-    ap.add_argument("--synthesize-model", default=_DEFAULT_SYNTHESIZE_MODEL)
+    ap.add_argument(
+        "--escalate-model",
+        default=None,
+        help=(
+            "Model for the escalation tier. Default: qwen3.8:latest, unless a new "
+            "tier flag (--seeds>1, --synthesize-think, --safety-check, "
+            "--self-consistency-samples>1, --reduce-group-size>0, "
+            "--escalate-with-prior-context) is set, in which case it defaults to a "
+            "faster benchmarked 8B model instead. An explicit value here always wins, "
+            "even if it equals the legacy default."
+        ),
+    )
+    ap.add_argument(
+        "--synthesize-model",
+        default=None,
+        help=(
+            "Model for the synthesis tier. Default: qwen3.8:latest, unless a new "
+            "tier flag is set (see --escalate-model), in which case it defaults to a "
+            "larger benchmarked model instead. An explicit value here always wins, "
+            "even if it equals the legacy default."
+        ),
+    )
     ap.add_argument(
         "--decompose-model",
         default=_DEFAULT_DECOMPOSE_MODEL,
@@ -1254,6 +1354,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=0,
         help="Opt into hierarchical synthesis reduce groups. 0 preserves current flat synthesis.",
     )
+    ap.add_argument(
+        "--stigmergic-consensus",
+        action="store_true",
+        help="Enable deterministic stigmergic gating before escalation.",
+    )
+    ap.add_argument(
+        "--stigmergic-ttl-minutes",
+        type=float,
+        default=60.0,
+        help="TTL for stigmergic findings before they require escalation. Default: 60.",
+    )
     return ap.parse_args(argv)
 
 
@@ -1261,24 +1372,60 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
     supplied = list(args.subtask or [])
     if args.subtasks_file:
         supplied.extend(_load_subtasks_file(args.subtasks_file))
+
+    synthesize_think = (
+        bool(args.synthesize_think) if args.synthesize_think is not None
+        else _env_bool("LOCI_SWARM_SYNTHESIZE_THINK")
+    )
+    safety_check = (
+        bool(args.safety_check) if args.safety_check is not None
+        else _env_bool("LOCI_SWARM_SAFETY_CHECK")
+    )
+    seeds = max(1, int(args.seeds))
+    self_consistency_samples = max(1, int(args.self_consistency_samples))
+    reduce_group_size = max(0, int(args.reduce_group_size))
+    escalate_with_prior_context = bool(args.escalate_with_prior_context)
+
+    # Tier gating: resolve escalate_model/synthesize_model BEFORE constructing
+    # SwarmConfig, using the raw --escalate-model/--synthesize-model CLI input (None
+    # when the flag is unset). This is what lets an explicit --escalate-model
+    # qwen3.8:latest survive even when --seeds/--safety-check/etc. are also set --
+    # resolve_tier_models() never has to guess whether a value came from the caller
+    # or from a default, because None only ever means "unset".
+    tier_active = compute_tier_active(
+        seeds=seeds,
+        synthesize_think=synthesize_think,
+        safety_check=safety_check,
+        self_consistency_samples=self_consistency_samples,
+        reduce_group_size=reduce_group_size,
+        escalate_with_prior_context=escalate_with_prior_context,
+    )
+    escalate_model, synthesize_model = resolve_tier_models(
+        escalate_model=args.escalate_model,
+        synthesize_model=args.synthesize_model,
+        tier_active=tier_active,
+    )
+
     kwargs = dict(
         topic=args.topic,
         cheap_model=args.cheap_model,
-        escalate_model=args.escalate_model,
-        synthesize_model=args.synthesize_model,
+        escalate_model=escalate_model,
+        synthesize_model=synthesize_model,
         decompose_model=args.decompose_model,
+        escalate_model_explicit=bool(str(args.escalate_model or "").strip()),
+        synthesize_model_explicit=bool(str(args.synthesize_model or "").strip()),
         subtasks=supplied or None,
         fanout_count=max(1, int(args.fanout_count)),
-        seeds=max(1, int(args.seeds)),
+        seeds=seeds,
         escalate_confidences=_split_csv(args.escalate_confidences) or ("low",),
-        self_consistency_samples=max(1, int(args.self_consistency_samples)),
-        escalate_with_prior_context=bool(args.escalate_with_prior_context),
-        reduce_group_size=max(0, int(args.reduce_group_size)),
+        self_consistency_samples=self_consistency_samples,
+        escalate_with_prior_context=escalate_with_prior_context,
+        reduce_group_size=reduce_group_size,
+        synthesize_think=synthesize_think,
+        safety_check=safety_check,
+        stigmergic_consensus=bool(args.stigmergic_consensus or _DEFAULT_STIGMERGIC_CONSENSUS),
+        stigmergic_ttl_minutes=max(0.0, float(args.stigmergic_ttl_minutes)),
     )
-    if args.synthesize_think is not None:
-        kwargs["synthesize_think"] = bool(args.synthesize_think)
-    if args.safety_check is not None:
-        kwargs["safety_check"] = bool(args.safety_check)
     return SwarmConfig(**kwargs)
 
 

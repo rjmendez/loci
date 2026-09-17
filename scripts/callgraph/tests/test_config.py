@@ -13,7 +13,7 @@ def test_corpus_is_exactly_133_files():
     injection-risk classification), then scripts/redteam/loci_adversarial_harness.py
     (sandboxed PyRIT red-team harness)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 142, sorted(files)
+    assert len(files) == 143, sorted(files)
 
 
 def test_corpus_excludes_test_directories():

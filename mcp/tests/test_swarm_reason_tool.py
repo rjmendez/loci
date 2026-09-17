@@ -62,6 +62,8 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
         self_consistency_samples=3,
         escalate_with_prior_context=True,
         reduce_group_size=8,
+        stigmergic_consensus=True,
+        stigmergic_ttl_minutes=45,
     ))
 
     assert out["summary"] == "auth is enabled"
@@ -80,6 +82,8 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
     assert captured["config"].self_consistency_samples == 3
     assert captured["config"].escalate_with_prior_context is True
     assert captured["config"].reduce_group_size == 8
+    assert captured["config"].stigmergic_consensus is True
+    assert captured["config"].stigmergic_ttl_minutes == 45
 
 
 def test_swarm_reason_fails_open_on_wrapper_exception(monkeypatch):

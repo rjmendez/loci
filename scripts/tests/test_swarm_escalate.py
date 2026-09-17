@@ -99,6 +99,50 @@ def test_swarm_all_cheap_success_no_escalation():
     assert not any(model == "strong-model:latest" for model, _ in calls)
 
 
+def test_stigmergic_gate_accepts_corroborated_duplicates_without_escalation():
+    calls = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        calls.append((model, list(prompts)))
+        if model == "cheap-model:latest":
+            return [
+                {"ok": True, "text": '{"answer":"Auth requires MFA because mcp/server.py:42 enforces it.","confidence":"high"}'},
+                {"ok": True, "text": '{"answer":"Auth requires MFA because mcp/server.py:42 enforces it.","confidence":"high"}'},
+            ]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Corroborated cheap answers were accepted."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["Check auth MFA", "Verify auth MFA"], fanout_count=2)
+    config.stigmergic_consensus = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["stats"]["escalated_count"] == 0
+    assert result["stigmergic_consensus"]["stats"]["accepted_clusters"] == 1
+    assert not any(model == "strong-model:latest" for model, _ in calls)
+
+
+def test_stigmergic_gate_escalates_under_corroborated_high_confidence():
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"Cache TTL appears to be five minutes.","confidence":"high"}'}]
+        if model == "strong-model:latest":
+            return [{"ok": True, "text": '{"answer":"Cache TTL is five minutes by default.","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Single cheap answer was escalated."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["Check cache TTL"], fanout_count=1)
+    config.stigmergic_consensus = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["stats"]["escalated_count"] == 1
+    assert result["triage"]["escalation_reasons"]["0"]
+    assert result["stigmergic_consensus"]["clusters"][0]["state"] == "degraded"
+
+
 def test_dead_cheap_tier_fails_open_with_valid_result():
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "planner-model:latest":
@@ -371,6 +415,52 @@ def test_safety_check_guardian_errors_fail_open_for_swarm():
     assert result["summary"] == "Safe synthesis."
     assert result["safety_flag"]["flagged"] is False
     assert "failed open" in result["safety_flag"]["why"]
+
+
+def test_resolve_config_default_no_opt_in_preserves_legacy_models():
+    config = S._resolve_config(S.parse_args(["topic only"]))
+
+    assert config.escalate_model == S._DEFAULT_ESCALATE_MODEL
+    assert config.synthesize_model == S._DEFAULT_SYNTHESIZE_MODEL
+    assert config.decompose_max_tokens == 1200
+    assert config.synthesize_max_tokens == 1400
+
+
+def test_resolve_config_opt_in_without_override_upgrades_models():
+    config = S._resolve_config(S.parse_args(["topic only", "--seeds", "2"]))
+
+    assert config.escalate_model == S._TIER_ESCALATE_MODEL
+    assert config.synthesize_model == S._TIER_SYNTHESIZE_MODEL
+    assert config.decompose_max_tokens == S._TIER_DECOMPOSE_MAX_TOKENS
+    assert config.synthesize_max_tokens == S._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_config_opt_in_preserves_explicit_non_default_overrides():
+    config = S._resolve_config(S.parse_args([
+        "topic only",
+        "--seeds", "2",
+        "--escalate-model", "strong-explicit:latest",
+        "--synthesize-model", "synth-explicit:latest",
+    ]))
+
+    assert config.escalate_model == "strong-explicit:latest"
+    assert config.synthesize_model == "synth-explicit:latest"
+    assert config.decompose_max_tokens == S._TIER_DECOMPOSE_MAX_TOKENS
+    assert config.synthesize_max_tokens == S._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_config_opt_in_preserves_explicit_legacy_default_overrides():
+    config = S._resolve_config(S.parse_args([
+        "topic only",
+        "--seeds", "2",
+        "--escalate-model", S._DEFAULT_ESCALATE_MODEL,
+        "--synthesize-model", S._DEFAULT_SYNTHESIZE_MODEL,
+    ]))
+
+    assert config.escalate_model == S._DEFAULT_ESCALATE_MODEL
+    assert config.synthesize_model == S._DEFAULT_SYNTHESIZE_MODEL
+    assert config.decompose_max_tokens == S._TIER_DECOMPOSE_MAX_TOKENS
+    assert config.synthesize_max_tokens == S._TIER_SYNTHESIZE_MAX_TOKENS
 
 
 def test_self_consistency_majority_replaces_low_confidence_before_escalation():

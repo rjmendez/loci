@@ -74,6 +74,9 @@ class ChainConfig:
     synthesize_model: str
     self_reflect_model: str
     redteam_model: str
+    verify_model_explicit: bool = False
+    synthesize_model_explicit: bool = False
+    self_reflect_model_explicit: bool = False
     learn_procedures: bool = True
     self_reflect: bool = True
     red_team: bool = False
@@ -98,11 +101,11 @@ class ChainConfig:
         # Opt-in tier upgrade: only takes effect once safety_check=True, and only for
         # fields still at their un-overridden default (an explicit --verify-model/
         # --synthesize-model/etc. always wins).
-        if self.verify_model == _DEFAULT_VERIFY_MODEL:
+        if not self.verify_model_explicit and self.verify_model == _DEFAULT_VERIFY_MODEL:
             self.verify_model = _TIER_VERIFY_MODEL
-        if self.synthesize_model == _DEFAULT_SYNTH_MODEL:
+        if not self.synthesize_model_explicit and self.synthesize_model == _DEFAULT_SYNTH_MODEL:
             self.synthesize_model = _TIER_SYNTH_MODEL
-        if self.self_reflect_model == _DEFAULT_REFLECT_MODEL:
+        if not self.self_reflect_model_explicit and self.self_reflect_model == _DEFAULT_REFLECT_MODEL:
             self.self_reflect_model = _TIER_REFLECT_MODEL
         if self.redteam_max_tokens == 900:
             self.redteam_max_tokens = _TIER_REDTEAM_MAX_TOKENS
@@ -195,6 +198,17 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "") not in ("", "0", "false", "False")
 
 
+def _resolve_model_input(cli_value: Optional[str], *, env_name: str, cfg_key: str,
+                         default: str) -> tuple[str, bool]:
+    cooked_cli = str(cli_value or "").strip()
+    if cooked_cli:
+        return cooked_cli, True
+    cooked_env = str(os.environ.get(env_name, "") or "").strip()
+    if cooked_env:
+        return cooked_env, True
+    return str(_cfg_value(cfg_key, default) or default), False
+
+
 def _safe_model_tag(model: str) -> str:
     text = _MODEL_SAFE_RE.sub("-", (model or "").lower()).strip("-")
     return text or "unknown-model"
@@ -217,21 +231,23 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         or os.environ.get("LOCI_LOCAL_DEEP_THINK_IDEATE_MODELS")
         or _cfg_value("deep_think_ideate_models", _DEFAULT_IDEATE_MODELS)
     )
-    verify_model = (
-        args.verify_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL")
-        or _cfg_value("deep_think_verify_model", _DEFAULT_VERIFY_MODEL)
+    verify_model, verify_model_explicit = _resolve_model_input(
+        args.verify_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        cfg_key="deep_think_verify_model",
+        default=_DEFAULT_VERIFY_MODEL,
     )
-    synthesize_model = (
-        args.synthesize_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL")
-        or _cfg_value("deep_think_synthesize_model", _DEFAULT_SYNTH_MODEL)
+    synthesize_model, synthesize_model_explicit = _resolve_model_input(
+        args.synthesize_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        cfg_key="deep_think_synthesize_model",
+        default=_DEFAULT_SYNTH_MODEL,
     )
-    self_reflect_model = (
-        args.self_reflect_model
-        or os.environ.get("LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL")
-        or _cfg_value("deep_think_self_reflect_model", _DEFAULT_REFLECT_MODEL)
-        or synthesize_model
+    self_reflect_model, self_reflect_model_explicit = _resolve_model_input(
+        args.self_reflect_model,
+        env_name="LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+        cfg_key="deep_think_self_reflect_model",
+        default=_DEFAULT_REFLECT_MODEL,
     )
     try:
         redteam_model = (
@@ -262,6 +278,9 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         synthesize_model=synthesize_model,
         self_reflect_model=self_reflect_model,
         redteam_model=redteam_model,
+        verify_model_explicit=verify_model_explicit,
+        synthesize_model_explicit=synthesize_model_explicit,
+        self_reflect_model_explicit=self_reflect_model_explicit,
         learn_procedures=not bool(args.no_learn_procedures),
         self_reflect=not bool(args.no_self_reflect),
         red_team=bool(args.red_team),

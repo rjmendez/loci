@@ -668,6 +668,92 @@ def test_safety_check_guardian_errors_fail_open_for_deep_think():
     assert result["lineage"][0]["text"] == "Idea with no supporting evidence."
 
 
+def test_resolve_models_default_no_opt_in_preserves_legacy_models(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args(["topic only"]))
+
+    assert config.safety_check is False
+    assert config.verify_model == L._DEFAULT_VERIFY_MODEL
+    assert config.synthesize_model == L._DEFAULT_SYNTH_MODEL
+    assert config.self_reflect_model == L._DEFAULT_REFLECT_MODEL
+    assert config.redteam_max_tokens == 900
+    assert config.synthesize_max_tokens == 1400
+
+
+def test_resolve_models_opt_in_without_override_upgrades_models(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args(["topic only", "--safety-check"]))
+
+    assert config.safety_check is True
+    assert config.verify_model == L._TIER_VERIFY_MODEL
+    assert config.synthesize_model == L._TIER_SYNTH_MODEL
+    assert config.self_reflect_model == L._TIER_REFLECT_MODEL
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_models_opt_in_preserves_explicit_non_default_overrides(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args([
+        "topic only",
+        "--safety-check",
+        "--verify-model", "verify-explicit:latest",
+        "--synthesize-model", "synth-explicit:latest",
+        "--self-reflect-model", "reflect-explicit:latest",
+    ]))
+
+    assert config.verify_model == "verify-explicit:latest"
+    assert config.synthesize_model == "synth-explicit:latest"
+    assert config.self_reflect_model == "reflect-explicit:latest"
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_models_opt_in_preserves_explicit_legacy_default_overrides(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args([
+        "topic only",
+        "--safety-check",
+        "--verify-model", L._DEFAULT_VERIFY_MODEL,
+        "--synthesize-model", L._DEFAULT_SYNTH_MODEL,
+        "--self-reflect-model", L._DEFAULT_REFLECT_MODEL,
+    ]))
+
+    assert config.verify_model == L._DEFAULT_VERIFY_MODEL
+    assert config.synthesize_model == L._DEFAULT_SYNTH_MODEL
+    assert config.self_reflect_model == L._DEFAULT_REFLECT_MODEL
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
 def test_strict_grounding_leaves_grounded_synthesis_untouched():
     def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
         if "IDEATE tier" in prompt:
