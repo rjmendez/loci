@@ -42,20 +42,24 @@ from typing import Callable, Optional
 LOG = logging.getLogger("local_deep_think")
 _MODEL_SAFE_RE = re.compile(r"[^a-z0-9]+")
 _TEXT_KEYS = ("text", "snippet", "content", "chunk_text", "summary", "body", "passage")
-# Tier defaults chosen from a live 12-model / 4-task benchmark on 2026-09-16 (see
-# swarm_escalate.py's tier comments for the full methodology/results). qwen3.8:latest
-# measured as the slowest model tested (~15 tok/s) with no answer-quality edge over 8B-class
-# models on these tasks, so it is kept only for ideation diversity (a second, differently-
-# trained voice), not as the verify/synth/reflect default.
 _DEFAULT_IDEATE_MODELS = "llama3.1-agent:latest,qwen3.8:latest"
-# verify: runs once per candidate idea -- throughput matters, and heretic-llama31-8b-instruct
-# matched qwen3.8:latest on every benchmarked task at ~5.6x the tokens/sec with no refusals.
-_DEFAULT_VERIFY_MODEL = "heretic-llama31-8b-instruct:latest"
-# synth / reflect: single call per run (final answer, self-reflection) -- quality matters
-# more than throughput here, so these keep the largest available model. The 27B abliterated
-# variant produced the most thorough answers of anything tested and never refused.
-_DEFAULT_SYNTH_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
-_DEFAULT_REFLECT_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+# Existing/default code path (no opt-in tier flags set): unchanged from before the
+# 2026-09-16 tier work. Do not change these without also changing the default behavior
+# for callers that pass no flags at all.
+_DEFAULT_VERIFY_MODEL = "qwen3.8:latest"
+_DEFAULT_SYNTH_MODEL = "qwen3.8:latest"
+_DEFAULT_REFLECT_MODEL = "qwen3.8:latest"
+# Opt-in "safety_check" tier: chosen from a live 12-model / 4-task benchmark on
+# 2026-09-16 (see swarm_escalate.py's tier comments for the full methodology/results).
+# These only apply when the caller explicitly sets safety_check=True (or
+# --safety-check / LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK); they must never change the
+# default code path used by every prior caller.
+_TIER_VERIFY_MODEL = "heretic-llama31-8b-instruct:latest"
+_TIER_SYNTH_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_REFLECT_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_REDTEAM_MAX_TOKENS = 1600
+_TIER_SELF_REFLECT_REVISE_MAX_TOKENS = 2200
+_TIER_SYNTHESIZE_MAX_TOKENS = 2200
 _PROCEDURE_LEARNING_MIN_CONFIDENCE = 0.75
 
 
@@ -82,6 +86,30 @@ class ChainConfig:
     ground_threshold: float = 0.59
     evidence_chars: int = 4200
     max_lineage: int = 12
+    # Existing/default token budgets (pre-2026-09-16 tier work). Bumped only when
+    # safety_check is explicitly opted into; see __post_init__.
+    redteam_max_tokens: int = 900
+    self_reflect_revise_max_tokens: int = 1400
+    synthesize_max_tokens: int = 1400
+
+    def __post_init__(self) -> None:
+        if not self.safety_check:
+            return
+        # Opt-in tier upgrade: only takes effect once safety_check=True, and only for
+        # fields still at their un-overridden default (an explicit --verify-model/
+        # --synthesize-model/etc. always wins).
+        if self.verify_model == _DEFAULT_VERIFY_MODEL:
+            self.verify_model = _TIER_VERIFY_MODEL
+        if self.synthesize_model == _DEFAULT_SYNTH_MODEL:
+            self.synthesize_model = _TIER_SYNTH_MODEL
+        if self.self_reflect_model == _DEFAULT_REFLECT_MODEL:
+            self.self_reflect_model = _TIER_REFLECT_MODEL
+        if self.redteam_max_tokens == 900:
+            self.redteam_max_tokens = _TIER_REDTEAM_MAX_TOKENS
+        if self.self_reflect_revise_max_tokens == 1400:
+            self.self_reflect_revise_max_tokens = _TIER_SELF_REFLECT_REVISE_MAX_TOKENS
+        if self.synthesize_max_tokens == 1400:
+            self.synthesize_max_tokens = _TIER_SYNTHESIZE_MAX_TOKENS
 
 
 @dataclass
@@ -830,10 +858,9 @@ def red_team_findings(survivors: list[StoredFinding], *, config: ChainConfig,
         f"TARGETS:\n{json.dumps(payload, indent=2)}"
     )
     # red-team: ONE adversarial sweep over all surviving findings, not per-finding fan-out.
-    # The earlier 900-token cap was conservative when every local call was treated as a
-    # latency hotspot, but after the 2026-09-16 concurrency fixes the quality risk here is
-    # more important: this tier must fit several concrete attacks, not just one-liners.
-    raw = _call_generate(gen_fn, prompt, model=config.redteam_model, max_tokens=1600)
+    # Default budget (900) is unchanged from before the 2026-09-16 tier work; it only
+    # grows to 1600 when safety_check is explicitly opted into (see ChainConfig.__post_init__).
+    raw = _call_generate(gen_fn, prompt, model=config.redteam_model, max_tokens=config.redteam_max_tokens)
     obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
     critiques = _normalize_critiques(obj or {})
     if not critiques:
@@ -959,11 +986,11 @@ def _self_reflect_synthesis(topic: str, *, synthesis: dict, evidence: list[dict]
         f"CRITIQUE:\n{critique_text}\n\n"
         f"AVAILABLE EVIDENCE:\n{json.dumps(evidence, indent=2)}"
     )
-    # revise: single quality-critical repair pass over the whole synthesis. Like the main
-    # synth tier, this is not multiplied by fan-out, so a somewhat larger budget buys room
-    # for fixing cited gaps / risks / next_steps without materially hurting throughput.
+    # revise: single quality-critical repair pass over the whole synthesis. Default budget
+    # (1400) is unchanged from before the 2026-09-16 tier work; it only grows to 2200 when
+    # safety_check is explicitly opted into (see ChainConfig.__post_init__).
     revise_raw = _call_generate(
-        gen_fn, revise_prompt, model=config.self_reflect_model, max_tokens=2200
+        gen_fn, revise_prompt, model=config.self_reflect_model, max_tokens=config.self_reflect_revise_max_tokens
     )
     revised_obj = _extract_json_object(str(revise_raw.get("text", ""))) if revise_raw.get("ok") else None
     revised = _normalize_synthesis(revised_obj or {})
@@ -997,11 +1024,10 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
         '"key_findings":[{"finding_id":"id","why":"..."}],"risks":["..."],"next_steps":["..."]}\n\n'
         f"TOPIC: {topic}\n\nEVIDENCE:\n{json.dumps(evidence, indent=2)}"
     )
-    # synthesize: ONE final answer for the whole run. After the 2026-09-16 local benchmark
-    # work, shrinking this for throughput no longer makes sense: the expensive part is the
-    # chosen large model, while a slightly roomier output budget can prevent clipped summary
-    # / key_findings / risks sections on evidence-heavy runs.
-    raw = _call_generate(gen_fn, prompt, model=config.synthesize_model, max_tokens=2200)
+    # synthesize: ONE final answer for the whole run. Default budget (1400) is unchanged
+    # from before the 2026-09-16 tier work; it only grows to 2200 when safety_check is
+    # explicitly opted into (see ChainConfig.__post_init__).
+    raw = _call_generate(gen_fn, prompt, model=config.synthesize_model, max_tokens=config.synthesize_max_tokens)
     obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
     synthesis = _normalize_synthesis(obj or {})
     if not synthesis:

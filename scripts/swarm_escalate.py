@@ -41,26 +41,23 @@ from typing import Callable, Optional
 
 
 _CONFIDENCE_LEVELS = ("low", "medium", "high")
-# Tier defaults chosen from a live 12-model / 4-task (code, math, JSON, security) benchmark
-# on 2026-09-16 across the machine's full local Ollama library (see ~/.loci notes /
-# session history). Two prior defaults (qwen3.8:latest for escalate+synthesize) measured
-# as the SLOWEST model tested (~15 tok/s) with no answer-quality edge over 8B-class models
-# on these tasks -- kept only where an actual quality edge showed up.
 _DEFAULT_CHEAP_MODEL = os.environ.get("LOCI_SWARM_CHEAP_MODEL", "qwen2.5:3b")
-# escalate: per-finding fan-out re-answer of the "low confidence" slice -- many small calls,
-# so throughput matters. heretic-llama31-8b-instruct matched qwen3.8:latest on every task
-# (code/math/json/security) at ~5.6x the tokens/sec (86 vs 15) with no refusal behavior.
-_DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "heretic-llama31-8b-instruct:latest")
-# synthesize: ONE call per run turning all findings into final structured JSON -- quality
-# matters more than throughput here, so this tier keeps the largest available model instead.
-# The 27B abliterated variant produced the most thorough, best-organized answers of anything
-# tested and never refused; its <think>...</think> preamble is harmless because
-# _extract_json_object() scans for the first balanced {...} anywhere in the text.
-_DEFAULT_SYNTHESIZE_MODEL = os.environ.get(
-    "LOCI_SWARM_SYNTHESIZE_MODEL",
-    "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M",
-)
+# Existing/default code path (no opt-in tier flags set): unchanged from before the
+# 2026-09-16 tier work. Do not change these without also changing the default behavior
+# for callers that pass no flags at all.
+_DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "qwen3.8:latest")
+_DEFAULT_SYNTHESIZE_MODEL = os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL", "qwen3.8:latest")
 _DEFAULT_DECOMPOSE_MODEL = os.environ.get("LOCI_SWARM_DECOMPOSE_MODEL", "")
+# Opt-in tier: chosen from a live 12-model / 4-task (code, math, JSON, security) benchmark
+# on 2026-09-16 across the machine's full local Ollama library (see ~/.loci notes /
+# session history). These only apply once the caller explicitly opts into one of the new
+# tier flags (seeds>1, synthesize_think, safety_check, self_consistency_samples>1,
+# reduce_group_size>0, escalate_with_prior_context); they must never change the default
+# code path used by every prior caller. See SwarmConfig.__post_init__.
+_TIER_ESCALATE_MODEL = "heretic-llama31-8b-instruct:latest"
+_TIER_SYNTHESIZE_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_DECOMPOSE_MAX_TOKENS = 2200
+_TIER_SYNTHESIZE_MAX_TOKENS = 2200
 _STOPWORDS = {
     "a", "an", "and", "are", "for", "how", "in", "is", "of", "on", "or", "the",
     "this", "to", "what", "when", "where", "which", "why", "with",
@@ -86,19 +83,13 @@ class SwarmConfig:
     escalate_confidences: tuple[str, ...] = ("low",)
     subtask_similarity_threshold: float = 0.50
     answer_similarity_threshold: float = 0.82
-    # decompose: ONE JSON-planner call per seed that must fit N atomic subtasks in one
-    # response. The original 1200-token cap was chosen while the cheap-answer lane still
-    # looked serial, but after the 2026-09-16 Ollama concurrency fix the throughput win
-    # comes from overlapping downstream requests, not starving this planner. Give it more
-    # room so wider fan-outs (especially multi-seed ones) do not truncate the subtask list.
-    decompose_max_tokens: int = 2200
+    # Existing/default token budget (pre-2026-09-16 tier work). Bumped only when an
+    # opt-in tier flag is set; see __post_init__.
+    decompose_max_tokens: int = 1200
     answer_max_tokens: int = 320
-    # synthesize (non-think): still ONE call per run, even in wide fan-out mode. The
-    # 27B synth tier produced the best-organized answers in the 2026-09-16 benchmark, and
-    # its latency is dominated by model choice, not shaving a few hundred output tokens.
-    # Raising this slightly buys more room for complete summaries / risks / next_steps
-    # without materially changing throughput because there is no per-subtask multiplier.
-    synthesize_max_tokens: int = 2200
+    # Existing/default token budget (pre-2026-09-16 tier work). Bumped only when an
+    # opt-in tier flag is set; see __post_init__.
+    synthesize_max_tokens: int = 1400
     subtask_prompt_chars: int = 1500
     synthesis_subtask_chars: int = 240
     synthesis_answer_chars: int = 400
@@ -122,6 +113,29 @@ class SwarmConfig:
     self_consistency_samples: int = 1
     escalate_with_prior_context: bool = False
     reduce_group_size: int = 0
+
+    def __post_init__(self) -> None:
+        tier_active = (
+            int(self.seeds or 1) > 1
+            or bool(self.synthesize_think)
+            or bool(self.safety_check)
+            or int(self.self_consistency_samples or 1) > 1
+            or int(self.reduce_group_size or 0) > 0
+            or bool(self.escalate_with_prior_context)
+        )
+        if not tier_active:
+            return
+        # Opt-in tier upgrade: only takes effect once a new tier flag is set, and only
+        # for fields still at their un-overridden default (an explicit --escalate-model/
+        # --synthesize-model/etc. always wins).
+        if self.escalate_model == _DEFAULT_ESCALATE_MODEL:
+            self.escalate_model = _TIER_ESCALATE_MODEL
+        if self.synthesize_model == _DEFAULT_SYNTHESIZE_MODEL:
+            self.synthesize_model = _TIER_SYNTHESIZE_MODEL
+        if self.decompose_max_tokens == 1200:
+            self.decompose_max_tokens = _TIER_DECOMPOSE_MAX_TOKENS
+        if self.synthesize_max_tokens == 1400:
+            self.synthesize_max_tokens = _TIER_SYNTHESIZE_MAX_TOKENS
 
 
 @dataclass

@@ -34,7 +34,9 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # Raised ceiling: the local-model fleet batch (verify/guardian follow-ons —
     # conflict/reflection/pre-answer/procedure-learning/mnemosyne/wiring-obligation
     # corroboration modules) adds several small new modules at once.
-    assert 954 <= len(module_level) <= 1320, len(module_level)
+    # 1320 -> 1360: opt-in reasoning-tier helpers added to local_deep_think.py and
+    # swarm_escalate.py (measured 1332 module-level functions on 2026-09-17).
+    assert 954 <= len(module_level) <= 1360, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
