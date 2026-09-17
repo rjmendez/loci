@@ -379,6 +379,7 @@ def summarize_suite(
         if trial.wall_ms > 0
     ]
     errors = sorted({req.error for req in flat_requests if req.error})
+    requests_streamed = sum(1 for req in flat_requests if req.stream_used)
     if stream_requested:
         ttft_note = (
             "measured from first non-empty streamed response chunk"
@@ -396,6 +397,7 @@ def summarize_suite(
         "transport_failures": sum(1 for req in flat_requests if not req.transport_ok),
         "streaming": {
             "requested": stream_requested,
+            "requests_streamed": requests_streamed,
             "ttft_measured": bool(ttft_ms),
             "ttft_note": ttft_note,
         },
