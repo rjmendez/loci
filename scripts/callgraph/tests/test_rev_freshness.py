@@ -66,6 +66,6 @@ def test_rev_head_is_immune_to_a_concurrently_mid_edited_working_tree(tmp_path, 
     finally:
         monkeypatch.setattr(Path, "read_text", original_read_text)
     assert origin.startswith("rev ")
-    assert len(sources) == 142  # 128 -> ... -> 140 -> 142: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate
+    assert len(sources) == 144  # 128 -> ... -> 140 -> 142 -> 143 -> 144: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus
     server = _source_for(sources, "mcp/server.py")
     assert server.error is None and "loci-mcp" in server.source[:200]

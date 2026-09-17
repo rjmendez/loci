@@ -96,6 +96,50 @@ def test_swarm_all_cheap_success_no_escalation():
     assert not any(model == "strong-model:latest" for model, _ in calls)
 
 
+def test_stigmergic_gate_accepts_corroborated_duplicates_without_escalation():
+    calls = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+        calls.append((model, list(prompts)))
+        if model == "cheap-model:latest":
+            return [
+                {"ok": True, "text": '{"answer":"Auth requires MFA because mcp/server.py:42 enforces it.","confidence":"high"}'},
+                {"ok": True, "text": '{"answer":"Auth requires MFA because mcp/server.py:42 enforces it.","confidence":"high"}'},
+            ]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Corroborated cheap answers were accepted."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["Check auth MFA", "Verify auth MFA"], fanout_count=2)
+    config.stigmergic_consensus = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["stats"]["escalated_count"] == 0
+    assert result["stigmergic_consensus"]["stats"]["accepted_clusters"] == 1
+    assert not any(model == "strong-model:latest" for model, _ in calls)
+
+
+def test_stigmergic_gate_escalates_under_corroborated_high_confidence():
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"Cache TTL appears to be five minutes.","confidence":"high"}'}]
+        if model == "strong-model:latest":
+            return [{"ok": True, "text": '{"answer":"Cache TTL is five minutes by default.","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Single cheap answer was escalated."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["Check cache TTL"], fanout_count=1)
+    config.stigmergic_consensus = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["stats"]["escalated_count"] == 1
+    assert result["triage"]["escalation_reasons"]["0"]
+    assert result["stigmergic_consensus"]["clusters"][0]["state"] == "degraded"
+
+
 def test_dead_cheap_tier_fails_open_with_valid_result():
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
         if model == "planner-model:latest":
@@ -195,4 +239,3 @@ def test_huge_subtasks_are_truncated_in_prompts_not_in_returned_findings():
     # truncation is a prompt-construction concern only, never a data-loss concern.
     assert result["findings"][0]["subtask"] == huge_subtask
     assert result["findings"][0]["answer"] == "Looks fine."
-
