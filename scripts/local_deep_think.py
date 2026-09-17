@@ -265,9 +265,18 @@ def _extract_json_object(text: str):
         return None
 
 
+def _provenance_module():
+    _ensure_paths()
+    return importlib.import_module("provenance_firewall")
+
+
 def _normalize_candidates(rows: list[dict]) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     out: list[dict] = []
+    try:
+        provenance = _provenance_module()
+    except Exception:
+        provenance = None
     for row in rows or []:
         if not isinstance(row, dict):
             continue
@@ -285,12 +294,15 @@ def _normalize_candidates(rows: list[dict]) -> list[dict]:
         if pair in seen:
             continue
         seen.add(pair)
-        out.append({
+        normalized = {
             "id": ident,
             "origin": origin,
             "score": float(row.get("score") or 0.0),
             "text": text,
-        })
+        }
+        if provenance is not None:
+            normalized.update(provenance.provenance_fields(row))
+        out.append(normalized)
     return out
 
 
@@ -512,7 +524,8 @@ def _format_idea_text(idea: Idea) -> str:
 
 def persist_record(store_fn: Callable[..., str], *, investigation_id: str, text: str,
                    source: str, confidence: str = "medium", tags: Optional[list[str]] = None,
-                   derived_from: Optional[list[str]] = None, finding_type: str = "inferred") -> Optional[str]:
+                   derived_from: Optional[list[str]] = None, finding_type: str = "inferred",
+                   metadata: Optional[dict] = None) -> Optional[str]:
     # One dedicated function owns ALL investigation_store writes. This is the same reliability
     # fix validated by deep_think_loci: generators reason, but only the writer persists, so a
     # model can never silently skip or fabricate a store confirmation.
@@ -525,6 +538,7 @@ def persist_record(store_fn: Callable[..., str], *, investigation_id: str, text:
             confidence=confidence,
             tags=",".join(tags or []),
             derived_from=derived_from or None,
+            metadata=metadata or None,
         )
         obj = _parse_json(raw)
         if obj.get("stored") and obj.get("finding_id"):
@@ -546,6 +560,11 @@ def write_ideas(ideas: list[Idea], *, config: ChainConfig, store_fn: Callable[..
             source=f"scripts/local_deep_think.py#ideate/{idea.model}",
             confidence=idea.confidence,
             tags=["local-deep-think", "ideate", f"model:{model_tag}"],
+            metadata={
+                "evidence_provenance_tier": "model_asserted",
+                "evidence_kind": "local_model_ideation",
+                "support_evidence_refs": idea.evidence_ids,
+            },
         )
         if fid:
             stored.append(StoredFinding(finding_id=fid, text=idea.claim, tier="ideate", model=idea.model))
@@ -648,7 +667,30 @@ def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: Ch
         raw_hits, retrieval = retrieve_candidates(query, config.collections, config.retrieval_limit, search_fn)
         gated_hits, gate = gate_candidates(item.text, raw_hits, config.ground_threshold, gate_fn)
         context, used_ids = _render_context(gated_hits, config.evidence_chars)
-        verdict = verify_fn(item.text, context=context, gen_fn=verify_gen)
+        try:
+            provenance = _provenance_module()
+            firewall = provenance.assert_evidence_firewall(
+                {"evidence_provenance_tier": provenance.MODEL_ASSERTED},
+                [hit for hit in gated_hits if hit.get("id") in set(used_ids)],
+                phase="local_deep_think.verify_findings",
+            )
+        except Exception as exc:
+            firewall = {
+                "allowed": True,
+                "phase": "local_deep_think.verify_findings",
+                "reason": f"provenance_firewall_failed_open:{type(exc).__name__}",
+                "degraded": True,
+            }
+        if not firewall.get("allowed"):
+            verdict = {
+                "verdict": "uncertain",
+                "refutation": firewall.get("reason", "provenance_firewall_blocked"),
+                "confidence": 0.0,
+                "degraded": False,
+                "provenance_firewall": firewall,
+            }
+        else:
+            verdict = verify_fn(item.text, context=context, gen_fn=verify_gen)
         status = str(verdict.get("verdict") or "uncertain")
         degraded = bool(verdict.get("degraded"))
         procedure_learning = _procedure_learning_gate(verdict, enabled=config.learn_procedures)
@@ -673,6 +715,7 @@ def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: Ch
             "retrieval": retrieval,
             "gate": gate,
             "context_ids": used_ids,
+            "provenance_firewall": verdict.get("provenance_firewall") or firewall,
             "procedure_learning": procedure_learning,
         })
         if status != "confirmed":
@@ -692,6 +735,11 @@ def verify_findings(stored_ideas: list[StoredFinding], *, topic: str, config: Ch
             confidence="high" if not degraded else "medium",
             tags=["local-deep-think", "verify", f"model:{_safe_model_tag(config.verify_model)}"],
             derived_from=[item.finding_id],
+            metadata={
+                "evidence_provenance_tier": "model_asserted",
+                "evidence_kind": "local_model_verification",
+                "support_evidence_refs": used_ids,
+            },
         )
         if fid:
             survivors.append(StoredFinding(
@@ -770,6 +818,11 @@ def red_team_findings(survivors: list[StoredFinding], *, config: ChainConfig,
             confidence=entry["severity"],
             tags=["local-deep-think", "red-team", f"model:{_safe_model_tag(config.redteam_model)}"],
             derived_from=[entry["target_finding_id"]],
+            metadata={
+                "evidence_provenance_tier": "model_asserted",
+                "evidence_kind": "local_model_red_team",
+                "support_evidence_refs": [entry["target_finding_id"]],
+            },
         )
         if fid:
             stored.append(StoredFinding(
@@ -956,6 +1009,11 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
         confidence=confidence,
         tags=tags,
         derived_from=derived,
+        metadata={
+            "evidence_provenance_tier": "model_asserted",
+            "evidence_kind": "local_model_synthesis",
+            "support_evidence_refs": derived,
+        },
     )
     synthesis["finding_id"] = fid
     synthesis["self_reflection"] = reflection_report

@@ -206,6 +206,18 @@ $LOCI_MEMORY_DIR/
 - `procedure` — a reusable step-by-step runbook/playbook entry; takes
   `procedure_preconditions`, `procedure_steps`, `procedure_postconditions`
 
+**finding provenance tier:** independent of the hot/warm/cold storage tier.
+New findings may set `metadata.evidence_provenance_tier` (or the
+`evidence_provenance_tier` argument) to `human_authored`, `tool_verified`,
+`deterministic_derived`, or `model_asserted`. Pre-answer, precheck,
+`verify_finding`, and local deep-think verification enforce the firewall:
+a `model_asserted` claim is **UNVERIFIED** when its support is only other
+`model_asserted` findings. It needs at least one human-authored, tool-verified,
+or deterministically-derived residual (for example a matching file/quote/hash,
+passing test, parseable schema, or audit receipt). Legacy untagged findings
+default to `tool_verified` when used as evidence so old investigations and
+callers continue to work; refs surface `provenance_defaulted: true` for audit.
+
 **72 MCP tools provided by loci-mcp** — 61 decorated `@mcp.tool()` in `mcp/server.py`
 plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)`.
 The tables below cover the 24 most-used ones. The rest are:

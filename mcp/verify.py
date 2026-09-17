@@ -55,6 +55,7 @@ from functools import lru_cache
 from typing import Callable, Optional
 
 from model_json import extract_json_object
+from provenance_firewall import MODEL_ASSERTED, assert_evidence_firewall
 
 # Private alias kept so existing call sites and test monkeypatches of the private
 # name keep working after the shared extraction moved to mcp/model_json.py.
@@ -527,6 +528,8 @@ def verify_finding(claim: str,
                    code_refs: Optional[list] = None,
                    reader: Optional[ReaderFn] = None,
                    finding_id: Optional[str] = None,
+                   candidate_provenance_tier: Optional[str] = None,
+                   evidence_rows: Optional[list[dict]] = None,
                    auto_promote_procedures: bool = False) -> dict:
     """Adversarially verify a `claim`: run a skeptic that tries to refute it.
 
@@ -537,6 +540,12 @@ def verify_finding(claim: str,
             (fail-open) to give the skeptic something to attack with.
         finding_id: when verifying a stored finding, its id. Required for optional
             procedure auto-promotion because the promotion mutates findings.jsonl.
+        candidate_provenance_tier: optional evidentiary provenance tier. When this is
+            ``model_asserted``, at least one evidence row must be human-authored,
+            tool-verified, or deterministically-derived before a model verdict may
+            verify the claim.
+        evidence_rows: optional structured support evidence with provenance tiers.
+            Untagged legacy evidence defaults to ``tool_verified`` for compatibility.
         gen_fn: injectable generation fn (shared contract). None -> lazy llm_local.generate.
         rag_fn: injectable grounding fn. None -> lazy rag_context_search.
         code_refs: optional list of ``file:line`` / ``file:start-end`` strings, or stored
@@ -558,6 +567,22 @@ def verify_finding(claim: str,
     c = (claim or "").strip()
     if not c:
         return _degraded()
+
+    if candidate_provenance_tier or evidence_rows is not None:
+        firewall = assert_evidence_firewall(
+            {"evidence_provenance_tier": candidate_provenance_tier or MODEL_ASSERTED},
+            evidence_rows or [],
+            phase="verify_finding",
+        )
+        if not firewall.get("allowed"):
+            return {
+                "verdict": "uncertain",
+                "refutation": firewall.get("reason", "provenance_firewall_blocked"),
+                "reasoning": "UNVERIFIED: model-asserted claim lacks independent provenance support.",
+                "confidence": 0.0,
+                "degraded": False,
+                "provenance_firewall": firewall,
+            }
 
     ctx = (context or "").strip()
     # Optional, fail-open grounding: only when we have an investigation and no explicit context.
