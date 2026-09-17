@@ -671,7 +671,13 @@ def test_safety_check_default_preserves_deep_think_result_shape():
 
 
 def test_safety_check_annotates_deep_think_findings_without_removing_text():
+    # This test is about guardian annotation, not grounding status, so swap in the
+    # non-empty gate: the shared ungrounded fixture's always-empty gate leaves no
+    # evidence rows for the provenance firewall to see, which now (correctly)
+    # blocks model-asserted claims with zero independent evidence before
+    # safety_check ever runs on them.
     deps, _stores = _ungrounded_deps()
+    deps["gate"] = _gate
     seen = []
 
     def _guardian(text):
@@ -689,7 +695,11 @@ def test_safety_check_annotates_deep_think_findings_without_removing_text():
 
 
 def test_safety_check_guardian_errors_fail_open_for_deep_think():
+    # See note above: swap in the non-empty gate so the provenance firewall sees
+    # independent evidence and this stays a test of guardian fail-open behavior,
+    # not of the (separately-tested) firewall gating itself.
     deps, _stores = _ungrounded_deps()
+    deps["gate"] = _gate
 
     def _guardian(_text):
         raise RuntimeError("guardian offline")
