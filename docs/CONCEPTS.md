@@ -86,7 +86,8 @@ half that saves you. That is why both lanes run.
 MCP stands for **Model Context Protocol** — a standard that lets AI tools like Claude Code
 call external functions. Think of it like browser extensions, but for AI agents.
 
-Loci ships 73 MCP tools that Claude can call. The map below groups the most commonly used
+Loci ships 75 MCP tools that Claude can call. The source-checked registration breakdown
+and representative call paths are in [docs/CALLGRAPH.md](CALLGRAPH.md). The map below groups the most commonly used
 ones into five families:
 
 ![Tool map](img/loci-tools.svg)

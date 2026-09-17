@@ -14,6 +14,48 @@ import server  # noqa: E402
 
 
 class ReflectionLoopTests(unittest.TestCase):
+    def test_warning_label_wins_over_failed_keyword(self):
+        line = (
+            "2026-09-16T04:31:11.071Z [WARNING] [rust:copilot_runtime::mcp] "
+            "Failed to list MCP tools for github-mcp-server; "
+            "transport closed before the server responded"
+        )
+
+        scan = server._ReflectionScan()
+        scan.scan_line(line)
+
+        self.assertEqual(dict(scan.error_counts), {})
+        self.assertEqual(
+            dict(scan.warning_counts),
+            {
+                "[warning] [rust:copilot_runtime::mcp] "
+                "failed to list mcp tools for github-mcp-server; "
+                "transport closed before the server responded": 1
+            },
+        )
+
+    def test_uuid_variants_collapse_to_one_signature(self):
+        line_a = (
+            "pending-request event was not delivered to the session host "
+            '{"error":"GenericFailure, no session host is registered for session '
+            "b9ee767c-b6fa-4a41-bb35-f85ce0d890ae\"}"
+        )
+        line_b = (
+            "pending-request event was not delivered to the session host "
+            '{"error":"GenericFailure, no session host is registered for session '
+            "7c70fb5d-736c-48a4-b404-8f07f3442ae7\"}"
+        )
+
+        self.assertEqual(
+            server._canonicalize_reflection_signature(line_a),
+            'pending-request event was not delivered to the session host {"error":"genericfailure, '
+            'no session host is registered for session <uuid>"}',
+        )
+        self.assertEqual(
+            server._canonicalize_reflection_signature(line_a),
+            server._canonicalize_reflection_signature(line_b),
+        )
+
     def test_process_log_uses_tail_sampling_for_large_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "process.log"
