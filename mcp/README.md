@@ -113,8 +113,9 @@ server twice under two names publishes every tool twice:
 investigation tools, 11 code-graph tools, and 10 local-model tools registered
 onto the shared FastMCP instance. The source-checked registration anchors and
 representative paths are maintained in
-[docs/CALLGRAPH.md](../docs/CALLGRAPH.md). The same inventory is listed in the
-[top-level README](../README.md#mcp-tools-75).
+[docs/CALLGRAPH.md](../docs/CALLGRAPH.md). The
+[top-level README](../README.md#mcp-tools-75) has a short categorized index
+with links back here for full signatures.
 
 **Session management:**
 - `investigation_start(investigation_id, title, context?)` — create or resume a session

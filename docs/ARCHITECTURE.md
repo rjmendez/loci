@@ -26,9 +26,10 @@ Four stores:
 
 A finding reaches Qdrant only on write (`_qdrant_upsert` at store time), so anything
 that leaves the index — usually the startup TTL purge below — is still on disk and only
-invisible to search. `loci_groom.py index` reconciles that gap: on the live corpus
-`on_disk=2922`, `indexed=2769`, `missing=153`, `coverage=0.9476`. `index --apply`
-re-embeds and re-upserts the missing ones.
+invisible to search. `loci_groom.py index` reconciles that gap by re-embedding and
+re-upserting whatever is on disk but missing from the index; see
+[docs/OPERATIONS.md](./OPERATIONS.md) for the current coverage numbers and the
+`index --apply` procedure.
 
 ### Investigation store (`LOCI_MEMORY_DIR`, default `~/.hermes/memory-sessions`)
 
@@ -456,14 +457,8 @@ candidate was not promoted.
 ### What actually runs on a schedule
 
 The **user crontab** runs four grooming passes through `scripts/loci_groom_cron.sh`.
-Verified through that real entrypoint, with the last line each one logged:
-
-| Pass | Schedule | Last measured result |
-|---|---|---|
-| `index --apply` | `17 */6 * * *` | ok, on_disk=2922 indexed=2769 coverage=0.9476 |
-| `knn_tags` | `20 3 * * *` | ok, vocabulary=60 candidates=360 generated=18 proposed=0 |
-| `codelink` | `40 3 * * *` | ok, symbols=11273 generated=718 proposed=0 |
-| `summaries` | `50 4 * * *` | ok, already_had=137 nothing_to_say=5 errors=0 |
+See [docs/OPERATIONS.md](./OPERATIONS.md) for the current schedule, exit-code
+contract, and last-measured results per pass.
 
 Every pass follows three rules: **idempotent** (a second run over unchanged input
 proposes nothing new), **fail-open** (a dead backend degrades the pass to a report),

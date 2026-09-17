@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Cron entrypoint for the MLOps loop.
 #
-# The loop promotes a model by WRITING INTO THE REPO — grounding_bleed_clf.joblib,
-# grounding_dataset.jsonl and metrics.json under deep_think_loci/grounding/ are
-# all tracked. Running it in the working tree leaves that tree dirty every
-# morning, in a checkout the operator also uses interactively, which is how a
-# rebuilt dataset ends up in an unrelated commit. So this runs in a dedicated
-# worktree pinned to origin/main and leaves the real checkout alone.
-#
-# A promotion is not applied automatically. If the loop promotes, the artifacts
-# sit in the run worktree and this says so; adopting them is a deliberate commit.
+# The loop promotes a model by writing tracked files under
+# deep_think_loci/grounding/ (grounding_bleed_clf.joblib, grounding_dataset.jsonl,
+# metrics.json), so it runs in a dedicated worktree pinned to origin/main rather
+# than the operator's working tree. Promotion is never applied automatically:
+# artifacts are written to the run worktree, and adopting them requires a
+# deliberate commit.
 #
 # Exit codes are loop.py's own: 0 clean, 1 one or more steps failed. A step that
 # was skipped (Ollama unreachable, nothing new to train on) is not a failure.

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Cron entrypoint for the curated memory index.
 #
-# The index overflowed its context-load cap twice, the second time within four
-# days of a hand trim. generate_memory_index.py enforces the budget, but a
-# generator nobody runs is the same failure with extra steps — so this is the
-# part that makes the guarantee continuous rather than per-invocation.
+# generate_memory_index.py enforces the context-load budget; this cron keeps
+# that enforcement continuous instead of depending on someone remembering to
+# run the generator.
 #
 # Not scheduled via cron/jobs.json: Hermes jobs have their own minute tick
 # through hermes_cron_runner.py. The curated index stays on the user crontab,
