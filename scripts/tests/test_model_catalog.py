@@ -22,13 +22,23 @@ def test_specialist_model_catalog_is_additive_only():
 
     assert catalog.CODE_SPECIALIST_MODEL == "qwen2.5-coder:7b"
     assert catalog.MATH_SPECIALIST_MODEL == "hf.co/bartowski/Qwen2.5-Math-7B-Instruct-GGUF:Q4_K_M"
-    assert catalog.SAFETY_SPECIALIST_MODEL == "llama-guard3:8b"
+    assert catalog.SAFETY_SPECIALIST_MODEL == "qwen2.5:3b"
     assert catalog.TOOL_CALLING_SPECIALIST_MODEL == "hf.co/eaddario/Watt-Tool-8B-GGUF:Q4_K_M"
     assert catalog.SPECIALIST_MODELS == {
         "code": catalog.CODE_SPECIALIST_MODEL,
         "math": catalog.MATH_SPECIALIST_MODEL,
         "safety": catalog.SAFETY_SPECIALIST_MODEL,
         "tool_calling": catalog.TOOL_CALLING_SPECIALIST_MODEL,
+    }
+    assert catalog.SWARM_CHEAP_FANOUT_MODEL == "qwen2.5:3b"
+    assert catalog.SWARM_GUARDIAN_MODEL == "qwen2.5:3b"
+    assert catalog.SWARM_ESCALATION_MODEL == "heretic-llama31-8b-instruct:latest"
+    assert catalog.SWARM_SYNTHESIS_MODEL == "qwen2.5:3b"
+    assert catalog.SWARM_ROLE_MODELS == {
+        "cheap_fanout": catalog.SWARM_CHEAP_FANOUT_MODEL,
+        "guardian": catalog.SWARM_GUARDIAN_MODEL,
+        "escalation": catalog.SWARM_ESCALATION_MODEL,
+        "synthesis": catalog.SWARM_SYNTHESIS_MODEL,
     }
     assert (
         swarm._DEFAULT_CHEAP_MODEL,
