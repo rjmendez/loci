@@ -2555,6 +2555,10 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
             "confidence": confidence,
             "tags": finding["tags"],
             "finding_id": finding["id"],
+            # Carry the finding's own provenance tier so a later Mnemosyne recall
+            # doesn't lose e.g. model_asserted and silently normalize it to the
+            # legacy tool_verified default (see _mnemo_recall).
+            **provenance_fields(finding),
         },
     )
     if tier != "cold":
@@ -6754,6 +6758,10 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     results = []
     for f in open_findings:
         fid = str(f.get("id", ""))
+        # Thread this finding's own stored provenance tier plus its investigation's
+        # other findings as candidate evidence, so a model_asserted finding with no
+        # independent (human/tool/deterministic) support is gated 'uncertain' by the
+        # provenance firewall instead of reaching the model verifier unchecked.
         res = _v.verify_finding(
             str(f.get("text") or ""),
             investigation_id=investigation_id,
@@ -6762,6 +6770,11 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             # WHICH checkout its source lives in; without them the skeptic reasons
             # over prose while the file sits on disk.
             code_refs=f.get("code_refs"),
+            candidate_provenance_tier=normalize_provenance_tier(f),
+            evidence_rows=[
+                g for g in findings
+                if isinstance(g, dict) and str(g.get("id") or "") != fid
+            ],
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
