@@ -43,6 +43,7 @@ _DEFAULT_CHEAP_MODEL = os.environ.get("LOCI_SWARM_CHEAP_MODEL", "qwen2.5:3b")
 _DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "qwen3.8:latest")
 _DEFAULT_SYNTHESIZE_MODEL = os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL", "qwen3.8:latest")
 _DEFAULT_DECOMPOSE_MODEL = os.environ.get("LOCI_SWARM_DECOMPOSE_MODEL", "")
+_DEFAULT_STIGMERGIC_CONSENSUS = os.environ.get("LOCI_SWARM_STIGMERGIC_CONSENSUS", "").strip().lower() in {"1", "true", "yes", "on"}
 _STOPWORDS = {
     "a", "an", "and", "are", "for", "how", "in", "is", "of", "on", "or", "the",
     "this", "to", "what", "when", "where", "which", "why", "with",
@@ -72,6 +73,8 @@ class SwarmConfig:
     subtask_prompt_chars: int = 1500
     synthesis_subtask_chars: int = 240
     synthesis_answer_chars: int = 400
+    stigmergic_consensus: bool = _DEFAULT_STIGMERGIC_CONSENSUS
+    stigmergic_ttl_minutes: float = 60.0
 
 
 @dataclass
@@ -445,6 +448,27 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
     }
 
 
+def apply_consensus_gate(findings: list[SwarmFinding], triage: dict, config: SwarmConfig) -> tuple[dict, dict]:
+    if not config.stigmergic_consensus:
+        return triage, {"enabled": False}
+    try:
+        import stigmergic_consensus
+
+        gate_config = stigmergic_consensus.StigmergicConfig(
+            enabled=True,
+            ttl_minutes=float(config.stigmergic_ttl_minutes),
+        )
+        result = stigmergic_consensus.apply_stigmergic_consensus(
+            findings,
+            triage,
+            gate_config,
+        )
+        return result["triage"], result["consensus"]
+    except Exception as exc:
+        report = {"enabled": True, "degraded": True, "error": str(exc)[:300]}
+        return triage, report
+
+
 def _public_finding(finding: SwarmFinding, *, subtask_chars: int = 0, answer_chars: int = 0) -> dict:
     subtask = finding.subtask
     answer = finding.answer
@@ -601,6 +625,7 @@ def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
         tier="cheap",
     )
     triage = triage_findings(cheap_findings, config)
+    triage, consensus_report = apply_consensus_gate(cheap_findings, triage, config)
     final_findings, escalate_report = escalate_findings(cheap_findings, triage, config=config, batch_fn=batch_fn)
     stats = {
         "fanout_count": len(subtasks),
@@ -610,6 +635,7 @@ def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
     result = synthesize_swarm(config, final_findings, stats, batch_fn)
     result["decomposition"] = decomposition
     result["triage"] = triage
+    result["stigmergic_consensus"] = consensus_report
     result["tiers"] = {
         "cheap": cheap_report,
         "escalate": escalate_report,
@@ -653,6 +679,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--subtasks-file", help="JSON array or newline-delimited subtasks.")
     ap.add_argument("--subtask", action="append", default=[], help="Repeatable pre-supplied subtask.")
     ap.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    ap.add_argument(
+        "--stigmergic-consensus",
+        action="store_true",
+        help="Enable deterministic stigmergic gating before escalation.",
+    )
+    ap.add_argument(
+        "--stigmergic-ttl-minutes",
+        type=float,
+        default=60.0,
+        help="TTL for stigmergic findings before they require escalation. Default: 60.",
+    )
     return ap.parse_args(argv)
 
 
@@ -669,6 +706,8 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
         subtasks=supplied or None,
         fanout_count=max(1, int(args.fanout_count)),
         escalate_confidences=_split_csv(args.escalate_confidences) or ("low",),
+        stigmergic_consensus=bool(args.stigmergic_consensus or _DEFAULT_STIGMERGIC_CONSENSUS),
+        stigmergic_ttl_minutes=max(0.0, float(args.stigmergic_ttl_minutes)),
     )
 
 
