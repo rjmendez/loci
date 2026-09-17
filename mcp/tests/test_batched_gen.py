@@ -116,9 +116,9 @@ class _FakeLLMLocal:
         self.calls = []
         self.fail_on = set(fail_on or ())
 
-    def generate(self, prompt, model=None, fmt=None, max_tokens=256):
+    def generate(self, prompt, model=None, fmt=None, max_tokens=256, think=False):
         self.calls.append({"prompt": prompt, "model": model,
-                           "fmt": fmt, "max_tokens": max_tokens})
+                           "fmt": fmt, "max_tokens": max_tokens, "think": think})
         if prompt in self.fail_on:
             return {"text": "", "ok": False, "model": model}
         return {"text": f"ollama:{prompt}", "ok": True, "model": model or "qwen2.5:3b"}
@@ -212,3 +212,41 @@ def test_client_fn_construction_failure_degrades_to_ollama(monkeypatch):
 
     out = B.generate_batch(["a"], client_fn=_boom)
     assert out == [{"text": "ollama:a", "ok": True}]  # fell back cleanly
+
+
+def test_ollama_fallback_dispatches_concurrently(monkeypatch):
+    """The Ollama fallback path must run prompts concurrently, not one-at-a-time.
+
+    Regression guard for the 2026-09 fix: _via_ollama used to loop serially even though
+    the module is documented/used as a concurrent fan-out client. A slow fake generate()
+    (sleep per call) proves concurrency by wall-clock: N calls at S seconds each must take
+    close to S seconds total (thread-pooled), not N*S (serial).
+    """
+    import time
+
+    _set_vllm(monkeypatch, "")  # no batched server -> exercise the Ollama fallback
+
+    class _SlowFakeLLMLocal:
+        def __init__(self, delay):
+            self.delay = delay
+            self.calls = 0
+
+        def generate(self, prompt, model=None, fmt=None, max_tokens=256, think=False):
+            self.calls += 1
+            time.sleep(self.delay)
+            return {"text": f"ollama:{prompt}", "ok": True, "model": model}
+
+    delay = 0.2
+    n = 5
+    fake = _SlowFakeLLMLocal(delay)
+    _install_fake_llm_local(monkeypatch, fake)
+
+    t0 = time.monotonic()
+    out = B.generate_batch([f"p{i}" for i in range(n)])
+    elapsed = time.monotonic() - t0
+
+    assert fake.calls == n
+    assert all(r["ok"] for r in out)
+    # Serial execution would take n * delay (~1.0s here); concurrent execution should
+    # complete well under half that. Generous margin for CI/thread-scheduling jitter.
+    assert elapsed < (n * delay) * 0.6, f"expected concurrent dispatch, took {elapsed:.2f}s"

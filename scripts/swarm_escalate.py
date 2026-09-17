@@ -23,12 +23,14 @@ valid JSON.
 Usage:
   python3 scripts/swarm_escalate.py "topic here"
   python3 scripts/swarm_escalate.py "topic here" --fanout-count 30 --pretty
+  python3 scripts/swarm_escalate.py "topic here" --fanout-count 10 --seeds 4 --pretty
   python3 scripts/swarm_escalate.py "topic here" --subtask "Check auth" --subtask "Check cache"
   python3 scripts/swarm_escalate.py "topic here" --subtasks-file subtasks.json
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -39,9 +41,25 @@ from typing import Callable, Optional
 
 
 _CONFIDENCE_LEVELS = ("low", "medium", "high")
+# Tier defaults chosen from a live 12-model / 4-task (code, math, JSON, security) benchmark
+# on 2026-09-16 across the machine's full local Ollama library (see ~/.loci notes /
+# session history). Two prior defaults (qwen3.8:latest for escalate+synthesize) measured
+# as the SLOWEST model tested (~15 tok/s) with no answer-quality edge over 8B-class models
+# on these tasks -- kept only where an actual quality edge showed up.
 _DEFAULT_CHEAP_MODEL = os.environ.get("LOCI_SWARM_CHEAP_MODEL", "qwen2.5:3b")
-_DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "qwen3.8:latest")
-_DEFAULT_SYNTHESIZE_MODEL = os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL", "qwen3.8:latest")
+# escalate: per-finding fan-out re-answer of the "low confidence" slice -- many small calls,
+# so throughput matters. heretic-llama31-8b-instruct matched qwen3.8:latest on every task
+# (code/math/json/security) at ~5.6x the tokens/sec (86 vs 15) with no refusal behavior.
+_DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "heretic-llama31-8b-instruct:latest")
+# synthesize: ONE call per run turning all findings into final structured JSON -- quality
+# matters more than throughput here, so this tier keeps the largest available model instead.
+# The 27B abliterated variant produced the most thorough, best-organized answers of anything
+# tested and never refused; its <think>...</think> preamble is harmless because
+# _extract_json_object() scans for the first balanced {...} anywhere in the text.
+_DEFAULT_SYNTHESIZE_MODEL = os.environ.get(
+    "LOCI_SWARM_SYNTHESIZE_MODEL",
+    "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M",
+)
 _DEFAULT_DECOMPOSE_MODEL = os.environ.get("LOCI_SWARM_DECOMPOSE_MODEL", "")
 _STOPWORDS = {
     "a", "an", "and", "are", "for", "how", "in", "is", "of", "on", "or", "the",
@@ -52,6 +70,7 @@ _POSITIVE_MARKERS = (
     " yes ", " present ", " true ", " supported ", " enabled ", " works ",
     " require ", " requires ",
 )
+_MULTI_SEED_SYNTHESIS_MAX_CHARS = 18000
 
 
 @dataclass
@@ -63,15 +82,46 @@ class SwarmConfig:
     decompose_model: str = _DEFAULT_DECOMPOSE_MODEL
     subtasks: Optional[list[str]] = None
     fanout_count: int = 20
+    seeds: int = 1
     escalate_confidences: tuple[str, ...] = ("low",)
     subtask_similarity_threshold: float = 0.50
     answer_similarity_threshold: float = 0.82
-    decompose_max_tokens: int = 1200
+    # decompose: ONE JSON-planner call per seed that must fit N atomic subtasks in one
+    # response. The original 1200-token cap was chosen while the cheap-answer lane still
+    # looked serial, but after the 2026-09-16 Ollama concurrency fix the throughput win
+    # comes from overlapping downstream requests, not starving this planner. Give it more
+    # room so wider fan-outs (especially multi-seed ones) do not truncate the subtask list.
+    decompose_max_tokens: int = 2200
     answer_max_tokens: int = 320
-    synthesize_max_tokens: int = 1400
+    # synthesize (non-think): still ONE call per run, even in wide fan-out mode. The
+    # 27B synth tier produced the best-organized answers in the 2026-09-16 benchmark, and
+    # its latency is dominated by model choice, not shaving a few hundred output tokens.
+    # Raising this slightly buys more room for complete summaries / risks / next_steps
+    # without materially changing throughput because there is no per-subtask multiplier.
+    synthesize_max_tokens: int = 2200
     subtask_prompt_chars: int = 1500
     synthesis_subtask_chars: int = 240
     synthesis_answer_chars: int = 400
+    # Opt-in "high-end" mode for the single synthesis call: enables Ollama reasoning
+    # (`think`) on models that support it, at a much larger token budget (see
+    # synthesize_think_max_tokens). Live-benchmarked 2026-09-16: enabling `think` on a
+    # thinking-capable model without a MUCH bigger budget is unsafe -- Ollama's
+    # num_predict is a budget SHARED between the hidden reasoning trace and the visible
+    # answer, and a 25B model burned an entire 1500-token budget on reasoning alone for
+    # one of five held-out prompts, returning a genuinely empty answer. Defaults to False
+    # (matches every prior run); synthesize_swarm() also auto-retries with think=False at
+    # the normal budget if a think=True attempt comes back unparseable/empty, so turning
+    # this on can only add latency on a bad draw, never break the fail-open guarantee.
+    synthesize_think: bool = field(
+        default_factory=lambda: os.environ.get("LOCI_SWARM_SYNTHESIZE_THINK", "") not in ("", "0", "false", "False")
+    )
+    synthesize_think_max_tokens: int = 4000
+    safety_check: bool = field(
+        default_factory=lambda: os.environ.get("LOCI_SWARM_SAFETY_CHECK", "") not in ("", "0", "false", "False")
+    )
+    self_consistency_samples: int = 1
+    escalate_with_prior_context: bool = False
+    reduce_group_size: int = 0
 
 
 @dataclass
@@ -99,11 +149,12 @@ def _ensure_paths() -> None:
 
 
 def _batched_generate(prompts: list[str], *, model: str, max_tokens: int,
-                      fmt: Optional[str] = None) -> list[dict]:
+                      fmt: Optional[str] = None, think: bool = False) -> list[dict]:
     _ensure_paths()
     import batched_gen
 
-    return batched_gen.generate_batch(prompts, model=model, max_tokens=max_tokens, fmt=fmt)
+    return batched_gen.generate_batch(prompts, model=model, max_tokens=max_tokens, fmt=fmt,
+                                      think=think)
 
 
 def _fail_batch(size: int, why: str) -> list[dict]:
@@ -111,12 +162,12 @@ def _fail_batch(size: int, why: str) -> list[dict]:
 
 
 def _call_batch(batch_fn: Callable[..., list[dict]], prompts: list[str], *, model: str,
-                max_tokens: int, fmt: Optional[str] = None) -> list[dict]:
+                max_tokens: int, fmt: Optional[str] = None, think: bool = False) -> list[dict]:
     prompts = [str(prompt) for prompt in (prompts or [])]
     if not prompts:
         return []
     try:
-        rows = batch_fn(prompts, model=model, max_tokens=max_tokens, fmt=fmt)
+        rows = batch_fn(prompts, model=model, max_tokens=max_tokens, fmt=fmt, think=think)
     except Exception as exc:
         return _fail_batch(len(prompts), str(exc))
     rows = list(rows or [])
@@ -126,8 +177,8 @@ def _call_batch(batch_fn: Callable[..., list[dict]], prompts: list[str], *, mode
 
 
 def _call_one(batch_fn: Callable[..., list[dict]], prompt: str, *, model: str,
-              max_tokens: int, fmt: Optional[str] = None) -> dict:
-    rows = _call_batch(batch_fn, [prompt], model=model, max_tokens=max_tokens, fmt=fmt)
+              max_tokens: int, fmt: Optional[str] = None, think: bool = False) -> dict:
+    rows = _call_batch(batch_fn, [prompt], model=model, max_tokens=max_tokens, fmt=fmt, think=think)
     return rows[0] if rows else {"text": "", "ok": False, "why": "empty batch result"}
 
 
@@ -187,15 +238,23 @@ def _fallback_subtasks(topic: str) -> list[str]:
     return [str(topic or "").strip() or "Answer the original topic directly."]
 
 
-def decompose_subtasks(config: SwarmConfig, batch_fn: Callable[..., list[dict]]) -> tuple[list[str], dict]:
+def decompose_subtasks(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *,
+                       seed_index: int = 0, seed_count: int = 1) -> tuple[list[str], dict]:
     supplied = _normalize_subtasks(config.subtasks or [], limit=0)
     if supplied:
         return supplied, {"source": "supplied", "requested": config.fanout_count, "degraded": False}
 
     model = config.decompose_model or config.cheap_model
+    diversity_line = ""
+    if seed_count > 1:
+        diversity_line = (
+            f"Independent seed: {seed_index + 1}/{seed_count}. Prefer a slightly different "
+            "decomposition angle than other parallel runs while staying concrete.\n"
+        )
     prompt = (
         "You are the FAN-OUT decomposition stage in a local reasoning swarm.\n"
         f"Topic: {config.topic}\n"
+        f"{diversity_line}"
         f"Return exactly {max(1, int(config.fanout_count))} atomic micro-subtasks that can be answered independently.\n"
         "Keep each subtask concrete, non-overlapping when possible, and phrased as a direct question or check.\n"
         'Return ONLY JSON: {"subtasks":["..."]}'
@@ -236,6 +295,22 @@ def _answer_prompt(topic: str, subtask: str, max_chars: int = 1500) -> str:
         f"Subtask: {_truncate(subtask, max_chars)}\n"
         "Answer only this subtask. Be brief and concrete.\n"
         'Return ONLY JSON: {"answer":"...","confidence":"high|medium|low"}'
+    )
+
+
+def _escalation_prompt(topic: str, finding: SwarmFinding, *, include_prior: bool,
+                       max_chars: int = 1500) -> str:
+    if not include_prior:
+        return _answer_prompt(topic, finding.subtask, max_chars)
+    return (
+        "You are the escalation stage in a local reasoning swarm.\n"
+        f"Topic: {topic}\n"
+        f"Subtask: {_truncate(finding.subtask, max_chars)}\n"
+        "A weaker cheap-tier model already attempted this subtask. Critique it, "
+        "correct any mistakes, and improve the answer without inventing evidence.\n"
+        f"PRIOR_WEAK_ANSWER: {_truncate(finding.answer, max_chars)}\n"
+        f"PRIOR_CONFIDENCE: {finding.confidence}\n"
+        "Return ONLY JSON: {\"answer\":\"...\",\"confidence\":\"high|medium|low\"}"
     )
 
 
@@ -391,6 +466,107 @@ def triage_findings(findings: list[SwarmFinding], config: SwarmConfig) -> dict:
     }
 
 
+def self_consistency_findings(findings: list[SwarmFinding], triage: dict, *, config: SwarmConfig,
+                              batch_fn: Callable[..., list[dict]]) -> tuple[list[SwarmFinding], dict, dict]:
+    samples = max(1, int(config.self_consistency_samples or 1))
+    if samples <= 1:
+        return list(findings), triage, {
+            "enabled": False,
+            "samples": samples,
+            "attempted": 0,
+            "majority": 0,
+            "disagreement": 0,
+            "model": config.cheap_model,
+        }
+
+    reasons_by_index = {
+        str(idx): list(reasons)
+        for idx, reasons in ((triage or {}).get("escalation_reasons") or {}).items()
+    }
+    flagged = [
+        int(idx)
+        for idx in ((triage or {}).get("flagged_indices") or [])
+        if "confidence:low" in reasons_by_index.get(str(idx), [])
+    ]
+    if not flagged:
+        return list(findings), triage, {
+            "enabled": True,
+            "samples": samples,
+            "attempted": 0,
+            "majority": 0,
+            "disagreement": 0,
+            "model": config.cheap_model,
+        }
+
+    prompts = [
+        _answer_prompt(config.topic, findings[idx].subtask, config.subtask_prompt_chars)
+        for idx in flagged
+        for _ in range(samples)
+    ]
+    raw_rows = _call_batch(
+        batch_fn,
+        prompts,
+        model=config.cheap_model,
+        max_tokens=config.answer_max_tokens,
+        fmt="json",
+    )
+
+    updated = list(findings)
+    new_reasons = {str(idx): list(reasons) for idx, reasons in reasons_by_index.items()}
+    majority = 0
+    disagreement = 0
+    for offset, idx in enumerate(flagged):
+        sample_rows = raw_rows[offset * samples:(offset + 1) * samples]
+        parsed = [
+            _parse_answer_result(raw, subtask=findings[idx].subtask, model=config.cheap_model, tier="cheap")
+            for raw in sample_rows
+        ]
+        buckets: dict[str, list[SwarmFinding]] = {}
+        for item in parsed:
+            if item.ok and item.answer.strip():
+                buckets.setdefault(_answer_signature(item.answer), []).append(item)
+        winner_key = ""
+        winner_items: list[SwarmFinding] = []
+        if buckets:
+            winner_key, winner_items = max(buckets.items(), key=lambda pair: (len(pair[1]), _finding_sort_key(pair[1][0])))
+        if winner_key and len(winner_items) > samples / 2:
+            chosen = max(winner_items, key=_finding_sort_key)
+            updated[idx] = chosen
+            majority += 1
+            existing = [
+                reason for reason in new_reasons.get(str(idx), [])
+                if not str(reason).startswith("confidence:")
+            ]
+            if chosen.confidence.lower() not in {item.lower() for item in config.escalate_confidences}:
+                if existing:
+                    new_reasons[str(idx)] = existing
+                else:
+                    new_reasons.pop(str(idx), None)
+            else:
+                reasons = new_reasons[str(idx)] = existing
+                if f"confidence:{chosen.confidence.lower()}" not in reasons:
+                    reasons.append(f"confidence:{chosen.confidence.lower()}")
+        else:
+            disagreement += 1
+            reasons = new_reasons.setdefault(str(idx), [])
+            if "self_consistency_disagreement" not in reasons:
+                reasons.append("self_consistency_disagreement")
+
+    new_flagged = sorted(int(idx) for idx, reasons in new_reasons.items() if reasons)
+    new_triage = dict(triage or {})
+    new_triage["flagged_indices"] = new_flagged
+    new_triage["flagged_count"] = len(new_flagged)
+    new_triage["escalation_reasons"] = {str(idx): sorted(reasons) for idx, reasons in new_reasons.items() if reasons}
+    return updated, new_triage, {
+        "enabled": True,
+        "samples": samples,
+        "attempted": len(flagged),
+        "majority": majority,
+        "disagreement": disagreement,
+        "model": config.cheap_model,
+    }
+
+
 def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: SwarmConfig,
                       batch_fn: Callable[..., list[dict]]) -> tuple[list[SwarmFinding], dict]:
     flagged = [int(idx) for idx in (triage or {}).get("flagged_indices") or []]
@@ -403,7 +579,12 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
         }
 
     prompts = [
-        _answer_prompt(config.topic, findings[idx].subtask, config.subtask_prompt_chars)
+        _escalation_prompt(
+            config.topic,
+            findings[idx],
+            include_prior=bool(config.escalate_with_prior_context),
+            max_chars=config.subtask_prompt_chars,
+        )
         for idx in flagged
     ]
     raw_rows = _call_batch(
@@ -479,8 +660,327 @@ def _fallback_summary(topic: str, findings: list[dict], stats: dict) -> str:
     return lead if not fragments else f"{lead} Key findings: {' | '.join(fragments)}"
 
 
+def _group_findings_for_reduce(prompt_findings: list[dict], group_size: int) -> list[list[dict]]:
+    size = max(1, int(group_size or 1))
+    return [prompt_findings[idx:idx + size] for idx in range(0, len(prompt_findings), size)]
+
+
+def _fallback_group_summary(group: list[dict], group_index: int) -> dict:
+    fragments = []
+    for item in group:
+        subtask = str(item.get("subtask") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if subtask or answer:
+            fragments.append(f"{subtask}: {answer}".strip(": "))
+    return {
+        "subtask": f"Reduced finding group {group_index + 1}",
+        "answer": " | ".join(fragments[:5]) or "Group summary unavailable.",
+        "confidence": "low",
+        "tier_reached": "synthesized",
+        "model": "",
+        "ok": False,
+    }
+
+
+def _reduce_findings_for_synthesis(config: SwarmConfig, prompt_findings: list[dict],
+                                   stats: dict, batch_fn: Callable[..., list[dict]]) -> tuple[list[dict], dict]:
+    group_size = max(0, int(config.reduce_group_size or 0))
+    if group_size <= 0 or len(prompt_findings) <= group_size:
+        return prompt_findings, {
+            "enabled": False,
+            "group_size": group_size,
+            "input_count": len(prompt_findings),
+            "group_count": 0,
+            "failed_open": 0,
+        }
+
+    groups = _group_findings_for_reduce(prompt_findings, group_size)
+    prompts = [
+        (
+            "You are an intermediate REDUCE stage in a tiered local reasoning swarm.\n"
+            "Summarize this group of per-subtask findings without dropping material facts.\n"
+            "Do not add claims absent from the inputs.\n"
+            'Return ONLY JSON: {"summary":"...","confidence":"high|medium|low"}\n\n'
+            f"TOPIC: {config.topic}\n"
+            f"GROUP_INDEX: {idx + 1}/{len(groups)}\n"
+            f"GROUP_FINDINGS: {json.dumps(group, indent=2)}\n"
+            f"OVERALL_STATS: {json.dumps(stats, indent=2)}"
+        )
+        for idx, group in enumerate(groups)
+    ]
+    rows = _call_batch(
+        batch_fn,
+        prompts,
+        model=config.synthesize_model,
+        max_tokens=config.synthesize_max_tokens,
+        fmt="json",
+    )
+    reduced: list[dict] = []
+    failed_open = 0
+    for idx, (group, raw) in enumerate(zip(groups, rows)):
+        obj = _extract_json_object(str((raw or {}).get("text") or "")) if (raw or {}).get("ok") else None
+        summary = str((obj or {}).get("summary") or "").strip() if isinstance(obj, dict) else ""
+        if summary:
+            reduced.append({
+                "subtask": f"Reduced finding group {idx + 1} ({len(group)} findings)",
+                "answer": summary,
+                "confidence": _normalize_confidence((obj or {}).get("confidence"), default="medium"),
+                "tier_reached": "synthesized",
+                "model": config.synthesize_model,
+                "ok": True,
+            })
+        else:
+            failed_open += 1
+            reduced.append(_fallback_group_summary(group, idx))
+    return reduced, {
+        "enabled": True,
+        "group_size": group_size,
+        "input_count": len(prompt_findings),
+        "group_count": len(groups),
+        "output_count": len(reduced),
+        "failed_open": failed_open,
+        "model": config.synthesize_model,
+    }
+
+
+def _guardian_check(text: str) -> dict:
+    _ensure_paths()
+    from guardian import check_injection_risk
+    return check_injection_risk(text)
+
+
+def _safety_flag(text: str, guardian_fn: Callable[[str], dict]) -> dict:
+    try:
+        result = guardian_fn(text)
+    except Exception as exc:
+        return {"flagged": False, "why": f"guardian failed open: {exc}"[:200]}
+    if not isinstance(result, dict):
+        return {"flagged": False, "why": "guardian failed open: invalid result"}
+    flagged = bool(result.get("flagged"))
+    if flagged:
+        why = result.get("error") or f"guardian verdict {result.get('verdict') or 'Yes'}"
+    elif result.get("ok") is False:
+        why = f"guardian failed open: {result.get('error') or 'unknown error'}"
+    else:
+        why = f"guardian verdict {result.get('verdict') or 'No'}"
+    return {"flagged": flagged, "why": str(why)[:200]}
+
+
+def _confidence_rank(value: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2}.get(str(value or "").lower(), -1)
+
+
+def _tier_rank(value: str) -> int:
+    return {"cheap": 0, "escalated": 1, "synthesized": 2}.get(str(value or "").lower(), -1)
+
+
+def _finding_sort_key(finding: SwarmFinding) -> tuple[int, int, int, int, int]:
+    return (
+        1 if finding.ok else 0,
+        1 if finding.parse_ok else 0,
+        _confidence_rank(finding.confidence),
+        _tier_rank(finding.tier_reached),
+        len(str(finding.answer or "")),
+    )
+
+
+def _merge_findings(findings: list[SwarmFinding]) -> tuple[list[SwarmFinding], dict]:
+    merged: list[SwarmFinding] = []
+    seen: dict[tuple[str, str], int] = {}
+    dropped = 0
+    for finding in findings:
+        key = (_answer_signature(finding.subtask), _answer_signature(finding.answer))
+        if key in seen:
+            dropped += 1
+            idx = seen[key]
+            if _finding_sort_key(finding) > _finding_sort_key(merged[idx]):
+                merged[idx] = finding
+            continue
+        seen[key] = len(merged)
+        merged.append(finding)
+    return merged, {
+        "input_count": len(findings),
+        "merged_count": len(merged),
+        "deduped_count": dropped,
+    }
+
+
+def _bound_findings_for_synthesis(config: SwarmConfig, findings: list[SwarmFinding]) -> tuple[list[SwarmFinding], dict]:
+    bounded: list[SwarmFinding] = []
+    total_chars = 2  # opening/closing brackets for the JSON list
+    dropped = 0
+    for finding in findings:
+        prompt_view = _public_finding(
+            finding,
+            subtask_chars=config.synthesis_subtask_chars,
+            answer_chars=config.synthesis_answer_chars,
+        )
+        serialized = json.dumps(prompt_view, separators=(",", ":"), sort_keys=True)
+        next_total = total_chars + len(serialized) + (1 if bounded else 0)
+        if bounded and next_total > _MULTI_SEED_SYNTHESIS_MAX_CHARS:
+            dropped += 1
+            continue
+        bounded.append(finding)
+        total_chars = next_total
+    return bounded, {
+        "input_count": len(findings),
+        "kept_count": len(bounded),
+        "dropped_count": dropped,
+        "prompt_chars": total_chars,
+        "max_prompt_chars": _MULTI_SEED_SYNTHESIS_MAX_CHARS,
+    }
+
+
+def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *, seed_index: int = 0,
+                     seed_count: int = 1) -> dict:
+    subtasks, decomposition = decompose_subtasks(config, batch_fn, seed_index=seed_index, seed_count=seed_count)
+    cheap_findings, cheap_report = answer_subtasks(
+        config.topic,
+        subtasks,
+        model=config.cheap_model,
+        config=config,
+        batch_fn=batch_fn,
+        tier="cheap",
+    )
+    triage = triage_findings(cheap_findings, config)
+    consistent_findings, triage, self_consistency_report = self_consistency_findings(
+        cheap_findings,
+        triage,
+        config=config,
+        batch_fn=batch_fn,
+    )
+    final_findings, escalate_report = escalate_findings(consistent_findings, triage, config=config, batch_fn=batch_fn)
+    return {
+        "seed": seed_index,
+        "subtasks": subtasks,
+        "decomposition": decomposition,
+        "cheap_report": cheap_report,
+        "triage": triage,
+        "self_consistency_report": self_consistency_report,
+        "final_findings": final_findings,
+        "escalate_report": escalate_report,
+    }
+
+
+def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
+                    guardian_fn: Callable[[str], dict]) -> dict:
+    ordered: list[dict | None] = [None] * int(config.seeds)
+    seed_errors: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(config.seeds))) as ex:
+        futures = {
+            ex.submit(_run_single_seed, config, batch_fn, seed_index=seed_idx, seed_count=int(config.seeds)): seed_idx
+            for seed_idx in range(int(config.seeds))
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            seed_idx = futures[fut]
+            try:
+                ordered[seed_idx] = fut.result()
+            except Exception as exc:
+                seed_errors.append({"seed": seed_idx, "error": str(exc)})
+
+    completed = [entry for entry in ordered if isinstance(entry, dict)]
+    if not completed:
+        return _run_single_seed_result(config, batch_fn, guardian_fn)
+
+    merged_findings, merge_report = _merge_findings([
+        finding
+        for entry in completed
+        for finding in entry["final_findings"]
+    ])
+    synthesis_findings, synthesis_bound = _bound_findings_for_synthesis(config, merged_findings)
+    escalated_count = sum(1 for item in merged_findings if item.escalation_attempted)
+    stats = {
+        "fanout_count": len(merged_findings),
+        "escalated_count": escalated_count,
+        "escalation_rate": _coerce_ratio(escalated_count, len(merged_findings)),
+        "seed_count": int(config.seeds),
+        "seed_failures": len(seed_errors),
+    }
+    result = synthesize_swarm(config, synthesis_findings, stats, batch_fn, guardian_fn)
+    result["findings"] = [_public_finding(item) for item in merged_findings]
+    result["stats"] = stats
+    result["decomposition"] = {
+        "source": "multi-seed",
+        "requested": config.fanout_count,
+        "degraded": any(bool(entry["decomposition"].get("degraded")) for entry in completed),
+        "seeds": [
+            {
+                "seed": entry["seed"],
+                **entry["decomposition"],
+            }
+            for entry in completed
+        ],
+    }
+    result["triage"] = {
+        "flagged_indices": [],
+        "flagged_count": sum(int(entry["triage"].get("flagged_count") or 0) for entry in completed),
+        "escalation_reasons": {
+            str(entry["seed"]): entry["triage"].get("escalation_reasons") or {}
+            for entry in completed
+        },
+        "similar_pairs": [
+            {
+                "seed": entry["seed"],
+                **pair,
+            }
+            for entry in completed
+            for pair in (entry["triage"].get("similar_pairs") or [])
+        ],
+    }
+    result["tiers"] = {
+        "cheap": {
+            "tier": "cheap",
+            "model": config.cheap_model,
+            "count": sum(int(entry["cheap_report"]["count"]) for entry in completed),
+            "ok": sum(int(entry["cheap_report"]["ok"]) for entry in completed),
+            "degraded": sum(int(entry["cheap_report"]["degraded"]) for entry in completed),
+        },
+        "escalate": {
+            "attempted": sum(int(entry["escalate_report"]["attempted"]) for entry in completed),
+            "succeeded": sum(int(entry["escalate_report"]["succeeded"]) for entry in completed),
+            "failed_open": sum(int(entry["escalate_report"]["failed_open"]) for entry in completed),
+            "model": config.escalate_model,
+        },
+    }
+    if int(config.self_consistency_samples or 1) > 1:
+        result["tiers"]["self_consistency"] = {
+            "enabled": True,
+            "samples": max(1, int(config.self_consistency_samples or 1)),
+            "attempted": sum(int(entry["self_consistency_report"]["attempted"]) for entry in completed),
+            "majority": sum(int(entry["self_consistency_report"]["majority"]) for entry in completed),
+            "disagreement": sum(int(entry["self_consistency_report"]["disagreement"]) for entry in completed),
+            "model": config.cheap_model,
+        }
+    result["lineage"] = [asdict(item) for item in merged_findings]
+    result["multi_seed"] = {
+        "enabled": True,
+        "seed_count": int(config.seeds),
+        "completed_seeds": len(completed),
+        "failed_seeds": len(seed_errors),
+        "errors": seed_errors,
+        "merge": merge_report,
+        "synthesis_input": synthesis_bound,
+        "per_seed": [
+            {
+                "seed": entry["seed"],
+                "subtask_count": len(entry["subtasks"]),
+                "decomposition": entry["decomposition"],
+                "cheap": entry["cheap_report"],
+                "triage": entry["triage"],
+                "self_consistency": entry["self_consistency_report"],
+                "escalate": entry["escalate_report"],
+            }
+            for entry in completed
+        ],
+    }
+    if len(synthesis_findings) != len(merged_findings):
+        result["synthesis"]["input_truncated"] = True
+    return result
+
+
 def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: dict,
-                     batch_fn: Callable[..., list[dict]]) -> dict:
+                     batch_fn: Callable[..., list[dict]],
+                     guardian_fn: Callable[[str], dict] = _guardian_check) -> dict:
     public_findings = [_public_finding(item) for item in findings]
     # The prompt sent to the synthesis model uses a separately truncated view: with dozens
     # of subtasks (especially ones carrying large embedded evidence, e.g. a full diff) the
@@ -496,6 +996,7 @@ def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: d
         )
         for item in findings
     ]
+    prompt_findings, reduce_report = _reduce_findings_for_synthesis(config, prompt_findings, stats, batch_fn)
     prompt = (
         "You are the SYNTHESIZE stage in a tiered local reasoning swarm.\n"
         "Combine the final per-subtask answers into one direct, evidence-aware JSON object.\n"
@@ -508,13 +1009,37 @@ def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: d
         f"FINAL_FINDINGS: {json.dumps(prompt_findings, indent=2)}\n"
         f"STATS: {json.dumps(stats, indent=2)}"
     )
-    raw = _call_one(
-        batch_fn,
-        prompt,
-        model=config.synthesize_model,
-        max_tokens=config.synthesize_max_tokens,
-        fmt="json",
-    )
+    used_think = False
+    raw = {}
+    if config.synthesize_think:
+        # High-end pass: let the model reason before answering, with a budget generous
+        # enough that reasoning traces don't starve the visible answer (see SwarmConfig's
+        # synthesize_think comment for the live-measured "too small a budget" failure mode).
+        raw = _call_one(
+            batch_fn,
+            prompt,
+            model=config.synthesize_model,
+            max_tokens=config.synthesize_think_max_tokens,
+            fmt="json",
+            think=True,
+        )
+        used_think = True
+        obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
+        if not (isinstance(obj, dict) and str(obj.get("summary") or "").strip()):
+            # The think=True attempt came back empty/unparseable (e.g. the reasoning
+            # trace ate the whole budget on a hard prompt) -- fall back to a normal,
+            # non-reasoning call at the usual budget rather than surface a degraded
+            # result when a plain call would have worked fine.
+            used_think = False
+            raw = {}
+    if not raw:
+        raw = _call_one(
+            batch_fn,
+            prompt,
+            model=config.synthesize_model,
+            max_tokens=config.synthesize_max_tokens,
+            fmt="json",
+        )
     obj = _extract_json_object(str(raw.get("text", ""))) if raw.get("ok") else None
     summary = ""
     if isinstance(obj, dict):
@@ -532,12 +1057,17 @@ def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: d
         "degraded": not bool(summary),
         "synthesis": {
             "model": config.synthesize_model,
+            "think": used_think,
             "ok": bool(summary),
             "degraded": not bool(summary),
         },
     }
+    if reduce_report.get("enabled"):
+        result["synthesis"]["reduce"] = reduce_report
     if raw.get("why"):
         result["synthesis"]["error"] = raw.get("why")
+    if config.safety_check:
+        result["safety_flag"] = _safety_flag(result["summary"], guardian_fn)
     return result
 
 
@@ -590,30 +1120,40 @@ def validate_swarm_result(result: dict) -> list[str]:
 def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
     deps = deps or {"generate_batch": _batched_generate}
     batch_fn = deps["generate_batch"]
+    guardian_fn = deps.get("guardian_check") or _guardian_check
+    if int(config.seeds or 1) > 1:
+        try:
+            return _run_multi_seed(config, batch_fn, guardian_fn)
+        except Exception:
+            return _run_single_seed_result(config, batch_fn, guardian_fn)
 
-    subtasks, decomposition = decompose_subtasks(config, batch_fn)
-    cheap_findings, cheap_report = answer_subtasks(
-        config.topic,
-        subtasks,
-        model=config.cheap_model,
-        config=config,
-        batch_fn=batch_fn,
-        tier="cheap",
-    )
-    triage = triage_findings(cheap_findings, config)
-    final_findings, escalate_report = escalate_findings(cheap_findings, triage, config=config, batch_fn=batch_fn)
+    return _run_single_seed_result(config, batch_fn, guardian_fn)
+
+
+def _run_single_seed_result(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
+                            guardian_fn: Callable[[str], dict] = _guardian_check) -> dict:
+    seed = _run_single_seed(config, batch_fn)
+
+    subtasks = seed["subtasks"]
+    decomposition = seed["decomposition"]
+    cheap_report = seed["cheap_report"]
+    triage = seed["triage"]
+    final_findings = seed["final_findings"]
+    escalate_report = seed["escalate_report"]
     stats = {
         "fanout_count": len(subtasks),
         "escalated_count": int(escalate_report["attempted"]),
         "escalation_rate": _coerce_ratio(int(escalate_report["attempted"]), len(subtasks)),
     }
-    result = synthesize_swarm(config, final_findings, stats, batch_fn)
+    result = synthesize_swarm(config, final_findings, stats, batch_fn, guardian_fn)
     result["decomposition"] = decomposition
     result["triage"] = triage
     result["tiers"] = {
         "cheap": cheap_report,
         "escalate": escalate_report,
     }
+    if int(config.self_consistency_samples or 1) > 1:
+        result["tiers"]["self_consistency"] = seed["self_consistency_report"]
     result["lineage"] = [asdict(item) for item in final_findings]
     return result
 
@@ -646,6 +1186,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     ap.add_argument("--fanout-count", type=int, default=20)
     ap.add_argument(
+        "--seeds",
+        type=int,
+        default=1,
+        help="Independent swarm seeds to run in parallel before one merged synthesis. Default: 1",
+    )
+    ap.add_argument(
         "--escalate-confidences",
         default="low",
         help="Comma-separated confidences that force escalation. Default: low",
@@ -653,6 +1199,47 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--subtasks-file", help="JSON array or newline-delimited subtasks.")
     ap.add_argument("--subtask", action="append", default=[], help="Repeatable pre-supplied subtask.")
     ap.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+    ap.add_argument(
+        "--synthesize-think",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable Ollama reasoning ('think') for the single synthesis call, at a much "
+            "larger token budget, with automatic fallback to a normal call if the "
+            "reasoning attempt returns empty/unparseable. Default: env "
+            "LOCI_SWARM_SYNTHESIZE_THINK, else off."
+        ),
+    )
+    ap.add_argument(
+        "--safety-check",
+        action="store_true",
+        default=None,
+        help=(
+            "Opt into an advisory Granite Guardian annotation on the final summary. "
+            "Never blocks, drops, or rewrites findings. Default: env LOCI_SWARM_SAFETY_CHECK, else off."
+        ),
+    )
+    ap.add_argument(
+        "--self-consistency-samples",
+        type=int,
+        default=1,
+        help=(
+            "Opt into cheap-tier self-consistency for low-confidence subtasks before "
+            "escalation. 1 preserves current behavior."
+        ),
+    )
+    ap.add_argument(
+        "--escalate-with-prior-context",
+        action="store_true",
+        default=False,
+        help="Include the weaker cheap-tier answer in escalation prompts for critique-and-improve.",
+    )
+    ap.add_argument(
+        "--reduce-group-size",
+        type=int,
+        default=0,
+        help="Opt into hierarchical synthesis reduce groups. 0 preserves current flat synthesis.",
+    )
     return ap.parse_args(argv)
 
 
@@ -660,7 +1247,7 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
     supplied = list(args.subtask or [])
     if args.subtasks_file:
         supplied.extend(_load_subtasks_file(args.subtasks_file))
-    return SwarmConfig(
+    kwargs = dict(
         topic=args.topic,
         cheap_model=args.cheap_model,
         escalate_model=args.escalate_model,
@@ -668,8 +1255,17 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
         decompose_model=args.decompose_model,
         subtasks=supplied or None,
         fanout_count=max(1, int(args.fanout_count)),
+        seeds=max(1, int(args.seeds)),
         escalate_confidences=_split_csv(args.escalate_confidences) or ("low",),
+        self_consistency_samples=max(1, int(args.self_consistency_samples)),
+        escalate_with_prior_context=bool(args.escalate_with_prior_context),
+        reduce_group_size=max(0, int(args.reduce_group_size)),
     )
+    if args.synthesize_think is not None:
+        kwargs["synthesize_think"] = bool(args.synthesize_think)
+    if args.safety_check is not None:
+        kwargs["safety_check"] = bool(args.safety_check)
+    return SwarmConfig(**kwargs)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

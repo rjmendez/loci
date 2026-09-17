@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import math
 import pathlib
+import re
 import sys
+import time
 
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -31,7 +34,7 @@ def _assert_valid(result: dict) -> None:
 def test_swarm_normal_flow_with_escalation():
     calls = []
 
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         calls.append((model, list(prompts)))
         if model == "planner-model:latest":
             return [{
@@ -74,7 +77,7 @@ def test_swarm_normal_flow_with_escalation():
 def test_swarm_all_cheap_success_no_escalation():
     calls = []
 
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         calls.append((model, list(prompts)))
         if model == "cheap-model:latest":
             return [
@@ -97,7 +100,7 @@ def test_swarm_all_cheap_success_no_escalation():
 
 
 def test_dead_cheap_tier_fails_open_with_valid_result():
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "planner-model:latest":
             return [{"ok": True, "text": '{"subtasks":["Check auth","Check cache"]}'}]
         if model == "cheap-model:latest":
@@ -123,7 +126,7 @@ def test_dead_cheap_tier_fails_open_with_valid_result():
 
 
 def test_escalation_rate_computed_correctly():
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "cheap-model:latest":
             return [
                 {"ok": True, "text": '{"answer":"A","confidence":"high"}'},
@@ -148,7 +151,7 @@ def test_schema_validation_catches_shape_errors_and_passes_real_result():
     errors = S.validate_swarm_result({"schema_version": 2, "topic": "", "findings": [], "summary": "", "stats": {}})
     assert errors
 
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "cheap-model:latest":
             return [{"ok": True, "text": '{"answer":"Done","confidence":"high"}'}]
         if model == "synth-model:latest":
@@ -171,7 +174,7 @@ def test_huge_subtasks_are_truncated_in_prompts_not_in_returned_findings():
     huge_subtask = "DIFF CONTEXT " + ("x" * 5000)
     seen_prompts = {"cheap": [], "synth": []}
 
-    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "cheap-model:latest":
             seen_prompts["cheap"].extend(prompts)
             return [{"ok": True, "text": '{"answer":"Looks fine.","confidence":"high"}'} for _ in prompts]
@@ -196,3 +199,263 @@ def test_huge_subtasks_are_truncated_in_prompts_not_in_returned_findings():
     assert result["findings"][0]["subtask"] == huge_subtask
     assert result["findings"][0]["answer"] == "Looks fine."
 
+
+def _seed_from_prompt(prompt: str) -> int:
+    match = re.search(r"Independent seed:\s*(\d+)/", prompt)
+    assert match, prompt
+    return int(match.group(1))
+
+
+def test_multi_seed_dispatches_seed_rounds_concurrently():
+    planner_calls = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            planner_calls.append(seed)
+            time.sleep(0.25)
+            return [{"ok": True, "text": f'{{"subtasks":["seed {seed} task"]}}'}]
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"done","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"multi-seed ok"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(fanout_count=1)
+    config.seeds = 4
+
+    start = time.perf_counter()
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+    elapsed = time.perf_counter() - start
+
+    _assert_valid(result)
+    assert elapsed < 0.65, f"expected concurrent seeds, took {elapsed:.2f}s"
+    assert sorted(planner_calls) == [1, 2, 3, 4]
+    assert result["multi_seed"]["completed_seeds"] == 4
+    assert result["summary"] == "multi-seed ok"
+
+
+def test_multi_seed_seed_failure_does_not_sink_run(monkeypatch):
+    original = S._run_single_seed
+
+    def _patched(config, batch_fn, *, seed_index=0, seed_count=1):
+        if seed_index == 1:
+            raise RuntimeError("seed exploded")
+        return original(config, batch_fn, seed_index=seed_index, seed_count=seed_count)
+
+    monkeypatch.setattr(S, "_run_single_seed", _patched)
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            return [{"ok": True, "text": f'{{"subtasks":["seed {seed} task"]}}'}]
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"done","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"survived one dead seed"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(fanout_count=1)
+    config.seeds = 3
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["degraded"] is False
+    assert result["summary"] == "survived one dead seed"
+    assert result["multi_seed"]["completed_seeds"] == 2
+    assert result["multi_seed"]["failed_seeds"] == 1
+    assert result["multi_seed"]["errors"][0]["seed"] == 1
+    assert len(result["findings"]) == 2
+
+
+def test_multi_seed_dedupes_findings_and_bounds_synthesis_prompt():
+    seen_synth_prompts = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            subtasks = ["common task"] + [f"seed {seed} task {idx}" for idx in range(1, 12)]
+            return [{"ok": True, "text": json.dumps({"subtasks": subtasks})}]
+        if model == "cheap-model:latest":
+            rows = []
+            for prompt in prompts:
+                if "Subtask: common task" in prompt:
+                    answer = "shared answer " + ("x" * 1200)
+                else:
+                    match = re.search(r"Subtask:\s*(seed \d+ task \d+)", prompt)
+                    assert match, prompt
+                    answer = (match.group(1) + " -> " + ("y" * 1200))
+                rows.append({"ok": True, "text": json.dumps({"answer": answer, "confidence": "high"})})
+            return rows
+        if model == "synth-model:latest":
+            seen_synth_prompts.extend(prompts)
+            return [{"ok": True, "text": '{"summary":"bounded multi-seed synthesis"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(fanout_count=12)
+    config.seeds = 3
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["summary"] == "bounded multi-seed synthesis"
+    assert result["multi_seed"]["merge"]["input_count"] == 36
+    assert result["multi_seed"]["merge"]["deduped_count"] == 2
+    assert result["multi_seed"]["merge"]["merged_count"] == 34
+    assert result["multi_seed"]["synthesis_input"]["dropped_count"] > 0
+    assert len(seen_synth_prompts[0]) < 21000
+    assert result["stats"]["fanout_count"] == 34
+
+
+def test_safety_check_default_preserves_swarm_result_shape():
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"Safe answer.","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Safe synthesis."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    def _guardian(_text):  # pragma: no cover - must not be called
+        raise AssertionError("guardian should not run by default")
+
+    result = S.run_swarm(
+        _config(subtasks=["check safety"], fanout_count=1),
+        deps={"generate_batch": _generate_batch, "guardian_check": _guardian},
+    )
+
+    _assert_valid(result)
+    assert "safety_flag" not in result
+    assert result["findings"][0]["answer"] == "Safe answer."
+
+
+def test_safety_check_adds_advisory_swarm_annotation_without_rewriting_summary():
+    seen = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"Keep the finding.","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Quoted attack text remains evidence."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    def _guardian(text):
+        seen.append(text)
+        return {"flagged": True, "verdict": "Yes", "ok": True, "error": None}
+
+    config = _config(subtasks=["check quoted attack text"], fanout_count=1)
+    config.safety_check = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch, "guardian_check": _guardian})
+
+    _assert_valid(result)
+    assert seen == ["Quoted attack text remains evidence."]
+    assert result["summary"] == "Quoted attack text remains evidence."
+    assert result["findings"][0]["answer"] == "Keep the finding."
+    assert result["safety_flag"] == {"flagged": True, "why": "guardian verdict Yes"}
+
+
+def test_safety_check_guardian_errors_fail_open_for_swarm():
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"Safe answer.","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Safe synthesis."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    def _guardian(_text):
+        raise RuntimeError("guardian offline")
+
+    config = _config(subtasks=["check safety"], fanout_count=1)
+    config.safety_check = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch, "guardian_check": _guardian})
+
+    _assert_valid(result)
+    assert result["summary"] == "Safe synthesis."
+    assert result["safety_flag"]["flagged"] is False
+    assert "failed open" in result["safety_flag"]["why"]
+
+
+def test_self_consistency_majority_replaces_low_confidence_before_escalation():
+    cheap_calls = 0
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        nonlocal cheap_calls
+        if model == "cheap-model:latest":
+            cheap_calls += 1
+            if cheap_calls == 1:
+                return [{"ok": True, "text": '{"answer":"uncertain draft","confidence":"low"}'}]
+            assert len(prompts) == 3
+            return [
+                {"ok": True, "text": '{"answer":"majority answer","confidence":"high"}'},
+                {"ok": True, "text": '{"answer":"minority answer","confidence":"low"}'},
+                {"ok": True, "text": '{"answer":"majority answer","confidence":"high"}'},
+            ]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Self-consistency avoided escalation."}'}]
+        if model == "strong-model:latest":  # pragma: no cover - must not be called
+            raise AssertionError("majority high-confidence answer should avoid escalation")
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["low confidence subtask"], fanout_count=1)
+    config.self_consistency_samples = 3
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["findings"][0]["answer"] == "majority answer"
+    assert result["stats"]["escalated_count"] == 0
+    assert result["tiers"]["self_consistency"]["attempted"] == 1
+    assert result["tiers"]["self_consistency"]["majority"] == 1
+
+
+def test_escalate_with_prior_context_includes_cheap_answer_in_prompt():
+    captured = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"cheap weaker draft","confidence":"low"}'}]
+        if model == "strong-model:latest":
+            captured.extend(prompts)
+            return [{"ok": True, "text": '{"answer":"improved strong answer","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"Prior-aware escalation succeeded."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["critique this"], fanout_count=1)
+    config.escalate_with_prior_context = True
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["findings"][0]["answer"] == "improved strong answer"
+    assert "PRIOR_WEAK_ANSWER: cheap weaker draft" in captured[0]
+    assert "Critique" in captured[0] or "critique" in captured[0]
+
+
+def test_hierarchical_reduce_groups_findings_and_fails_open_per_group():
+    final_prompts = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [
+                {"ok": True, "text": json.dumps({"answer": f"answer {idx}", "confidence": "high"})}
+                for idx, _ in enumerate(prompts)
+            ]
+        if model == "synth-model:latest" and len(prompts) == 3:
+            return [
+                {"ok": True, "text": '{"summary":"group one summary","confidence":"high"}'},
+                {"ok": False, "text": "", "why": "group model failed"},
+                {"ok": True, "text": '{"summary":"group three summary","confidence":"medium"}'},
+            ]
+        if model == "synth-model:latest":
+            final_prompts.extend(prompts)
+            return [{"ok": True, "text": '{"summary":"Reduced synthesis complete."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=[f"task {idx}" for idx in range(5)], fanout_count=5)
+    config.reduce_group_size = 2
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert result["summary"] == "Reduced synthesis complete."
+    assert result["synthesis"]["reduce"]["group_count"] == 3
+    assert result["synthesis"]["reduce"]["failed_open"] == 1
+    assert "group one summary" in final_prompts[0]
+    assert "Reduced finding group 2" in final_prompts[0]
+    assert len(result["findings"]) == 5

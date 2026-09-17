@@ -50,24 +50,36 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
     out = json.loads(server.swarm_reason(
         "why is auth failing",
         fanout_count=7,
+        seeds=3,
         cheap_model="cheap-x",
         escalate_model="strong-y",
         synthesize_model="synth-z",
         decompose_model="decomp-a",
         subtasks=["check auth", "check logs"],
         escalate_confidences=["low", "medium"],
+        synthesize_think=True,
+        safety_check=True,
+        self_consistency_samples=3,
+        escalate_with_prior_context=True,
+        reduce_group_size=8,
     ))
 
     assert out["summary"] == "auth is enabled"
     assert captured["deps"] is None
     assert captured["config"].topic == "why is auth failing"
     assert captured["config"].fanout_count == 7
+    assert captured["config"].seeds == 3
     assert captured["config"].cheap_model == "cheap-x"
     assert captured["config"].escalate_model == "strong-y"
     assert captured["config"].synthesize_model == "synth-z"
     assert captured["config"].decompose_model == "decomp-a"
     assert captured["config"].subtasks == ["check auth", "check logs"]
     assert captured["config"].escalate_confidences == ("low", "medium")
+    assert captured["config"].synthesize_think is True
+    assert captured["config"].safety_check is True
+    assert captured["config"].self_consistency_samples == 3
+    assert captured["config"].escalate_with_prior_context is True
+    assert captured["config"].reduce_group_size == 8
 
 
 def test_swarm_reason_fails_open_on_wrapper_exception(monkeypatch):
