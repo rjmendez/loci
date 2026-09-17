@@ -1006,7 +1006,7 @@ def supervise_and_correct(
                             gen_fn=gen_fn,
                             budget=budget_state,
                         )
-                    except BudgetExceeded as exc:
+                    except BudgetExceeded:
                         return {
                             "fail_open": False,
                             "budget_exceeded": True,
