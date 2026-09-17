@@ -24,6 +24,7 @@ ollama_cloud_models_cache.json
 
 # Runtime / generated
 cron/output/
+scripts/issue_proposals_dry_run_demo.jsonl
 skills/
 plugin-data/
 channel_directory.json

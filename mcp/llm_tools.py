@@ -319,7 +319,9 @@ def swarm_reason(topic: str,
                  synthesize_model: str = "",
                  decompose_model: str = "",
                  subtasks: Optional[list] = None,
-                 escalate_confidences: Optional[list] = None) -> str:
+                 escalate_confidences: Optional[list] = None,
+                 stigmergic_consensus: bool = False,
+                 stigmergic_ttl_minutes: float = 60.0) -> str:
     """
     Run the 4-stage local swarm reasoner: cheap fan-out, triage, selective
     escalation, then synthesis. Returns the structured JSON result with
@@ -343,6 +345,8 @@ def swarm_reason(topic: str,
                 for item in _coerce_labels(escalate_confidences or ("low",))
                 if str(item).strip()
             ) or ("low",),
+            stigmergic_consensus=bool(stigmergic_consensus),
+            stigmergic_ttl_minutes=max(0.0, float(stigmergic_ttl_minutes)),
         )
         result = swarm.run_swarm(config)
         errors = list(swarm.validate_swarm_result(result))
