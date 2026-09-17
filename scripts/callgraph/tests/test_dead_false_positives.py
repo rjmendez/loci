@@ -38,7 +38,7 @@ def test_no_registered_function_is_ever_reported_dead(head_build):
     1 resource, 1 custom_route = 96 registered functions. None may be dead."""
     store = head_build.store
     registered = {e.dst for e in store.edges_of_kind("REGISTERS")}
-    assert len(registered) == 96, f"registration surface changed: {len(registered)}"
+    assert len(registered) == 97, f"registration surface changed: {len(registered)}"
 
     offenders = registered_but_dead(store)
     assert offenders == [], (
@@ -60,7 +60,7 @@ def test_mcp_tool_and_manifest_surfaces_specifically(head_build):
                 and src.attrs.get("mechanism") == "manifest-tuple"}
 
     assert len(tools) == 43, f"@mcp.tool() count changed: {len(tools)}"
-    assert len(manifest) == 32, f"register() manifest count changed: {len(manifest)}"
+    assert len(manifest) == 33, f"register() manifest count changed: {len(manifest)}"
     assert tools & dead_ids == set()
     assert manifest & dead_ids == set()
 
