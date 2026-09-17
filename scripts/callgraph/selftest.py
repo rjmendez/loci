@@ -310,7 +310,7 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 150, result.meta.file_count  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148 -> 149: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor, bench-local-models, provenance-firewall, adversarial-review
+    assert result.meta.file_count == 151, result.meta.file_count  # ...149 -> 150 -> 151: ...bench-model-catalog-quality, adversarial-review
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]
@@ -319,7 +319,7 @@ def _check_real_corpus():
     assert by_rule["DEC-tool"] == 44, dict(by_rule)
     assert by_rule["DEC-route"] == 6, dict(by_rule)
     assert by_rule["DEC-mcp-route"] == 1, dict(by_rule)
-    assert by_rule["MAN-LOOP"] == 33, dict(by_rule)
+    assert by_rule["MAN-LOOP"] == 32, dict(by_rule)
     assert by_rule["MAN-DICT"] == 13, dict(by_rule)
     unmatched = [e for e in store.edges_of_kind("DECORATED_BY") if e.attrs["classification"] == "unknown"]
     assert unmatched == [], [(e.src, e.attrs["raw"]) for e in unmatched]

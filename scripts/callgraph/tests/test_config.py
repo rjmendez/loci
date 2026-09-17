@@ -1,22 +1,17 @@
 """config.py against the REAL repo: acceptance criterion is an exact file
-count (150), not a vibe. If this drifts, either the repo changed shape or
+count (151), not a vibe. If this drifts, either the repo changed shape or
 the exclusion rules regressed — both worth failing loudly on."""
 
 from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 from .. import config
 
 
-def test_corpus_is_exactly_150_files():
-    """127 -> 128 -> 129 -> 130 -> 131 -> 132 -> 133 -> ... -> 140 -> 141 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148 -> 149 -> 150:
-    memory-integrity audit test, mcp/compact.py, deploy script, A/B eval
-    script, prefilter script, mcp/guardian.py (Granite Guardian semantic
-    injection-risk classification), scripts/redteam/loci_adversarial_harness.py
-    (sandboxed PyRIT red-team harness), scripts/issue_proposer.py (guarded
-    reflection-loop issue proposer), scripts/stigmergic_consensus.py
-    (opt-in stigmergic consensus gate for swarm findings), then
-    scripts/model_catalog.py (specialist model catalog)."""
+def test_corpus_is_exactly_151_files():
+    """127 -> ... -> 149 -> 150 -> 151: ...then mcp/adversarial.py
+    (adversarial red-team review tool) and scripts/bench_model_catalog_quality.py
+    (quality-first local-model catalog benchmark)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 150, sorted(files)
+    assert len(files) == 151, sorted(files)
 
 
 def test_corpus_excludes_test_directories():

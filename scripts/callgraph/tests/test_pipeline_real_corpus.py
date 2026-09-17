@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 150  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148 -> 149: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor, bench-local-models, provenance-firewall, adversarial-review
+    assert head_build.meta.file_count == 151  # ...149 -> 150 -> 151: ...bench-model-catalog-quality, adversarial-review
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -199,7 +199,7 @@ def test_registry_counts_match_the_real_corpus(head_build):
     assert by_rule["DEC-tool"] == 44
     assert by_rule["DEC-route"] == 6         # a2a_server's @app.get/@app.post
     assert by_rule["DEC-mcp-route"] == 1     # mcp/server.py's @mcp.custom_route("/health", ...)
-    assert by_rule["MAN-LOOP"] == 33         # graph_tools(11) + investigation_tools(11) + llm_tools(11)
+    assert by_rule["MAN-LOOP"] == 32         # graph_tools(11) + investigation_tools(11) + llm_tools(10)
     assert by_rule["MAN-DICT"] == 13         # a2a_server's _SKILL_MAP
 
 
