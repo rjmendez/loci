@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import math
+import threading
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
@@ -17,6 +20,129 @@ GenFn = Callable[..., Any]
 EvidenceFn = Callable[..., Any]
 WorkerFn = Callable[..., Any]
 DEFAULT_MAX_TREE_NODES = 25
+
+
+class BudgetExceeded(RuntimeError):
+    """Internal control-flow signal for clean supervisor budget aborts."""
+
+
+@dataclass
+class SupervisorBudget:
+    max_calls: int | None = None
+    max_tokens: int | None = None
+    max_cost_usd: float | None = None
+    usd_per_1k_tokens: float = 0.0
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": round(self.cost_usd, 8),
+            "max_calls": self.max_calls,
+            "max_tokens": self.max_tokens,
+            "max_cost_usd": self.max_cost_usd,
+        }
+
+    def charge_call(self, *, prompt: str, max_completion_tokens: int) -> None:
+        prompt_tokens = _estimate_tokens(prompt)
+        reserve_tokens = max(0, int(max_completion_tokens))
+        with self._lock:
+            next_calls = self.calls + 1
+            next_tokens = self.total_tokens + prompt_tokens + reserve_tokens
+            next_cost = self._cost_for_tokens(next_tokens)
+            if self.max_calls is not None and next_calls > self.max_calls:
+                raise BudgetExceeded(f"supervisor call budget exceeded: {next_calls}>{self.max_calls}")
+            if self.max_tokens is not None and next_tokens > self.max_tokens:
+                raise BudgetExceeded(f"supervisor token budget exceeded: {next_tokens}>{self.max_tokens}")
+            if self.max_cost_usd is not None and next_cost > self.max_cost_usd:
+                raise BudgetExceeded(f"supervisor cost budget exceeded: {next_cost:.6f}>{self.max_cost_usd:.6f}")
+            self.calls = next_calls
+            self.prompt_tokens += prompt_tokens
+
+    def charge_completion(self, raw: Any, text: str) -> None:
+        completion_tokens = _usage_tokens(raw, "completion") or _estimate_tokens(text)
+        with self._lock:
+            self.completion_tokens += max(0, completion_tokens)
+            self.cost_usd = self._cost_for_tokens(self.total_tokens)
+            if self.max_tokens is not None and self.total_tokens > self.max_tokens:
+                raise BudgetExceeded(f"supervisor token budget exceeded after completion: {self.total_tokens}>{self.max_tokens}")
+            if self.max_cost_usd is not None and self.cost_usd > self.max_cost_usd:
+                raise BudgetExceeded(f"supervisor cost budget exceeded after completion: {self.cost_usd:.6f}>{self.max_cost_usd:.6f}")
+
+    def _cost_for_tokens(self, tokens: int) -> float:
+        return (tokens / 1000.0) * max(0.0, float(self.usd_per_1k_tokens or 0.0))
+
+
+def _estimate_tokens(text: str) -> int:
+    clean = str(text or "")
+    if not clean:
+        return 0
+    return max(1, math.ceil(len(clean) / 4))
+
+
+def _usage_tokens(raw: Any, kind: str) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else raw
+    keys = (
+        ("completion_tokens", "output_tokens", "eval_count", "response_tokens")
+        if kind == "completion"
+        else ("prompt_tokens", "input_tokens", "prompt_eval_count")
+    )
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    return None
+
+
+def _budget_payload(budget: SupervisorBudget | None) -> dict[str, Any] | None:
+    return budget.snapshot() if budget is not None else None
+
+
+def _coerce_budget(
+    budget: SupervisorBudget | dict[str, Any] | None = None,
+    *,
+    max_calls: int | None = None,
+    max_tokens: int | None = None,
+    max_cost_usd: float | None = None,
+    usd_per_1k_tokens: float = 0.0,
+) -> SupervisorBudget | None:
+    if isinstance(budget, SupervisorBudget):
+        return budget
+    values: dict[str, Any] = {}
+    if isinstance(budget, dict):
+        values.update(budget)
+    if max_calls is not None:
+        values["max_calls"] = max_calls
+    if max_tokens is not None:
+        values["max_tokens"] = max_tokens
+    if max_cost_usd is not None:
+        values["max_cost_usd"] = max_cost_usd
+    if usd_per_1k_tokens:
+        values["usd_per_1k_tokens"] = usd_per_1k_tokens
+    limits = {key: values.get(key) for key in ("max_calls", "max_tokens", "max_cost_usd")}
+    if all(value is None for value in limits.values()):
+        return None
+    return SupervisorBudget(
+        max_calls=None if values.get("max_calls") is None else int(values["max_calls"]),
+        max_tokens=None if values.get("max_tokens") is None else int(values["max_tokens"]),
+        max_cost_usd=None if values.get("max_cost_usd") is None else float(values["max_cost_usd"]),
+        usd_per_1k_tokens=float(values.get("usd_per_1k_tokens") or 0.0),
+    )
 
 
 def _json_default(obj: Any) -> str:
@@ -51,7 +177,16 @@ def _safe_sources(available_sources: list[dict[str, Any]]) -> list[dict[str, str
     return out
 
 
-def _call_generate(gen_fn: GenFn, prompt: str, *, max_tokens: int = 1200, temperature: float = 0.1) -> Any:
+def _call_generate(
+    gen_fn: GenFn,
+    prompt: str,
+    *,
+    max_tokens: int = 1200,
+    temperature: float = 0.1,
+    budget: SupervisorBudget | None = None,
+) -> Any:
+    if budget is not None:
+        budget.charge_call(prompt=prompt, max_completion_tokens=max_tokens)
     attempts = (
         {"prompt": prompt, "fmt": "json", "max_tokens": max_tokens, "temperature": temperature},
         {"prompt": prompt, "format": "json", "max_tokens": max_tokens, "temperature": temperature},
@@ -60,9 +195,14 @@ def _call_generate(gen_fn: GenFn, prompt: str, *, max_tokens: int = 1200, temper
     )
     for kwargs in attempts:
         try:
-            return gen_fn(**kwargs)
+            raw = gen_fn(**kwargs)
+            if budget is not None:
+                budget.charge_completion(raw, _response_text(raw))
+            return raw
         except TypeError:
             continue
+        except BudgetExceeded:
+            raise
         except Exception as exc:
             return {"ok": False, "text": "", "error": str(exc)}
     return {"ok": False, "text": "", "error": "generate signature mismatch"}
@@ -221,6 +361,7 @@ def _expand_node(
     gen_fn: GenFn,
     depth_remaining: int,
     node_budget: int,
+    budget: SupervisorBudget | None = None,
 ) -> tuple[dict[str, Any], int]:
     if depth_remaining <= 1 or node_budget <= 1:
         return dict(node), 1
@@ -246,7 +387,7 @@ Task: {task}
 Available sources: {_json_default(safe_sources)}
 Node to expand: {_json_default(node)}
 """
-    raw = _call_generate(gen_fn, prompt, max_tokens=1200, temperature=0.1)
+    raw = _call_generate(gen_fn, prompt, max_tokens=1200, temperature=0.1, budget=budget)
     expanded = _normalize_node(_extract_json(_response_text(raw)), allow_nested=True)
     if expanded is None:
         raise ValueError("expanded node was unusable")
@@ -266,6 +407,7 @@ Node to expand: {_json_default(node)}
                     gen_fn=gen_fn,
                     depth_remaining=depth_remaining - 1,
                     node_budget=per_child_budget,
+                    budget=budget,
                 ): idx
                 for idx, child in enumerate(children)
             }
@@ -337,6 +479,11 @@ def plan_source_routing(
     max_depth: int = 1,
     *,
     max_nodes: int = DEFAULT_MAX_TREE_NODES,
+    budget: SupervisorBudget | dict[str, Any] | None = None,
+    max_calls: int | None = None,
+    max_tokens: int | None = None,
+    max_cost_usd: float | None = None,
+    usd_per_1k_tokens: float = 0.0,
 ) -> dict[str, Any]:
     """Return a structured source-routing decision tree for a task.
 
@@ -344,6 +491,13 @@ def plan_source_routing(
     expand each flat node through separate concurrent model calls, and fail open
     back to that flat plan if recursive expansion degrades.
     """
+    budget_state = _coerce_budget(
+        budget,
+        max_calls=max_calls,
+        max_tokens=max_tokens,
+        max_cost_usd=max_cost_usd,
+        usd_per_1k_tokens=usd_per_1k_tokens,
+    )
     safe_sources = _safe_sources(available_sources)
     prompt = f"""You are a supervisor/orchestrator planning source use before workers start.
 Return ONLY valid JSON with this schema:
@@ -364,10 +518,18 @@ Rules:
 Task: {task}
 Available sources: {_json_default(safe_sources)}
 """
-    raw = _call_generate(gen_fn, prompt, max_tokens=1300, temperature=0.1)
+    try:
+        raw = _call_generate(gen_fn, prompt, max_tokens=1300, temperature=0.1, budget=budget_state)
+    except BudgetExceeded as exc:
+        plan = _default_routing_plan(task, safe_sources, f"budget exceeded before supervisor routing: {exc}")
+        plan["budget_exceeded"] = True
+        plan["budget"] = _budget_payload(budget_state)
+        return plan
     try:
         obj = _extract_json(_response_text(raw))
         flat_plan = _normalize_routing_plan(obj, task, safe_sources)
+        if budget_state is not None:
+            flat_plan["budget"] = _budget_payload(budget_state)
         depth = max(1, int(max_depth))
         if depth <= 1:
             return flat_plan
@@ -387,6 +549,7 @@ Available sources: {_json_default(safe_sources)}
                         gen_fn=gen_fn,
                         depth_remaining=depth,
                         node_budget=per_node_budget,
+                        budget=budget_state,
                     ): idx
                     for idx, node in enumerate(flat_plan["decision_tree"])
                 }
@@ -398,10 +561,21 @@ Available sources: {_json_default(safe_sources)}
                 raise ValueError("expanded routing tree exceeds node cap")
             expanded_plan = dict(flat_plan)
             expanded_plan["decision_tree"] = tree
+            if budget_state is not None:
+                expanded_plan["budget"] = _budget_payload(budget_state)
             return expanded_plan
+        except BudgetExceeded as exc:
+            flat_copy = dict(flat_plan)
+            flat_copy["fail_open"] = True
+            flat_copy["budget_exceeded"] = True
+            flat_copy["budget"] = _budget_payload(budget_state)
+            flat_copy["source_policy"] = str(flat_copy.get("source_policy") or "") + f" Recursive expansion stopped by budget: {exc}"
+            return flat_copy
         except Exception:
             flat_copy = dict(flat_plan)
             flat_copy["fail_open"] = True
+            if budget_state is not None:
+                flat_copy["budget"] = _budget_payload(budget_state)
             flat_copy["source_policy"] = str(flat_copy.get("source_policy") or "") + " Recursive expansion degraded; using flat routing plan."
             return flat_copy
     except Exception as exc:
@@ -434,6 +608,26 @@ def _apply_evidence_verdict(verdict: dict[str, Any], _finding: dict[str, Any], e
         prior = str(updated.get("rationale") or "").strip()
         updated["rationale"] = f"{prior}; evidence_fn: {rationale}" if prior else f"evidence_fn: {rationale}"
     updated["evidence_checked"] = True
+    return updated
+
+
+def _apply_tripwire(result: dict[str, Any]) -> dict[str, Any]:
+    tripped = False
+    verdicts: list[dict[str, Any]] = []
+    for verdict in result.get("verdicts") or []:
+        item = dict(verdict)
+        if bool(item.get("evidence_checked")) and not bool(item.get("supported", True)):
+            item["tripwire_triggered"] = True
+            item["hard_fail"] = True
+            if not item.get("guidance"):
+                item["guidance"] = "Strict supervisor tripwire: unsupported finding must not be emitted."
+            tripped = True
+        verdicts.append(item)
+    updated = dict(result)
+    updated["verdicts"] = verdicts
+    if tripped:
+        updated["tripwire_triggered"] = True
+        updated["hard_fail"] = True
     return updated
 
 
@@ -473,8 +667,22 @@ def supervise_findings(
     routing_plan: dict[str, Any],
     gen_fn: GenFn,
     evidence_fn: EvidenceFn | None = None,
+    *,
+    strict_tripwire: bool = False,
+    budget: SupervisorBudget | dict[str, Any] | None = None,
+    max_calls: int | None = None,
+    max_tokens: int | None = None,
+    max_cost_usd: float | None = None,
+    usd_per_1k_tokens: float = 0.0,
 ) -> dict[str, Any]:
     """Return advisory per-finding verdicts against task, evidence, and routing plan."""
+    budget_state = _coerce_budget(
+        budget,
+        max_calls=max_calls,
+        max_tokens=max_tokens,
+        max_cost_usd=max_cost_usd,
+        usd_per_1k_tokens=usd_per_1k_tokens,
+    )
     safe_findings = [finding for finding in (findings or []) if isinstance(finding, dict)]
     prompt = f"""You are a supervisor monitoring worker findings mid-run.
 Return ONLY valid JSON with this schema:
@@ -493,10 +701,18 @@ Task: {task}
 Routing plan: {_json_default(routing_plan)}
 Findings: {_json_default(safe_findings)}
 """
-    raw = _call_generate(gen_fn, prompt, max_tokens=1600, temperature=0.0)
+    try:
+        raw = _call_generate(gen_fn, prompt, max_tokens=1600, temperature=0.0, budget=budget_state)
+    except BudgetExceeded as exc:
+        result = _neutral_verdicts(safe_findings, f"supervisor budget exceeded: {exc}")
+        result["budget_exceeded"] = True
+        result["budget"] = _budget_payload(budget_state)
+        return result
     try:
         obj = _extract_json(_response_text(raw))
         result = _normalize_supervision(obj, safe_findings)
+        if budget_state is not None:
+            result["budget"] = _budget_payload(budget_state)
         if evidence_fn is None:
             return result
         verdicts = []
@@ -508,6 +724,8 @@ Findings: {_json_default(safe_findings)}
             verdicts.append(_apply_evidence_verdict(verdict, finding, evidence_result))
         result["verdicts"] = verdicts
         result["evidence_grounded"] = True
+        if strict_tripwire:
+            result = _apply_tripwire(result)
         return result
     except Exception as exc:
         return _neutral_verdicts(safe_findings, f"supervisor review degraded: {exc}")
@@ -515,6 +733,87 @@ Findings: {_json_default(safe_findings)}
 
 def _verdict_clean(verdict: dict[str, Any]) -> bool:
     return all(bool(verdict.get(key, True)) for key in ("on_task", "supported", "source_appropriate"))
+
+
+def _text_signature(finding: dict[str, Any]) -> str:
+    parts = [
+        str(finding.get("source") or ""),
+        str(finding.get("sub_need") or ""),
+        str(finding.get("claim") or finding.get("text") or ""),
+        str(finding.get("evidence") or finding.get("context") or ""),
+    ]
+    return " ".join(part.strip().lower() for part in parts if part.strip())
+
+
+def _token_set(text: str) -> set[str]:
+    return {token for token in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split() if len(token) > 2}
+
+
+def _materially_different(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if before == after:
+        return False
+    if str(before.get("source") or "").strip().lower() != str(after.get("source") or "").strip().lower():
+        return True
+    before_text = _text_signature(before)
+    after_text = _text_signature(after)
+    if before_text == after_text:
+        return False
+    a = _token_set(before_text)
+    b = _token_set(after_text)
+    if not a or not b:
+        return before_text != after_text
+    overlap = len(a & b) / max(1, len(a | b))
+    return overlap < 0.82 or abs(len(after_text) - len(before_text)) > 40
+
+
+def _replan_after_stall(
+    *,
+    task: str,
+    routing_plan: dict[str, Any],
+    failing_finding: dict[str, Any],
+    verdict: dict[str, Any],
+    gen_fn: GenFn,
+    budget: SupervisorBudget | None = None,
+) -> dict[str, Any]:
+    prompt = f"""You are a supervisor rewriting a stalled task ledger at a higher abstraction level.
+Return ONLY valid JSON with this schema:
+{{
+  "task": string,
+  "fail_open": false,
+  "decision_tree": [{{"sub_need": string, "preferred_sources": [string], "fallback_sources": [string], "rationale": string}}],
+  "assignments": [{{"sub_need": string, "source": string, "rationale": string}}],
+  "source_policy": string,
+  "root_cause": string
+}}
+
+The previous correction loop repeated without material progress. Rewrite the plan
+so the next worker gets a higher-level instruction that addresses the root cause,
+not the same low-level retry.
+
+Task: {task}
+Prior routing plan: {_json_default(routing_plan)}
+Stalled finding: {_json_default(failing_finding)}
+Supervisor verdict: {_json_default(verdict)}
+"""
+    raw = _call_generate(gen_fn, prompt, max_tokens=1300, temperature=0.0, budget=budget)
+    obj = _extract_json(_response_text(raw))
+    replanned = _normalize_routing_plan(obj, task, [], allow_nested=True)
+    replanned["replanned"] = True
+    replanned["root_cause"] = str(obj.get("root_cause") or verdict.get("rationale") or "repeated correction produced no material progress")
+    return replanned
+
+
+def _fallback_replan(task: str, routing_plan: dict[str, Any], verdict: dict[str, Any], why: str) -> dict[str, Any]:
+    plan = dict(routing_plan or {})
+    plan.setdefault("task", task)
+    plan["replanned"] = True
+    plan["fail_open"] = True
+    plan["root_cause"] = str(verdict.get("rationale") or "repeated correction produced no material progress")
+    plan["source_policy"] = (
+        str(plan.get("source_policy") or "")
+        + f" Stalled correction escalated to higher-level re-plan; replan degraded: {why}"
+    ).strip()
+    return plan
 
 
 def _flatten_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -572,23 +871,84 @@ def supervise_and_correct(
     worker_fn: WorkerFn,
     max_rounds: int = 2,
     evidence_fn: EvidenceFn | None = None,
+    *,
+    max_stalls: int = 2,
+    strict_tripwire: bool = False,
+    budget: SupervisorBudget | dict[str, Any] | None = None,
+    max_calls: int | None = None,
+    max_tokens: int | None = None,
+    max_cost_usd: float | None = None,
+    usd_per_1k_tokens: float = 0.0,
 ) -> dict[str, Any]:
     """Supervise, re-dispatch flagged findings, and return a visible audit trail.
 
     Any supervisor or worker failure fails open: original findings are returned
     untouched with ``fail_open=True`` instead of blocking or dropping work.
     """
+    budget_state = _coerce_budget(
+        budget,
+        max_calls=max_calls,
+        max_tokens=max_tokens,
+        max_cost_usd=max_cost_usd,
+        usd_per_1k_tokens=usd_per_1k_tokens,
+    )
     original_findings = [dict(finding) for finding in (findings or []) if isinstance(finding, dict)]
     current_findings = [dict(finding) for finding in original_findings]
+    active_routing_plan = dict(routing_plan or {})
+    stall_counts = [0 for _ in current_findings]
+    seen_signatures: list[set[str]] = [{_text_signature(finding)} for finding in current_findings]
     audit: list[dict[str, Any]] = [
         {"finding_index": idx, "original_finding": dict(finding), "rounds": [], "converged": False}
         for idx, finding in enumerate(original_findings)
     ]
     try:
         rounds = max(0, int(max_rounds))
-        verdict_result = supervise_findings(task, current_findings, routing_plan, gen_fn, evidence_fn=evidence_fn)
+        stalls_limit = max(1, int(max_stalls))
+        verdict_result = supervise_findings(
+            task,
+            current_findings,
+            active_routing_plan,
+            gen_fn,
+            evidence_fn=evidence_fn,
+            strict_tripwire=strict_tripwire,
+            budget=budget_state,
+        )
         for round_index in range(rounds + 1):
             verdicts = verdict_result["verdicts"]
+            if verdict_result.get("budget_exceeded"):
+                for idx in range(len(audit)):
+                    audit[idx]["budget_exceeded"] = True
+                return {
+                    "fail_open": False,
+                    "budget_exceeded": True,
+                    "budget": _budget_payload(budget_state),
+                    "findings": current_findings,
+                    "verdicts": verdicts,
+                    "audit_trail": audit,
+                    "converged": False,
+                    "rounds": round_index,
+                }
+            if strict_tripwire and verdict_result.get("tripwire_triggered"):
+                for idx, verdict in enumerate(verdicts):
+                    audit[idx]["rounds"].append({
+                        "round": round_index,
+                        "finding": dict(current_findings[idx]),
+                        "verdict": dict(verdict),
+                        "guidance": str(verdict.get("guidance") or ""),
+                        "tripwire_triggered": bool(verdict.get("tripwire_triggered")),
+                    })
+                    if verdict.get("tripwire_triggered"):
+                        audit[idx]["tripwire_triggered"] = True
+                return {
+                    "fail_open": False,
+                    "tripwire_triggered": True,
+                    "hard_fail": True,
+                    "findings": current_findings,
+                    "verdicts": verdicts,
+                    "audit_trail": audit,
+                    "converged": False,
+                    "rounds": round_index,
+                }
             flagged = [idx for idx, verdict in enumerate(verdicts) if not _verdict_clean(verdict)]
             for idx, verdict in enumerate(verdicts):
                 entry = {
@@ -615,7 +975,7 @@ def supervise_and_correct(
                         task=task,
                         finding=current_findings[idx],
                         guidance=str(verdicts[idx].get("guidance") or ""),
-                        routing_node=_routing_node_for_finding(current_findings[idx], routing_plan),
+                        routing_node=_routing_node_for_finding(current_findings[idx], active_routing_plan),
                         round_index=round_index + 1,
                     ): idx
                     for idx in flagged
@@ -623,10 +983,54 @@ def supervise_and_correct(
                 for fut in concurrent.futures.as_completed(futures):
                     corrected_by_index[futures[fut]] = fut.result()
             for idx, corrected in corrected_by_index.items():
+                before = current_findings[idx]
+                sig = _text_signature(corrected)
+                progressed = _materially_different(before, corrected) and sig not in seen_signatures[idx]
+                if progressed:
+                    stall_counts[idx] = max(0, stall_counts[idx] - 1)
+                else:
+                    stall_counts[idx] += 1
+                seen_signatures[idx].add(sig)
                 current_findings[idx] = corrected
                 audit[idx]["rounds"][-1]["corrected_finding"] = dict(corrected)
-                audit[idx]["rounds"][-1]["routing_node"] = _routing_node_for_finding(corrected, routing_plan)
-            verdict_result = supervise_findings(task, current_findings, routing_plan, gen_fn, evidence_fn=evidence_fn)
+                audit[idx]["rounds"][-1]["routing_node"] = _routing_node_for_finding(corrected, active_routing_plan)
+                audit[idx]["rounds"][-1]["progress_made"] = progressed
+                audit[idx]["rounds"][-1]["stall_count"] = stall_counts[idx]
+                if stall_counts[idx] >= stalls_limit:
+                    try:
+                        active_routing_plan = _replan_after_stall(
+                            task=task,
+                            routing_plan=active_routing_plan,
+                            failing_finding=corrected,
+                            verdict=verdicts[idx],
+                            gen_fn=gen_fn,
+                            budget=budget_state,
+                        )
+                    except BudgetExceeded:
+                        return {
+                            "fail_open": False,
+                            "budget_exceeded": True,
+                            "budget": _budget_payload(budget_state),
+                            "findings": current_findings,
+                            "verdicts": verdicts,
+                            "audit_trail": audit,
+                            "converged": False,
+                            "rounds": round_index,
+                        }
+                    except Exception as exc:
+                        active_routing_plan = _fallback_replan(task, active_routing_plan, verdicts[idx], str(exc))
+                    audit[idx]["rounds"][-1]["stalled"] = True
+                    audit[idx]["rounds"][-1]["replanned_routing_plan"] = dict(active_routing_plan)
+                    stall_counts[idx] = 0
+            verdict_result = supervise_findings(
+                task,
+                current_findings,
+                active_routing_plan,
+                gen_fn,
+                evidence_fn=evidence_fn,
+                strict_tripwire=strict_tripwire,
+                budget=budget_state,
+            )
     except Exception as exc:
         return {
             "fail_open": True,
