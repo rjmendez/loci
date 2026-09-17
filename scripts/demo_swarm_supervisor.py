@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.swarm_supervisor import plan_source_routing, supervise_and_correct  # noqa: E402
+from scripts.swarm_supervisor import make_loci_evidence_fn, plan_source_routing, supervise_and_correct  # noqa: E402
 
 OLLAMA_URL = "http://100.73.200.19:11434"
 DEFAULT_MODEL = os.environ.get("LOCI_SWARM_SUPERVISOR_MODEL", "llama3.1-agent:latest")
@@ -79,16 +79,18 @@ def main() -> int:
         "evidence": "Wikipedia background says it is common in North America; no local GPS/photo observation is cited.",
     }]
 
-    def evidence_fn(*, finding: dict[str, Any], **_: Any) -> dict[str, Any]:
-        source = str(finding.get("source") or "")
-        return {
-            "supported": source == "iNaturalist" and "INAT-EX-101" in str(finding.get("evidence") or ""),
-            "rationale": (
-                "stubbed iNaturalist evidence contains GPS/photo observation IDs"
-                if source == "iNaturalist"
-                else "stubbed evidence has no GPS/photo observation IDs; Wikipedia is background only"
-            ),
-        }
+    def loci_verify_fn(*, claim: str, context: str, **_: Any) -> dict[str, Any]:
+        _ = claim
+        source = "iNaturalist" if "INAT-EX-" in context else "Wikipedia"
+        supported = source == "iNaturalist" and "INAT-EX-101" in context
+        rationale = (
+            "stubbed iNaturalist evidence contains GPS/photo observation IDs"
+            if supported
+            else "stubbed evidence has no GPS/photo observation IDs; Wikipedia is background only"
+        )
+        return {"supported": supported, "rationale": rationale}
+
+    evidence_fn = make_loci_evidence_fn(loci_verify_fn)
 
     def worker_fn(**kwargs: Any) -> dict[str, Any]:
         return {
