@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Propose reflection-loop findings as human-gated GitHub issues.
 
-The module is standalone and deliberately fail-open: queue, dedup, or GitHub
-adapter failures return audit metadata instead of crashing the caller. Dry-run is
-the default; creating public issues requires ``confirm=True``.
+The module is standalone and deliberately fail-open: queue, dashboard, dedup,
+rejection-ledger, or GitHub adapter failures return audit metadata instead of
+crashing the caller. Dashboard rendering is the default sink; creating a public
+issue additionally requires an explicit promotion id, ``confirm=True``, and a
+repository allowlist match.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import hashlib
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +25,8 @@ DedupFn = Callable[..., Any]
 GhFn = Callable[..., Any]
 
 DEFAULT_QUEUE_PATH = Path(__file__).with_name("issue_proposals_queue.jsonl")
+DEFAULT_DASHBOARD_PATH = Path(__file__).with_name("issue_proposals_dashboard.md")
+DEFAULT_REJECTION_PATH = Path(__file__).with_name("issue_proposal_rejections.jsonl")
 DEFAULT_MIN_CONFIDENCE = 0.7
 DEFAULT_MAX_PROPOSALS = 5
 FUZZY_TITLE_THRESHOLD = 0.88
@@ -84,6 +89,18 @@ def _fingerprint(repo: str, finding: dict[str, Any], title: str, evidence: list[
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _normalize_repo(repo: str) -> str:
+    return _normalize_text(repo)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -94,14 +111,56 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
-def _evidence_items(finding: dict[str, Any]) -> list[str]:
+def _evidence_raw_items(finding: dict[str, Any]) -> list[Any]:
     raw_items: list[Any] = []
-    for key in ("evidence", "evidence_refs", "supporting_evidence", "citations", "loci_finding_ids", "logs"):
+    for key in (
+        "evidence",
+        "evidence_refs",
+        "supporting_evidence",
+        "citations",
+        "loci_finding_ids",
+        "logs",
+    ):
         raw_items.extend(_as_list(finding.get(key)))
+    for key in (
+        "error_signature",
+        "signature",
+        "crash_state",
+        "file",
+        "file_path",
+        "path",
+        "symbol",
+        "function",
+        "line",
+        "lines",
+        "location",
+        "log_excerpt",
+        "finding_id",
+    ):
+        if finding.get(key) not in (None, ""):
+            raw_items.append({key: finding.get(key)})
+    return raw_items
+
+
+def _evidence_items(finding: dict[str, Any]) -> list[str]:
     out: list[str] = []
-    for item in raw_items:
+    for item in _evidence_raw_items(finding):
         if isinstance(item, dict):
-            text = str(item.get("text") or item.get("line") or item.get("ref") or item.get("id") or item).strip()
+            text = str(
+                item.get("text")
+                or item.get("line")
+                or item.get("ref")
+                or item.get("id")
+                or item.get("signature")
+                or item.get("error_signature")
+                or item.get("crash_state")
+                or item.get("file")
+                or item.get("file_path")
+                or item.get("path")
+                or item.get("symbol")
+                or item.get("location")
+                or item
+            ).strip()
         else:
             text = str(item or "").strip()
         if text:
@@ -165,10 +224,19 @@ def _finding_body_seed(finding: dict[str, Any]) -> str:
     return _finding_title(finding)
 
 
-def _compose_body(finding: dict[str, Any], *, repo: str, confidence: float, evidence: list[str]) -> str:
+def _compose_body(
+    finding: dict[str, Any],
+    *,
+    repo: str,
+    confidence: float,
+    evidence: list[str],
+    proposal_id: str,
+) -> str:
     lines = [
         "> Machine-generated proposal from the Loci reflection loop. A human maintainer must review before any action.",
+        "> Dashboard-first mode is the default; filing requires explicit promotion plus repository allowlisting.",
         "",
+        f"Proposal ID: `{proposal_id}`",
         f"Target repository: `{repo}`",
         f"Confidence: `{confidence:.2f}`",
         "",
@@ -189,29 +257,32 @@ def _proposal_from_finding(finding: dict[str, Any], repo: str) -> dict[str, Any]
     confidence = _safe_float(finding.get("numeric_confidence", finding.get("confidence", 0.0)))
     evidence = _evidence_items(finding)
     title = _finding_title(finding)
-    body = _compose_body(finding, repo=repo, confidence=confidence, evidence=evidence)
+    fingerprint = _fingerprint(repo, finding, title, evidence)
+    body = _compose_body(finding, repo=repo, confidence=confidence, evidence=evidence, proposal_id=fingerprint)
     return {
+        "proposal_id": fingerprint,
         "title": title,
         "body": body,
         "repo": repo,
         "confidence": confidence,
         "evidence": evidence,
         "source_finding": dict(finding),
-        "fingerprint": _fingerprint(repo, finding, title, evidence),
+        "fingerprint": fingerprint,
         "labels": ["loci-reflection", "machine-generated-proposal"],
+        "status": "proposed",
     }
 
 
-def _read_queue(queue_path: str | Path | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-    if queue_path is None:
+def _read_jsonl(path: str | Path | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    if path is None:
         return [], [], False
-    path = Path(queue_path)
-    if not path.exists():
+    target = Path(path)
+    if not target.exists():
         return [], [], False
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     try:
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        for line_no, line in enumerate(target.read_text(encoding="utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
             try:
@@ -222,31 +293,166 @@ def _read_queue(queue_path: str | Path | None) -> tuple[list[dict[str, Any]], li
                 errors.append({"line": line_no, "error": str(exc)})
         return rows, errors, bool(errors)
     except Exception as exc:
-        return [], [{"error": f"queue read degraded: {exc}"}], True
+        return [], [{"error": f"jsonl read degraded: {exc}"}], True
 
 
-def _append_queue(queue_path: str | Path | None, proposals: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
-    if queue_path is None or not proposals:
+def _write_jsonl(path: str | Path | None, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    if path is None:
         return [], False
-    path = Path(queue_path)
-    rows = [{
-        "status": "proposed",
-        "repo": proposal["repo"],
-        "title": proposal["title"],
-        "body": proposal["body"],
-        "confidence": proposal["confidence"],
-        "evidence": proposal["evidence"],
-        "fingerprint": proposal["fingerprint"],
-        "labels": proposal.get("labels", []),
-    } for proposal in proposals]
+    target = Path(path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n")
         return [], False
     except Exception as exc:
-        return [{"error": f"queue append degraded: {exc}"}], True
+        return [{"error": f"jsonl write degraded: {exc}"}], True
+
+
+def _append_jsonl(path: str | Path | None, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    if path is None or not rows:
+        return [], False
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        return [], False
+    except Exception as exc:
+        return [{"error": f"jsonl append degraded: {exc}"}], True
+
+
+def _queue_row_from_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "created_at": proposal.get("created_at") or _now_iso(),
+        "status": proposal.get("status") or "proposed",
+        "proposal_id": proposal.get("proposal_id") or proposal.get("fingerprint"),
+        "repo": proposal.get("repo"),
+        "title": proposal.get("title"),
+        "body": proposal.get("body"),
+        "confidence": proposal.get("confidence"),
+        "evidence": proposal.get("evidence", []),
+        "fingerprint": proposal.get("fingerprint"),
+        "labels": proposal.get("labels", []),
+        "rejection_reason": proposal.get("rejection_reason"),
+        "rejected_at": proposal.get("rejected_at"),
+        "opened_at": proposal.get("opened_at"),
+        "opened_url": proposal.get("opened_url"),
+    }
+
+
+def _read_queue(queue_path: str | Path | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    rows, errors, degraded = _read_jsonl(queue_path)
+    normalized = []
+    for row in rows:
+        normalized.append(_queue_row_from_proposal(row))
+    return normalized, errors, degraded
+
+
+def _append_queue(queue_path: str | Path | None, proposals: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    rows = [_queue_row_from_proposal(proposal) for proposal in proposals]
+    return _append_jsonl(queue_path, rows)
+
+
+def _read_rejection_ledger(rejection_path: str | Path | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    return _read_jsonl(rejection_path)
+
+
+def _rejection_entry(proposal: dict[str, Any], *, reason: str = "") -> dict[str, Any]:
+    return {
+        "proposal_id": proposal.get("proposal_id") or proposal.get("fingerprint"),
+        "fingerprint": proposal.get("fingerprint"),
+        "repo": proposal.get("repo"),
+        "title": proposal.get("title"),
+        "reason": reason or "rejected_by_human",
+        "rejected_at": _now_iso(),
+    }
+
+
+def _render_dashboard(
+    queue_rows: list[dict[str, Any]],
+    *,
+    dashboard_path: str | Path | None,
+    rejection_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    if dashboard_path is None:
+        return [], False
+    target = Path(dashboard_path)
+    pending = sorted(
+        [row for row in queue_rows if str(row.get("status") or "proposed") == "proposed"],
+        key=lambda item: (-_safe_float(item.get("confidence")), str(item.get("title") or "").lower()),
+    )
+    opened = sorted(
+        [row for row in queue_rows if str(row.get("status") or "") == "opened"],
+        key=lambda item: str(item.get("opened_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    rejected = sorted(
+        [row for row in queue_rows if str(row.get("status") or "") == "rejected"],
+        key=lambda item: str(item.get("rejected_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+
+    def render_rows(rows: list[dict[str, Any]], *, include_status: bool = False) -> list[str]:
+        if not rows:
+            return ["_None._", ""]
+        lines: list[str] = []
+        for row in rows:
+            proposal_id = row.get("proposal_id") or row.get("fingerprint") or "unknown"
+            lines.extend([
+                f"### `{proposal_id}` — {row.get('title') or 'Untitled proposal'}",
+                f"- Repo: `{row.get('repo') or ''}`",
+                f"- Confidence: `{_safe_float(row.get('confidence')):.2f}`",
+                f"- Fingerprint: `{row.get('fingerprint') or proposal_id}`",
+            ])
+            if include_status:
+                lines.append(f"- Status: `{row.get('status') or 'proposed'}`")
+            if row.get("opened_url"):
+                lines.append(f"- Opened issue: {row.get('opened_url')}")
+            if row.get("rejection_reason"):
+                lines.append(f"- Rejection reason: {row.get('rejection_reason')}")
+            lines.extend(["", "#### Evidence"])
+            evidence = row.get("evidence") or []
+            lines.extend(f"- {item}" for item in evidence)
+            lines.extend(["", "#### Proposed body", "", row.get("body") or "", ""])
+        return lines
+
+    lines = [
+        "# Loci issue proposal dashboard",
+        "",
+        "Dashboard-first mode is the default. No issue is filed from this artifact unless a human promotes a specific proposal ID and reruns with `--confirm-open` and an explicit `--allow-repo`.",
+        "",
+        f"Generated at: `{_now_iso()}`",
+        "",
+        "## Pending proposals",
+        "",
+        *render_rows(pending),
+        "## Opened proposals",
+        "",
+        *render_rows(opened, include_status=True),
+        "## Rejected proposals",
+        "",
+        *render_rows(rejected, include_status=True),
+        "## Rejection ledger",
+        "",
+    ]
+    if rejection_rows:
+        for row in sorted(rejection_rows, key=lambda item: str(item.get("rejected_at") or ""), reverse=True):
+            lines.append(
+                f"- `{row.get('proposal_id') or row.get('fingerprint')}` `{row.get('fingerprint')}` `{row.get('repo')}` — {row.get('reason') or 'rejected_by_human'}"
+            )
+    else:
+        lines.append("_None._")
+    lines.append("")
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return [], False
+    except Exception as exc:
+        return [{"error": f"dashboard render degraded: {exc}"}], True
 
 
 def _call_existing_issues(existing_issues_fn: IssueSearchFn | None, repo: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
@@ -347,12 +553,13 @@ def _dedup_match(
 def make_loci_dedup_fn(loci_semantic_dedup_fn: Callable[..., Any], *, threshold: float = 0.88) -> DedupFn:
     """Adapt an injected Loci ``semantic_dedup`` callable into ``dedup_fn``.
 
-    The deterministic title/fingerprint checks still run first; this adapter is
-    the semantic backstop for differently worded duplicates.
+    The deterministic evidence fingerprint and title checks still run first;
+    this adapter is the semantic backstop for differently worded duplicates.
     """
+
     def dedup_fn(*, proposal: dict[str, Any], candidates: list[dict[str, Any]], source: str = "") -> dict[str, Any]:
-        items = [{"text": f"{proposal.get('title', '')}\n{proposal.get('body', '')}", "candidate": proposal}]
-        items.extend({"text": f"{candidate.get('title', '')}\n{candidate.get('body', '')}", "candidate": candidate} for candidate in candidates)
+        items = [{"text": "\n".join(proposal.get("evidence") or [proposal.get("title", "")]), "candidate": proposal}]
+        items.extend({"text": "\n".join(candidate.get("evidence") or [candidate.get("title", "")]), "candidate": candidate} for candidate in candidates)
         try:
             raw = loci_semantic_dedup_fn(items=items, text_key="text", threshold=threshold)
         except TypeError:
@@ -370,6 +577,7 @@ def make_loci_dedup_fn(loci_semantic_dedup_fn: Callable[..., Any], *, threshold:
                     "method": f"loci_semantic_dedup:{source}" if source else "loci_semantic_dedup",
                 }
         return {"duplicate": False, "method": "loci_semantic_dedup", "degraded": bool(raw.get("degraded"))}
+
     return dedup_fn
 
 
@@ -382,19 +590,23 @@ def propose_issues(
     dedup_fn: DedupFn | None = None,
     *,
     queue_path: str | Path | None = DEFAULT_QUEUE_PATH,
+    dashboard_path: str | Path | None = DEFAULT_DASHBOARD_PATH,
+    rejection_path: str | Path | None = DEFAULT_REJECTION_PATH,
 ) -> dict[str, Any]:
-    """Rank and persist issue proposals, returning accepted and rejected audit.
+    """Rank and persist dashboard proposals, returning accepted and rejected audit."""
 
-    Accepted items are appended to the local proposal queue. Re-running with the
-    same queue makes the call idempotent because those items deduplicate before
-    they can be appended again.
-    """
     audit: list[dict[str, Any]] = []
     fail_open = False
     local_queue, queue_errors, queue_degraded = _read_queue(queue_path)
+    rejection_rows, rejection_errors, rejection_degraded = _read_rejection_ledger(rejection_path)
     existing_issues, issue_errors, issue_degraded = _call_existing_issues(existing_issues_fn, repo)
-    fail_open = fail_open or queue_degraded or issue_degraded
-    audit.extend({"action": "degraded", **error} for error in queue_errors + issue_errors)
+    fail_open = fail_open or queue_degraded or rejection_degraded or issue_degraded
+    audit.extend({"action": "degraded", **error} for error in queue_errors + rejection_errors + issue_errors)
+    rejected_fingerprints = {
+        str(row.get("fingerprint") or row.get("proposal_id") or "")
+        for row in rejection_rows
+        if str(row.get("fingerprint") or row.get("proposal_id") or "")
+    }
 
     candidates: list[dict[str, Any]] = []
     for idx, raw_finding in enumerate(findings or []):
@@ -402,6 +614,16 @@ def propose_issues(
         proposal = _proposal_from_finding(finding, repo)
         if not _has_concrete_evidence(finding):
             audit.append({"finding_index": idx, "action": "dropped", "reason": "missing_concrete_evidence", "title": proposal["title"]})
+            continue
+        if proposal["fingerprint"] in rejected_fingerprints:
+            audit.append({
+                "finding_index": idx,
+                "action": "dropped",
+                "reason": "previously_rejected",
+                "proposal_id": proposal["proposal_id"],
+                "fingerprint": proposal["fingerprint"],
+                "title": proposal["title"],
+            })
             continue
         if proposal["confidence"] < float(min_confidence):
             audit.append({
@@ -425,10 +647,18 @@ def propose_issues(
                 "method": match["method"],
                 "score": match["score"],
                 "title": proposal["title"],
+                "proposal_id": proposal["proposal_id"],
             })
             continue
         candidates.append(proposal)
-        audit.append({"finding_index": idx, "action": "candidate", "reason": "passed_gates", "title": proposal["title"], "confidence": proposal["confidence"]})
+        audit.append({
+            "finding_index": idx,
+            "action": "candidate",
+            "reason": "passed_gates",
+            "title": proposal["title"],
+            "confidence": proposal["confidence"],
+            "proposal_id": proposal["proposal_id"],
+        })
 
     ranked = sorted(candidates, key=lambda item: (-item["confidence"], item["title"].lower()))
     accepted = ranked[: max(0, int(max_proposals))]
@@ -437,8 +667,18 @@ def propose_issues(
     append_errors, append_degraded = _append_queue(queue_path, accepted)
     fail_open = fail_open or append_degraded
     audit.extend({"action": "degraded", **error} for error in append_errors)
+    queue_rows = local_queue + [_queue_row_from_proposal(proposal) for proposal in accepted]
+    dashboard_errors, dashboard_degraded = _render_dashboard(queue_rows, dashboard_path=dashboard_path, rejection_rows=rejection_rows)
+    fail_open = fail_open or dashboard_degraded
+    audit.extend({"action": "degraded", **error} for error in dashboard_errors)
     for proposal in accepted:
-        audit.append({"action": "proposed", "reason": "queued_for_human_review", "title": proposal["title"], "fingerprint": proposal["fingerprint"]})
+        audit.append({
+            "action": "proposed",
+            "reason": "rendered_to_dashboard",
+            "title": proposal["title"],
+            "fingerprint": proposal["fingerprint"],
+            "proposal_id": proposal["proposal_id"],
+        })
 
     dropped = [item for item in audit if item.get("action") == "dropped"]
     deduped = [item for item in audit if item.get("action") == "deduped"]
@@ -447,6 +687,8 @@ def propose_issues(
         "dry_run": True,
         "repo": repo,
         "queue_path": str(queue_path) if queue_path is not None else None,
+        "dashboard_path": str(dashboard_path) if dashboard_path is not None else None,
+        "rejection_path": str(rejection_path) if rejection_path is not None else None,
         "proposals": accepted,
         "dropped": dropped,
         "deduped": deduped,
@@ -454,34 +696,262 @@ def propose_issues(
     }
 
 
-def open_proposed_issues(proposals: list[dict[str, Any]], gh_fn: GhFn, *, confirm: bool = False) -> dict[str, Any]:
-    """Open accepted proposals only when explicitly confirmed.
+def _allowlist_match(repo: str, allowed_repos: list[str] | tuple[str, ...] | set[str] | None) -> bool:
+    normalized = {_normalize_repo(item) for item in (allowed_repos or []) if _normalize_repo(item)}
+    return _normalize_repo(repo) in normalized
 
-    With ``confirm=False`` this is a pure dry-run and never calls ``gh_fn``.
-    """
-    audit: list[dict[str, Any]] = []
+
+def _load_targeted_proposal(queue_rows: list[dict[str, Any]], proposal_id: str) -> dict[str, Any] | None:
+    for row in queue_rows:
+        if str(row.get("proposal_id") or row.get("fingerprint") or "") == str(proposal_id):
+            return row
+    return None
+
+
+def open_proposed_issues(
+    proposals: list[dict[str, Any]],
+    gh_fn: GhFn,
+    *,
+    confirm: bool = False,
+    promotion_id: str | None = None,
+    allowed_repos: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> dict[str, Any]:
+    """Open a single promoted proposal only when confirmed and allowlisted."""
+
+    if not promotion_id:
+        return {
+            "fail_open": False,
+            "dry_run": True,
+            "opened": [],
+            "would_open": [],
+            "audit_trail": [{"action": "skipped", "reason": "promotion_id_required"}],
+        }
+    proposal = _load_targeted_proposal([_queue_row_from_proposal(item) for item in proposals or []], promotion_id)
+    if proposal is None:
+        return {
+            "fail_open": False,
+            "dry_run": True,
+            "opened": [],
+            "would_open": [],
+            "audit_trail": [{"action": "skipped", "reason": "proposal_not_found", "proposal_id": promotion_id}],
+        }
     if not confirm:
         return {
             "fail_open": False,
             "dry_run": True,
             "opened": [],
-            "would_open": [{"repo": p.get("repo"), "title": p.get("title"), "body": p.get("body"), "labels": p.get("labels", [])} for p in proposals or []],
-            "audit_trail": [{"action": "dry_run", "reason": "confirm_false", "title": p.get("title")} for p in proposals or []],
+            "would_open": [{"repo": proposal.get("repo"), "title": proposal.get("title"), "body": proposal.get("body"), "labels": proposal.get("labels", [])}],
+            "audit_trail": [{"action": "dry_run", "reason": "confirm_false", "proposal_id": proposal.get("proposal_id")}],
         }
-    opened: list[Any] = []
-    fail_open = False
-    for proposal in proposals or []:
+    if not _allowlist_match(str(proposal.get("repo") or ""), allowed_repos):
+        return {
+            "fail_open": False,
+            "dry_run": True,
+            "opened": [],
+            "would_open": [{"repo": proposal.get("repo"), "title": proposal.get("title"), "body": proposal.get("body"), "labels": proposal.get("labels", [])}],
+            "audit_trail": [{
+                "action": "skipped",
+                "reason": "repo_not_allowlisted",
+                "proposal_id": proposal.get("proposal_id"),
+                "repo": proposal.get("repo"),
+            }],
+        }
+    try:
         try:
-            try:
-                result = gh_fn(repo=proposal.get("repo"), title=proposal.get("title"), body=proposal.get("body"), labels=proposal.get("labels", []))
-            except TypeError:
-                result = gh_fn(proposal)
-            opened.append(result)
-            audit.append({"action": "opened", "title": proposal.get("title"), "result": result})
-        except Exception as exc:
-            fail_open = True
-            audit.append({"action": "degraded", "reason": "gh_fn_failed", "title": proposal.get("title"), "error": str(exc)})
-    return {"fail_open": fail_open, "dry_run": False, "opened": opened, "would_open": [], "audit_trail": audit}
+            result = gh_fn(repo=proposal.get("repo"), title=proposal.get("title"), body=proposal.get("body"), labels=proposal.get("labels", []))
+        except TypeError:
+            result = gh_fn(proposal)
+    except Exception as exc:
+        return {
+            "fail_open": True,
+            "dry_run": False,
+            "opened": [],
+            "would_open": [],
+            "audit_trail": [{
+                "action": "degraded",
+                "reason": "gh_fn_failed",
+                "title": proposal.get("title"),
+                "proposal_id": proposal.get("proposal_id"),
+                "error": str(exc),
+            }],
+        }
+    return {
+        "fail_open": False,
+        "dry_run": False,
+        "opened": [result],
+        "would_open": [],
+        "audit_trail": [{"action": "opened", "title": proposal.get("title"), "proposal_id": proposal.get("proposal_id"), "result": result}],
+    }
+
+
+def promote_proposal(
+    proposal_id: str,
+    *,
+    queue_path: str | Path | None = DEFAULT_QUEUE_PATH,
+    dashboard_path: str | Path | None = DEFAULT_DASHBOARD_PATH,
+    rejection_path: str | Path | None = DEFAULT_REJECTION_PATH,
+    gh_fn: GhFn,
+    confirm: bool = False,
+    allowed_repos: list[str] | tuple[str, ...] | set[str] | None = None,
+    existing_issues_fn: IssueSearchFn | None = None,
+    dedup_fn: DedupFn | None = None,
+) -> dict[str, Any]:
+    audit: list[dict[str, Any]] = []
+    fail_open = False
+    queue_rows, queue_errors, queue_degraded = _read_queue(queue_path)
+    rejection_rows, rejection_errors, rejection_degraded = _read_rejection_ledger(rejection_path)
+    fail_open = fail_open or queue_degraded or rejection_degraded
+    audit.extend({"action": "degraded", **error} for error in queue_errors + rejection_errors)
+
+    proposal = _load_targeted_proposal(queue_rows, proposal_id)
+    if proposal is None:
+        return {"fail_open": fail_open, "dry_run": True, "opened": [], "would_open": [], "audit_trail": audit + [{"action": "skipped", "reason": "proposal_not_found", "proposal_id": proposal_id}]}
+    if str(proposal.get("status") or "") == "rejected":
+        return {"fail_open": fail_open, "dry_run": True, "opened": [], "would_open": [], "audit_trail": audit + [{"action": "skipped", "reason": "proposal_previously_rejected", "proposal_id": proposal_id}]}
+    if str(proposal.get("status") or "") == "opened":
+        return {"fail_open": fail_open, "dry_run": True, "opened": [], "would_open": [], "audit_trail": audit + [{"action": "skipped", "reason": "proposal_already_opened", "proposal_id": proposal_id}]}
+    rejected_fingerprints = {
+        str(row.get("fingerprint") or row.get("proposal_id") or "")
+        for row in rejection_rows
+        if str(row.get("fingerprint") or row.get("proposal_id") or "")
+    }
+    if str(proposal.get("fingerprint") or proposal.get("proposal_id") or "") in rejected_fingerprints:
+        return {"fail_open": fail_open, "dry_run": True, "opened": [], "would_open": [], "audit_trail": audit + [{"action": "skipped", "reason": "proposal_previously_rejected", "proposal_id": proposal_id}]}
+
+    would_open = [{
+        "repo": proposal.get("repo"),
+        "title": proposal.get("title"),
+        "body": proposal.get("body"),
+        "labels": proposal.get("labels", []),
+    }]
+    if not confirm:
+        audit.append({"action": "dry_run", "reason": "confirm_false", "proposal_id": proposal_id})
+        return {"fail_open": fail_open, "dry_run": True, "opened": [], "would_open": would_open, "audit_trail": audit}
+    if not _allowlist_match(str(proposal.get("repo") or ""), allowed_repos):
+        audit.append({
+            "action": "skipped",
+            "reason": "repo_not_allowlisted",
+            "proposal_id": proposal_id,
+            "repo": proposal.get("repo"),
+        })
+        return {
+            "fail_open": fail_open,
+            "dry_run": True,
+            "opened": [],
+            "would_open": would_open,
+            "audit_trail": audit,
+        }
+    if existing_issues_fn is not None:
+        existing_issues, issue_errors, issue_degraded = _call_existing_issues(existing_issues_fn, str(proposal.get("repo") or ""))
+        fail_open = fail_open or issue_degraded
+        audit.extend({"action": "degraded", **error} for error in issue_errors)
+        match, errors, degraded = _dedup_match(proposal, [], existing_issues, dedup_fn)
+        fail_open = fail_open or degraded
+        audit.extend({"action": "degraded", **error} for error in errors)
+        if match:
+            return {
+                "fail_open": fail_open,
+                "dry_run": True,
+                "opened": [],
+                "would_open": would_open,
+                "audit_trail": audit + [{
+                    "action": "skipped",
+                    "reason": "duplicate_existing_open_issue",
+                    "proposal_id": proposal_id,
+                    "against": match["source"],
+                    "method": match["method"],
+                }],
+            }
+        if fail_open:
+            return {
+                "fail_open": True,
+                "dry_run": True,
+                "opened": [],
+                "would_open": would_open,
+                "audit_trail": audit + [{"action": "skipped", "reason": "promotion_fail_open_blocks_issue_creation", "proposal_id": proposal_id}],
+            }
+
+    opened_result = open_proposed_issues(
+        [proposal],
+        gh_fn,
+        confirm=True,
+        promotion_id=proposal_id,
+        allowed_repos=allowed_repos,
+    )
+    audit.extend(opened_result["audit_trail"])
+    if opened_result["fail_open"]:
+        return {"fail_open": True, "dry_run": False, "opened": [], "would_open": [], "audit_trail": audit}
+
+    opened_url = ""
+    if opened_result["opened"] and isinstance(opened_result["opened"][0], dict):
+        opened_url = str(opened_result["opened"][0].get("url") or "")
+    updated_rows = []
+    for row in queue_rows:
+        if str(row.get("proposal_id") or row.get("fingerprint") or "") != proposal_id:
+            updated_rows.append(row)
+            continue
+        changed = dict(row)
+        changed["status"] = "opened"
+        changed["opened_at"] = _now_iso()
+        changed["opened_url"] = opened_url
+        updated_rows.append(_queue_row_from_proposal(changed))
+    write_errors, write_degraded = _write_jsonl(queue_path, updated_rows)
+    fail_open = fail_open or write_degraded
+    audit.extend({"action": "degraded", **error} for error in write_errors)
+    dashboard_errors, dashboard_degraded = _render_dashboard(updated_rows, dashboard_path=dashboard_path, rejection_rows=rejection_rows)
+    fail_open = fail_open or dashboard_degraded
+    audit.extend({"action": "degraded", **error} for error in dashboard_errors)
+    return {"fail_open": fail_open, "dry_run": False, "opened": opened_result["opened"], "would_open": [], "audit_trail": audit}
+
+
+def record_proposal_rejection(
+    proposal_id: str,
+    *,
+    queue_path: str | Path | None = DEFAULT_QUEUE_PATH,
+    dashboard_path: str | Path | None = DEFAULT_DASHBOARD_PATH,
+    rejection_path: str | Path | None = DEFAULT_REJECTION_PATH,
+    reason: str = "",
+) -> dict[str, Any]:
+    audit: list[dict[str, Any]] = []
+    fail_open = False
+    queue_rows, queue_errors, queue_degraded = _read_queue(queue_path)
+    rejection_rows, rejection_errors, rejection_degraded = _read_rejection_ledger(rejection_path)
+    fail_open = fail_open or queue_degraded or rejection_degraded
+    audit.extend({"action": "degraded", **error} for error in queue_errors + rejection_errors)
+
+    proposal = _load_targeted_proposal(queue_rows, proposal_id)
+    if proposal is None:
+        return {"fail_open": fail_open, "recorded": [], "audit_trail": audit + [{"action": "skipped", "reason": "proposal_not_found", "proposal_id": proposal_id}]}
+    fingerprint = str(proposal.get("fingerprint") or proposal.get("proposal_id") or "")
+    existing_rejection = next(
+        (row for row in rejection_rows if str(row.get("fingerprint") or row.get("proposal_id") or "") == fingerprint),
+        None,
+    )
+    entry = existing_rejection or _rejection_entry(proposal, reason=reason)
+    if existing_rejection is None:
+        append_errors, append_degraded = _append_jsonl(rejection_path, [entry])
+        fail_open = fail_open or append_degraded
+        audit.extend({"action": "degraded", **error} for error in append_errors)
+        if existing_rejection is None:
+            rejection_rows = rejection_rows + [entry]
+    updated_rows = []
+    for row in queue_rows:
+        if str(row.get("proposal_id") or row.get("fingerprint") or "") != proposal_id:
+            updated_rows.append(row)
+            continue
+        changed = dict(row)
+        changed["status"] = "rejected"
+        changed["rejection_reason"] = reason or entry.get("reason") or "rejected_by_human"
+        changed["rejected_at"] = entry.get("rejected_at") or _now_iso()
+        updated_rows.append(_queue_row_from_proposal(changed))
+    write_errors, write_degraded = _write_jsonl(queue_path, updated_rows)
+    fail_open = fail_open or write_degraded
+    audit.extend({"action": "degraded", **error} for error in write_errors)
+    dashboard_errors, dashboard_degraded = _render_dashboard(updated_rows, dashboard_path=dashboard_path, rejection_rows=rejection_rows)
+    fail_open = fail_open or dashboard_degraded
+    audit.extend({"action": "degraded", **error} for error in dashboard_errors)
+    audit.append({"action": "rejected", "reason": changed.get("rejection_reason"), "proposal_id": proposal_id, "fingerprint": fingerprint})
+    return {"fail_open": fail_open, "recorded": [entry], "audit_trail": audit}
 
 
 def gh_issue_search_fn(*, repo: str, state: str = "open", limit: int = 100) -> list[dict[str, Any]]:
@@ -523,20 +993,56 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--findings-json", help="JSON/JSONL findings file; omitted means no findings.")
     parser.add_argument("--queue-path", default=str(DEFAULT_QUEUE_PATH))
+    parser.add_argument("--dashboard-path", default=str(DEFAULT_DASHBOARD_PATH))
+    parser.add_argument("--rejection-path", default=str(DEFAULT_REJECTION_PATH))
     parser.add_argument("--min-confidence", type=float, default=DEFAULT_MIN_CONFIDENCE)
     parser.add_argument("--max-proposals", type=int, default=DEFAULT_MAX_PROPOSALS)
-    parser.add_argument("--confirm-open", action="store_true", help="Actually open GitHub issues after proposing.")
-    parser.add_argument("--live-existing-issues", action="store_true", help="Use gh to deduplicate against open issues.")
+    parser.add_argument("--confirm-open", action="store_true", help="Actually open a promoted GitHub issue.")
+    parser.add_argument("--live-existing-issues", action="store_true", help="Use gh to deduplicate a promoted proposal against open issues.")
+    parser.add_argument("--allow-repo", action="append", default=[], help="Explicit repository allowlist entry. Repeatable.")
+    parser.add_argument("--rejection-reason", default="", help="Reason recorded with --reject-proposal.")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--promote-proposal", help="Proposal ID to promote into a real GitHub issue.")
+    action.add_argument("--reject-proposal", help="Proposal ID to persist into the rejection ledger.")
     args = parser.parse_args(argv)
 
-    existing_fn = gh_issue_search_fn if args.live_existing_issues and args.confirm_open else None
+    if args.reject_proposal:
+        result = record_proposal_rejection(
+            args.reject_proposal,
+            queue_path=args.queue_path,
+            dashboard_path=args.dashboard_path,
+            rejection_path=args.rejection_path,
+            reason=args.rejection_reason,
+        )
+        print(json.dumps({"rejection_result": result}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.promote_proposal:
+        existing_fn = gh_issue_search_fn if args.live_existing_issues and args.confirm_open else None
+        result = promote_proposal(
+            args.promote_proposal,
+            queue_path=args.queue_path,
+            dashboard_path=args.dashboard_path,
+            rejection_path=args.rejection_path,
+            gh_fn=gh_create_issue_fn,
+            confirm=args.confirm_open,
+            allowed_repos=args.allow_repo,
+            existing_issues_fn=existing_fn,
+        )
+        if args.live_existing_issues and not args.confirm_open:
+            result["audit_trail"].append({"action": "skipped", "reason": "live_existing_issues_requires_confirm_open"})
+        print(json.dumps({"promotion_result": result}, ensure_ascii=False, indent=2))
+        return 0
+
     result = propose_issues(
         _load_findings(args.findings_json),
         args.repo,
         args.min_confidence,
         args.max_proposals,
-        existing_fn,
+        None,
         queue_path=args.queue_path,
+        dashboard_path=args.dashboard_path,
+        rejection_path=args.rejection_path,
     )
     if args.live_existing_issues and not args.confirm_open:
         result["audit_trail"].append({

@@ -45,7 +45,7 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # 1410 -> 1450: swarm-reasoning-tiers explicit-override fix
     # (local_deep_think.py, swarm_escalate.py) adds per-field *_explicit
     # tracking + regression tests; CI-measured at 1424, margin kept.
-    assert 954 <= len(module_level) <= 1490, len(module_level)
+    assert 954 <= len(module_level) <= 1500, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
