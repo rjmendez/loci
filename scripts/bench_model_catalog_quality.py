@@ -18,8 +18,21 @@ from typing import Any
 
 try:
     import requests
-except Exception as exc:  # pragma: no cover - only hit in a broken runtime
-    raise SystemExit(f"error: requests is required: {exc}")
+except Exception as exc:  # pragma: no cover - exercised only when runtime deps are broken
+    # Deferred rather than a hard SystemExit at import time: this module is imported by
+    # the unit-test suite (which only exercises pure functions and never touches the
+    # network), and some CI jobs run those tests without installing `requests`. Failing
+    # immediately here would abort test collection entirely instead of just the
+    # network-dependent paths.
+    requests = None
+    _REQUESTS_IMPORT_ERROR = exc
+else:
+    _REQUESTS_IMPORT_ERROR = None
+
+
+def _require_requests() -> None:
+    if requests is None:
+        raise SystemExit(f"error: requests is required: {_REQUESTS_IMPORT_ERROR}")
 
 
 DEFAULT_BASE_URL = "http://100.73.200.19:11434"
@@ -523,6 +536,7 @@ def build_prompt(case: dict[str, Any]) -> str:
 
 
 def ollama_generate(base_url: str, model: str, prompt: str, timeout_s: float, max_tokens: int) -> tuple[str, str, float]:
+    _require_requests()
     started = time.perf_counter()
     try:
         response = requests.post(
