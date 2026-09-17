@@ -56,6 +56,8 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
         decompose_model="decomp-a",
         subtasks=["check auth", "check logs"],
         escalate_confidences=["low", "medium"],
+        stigmergic_consensus=True,
+        stigmergic_ttl_minutes=45,
     ))
 
     assert out["summary"] == "auth is enabled"
@@ -68,6 +70,8 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
     assert captured["config"].decompose_model == "decomp-a"
     assert captured["config"].subtasks == ["check auth", "check logs"]
     assert captured["config"].escalate_confidences == ("low", "medium")
+    assert captured["config"].stigmergic_consensus is True
+    assert captured["config"].stigmergic_ttl_minutes == 45
 
 
 def test_swarm_reason_fails_open_on_wrapper_exception(monkeypatch):
