@@ -158,3 +158,41 @@ def test_schema_validation_catches_shape_errors_and_passes_real_result():
     result = S.run_swarm(_config(subtasks=["single"], fanout_count=1), deps={"generate_batch": _generate_batch})
 
     _assert_valid(result)
+
+
+def test_huge_subtasks_are_truncated_in_prompts_not_in_returned_findings():
+    """Regression test: a live run against 10 real diff-review subtasks (each a multi-KB
+    diff pasted verbatim as the "subtask") produced garbled cheap-tier answers and a
+    context-overflowed synthesis call that never returned valid JSON, forcing the
+    mechanical fallback summary. Root cause: the full subtask text was re-embedded,
+    uncapped, into both the per-subtask answer prompt and the synthesis prompt. This
+    test pins the fix: prompts sent to the model must be bounded regardless of how large
+    a subtask's text is, while the findings returned to the caller keep full fidelity."""
+    huge_subtask = "DIFF CONTEXT " + ("x" * 5000)
+    seen_prompts = {"cheap": [], "synth": []}
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            seen_prompts["cheap"].extend(prompts)
+            return [{"ok": True, "text": '{"answer":"Looks fine.","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            seen_prompts["synth"].extend(prompts)
+            return [{"ok": True, "text": '{"summary":"All clear."}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    result = S.run_swarm(
+        _config(subtasks=[huge_subtask], fanout_count=1),
+        deps={"generate_batch": _generate_batch},
+    )
+
+    _assert_valid(result)
+    # The prompt actually sent to the cheap tier must be bounded, not a multi-KB blob.
+    assert len(seen_prompts["cheap"][0]) < 2000
+    assert "[truncated]" in seen_prompts["cheap"][0]
+    # Same for whatever gets re-embedded into the synthesis prompt.
+    assert len(seen_prompts["synth"][0]) < 2000
+    # But the finding returned to the caller keeps the full, untruncated subtask text —
+    # truncation is a prompt-construction concern only, never a data-loss concern.
+    assert result["findings"][0]["subtask"] == huge_subtask
+    assert result["findings"][0]["answer"] == "Looks fine."
+

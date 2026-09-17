@@ -69,6 +69,9 @@ class SwarmConfig:
     decompose_max_tokens: int = 1200
     answer_max_tokens: int = 320
     synthesize_max_tokens: int = 1400
+    subtask_prompt_chars: int = 1500
+    synthesis_subtask_chars: int = 240
+    synthesis_answer_chars: int = 400
 
 
 @dataclass
@@ -216,11 +219,21 @@ def decompose_subtasks(config: SwarmConfig, batch_fn: Callable[..., list[dict]])
     }
 
 
-def _answer_prompt(topic: str, subtask: str) -> str:
+def _truncate(text: str, max_chars: int) -> str:
+    """Bound embedded text so a huge subtask/answer never crowds out the model's output
+    budget or blows the synthesis prompt past context length [pattern: evidence_chars in
+    local_deep_think.py]. Marks truncation explicitly rather than silently cutting text."""
+    cooked = str(text or "")
+    if max_chars <= 0 or len(cooked) <= max_chars:
+        return cooked
+    return cooked[:max_chars] + "\u2026 [truncated]"
+
+
+def _answer_prompt(topic: str, subtask: str, max_chars: int = 1500) -> str:
     return (
         "You are the answer stage in a local reasoning swarm.\n"
         f"Topic: {topic}\n"
-        f"Subtask: {subtask}\n"
+        f"Subtask: {_truncate(subtask, max_chars)}\n"
         "Answer only this subtask. Be brief and concrete.\n"
         'Return ONLY JSON: {"answer":"...","confidence":"high|medium|low"}'
     )
@@ -272,7 +285,7 @@ def _parse_answer_result(raw: dict, *, subtask: str, model: str, tier: str) -> S
 def answer_subtasks(topic: str, subtasks: list[str], *, model: str,
                     config: SwarmConfig, batch_fn: Callable[..., list[dict]],
                     tier: str) -> tuple[list[SwarmFinding], dict]:
-    prompts = [_answer_prompt(topic, subtask) for subtask in subtasks]
+    prompts = [_answer_prompt(topic, subtask, config.subtask_prompt_chars) for subtask in subtasks]
     raw_rows = _call_batch(batch_fn, prompts, model=model, max_tokens=config.answer_max_tokens, fmt="json")
     findings = [
         _parse_answer_result(raw, subtask=subtask, model=model, tier=tier)
@@ -389,7 +402,10 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
             "model": config.escalate_model,
         }
 
-    prompts = [_answer_prompt(config.topic, findings[idx].subtask) for idx in flagged]
+    prompts = [
+        _answer_prompt(config.topic, findings[idx].subtask, config.subtask_prompt_chars)
+        for idx in flagged
+    ]
     raw_rows = _call_batch(
         batch_fn,
         prompts,
@@ -429,10 +445,16 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
     }
 
 
-def _public_finding(finding: SwarmFinding) -> dict:
+def _public_finding(finding: SwarmFinding, *, subtask_chars: int = 0, answer_chars: int = 0) -> dict:
+    subtask = finding.subtask
+    answer = finding.answer
+    if subtask_chars > 0:
+        subtask = _truncate(subtask, subtask_chars)
+    if answer_chars > 0:
+        answer = _truncate(answer, answer_chars)
     payload = {
-        "subtask": finding.subtask,
-        "answer": finding.answer,
+        "subtask": subtask,
+        "answer": answer,
         "confidence": finding.confidence,
         "tier_reached": finding.tier_reached,
         "model": finding.model,
@@ -460,6 +482,20 @@ def _fallback_summary(topic: str, findings: list[dict], stats: dict) -> str:
 def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: dict,
                      batch_fn: Callable[..., list[dict]]) -> dict:
     public_findings = [_public_finding(item) for item in findings]
+    # The prompt sent to the synthesis model uses a separately truncated view: with dozens
+    # of subtasks (especially ones carrying large embedded evidence, e.g. a full diff) the
+    # untruncated findings list can blow past the model's context window on its own, before
+    # the model ever emits a token of output. Bounding what's re-embedded here keeps the
+    # synthesis prompt's size roughly independent of how large any one subtask/answer is,
+    # while the full-fidelity public_findings above is still what callers get back.
+    prompt_findings = [
+        _public_finding(
+            item,
+            subtask_chars=config.synthesis_subtask_chars,
+            answer_chars=config.synthesis_answer_chars,
+        )
+        for item in findings
+    ]
     prompt = (
         "You are the SYNTHESIZE stage in a tiered local reasoning swarm.\n"
         "Combine the final per-subtask answers into one direct, evidence-aware JSON object.\n"
@@ -469,7 +505,7 @@ def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: d
         '"tier_reached":"cheap|escalated|synthesized"}],"summary":"...",'
         '"stats":{"fanout_count":0,"escalated_count":0,"escalation_rate":0.0}}\n\n'
         f"TOPIC: {config.topic}\n"
-        f"FINAL_FINDINGS: {json.dumps(public_findings, indent=2)}\n"
+        f"FINAL_FINDINGS: {json.dumps(prompt_findings, indent=2)}\n"
         f"STATS: {json.dumps(stats, indent=2)}"
     )
     raw = _call_one(
@@ -487,7 +523,7 @@ def synthesize_swarm(config: SwarmConfig, findings: list[SwarmFinding], stats: d
         "schema_version": 1,
         "topic": config.topic,
         "findings": public_findings,
-        "summary": summary or _fallback_summary(config.topic, public_findings, stats),
+        "summary": summary or _fallback_summary(config.topic, prompt_findings, stats),
         "stats": {
             "fanout_count": int(stats.get("fanout_count") or 0),
             "escalated_count": int(stats.get("escalated_count") or 0),
