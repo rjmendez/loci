@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.swarm_supervisor import plan_source_routing, supervise_and_correct, supervise_findings
+from scripts.swarm_supervisor import make_loci_evidence_fn, plan_source_routing, supervise_and_correct, supervise_findings
 
 
 SOURCES = [
@@ -230,3 +230,37 @@ def test_supervise_findings_evidence_fn_none_preserves_current_behavior_and_fake
     assert baseline["verdicts"][0]["supported"] is True
     assert grounded["verdicts"][0]["supported"] is False
     assert "retrieved evidence" in grounded["verdicts"][0]["rationale"]
+
+
+def test_make_loci_evidence_fn_adapts_structured_verifier_result():
+    def loci_verify_fn(*, claim, context, investigation_id=None):
+        assert investigation_id == "inv-123"
+        return {"verdict": "supported", "rationale": "matched retrieved passage"}
+
+    evidence_fn = make_loci_evidence_fn(loci_verify_fn, investigation_id="inv-123")
+    result = evidence_fn(finding={"claim": "spiders observed nearby", "evidence": "photo record"})
+    assert result == {"supported": True, "rationale": "matched retrieved passage"}
+
+
+def test_make_loci_evidence_fn_falls_back_to_positional_call_and_parses_json_string():
+    def loci_verify_fn(claim, context=""):
+        return json.dumps({"supported": False, "reason": "no matching evidence"})
+
+    evidence_fn = make_loci_evidence_fn(loci_verify_fn)
+    result = evidence_fn(finding={"text": "unverified claim", "context": "irrelevant background"})
+    assert result == {"supported": False, "rationale": "no matching evidence"}
+
+
+def test_supervise_findings_can_use_make_loci_evidence_fn_as_evidence_fn():
+    finding = {"source": "iNaturalist", "claim": "observed nearby", "evidence": "photo"}
+
+    def gen_fn(**_kwargs):
+        return json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "model says supported"}]})
+
+    def loci_verify_fn(*, claim, context, **_kwargs):
+        return {"supported": False, "rationale": "loci grounding found no supporting passage"}
+
+    evidence_fn = make_loci_evidence_fn(loci_verify_fn)
+    result = supervise_findings(TASK, [finding], {}, gen_fn, evidence_fn=evidence_fn)
+    assert result["verdicts"][0]["supported"] is False
+    assert "loci grounding found no supporting passage" in result["verdicts"][0]["rationale"]

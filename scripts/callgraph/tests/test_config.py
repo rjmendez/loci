@@ -11,9 +11,11 @@ def test_corpus_is_exactly_133_files():
     memory-integrity audit test, mcp/compact.py, deploy script, A/B eval
     script, prefilter script, mcp/guardian.py (Granite Guardian semantic
     injection-risk classification), then scripts/redteam/loci_adversarial_harness.py
-    (sandboxed PyRIT red-team harness)."""
+    (sandboxed PyRIT red-team harness).
+    142 -> 144: scripts/swarm_supervisor.py + scripts/demo_swarm_supervisor.py
+    (advisory swarm supervisor)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 142, sorted(files)
+    assert len(files) == 144, sorted(files)
 
 
 def test_corpus_excludes_test_directories():
