@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.swarm_supervisor import make_loci_evidence_fn, plan_source_routing, supervise_and_correct, supervise_findings
+from scripts.swarm_supervisor import SupervisorBudget, make_loci_evidence_fn, plan_source_routing, supervise_and_correct, supervise_findings
 
 
 SOURCES = [
@@ -114,6 +114,30 @@ def test_plan_source_routing_node_count_cap_falls_back_to_flat_plan():
 
     assert plan["fail_open"] is True
     assert plan["decision_tree"] == [{"sub_need": "GPS/photo-verified local observations", "preferred_sources": ["iNaturalist"], "fallback_sources": [], "rationale": "best fit"}]
+
+
+def test_plan_source_routing_budget_aborts_recursive_expansion_with_partial_plan():
+    calls = []
+
+    def gen_fn(**kwargs):
+        calls.append(kwargs["prompt"])
+        if "planning source use" in kwargs["prompt"]:
+            return {"text": json.dumps({
+                "task": TASK,
+                "fail_open": False,
+                "decision_tree": [{"sub_need": "GPS/photo-verified local observations", "preferred_sources": ["iNaturalist"], "rationale": "best fit"}],
+                "source_policy": "Use iNaturalist.",
+            }), "eval_count": 1}
+        return {"text": "{}"}
+
+    budget = SupervisorBudget(max_calls=1)
+    plan = plan_source_routing(TASK, SOURCES, gen_fn, max_depth=2, budget=budget)
+
+    assert len(calls) == 1
+    assert plan["budget_exceeded"] is True
+    assert plan["fail_open"] is True
+    assert plan["decision_tree"][0]["preferred_sources"] == ["iNaturalist"]
+    assert plan["budget"]["calls"] == 1
 
 
 def test_supervise_findings_flags_bad_source_and_unsupported_count_and_clean_good_finding():
@@ -264,3 +288,78 @@ def test_supervise_findings_can_use_make_loci_evidence_fn_as_evidence_fn():
     result = supervise_findings(TASK, [finding], {}, gen_fn, evidence_fn=evidence_fn)
     assert result["verdicts"][0]["supported"] is False
     assert "loci grounding found no supporting passage" in result["verdicts"][0]["rationale"]
+
+
+def test_supervise_findings_strict_tripwire_is_opt_in():
+    finding = {"source": "iNaturalist", "claim": "observed nearby", "evidence": "photo"}
+
+    def gen_fn(**_kwargs):
+        return json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "model says supported"}]})
+
+    advisory = supervise_findings(TASK, [finding], {}, gen_fn, evidence_fn=lambda **_kwargs: {"supported": False, "rationale": "not in evidence"})
+    strict = supervise_findings(TASK, [finding], {}, gen_fn, evidence_fn=lambda **_kwargs: {"supported": False, "rationale": "not in evidence"}, strict_tripwire=True)
+
+    assert "tripwire_triggered" not in advisory
+    assert advisory["verdicts"][0]["supported"] is False
+    assert strict["tripwire_triggered"] is True
+    assert strict["hard_fail"] is True
+    assert strict["verdicts"][0]["tripwire_triggered"] is True
+
+
+def test_supervise_and_correct_escalates_to_replan_on_stall():
+    plan = {"decision_tree": [{"sub_need": "GPS/photo-verified local observations", "preferred_sources": ["iNaturalist"]}], "source_policy": "Use iNaturalist."}
+    findings = [{"source": "Wikipedia", "sub_need": "GPS/photo-verified local observations", "claim": "local proof", "evidence": "background"}]
+    worker_contexts = []
+
+    def gen_fn(**kwargs):
+        prompt = kwargs["prompt"]
+        if "rewriting a stalled task ledger" in prompt:
+            return json.dumps({
+                "task": TASK,
+                "fail_open": False,
+                "decision_tree": [{"sub_need": "Use observation IDs, not encyclopedia background", "preferred_sources": ["iNaturalist"], "fallback_sources": [], "rationale": "Root cause is wrong evidence class."}],
+                "assignments": [{"sub_need": "Use observation IDs, not encyclopedia background", "source": "iNaturalist", "rationale": "structured proof"}],
+                "source_policy": "Require GPS/photo observation IDs before claiming local proof.",
+                "root_cause": "Worker kept using background as local proof.",
+            })
+        return json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Use iNaturalist observation IDs.", "rationale": "wrong evidence class"}]})
+
+    def worker_fn(**kwargs):
+        worker_contexts.append(kwargs)
+        if len(worker_contexts) == 1:
+            return dict(kwargs["finding"])
+        return {"source": "iNaturalist", "sub_need": kwargs["routing_node"]["sub_need"], "claim": "local proof", "evidence": "INAT-EX-101 photo GPS"}
+
+    result = supervise_and_correct(TASK, findings, plan, gen_fn, worker_fn, max_rounds=2, max_stalls=1)
+
+    assert result["audit_trail"][0]["rounds"][0]["progress_made"] is False
+    assert result["audit_trail"][0]["rounds"][0]["stalled"] is True
+    assert result["audit_trail"][0]["rounds"][0]["replanned_routing_plan"]["root_cause"] == "Worker kept using background as local proof."
+    assert worker_contexts[1]["routing_node"]["sub_need"] == "Use observation IDs, not encyclopedia background"
+
+
+def test_supervise_and_correct_strict_tripwire_stops_without_worker_retry():
+    plan = {"decision_tree": [{"sub_need": "GPS/photo-verified local observations", "preferred_sources": ["iNaturalist"]}]}
+    findings = [{"source": "iNaturalist", "claim": "unsupported", "evidence": "photo"}]
+    worker_calls = []
+
+    def gen_fn(**_kwargs):
+        return json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "model says supported"}]})
+
+    def worker_fn(**kwargs):
+        worker_calls.append(kwargs)
+        return kwargs["finding"]
+
+    result = supervise_and_correct(
+        TASK,
+        findings,
+        plan,
+        gen_fn,
+        worker_fn,
+        evidence_fn=lambda **_kwargs: {"supported": False, "rationale": "not retrieved"},
+        strict_tripwire=True,
+    )
+
+    assert result["tripwire_triggered"] is True
+    assert result["hard_fail"] is True
+    assert worker_calls == []
