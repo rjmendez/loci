@@ -106,6 +106,57 @@ def test_confirmation_yields_confirmed():
     assert 0.0 <= r["confidence"] <= 1.0
 
 
+def test_model_asserted_claim_with_only_model_asserted_evidence_is_unverified():
+    def _should_not_call(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("model verifier must not run on circular model-only support")
+
+    r = V.verify_finding(
+        "The reflection loop is fixed.",
+        candidate_provenance_tier="model_asserted",
+        evidence_rows=[{"evidence_provenance_tier": "model_asserted", "text": "The reflection loop is fixed."}],
+        gen_fn=_should_not_call,
+    )
+    assert r["verdict"] == "uncertain"
+    assert r["confidence"] == 0.0
+    assert r["provenance_firewall"]["allowed"] is False
+
+
+def test_tool_verified_evidence_passes_provenance_firewall():
+    r = V.verify_finding(
+        "The schema parses.",
+        candidate_provenance_tier="model_asserted",
+        evidence_rows=[{"evidence_provenance_tier": "tool_verified", "text": "python3 parsed schema OK"}],
+        gen_fn=_ok(_CONFIRMED),
+    )
+    assert r["verdict"] == "confirmed"
+    assert r["degraded"] is False
+
+
+def test_legacy_untagged_evidence_defaults_to_tool_verified_for_compatibility():
+    r = V.verify_finding(
+        "Legacy finding remains usable.",
+        candidate_provenance_tier="model_asserted",
+        evidence_rows=[{"text": "Legacy finding remains usable."}],
+        gen_fn=_ok(_CONFIRMED),
+    )
+    assert r["verdict"] == "confirmed"
+
+
+def test_provenance_firewall_fails_open(monkeypatch):
+    monkeypatch.setattr(
+        V,
+        "assert_evidence_firewall",
+        lambda *args, **kwargs: {"allowed": True, "degraded": True, "reason": "failed-open"},
+    )
+    r = V.verify_finding(
+        "Firewall failure does not crash callers.",
+        candidate_provenance_tier="model_asserted",
+        evidence_rows=[{"evidence_provenance_tier": "model_asserted"}],
+        gen_fn=_ok(_CONFIRMED),
+    )
+    assert r["verdict"] == "confirmed"
+
+
 def test_confirmed_embedded_in_prose_with_fences():
     r = V.verify_finding("claim", gen_fn=_ok(_CONFIRMED_PROSE))
     assert r["verdict"] == "confirmed"

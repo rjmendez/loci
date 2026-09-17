@@ -19,8 +19,23 @@ Reads OLLAMA_BASE_URL / OLLAMA_URL from env (same as mcp/embed_ops.py). See mcp/
 """
 import os
 import sys
+from importlib import util
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mcp"))
+
+
+def _load_generate():
+    path = Path(__file__).resolve().parent.parent / "mcp" / "llm_local.py"
+    spec = util.spec_from_file_location("_loci_mcp_llm_local", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"unable to load {path}")
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.generate
+
+
+generate = _load_generate()
 
 
 def main() -> int:
