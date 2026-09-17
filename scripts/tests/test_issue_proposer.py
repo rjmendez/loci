@@ -100,8 +100,44 @@ def test_unevidenced_findings_are_dropped():
     clean_queue()
 
 
-def test_finding_id_without_evidence_is_dropped_not_softened():
+def test_prose_only_evidence_is_rejected():
     clean_queue()
+    result = propose_issues(
+        [finding(evidence=["model says this is bad and very confident about it"])],
+        "owner/repo",
+        queue_path=QUEUE,
+    )
+
+    assert result["proposals"] == []
+    assert result["dropped"][0]["reason"] == "missing_concrete_evidence"
+    clean_queue()
+
+
+def test_finding_id_style_evidence_is_accepted():
+    clean_queue()
+    result = propose_issues(
+        [finding(evidence=["duplicate remediation flagged as FND-4821"])],
+        "owner/repo",
+        queue_path=QUEUE,
+    )
+
+    assert len(result["proposals"]) == 1
+    clean_queue()
+
+
+def test_structured_evidence_object_with_id_field_is_accepted():
+    clean_queue()
+    result = propose_issues(
+        [finding(evidence=[{"id": "9f86d081884c7d659a2feaa0c55ad015"}])],
+        "owner/repo",
+        queue_path=QUEUE,
+    )
+
+    assert len(result["proposals"]) == 1
+    clean_queue()
+
+
+def test_finding_id_without_evidence_is_dropped_not_softened():
     raw = finding(evidence=[])
     raw["finding_id"] = "12345678-1234-1234-1234-123456789abc"
 
@@ -109,6 +145,22 @@ def test_finding_id_without_evidence_is_dropped_not_softened():
 
     assert result["proposals"] == []
     assert result["dropped"][0]["reason"] == "missing_concrete_evidence"
+    clean_queue()
+
+
+def test_fingerprint_is_stable_across_reworded_title_and_confidence():
+    clean_queue()
+    same_evidence = ["scripts/reflection_loop.py:42 showed the same finding emitted twice"]
+    first = propose_issues([finding("Original phrasing of the finding", confidence=0.9, evidence=same_evidence)], "owner/repo", queue_path=QUEUE)
+    second = propose_issues(
+        [finding("A totally reworded description of the same bug", confidence=0.75, evidence=same_evidence)],
+        "owner/repo",
+        queue_path=QUEUE,
+    )
+
+    assert len(first["proposals"]) == 1
+    assert second["proposals"] == []
+    assert second["deduped"][0]["method"] == "fingerprint"
     clean_queue()
 
 
@@ -124,9 +176,9 @@ def test_confidence_floor_is_enforced():
 def test_max_proposals_cap_is_enforced_after_ranking():
     clean_queue()
     findings = [
-        finding("low accepted second", confidence=0.8),
-        finding("top accepted first", confidence=0.95),
-        finding("capped candidate", confidence=0.9),
+        finding("low accepted second", confidence=0.8, evidence=["scripts/low.py:10 low finding"]),
+        finding("top accepted first", confidence=0.95, evidence=["scripts/top.py:20 top finding"]),
+        finding("capped candidate", confidence=0.9, evidence=["scripts/capped.py:30 capped finding"]),
     ]
 
     result = propose_issues(findings, "owner/repo", min_confidence=0.7, max_proposals=2, queue_path=QUEUE)

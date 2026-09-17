@@ -58,8 +58,29 @@ def _normalize_title(title: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", title.lower())).strip()
 
 
-def _fingerprint(title: str, body: str) -> str:
-    payload = f"{_normalize_title(title)}\n{body.strip().lower()}"
+def _normalize_evidence_key(item: str) -> str:
+    return re.sub(r"\s+", " ", item.strip().lower())
+
+
+def _fingerprint(repo: str, finding: dict[str, Any], title: str, evidence: list[str]) -> str:
+    """Stable identity for dedup: repo + normalized evidence, not rendered prose.
+
+    Rewording the same finding's title/body/confidence must not change the
+    fingerprint, so identity is derived from structured, stable identifiers
+    (a finding ID if present, otherwise the normalized evidence references
+    such as file:line or signature) rather than the natural-language text.
+    """
+    finding_id = str(finding.get("finding_id") or finding.get("id") or "").strip().lower()
+    if finding_id:
+        identity_parts = [finding_id]
+    else:
+        identity_parts = sorted({_normalize_evidence_key(item) for item in evidence if item.strip()})
+    if not identity_parts:
+        # No stable identifiers available (e.g. evidence-less findings that
+        # were not filtered upstream); fall back to the normalized title so
+        # the function still returns a deterministic value.
+        identity_parts = [_normalize_title(title)]
+    payload = "\n".join([repo.strip().lower(), *identity_parts])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -88,13 +109,42 @@ def _evidence_items(finding: dict[str, Any]) -> list[str]:
     return out
 
 
+# Patterns that mark evidence text as verifiable/traceable rather than prose.
+_EVIDENCE_FILE_LINE_RE = re.compile(r"\b[\w./-]+\.[a-zA-Z0-9]+:\d+\b")
+_EVIDENCE_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+_EVIDENCE_FINDING_ID_RE = re.compile(r"\b(?:FND|CVE|GHSA|CWE)-[A-Za-z0-9-]+\b", re.I)
+_EVIDENCE_SIGNATURE_RE = re.compile(r"\b(?:sha(?:1|256|512)?:[0-9a-f]{7,64}|(?=[0-9a-f]*\d)[0-9a-f]{7,64})\b", re.I)
+_EVIDENCE_STRUCTURED_KEYS = ("finding_id", "id", "ref", "sha", "signature", "line", "path", "file")
+
+
 def _has_concrete_evidence(finding: dict[str, Any]) -> bool:
-    for item in _evidence_items(finding):
-        if re.search(r"\b[\w./-]+:\d+\b", item):
+    """Require actually verifiable/traceable evidence, not just prose.
+
+    Accepts: a file path + line number reference, a finding ID (UUID or
+    FND/CVE/GHSA/CWE-style identifier), a hash/signature, or a structured
+    evidence object carrying one of those as a distinct field. Plain
+    natural-language sentences (regardless of length) are rejected.
+    """
+    raw_items: list[Any] = []
+    for key in ("evidence", "evidence_refs", "supporting_evidence", "citations", "loci_finding_ids", "logs"):
+        raw_items.extend(_as_list(finding.get(key)))
+    for raw_item in raw_items:
+        if isinstance(raw_item, dict):
+            for struct_key in _EVIDENCE_STRUCTURED_KEYS:
+                if str(raw_item.get(struct_key) or "").strip():
+                    return True
+            text = str(raw_item.get("text") or "").strip()
+        else:
+            text = str(raw_item or "").strip()
+        if not text:
+            continue
+        if _EVIDENCE_FILE_LINE_RE.search(text):
             return True
-        if re.search(r"\b[0-9a-f]{8}-[0-9a-f-]{13,}\b", item, flags=re.I):
+        if _EVIDENCE_UUID_RE.search(text):
             return True
-        if len(item.split()) >= 4:
+        if _EVIDENCE_FINDING_ID_RE.search(text):
+            return True
+        if _EVIDENCE_SIGNATURE_RE.search(text):
             return True
     return False
 
@@ -147,7 +197,7 @@ def _proposal_from_finding(finding: dict[str, Any], repo: str) -> dict[str, Any]
         "confidence": confidence,
         "evidence": evidence,
         "source_finding": dict(finding),
-        "fingerprint": _fingerprint(title, body),
+        "fingerprint": _fingerprint(repo, finding, title, evidence),
         "labels": ["loci-reflection", "machine-generated-proposal"],
     }
 
@@ -193,7 +243,7 @@ def _append_queue(queue_path: str | Path | None, proposals: list[dict[str, Any]]
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             for row in rows:
-                fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=_json_default) + "\n")
         return [], False
     except Exception as exc:
         return [{"error": f"queue append degraded: {exc}"}], True
@@ -503,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     else:
         open_result = open_proposed_issues(result["proposals"], gh_create_issue_fn, confirm=args.confirm_open)
-    print(json.dumps({"proposal_result": result, "open_result": open_result}, ensure_ascii=False, indent=2))
+    print(json.dumps({"proposal_result": result, "open_result": open_result}, ensure_ascii=False, indent=2, default=_json_default))
     return 0
 
 
