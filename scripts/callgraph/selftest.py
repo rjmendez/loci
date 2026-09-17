@@ -310,7 +310,7 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 146, result.meta.file_count  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 146: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, swarm-supervisor
+    assert result.meta.file_count == 147, result.meta.file_count  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]

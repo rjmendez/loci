@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 146  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 146: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, swarm-supervisor
+    assert head_build.meta.file_count == 147  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -34,15 +34,10 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # Raised ceiling: the local-model fleet batch (verify/guardian follow-ons —
     # conflict/reflection/pre-answer/procedure-learning/mnemosyne/wiring-obligation
     # corroboration modules) adds several small new modules at once.
-    # Raised again (1320 -> 1340): scripts/stigmergic_consensus.py (19
-    # module-level functions) plus the merged origin/main reflection-
-    # severity/signature normalization (#353) and canonical callgraph docs
-    # (#356) landing on this branch.
-    # Raised again (1340 -> 1380): scripts/swarm_supervisor.py + demo script
-    # add the advisory swarm supervisor's module-level helpers.
-    # Raised again (1380 -> 1400): merge commit 1ab0926 pulls
-    # scripts/issue_proposer.py onto the branch as well; measured 1382.
-    assert 954 <= len(module_level) <= 1400, len(module_level)
+    # 1320 -> 1360: scripts/issue_proposer.py (guarded reflection-loop issue
+    # proposer) and scripts/stigmergic_consensus.py (19 module-level functions)
+    # both add their module-level helpers to the census.
+    assert 954 <= len(module_level) <= 1360, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
