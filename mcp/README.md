@@ -109,8 +109,8 @@ server twice under two names publishes every tool twice:
 
 ## Tools (75)
 
-75 tools are registered at runtime: 43 server-local decorators, plus 11
-investigation tools, 11 code-graph tools, and 10 local-model tools registered
+76 tools are registered at runtime: 43 server-local decorators, plus 11
+investigation tools, 11 code-graph tools, and 11 local-model tools registered
 onto the shared FastMCP instance. The source-checked registration anchors and
 representative paths are maintained in
 [docs/CALLGRAPH.md](../docs/CALLGRAPH.md). The

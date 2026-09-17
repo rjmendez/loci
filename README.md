@@ -27,7 +27,7 @@ findings, and context persist in a searchable memory store Claude can read and w
 ![Loci architecture](docs/img/loci-overview.svg)
 
 Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
-something, it calls one of Loci's 75 tools — the same way it calls any other tool. Your
+something, it calls one of Loci's 76 tools — the same way it calls any other tool. Your
 data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
 > **New to terms like "vector search", "RAG", or "MCP"?**
@@ -87,13 +87,13 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 
 ---
 
-## MCP tools (75)
+## MCP tools (77)
 
 ![Tool groups](docs/img/loci-tools.svg)
 
 *This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds.
-The canonical source-checked composition is 75 tools: 43 server-local, 11
-investigation, 11 code-graph, and 10 local-model tools, all registered onto the
+The canonical source-checked composition is 77 tools: 43 server-local, 11
+investigation, 11 code-graph, and 12 local-model tools, all registered onto the
 shared FastMCP instance at import time. See [docs/CALLGRAPH.md](docs/CALLGRAPH.md)
 for registration anchors and call paths.*
 
@@ -104,7 +104,7 @@ for registration anchors and call paths.*
 - **Memory lifecycle & health** — `audit_log`, `memory_self_check`, `code_memory_correlate`, `memory_health`, `loci_health`, `retrieval_selftest`, `memory_retract`, `memory_restore`, `memory_promote`, `memory_demote`, `memory_hints`, `memory_surface`, `memory_route`, `memory_consolidate`, `memory_confidence`
 - **Reflection loop** — `reflection_loop_seed`, `reflection_loop_tick`, `reflection_loop_status`
 - **Contracts & wiring obligations** — `contract_declare`, `contract_query`, `contract_check`, `wiring_obligation_scan`, `wiring_obligation_declare`, `wiring_obligation_list`, `wiring_obligation_resolve`
-- **Local-model offload** — `llm_local`, `generate_batch`, `query_expand`, `verify_finding`, `investigation_verify_all`, `classify_text`, `compress_text`, `semantic_dedup`, `semantic_relevance`, `swarm_reason`
+- **Local-model offload** — `llm_local`, `generate_batch`, `query_expand`, `verify_finding`, `adversarial_review`, `investigation_verify_all`, `classify_text`, `compress_text`, `semantic_dedup`, `semantic_relevance`, `swarm_reason`
 - **Code graph** — `code_graph_ingest`, `code_graph_query`, `code_memory_relink`, `code_memory_map`, `symbol_impact`, `impact_report`, `finding_code_context`, `investigation_code_briefing`, `subsystem_report`, `related_investigations_via_code`, `dead_code_candidates`
 
 ---
@@ -249,7 +249,7 @@ LOCI_MCP_TRANSPORT=sse LOCI_MCP_HOST=0.0.0.0 LOCI_MCP_PORT=8000 \
 
 ```
 loci/
-├── mcp/                   MCP server — 75 tools: investigation memory, RAG, claim validation, code graph
+├── mcp/                   MCP server — 76 tools: investigation memory, RAG, claim validation, code graph
 │   ├── server.py          FastMCP server entry point
 │   ├── backends.py        Endpoint resolution: env var -> localhost probe -> ~/.loci/backends.toml
 │   ├── memcheck/          Standalone claim-validation + code-hallucination module
