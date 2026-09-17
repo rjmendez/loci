@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import pathlib
 import sys
+import threading
+import time
 
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -11,7 +13,8 @@ sys.path.insert(0, str(REPO / "scripts"))
 import local_deep_think as L  # noqa: E402
 
 
-def _config(*, red_team: bool = False, self_reflect: bool = True, strict_grounding: bool = False) -> L.ChainConfig:
+def _config(*, red_team: bool = False, self_reflect: bool = True,
+            strict_grounding: bool = False, safety_check: bool = False) -> L.ChainConfig:
     return L.ChainConfig(
         topic="fail-open local reasoning",
         investigation_id="local-deep-think-test",
@@ -25,6 +28,7 @@ def _config(*, red_team: bool = False, self_reflect: bool = True, strict_groundi
         self_reflect=self_reflect,
         red_team=red_team,
         strict_grounding=strict_grounding,
+        safety_check=safety_check,
         ideas_per_model=1,
         retrieval_limit=3,
         ground_threshold=0.59,
@@ -161,6 +165,55 @@ def test_dead_tier_fails_open():
     assert any(not report["ok"] for report in reports)
     assert result["ideate"]["stored_count"] == 1
     assert result["verify"]["survivor_count"] == 1
+
+
+def test_ideate_dispatches_models_concurrently_and_preserves_order():
+    config = _config(self_reflect=False)
+    config.ideate_models = [
+        "model-a:latest",
+        "model-b:latest",
+        "model-c:latest",
+        "model-d:latest",
+    ]
+    config.ideas_per_model = 1
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
+        nonlocal active, max_active
+        assert "IDEATE tier" in prompt
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.25)
+            return {
+                "ok": True,
+                "text": (
+                    '{"ideas":[{"claim":"idea from '
+                    f'{model}'
+                    '","rationale":"why","confidence":"medium","evidence_ids":["seed-1"]}]}'
+                ),
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    start = time.perf_counter()
+    ideas, reports = L.ideate(
+        config.topic,
+        candidates=_search_collection(query=config.topic, collection_name="loci_memory", limit=3),
+        config=config,
+        gen_fn=_generate,
+    )
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.70
+    assert max_active > 1
+    assert [idea.model for idea in ideas] == config.ideate_models
+    assert [report["model"] for report in reports] == config.ideate_models
+    assert [idea.claim for idea in ideas] == [f"idea from {model}" for model in config.ideate_models]
 
 
 def test_verified_high_confidence_finding_calls_procedure_learning():
@@ -568,6 +621,139 @@ def test_strict_grounding_downgrades_ungrounded_synthesis():
     assert synth_store["confidence"] == "low"
 
 
+def test_safety_check_default_preserves_deep_think_result_shape():
+    deps, _stores = _ungrounded_deps()
+
+    def _guardian(_text):  # pragma: no cover - must not be called
+        raise AssertionError("guardian should not run by default")
+
+    deps["guardian_check"] = _guardian
+    result = L.run_chain(_config(self_reflect=False), deps=deps)
+
+    assert "safety_flag" not in result["synthesis"]
+    assert all("safety_flag" not in item for item in result["lineage"])
+    assert result["synthesis"]["summary"] == "Confident-sounding synthesis."
+
+
+def test_safety_check_annotates_deep_think_findings_without_removing_text():
+    deps, _stores = _ungrounded_deps()
+    seen = []
+
+    def _guardian(text):
+        seen.append(text)
+        return {"flagged": len(seen) == 1, "verdict": "Yes" if len(seen) == 1 else "No", "ok": True, "error": None}
+
+    deps["guardian_check"] = _guardian
+    result = L.run_chain(_config(self_reflect=False, safety_check=True), deps=deps)
+
+    assert result["synthesis"]["summary"] == "Confident-sounding synthesis."
+    assert result["synthesis"]["safety_flag"] == {"flagged": True, "why": "guardian verdict Yes"}
+    assert result["lineage"][0]["text"] == "Idea with no supporting evidence."
+    assert result["lineage"][0]["safety_flag"] == {"flagged": False, "why": "guardian verdict No"}
+    assert seen == ["Confident-sounding synthesis.", "Idea with no supporting evidence."]
+
+
+def test_safety_check_guardian_errors_fail_open_for_deep_think():
+    deps, _stores = _ungrounded_deps()
+
+    def _guardian(_text):
+        raise RuntimeError("guardian offline")
+
+    deps["guardian_check"] = _guardian
+    result = L.run_chain(_config(self_reflect=False, safety_check=True), deps=deps)
+
+    assert result["synthesis"]["summary"] == "Confident-sounding synthesis."
+    assert result["synthesis"]["safety_flag"]["flagged"] is False
+    assert "failed open" in result["synthesis"]["safety_flag"]["why"]
+    assert result["lineage"][0]["text"] == "Idea with no supporting evidence."
+
+
+def test_resolve_models_default_no_opt_in_preserves_legacy_models(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args(["topic only"]))
+
+    assert config.safety_check is False
+    assert config.verify_model == L._DEFAULT_VERIFY_MODEL
+    assert config.synthesize_model == L._DEFAULT_SYNTH_MODEL
+    assert config.self_reflect_model == L._DEFAULT_REFLECT_MODEL
+    assert config.redteam_max_tokens == 900
+    assert config.synthesize_max_tokens == 1400
+
+
+def test_resolve_models_opt_in_without_override_upgrades_models(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args(["topic only", "--safety-check"]))
+
+    assert config.safety_check is True
+    assert config.verify_model == L._TIER_VERIFY_MODEL
+    assert config.synthesize_model == L._TIER_SYNTH_MODEL
+    assert config.self_reflect_model == L._TIER_REFLECT_MODEL
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_models_opt_in_preserves_explicit_non_default_overrides(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args([
+        "topic only",
+        "--safety-check",
+        "--verify-model", "verify-explicit:latest",
+        "--synthesize-model", "synth-explicit:latest",
+        "--self-reflect-model", "reflect-explicit:latest",
+    ]))
+
+    assert config.verify_model == "verify-explicit:latest"
+    assert config.synthesize_model == "synth-explicit:latest"
+    assert config.self_reflect_model == "reflect-explicit:latest"
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_resolve_models_opt_in_preserves_explicit_legacy_default_overrides(monkeypatch):
+    for name in (
+        "LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK",
+        "LOCI_LOCAL_DEEP_THINK_VERIFY_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SYNTHESIZE_MODEL",
+        "LOCI_LOCAL_DEEP_THINK_SELF_REFLECT_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = L._resolve_models(L.parse_args([
+        "topic only",
+        "--safety-check",
+        "--verify-model", L._DEFAULT_VERIFY_MODEL,
+        "--synthesize-model", L._DEFAULT_SYNTH_MODEL,
+        "--self-reflect-model", L._DEFAULT_REFLECT_MODEL,
+    ]))
+
+    assert config.verify_model == L._DEFAULT_VERIFY_MODEL
+    assert config.synthesize_model == L._DEFAULT_SYNTH_MODEL
+    assert config.self_reflect_model == L._DEFAULT_REFLECT_MODEL
+    assert config.redteam_max_tokens == L._TIER_REDTEAM_MAX_TOKENS
+    assert config.synthesize_max_tokens == L._TIER_SYNTHESIZE_MAX_TOKENS
+
+
 def test_strict_grounding_leaves_grounded_synthesis_untouched():
     def _generate(prompt, *, model="", fmt=None, max_tokens=256, temperature=0.2):  # noqa: ARG001
         if "IDEATE tier" in prompt:
@@ -606,4 +792,3 @@ def test_strict_grounding_leaves_grounded_synthesis_untouched():
     assert synthesis["summary"] == "Grounded synthesis."
     assert "ungrounded" not in synthesis["tags"]
     assert stores[-1]["confidence"] == "high"
-
