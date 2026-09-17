@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 148  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor, provenance-firewall
+    assert head_build.meta.file_count == 149  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148 -> 149: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor, bench-local-models, provenance-firewall
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -40,7 +40,9 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog),
     # scripts/swarm_supervisor.py, and scripts/demo_swarm_supervisor.py
     # (advisory swarm supervisor + demo) add their module-level helpers.
-    assert 954 <= len(module_level) <= 1390, len(module_level)
+    # 1390 -> 1410: scripts/bench_local_models.py (honest local model
+    # benchmark harness) adds its module-level helpers.
+    assert 954 <= len(module_level) <= 1410, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
