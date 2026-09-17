@@ -4,7 +4,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.swarm_supervisor import SupervisorBudget, make_loci_evidence_fn, plan_source_routing, supervise_and_correct, supervise_findings
+from scripts.swarm_supervisor import (
+    SupervisorBudget,
+    make_loci_evidence_fn,
+    plan_source_routing,
+    supervise_and_correct,
+    supervise_findings,
+)
 
 
 SOURCES = [
@@ -263,7 +269,7 @@ def test_make_loci_evidence_fn_adapts_structured_verifier_result():
 
     evidence_fn = make_loci_evidence_fn(loci_verify_fn, investigation_id="inv-123")
     result = evidence_fn(finding={"claim": "spiders observed nearby", "evidence": "photo record"})
-    assert result == {"supported": True, "rationale": "matched retrieved passage"}
+    assert result == {"supported": True, "verdict": "supported", "rationale": "matched retrieved passage"}
 
 
 def test_make_loci_evidence_fn_falls_back_to_positional_call_and_parses_json_string():
@@ -272,7 +278,7 @@ def test_make_loci_evidence_fn_falls_back_to_positional_call_and_parses_json_str
 
     evidence_fn = make_loci_evidence_fn(loci_verify_fn)
     result = evidence_fn(finding={"text": "unverified claim", "context": "irrelevant background"})
-    assert result == {"supported": False, "rationale": "no matching evidence"}
+    assert result == {"supported": False, "verdict": "uncertain", "rationale": "no matching evidence"}
 
 
 def test_supervise_findings_can_use_make_loci_evidence_fn_as_evidence_fn():
@@ -288,6 +294,52 @@ def test_supervise_findings_can_use_make_loci_evidence_fn_as_evidence_fn():
     result = supervise_findings(TASK, [finding], {}, gen_fn, evidence_fn=evidence_fn)
     assert result["verdicts"][0]["supported"] is False
     assert "loci grounding found no supporting passage" in result["verdicts"][0]["rationale"]
+def test_loci_evidence_adapter_maps_confirmed_refuted_and_uncertain():
+    finding = {"claim": "exact code fact"}
+
+    confirmed = make_loci_evidence_fn(
+        lambda **_kwargs: {"verdict": "confirmed", "reasoning": "source matches"}
+    )(finding=finding)
+    refuted = make_loci_evidence_fn(
+        lambda **_kwargs: {"verdict": "refuted", "refutation": "source says 2, not 3"}
+    )(finding=finding)
+    uncertain = make_loci_evidence_fn(
+        lambda **_kwargs: {"verdict": "uncertain", "degraded": True}
+    )(finding=finding)
+
+    assert confirmed == {
+        "supported": True,
+        "verdict": "confirmed",
+        "rationale": "source matches",
+    }
+    assert refuted == {
+        "supported": False,
+        "verdict": "refuted",
+        "rationale": "source says 2, not 3",
+    }
+    assert uncertain["supported"] is None
+    assert uncertain["verdict"] == "uncertain"
+
+
+def test_inconclusive_evidence_preserves_supervisor_verdict_and_does_not_tripwire():
+    finding = {"source": "iNaturalist", "claim": "observed nearby", "evidence": "photo"}
+
+    def gen_fn(**_kwargs):
+        return json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": False, "source_appropriate": True, "guidance": "check support", "rationale": "model says unsupported"}]})
+
+    result = supervise_findings(
+        TASK,
+        [finding],
+        {},
+        gen_fn,
+        evidence_fn=lambda **_kwargs: {"supported": None, "verdict": "uncertain", "rationale": "retrieval unavailable"},
+        strict_tripwire=True,
+    )
+
+    assert result["verdicts"][0]["supported"] is False
+    assert result["verdicts"][0]["evidence_checked"] is True
+    assert result["verdicts"][0]["evidence_inconclusive"] is True
+    assert "tripwire_triggered" not in result
 
 
 def test_supervise_findings_strict_tripwire_is_opt_in():

@@ -584,25 +584,44 @@ Available sources: {_json_default(safe_sources)}
 
 def _apply_evidence_verdict(verdict: dict[str, Any], _finding: dict[str, Any], evidence_result: Any) -> dict[str, Any]:
     updated = dict(verdict)
+    supported: bool | None
     if isinstance(evidence_result, bool):
         supported = evidence_result
         rationale = "evidence_fn returned supported" if supported else "evidence_fn returned unsupported"
     elif isinstance(evidence_result, dict):
         value = evidence_result.get("supported")
         if value is None:
-            value = evidence_result.get("ok")
-        if value is None:
             value = evidence_result.get("verdict")
+        if value is None:
+            value = evidence_result.get("status")
         if isinstance(value, str):
-            supported = value.lower() in {"supported", "true", "yes", "ok", "pass"}
+            normalized = value.strip().lower()
+            if normalized in {"supported", "confirmed", "true", "yes", "pass", "grounded"}:
+                supported = True
+            elif normalized in {"unsupported", "refuted", "contradicted", "false", "no", "fail"}:
+                supported = False
+            else:
+                supported = None
+        elif isinstance(value, bool):
+            supported = value
         else:
-            supported = bool(value)
-        rationale = str(evidence_result.get("rationale") or evidence_result.get("reason") or evidence_result.get("evidence") or "").strip()
+            supported = None
+        rationale = str(
+            evidence_result.get("rationale")
+            or evidence_result.get("reason")
+            or evidence_result.get("refutation")
+            or evidence_result.get("reasoning")
+            or evidence_result.get("evidence")
+            or ""
+        ).strip()
     else:
-        supported = bool(evidence_result)
+        supported = None
         rationale = f"evidence_fn returned {type(evidence_result).__name__}"
-    updated["supported"] = supported
-    if not supported and not updated.get("guidance"):
+    if supported is None:
+        updated["evidence_inconclusive"] = True
+    else:
+        updated["supported"] = supported
+    if supported is False and not updated.get("guidance"):
         updated["guidance"] = "Re-check the claim against retrieved evidence and remove or qualify unsupported details."
     if rationale:
         prior = str(updated.get("rationale") or "").strip()
@@ -616,7 +635,11 @@ def _apply_tripwire(result: dict[str, Any]) -> dict[str, Any]:
     verdicts: list[dict[str, Any]] = []
     for verdict in result.get("verdicts") or []:
         item = dict(verdict)
-        if bool(item.get("evidence_checked")) and not bool(item.get("supported", True)):
+        if (
+            bool(item.get("evidence_checked"))
+            and not bool(item.get("evidence_inconclusive"))
+            and not bool(item.get("supported", True))
+        ):
             item["tripwire_triggered"] = True
             item["hard_fail"] = True
             if not item.get("guidance"):
@@ -647,17 +670,34 @@ def make_loci_evidence_fn(loci_verify_fn: Callable[..., Any], *, investigation_i
             try:
                 raw = json.loads(raw)
             except json.JSONDecodeError:
-                return {"supported": False, "rationale": raw}
+                return {"supported": None, "verdict": "uncertain", "rationale": raw}
         if isinstance(raw, dict):
-            verdict = str(raw.get("verdict") or raw.get("supported") or raw.get("status") or "").lower()
+            verdict = str(raw.get("verdict") or raw.get("status") or "").strip().lower()
             supported = raw.get("supported")
             if supported is None:
-                supported = verdict in {"supported", "true", "yes", "pass", "grounded"}
+                if verdict in {"supported", "confirmed", "true", "yes", "pass", "grounded"}:
+                    supported = True
+                elif verdict in {"unsupported", "refuted", "contradicted", "false", "no", "fail"}:
+                    supported = False
             return {
-                "supported": bool(supported),
-                "rationale": str(raw.get("rationale") or raw.get("reason") or raw.get("summary") or raw),
+                "supported": supported if isinstance(supported, bool) else None,
+                "verdict": verdict or "uncertain",
+                "rationale": str(
+                    raw.get("rationale")
+                    or raw.get("reason")
+                    or raw.get("refutation")
+                    or raw.get("reasoning")
+                    or raw.get("summary")
+                    or raw
+                ),
             }
-        return {"supported": bool(raw), "rationale": "loci evidence adapter returned non-structured result"}
+        if isinstance(raw, bool):
+            return {"supported": raw, "rationale": "loci evidence adapter returned a boolean result"}
+        return {
+            "supported": None,
+            "verdict": "uncertain",
+            "rationale": "loci evidence adapter returned a non-structured result",
+        }
     return evidence_fn
 
 
