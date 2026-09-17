@@ -1,10 +1,12 @@
 """Batched-serving generation client — concurrent fan-out generation with Ollama fallback.
 
 For high-concurrency workflow fan-out (N planning/research agents, per-prompt gates,
-map-stage classification), the Ollama tier serializes: `llm_local.generate` issues one
-POST per prompt and Ollama processes them essentially one-at-a-time. A batched,
-OpenAI-compatible server (vLLM / TGI) can serve many small requests *concurrently* with
-continuous batching, which is a large throughput win when you have dozens of short prompts.
+map-stage classification), a batched, OpenAI-compatible server (vLLM / TGI) can serve many
+small requests *concurrently* with continuous batching, which is a large throughput win
+when you have dozens of short prompts. The Ollama fallback tier ALSO dispatches concurrently
+(bounded by OLLAMA_MAX_CONCURRENCY) -- live-verified 2026-09-16 that the Ollama server
+genuinely parallelizes concurrent requests to an already-loaded model rather than silently
+serializing them one-at-a-time.
 
 Substrate facts this is built against (session grounding):
   - [gen] The local generation tier (mcp/llm_local.py) already exists and speaks to Ollama
@@ -39,6 +41,17 @@ from typing import Callable, Optional
 # Max in-flight requests to the batched server. Continuous batching only engages when the
 # server sees multiple concurrent requests, so we dispatch the batch across a thread pool.
 _MAX_CONCURRENCY = int(os.environ.get("VLLM_MAX_CONCURRENCY", "16"))
+
+# Max in-flight requests to the Ollama fallback host. Live-verified 2026-09-16: Ollama
+# (0.34.1, Windows-native, 100.73.200.19:11434) genuinely parallelizes concurrent requests
+# to an already-loaded model rather than silently queueing them one-at-a-time -- 4 concurrent
+# calls to qwen2.5:3b completed in 1.82s wall-clock vs 4.08s sequential. Kept modest (default
+# 6) rather than matching VLLM_MAX_CONCURRENCY's 16: unlike the batched vLLM tier, Ollama here
+# also shares two GPUs (2080 Ti 11GB / 4070 Ti 12GB) with only one large (5-18GB) model
+# resident at a time, so heavy over-fanout against a large model risks request queuing/latency
+# cliffs rather than a hard crash. Override via OLLAMA_MAX_CONCURRENCY for wider fan-out modes
+# (e.g. swarm_escalate.py's --seeds) that have already sized their batch to the target model.
+_OLLAMA_MAX_CONCURRENCY = int(os.environ.get("OLLAMA_MAX_CONCURRENCY", "6"))
 
 # The batched server's OpenAI-compatible base URL, e.g. http://<host>:8000. Env wins; when
 # unset, _resolve_vllm() falls back to backends (local :8000 probe -> gitignored config).
@@ -83,8 +96,15 @@ def _ok_text(text: str, fmt: Optional[str]) -> dict:
 
 
 def _via_ollama(prompts: list[str], model: Optional[str], max_tokens: int,
-                fmt: Optional[str]) -> list[dict]:
-    """FALLBACK path: sequential mcp/llm_local.generate per prompt. Fail-open per prompt.
+                fmt: Optional[str], think: bool = False) -> list[dict]:
+    """FALLBACK path: concurrent mcp/llm_local.generate calls, dispatched across a thread
+    pool (bounded by OLLAMA_MAX_CONCURRENCY). Fail-open per prompt.
+
+    Live-verified (2026-09-16): the Ollama server genuinely serves concurrent requests in
+    parallel rather than silently serializing them -- a single blocking for-loop here would
+    leave real throughput on the table for every caller (swarm_escalate.py's fan-out,
+    local_deep_think.py's multi-model ideation) whenever routing goes through Ollama, which
+    it always does for multi-model tier diversity (vLLM is single-model-per-process).
 
     Lazily imports llm_local so this module never hard-requires it at import time
     [pattern:injectable]. If the import itself fails, we degrade the whole batch.
@@ -97,20 +117,40 @@ def _via_ollama(prompts: list[str], model: Optional[str], max_tokens: int,
         except Exception:
             return _fail(len(prompts))
 
-    out: list[dict] = []
-    for p in prompts:
+    def _one(p: str) -> dict:
         try:
             # llm_local.generate defaults model to qwen2.5:3b when we pass None-equivalent;
             # only forward `model` if the caller actually named one for the batched server.
             if model:
-                res = llm_local.generate(p, model=model, fmt=fmt, max_tokens=max_tokens)
+                res = llm_local.generate(p, model=model, fmt=fmt, max_tokens=max_tokens,
+                                         think=think)
             else:
-                res = llm_local.generate(p, fmt=fmt, max_tokens=max_tokens)
-            out.append({"text": res.get("text", ""), "ok": bool(res.get("ok"))})
+                res = llm_local.generate(p, fmt=fmt, max_tokens=max_tokens, think=think)
+            return {"text": res.get("text", ""), "ok": bool(res.get("ok"))}
         except Exception:
             # Per-prompt isolation: one bad prompt never poisons the rest [pattern:fail-open].
-            out.append({"text": "", "ok": False})
-    return out
+            return {"text": "", "ok": False}
+
+    if len(prompts) == 1:
+        # Skip pool overhead for the common single-prompt call path.
+        return [_one(prompts[0])]
+
+    workers = max(1, min(len(prompts), _OLLAMA_MAX_CONCURRENCY))
+    out: list[Optional[dict]] = [None] * len(prompts)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_one, p): i for i, p in enumerate(prompts)}
+            for fut in concurrent.futures.as_completed(futures):
+                i = futures[fut]
+                try:
+                    out[i] = fut.result()
+                except Exception:
+                    out[i] = {"text": "", "ok": False}
+    except Exception:
+        # Pool-level failure (never expected) -- degrade the whole batch rather than raise
+        # [pattern:fail-open].
+        return _fail(len(prompts))
+    return [r if r is not None else {"text": "", "ok": False} for r in out]
 
 
 def _post_completions(client, url: str, model: str, prompt: str, max_tokens: int,
@@ -144,14 +184,17 @@ def generate_batch(prompts: list[str],
                    model: Optional[str] = None,
                    max_tokens: int = 256,
                    fmt: Optional[str] = None,
-                   client_fn: Optional[Callable[[], object]] = None) -> list[dict]:
+                   client_fn: Optional[Callable[[], object]] = None,
+                   think: bool = False) -> list[dict]:
     """Generate for many prompts, batched on vLLM/TGI when available, else Ollama fallback.
 
     Args:
         prompts: list of prompt strings. The result is ALWAYS the same length and order.
         model: model tag to serve. None -> VLLM_MODEL default on the batched path, and
                llm_local's own default (qwen2.5:3b) on the fallback path.
-        max_tokens: max new tokens per prompt.
+        max_tokens: max new tokens per prompt. See llm_local.generate's think=True note:
+               this budget is SHARED between hidden reasoning and the visible answer on
+               thinking-capable models, so pass a larger value (~1000+) when think=True.
         fmt: 'json' requests JSON-guided output AND validates each body parses as JSON;
              a non-JSON body downgrades that prompt to ok=False (mirrors llm_local).
         client_fn: injectable zero-arg factory returning an HTTP client exposing
@@ -159,6 +202,11 @@ def generate_batch(prompts: list[str],
                    and .json() (i.e. a `requests`-like Session). None -> lazily use
                    `requests` [pattern:injectable]. Used ONLY for the batched path;
                    the fallback path goes through llm_local.
+        think: opt-in reasoning mode, forwarded to llm_local.generate on the Ollama
+               fallback path ONLY. vLLM's OpenAI-compatible /v1/completions endpoint used
+               on the batched path has no equivalent concept (it is a raw text-completion
+               endpoint, not a chat/reasoning API), so this flag is a no-op there. Default
+               False preserves every existing caller's behavior.
 
     Returns:
         list[dict] aligned to `prompts`, each {"text": str, "ok": bool}. Never raises.
@@ -172,7 +220,7 @@ def generate_batch(prompts: list[str],
     # Batched server: env wins; else backends (local :8000 probe -> config). None -> Ollama fallback.
     vllm = _VLLM or _resolve_vllm()
     if not vllm:
-        return _via_ollama(prompts, model, max_tokens, fmt)
+        return _via_ollama(prompts, model, max_tokens, fmt, think=think)
 
     # Resolve the HTTP client lazily/injectably. If even that fails, degrade to Ollama.
     try:
@@ -182,7 +230,7 @@ def generate_batch(prompts: list[str],
             import requests  # lazy: importing this module must not require requests
             client = requests
     except Exception:
-        return _via_ollama(prompts, model, max_tokens, fmt)
+        return _via_ollama(prompts, model, max_tokens, fmt, think=think)
 
     served_model = model or _DEFAULT_MODEL or _resolve_vllm_model()
 
@@ -209,11 +257,11 @@ def generate_batch(prompts: list[str],
                 hard_fail = hard_fail or failed
     except Exception:
         # Pool-level failure (never expected) -> degrade the whole batch to Ollama.
-        return _via_ollama(prompts, model, max_tokens, fmt)
+        return _via_ollama(prompts, model, max_tokens, fmt, think=think)
 
     any_ok = any(r and r["ok"] for r in out)
     # If the batched server produced NOTHING usable (e.g. server down -> every request
     # raised), fall back to Ollama for the whole batch rather than returning all-failed.
     if hard_fail and not any_ok:
-        return _via_ollama(prompts, model, max_tokens, fmt)
+        return _via_ollama(prompts, model, max_tokens, fmt, think=think)
     return [r if r is not None else {"text": "", "ok": False} for r in out]
