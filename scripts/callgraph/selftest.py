@@ -319,7 +319,7 @@ def _check_real_corpus():
     assert by_rule["DEC-tool"] == 44, dict(by_rule)
     assert by_rule["DEC-route"] == 6, dict(by_rule)
     assert by_rule["DEC-mcp-route"] == 1, dict(by_rule)
-    assert by_rule["MAN-LOOP"] == 32, dict(by_rule)
+    assert by_rule["MAN-LOOP"] == 33, dict(by_rule)
     assert by_rule["MAN-DICT"] == 13, dict(by_rule)
     unmatched = [e for e in store.edges_of_kind("DECORATED_BY") if e.attrs["classification"] == "unknown"]
     assert unmatched == [], [(e.src, e.attrs["raw"]) for e in unmatched]

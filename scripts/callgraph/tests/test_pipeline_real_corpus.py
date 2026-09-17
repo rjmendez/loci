@@ -199,7 +199,7 @@ def test_registry_counts_match_the_real_corpus(head_build):
     assert by_rule["DEC-tool"] == 44
     assert by_rule["DEC-route"] == 6         # a2a_server's @app.get/@app.post
     assert by_rule["DEC-mcp-route"] == 1     # mcp/server.py's @mcp.custom_route("/health", ...)
-    assert by_rule["MAN-LOOP"] == 32         # graph_tools(11) + investigation_tools(11) + llm_tools(10)
+    assert by_rule["MAN-LOOP"] == 33         # graph_tools(11) + investigation_tools(11) + llm_tools(10)
     assert by_rule["MAN-DICT"] == 13         # a2a_server's _SKILL_MAP
 
 
