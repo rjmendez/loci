@@ -97,83 +97,15 @@ investigation, 11 code-graph, and 10 local-model tools, all registered onto the
 shared FastMCP instance at import time. See [docs/CALLGRAPH.md](docs/CALLGRAPH.md)
 for registration anchors and call paths.*
 
-| Tool | Purpose |
-|---|---|
-| `investigation_start` | Open a new investigation session |
-| `investigation_load` | Load an existing investigation by ID |
-| `investigation_as_of` | Return findings as they were believed at a point in time |
-| `investigation_store` | Persist findings to the investigation |
-| `finding_resolve` | Mark a finding's lifecycle state — fixed / intentional / wontfix / superseded, or back to open |
-| `procedure_attempt` | Record a pass/fail attempt against a procedure-type finding |
-| `procedure_search` | Search for procedure-type findings matching a query |
-| `investigation_note` | Update a manifest field — hypothesis, next step, context, open questions, checked sources, closing summary |
-| `investigation_reflect` | Run reflection over current findings |
-| `investigation_reason` | Reason over findings with grounded, multi-perspective analysis |
-| `investigation_search` | Search within an investigation |
-| `investigation_pre_answer_check` | Validate a claim against stored evidence before answering |
-| `investigation_evidence_precheck` | Pre-screen evidence before ingestion |
-| `investigation_entity_lookup` | Look up an entity by name across stored findings |
-| `entity_list` | List all named entities extracted from an investigation's findings |
-| `entity_timeline` | Chronological timeline of every finding mentioning an entity |
-| `investigation_related_cases` | Find related prior investigations |
-| `investigation_finding_provenance` | Trace source provenance for a finding |
-| `causal_infer` | Infer causal edges for an investigation and write them to `causal_edges.jsonl` |
-| `causal_edges_list` | List causal edges inferred for an investigation |
-| `conflict_list` | List detected conflicts for an investigation |
-| `conflict_resolve` | Resolve a detected conflict by recording a verdict |
-| `investigation_list` | List investigations, most-recent first. Paginated (`limit=30`, `offset=0`) and compact by default (`summary=True`); pass `summary=False` for full records and `limit=0` (or any value `<=0`) for all — note `offset` still applies in no-limit mode, returning all *remaining* records starting at `offset`. Response includes `total`/`limit`/`offset`. |
-| `investigation_share` | Grant read/write access to an investigation for one or more agents |
-| `investigation_unshare` | Revoke access to an investigation for one or more agents |
-| `investigation_export` | Export an investigation as a portable JSON bundle |
-| `investigation_import` | Import an investigation bundle produced by `investigation_export` |
-| `audit_log` | Append to the audit trail |
-| `memory_self_check` | Cross-check stored memories for consistency |
-| `code_memory_correlate` | Link a detected code hallucination to the memories it contaminated (advisory, read-only) |
-| `memory_health` | Report memory system health |
-| `loci_health` | Read-only self-diagnosis of the MCP server as a JSON snapshot |
-| `retrieval_selftest` | Query every Qdrant collection in the store and report which ones actually return rows |
-| `memory_retract` | Soft-retract an incorrect or stale memory |
-| `memory_restore` | Restore a previously retracted memory |
-| `memory_promote` | Promote a finding to a higher memory tier |
-| `memory_demote` | Demote a finding to a lower memory tier |
-| `memory_hints` | Return the most recent findings as lightweight hints |
-| `memory_surface` | Proactively surface prior findings relevant to the current working context |
-| `memory_route` | Mesh-aware search across all investigations — no `investigation_id` filter |
-| `reflection_loop_seed` | Seed the reflection loop with new material |
-| `reflection_loop_tick` | Advance the reflection loop one step |
-| `reflection_loop_status` | Report reflection loop queue status |
-| `rag_context_search` | Fan-out semantic search across all configured Qdrant collections |
-| `ground` | Assemble a provenance-tagged, character-budgeted grounding block for a task |
-| `memory_consolidate` | Trigger memory consolidation (dedup + merge) |
-| `memory_confidence` | Estimate confidence in a memory-derived claim before asserting it |
-| `contract_declare` | Store a cross-boundary contract declaration for an entity |
-| `contract_query` | Query stored contract declarations for an entity |
-| `contract_check` | Check whether a field name conflicts with stored contract declarations |
-| `wiring_obligation_scan` | Advisory-only scan for implicit obligations that may merit manual declaration |
-| `wiring_obligation_declare` | Declare a wiring obligation — a method that should integrate but is unverified |
-| `wiring_obligation_list` | List wiring obligations for an investigation |
-| `wiring_obligation_resolve` | Resolve a wiring obligation with evidence of fulfilment |
-| `llm_local` | Generate with a local Ollama model — the generation tier of the offload path |
-| `generate_batch` | Generate for many prompts at once, for high-concurrency fan-out |
-| `query_expand` | Expand a search query (HyDE-lite) using the local model |
-| `verify_finding` | Adversarially verify a claim with the local model |
-| `investigation_verify_all` | Batch adversarial-verify an investigation's open findings |
-| `classify_text` | Pick the single best label for a text using the local model |
-| `compress_text` | Semantically condense text to a character budget using the local model |
-| `semantic_dedup` | Cluster near-duplicate items by embedding cosine similarity |
-| `semantic_relevance` | Score each text's cosine relevance to a topic on the local embedding path |
-| `swarm_reason` | Run bounded local-model fan-out and synthesis reasoning |
-| `code_graph_ingest` | Parse source with tree-sitter and ingest its symbol graph |
-| `code_graph_query` | Run a read-only Cypher query over the code + memory graph |
-| `code_memory_relink` | Scan findings and idempotently `MERGE` matching code-symbol `REFERENCES` edges |
-| `code_memory_map` | Map the code/memory neighbourhood around an anchor node |
-| `symbol_impact` | Blast radius of a code symbol across code and memory |
-| `impact_report` | Change blast radius for a symbol or class, with the findings that reference it |
-| `finding_code_context` | The code a finding references, with callers/callees where the live graph resolves them |
-| `investigation_code_briefing` | The code story of an investigation in a single call |
-| `subsystem_report` | Full picture of a subsystem: code, call boundary, memory hotspots |
-| `related_investigations_via_code` | Other investigations that reference the same code symbols |
-| `dead_code_candidates` | Functions with no code caller and no finding reference |
+**By category** (full signatures, param docs, and response shapes: [mcp/README.md](mcp/README.md); curated deep-dive on the 24 most-used: [docs/memory-and-code-review-tools.md](docs/memory-and-code-review-tools.md#2d-loci-mcp--loci_memory--investigation-and-memory-layer)):
+
+- **Session & findings** — `investigation_start`, `investigation_load`, `investigation_as_of`, `investigation_store`, `investigation_note`, `investigation_reflect`, `investigation_reason`, `investigation_list`, `investigation_share`, `investigation_unshare`, `investigation_export`, `investigation_import`, `finding_resolve`, `procedure_attempt`, `procedure_search`
+- **Search & entities** — `investigation_search`, `investigation_pre_answer_check`, `investigation_evidence_precheck`, `investigation_entity_lookup`, `entity_list`, `entity_timeline`, `investigation_related_cases`, `investigation_finding_provenance`, `causal_infer`, `causal_edges_list`, `conflict_list`, `conflict_resolve`, `rag_context_search`, `ground`
+- **Memory lifecycle & health** — `audit_log`, `memory_self_check`, `code_memory_correlate`, `memory_health`, `loci_health`, `retrieval_selftest`, `memory_retract`, `memory_restore`, `memory_promote`, `memory_demote`, `memory_hints`, `memory_surface`, `memory_route`, `memory_consolidate`, `memory_confidence`
+- **Reflection loop** — `reflection_loop_seed`, `reflection_loop_tick`, `reflection_loop_status`
+- **Contracts & wiring obligations** — `contract_declare`, `contract_query`, `contract_check`, `wiring_obligation_scan`, `wiring_obligation_declare`, `wiring_obligation_list`, `wiring_obligation_resolve`
+- **Local-model offload** — `llm_local`, `generate_batch`, `query_expand`, `verify_finding`, `investigation_verify_all`, `classify_text`, `compress_text`, `semantic_dedup`, `semantic_relevance`, `swarm_reason`
+- **Code graph** — `code_graph_ingest`, `code_graph_query`, `code_memory_relink`, `code_memory_map`, `symbol_impact`, `impact_report`, `finding_code_context`, `investigation_code_briefing`, `subsystem_report`, `related_investigations_via_code`, `dead_code_candidates`
 
 ---
 

@@ -470,14 +470,9 @@ ever actually run, and what did it say" has an answer.
 **Exit codes:** `0` ok, `1` a pass errored, `3` a pass refused or degraded. A `3`
 prints the pass's own reason on stderr so cron mails it.
 
-**Live schedule and last measured result (2026-08-27):**
-
-| Pass | Schedule | Result |
-|---|---|---|
-| `index --apply` | `17 */6 * * *` | ok, `on_disk=2922 indexed=2769 missing=153 coverage=0.9476` |
-| `knn_tags` | `20 3 * * *` | ok, `candidates=360 generated=18 proposed=0` |
-| `codelink` | `40 3 * * *` | ok, `symbols=11273 generated=718 proposed=0` |
-| `summaries` | `50 4 * * *` | ok, `already_had=137 nothing_to_say=5 errors=0` |
+**Live schedule and last measured result:** see [docs/OPERATIONS.md](./OPERATIONS.md)
+for the current per-pass schedule and measured results (`index --apply`, `knn_tags`,
+`codelink`, `summaries`).
 
 `verify` exists as a pass but is **not** scheduled and is not fit to schedule:
 `eval/verify_skeptic_eval.py` measured 22% false refutation on main, and five

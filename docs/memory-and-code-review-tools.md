@@ -67,7 +67,9 @@ Written from the actual running config and source code, not assumed behavior.
     hermes-grounding            — systemd --user — grounding daemon (UNIX socket)
 
   Interactive tools (in-session):
-    loci-mcp (loci_memory)  — investigation/memory/code-graph layer, 71 tools (see Section 2d)
+    loci-mcp (loci_memory)  — investigation/memory/code-graph layer (see
+                                 Section 2d; tool composition is canonically
+                                 tracked in docs/CALLGRAPH.md)
     Mnemosyne MCP             — episodic facts, store/recall with semantic search
     Serena MCP                — LSP-powered code navigation (symbols, refs, diagnostics)
     CocoIndex MCP             — semantic code search (ccc) across indexed repos
@@ -218,8 +220,8 @@ passing test, parseable schema, or audit receipt). Legacy untagged findings
 default to `tool_verified` when used as evidence so old investigations and
 callers continue to work; refs surface `provenance_defaulted: true` for audit.
 
-**72 MCP tools provided by loci-mcp** — 61 decorated `@mcp.tool()` in `mcp/server.py`
-plus 11 registered from `mcp/graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)`.
+**MCP tools provided by loci-mcp** — full registration composition and current
+count are canonical in [docs/CALLGRAPH.md](./CALLGRAPH.md).
 The tables below cover the 24 most-used ones. The rest are:
 `investigation_as_of`, `investigation_share`, `investigation_unshare`,
 `investigation_verify_all`, `investigation_reason`, `investigation_export`,
@@ -983,9 +985,10 @@ rules/quality.md               — verification and correctness rules
 rules/infra.md                 — infrastructure and security rules
 rules/knowledge.md             — skill/knowledge management rules
 skills/                        — 186 skill files across 26 categories
-mcp/server.py                  — loci-mcp server (loci_memory MCP, 60 tools)
-mcp/graph_tools.py             — 11 code-graph tools registered onto the same
-                                 server (71 tools total at runtime)
+mcp/server.py                  — loci-mcp server (loci_memory MCP; tool
+                                 composition tracked in docs/CALLGRAPH.md)
+mcp/graph_tools.py             — code-graph tools registered onto the same
+                                 server (see docs/CALLGRAPH.md)
 scripts/grounding_client.py    — pre_llm_call hook entry (UNIX socket client)
 scripts/grounding_daemon.py    — persistent daemon (systemd --user)
 scripts/hooks/pre_llm_grounding.py  — grounding logic v3
@@ -1049,8 +1052,8 @@ degrades to keyword-only search. `fastembed` is still a requirement, but it is
 used solely for the *sparse* BM25 vector (`Qdrant/bm25`), which is unaffected by
 `MNEMOSYNE_EMBEDDING_DIM`.
 
-**loci-mcp tool index (`mcp/server.py` — 60 `@mcp.tool()` functions, plus 11
-registered by `mcp/graph_tools.py` for 71 total at runtime; the 24 core
+**loci-mcp tool index (full registration composition and current count are
+canonical in [docs/CALLGRAPH.md](./CALLGRAPH.md); the 24 core
 investigation/memory tools are indexed below):**
 
 | Tool | Brief description |

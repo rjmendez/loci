@@ -3,16 +3,11 @@
 
 Run:  ./mcp/.venv/bin/python eval/verify_skeptic_eval.py [trials] [votes]
 
-WHY THESE CASES. An earlier probe of this same skeptic was invalidated because
-its labels asserted things about the loci corpus that the corpus then changed —
-past-tense-true labels against a present-tense codebase. Nothing here touches
-loci: every case carries its own context, so no commit can falsify a label.
-
-WHY THE SCORE IS ASYMMETRIC. Overall accuracy is the wrong objective. A verdict
-is an advisory note and never changes a finding's lifecycle, so "uncertain" is
-harmless — it leaves a finding unverified. "Refuted" on a claim that is actually
-true is the damage, because it is what a later reader acts on. FALSE REFUTATION
-is therefore the headline number; missed refutations are reported but mild.
+Cases are self-contained (no assertions about the loci corpus) so corpus
+drift can never falsify a label. Scoring is asymmetric: false refutations
+(rejecting a true claim) are the headline metric and weighted more heavily
+than missed refutations (an "uncertain" verdict on a false claim), since a
+verdict is advisory and only a false refutation misleads a later reader.
 """
 from __future__ import annotations
 
