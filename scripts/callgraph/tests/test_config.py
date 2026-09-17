@@ -12,10 +12,11 @@ def test_corpus_is_exactly_133_files():
     script, prefilter script, mcp/guardian.py (Granite Guardian semantic
     injection-risk classification), then scripts/redteam/loci_adversarial_harness.py
     (sandboxed PyRIT red-team harness).
-    142 -> 144: scripts/swarm_supervisor.py + scripts/demo_swarm_supervisor.py
+    142 -> 143: scripts/stigmergic_consensus.py (opt-in stigmergic consensus gate).
+    143 -> 145: scripts/swarm_supervisor.py + scripts/demo_swarm_supervisor.py
     (advisory swarm supervisor)."""
     files = config.iter_corpus_files_worktree()
-    assert len(files) == 144, sorted(files)
+    assert len(files) == 145, sorted(files)
 
 
 def test_corpus_excludes_test_directories():
