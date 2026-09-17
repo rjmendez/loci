@@ -375,6 +375,29 @@ all SKILL.md frontmatter.
 
 ---
 
+### `scripts/bench_local_models.py`
+**Purpose:** Honest local-generation benchmarking against an Ollama host. Sends a
+fixed prompt through `/api/generate`, performs explicit discarded warmups, records
+wall-clock total latency and streamed TTFT when available, computes
+mean/stddev/`p50`/`p90`/`p99`, and reports per-request plus aggregate
+tokens/second across one or more concurrency levels.
+
+**Output:** Stable JSON to `--output`, plus a human-readable summary table on stdout.
+
+**Key args / env:**
+- `--base-url` (default: resolved through `mcp/backends.py:ollama_gen_url()`)
+- `--model` (default: `mcp/backends.py:ollama_gen_model()`)
+- `--concurrency 1 4 8` — run one or more parallel-fanout levels
+- `--warmup` / `--trials`
+- `--no-stream` — disables streaming and makes TTFT explicitly unavailable
+- `OLLAMA_BENCH_TIMEOUT` — default request timeout override
+
+**Honesty guardrails:** Records whether the target model was already resident,
+which other models were loaded on the host, the prompt length, and any transport
+errors or missing TTFT evidence instead of fabricating first-token timing.
+
+---
+
 ## Multi-level search
 
 ### `scripts/memgas_hierarchy.py`
