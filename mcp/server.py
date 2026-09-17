@@ -1091,6 +1091,13 @@ def _session_hints_push(investigation_id: str, hint: dict) -> None:
 
 _REFLECTION_ERROR_RE = re.compile(r"\b(error|exception|traceback|failed|failure|timeout|conflict)\b", re.I)
 _REFLECTION_WARN_RE = re.compile(r"\b(warn|warning|degraded|fallback|retry)\b", re.I)
+_REFLECTION_WARN_LABEL_RE = re.compile(r"\[(?:warn|warning)\]", re.I)
+_REFLECTION_ERROR_LABEL_RE = re.compile(r"\[(?:err|error)\]", re.I)
+_REFLECTION_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.I,
+)
+_REFLECTION_HEXISH_ID_RE = re.compile(r"\b(?:[0-9a-f]{4,}-){2,}[0-9a-f]{4,}\b", re.I)
 _REFLECTION_HEX_RE = re.compile(r"\b[0-9a-f]{7,64}\b", re.I)
 _REFLECTION_NUM_RE = re.compile(r"\b\d+\b")
 _REFLECTION_TS_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?\b", re.I)
@@ -1148,10 +1155,24 @@ def _save_reflection_state(state: dict) -> None:
 def _canonicalize_reflection_signature(text: str) -> str:
     line = str(text or "").strip().lower()
     line = _REFLECTION_TS_RE.sub("<ts>", line)
+    line = re.sub(r"^(?:<ts>\s+)+", "", line)
+    line = _REFLECTION_UUID_RE.sub("<uuid>", line)
+    line = _REFLECTION_HEXISH_ID_RE.sub("<hexid>", line)
     line = _REFLECTION_HEX_RE.sub("<hex>", line)
     line = _REFLECTION_NUM_RE.sub("<n>", line)
     line = re.sub(r"\s+", " ", line)
     return line[:220]
+
+
+def _reflection_line_severity(line: str) -> str | None:
+    text = str(line or "")
+    if not text.strip():
+        return None
+    if _REFLECTION_WARN_LABEL_RE.search(text) or _REFLECTION_WARN_RE.search(text):
+        return "warning"
+    if _REFLECTION_ERROR_LABEL_RE.search(text) or _REFLECTION_ERROR_RE.search(text):
+        return "error"
+    return None
 
 
 def _hash_path(path: str) -> str:
@@ -1229,9 +1250,10 @@ class _ReflectionScan:
 
     def scan_line(self, line: str) -> None:
         canon = _canonicalize_reflection_signature(line)
-        if _REFLECTION_ERROR_RE.search(line):
+        severity = _reflection_line_severity(line)
+        if severity == "error":
             self.error_counts[canon] += 1
-        elif _REFLECTION_WARN_RE.search(line):
+        elif severity == "warning":
             self.warning_counts[canon] += 1
 
 
