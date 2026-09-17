@@ -326,17 +326,19 @@ signal-bearing.
 
 ## MCP server (loci-mcp)
 
-`mcp/server.py` is registered as `FastMCP('loci')` and exposes **73** tools under
-the `loci-mcp` server name. Only 42 are declared with `@mcp.tool()` in `server.py`;
+`mcp/server.py` is registered as `FastMCP('loci')` and exposes **75** tools under
+the `loci-mcp` server name. The source-checked registration breakdown and
+runtime paths are maintained in [CALLGRAPH.md](CALLGRAPH.md). Only 43 are
+declared with `@mcp.tool()` in `server.py`;
 the rest come from modules that are handed the shared instance at import time and
 register their own list:
 
 | Source | Tools | Registration |
 |---|---|---|
-| `server.py` | 42 | `@mcp.tool()` |
+| `server.py` | 43 | `@mcp.tool()` |
 | `graph_tools.py` | 11 | `graph_tools.register(mcp, _get_ladybug)` |
 | `investigation_tools.py` | 11 | `investigation_tools.register(mcp, …, deps)` |
-| `llm_tools.py` | 9 | `llm_tools.register(mcp)` |
+| `llm_tools.py` | 10 | `llm_tools.register(mcp)` |
 
 Count them with `grep -c '@mcp.tool()' mcp/server.py` plus the `for fn in (...)`
 tuple in each module's `register()`. `inv_store.register()` and
