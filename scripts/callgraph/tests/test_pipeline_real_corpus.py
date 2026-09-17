@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 145  # 128 -> ... -> 142 -> 143 -> 144 -> 145: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, bench-local-models, issue-proposer, stigmergic-consensus
+    assert head_build.meta.file_count == 146  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, bench-local-models
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -29,16 +29,17 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
         n for n in head_build.store.nodes_of_kind("FUNCTION")
         if not n.attrs["is_nested"] and not n.attrs["is_method"]
     ]
-    # Band is the 1330 measured count +-10%; helper scripts add a handful of
+    # Band is the 1060 measured count +-10%; helper scripts add a handful of
     # module-level functions, but large swings still catch corpus regressions.
     # Raised ceiling: the local-model fleet batch (verify/guardian follow-ons —
     # conflict/reflection/pre-answer/procedure-learning/mnemosyne/wiring-obligation
     # corroboration modules) adds several small new modules at once.
-    # 1320 -> 1380: scripts/bench_local_models.py (local model benchmark harness),
-    # scripts/issue_proposer.py (guarded reflection-loop issue proposer), and
-    # scripts/stigmergic_consensus.py (19 module-level helpers) all moved the
-    # measured census upward again.
-    assert 954 <= len(module_level) <= 1380, len(module_level)
+    # 1320 -> 1360: scripts/issue_proposer.py (guarded reflection-loop issue
+    # proposer) and scripts/stigmergic_consensus.py (19 module-level functions)
+    # both add their module-level helpers to the census.
+    # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog) and
+    # scripts/bench_local_models.py (honest local model benchmark harness).
+    assert 954 <= len(module_level) <= 1390, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
