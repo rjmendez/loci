@@ -27,7 +27,7 @@ findings, and context persist in a searchable memory store Claude can read and w
 ![Loci architecture](docs/img/loci-overview.svg)
 
 Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
-something, it calls one of Loci's 73 tools — the same way it calls any other tool. Your
+something, it calls one of Loci's 75 tools — the same way it calls any other tool. Your
 data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
 
 > **New to terms like "vector search", "RAG", or "MCP"?**
@@ -78,6 +78,7 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 |---|---|
 | New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
 | How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Runtime registration and call paths | [docs/CALLGRAPH.md](docs/CALLGRAPH.md) |
 | Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
 | What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
 | How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
@@ -86,15 +87,15 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 
 ---
 
-## MCP tools (74)
+## MCP tools (75)
 
 ![Tool groups](docs/img/loci-tools.svg)
 
-*This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds,
-but the surface is now 74 tools: 43 in `mcp/server.py`, plus 11 investigation tools
-from `mcp/investigation_tools.py`, 11 code-graph tools from `mcp/graph_tools.py`,
-and 9 local-model tools from `mcp/llm_tools.py`, all registered onto the shared
-FastMCP instance at import time. See the table below for the current inventory.*
+*This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds.
+The canonical source-checked composition is 75 tools: 43 server-local, 11
+investigation, 11 code-graph, and 10 local-model tools, all registered onto the
+shared FastMCP instance at import time. See [docs/CALLGRAPH.md](docs/CALLGRAPH.md)
+for registration anchors and call paths.*
 
 | Tool | Purpose |
 |---|---|
@@ -161,13 +162,14 @@ FastMCP instance at import time. See the table below for the current inventory.*
 | `compress_text` | Semantically condense text to a character budget using the local model |
 | `semantic_dedup` | Cluster near-duplicate items by embedding cosine similarity |
 | `semantic_relevance` | Score each text's cosine relevance to a topic on the local embedding path |
+| `swarm_reason` | Run bounded local-model fan-out and synthesis reasoning |
 | `code_graph_ingest` | Parse source with tree-sitter and ingest its symbol graph |
 | `code_graph_query` | Run a read-only Cypher query over the code + memory graph |
 | `code_memory_relink` | Rebuild every finding → code-symbol `REFERENCES` edge |
 | `code_memory_map` | Map the code/memory neighbourhood around an anchor node |
 | `symbol_impact` | Blast radius of a code symbol across code and memory |
 | `impact_report` | Change blast radius for a symbol or class, with the findings that reference it |
-| `finding_code_context` | The code a finding references, each symbol with its callers/callees |
+| `finding_code_context` | The code a finding references, with callers/callees where the live graph resolves them |
 | `investigation_code_briefing` | The code story of an investigation in a single call |
 | `subsystem_report` | Full picture of a subsystem: code, call boundary, memory hotspots |
 | `related_investigations_via_code` | Other investigations that reference the same code symbols |
@@ -315,7 +317,7 @@ LOCI_MCP_TRANSPORT=sse LOCI_MCP_HOST=0.0.0.0 LOCI_MCP_PORT=8000 \
 
 ```
 loci/
-├── mcp/                   MCP server — 73 tools: investigation memory, RAG, claim validation, code graph
+├── mcp/                   MCP server — 75 tools: investigation memory, RAG, claim validation, code graph
 │   ├── server.py          FastMCP server entry point
 │   ├── backends.py        Endpoint resolution: env var -> localhost probe -> ~/.loci/backends.toml
 │   ├── memcheck/          Standalone claim-validation + code-hallucination module

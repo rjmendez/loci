@@ -107,12 +107,14 @@ server twice under two names publishes every tool twice:
 }
 ```
 
-## Tools (72)
+## Tools (75)
 
-72 tools are registered at runtime: 61 defined in `server.py`, plus 11 code-graph
-tools registered from `graph_tools.py` via `graph_tools.register(mcp, _get_ladybug)` at
-server startup — which is why they do not appear as `@mcp.tool()` in `server.py`.
-The same inventory is listed in the [top-level README](../README.md#mcp-tools-74).
+75 tools are registered at runtime: 43 server-local decorators, plus 11
+investigation tools, 11 code-graph tools, and 10 local-model tools registered
+onto the shared FastMCP instance. The source-checked registration anchors and
+representative paths are maintained in
+[docs/CALLGRAPH.md](../docs/CALLGRAPH.md). The same inventory is listed in the
+[top-level README](../README.md#mcp-tools-75).
 
 **Session management:**
 - `investigation_start(investigation_id, title, context?)` — create or resume a session
@@ -181,6 +183,7 @@ The same inventory is listed in the [top-level README](../README.md#mcp-tools-74
 - `compress_text(text, max_chars?)` — semantically condense text to a char budget
 - `semantic_dedup(items, threshold?, text_key?)` — cluster near-duplicate items by embedding similarity
 - `semantic_relevance(texts, topic)` — cosine relevance of each text to a topic
+- `ground(...)` / `swarm_reason(topic, ...)` — structured grounding and bounded local-model swarm reasoning
 
 **Audit & health:**
 - `audit_log(tool_name, inputs_json, output, investigation_id?, embedding_text?)` — record a tool call in the audit trail
@@ -205,7 +208,7 @@ The same inventory is listed in the [top-level README](../README.md#mcp-tools-74
 - `code_memory_relink()` — rebuild all Finding → CodeSymbol edges
 - `code_memory_map(anchor, anchor_type?, hops?)` — code↔memory neighbourhood around an anchor
 - `symbol_impact(symbol, hops?)` — blast radius of a symbol across code and memory
-- `impact_report(symbol, hops?)` — change blast radius: transitive callers and callees
+- `impact_report(symbol, hops?)` — change blast radius: transitive callers plus co-referenced symbols/findings/investigations
 - `finding_code_context(finding_id)` — the code a finding references, with callers/callees
 - `investigation_code_briefing(investigation_id, top?)` — the code story of an investigation
 - `subsystem_report(anchor, limit?)` — full picture of the code under a path or package prefix
