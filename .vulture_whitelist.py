@@ -127,6 +127,18 @@ _ = payload_arguments
 _ = payload_rationale
 _ = redteam_observation
 
+# ── scripts/stigmergic_consensus.py PheromoneCluster fields
+# cluster_id, claim_keys, and independent_agents are populated by keyword in
+# _cluster_state() and read back only via dataclasses.asdict(cluster) when
+# consensus_gate()/apply_stigmergic_consensus() serialize each cluster into the
+# "clusters" list of their returned dict -- the public, JSON-shaped contract
+# consumed by scripts/swarm_escalate.py and the swarm_reason MCP tool. Same
+# pattern as the AttackCase/CaseResult entries above: vulture only sees the
+# class-body assignment, never the asdict() read.
+_ = claim_keys
+_ = cluster_id
+_ = independent_agents
+
 # ── pyrit.prompt_target.common.prompt_target.PromptTarget interface hooks
 # _OllamaPromptTarget in scripts/redteam/loci_adversarial_harness.py subclasses
 # PyRIT's PromptTarget; both methods are invoked by the PyRIT orchestrator
