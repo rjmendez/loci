@@ -319,6 +319,25 @@ Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`, and
 > [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
 > numbers and what more findings are actually worth.
 
+### Benchmark local Ollama generation honestly
+
+`scripts/bench_local_models.py` is the latency/throughput harness for the local
+generation tier. It does explicit discarded warmups, reports mean/stddev plus
+`p50`/`p90`/`p99`, writes stable JSON, and only reports TTFT when it is actually
+measuring streamed chunks instead of guessing.
+
+```bash
+$LOCI_PY $LOCI/scripts/bench_local_models.py \
+  --model qwen2.5:3b \
+  --concurrency 1 4 8 \
+  --warmup 3 \
+  --trials 20 \
+  --output bench-local-models-qwen25.json
+```
+
+Use this when you need to check whether swarm fan-out is really parallel on the
+current Ollama host or only appears parallel at the caller.
+
 ### Prefilter bulky agent output before cloud synthesis
 
 `scripts/agent_output_prefilter.py` is an **opt-in** helper for workflows that
