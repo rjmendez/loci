@@ -15,7 +15,7 @@ from ..pipeline import build_graph
 
 
 def test_build_is_clean_and_fast(head_build):
-    assert head_build.meta.file_count == 144  # 128 -> ... -> 140 -> 142 -> 143 -> 144: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus
+    assert head_build.meta.file_count == 147  # 128 -> ... -> 140 -> 142 -> 143 -> 144 -> 145 -> 146 -> 147: compact, deploy, A/B eval, prefilter, guardian, procedure-learning, conflict-verify, pre-answer-entailment, consolidation-audit, reflection-triage, wiring-obligation, local-deep-think, redteam-harness, swarm-escalate, issue-proposer, stigmergic-consensus, model-catalog, swarm-supervisor
     assert head_build.meta.error_count == 0
     # Loose sanity bound, not a benchmark: measured 4.2s standalone / 5.0s under suite load.
     assert head_build.meta.elapsed_s < 30, (
@@ -37,7 +37,10 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # 1320 -> 1360: scripts/issue_proposer.py (guarded reflection-loop issue
     # proposer) and scripts/stigmergic_consensus.py (19 module-level functions)
     # both add their module-level helpers to the census.
-    assert 954 <= len(module_level) <= 1360, len(module_level)
+    # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog),
+    # scripts/swarm_supervisor.py, and scripts/demo_swarm_supervisor.py
+    # (advisory swarm supervisor + demo) add their module-level helpers.
+    assert 954 <= len(module_level) <= 1390, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):

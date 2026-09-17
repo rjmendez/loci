@@ -28,7 +28,7 @@ def test_selftest_covers_every_dispatch_shape_and_the_hard_gate():
 
 def test_selftest_finishes_well_under_the_five_second_budget():
     # Design target is still single-digit seconds, but the real-corpus build now walks
-    # 144 files and shared CI variance is material; keep a loose smoke bound here rather
+    # 147 files and shared CI variance is material; keep a loose smoke bound here rather
     # than turning ordinary repo growth into a red build.
     t0 = time.time()
     report = run_selftest()
