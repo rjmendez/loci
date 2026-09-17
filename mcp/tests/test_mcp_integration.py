@@ -2976,6 +2976,87 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         ))
         self.assertIn("claim_results", result)
 
+    def test_model_asserted_support_only_reports_unsupported(self):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Provenance firewall test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="The circularity bug is fixed by model agreement.",
+            source="test-model",
+            confidence="high",
+            metadata={"evidence_provenance_tier": "model_asserted"},
+        )
+
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="The circularity bug is fixed by model agreement.",
+            record=False,
+        ))
+
+        first = result["claim_results"][0]
+        self.assertFalse(first["supported"])
+        self.assertEqual(first["support_basis"], "provenance_blocked")
+        self.assertFalse(first["provenance_firewall"]["allowed"])
+
+    def test_evidence_precheck_does_not_treat_model_only_match_as_verified(self):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Precheck provenance test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="inferred",
+            text="The provenance loop is safe because a model said so.",
+            source="test-model",
+            confidence="high",
+            metadata={"evidence_provenance_tier": "model_asserted"},
+        )
+
+        with mock.patch.object(server, "_get_qdrant", return_value=(None, "")):
+            result = _json(server.investigation_evidence_precheck(
+                investigation_id=inv_id,
+                proposed_query="The provenance loop is safe because a model said so.",
+            ))
+
+        self.assertFalse(result["has_similar_evidence"])
+        self.assertEqual(result["similar_evidence"], [])
+        self.assertFalse(result["provenance_firewall"]["allowed"])
+
+    def test_tool_verified_support_passes_provenance_firewall(self):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Tool provenance test")
+        server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="The schema parses successfully.",
+            source="python3 -m json.tool",
+            confidence="high",
+            metadata={"evidence_provenance_tier": "tool_verified"},
+        )
+
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="The schema parses successfully.",
+            record=False,
+        ))
+
+        first = result["claim_results"][0]
+        self.assertTrue(first["supported"])
+        self.assertEqual(first["support_basis"], "lexical")
+        self.assertTrue(first["provenance_firewall"]["allowed"])
+
+    def test_legacy_untagged_support_defaults_to_tool_verified(self):
+        inv_id = self._setup_investigation("Legacy findings remain usable.")
+        result = _json(server.investigation_pre_answer_check(
+            investigation_id=inv_id,
+            claims="Legacy findings remain usable.",
+            record=False,
+        ))
+
+        first = result["claim_results"][0]
+        self.assertTrue(first["supported"])
+        self.assertEqual(first["support_refs"][0]["evidence_provenance_tier"], "tool_verified")
+        self.assertTrue(first["support_refs"][0]["provenance_defaulted"])
+
     def test_stale_audit_lane_is_reported_and_not_used_as_evidence(self):
         inv_id = self._setup_investigation("A recent finding unrelated to the stale receipt.")
         stale_audit = {

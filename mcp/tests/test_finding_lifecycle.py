@@ -365,6 +365,46 @@ class FindingLifecycleTest(unittest.TestCase):
         out = _json(server.investigation_verify_all(inv_id, limit=2))
         self.assertEqual(out["verified"], 2)
 
+    def test_verify_all_gates_model_only_finding_without_calling_model(self):
+        # A model_asserted finding with no independent (human/tool/deterministic)
+        # evidence in the investigation must be reported uncertain by the
+        # provenance firewall, and the model verifier must never even run —
+        # confirming it would be circular (model confirming its own claim).
+        inv_id = self._start()
+        fid = self._store(
+            inv_id, "The reflection loop is fixed by model agreement.",
+            metadata={"evidence_provenance_tier": "model_asserted"},
+        )
+
+        def _should_not_call(*args, **kwargs):
+            raise AssertionError("model verifier must not run on a circular model-only finding")
+
+        server._verify_gen_fn = _should_not_call
+        out = _json(server.investigation_verify_all(inv_id))
+        result = {r["finding_id"]: r for r in out["results"]}[fid]
+        self.assertEqual(result["verdict"], "uncertain")
+        self.assertEqual(result["confidence"], 0.0)
+
+    def test_verify_all_confirms_model_asserted_finding_with_tool_verified_support(self):
+        # The same model_asserted claim, but this time backed by an independent
+        # tool_verified finding in the same investigation, passes the firewall
+        # and reaches (and is confirmed by) the stubbed model verifier.
+        inv_id = self._start()
+        self._store(
+            inv_id, "python3 -m json.tool confirms the schema parses.",
+            metadata={"evidence_provenance_tier": "tool_verified"},
+        )
+        fid = self._store(
+            inv_id, "The reflection loop is fixed by model agreement.",
+            metadata={"evidence_provenance_tier": "model_asserted"},
+        )
+
+        server._verify_gen_fn = lambda *a, **k: {"ok": True, "text": json.dumps(
+            {"verdict": "confirmed", "refutation": "", "confidence": 0.8})}
+        out = _json(server.investigation_verify_all(inv_id))
+        result = {r["finding_id"]: r for r in out["results"]}[fid]
+        self.assertEqual(result["verdict"], "confirmed")
+
     # -- fail-open write guards (Copilot round 5) ----------------------------
 
     def test_resolve_append_failure_fails_open(self):

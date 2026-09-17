@@ -13,6 +13,7 @@ import os
 from typing import Any, Optional
 
 from inv_store import _safe_float
+from provenance_firewall import provenance_fields
 
 logger = logging.getLogger("loci-mcp")
 
@@ -133,5 +134,12 @@ def _mnemo_recall(query: str, *, top_k: int = 10, investigation_id: Optional[str
             "ts": item.get("ts") or item.get("created_at"),
             "text": text,
             "origin": "mnemosyne",
+            # Surface the provenance tier the finding was stored with (see
+            # _store_index) instead of leaving it out — an absent field here
+            # would otherwise let a model-asserted finding read back as the
+            # legacy tool_verified default without any way to tell the two
+            # apart. provenance_fields() still applies that default for truly
+            # untagged (pre-fix) rows, but flags it via provenance_defaulted.
+            **provenance_fields(metadata),
         })
     return rows

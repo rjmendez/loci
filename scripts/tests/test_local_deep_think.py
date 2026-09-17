@@ -551,6 +551,41 @@ def test_dedicated_writer_owns_persistence_calls():
     assert all(call["source"].startswith("scripts/local_deep_think.py#") for call in stores)
     assert stores[0]["derived_from"] is None
     assert stores[2]["derived_from"] == ["f1"]
+    assert stores[0]["metadata"]["evidence_provenance_tier"] == "model_asserted"
+    assert stores[2]["metadata"]["support_evidence_refs"] == ["seed-1", "seed-2"]
+
+
+def test_verify_findings_blocks_model_only_provenance_support():
+    verify_calls = []
+
+    def _search(*, query, collection_name, limit):  # noqa: ARG001
+        return [{
+            "id": "model-memory-1",
+            "origin": collection_name,
+            "score": 0.95,
+            "text": "Circular claim from a prior model run.",
+            "metadata": {"evidence_provenance_tier": "model_asserted"},
+        }]
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        verify_calls.append(claim)
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.9, "degraded": False}
+
+    survivors, reports = L.verify_findings(
+        [L.StoredFinding("idea-1", "Circular claim from a prior model run.", "ideate", "m")],
+        topic="circularity",
+        config=_config(self_reflect=False),
+        search_fn=_search,
+        gate_fn=_gate,
+        verify_fn=_verify,
+        gen_fn=lambda *args, **kwargs: {"ok": True, "text": "{}"},
+        store_fn=lambda **kwargs: '{"stored": true, "finding_id": "vf1"}',
+    )
+
+    assert survivors == []
+    assert verify_calls == []
+    assert reports[0]["verdict"] == "uncertain"
+    assert reports[0]["provenance_firewall"]["allowed"] is False
 
 
 def _ungrounded_deps():
@@ -636,7 +671,13 @@ def test_safety_check_default_preserves_deep_think_result_shape():
 
 
 def test_safety_check_annotates_deep_think_findings_without_removing_text():
+    # This test is about guardian annotation, not grounding status, so swap in the
+    # non-empty gate: the shared ungrounded fixture's always-empty gate leaves no
+    # evidence rows for the provenance firewall to see, which now (correctly)
+    # blocks model-asserted claims with zero independent evidence before
+    # safety_check ever runs on them.
     deps, _stores = _ungrounded_deps()
+    deps["gate"] = _gate
     seen = []
 
     def _guardian(text):
@@ -654,7 +695,11 @@ def test_safety_check_annotates_deep_think_findings_without_removing_text():
 
 
 def test_safety_check_guardian_errors_fail_open_for_deep_think():
+    # See note above: swap in the non-empty gate so the provenance firewall sees
+    # independent evidence and this stays a test of guardian fail-open behavior,
+    # not of the (separately-tested) firewall gating itself.
     deps, _stores = _ungrounded_deps()
+    deps["gate"] = _gate
 
     def _guardian(_text):
         raise RuntimeError("guardian offline")

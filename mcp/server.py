@@ -230,6 +230,13 @@ from inv_store import (  # noqa: E402,F401
     _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
     StoreBusyError, _locked_file,
 )
+from provenance_firewall import (  # noqa: E402
+    MODEL_ASSERTED,
+    TOOL_VERIFIED,
+    assert_evidence_firewall,
+    normalize_provenance_tier,
+    provenance_fields,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +1681,7 @@ def build_validation_evidence(
             "snippet": _entry_snippet(finding),
             "tokens": tokenize(str(finding.get("text", ""))),
             "origin": "findings_jsonl",
+            **provenance_fields(finding),
         })
 
     if audit_lane["usable"]:
@@ -1689,6 +1697,8 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "audit_jsonl",
+                "evidence_provenance_tier": TOOL_VERIFIED,
+                "provenance_defaulted": False,
             })
 
         for idx, entry in enumerate(global_recent_audit):
@@ -1703,6 +1713,8 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "global_audit_jsonl",
+                "evidence_provenance_tier": TOOL_VERIFIED,
+                "provenance_defaulted": False,
             })
     return evidence, {"audit": audit_lane}
 
@@ -1766,6 +1778,7 @@ def _search_qdrant_claim_evidence(
                 "pool_size": len(pool_scores),
                 "margin": round(score - pool_median, 4),
                 "snippet": text.replace("\n", " ").strip()[:260],
+                **provenance_fields(payload),
             })
         return matches, status
     except Exception as exc:
@@ -2441,7 +2454,8 @@ def _normalize_finding_metadata(metadata: Any) -> Optional[dict]:
 def _store_build_finding(investigation_id, finding_type, text, source, confidence, tags,
                          derived_from, numeric_confidence, procedure_preconditions,
                          procedure_steps, procedure_postconditions, valid_from,
-                         valid_until, authored_by, tier, resolution, code_refs, metadata):
+                         valid_until, authored_by, tier, resolution, code_refs, metadata,
+                         evidence_provenance_tier):
     """Build the finding record. Returns (finding, error_json); one is always None.
 
     The only failure mode is a derived_from id with no matching parent, which the
@@ -2477,8 +2491,15 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
             return None, json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     normalized_metadata = _normalize_finding_metadata(metadata)
+    if evidence_provenance_tier:
+        normalized_metadata = normalized_metadata or {}
+        normalized_metadata["evidence_provenance_tier"] = normalize_provenance_tier(
+            {"evidence_provenance_tier": evidence_provenance_tier}
+        )
     if normalized_metadata is not None:
         finding["metadata"] = normalized_metadata
+        if normalized_metadata.get("evidence_provenance_tier"):
+            finding["evidence_provenance_tier"] = normalized_metadata["evidence_provenance_tier"]
 
     finding["entities"] = _extract_entities(text)
 
@@ -2534,6 +2555,10 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
             "confidence": confidence,
             "tags": finding["tags"],
             "finding_id": finding["id"],
+            # Carry the finding's own provenance tier so a later Mnemosyne recall
+            # doesn't lose e.g. model_asserted and silently normalize it to the
+            # legacy tool_verified default (see _mnemo_recall).
+            **provenance_fields(finding),
         },
     )
     if tier != "cold":
@@ -2587,6 +2612,7 @@ def investigation_store(
     resolution: str = "open",
     code_refs: str | list[str] | None = None,
     metadata: Any | None = None,
+    evidence_provenance_tier: Optional[str] = None,
 ) -> str:
     """
     Record a finding in an investigation.
@@ -2645,6 +2671,10 @@ def investigation_store(
         metadata: Optional advisory metadata dict (or JSON string encoding one)
             stored verbatim under ``finding["metadata"]``. Additive only; ignored
             when empty/unparseable-to-dict.
+        evidence_provenance_tier: Optional provenance authority for this finding:
+            ``human_authored``, ``tool_verified``, ``deterministic_derived``, or
+            ``model_asserted``. Untagged legacy findings default to tool-verified
+            only when used as evidence, preserving old stores and callers.
 
     Returns:
         JSON ``{"stored": true, "finding_id": "<uuid>", "type": "<finding_type>",
@@ -2667,7 +2697,7 @@ def investigation_store(
         investigation_id, finding_type, text, source, confidence, tags, derived_from,
         numeric_confidence, procedure_preconditions, procedure_steps,
         procedure_postconditions, valid_from, valid_until, authored_by, tier,
-        resolution, code_refs, metadata,
+        resolution, code_refs, metadata, evidence_provenance_tier,
     )
     if invalid:
         return invalid
@@ -4104,6 +4134,22 @@ def investigation_pre_answer_check(
         else:
             support_basis = "none"
 
+        support_evidence_rows = []
+        provenance_firewall = {"allowed": True, "phase": "investigation_pre_answer_check",
+                               "reason": "no_support_refs", "degraded": False}
+        if claim_support_refs:
+            for ref in claim_support_refs:
+                ev_id = str(ref.get("evidence_id") or "")
+                support_evidence_rows.append(evidence_by_id.get(ev_id) or ref)
+            provenance_firewall = assert_evidence_firewall(
+                {"evidence_provenance_tier": MODEL_ASSERTED},
+                support_evidence_rows,
+                phase="investigation_pre_answer_check",
+            )
+            if not provenance_firewall.get("allowed"):
+                claim_support_refs = []
+                support_basis = "provenance_blocked"
+
         if claim_support_refs:
             support_count += 1
         else:
@@ -4135,6 +4181,7 @@ def investigation_pre_answer_check(
             "semantic_candidates": semantic_candidates[:8],
             "contradiction_refs": claim_contradiction_refs[:8],
             "benign_context_refs": benign_context_refs,
+            "provenance_firewall": provenance_firewall,
         }
         if _should_run_pre_answer_entailment_check(
             claim_support_refs, support_basis, claim_contradiction_refs, benign_context_refs
@@ -4521,12 +4568,24 @@ def investigation_evidence_precheck(
         seen.add(key)
         deduped.append(item)
 
+    provenance_firewall = {"allowed": True, "phase": "investigation_evidence_precheck",
+                           "reason": "no_similar_evidence", "degraded": False}
+    if deduped:
+        provenance_firewall = assert_evidence_firewall(
+            {"evidence_provenance_tier": MODEL_ASSERTED},
+            deduped,
+            phase="investigation_evidence_precheck",
+        )
+        if not provenance_firewall.get("allowed"):
+            deduped = []
+
     return json.dumps({
         "investigation_id": investigation_id,
         "proposed_query": query,
         "has_similar_evidence": bool(deduped),
         "similar_evidence_count": len(deduped),
         "similar_evidence": deduped[:10],
+        "provenance_firewall": provenance_firewall,
         "qdrant_status": {
             "enabled": qdrant_enabled,
             "available": qdrant_available,
@@ -6699,6 +6758,10 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     results = []
     for f in open_findings:
         fid = str(f.get("id", ""))
+        # Thread this finding's own stored provenance tier plus its investigation's
+        # other findings as candidate evidence, so a model_asserted finding with no
+        # independent (human/tool/deterministic) support is gated 'uncertain' by the
+        # provenance firewall instead of reaching the model verifier unchecked.
         res = _v.verify_finding(
             str(f.get("text") or ""),
             investigation_id=investigation_id,
@@ -6707,6 +6770,11 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             # WHICH checkout its source lives in; without them the skeptic reasons
             # over prose while the file sits on disk.
             code_refs=f.get("code_refs"),
+            candidate_provenance_tier=normalize_provenance_tier(f),
+            evidence_rows=[
+                g for g in findings
+                if isinstance(g, dict) and str(g.get("id") or "") != fid
+            ],
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)

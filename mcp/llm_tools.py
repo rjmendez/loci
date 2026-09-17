@@ -166,6 +166,37 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
     return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
 
 
+def _finding_provenance_context(investigation_id: Optional[str], finding_id: Optional[str]):
+    """Look up a stored finding's own provenance tier plus its investigation's
+    other findings, to thread into ``verify.verify_finding``'s provenance
+    firewall. Fail-open: any lookup problem (missing investigation/finding,
+    corrupt storage) returns ``(None, None)`` so the caller falls back to
+    verify_finding's own legacy-default behavior instead of raising or wrongly
+    gating a claim it could not resolve.
+    """
+    if not investigation_id or not finding_id:
+        return None, None
+    try:
+        from inv_store import _inv_dir, _read_jsonl
+        from provenance_firewall import normalize_provenance_tier
+        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+        target = None
+        evidence_rows = []
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            if target is None and str(f.get("id") or "") == str(finding_id):
+                target = f
+            else:
+                evidence_rows.append(f)
+        if target is None:
+            return None, None
+        return normalize_provenance_tier(target), evidence_rows
+    except Exception as exc:
+        logger.debug("verify_finding: provenance lookup failed (fail-open): %r", exc)
+        return None, None
+
+
 def verify_finding(claim: str,
                    context: str = "",
                    investigation_id: Optional[str] = None,
@@ -182,6 +213,13 @@ def verify_finding(claim: str,
     unavailable or output is unparseable, returns ``verdict='uncertain'`` with
     ``degraded=True``.
 
+    When ``investigation_id`` and ``finding_id`` identify a stored finding, its
+    own provenance tier and the investigation's other findings are threaded
+    into the provenance firewall, so a ``model_asserted`` finding with no
+    independent (human/tool/deterministic) supporting evidence is reported
+    ``uncertain`` instead of reaching the model verifier and possibly being
+    confirmed on its own say-so.
+
     Pass ``auto_promote_procedures=True`` with both ``investigation_id`` and
     ``finding_id`` to opt into procedure auto-promotion for action-shaped
     confirmed findings. Default False preserves existing write behavior.
@@ -189,9 +227,12 @@ def verify_finding(claim: str,
     Returns JSON ``{verdict, refutation, confidence, degraded}``.
     """
     import verify as _v
+    candidate_provenance_tier, evidence_rows = _finding_provenance_context(investigation_id, finding_id)
     return json.dumps(_v.verify_finding(claim, context=context,
                                         investigation_id=investigation_id,
                                         finding_id=finding_id,
+                                        candidate_provenance_tier=candidate_provenance_tier,
+                                        evidence_rows=evidence_rows,
                                         auto_promote_procedures=auto_promote_procedures), indent=2)
 
 
