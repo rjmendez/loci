@@ -37,7 +37,10 @@ def test_module_level_function_count_matches_census_within_tolerance(head_build)
     # 1320 -> 1360: scripts/issue_proposer.py (guarded reflection-loop issue
     # proposer) and scripts/stigmergic_consensus.py (19 module-level functions)
     # both add their module-level helpers to the census.
-    assert 954 <= len(module_level) <= 1360, len(module_level)
+    # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog),
+    # scripts/swarm_supervisor.py, and scripts/demo_swarm_supervisor.py
+    # (advisory swarm supervisor + demo) add their module-level helpers.
+    assert 954 <= len(module_level) <= 1390, len(module_level)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
