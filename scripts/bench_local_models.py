@@ -36,7 +36,21 @@ from urllib.parse import urlparse
 try:
     import requests
 except Exception as exc:  # pragma: no cover - exercised only when runtime deps are broken
-    raise SystemExit(f"error: requests is required for this harness: {exc}")
+    # Deferred rather than a hard SystemExit at import time: this module is imported by
+    # the unit-test suite (which only exercises pure functions like percentile()/
+    # summarize_suite() and never touches the network), and some CI jobs run those tests
+    # without installing `requests`. Failing immediately here would abort test collection
+    # entirely instead of just the network-dependent paths.
+    requests = None
+    _REQUESTS_IMPORT_ERROR = exc
+else:
+    _REQUESTS_IMPORT_ERROR = None
+
+
+def _require_requests() -> None:
+    if requests is None:
+        raise SystemExit(f"error: requests is required for this harness: {_REQUESTS_IMPORT_ERROR}")
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MCP_DIR = REPO_ROOT / "mcp"
@@ -182,6 +196,7 @@ def _request_body(*, model: str, prompt: str, max_tokens: int, temperature: floa
 
 
 def _sample_residency(base_url: str, model: str, timeout_s: float) -> ResidencySnapshot:
+    _require_requests()
     try:
         resp = requests.get(f"{base_url.rstrip('/')}/api/ps", timeout=timeout_s)
         resp.raise_for_status()
@@ -210,6 +225,7 @@ def _measure_streaming_request(
     output_tokens: Optional[int] = None
     prompt_tokens: Optional[int] = None
     server_eval_tokens_per_sec: Optional[float] = None
+    _require_requests()
     try:
         body = _request_body(
             model=model,
@@ -284,6 +300,7 @@ def _measure_blocking_request(
     timeout_s: float,
 ) -> RequestMetrics:
     started = time.perf_counter()
+    _require_requests()
     try:
         body = _request_body(
             model=model,
