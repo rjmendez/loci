@@ -121,9 +121,11 @@ Fast path: a session with no new messages since the last upsert (mtime cache und
 ## MCP server (`mcp/`)
 
 ### `mcp/server.py`
-**Purpose:** the FastMCP server. 8,433 lines; 42 tools are defined here and 31 more
-are registered by the submodules below, for **73 tools total** (counted by calling
-`server.mcp.list_tools()`).
+**Purpose:** the FastMCP server. The current runtime surface is **75 tools**:
+43 server-local decorators, plus 11 investigation, 11 code-graph, and 10
+local-model tools registered onto the shared FastMCP instance. See the
+[canonical call-graph and runtime-path documentation](CALLGRAPH.md) for
+source-checked anchors and the dispatch paths.
 
 **Transport:** `LOCI_MCP_TRANSPORT` — `stdio` (default), `sse`, or
 `streamable-http`. For the HTTP transports:
@@ -152,9 +154,9 @@ A non-integer value disables the purge rather than guessing a window.
   `code_memory_relink`, `code_memory_map`, `symbol_impact`, `impact_report`,
   `finding_code_context`, `investigation_code_briefing`, `subsystem_report`,
   `related_investigations_via_code`, `dead_code_candidates`
-- `llm_tools.py` — 9 tools: `llm_local`, `generate_batch`, `query_expand`,
+- `llm_tools.py` — 10 tools: `llm_local`, `generate_batch`, `query_expand`,
   `verify_finding`, `classify_text`, `compress_text`, `semantic_dedup`,
-  `semantic_relevance`, `ground`
+  `semantic_relevance`, `ground`, `swarm_reason`
 
 **Supporting libraries:**
 
