@@ -4,7 +4,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.swarm_supervisor import SupervisorBudget, make_loci_evidence_fn, plan_source_routing, supervise_and_correct, supervise_findings
 from scripts.swarm_supervisor import (
     SupervisorBudget,
     make_loci_evidence_fn,
@@ -270,7 +269,7 @@ def test_make_loci_evidence_fn_adapts_structured_verifier_result():
 
     evidence_fn = make_loci_evidence_fn(loci_verify_fn, investigation_id="inv-123")
     result = evidence_fn(finding={"claim": "spiders observed nearby", "evidence": "photo record"})
-    assert result == {"supported": True, "rationale": "matched retrieved passage"}
+    assert result == {"supported": True, "verdict": "supported", "rationale": "matched retrieved passage"}
 
 
 def test_make_loci_evidence_fn_falls_back_to_positional_call_and_parses_json_string():
@@ -279,7 +278,7 @@ def test_make_loci_evidence_fn_falls_back_to_positional_call_and_parses_json_str
 
     evidence_fn = make_loci_evidence_fn(loci_verify_fn)
     result = evidence_fn(finding={"text": "unverified claim", "context": "irrelevant background"})
-    assert result == {"supported": False, "rationale": "no matching evidence"}
+    assert result == {"supported": False, "verdict": "uncertain", "rationale": "no matching evidence"}
 
 
 def test_supervise_findings_can_use_make_loci_evidence_fn_as_evidence_fn():
