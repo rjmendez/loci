@@ -224,23 +224,78 @@ def _batched_generate(prompts: list[str], *, model: str, max_tokens: int,
 
 
 _AUTO_VLLM_SEEDS = int(os.environ.get("LOCI_SWARM_AUTO_VLLM_SEEDS", "3"))
+# Bounds the /v1/models liveness probe used to verify the swarm's own models are
+# actually served before auto-parallelizing (see _batched_backend_available below).
+_VLLM_MODEL_PROBE_TIMEOUT = float(os.environ.get("LOCI_SWARM_VLLM_MODEL_PROBE_TIMEOUT", "0.5"))
 
 
-def _batched_backend_available() -> bool:
+def _vllm_served_model_ids(vllm_base_url: str, probe_timeout: float = _VLLM_MODEL_PROBE_TIMEOUT) -> Optional[set[str]]:
+    """Best-effort GET {vllm_base_url}/v1/models, returning the served model ids.
+
+    Returns None (not an empty set) on any failure -- including an older/non-OpenAI
+    server that lacks /v1/models -- so a probe failure is distinguishable from "the
+    server genuinely serves zero models" and callers can choose to fail open rather
+    than wrongly treat an unprobeable server as incompatible."""
+    try:
+        import requests
+
+        resp = requests.get(f"{vllm_base_url.rstrip('/')}/v1/models", timeout=probe_timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            str(item.get("id") or "").strip()
+            for item in (data.get("data") or [])
+            if str(item.get("id") or "").strip()
+        }
+    except Exception:
+        return None
+
+
+def _batched_backend_available(candidate_models: Optional[tuple[str, ...]] = None) -> bool:
+    """True when a vLLM/TGI batched endpoint is reachable AND (if candidate_models is
+    given) actually serves at least one of the models the swarm is about to request.
+
+    Live-verified 2026-09-17: a reachable vLLM URL does NOT imply it serves the swarm's
+    configured model tags. When it doesn't, mcp/batched_gen.py's generate_batch() 404s
+    every request and silently falls back to plain (non-batched, single-model) Ollama
+    for the WHOLE batch -- so blindly auto-parallelizing on URL-reachability alone
+    multiplies wall-clock (each of N seeds re-pays the fallback + serial-Ollama cost)
+    with zero batching benefit. Checking /v1/models first turns this into a verified
+    decision instead of an optimistic guess.
+
+    candidate_models=None preserves the old URL-only reachability check (used by a few
+    non-swarm callers that don't have a specific model list to check)."""
     try:
         _ensure_paths()
         import backends
 
-        return bool(str(backends.vllm_url(probe_timeout=0.2) or "").strip())
+        url = str(backends.vllm_url(probe_timeout=0.2) or "").strip()
     except Exception:
         return False
+    if not url:
+        return False
+    if not candidate_models:
+        return True
+    served = _vllm_served_model_ids(url)
+    if served is None:
+        # Could not verify (probe failed, older server, network hiccup): fail open
+        # rather than disable auto-parallel on an inconclusive check. batched_gen's
+        # existing hard-fail-to-Ollama fallback still protects correctness either way.
+        return True
+    return any(str(model or "").strip() in served for model in candidate_models)
 
 
 def _effective_seed_count(config: "SwarmConfig") -> int:
     requested = max(1, int(config.seeds or 1))
     if requested > 1 or config.seeds_explicit or not config.auto_parallel:
         return requested
-    return max(1, _AUTO_VLLM_SEEDS) if _batched_backend_available() else requested
+    candidate_models = (
+        config.cheap_model,
+        config.decompose_model or config.cheap_model,
+        config.escalate_model,
+        config.synthesize_model,
+    )
+    return max(1, _AUTO_VLLM_SEEDS) if _batched_backend_available(candidate_models) else requested
 
 
 def _fail_batch(size: int, why: str) -> list[dict]:
