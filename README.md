@@ -78,6 +78,7 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 |---|---|
 | New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
 | How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| API overview by tool family | [docs/API.md](docs/API.md) |
 | Runtime registration and call paths | [docs/CALLGRAPH.md](docs/CALLGRAPH.md) |
 | Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
 | What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
