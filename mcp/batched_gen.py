@@ -23,12 +23,14 @@ Substrate facts this is built against (session grounding):
     a live vLLM server, or the sibling llm_local module. Tests stub both paths.
 
 Grounding is SILENT on: whether a vLLM/TGI server is actually deployed, its model name, and
-the exact VLLM_BASE_URL value. This module therefore treats VLLM_BASE_URL as the sole switch:
-unset -> go straight to the Ollama fallback; set -> try the batched path first, fall back on
-any failure. The concrete deploy plan lives in scripts/vllm_serve.md (not yet executed).
+the exact VLLM_BASE_URL value. This module therefore treats the resolved shared or per-role
+vLLM base URL as the sole switch: unset -> go straight to the Ollama fallback; set -> try
+the batched path first, fall back on any failure. The concrete deploy plan lives in
+scripts/vllm_serve.md.
 
 Contract:
-    generate_batch(prompts, model=None, max_tokens=256, fmt=None, client_fn=None)
+    generate_batch(prompts, model=None, max_tokens=256, fmt=None, client_fn=None,
+                   endpoint_role=None)
         -> list[dict]   # each {"text": str, "ok": bool}, aligned to `prompts`
 """
 from __future__ import annotations
@@ -53,25 +55,29 @@ _MAX_CONCURRENCY = int(os.environ.get("VLLM_MAX_CONCURRENCY", "16"))
 # (e.g. swarm_escalate.py's --seeds) that have already sized their batch to the target model.
 _OLLAMA_MAX_CONCURRENCY = int(os.environ.get("OLLAMA_MAX_CONCURRENCY", "6"))
 
-# The batched server's OpenAI-compatible base URL, e.g. http://<host>:8000. Env wins; when
-# unset, _resolve_vllm() falls back to backends (local :8000 probe -> gitignored config).
-_VLLM = os.environ.get("VLLM_BASE_URL") or ""
-_DEFAULT_MODEL = os.environ.get("VLLM_MODEL", "")   # empty -> resolved via backends at call time
+def _role_env(prefix: str, endpoint_role: Optional[str]) -> str:
+    return f"{prefix}_{str(endpoint_role).strip().upper().replace('-', '_')}"
 
 
-def _resolve_vllm() -> str:
+def _resolve_vllm(endpoint_role: Optional[str] = None) -> str:
     try:
         import backends
-        return backends.vllm_url()
+        return backends.vllm_url(endpoint_role)
     except Exception:
-        return ""
+        if endpoint_role:
+            return os.environ.get(_role_env("VLLM_BASE_URL", endpoint_role), "") or os.environ.get("VLLM_BASE_URL", "")
+        return os.environ.get("VLLM_BASE_URL", "")
 
 
-def _resolve_vllm_model() -> str:
+def _resolve_vllm_model(endpoint_role: Optional[str] = None) -> str:
     try:
         import backends
-        return backends.vllm_model()
+        return backends.vllm_model(endpoint_role)
     except Exception:
+        if endpoint_role:
+            return (os.environ.get(_role_env("VLLM_MODEL", endpoint_role), "")
+                    or os.environ.get("VLLM_MODEL", "")
+                    or "Qwen2.5-3B-Instruct")
         return "Qwen2.5-3B-Instruct"
 
 # Generous timeout: a batched server may queue many concurrent requests behind continuous
@@ -185,7 +191,8 @@ def generate_batch(prompts: list[str],
                    max_tokens: int = 256,
                    fmt: Optional[str] = None,
                    client_fn: Optional[Callable[[], object]] = None,
-                   think: bool = False) -> list[dict]:
+                   think: bool = False,
+                   endpoint_role: Optional[str] = None) -> list[dict]:
     """Generate for many prompts, batched on vLLM/TGI when available, else Ollama fallback.
 
     Args:
@@ -207,6 +214,9 @@ def generate_batch(prompts: list[str],
                on the batched path has no equivalent concept (it is a raw text-completion
                endpoint, not a chat/reasoning API), so this flag is a no-op there. Default
                False preserves every existing caller's behavior.
+        endpoint_role: optional specialist endpoint selector. None preserves the shared
+               resolver path exactly; named roles consult backends.vllm_url/model(role)
+               so operators can route e.g. code traffic to a dedicated vLLM pod.
 
     Returns:
         list[dict] aligned to `prompts`, each {"text": str, "ok": bool}. Never raises.
@@ -217,8 +227,9 @@ def generate_batch(prompts: list[str],
     # Normalize to strings so a stray non-str prompt can't blow up json serialization.
     prompts = [p if isinstance(p, str) else str(p) for p in prompts]
 
-    # Batched server: env wins; else backends (local :8000 probe -> config). None -> Ollama fallback.
-    vllm = _VLLM or _resolve_vllm()
+    # Batched server: request-time resolution so per-role env/config overrides are honored.
+    # endpoint_role=None preserves the shared/default resolver path.
+    vllm = _resolve_vllm(endpoint_role)
     if not vllm:
         return _via_ollama(prompts, model, max_tokens, fmt, think=think)
 
@@ -232,7 +243,7 @@ def generate_batch(prompts: list[str],
     except Exception:
         return _via_ollama(prompts, model, max_tokens, fmt, think=think)
 
-    served_model = model or _DEFAULT_MODEL or _resolve_vllm_model()
+    served_model = model or _resolve_vllm_model(endpoint_role)
 
     # Dispatch the batch CONCURRENTLY so the batched server has multiple in-flight requests
     # to interleave — a plain blocking loop would serialize and never engage continuous

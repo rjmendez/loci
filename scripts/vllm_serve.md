@@ -85,6 +85,63 @@ export VLLM_TIMEOUT="120"                 # seconds
 
 `batched_gen` appends `/v1/completions` itself — pass only the base.
 
+## Multiple specialist endpoints
+
+The shared/default resolver remains unchanged:
+
+- `VLLM_BASE_URL` → localhost `:8000` probe → `[vllm].url` → Ollama fallback
+- `VLLM_MODEL` → `[vllm].model` → `Qwen2.5-3B-Instruct`
+
+You can now also route named specialist roles to dedicated vLLM pods. Supported env vars are:
+
+```bash
+export VLLM_BASE_URL_CODE="http://gpu-host:8001"
+export VLLM_MODEL_CODE="qwen2.5-coder:7b"
+
+export VLLM_BASE_URL_MATH="http://gpu-host:8002"
+export VLLM_MODEL_MATH="qwen2.5-math:7b"
+
+export VLLM_BASE_URL_SAFETY="http://gpu-host:8003"
+export VLLM_MODEL_SAFETY="llama-guard3:8b"
+
+export VLLM_BASE_URL_TOOL_CALLING="http://gpu-host:8004"
+export VLLM_MODEL_TOOL_CALLING="tool-calling-model"
+```
+
+Or configure the same layout in `~/.loci/backends.toml`:
+
+```toml
+[vllm]
+url = "http://gpu-host:8000"
+model = "Qwen2.5-3B-Instruct"
+
+[vllm.code]
+url = "http://gpu-host:8001"
+model = "qwen2.5-coder:7b"
+
+[vllm.math]
+url = "http://gpu-host:8002"
+model = "qwen2.5-math:7b"
+
+[vllm.safety]
+url = "http://gpu-host:8003"
+model = "llama-guard3:8b"
+
+[vllm.tool_calling]
+url = "http://gpu-host:8004"
+model = "tool-calling-model"
+```
+
+Resolution for a specialist role is explicit env/config first, then shared fallback:
+
+- `VLLM_BASE_URL_CODE` → `[vllm.code].url` → shared `vllm_url()`
+- `VLLM_MODEL_CODE` → `[vllm.code].model` → shared `vllm_model()`
+
+The same pattern applies to `math`, `safety`, and `tool_calling`. Importantly, specialist
+roles do **not** perform their own localhost probe. If a code/math/safety/tool-calling pod
+is not explicitly configured, the role falls back to the shared/default resolver instead of
+silently pretending a dedicated localhost endpoint exists.
+
 ## Smoke test (no client code)
 
 ```bash

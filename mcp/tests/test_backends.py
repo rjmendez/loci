@@ -12,6 +12,22 @@ def _no_ollama_env(mp):
     mp.delenv("OLLAMA_URL", raising=False)
 
 
+def _no_vllm_env(mp):
+    for key in (
+        "VLLM_BASE_URL",
+        "VLLM_MODEL",
+        "VLLM_BASE_URL_CODE",
+        "VLLM_MODEL_CODE",
+        "VLLM_BASE_URL_MATH",
+        "VLLM_MODEL_MATH",
+        "VLLM_BASE_URL_SAFETY",
+        "VLLM_MODEL_SAFETY",
+        "VLLM_BASE_URL_TOOL_CALLING",
+        "VLLM_MODEL_TOOL_CALLING",
+    ):
+        mp.delenv(key, raising=False)
+
+
 def test_env_wins(monkeypatch):
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://envhost:11434")
     B._reset_cache()
@@ -45,9 +61,10 @@ def test_empty_when_nothing_configured(monkeypatch):
 
 
 def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
-    for k in ("EMBED_MODEL", "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL",
-              "QDRANT_API_KEY", "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR"):
+    for k in ("EMBED_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
+              "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
+    _no_vllm_env(monkeypatch)
     cfg = tmp_path / "b.toml"
     cfg.write_text('[embed]\nmodel="e"\n[vllm]\nmodel="v"\n[rerank]\nmodel="r"\n'
                    '[qdrant]\nurl="q"\napi_key="k"\n[memory]\ndir="/m"\n')
@@ -159,6 +176,7 @@ def test_redteam_model_env_wins_over_config(tmp_path, monkeypatch):
 def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "OLLAMA_BASE_URL", "OLLAMA_URL"):
         monkeypatch.delenv(k, raising=False)
+    _no_vllm_env(monkeypatch)
     cfg = tmp_path / "bad.toml"
     cfg.write_text("this is [not valid toml")
     monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
@@ -166,6 +184,48 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     B._reset_cache()
     assert B.embed_model() == "nomic-embed-text"      # falls to default, never raises
     assert B.ollama_url() == ""
+
+
+def test_vllm_role_env_wins_over_role_config_and_shared(tmp_path, monkeypatch):
+    _no_vllm_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text(
+        '[vllm]\nurl = "http://shared:8000"\nmodel = "shared-model"\n'
+        '[vllm.code]\nurl = "http://cfg-code:8001"\nmodel = "cfg-code-model"\n'
+    )
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setenv("VLLM_BASE_URL_CODE", "http://env-code:8001")
+    monkeypatch.setenv("VLLM_MODEL_CODE", "env-code-model")
+    B._reset_cache()
+    assert B.vllm_url("code") == "http://env-code:8001"
+    assert B.vllm_model("code") == "env-code-model"
+
+
+def test_vllm_role_config_wins_over_shared_without_local_probe(tmp_path, monkeypatch):
+    _no_vllm_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text(
+        '[vllm]\nurl = "http://shared:8000"\nmodel = "shared-model"\n'
+        '[vllm.code]\nurl = "http://cfg-code:8001"\nmodel = "cfg-code-model"\n'
+    )
+    probes = []
+    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: probes.append((url, timeout)) or False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.vllm_url("code") == "http://cfg-code:8001"
+    assert B.vllm_model("code") == "cfg-code-model"
+    assert probes == []
+
+
+def test_vllm_role_falls_back_to_shared_resolver(monkeypatch):
+    _no_vllm_env(monkeypatch)
+    probes = []
+    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: probes.append((url, timeout)) or (url == B._LOCAL_VLLM))
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    B._reset_cache()
+    assert B.vllm_url("code") == B._LOCAL_VLLM
+    assert B.vllm_model("code") == "Qwen2.5-3B-Instruct"
+    assert probes == [(B._LOCAL_VLLM, 1.0)]
 
 
 # --- Fresh install: all backends together, so the resolution chain is guarded as one unit ---

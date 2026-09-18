@@ -49,26 +49,18 @@ def _client_fn_for(client):
     return lambda: client
 
 
-# ---- helpers to force VLLM_BASE_URL state ----------------------------------------------
+# ---- helpers to force request-time vLLM resolution -------------------------------------
 
-def _set_vllm(monkeypatch, url):
-    """Pin the vLLM endpoint, resolver included.
-
-    Setting B._VLLM alone is not enough: _resolve_vllm() falls through to
-    backends.vllm_url(), which reads ~/.loci/backends.toml and probes. Once that
-    config gained a real [vllm] url, "" stopped meaning "no server" and these
-    tests started reaching the LIVE endpoint — non-deterministically, 2-3
-    failures per run with real model text leaking into assertions. A unit test
-    must not depend on the operator's config.
-    """
-    monkeypatch.setattr(B, "_VLLM", url)
-    monkeypatch.setattr(B, "_resolve_vllm", lambda: url)
+def _set_vllm(monkeypatch, url, model="resolved-model"):
+    """Pin request-time vLLM resolution so tests never hit operator config or live servers."""
+    monkeypatch.setattr(B, "_resolve_vllm", lambda endpoint_role=None: url)
+    monkeypatch.setattr(B, "_resolve_vllm_model", lambda endpoint_role=None: model)
 
 
 # ---- batched happy path ----------------------------------------------------------------
 
 def test_batched_happy_path(monkeypatch):
-    _set_vllm(monkeypatch, "http://vllm.local:8000")
+    _set_vllm(monkeypatch, "http://vllm.local:8000", model="resolved-model")
     client = _StubClient()
     prompts = ["a", "b", "c"]
     out = B.generate_batch(prompts, client_fn=_client_fn_for(client))
@@ -78,7 +70,7 @@ def test_batched_happy_path(monkeypatch):
     # Hit the OpenAI-compatible completions endpoint, once per prompt.
     assert all(c["url"].endswith("/v1/completions") for c in client.calls)
     assert len(client.calls) == 3
-    assert client.calls[0]["json"]["model"] == (B._DEFAULT_MODEL or B._resolve_vllm_model())
+    assert client.calls[0]["json"]["model"] == "resolved-model"
 
 
 def test_batched_respects_model_and_max_tokens(monkeypatch):
@@ -161,6 +153,42 @@ def test_fallback_when_batched_server_down(monkeypatch):
     out = B.generate_batch(["a", "b"], client_fn=_client_fn_for(client))
     assert [r["text"] for r in out] == ["ollama:a", "ollama:b"]
     assert all(r["ok"] for r in out)
+
+
+def test_endpoint_role_threads_to_resolvers_at_request_time(monkeypatch):
+    client = _StubClient()
+    calls = []
+    state = {
+        "url": "http://code-v1.local:8000",
+        "model": "code-model-v1",
+    }
+
+    def _resolve_vllm(endpoint_role=None):
+        calls.append(("url", endpoint_role, state["url"]))
+        return state["url"]
+
+    def _resolve_vllm_model(endpoint_role=None):
+        calls.append(("model", endpoint_role, state["model"]))
+        return state["model"]
+
+    monkeypatch.setattr(B, "_resolve_vllm", _resolve_vllm)
+    monkeypatch.setattr(B, "_resolve_vllm_model", _resolve_vllm_model)
+
+    B.generate_batch(["a"], endpoint_role="code", client_fn=_client_fn_for(client))
+    state["url"] = "http://code-v2.local:8000"
+    state["model"] = "code-model-v2"
+    B.generate_batch(["b"], endpoint_role="code", client_fn=_client_fn_for(client))
+
+    assert calls == [
+        ("url", "code", "http://code-v1.local:8000"),
+        ("model", "code", "code-model-v1"),
+        ("url", "code", "http://code-v2.local:8000"),
+        ("model", "code", "code-model-v2"),
+    ]
+    assert client.calls[0]["url"] == "http://code-v1.local:8000/v1/completions"
+    assert client.calls[0]["json"]["model"] == "code-model-v1"
+    assert client.calls[1]["url"] == "http://code-v2.local:8000/v1/completions"
+    assert client.calls[1]["json"]["model"] == "code-model-v2"
 
 
 # ---- per-prompt failure isolation ------------------------------------------------------

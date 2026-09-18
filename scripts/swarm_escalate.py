@@ -210,12 +210,13 @@ def _ensure_paths() -> None:
 
 
 def _batched_generate(prompts: list[str], *, model: str, max_tokens: int,
-                      fmt: Optional[str] = None, think: bool = False) -> list[dict]:
+                      fmt: Optional[str] = None, think: bool = False,
+                      endpoint_role: Optional[str] = None) -> list[dict]:
     _ensure_paths()
     import batched_gen
 
     return batched_gen.generate_batch(prompts, model=model, max_tokens=max_tokens, fmt=fmt,
-                                      think=think)
+                                      think=think, endpoint_role=endpoint_role)
 
 
 def _fail_batch(size: int, why: str) -> list[dict]:
