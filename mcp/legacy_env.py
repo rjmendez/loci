@@ -12,9 +12,96 @@ runs inside, not Loci itself, and renaming them would break that integration.
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
+from urllib.parse import urlparse
 
-# Legacy name -> current name. Suffixes are identical; both are spelled out so
-# the mapping is greppable from either direction.
+LOCALHOST_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+LOCAL_SERVICE_KEYS = {
+    "OLLAMA_BASE_URL",
+    "QDRANT_URL",
+    "MNEMOSYNE_LLM_BASE_URL",
+    "MNEMOSYNE_EMBEDDING_API_URL",
+    "HERMES_A2A_URL",
+    "MRPINK_A2A_URL",
+    "SEARXNG_URL",
+    "FIRECRAWL_API_URL",
+    "EMBED_WORKER_URL",
+    "base_url",
+}
+
+
+def _normalize_host(host: str | None) -> str:
+    if not host:
+        return ""
+    return host.strip().lower().strip("[]")
+
+
+def _is_private_bridge(host: str) -> bool:
+    if not host or host in LOCALHOST_HOSTS:
+        return False
+    parts = host.split(".")
+    if len(parts) == 4:
+        first, second = parts[0], parts[1]
+        if first == "10":
+            return True
+        if first == "192" and second == "168":
+            return True
+        if first == "172" and 16 <= int(second) <= 31:
+            return True
+        if first == "100" and 64 <= int(second) <= 127:
+            return True
+    return False
+
+
+def _iter_hermes_urls(environ: dict | None = None, files: list[Path] | None = None):
+    env = os.environ if environ is None else environ
+    paths = files or []
+    if not paths:
+        hermes_home = Path(env.get("HERMES_HOME", "~/.hermes")).expanduser()
+        paths = [hermes_home / ".env", hermes_home / "config.yaml"]
+        profiles = hermes_home / "profiles"
+        if profiles.exists():
+            paths.extend(sorted(profiles.glob("*/.env")))
+            paths.extend(sorted(profiles.glob("*/config.yaml")))
+
+    out = []
+    for key in sorted(LOCAL_SERVICE_KEYS):
+        value = env.get(key)
+        if value and isinstance(value, str):
+            out.append((None, key, value.strip()))
+
+    for path in dict.fromkeys(paths):
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        pattern = re.compile(r"(?P<key>[A-Za-z0-9_]+)\s*[:=]\s*(?P<value>https?://[^\s\"'\),\]}]+)")
+        for match in pattern.finditer(text):
+            key = match.group("key")
+            if key not in LOCAL_SERVICE_KEYS:
+                continue
+            value = match.group("value").rstrip(") ,")
+            out.append((path, key, value))
+    return out
+
+
+def validate_hermes_endpoint_policy(environ: dict | None = None, files: list[Path] | None = None) -> list[str]:
+    """Reject bridge/private IP drift in Hermes local backend endpoints."""
+    issues = []
+    for path, key, value in _iter_hermes_urls(environ, files):
+        try:
+            host = _normalize_host(urlparse(value).hostname)
+        except Exception:
+            continue
+        if not host:
+            continue
+        if host in LOCALHOST_HOSTS:
+            continue
+        if _is_private_bridge(host):
+            issues.append(f"{path or 'env'}:{key} uses bridge/private hostname {host} instead of 127.0.0.1/localhost")
+    return issues
+
+
 RENAMED: dict[str, str] = {
     "HERMES_A2A_BOOTSTRAP_KEY":       "LOCI_A2A_BOOTSTRAP_KEY",
     "HERMES_A2A_HEALTH_URL":          "LOCI_A2A_HEALTH_URL",
@@ -60,6 +147,9 @@ def apply(environ: dict | None = None) -> list[str]:
         if env.get(old) and not env.get(new):
             env[new] = env[old]
             mapped.append(old)
+    errors = validate_hermes_endpoint_policy(env)
+    if errors:
+        raise RuntimeError("Hermes endpoint policy violation: " + " | ".join(errors))
     return mapped
 
 

@@ -261,10 +261,13 @@ def openrouter() -> tuple[str, str]:
 
 
 def memory_dir() -> str:
-    """Curated MEMORY.md dir for the grounding memory lane: env -> config -> LOCI_MEMORY_DIR -> ''.
+    """Curated MEMORY.md dir for the grounding memory lane: env -> config -> ''.
     No machine/user-specific default (the old ~/.claude/.../-home-<user>/memory default is gone)."""
-    return (os.environ.get("LOCI_MEMORY_MD_DIR") or _cfg("memory", "dir", "")
-            or os.environ.get("LOCI_MEMORY_DIR") or os.environ.get("HERMES_MEMORY_DIR", "") or "")
+    return (os.environ.get("LOCI_MEMORY_MD_DIR")
+            or os.environ.get("LOCI_MEMORY_DIR")
+            or os.environ.get("HERMES_MEMORY_DIR", "")
+            or _cfg("memory", "dir", "")
+            or "")
 
 
 def load_env(repo: "Path | None" = None) -> dict:

@@ -74,6 +74,17 @@ def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     assert B.qdrant() == ("q", "k") and B.memory_dir() == "/m"
 
 
+def test_memory_dir_env_precedence_over_config(tmp_path, monkeypatch):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[memory]\ndir="/cfg/mem"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setenv("HERMES_MEMORY_DIR", "/legacy/mem")
+    monkeypatch.delenv("LOCI_MEMORY_DIR", raising=False)
+    monkeypatch.delenv("LOCI_MEMORY_MD_DIR", raising=False)
+    B._reset_cache()
+    assert B.memory_dir() == "/legacy/mem"
+
+
 def test_env_overrides_config_for_models(tmp_path, monkeypatch):
     cfg = tmp_path / "b.toml"
     cfg.write_text('[embed]\nmodel="cfg"\n')
