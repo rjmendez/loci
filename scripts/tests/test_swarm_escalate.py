@@ -23,6 +23,7 @@ def _config(*, subtasks=None, fanout_count: int = 4) -> S.SwarmConfig:
         decompose_model="planner-model:latest",
         subtasks=subtasks,
         fanout_count=fanout_count,
+        auto_parallel=False,
     )
 
 
@@ -459,15 +460,125 @@ def test_safety_check_guardian_errors_fail_open_for_swarm():
 def test_resolve_config_default_no_opt_in_preserves_legacy_models():
     config = S._resolve_config(S.parse_args(["topic only"]))
 
+    assert config.seeds == 1
+    assert config.seeds_explicit is False
     assert config.escalate_model == S._DEFAULT_ESCALATE_MODEL
     assert config.synthesize_model == S._DEFAULT_SYNTHESIZE_MODEL
     assert config.decompose_max_tokens == 1200
     assert config.synthesize_max_tokens == 1400
 
 
+def test_run_swarm_omitted_seeds_without_vllm_stays_single_seed(monkeypatch):
+    monkeypatch.setattr(S, "_batched_backend_available", lambda: False)
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"single seed","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"legacy single-seed path"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(subtasks=["check single"], fanout_count=1)
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert "multi_seed" not in result
+    assert result["summary"] == "legacy single-seed path"
+    assert config.escalate_model == "strong-model:latest"
+    assert config.synthesize_model == "synth-model:latest"
+
+
+def test_run_swarm_omitted_seeds_with_vllm_auto_parallelizes_without_tier_upgrade(monkeypatch):
+    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    planner_calls = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            planner_calls.append(seed)
+            return [{"ok": True, "text": f'{{"subtasks":["seed {seed} task"]}}'}]
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"parallel seed","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"auto-parallel path"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = S._resolve_config(S.parse_args(["topic only"]))
+    config.cheap_model = "cheap-model:latest"
+    config.decompose_model = "planner-model:latest"
+    config.subtasks = None
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert sorted(planner_calls) == [1, 2, 3]
+    assert result["multi_seed"]["enabled"] is True
+    assert result["multi_seed"]["requested_seed_count"] == 1
+    assert result["multi_seed"]["resolved_seed_count"] == 3
+    assert result["multi_seed"]["auto_parallel"] is True
+    assert config.seeds == 1
+    assert config.escalate_model == S._DEFAULT_ESCALATE_MODEL
+    assert config.synthesize_model == S._DEFAULT_SYNTHESIZE_MODEL
+    assert config.decompose_max_tokens == 1200
+    assert config.synthesize_max_tokens == 1400
+
+
+def test_run_swarm_explicit_seeds_one_disables_auto_parallel(monkeypatch):
+    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"explicit one","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"explicit one seed"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = S._resolve_config(S.parse_args(["topic only", "--seeds", "1"]))
+    config.cheap_model = "cheap-model:latest"
+    config.synthesize_model = "synth-model:latest"
+    config.subtasks = ["check explicit"]
+    config.fanout_count = 1
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert config.seeds_explicit is True
+    assert "multi_seed" not in result
+    assert result["summary"] == "explicit one seed"
+
+
+def test_run_swarm_explicit_seeds_two_preserves_requested_parallelism(monkeypatch):
+    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    planner_calls = []
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            planner_calls.append(seed)
+            return [{"ok": True, "text": f'{{"subtasks":["seed {seed} task"]}}'}]
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"explicit two","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"explicit two seeds"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = S._resolve_config(S.parse_args(["topic only", "--seeds", "2"]))
+    config.cheap_model = "cheap-model:latest"
+    config.decompose_model = "planner-model:latest"
+    config.synthesize_model = "synth-model:latest"
+    config.subtasks = None
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert sorted(planner_calls) == [1, 2]
+    assert result["multi_seed"]["requested_seed_count"] == 2
+    assert result["multi_seed"]["resolved_seed_count"] == 2
+    assert result["multi_seed"]["auto_parallel"] is False
+    assert result["summary"] == "explicit two seeds"
+
+
 def test_resolve_config_opt_in_without_override_upgrades_models():
     config = S._resolve_config(S.parse_args(["topic only", "--seeds", "2"]))
 
+    assert config.seeds_explicit is True
     assert config.escalate_model == S._TIER_ESCALATE_MODEL
     assert config.synthesize_model == S._TIER_SYNTHESIZE_MODEL
     assert config.decompose_max_tokens == S._TIER_DECOMPOSE_MAX_TOKENS
@@ -500,6 +611,30 @@ def test_resolve_config_opt_in_preserves_explicit_legacy_default_overrides():
     assert config.synthesize_model == S._DEFAULT_SYNTHESIZE_MODEL
     assert config.decompose_max_tokens == S._TIER_DECOMPOSE_MAX_TOKENS
     assert config.synthesize_max_tokens == S._TIER_SYNTHESIZE_MAX_TOKENS
+
+
+def test_run_swarm_auto_parallel_can_be_disabled_by_env(monkeypatch):
+    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    monkeypatch.setenv("LOCI_SWARM_AUTO_PARALLEL", "0")
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"env disabled","confidence":"high"}'}]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"env disabled auto-parallel"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = S._resolve_config(S.parse_args(["topic only"]))
+    config.cheap_model = "cheap-model:latest"
+    config.synthesize_model = "synth-model:latest"
+    config.subtasks = ["check env"]
+    config.fanout_count = 1
+    result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+    _assert_valid(result)
+    assert config.auto_parallel is False
+    assert "multi_seed" not in result
+    assert result["summary"] == "env disabled auto-parallel"
 
 
 def test_self_consistency_majority_replaces_low_confidence_before_escalation():

@@ -71,6 +71,7 @@ def test_swarm_reason_delegates_and_serializes(monkeypatch):
     assert captured["config"].topic == "why is auth failing"
     assert captured["config"].fanout_count == 7
     assert captured["config"].seeds == 3
+    assert captured["config"].auto_parallel is False
     assert captured["config"].cheap_model == "cheap-x"
     assert captured["config"].escalate_model == "strong-y"
     assert captured["config"].synthesize_model == "synth-z"

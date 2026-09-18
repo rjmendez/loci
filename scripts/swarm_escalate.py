@@ -122,6 +122,10 @@ class SwarmConfig:
     subtasks: Optional[list[str]] = None
     fanout_count: int = 20
     seeds: int = 1
+    seeds_explicit: bool = False
+    auto_parallel: bool = field(default_factory=lambda: os.environ.get(
+        "LOCI_SWARM_AUTO_PARALLEL", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"})
     escalate_confidences: tuple[str, ...] = ("low",)
     subtask_similarity_threshold: float = 0.50
     answer_similarity_threshold: float = 0.82
@@ -217,6 +221,26 @@ def _batched_generate(prompts: list[str], *, model: str, max_tokens: int,
 
     return batched_gen.generate_batch(prompts, model=model, max_tokens=max_tokens, fmt=fmt,
                                       think=think, endpoint_role=endpoint_role)
+
+
+_AUTO_VLLM_SEEDS = int(os.environ.get("LOCI_SWARM_AUTO_VLLM_SEEDS", "3"))
+
+
+def _batched_backend_available() -> bool:
+    try:
+        _ensure_paths()
+        import backends
+
+        return bool(str(backends.vllm_url(probe_timeout=0.2) or "").strip())
+    except Exception:
+        return False
+
+
+def _effective_seed_count(config: "SwarmConfig") -> int:
+    requested = max(1, int(config.seeds or 1))
+    if requested > 1 or config.seeds_explicit or not config.auto_parallel:
+        return requested
+    return max(1, _AUTO_VLLM_SEEDS) if _batched_backend_available() else requested
 
 
 def _fail_batch(size: int, why: str) -> list[dict]:
@@ -948,13 +972,15 @@ def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *
 
 
 def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
-                    guardian_fn: Callable[[str], dict]) -> dict:
-    ordered: list[dict | None] = [None] * int(config.seeds)
+                    guardian_fn: Callable[[str], dict],
+                    effective_seeds: Optional[int] = None) -> dict:
+    effective_seeds = max(1, int(effective_seeds if effective_seeds is not None else config.seeds))
+    ordered: list[dict | None] = [None] * effective_seeds
     seed_errors: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(config.seeds))) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_seeds) as ex:
         futures = {
-            ex.submit(_run_single_seed, config, batch_fn, seed_index=seed_idx, seed_count=int(config.seeds)): seed_idx
-            for seed_idx in range(int(config.seeds))
+            ex.submit(_run_single_seed, config, batch_fn, seed_index=seed_idx, seed_count=effective_seeds): seed_idx
+            for seed_idx in range(effective_seeds)
         }
         for fut in concurrent.futures.as_completed(futures):
             seed_idx = futures[fut]
@@ -978,7 +1004,7 @@ def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
         "fanout_count": len(merged_findings),
         "escalated_count": escalated_count,
         "escalation_rate": _coerce_ratio(escalated_count, len(merged_findings)),
-        "seed_count": int(config.seeds),
+        "seed_count": effective_seeds,
         "seed_failures": len(seed_errors),
     }
     result = synthesize_swarm(config, synthesis_findings, stats, batch_fn, guardian_fn)
@@ -1046,7 +1072,10 @@ def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
     result["lineage"] = [asdict(item) for item in merged_findings]
     result["multi_seed"] = {
         "enabled": True,
-        "seed_count": int(config.seeds),
+        "seed_count": effective_seeds,
+        "requested_seed_count": int(config.seeds),
+        "resolved_seed_count": effective_seeds,
+        "auto_parallel": bool(not config.seeds_explicit and config.auto_parallel),
         "completed_seeds": len(completed),
         "failed_seeds": len(seed_errors),
         "errors": seed_errors,
@@ -1214,9 +1243,10 @@ def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
     deps = deps or {"generate_batch": _batched_generate}
     batch_fn = deps["generate_batch"]
     guardian_fn = deps.get("guardian_check") or _guardian_check
-    if int(config.seeds or 1) > 1:
+    effective_seeds = _effective_seed_count(config)
+    if effective_seeds > 1:
         try:
-            return _run_multi_seed(config, batch_fn, guardian_fn)
+            return _run_multi_seed(config, batch_fn, guardian_fn, effective_seeds=effective_seeds)
         except Exception:
             return _run_single_seed_result(config, batch_fn, guardian_fn)
 
@@ -1303,8 +1333,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument(
         "--seeds",
         type=int,
-        default=1,
-        help="Independent swarm seeds to run in parallel before one merged synthesis. Default: 1",
+        default=None,
+        help=(
+            "Independent swarm seeds. Explicit value disables auto-parallel. When omitted, "
+            "default is 1 without a batched vLLM endpoint / 3 when one is detected available "
+            "(override via LOCI_SWARM_AUTO_VLLM_SEEDS, disable via LOCI_SWARM_AUTO_PARALLEL=0)."
+        ),
     )
     ap.add_argument(
         "--escalate-confidences",
@@ -1382,7 +1416,8 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
         bool(args.safety_check) if args.safety_check is not None
         else _env_bool("LOCI_SWARM_SAFETY_CHECK")
     )
-    seeds = max(1, int(args.seeds))
+    seeds_explicit = args.seeds is not None
+    seeds = 1 if args.seeds is None else max(1, int(args.seeds))
     self_consistency_samples = max(1, int(args.self_consistency_samples))
     reduce_group_size = max(0, int(args.reduce_group_size))
     escalate_with_prior_context = bool(args.escalate_with_prior_context)
@@ -1418,6 +1453,7 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
         subtasks=supplied or None,
         fanout_count=max(1, int(args.fanout_count)),
         seeds=seeds,
+        seeds_explicit=seeds_explicit,
         escalate_confidences=_split_csv(args.escalate_confidences) or ("low",),
         self_consistency_samples=self_consistency_samples,
         escalate_with_prior_context=escalate_with_prior_context,

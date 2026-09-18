@@ -8,6 +8,12 @@ your host lives in the code.
 > `batched_gen.generate_batch` degrades to the sequential Ollama tier (`mcp/llm_local.generate`)
 > until a vLLM base URL is configured (env `VLLM_BASE_URL`, a local `:8000`, or `[vllm].url` in
 > `~/.loci/backends.toml`).
+>
+> `scripts/swarm_escalate.py` now also auto-expands from its legacy single-seed default to
+> 3 parallel seeds when a batched vLLM endpoint is actually reachable. Omit `--seeds` to keep
+> that heuristic active, override the resolved seed count with `LOCI_SWARM_AUTO_VLLM_SEEDS`,
+> or disable it entirely with `LOCI_SWARM_AUTO_PARALLEL=0`. An explicit `--seeds N` still wins
+> and keeps the historic tier/model-selection semantics unchanged.
 
 ## Why a batched server at all
 
