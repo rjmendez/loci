@@ -469,7 +469,7 @@ def test_resolve_config_default_no_opt_in_preserves_legacy_models():
 
 
 def test_run_swarm_omitted_seeds_without_vllm_stays_single_seed(monkeypatch):
-    monkeypatch.setattr(S, "_batched_backend_available", lambda: False)
+    monkeypatch.setattr(S, "_batched_backend_available", lambda *a, **k: False)
 
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "cheap-model:latest":
@@ -489,7 +489,7 @@ def test_run_swarm_omitted_seeds_without_vllm_stays_single_seed(monkeypatch):
 
 
 def test_run_swarm_omitted_seeds_with_vllm_auto_parallelizes_without_tier_upgrade(monkeypatch):
-    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    monkeypatch.setattr(S, "_batched_backend_available", lambda *a, **k: True)
     planner_calls = []
 
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
@@ -523,7 +523,7 @@ def test_run_swarm_omitted_seeds_with_vllm_auto_parallelizes_without_tier_upgrad
 
 
 def test_run_swarm_explicit_seeds_one_disables_auto_parallel(monkeypatch):
-    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    monkeypatch.setattr(S, "_batched_backend_available", lambda *a, **k: True)
 
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
         if model == "cheap-model:latest":
@@ -546,7 +546,7 @@ def test_run_swarm_explicit_seeds_one_disables_auto_parallel(monkeypatch):
 
 
 def test_run_swarm_explicit_seeds_two_preserves_requested_parallelism(monkeypatch):
-    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    monkeypatch.setattr(S, "_batched_backend_available", lambda *a, **k: True)
     planner_calls = []
 
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
@@ -614,7 +614,7 @@ def test_resolve_config_opt_in_preserves_explicit_legacy_default_overrides():
 
 
 def test_run_swarm_auto_parallel_can_be_disabled_by_env(monkeypatch):
-    monkeypatch.setattr(S, "_batched_backend_available", lambda: True)
+    monkeypatch.setattr(S, "_batched_backend_available", lambda *a, **k: True)
     monkeypatch.setenv("LOCI_SWARM_AUTO_PARALLEL", "0")
 
     def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
@@ -635,6 +635,94 @@ def test_run_swarm_auto_parallel_can_be_disabled_by_env(monkeypatch):
     assert config.auto_parallel is False
     assert "multi_seed" not in result
     assert result["summary"] == "env disabled auto-parallel"
+
+
+def test_batched_backend_available_url_only_check_preserves_legacy_behavior(monkeypatch):
+    # candidate_models=None (the default) must keep the old reachability-only semantics
+    # for any caller that doesn't have a specific model list to verify.
+    class _FakeBackends:
+        @staticmethod
+        def vllm_url(probe_timeout=0.2):  # noqa: ARG001
+            return "http://127.0.0.1:18000"
+
+    monkeypatch.setitem(sys.modules, "backends", _FakeBackends)
+    assert S._batched_backend_available() is True
+
+
+def test_batched_backend_available_returns_false_when_url_missing(monkeypatch):
+    class _FakeBackends:
+        @staticmethod
+        def vllm_url(probe_timeout=0.2):  # noqa: ARG001
+            return ""
+
+    monkeypatch.setitem(sys.modules, "backends", _FakeBackends)
+    assert S._batched_backend_available() is False
+    assert S._batched_backend_available(("any-model:latest",)) is False
+
+
+def test_batched_backend_available_blocks_auto_parallel_on_model_tag_mismatch(monkeypatch):
+    # Live-verified regression test (2026-09-17): a reachable vLLM URL that does NOT
+    # serve the swarm's configured model tags must NOT be treated as "batched backend
+    # available" for auto-parallel purposes, since every request would 404 and
+    # batched_gen would silently fall back to serial Ollama for the whole batch.
+    class _FakeBackends:
+        @staticmethod
+        def vllm_url(probe_timeout=0.2):  # noqa: ARG001
+            return "http://127.0.0.1:18000"
+
+    monkeypatch.setitem(sys.modules, "backends", _FakeBackends)
+    monkeypatch.setattr(S, "_vllm_served_model_ids", lambda url, probe_timeout=0.5: {"Qwen/Qwen3-4B-Instruct-2507"})
+
+    assert S._batched_backend_available(("qwen3.8:latest", "qwen2.5:3b")) is False
+
+
+def test_batched_backend_available_allows_auto_parallel_on_model_tag_match(monkeypatch):
+    class _FakeBackends:
+        @staticmethod
+        def vllm_url(probe_timeout=0.2):  # noqa: ARG001
+            return "http://127.0.0.1:18000"
+
+    monkeypatch.setitem(sys.modules, "backends", _FakeBackends)
+    monkeypatch.setattr(S, "_vllm_served_model_ids", lambda url, probe_timeout=0.5: {"Qwen/Qwen3-4B-Instruct-2507"})
+
+    assert S._batched_backend_available(("Qwen/Qwen3-4B-Instruct-2507", "qwen2.5:3b")) is True
+
+
+def test_batched_backend_available_fails_open_when_models_probe_is_inconclusive(monkeypatch):
+    # An unprobeable /v1/models (older server, transient network error) must fail OPEN
+    # (preserve legacy behavior) rather than silently disabling auto-parallel forever.
+    class _FakeBackends:
+        @staticmethod
+        def vllm_url(probe_timeout=0.2):  # noqa: ARG001
+            return "http://127.0.0.1:18000"
+
+    monkeypatch.setitem(sys.modules, "backends", _FakeBackends)
+    monkeypatch.setattr(S, "_vllm_served_model_ids", lambda url, probe_timeout=0.5: None)
+
+    assert S._batched_backend_available(("qwen3.8:latest",)) is True
+
+
+def test_effective_seed_count_checks_all_role_models_not_just_cheap_model(monkeypatch):
+    seen_candidates = []
+
+    def _fake_available(candidate_models=None):
+        seen_candidates.append(candidate_models)
+        return False
+
+    monkeypatch.setattr(S, "_batched_backend_available", _fake_available)
+
+    config = S.SwarmConfig(
+        topic="t",
+        cheap_model="cheap:latest",
+        escalate_model="escalate:latest",
+        synthesize_model="synth:latest",
+        decompose_model="decompose:latest",
+        seeds=1,
+        seeds_explicit=False,
+        auto_parallel=True,
+    )
+    assert S._effective_seed_count(config) == 1
+    assert seen_candidates == [("cheap:latest", "decompose:latest", "escalate:latest", "synth:latest")]
 
 
 def test_self_consistency_majority_replaces_low_confidence_before_escalation():
