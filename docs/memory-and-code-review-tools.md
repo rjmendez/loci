@@ -237,6 +237,8 @@ The tables below cover the 24 most-used ones. The rest are:
 `symbol_impact`, `impact_report`, `finding_code_context`,
 `investigation_code_briefing`, `subsystem_report`,
 `related_investigations_via_code`, `dead_code_candidates`).
+For a source-checked signature/reference view of the memory-facing subset, see
+[docs/API_MEMORY.md](./API_MEMORY.md).
 
 #### Investigation CRUD
 

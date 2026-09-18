@@ -1,3 +1,4 @@
+# ruff: noqa: F821
 # vulture whitelist — intentionally-defined names that are not called locally
 # but are part of the public API, MCP tool surface, or hook interface.
 #
