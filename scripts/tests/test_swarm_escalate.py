@@ -207,6 +207,45 @@ def test_schema_validation_catches_shape_errors_and_passes_real_result():
     _assert_valid(result)
 
 
+def test_batched_generate_forwards_endpoint_role(monkeypatch):
+    seen = {}
+
+    class _FakeBatchedGen:
+        @staticmethod
+        def generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False,
+                           endpoint_role=None):
+            seen.update({
+                "prompts": list(prompts),
+                "model": model,
+                "max_tokens": max_tokens,
+                "fmt": fmt,
+                "think": think,
+                "endpoint_role": endpoint_role,
+            })
+            return [{"text": "ok", "ok": True}]
+
+    monkeypatch.setitem(sys.modules, "batched_gen", _FakeBatchedGen)
+
+    out = S._batched_generate(
+        ["check code"],
+        model="code-model:latest",
+        max_tokens=77,
+        fmt="json",
+        think=True,
+        endpoint_role="code",
+    )
+
+    assert out == [{"text": "ok", "ok": True}]
+    assert seen == {
+        "prompts": ["check code"],
+        "model": "code-model:latest",
+        "max_tokens": 77,
+        "fmt": "json",
+        "think": True,
+        "endpoint_role": "code",
+    }
+
+
 def test_huge_subtasks_are_truncated_in_prompts_not_in_returned_findings():
     """Regression test: a live run against 10 real diff-review subtasks (each a multi-KB
     diff pasted verbatim as the "subtask") produced garbled cheap-tier answers and a

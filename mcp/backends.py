@@ -65,6 +65,12 @@ def _cfg(section: str, key: str, default=None):
     return (_config().get(section) or {}).get(key, default)
 
 
+def _cfg_nested(section: str, subsection: str, key: str, default=None):
+    parent = _config().get(section) or {}
+    child = parent.get(subsection) if isinstance(parent, dict) else None
+    return child.get(key, default) if isinstance(child, dict) else default
+
+
 def _alive(url: str, timeout: float = 1.0) -> bool:
     """Cheap TCP reachability probe of a URL's host:port. Never raises."""
     if not url:
@@ -187,11 +193,25 @@ def ollama_redteam_model() -> str:
             or "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M")
 
 
-@functools.lru_cache(maxsize=8)
-def vllm_url(probe_timeout: float = 1.0) -> str:
+def _vllm_role_env(prefix: str, role: str) -> str:
+    return f"{prefix}_{role.strip().upper().replace('-', '_')}"
+
+
+@functools.lru_cache(maxsize=32)
+def vllm_url(role: str | None = None, probe_timeout: float = 1.0) -> str:
     """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).
 
     `probe_timeout` bounds the local reachability probe (see ollama_url)."""
+    if role:
+        env = os.environ.get(_vllm_role_env("VLLM_BASE_URL", role))
+        if env:
+            return env
+        configured = _cfg_nested("vllm", role, "url", "") or ""
+        if configured:
+            return configured
+        # Deliberately no role-specific localhost probe: specialist routing must be explicit,
+        # then fall back to the shared/default resolver whose existing localhost probe remains.
+        return vllm_url(probe_timeout=probe_timeout)
     env = os.environ.get("VLLM_BASE_URL")
     if env:
         return env
@@ -204,7 +224,15 @@ def embed_model() -> str:
     return os.environ.get("EMBED_MODEL") or _cfg("embed", "model", "nomic-embed-text")
 
 
-def vllm_model() -> str:
+def vllm_model(role: str | None = None) -> str:
+    if role:
+        env = os.environ.get(_vllm_role_env("VLLM_MODEL", role))
+        if env:
+            return env
+        configured = _cfg_nested("vllm", role, "model", "") or ""
+        if configured:
+            return configured
+        return vllm_model()
     return os.environ.get("VLLM_MODEL") or _cfg("vllm", "model", "Qwen2.5-3B-Instruct")
 
 
