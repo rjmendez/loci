@@ -466,6 +466,7 @@ def swarm_reason(topic: str,
             subtasks=_coerce_labels(subtasks) or None,
             fanout_count=max(1, int(fanout_count)),
             seeds=resolved_seeds,
+            auto_parallel=False,
             escalate_confidences=tuple(
                 str(item).strip().lower()
                 for item in _coerce_labels(escalate_confidences or ("low",))
