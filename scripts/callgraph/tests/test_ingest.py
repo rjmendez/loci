@@ -1,20 +1,14 @@
 """ingest.py: worktree parsing, git-rev parsing, and the SyntaxError
 degrade-not-abort contract."""
+from .. import config
 from .. import ingest
 from ..tests.helpers import source_file
 
 
-def test_load_corpus_worktree_parses_148_files_with_no_errors():
-    """127 -> 128 -> 129 -> 130 -> 131 -> 132 -> 133 -> ... -> 142 -> 143 -> 144 -> 145 -> 146 -> 147 -> 148:
-    memory-integrity audit test, mcp/compact.py, deploy script, A/B eval script,
-    prefilter script, mcp/guardian.py (Granite Guardian semantic injection-risk
-    classification), scripts/issue_proposer.py (guarded reflection-loop
-    issue proposer), scripts/stigmergic_consensus.py (opt-in stigmergic
-    consensus gate for swarm findings), then scripts/model_catalog.py
-    (specialist model catalog)."""
+def test_load_corpus_worktree_parses_current_corpus_with_no_errors():
     sources, origin = ingest.load_corpus(rev=None)
     assert origin == "working tree"
-    assert len(sources) == 151  # adversarial_review.py + bench_model_catalog_quality.py added
+    assert len(sources) == len(config.iter_corpus_files_worktree())
     errors = [(sf.rel_path, sf.error) for sf in sources if sf.error is not None]
     assert errors == []
     assert all(sf.tree is not None for sf in sources)
@@ -23,7 +17,7 @@ def test_load_corpus_worktree_parses_148_files_with_no_errors():
 def test_load_corpus_rev_head_reads_git_blobs():
     sources, origin = ingest.load_corpus(rev="HEAD")
     assert origin.startswith("rev ")
-    assert len(sources) == 151  # adversarial_review.py + bench_model_catalog_quality.py added
+    assert len(sources) == len(config.iter_corpus_files_worktree())
     assert all(sf.error is None for sf in sources)
     server = next(sf for sf in sources if sf.rel_path == "mcp/server.py")
     assert "loci-mcp" in server.source[:200]
