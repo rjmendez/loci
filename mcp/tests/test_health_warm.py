@@ -107,6 +107,35 @@ def test_loci_health_unconfigured_backend_down_stays_fail_open(monkeypatch):
     assert "optional_down" in out
 
 
+def test_loci_health_tmux_required_missing_is_unhealthy(monkeypatch):
+    monkeypatch.setenv("LOCI_TMUX_COMPANION_REQUIRED", "1")
+    monkeypatch.setenv("LOCI_TMUX_COMPANION_SESSIONS", "claude,copilot")
+
+    class _Proc:
+        stdout = "claude: 1 windows (created ...)\n"
+        returncode = 0
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _Proc())
+    out = json.loads(server.loci_health())
+    assert out["status"] == "unhealthy"
+    assert "tmux_companion_missing" in out
+    assert "copilot" in out["tmux_companion_missing"]
+
+
+def test_loci_health_tmux_optional_missing_stays_ok(monkeypatch):
+    monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
+    monkeypatch.setenv("LOCI_TMUX_COMPANION_SESSIONS", "claude,copilot")
+
+    class _Proc:
+        stdout = "claude: 1 windows (created ...)\n"
+        returncode = 0
+
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: _Proc())
+    out = json.loads(server.loci_health())
+    assert out["status"] == "ok"
+    assert out.get("tmux_companion_optional_down") == ["copilot"]
+
+
 def test_code_version_first_compute_is_thread_safe(monkeypatch):
     # Double-checked locking: concurrent cold callers spawn `git rev-parse` exactly once.
     import subprocess as _sp
