@@ -138,7 +138,7 @@ tier below still runs from the user crontab separately.
 Reference crontab line for the live profile copy:
 
 ```cron
-* * * * * /home/rjmendez/development/loci/scripts/hermes_cron_runner.py --jobs-file ~/.hermes/profiles/mrpink/cron/jobs.json
+* * * * * /home/rjmendez/development/loci/scripts/hermes_cron_runner.py --jobs-file ~/.hermes/profiles/edge/cron/jobs.json
 ```
 
 | ID | Name | Interval | Script |
