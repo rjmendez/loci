@@ -74,6 +74,25 @@ def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     assert B.qdrant() == ("q", "k") and B.memory_dir() == "/m"
 
 
+def test_memory_dir_env_beats_config_even_for_legacy_name(tmp_path, monkeypatch):
+    for k in ("LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR", "HERMES_MEMORY_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[memory]\ndir="/cfg/mem"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    monkeypatch.setenv("HERMES_MEMORY_DIR", "/legacy/mem")
+    assert B.memory_dir() == "/legacy/mem"
+
+
+def test_memory_dir_current_name_beats_legacy_name(monkeypatch):
+    monkeypatch.delenv("LOCI_MEMORY_MD_DIR", raising=False)
+    monkeypatch.setenv("LOCI_MEMORY_DIR", "/current/mem")
+    monkeypatch.setenv("HERMES_MEMORY_DIR", "/legacy/mem")
+    B._reset_cache()
+    assert B.memory_dir() == "/current/mem"
+
+
 def test_env_overrides_config_for_models(tmp_path, monkeypatch):
     cfg = tmp_path / "b.toml"
     cfg.write_text('[embed]\nmodel="cfg"\n')
@@ -91,6 +110,7 @@ def _no_task_model_env(mp):
 def test_verify_and_compress_model_fall_back_to_gen_model_when_unset(monkeypatch):
     _no_task_model_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
     assert B.ollama_verify_model() == B.ollama_gen_model()
     assert B.ollama_compress_model() == B.ollama_gen_model()
@@ -123,6 +143,7 @@ def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, mon
     # meaningless Yes/No output rather than a degraded-but-sane answer.
     monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
     monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "some-other-chat-model:latest")
     assert B.ollama_guardian_model() == "granite3-guardian:2b"
@@ -149,10 +170,37 @@ def test_guardian_model_env_wins_over_config(tmp_path, monkeypatch):
 def test_redteam_model_defaults_to_heretic_qwen38(monkeypatch):
     monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
     assert B.ollama_redteam_model() == (
         "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
     )
+
+
+def test_gen_model_auto_selects_local_non_embedding_when_default_missing(monkeypatch):
+    _no_task_model_env(monkeypatch)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags",
+                        lambda: {"nomic-embed-text:latest", "local-heretic-llama31-8b:q4km"})
+    B._reset_cache()
+    assert B.ollama_gen_model() == "local-heretic-llama31-8b:q4km"
+
+
+def test_guardian_model_auto_selects_local_when_granite_unavailable(monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags",
+                        lambda: {"nomic-embed-text:latest", "local-heretic-llama31-8b:q4km"})
+    B._reset_cache()
+    assert B.ollama_guardian_model() == "local-heretic-llama31-8b:q4km"
+
+
+def test_redteam_model_auto_selects_local_heretic_when_default_tag_unavailable(monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: {"local-heretic-qwen38-27b:q4km"})
+    B._reset_cache()
+    assert B.ollama_redteam_model() == "local-heretic-qwen38-27b:q4km"
 
 
 def test_redteam_model_config_key_overrides_default(tmp_path, monkeypatch):

@@ -80,6 +80,7 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 | How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | API overview by tool family | [docs/API.md](docs/API.md) |
 | Runtime registration and call paths | [docs/CALLGRAPH.md](docs/CALLGRAPH.md) |
+| MCP reference for code graph / contracts / audit | [docs/API_CODE_GRAPH.md](docs/API_CODE_GRAPH.md) |
 | Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
 | What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
 | How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |

@@ -12,7 +12,7 @@ Three schedulers are declared in this repo:
   executes one catch-up run and persists the next future occurrence on the same tick.
 - **the user crontab** — four `loci_groom_cron.sh` passes. Verified running:
   `~/.loci/groom/runs.jsonl` has an `rc:0` line for each within the last 24h.
-- **a systemd user timer** — `mrpink-context-bridge.timer`, every 10m, last fired
+- **a systemd user timer** — `edge-context-bridge.timer`, every 10m, last fired
   2026-08-27 12:39 EDT.
 
 ---
@@ -194,6 +194,24 @@ so it observes without bypassing the permission prompt or blocking a tool.
 
 ---
 
+### `mcp/investigation_tools.py` coordination queue (cross-session leasing)
+
+Investigation tools expose a durable queue for cross-session coordination. Queue items live on each investigation manifest (`manifest["coordination"]["items"]`) and carry item scope, owner session, lease expiry, dependencies, and completion notes.
+
+Current MCP tools:
+- `investigation_queue_enqueue(...)` — create a queued item.
+- `investigation_queue_claim(...)` — claim or renew an item lease for a session.
+- `investigation_queue_complete(...)` — finalize as `done`, `blocked`, or `cancelled`.
+- `investigation_queue_release(...)` — convenience alias for blocked release.
+- `investigation_queue_status(...)` / `investigation_queue_list(...)` — inspect queue snapshots and filters.
+
+Safety invariants:
+1. Item IDs are unique per investigation.
+2. Active lease ownership is exclusive until expiration.
+3. Non-owner completion is rejected while lease is active.
+4. Legacy manifests are migrated automatically to include coordination state.
+
+---
 ## Consolidation and decay
 
 ### `scripts/ebbinghaus_consolidation.py`
@@ -598,7 +616,7 @@ keeps its own watermark in `BRIDGE_STATE_FILE`, so a skipped tick loses nothing.
 
 **Schedule:** systemd, not cron. `scripts/systemd/` ships two pairs —
 `loci-context-bridge.{service,timer}` (a template for a system unit, needs the
-marked block adjusted) and `mrpink-context-bridge.{service,timer}`, which is
+marked block adjusted) and `edge-context-bridge.{service,timer}`, which is
 installed as a **user** unit on this host and fires every 10m
 (`OnUnitActiveSec=10min`, `OnBootSec=3min`).
 
@@ -607,6 +625,18 @@ installed as a **user** unit on this host and fires every 10m
 fans out, and every run re-inserts a copy of the memory it just read with a fresh
 id and `created_at` — unbounded growth on a single node, no peer required. See
 `scripts/systemd/README.md` for the check.
+
+### `scripts/endpoint_maintenance.py`
+Deterministic endpoint maintenance for a caller-specified SSH alias. It ensures the
+remote `~/development/loci` repo exists (clones if missing), hard-syncs to
+`origin/main` (or a caller-specified branch), then emits machine-readable JSON with
+remote commit SHA, clean/dirty status, optional health endpoint probe results, and
+optional `systemctl --user` unit status snapshots.
+
+**Run on demand:** `python scripts/endpoint_maintenance.py --endpoint edge-endpoint --default-services`
+
+**Key flags:** `--endpoint`, `--branch`, `--repo-path`, `--repo-url`, `--timeout`,
+`--health-url`, `--health-timeout`, `--service` (repeatable), `--default-services`.
 
 ### `scripts/install_hooks.sh`
 Symlinks `scripts/hooks/post-commit` into `.git/hooks/`. Two post-commit bodies
@@ -696,7 +726,7 @@ Idempotent. It copies **only** `deep-think-loci.js` (landing as
 
 | Unit | Runs | Schedule |
 |---|---|---|
-| `mrpink-context-bridge.timer` | `a2a_context_bridge.py` | every 10m |
+| `edge-context-bridge.timer` | `a2a_context_bridge.py` | every 10m |
 
 ### Declared in `cron/jobs.json` — run through `scripts/hermes_cron_runner.py`
 

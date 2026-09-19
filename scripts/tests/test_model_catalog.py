@@ -34,6 +34,7 @@ def test_specialist_model_catalog_is_additive_only():
         "tool_calling": catalog.TOOL_CALLING_SPECIALIST_MODEL,
     }
     assert catalog.SWARM_CHEAP_FANOUT_MODELS == (
+        "qwen2.5:3b",
         "heretic-llama31-8b-instruct:latest",
         "llama3.1-agent:latest",
     )
