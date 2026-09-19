@@ -23,8 +23,8 @@ not live in the repo.
 | `OLLAMA_URL` | _(none, required)_ | most embedding + generation scripts (memgas_hierarchy.py, ebbinghaus_consolidation.py, amem_consolidation.py, agentHER_relabeler.py, skillops_maintenance.py, exif_skill_discovery.py, score_trace_collector.py, eval/harness.py) |
 | `OLLAMA_BASE_URL` | _(none in code; `backends.ollama_url()` probes `http://localhost:11434`)_ | the **embedding** endpoint for 16 non-test files: `mcp/{qdrant_ops,embed_ops,backends,memcheck/llm}.py`, `scripts/hooks/{pre_llm_grounding,session_end_sync}.py`, `scripts/{loci_groom,glymphatic_sweep,gpu_warm}.py`, all of `mlops/`, `deep_think_loci/grounding/` |
 | `LOCI_OLLAMA_GEN_URL` / `OLLAMA_GEN_URL` | _(none; falls back to `backends.ollama_gen_url()` → `ollama_url()`)_ | the **generation** endpoint, resolved separately from embeddings (`mcp/llm_local.py`). `OLLAMA_BASE_URL` deliberately does **not** feed it |
-| `LOCI_OLLAMA_GEN_MODEL` | `qwen2.5:3b` | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). **Must be a tag `ollama list` actually shows on that host** — a misconfigured/unpulled tag fails every `generate()` call silently (fail-open, `degraded=True` everywhere upstream) with no error surfaced short of the `why` field in `llm_local.generate()`'s return dict |
-| `LOCI_OLLAMA_REDTEAM_MODEL` | `hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M` | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This one intentionally defaults to a heretic/abliterated build because aligned models often refuse or soften "attack this proposal as an adversary would" prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures` |
+| `LOCI_OLLAMA_GEN_MODEL` | auto (`qwen2.5:3b` if present, else first local non-embedding tag, else `qwen2.5:3b`) | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). Explicit env/config still wins. This auto-fallback prevents hardcoded defaults from silently pointing at missing local tags. |
+| `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M`, then local heretic/abliterated tag, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
 | `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
 
 **Diagnosed 2026-09-15, corrected in `~/.loci/backends.toml` (machine-specific,
@@ -96,6 +96,56 @@ After that, switch Loci yourself with `LOCI_OLLAMA_GEN_MODEL=<the-created-tag>`.
 See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →
 `~/.loci/backends.toml` `[ollama].gen_model` → code default) rather than changing code.
 
+### Benchmark-driven role assignment (required)
+
+Do **not** hand-pick role defaults from memory or one-off host state. Assignments must
+come from a benchmark artifact plus local tag availability.
+
+1. Run the quality benchmark against the target generation endpoint:
+
+```bash
+python3 scripts/bench_model_catalog_quality.py \
+  --base-url http://<ollama-host>:11434 \
+  --timeout-s 45 \
+  --max-tokens 96 \
+  --output artifacts/model_catalog/quality_<date>.json
+```
+
+2. Derive role assignments from that JSON and currently installed local tags:
+
+```bash
+python3 scripts/assign_models_from_benchmark.py \
+  --benchmark-json artifacts/model_catalog/quality_<date>.json
+```
+
+This prints an `[ollama]` TOML block mapping:
+- `synthesis` winner -> `gen_model`
+- `escalation` winner -> `verify_model`
+- `cheap_fanout` winner -> `compress_model`
+- `guardian` winner -> `guardian_model`
+- best available local heretic/abliterated -> `redteam_model`
+
+If the script exits non-zero, at least one selected winner is not installed locally.
+Fix the local model inventory first, then rerun.
+
+3. Copy the emitted block into `~/.loci/backends.toml` (or the file pointed to by
+`$LOCI_CONFIG`) and validate every assigned tag resolves:
+
+```bash
+ollama show <gen_model>
+ollama show <verify_model>
+ollama show <compress_model>
+ollama show <guardian_model>
+ollama show <redteam_model>
+```
+
+4. If you update additive catalog recommendations in `scripts/model_catalog.py`, keep
+the benchmark and catalog tests green:
+
+```bash
+python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py scripts/tests/test_model_catalog.py -q
+```
+
 ### Memory store paths
 
 | Variable | Default | Used by |
@@ -122,6 +172,66 @@ See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →
 
 ---
 
+### Coordination queue / cross-session handoff
+
+Loci now supports a durable investigation-scoped coordination queue so parallel sessions can reserve and complete non-overlapping work without direct runtime interaction.
+
+**Why this queue exists**
+- Prevents silent overlap across active Copilot/Claude sessions.
+- Captures ownership and lease expiry in machine-readable state.
+- Keeps work pickup deterministic: discover, claim, complete, then verify queue state.
+
+**Workflow**
+1. Discover: `investigation_queue_status(investigation_id=...)` for current queue state.
+2. Enqueue: `investigation_queue_enqueue(...)` with a stable item id, scope, and targets.
+3. Claim lease: `investigation_queue_claim(...)` with `owner_session` and bounded `lease_seconds`.
+4. Heartbeat/renew: re-run `investigation_queue_claim(...)` with the same owner before expiry.
+5. Complete/release: `investigation_queue_complete(...)` with `state=done|blocked|cancelled` (or `investigation_queue_release(...)` alias).
+
+**Conflict-avoidance rules**
+- One owner per item while lease is active.
+- Claims from other sessions fail unless the lease is expired.
+- Completion by non-owners is rejected while another owner’s lease is still valid.
+- Use explicit `dependencies` to serialize truly dependent work only.
+
+**Example MCP calls**
+
+```json
+// enqueue a work item
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "scope_kind": "file",
+  "scope_targets": ["docs/wiki/backend-protocol.md"],
+  "dependencies": [],
+  "notes": "Add sendHello #8 and remove stale overclaims"
+}
+```
+
+```json
+// claim lease
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "owner_session": "800cdfd9-0fd7-46e0-b292-71b6f556b025",
+  "lease_seconds": 300
+}
+```
+
+```json
+// complete
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "owner_session": "800cdfd9-0fd7-46e0-b292-71b6f556b025",
+  "state": "done",
+  "notes": "Updated docs + verified wording against findings"
+}
+```
+
+Queue state is persisted on the investigation manifest under `coordination.items`; treat that manifest as the source of truth for item state, ownership, and lease expiry.
+
+---
 ## Cron jobs
 
 `cron/jobs.json` defines six jobs; the five enabled ones are below.
@@ -138,7 +248,7 @@ tier below still runs from the user crontab separately.
 Reference crontab line for the live profile copy:
 
 ```cron
-* * * * * /home/rjmendez/development/loci/scripts/hermes_cron_runner.py --jobs-file ~/.hermes/profiles/mrpink/cron/jobs.json
+* * * * * /home/rjmendez/development/loci/scripts/hermes_cron_runner.py --jobs-file ~/.hermes/profiles/edge/cron/jobs.json
 ```
 
 | ID | Name | Interval | Script |

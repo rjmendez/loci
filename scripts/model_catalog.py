@@ -11,7 +11,12 @@ CODE_SPECIALIST_MODEL = "qwen2.5-coder:7b"
 MATH_SPECIALIST_MODEL = "hf.co/bartowski/Qwen2.5-Math-7B-Instruct-GGUF:Q4_K_M"
 # 2026-09-17 quality-first benchmark: qwen3.8:latest and llama-guard3:8b both
 # passed all 15 adversarial safety cases. Latency was recorded but not used to
-# break the quality tie.
+# break the quality tie. Same-day live swarm sanity check on 3 borderline safety
+# prompts: qwen3.8 answered buffer-overflow/SQLi in bounded educational terms and
+# refused padlock guidance; llama-guard3 timed out at 120s on all 3 prompts; the
+# live-pulled granite3-guardian:2b returned a terse "No" once and otherwise
+# failed the swarm JSON contract on those prompts, so it stays out of answer-stage
+# safety routing for now.
 SAFETY_SPECIALIST_MODELS = (
     "llama-guard3:8b",
     "qwen3.8:latest",
@@ -19,6 +24,9 @@ SAFETY_SPECIALIST_MODELS = (
 TOOL_CALLING_SPECIALIST_MODEL = "hf.co/eaddario/Watt-Tool-8B-GGUF:Q4_K_M"
 
 SWARM_CHEAP_FANOUT_MODELS = (
+    # 2026-09-17 live /api/tags roster confirms qwen2.5:3b is already pulled on
+    # the Ollama host, and it remains the unchanged runtime cheap-tier default.
+    "qwen2.5:3b",
     "heretic-llama31-8b-instruct:latest",
     "llama3.1-agent:latest",
 )

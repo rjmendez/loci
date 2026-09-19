@@ -35,6 +35,7 @@ import logging
 import functools
 import os
 import socket
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,6 +47,7 @@ _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "bac
 # module, and generic (localhost) — nothing machine-specific.
 _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
 _LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:8000")
+_OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -85,6 +87,52 @@ def _alive(url: str, timeout: float = 1.0) -> bool:
             return True
     except Exception:
         return False
+
+
+@functools.lru_cache(maxsize=1)
+def _ollama_local_tags() -> set[str]:
+    """Best-effort local Ollama tag inventory. Never raises."""
+    try:
+        p = subprocess.run(["ollama", "list"], capture_output=True, text=True,
+                           timeout=_OLLAMA_LIST_TIMEOUT, check=False)
+    except Exception:
+        return set()
+    if p.returncode != 0:
+        return set()
+    tags: set[str] = set()
+    for line in (p.stdout or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("NAME "):
+            continue
+        tag = s.split()[0]
+        if tag:
+            tags.add(tag)
+    return tags
+
+
+def _first_installed(candidates: tuple[str, ...]) -> str:
+    tags = _ollama_local_tags()
+    for c in candidates:
+        if c in tags:
+            return c
+    return ""
+
+
+def _first_non_embedding_local() -> str:
+    tags = sorted(_ollama_local_tags())
+    for t in tags:
+        if "embed" not in t.lower():
+            return t
+    return ""
+
+
+def _first_matching_local(patterns: tuple[str, ...]) -> str:
+    tags = sorted(_ollama_local_tags())
+    for t in tags:
+        lt = t.lower()
+        if any(p in lt for p in patterns):
+            return t
+    return ""
 
 
 @functools.lru_cache(maxsize=8)
@@ -131,10 +179,13 @@ def ollama_gen_url(probe_timeout: float = 1.0) -> str:
 
 
 def ollama_gen_model() -> str:
-    """Generation model tag. Env -> [ollama].gen_model -> the verified-good default."""
-    return (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
-            or _cfg("ollama", "gen_model", "")
-            or "qwen2.5:3b")
+    """Generation model tag. Env -> [ollama].gen_model -> installed local -> default."""
+    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
+                  or _cfg("ollama", "gen_model", ""))
+    if env_or_cfg:
+        return env_or_cfg
+    preferred = ("qwen2.5:3b", "qwen3.8:latest", "heretic-llama31-8b-instruct:latest")
+    return _first_installed(preferred) or _first_non_embedding_local() or "qwen2.5:3b"
 
 
 def _task_model(env_var: str, cfg_key: str) -> str:
@@ -174,9 +225,13 @@ def ollama_guardian_model() -> str:
 
     Env -> [ollama].guardian_model -> "granite3-guardian:2b".
     """
-    return (os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
-            or _cfg("ollama", "guardian_model", "")
-            or "granite3-guardian:2b")
+    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
+                  or _cfg("ollama", "guardian_model", ""))
+    if env_or_cfg:
+        return env_or_cfg
+    preferred = ("llama-guard3:8b", "granite3-guardian:2b", "qwen3.8:latest",
+                 "heretic-llama31-8b-instruct:latest", "qwen2.5:3b")
+    return _first_installed(preferred) or _first_non_embedding_local() or "granite3-guardian:2b"
 
 
 def ollama_redteam_model() -> str:
@@ -188,8 +243,14 @@ def ollama_redteam_model() -> str:
     instruct models often introduce on "attack this" prompts. Resolution stays portable:
     env -> [ollama].redteam_model -> a known-good heretic default.
     """
-    return (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
-            or _cfg("ollama", "redteam_model", "")
+    env_or_cfg = (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
+                  or _cfg("ollama", "redteam_model", ""))
+    if env_or_cfg:
+        return env_or_cfg
+    preferred = ("hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M",
+                 "qwen3.8:latest")
+    return (_first_installed(preferred)
+            or _first_matching_local(("heretic", "abliterated"))
             or "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M")
 
 
@@ -264,13 +325,14 @@ def openrouter() -> tuple[str, str]:
 
 
 def memory_dir() -> str:
-    """Curated MEMORY.md dir for the grounding memory lane: env -> config -> ''.
-    No machine/user-specific default (the old ~/.claude/.../-home-<user>/memory default is gone)."""
-    return (os.environ.get("LOCI_MEMORY_MD_DIR")
-            or os.environ.get("LOCI_MEMORY_DIR")
-            or os.environ.get("HERMES_MEMORY_DIR", "")
-            or _cfg("memory", "dir", "")
-            or "")
+    """Curated MEMORY.md dir for the grounding memory lane.
+
+    Lookup order: LOCI_MEMORY_MD_DIR -> LOCI_MEMORY_DIR -> HERMES_MEMORY_DIR
+    -> gitignored config [memory].dir -> ''. No machine/user-specific default
+    (the old ~/.claude/.../-home-<user>/memory default is gone).
+    """
+    return (os.environ.get("LOCI_MEMORY_MD_DIR") or os.environ.get("LOCI_MEMORY_DIR")
+            or os.environ.get("HERMES_MEMORY_DIR") or _cfg("memory", "dir", "") or "")
 
 
 def load_env(repo: "Path | None" = None) -> dict:
@@ -347,5 +409,7 @@ def load_env(repo: "Path | None" = None) -> dict:
 
 def _reset_cache() -> None:
     """Test hook: clear memoized resolutions (env/config may have changed)."""
-    for fn in (_config, ollama_url, vllm_url):
-        fn.cache_clear()
+    for fn in (_config, _ollama_local_tags, ollama_url, vllm_url):
+        clear = getattr(fn, "cache_clear", None)
+        if clear:
+            clear()

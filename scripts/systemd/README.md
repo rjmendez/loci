@@ -56,9 +56,9 @@ before and after.
 | `BRIDGE_STATE_FILE` | `~/.hermes/bridge_state.json` | last clean-run timestamp, plus the bounded `sent_ids` delivered-set |
 | `LOCI_A2A_TOTP_SEED` | unset | required where the LOCAL server enforces TOTP; unset = no header sent |
 
-## mrpink-context-bridge (the oxalis-mrpink half)
+## edge-context-bridge (profile-specific user-unit variant)
 
-`mrpink-context-bridge.{service,timer}` are the live units from the second node, kept here
+`edge-context-bridge.{service,timer}` are the live profile units from a second node, kept here
 for the same reason as the first pair: the mesh should be reproducible from the checkout
 rather than from whoever last touched the box. They differ from the loci pair in three ways
 that matter, and each of them cost debugging time:
@@ -75,8 +75,8 @@ that matter, and each of them cost debugging time:
 
 ### Before enabling it on a second node, part 2: TOTP
 
-If the local A2A server enforces TOTP on `/a2a` (oxalis-mrpink does, hugbot5000-jetson does
-not — check `"totp_enabled"` in `/health`), the bridge needs `LOCI_A2A_TOTP_SEED` in its
+If the local A2A server enforces TOTP on `/a2a` (check `"totp_enabled"` in `/health`), the
+bridge needs `LOCI_A2A_TOTP_SEED` in its
 environment. Without it the bearer alone returns a flat `401` on every send, and the symptom
 is a bridge that runs cleanly on a timer forever while moving nothing:
 
