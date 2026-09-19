@@ -122,6 +122,66 @@ See the resolution chain in `mcp/backends.py` (`LOCI_OLLAMA_GEN_MODEL` →
 
 ---
 
+### Coordination queue / cross-session handoff
+
+Loci now supports a durable investigation-scoped coordination queue so parallel sessions can reserve and complete non-overlapping work without direct runtime interaction.
+
+**Why this queue exists**
+- Prevents silent overlap across active Copilot/Claude sessions.
+- Captures ownership and lease expiry in machine-readable state.
+- Keeps work pickup deterministic: discover, claim, complete, then verify queue state.
+
+**Workflow**
+1. Discover: `investigation_queue_status(investigation_id=...)` for current queue state.
+2. Enqueue: `investigation_queue_enqueue(...)` with a stable item id, scope, and targets.
+3. Claim lease: `investigation_queue_claim(...)` with `owner_session` and bounded `lease_seconds`.
+4. Heartbeat/renew: re-run `investigation_queue_claim(...)` with the same owner before expiry.
+5. Complete/release: `investigation_queue_complete(...)` with `state=done|blocked|cancelled` (or `investigation_queue_release(...)` alias).
+
+**Conflict-avoidance rules**
+- One owner per item while lease is active.
+- Claims from other sessions fail unless the lease is expired.
+- Completion by non-owners is rejected while another owner’s lease is still valid.
+- Use explicit `dependencies` to serialize truly dependent work only.
+
+**Example MCP calls**
+
+```json
+// enqueue a work item
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "scope_kind": "file",
+  "scope_targets": ["docs/wiki/backend-protocol.md"],
+  "dependencies": [],
+  "notes": "Add sendHello #8 and remove stale overclaims"
+}
+```
+
+```json
+// claim lease
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "owner_session": "800cdfd9-0fd7-46e0-b292-71b6f556b025",
+  "lease_seconds": 300
+}
+```
+
+```json
+// complete
+{
+  "investigation_id": "flock-re-hardening",
+  "item_id": "wiki-correction-pass",
+  "owner_session": "800cdfd9-0fd7-46e0-b292-71b6f556b025",
+  "state": "done",
+  "notes": "Updated docs + verified wording against findings"
+}
+```
+
+Queue state is persisted on the investigation manifest under `coordination.items`; treat that manifest as the source of truth for item state, ownership, and lease expiry.
+
+---
 ## Cron jobs
 
 `cron/jobs.json` defines six jobs; the five enabled ones are below.

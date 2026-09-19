@@ -194,6 +194,24 @@ so it observes without bypassing the permission prompt or blocking a tool.
 
 ---
 
+### `mcp/investigation_tools.py` coordination queue (cross-session leasing)
+
+Investigation tools expose a durable queue for cross-session coordination. Queue items live on each investigation manifest (`manifest["coordination"]["items"]`) and carry item scope, owner session, lease expiry, dependencies, and completion notes.
+
+Current MCP tools:
+- `investigation_queue_enqueue(...)` — create a queued item.
+- `investigation_queue_claim(...)` — claim or renew an item lease for a session.
+- `investigation_queue_complete(...)` — finalize as `done`, `blocked`, or `cancelled`.
+- `investigation_queue_release(...)` — convenience alias for blocked release.
+- `investigation_queue_status(...)` / `investigation_queue_list(...)` — inspect queue snapshots and filters.
+
+Safety invariants:
+1. Item IDs are unique per investigation.
+2. Active lease ownership is exclusive until expiration.
+3. Non-owner completion is rejected while lease is active.
+4. Legacy manifests are migrated automatically to include coordination state.
+
+---
 ## Consolidation and decay
 
 ### `scripts/ebbinghaus_consolidation.py`
