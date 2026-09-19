@@ -9122,6 +9122,9 @@ from investigation_tools import (  # noqa: E402,F401
     investigation_note, investigation_reflect, investigation_finding_provenance,
     investigation_list, investigation_share, investigation_unshare,
     investigation_export, investigation_import,
+    investigation_queue_enqueue, investigation_queue_claim,
+    investigation_queue_complete, investigation_queue_release,
+    investigation_queue_status, investigation_queue_list,
 )
 
 

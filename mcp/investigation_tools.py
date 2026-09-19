@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -69,6 +71,428 @@ def _reflect_context_bullets(findings: list, investigation_id: str) -> str:
     )
 
 
+def _coordination_error(message: str) -> str:
+    """Return a fail-safe error payload for queue operations."""
+    return json.dumps({"error": message}, indent=2)
+
+
+def _coordination_manifest(manifest: dict) -> dict:
+    """Normalize manifest coordination state for legacy and new investigations."""
+    coordination = manifest.get("coordination")
+    if not isinstance(coordination, dict):
+        coordination = {}
+    coordination.setdefault("version", 1)
+    items = coordination.get("items")
+    if not isinstance(items, list):
+        items = []
+    normalized_items = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        scope_kind = str(item.get("scope_kind") or "investigation").strip().lower()
+        if not scope_kind or not re.fullmatch(r"[A-Za-z0-9_.:-]+", scope_kind):
+            scope_kind = "investigation"
+        target_value = item.get("scope_targets")
+        if isinstance(target_value, str):
+            try:
+                scope_targets = json.loads(target_value)
+            except json.JSONDecodeError:
+                scope_targets = [t.strip() for t in target_value.split(',') if t.strip()]
+        elif isinstance(target_value, (list, tuple, set)):
+            scope_targets = [str(t).strip() for t in target_value if str(t).strip()]
+        else:
+            scope_targets = []
+        scope_targets = [str(t).strip() for t in scope_targets if str(t).strip()]
+        state = str(item.get("state") or "queued").strip().lower()
+        if state not in {"queued", "claimed", "done", "blocked", "cancelled"}:
+            state = "queued"
+        owner_session = item.get("owner_session")
+        if owner_session is not None:
+            owner_session = str(owner_session).strip() or None
+        lease_expires_at = item.get("lease_expires_at")
+        if lease_expires_at is not None:
+            lease_expires_at = str(lease_expires_at).strip() or None
+        dependencies = item.get("dependencies") or []
+        if isinstance(dependencies, str):
+            try:
+                dependencies = json.loads(dependencies)
+            except json.JSONDecodeError:
+                dependencies = [d.strip() for d in dependencies.split(',') if d.strip()]
+        if not isinstance(dependencies, list):
+            dependencies = []
+        dependencies = [str(d).strip() for d in dependencies if str(d).strip()]
+        notes = item.get("notes")
+        if notes is None:
+            notes = ""
+        notes = str(notes).strip()
+        normalized_items.append({
+            "id": item_id,
+            "scope_kind": scope_kind,
+            "scope_targets": scope_targets,
+            "state": state,
+            "owner_session": owner_session,
+            "lease_expires_at": lease_expires_at,
+            "dependencies": dependencies,
+            "notes": notes,
+            "created_at": item.get("created_at") or _now(),
+            "updated_at": item.get("updated_at") or _now(),
+        })
+    coordination["items"] = normalized_items
+    manifest["coordination"] = coordination
+    return manifest
+
+
+def _coordination_migrate_manifest(manifest: dict) -> dict:
+    """Persist a manifest migration once so old investigations acquire the queue state."""
+    before = json.dumps(manifest, sort_keys=True)
+    migrated = _coordination_manifest(manifest)
+    after = json.dumps(migrated, sort_keys=True)
+    if before != after:
+        _save_manifest(migrated)
+    return migrated
+
+
+def _coordination_now_plus(seconds: float) -> str:
+    ts = datetime.now(timezone.utc).timestamp() + float(seconds)
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def _coordination_lease_expired(item: dict) -> bool:
+    expires = (item.get("lease_expires_at") or "").strip()
+    if not expires:
+        return False
+    try:
+        expires_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+        return expires_dt <= datetime.now(timezone.utc)
+    except ValueError:
+        return True
+
+
+def _coordination_item_from_payload(payload: dict, *, require_id: bool = True) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("Queue payload must be a JSON object.")
+    item = dict(payload)
+    item_id = str(item.get("id") or "").strip()
+    if require_id and not item_id:
+        raise ValueError("Queue item id is required.")
+
+    scope_kind = str(item.get("scope_kind") or "investigation").strip().lower()
+    if not scope_kind or not re.fullmatch(r"[A-Za-z0-9_.:-]+", scope_kind):
+        raise ValueError("scope_kind must be a short stable identifier.")
+
+    raw_targets = item.get("scope_targets")
+    if raw_targets is None:
+        scope_targets = ["investigation"]
+    elif isinstance(raw_targets, str):
+        text = raw_targets.strip()
+        if not text:
+            raise ValueError("scope_targets must include at least one target.")
+        try:
+            parsed_targets = json.loads(text)
+        except json.JSONDecodeError:
+            parsed_targets = [p.strip() for p in text.split(",") if p.strip()]
+        if isinstance(parsed_targets, str):
+            parsed_targets = [parsed_targets]
+        if not isinstance(parsed_targets, (list, tuple, set)):
+            raise ValueError("scope_targets must be a list of target IDs or a comma-separated string.")
+        scope_targets = [str(p).strip() for p in parsed_targets if str(p).strip()]
+    elif isinstance(raw_targets, (list, tuple, set)):
+        scope_targets = [str(p).strip() for p in raw_targets if str(p).strip()]
+    else:
+        raise ValueError("scope_targets must be a list of target IDs or a comma-separated string.")
+    if not scope_targets:
+        raise ValueError("scope_targets must include at least one target.")
+
+    state_raw = item.get("state")
+    if state_raw is None:
+        state = "queued"
+    elif not isinstance(state_raw, str):
+        raise ValueError("state must be one of queued, claimed, done, blocked, cancelled.")
+    else:
+        state = state_raw.strip().lower()
+    if state not in {"queued", "claimed", "done", "blocked", "cancelled"}:
+        raise ValueError("state must be one of queued, claimed, done, blocked, cancelled.")
+
+    owner_session = item.get("owner_session")
+    if owner_session is not None:
+        owner_session = str(owner_session).strip() or None
+
+    dependencies_raw = item.get("dependencies")
+    if dependencies_raw is None:
+        dependencies = []
+    elif isinstance(dependencies_raw, str):
+        try:
+            parsed_deps = json.loads(dependencies_raw)
+        except json.JSONDecodeError:
+            parsed_deps = [d.strip() for d in dependencies_raw.split(",") if d.strip()]
+        if isinstance(parsed_deps, str):
+            parsed_deps = [parsed_deps]
+        if not isinstance(parsed_deps, (list, tuple, set)):
+            raise ValueError("dependencies must be a list of item IDs.")
+        dependencies = [str(d).strip() for d in parsed_deps if str(d).strip()]
+    elif isinstance(dependencies_raw, (list, tuple, set)):
+        dependencies = [str(d).strip() for d in dependencies_raw if str(d).strip()]
+    else:
+        raise ValueError("dependencies must be a list of item IDs.")
+    if item_id in dependencies:
+        raise ValueError("Item dependencies must not include the item itself.")
+
+    notes = item.get("notes")
+    notes = "" if notes is None else str(notes).strip()
+
+    lease_expires_at = item.get("lease_expires_at")
+    if lease_expires_at is not None:
+        if not isinstance(lease_expires_at, str):
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.")
+        lease_expires_at = lease_expires_at.strip()
+        if not lease_expires_at:
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.")
+        try:
+            datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.") from exc
+
+    result = {
+        "id": item_id,
+        "scope_kind": scope_kind,
+        "scope_targets": scope_targets,
+        "state": state,
+        "owner_session": owner_session,
+        "lease_expires_at": lease_expires_at,
+        "dependencies": dependencies,
+        "notes": notes,
+        "created_at": item.get("created_at") or _now(),
+        "updated_at": item.get("updated_at") or _now(),
+    }
+    return result
+def _coordination_payload_from_json(value, *, field_name: str) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{field_name} must not be empty.")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {field_name}: {exc.msg}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{field_name} must decode to a JSON object.")
+        return parsed
+    raise ValueError(f"{field_name} must be a JSON object or JSON string.")
+
+
+def _coordination_find_item(manifest: dict, item_id: str) -> tuple[int, dict] | None:
+    coordination = manifest.get("coordination") or {}
+    items = coordination.get("items") or []
+    for index, item in enumerate(items):
+        if item.get("id") == item_id:
+            return index, item
+    return None
+
+
+def _coordination_require_item(manifest: dict, item_id: str) -> dict:
+    match = _coordination_find_item(manifest, item_id)
+    if match is None:
+        raise ValueError(f"Queue item '{item_id}' not found.")
+    return match[1]
+
+
+def investigation_queue_enqueue(
+    investigation_id: str,
+    item_id: Optional[str] = None,
+    item_json: Optional[str | dict] = None,
+    scope_kind: Optional[str] = None,
+    scope_targets: Optional[list | str] = None,
+    notes: Optional[str] = None,
+    dependencies: Optional[list | str] = None,
+    state: Optional[str] = None,
+    owner_session: Optional[str] = None,
+) -> str:
+    """Enqueue a deterministic work item into an investigation's coordination queue."""
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return _coordination_error(f"Investigation '{investigation_id}' not found.")
+    manifest = _coordination_manifest(manifest)
+    try:
+        payload = _coordination_payload_from_json(item_json, field_name='item_json') if item_json is not None else {}
+    except ValueError as exc:
+        return _coordination_error(str(exc))
+    if item_id is not None:
+        payload['id'] = item_id
+    if scope_kind is not None:
+        payload['scope_kind'] = scope_kind
+    if scope_targets is not None:
+        payload['scope_targets'] = scope_targets
+    if notes is not None:
+        payload['notes'] = notes
+    if dependencies is not None:
+        payload['dependencies'] = dependencies
+    if state is not None:
+        payload['state'] = state
+    if owner_session is not None:
+        payload['owner_session'] = owner_session
+    try:
+        item = _coordination_item_from_payload(payload)
+    except ValueError as exc:
+        return _coordination_error(str(exc))
+    coordination = manifest['coordination']
+    if any(existing.get('id') == item['id'] for existing in coordination['items']):
+        return _coordination_error(f"Queue item '{item['id']}' already exists.")
+    item['created_at'] = _now()
+    item['updated_at'] = _now()
+    if item['state'] not in {'queued', 'claimed'}:
+        item['state'] = 'queued'
+    coordination['items'].append(item)
+    _save_manifest(manifest)
+    return json.dumps({"queued": True, "item": item}, indent=2)
+
+
+def investigation_queue_claim(
+    investigation_id: str,
+    item_id: str,
+    owner_session: str,
+    lease_seconds: float | int = 300,
+) -> str:
+    """Claim / renew a queue item for a specific session with a lease TTL."""
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return _coordination_error(f"Investigation '{investigation_id}' not found.")
+    manifest = _coordination_manifest(manifest)
+    try:
+        ttl = float(lease_seconds)
+    except (TypeError, ValueError):
+        return _coordination_error('lease_seconds must be a positive number.')
+    if not math.isfinite(ttl) or ttl <= 0:
+        return _coordination_error("lease_seconds must be a positive number.")
+    item_id = str(item_id).strip()
+    owner_session = str(owner_session).strip()
+    if not item_id or not owner_session:
+        return _coordination_error('item_id and owner_session are required.')
+    item = _coordination_require_item(manifest, item_id)
+    if item['state'] in {'done', 'blocked', 'cancelled'}:
+        return _coordination_error(f"Queue item '{item_id}' is already final: {item['state']}")
+    current_owner = item.get('owner_session')
+    if current_owner and current_owner != owner_session and not _coordination_lease_expired(item):
+        return _coordination_error(
+            f"Queue item '{item_id}' is already claimed by session '{current_owner}'."
+        )
+    item['owner_session'] = owner_session
+    item['state'] = 'claimed'
+    item['lease_expires_at'] = _coordination_now_plus(ttl)
+    item['updated_at'] = _now()
+    _save_manifest(manifest)
+    return json.dumps({"claimed": True, "item": item}, indent=2)
+
+
+def investigation_queue_complete(
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    state: str = 'done',
+    notes: Optional[str] = None,
+) -> str:
+    """Finalize a queue item as done, blocked, or cancelled."""
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return _coordination_error(f"Investigation '{investigation_id}' not found.")
+    manifest = _coordination_manifest(manifest)
+    item_id = str(item_id).strip()
+    if not item_id:
+        return _coordination_error('item_id is required.')
+    state = str(state or 'done').strip().lower()
+    if state not in {'done', 'blocked', 'cancelled'}:
+        return _coordination_error('state must be one of done, blocked, cancelled.')
+    owner_session = str(owner_session).strip() if owner_session is not None else None
+    item = _coordination_require_item(manifest, item_id)
+    if item['state'] in {'done', 'blocked', 'cancelled'}:
+        if state != item['state']:
+            return _coordination_error(
+                f"Queue item '{item_id}' is already final with state '{item['state']}'."
+            )
+    current_owner = item.get('owner_session')
+    if current_owner and owner_session is None:
+        return _coordination_error(
+            f"Queue item '{item_id}' is owned by session '{current_owner}' and requires owner_session to complete."
+        )
+    if current_owner and current_owner != owner_session:
+        return _coordination_error(
+            f"Queue item '{item_id}' is owned by session '{current_owner}' and cannot be completed by '{owner_session}'."
+        )
+    if notes is not None:
+        notes = str(notes).strip()
+        if notes:
+            item['notes'] = notes
+    item['state'] = state
+    item['lease_expires_at'] = None
+    if owner_session:
+        item['owner_session'] = owner_session
+    item['updated_at'] = _now()
+    _save_manifest(manifest)
+    return json.dumps({"updated": True, "item": item}, indent=2)
+
+def investigation_queue_release(
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> str:
+    """Alias for completing a queue item as blocked or cancelled."""
+    return investigation_queue_complete(
+        investigation_id=investigation_id,
+        item_id=item_id,
+        owner_session=owner_session,
+        state='blocked',
+        notes=notes,
+    )
+
+
+def investigation_queue_status(
+    investigation_id: str,
+    item_id: Optional[str] = None,
+    state: Optional[str] = None,
+) -> str:
+    """Return the queue snapshot or a single item's status."""
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return _coordination_error(f"Investigation '{investigation_id}' not found.")
+    manifest = _coordination_manifest(manifest)
+    items = list((manifest.get('coordination') or {}).get('items', []))
+    if item_id is not None:
+        item_id = str(item_id).strip()
+        items = [item for item in items if item.get('id') == item_id]
+        if not items:
+            return _coordination_error(f"Queue item '{item_id}' not found.")
+    if state is not None:
+        value = str(state).strip().lower()
+        if value not in {'queued', 'claimed', 'done', 'blocked', 'cancelled'}:
+            return _coordination_error(
+                'state filter must be one of queued, claimed, done, blocked, cancelled.'
+            )
+        items = [item for item in items if item.get('state') == value]
+    payload = {
+        "investigation_id": investigation_id,
+        "queue": items,
+        "item_count": len(items),
+    }
+    return json.dumps(payload, indent=2)
+
+
+def investigation_queue_list(
+    investigation_id: str,
+    item_id: Optional[str] = None,
+    state: Optional[str] = None,
+) -> str:
+    """Alias for queue status."""
+    return investigation_queue_status(investigation_id=investigation_id, item_id=item_id, state=state)
+
+
 def investigation_start(
     investigation_id: str,
     title: str,
@@ -91,6 +515,7 @@ def investigation_start(
     """
     existing = _load_manifest(investigation_id)
     if existing:
+        existing = _coordination_migrate_manifest(existing)
         _ladybug_upsert_investigation(investigation_id, existing.get("title", ""))
         return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
 
@@ -112,7 +537,9 @@ def investigation_start(
         "acl": [],
         "summary_l1": [],
         "summary_l2": "",
+        "coordination": {"version": 1, "items": []},
     }
+    manifest = _coordination_migrate_manifest(manifest)
     _save_manifest(manifest)
     _ladybug_upsert_investigation(investigation_id, title)
     logger.info("Created investigation %s", investigation_id)
@@ -309,6 +736,7 @@ def investigation_load(
         return json.dumps({
             "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
         })
+    manifest = _coordination_migrate_manifest(manifest)
 
     # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
     summary_l1 = manifest.get("summary_l1") or []
@@ -1303,5 +1731,11 @@ def register(mcp, get_memory_dir, deps):
         investigation_unshare,
         investigation_export,
         investigation_import,
+        investigation_queue_enqueue,
+        investigation_queue_claim,
+        investigation_queue_complete,
+        investigation_queue_release,
+        investigation_queue_status,
+        investigation_queue_list,
     ):
         mcp.tool()(fn)
