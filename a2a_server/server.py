@@ -58,6 +58,8 @@ Optional / tunable:
     PEER_A2A_TOTP_SEED. Default: '{}'
   SAR_PRIMING_STATE_PATH where memory_prime persists per-peer priming state.
     Default: ~/.hermes/sar-priming.json
+  LOCI_A2A_IDEMPOTENCY_TTL_S replay-protection window for `_boundary.idempotency_key`
+    reservations (`sender + skill + key`). Default: 3600
   UA_SEARCH_SCRIPT path to the external UA search helper script.
     Default: '' (skill returns "not configured")
 
@@ -137,7 +139,7 @@ JSON-RPC call shape
   }
 """
 
-import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading
+import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading, hashlib, re
 from typing import Optional, Any
 from contextlib import contextmanager
 
@@ -218,6 +220,22 @@ DESTRUCTIVE_SKILLS: frozenset[str] = frozenset({
     'context_broadcast',
     'mnemosyne_triple_add',
 })
+
+# Explicitly allowed skills for peer fan-out envelopes.
+_PEER_FANOUT_ALLOWLIST: frozenset[str] = frozenset({
+    'memory_remember',
+    'memory_prime',
+})
+
+# Boundary lanes accepted via tasks/send metadata.
+_BOUNDARY_LANE_SKILL_ALLOWLIST: dict[str, frozenset[str]] = {
+    'context_broadcast': frozenset({'memory_remember'}),
+    'memory_prime': frozenset({'memory_prime'}),
+}
+
+_IDEMPOTENCY_KEY_RE = re.compile(r'^[A-Za-z0-9._:-]{8,128}$')
+_SHA256_HEX_RE = re.compile(r'^[a-f0-9]{64}$')
+_IDEMPOTENCY_TTL_S = max(60, int(os.environ.get('LOCI_A2A_IDEMPOTENCY_TTL_S', '3600')))
 
 # Senders allowed to call destructive skills. Configure via
 # LOCI_A2A_PRIVILEGED_SENDERS=agent1,agent2.
@@ -359,6 +377,8 @@ AGENT_CARD = {
 _TASK_CAP = 1000
 _tasks: dict[str, dict[str, dict]] = {}
 _tasks_lock = threading.Lock()
+_idempotency_seen: dict[str, float] = {}
+_idempotency_lock = threading.Lock()
 
 
 def _store_task(task_id: str, task: dict) -> None:
@@ -373,6 +393,177 @@ def _store_task(task_id: str, task: dict) -> None:
 # session tokens issued by /bootstrap — token → expiry (UTC)
 _session_tokens: dict[str, datetime.datetime] = {}
 _session_token_agents: dict[str, str] = {}
+
+
+def _json_dumps_stable(obj: dict) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def _artifact_payload_for_skill(skill_id: str, params: dict) -> Optional[dict]:
+    inp = params.get('input', {})
+    if not isinstance(inp, dict):
+        return None
+
+    if skill_id == 'memory_remember':
+        content = str(inp.get('content') or params.get('message', '')).strip()
+        if not content:
+            return None
+        return {
+            'content': content,
+            'source': str(inp.get('source', 'a2a')),
+            'bank': str(inp.get('bank', 'default')),
+        }
+    if skill_id == 'memory_prime':
+        topic = str(inp.get('topic', '') or params.get('message', '')).strip()
+        if not topic:
+            return None
+        return {
+            'topic': topic,
+            'skepticism_delta': float(inp.get('skepticism_delta', 0.2)),
+            'ttl_seconds': int(inp.get('ttl_seconds', 3600)),
+            'broadcast': bool(inp.get('broadcast', True)),
+        }
+    return None
+
+
+def _build_boundary_receipt(*, accepted: bool, reason: str, skill_id: str,
+                            sender: str, lane: str, metadata: Optional[dict] = None) -> dict:
+    return {
+        'receipt_id': str(uuid.uuid4()),
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'accepted': accepted,
+        'reason': reason,
+        'skill_id': skill_id,
+        'sender': sender,
+        'lane': lane,
+        'metadata': metadata or {},
+    }
+
+
+def _log_boundary_receipt(receipt: dict) -> None:
+    level = log.info if receipt.get('accepted') else log.warning
+    level(f"boundary_receipt={_json_dumps_stable(receipt)}")
+
+
+def _validate_and_reserve_idempotency(sender: str, skill_id: str,
+                                      idempotency_key: str) -> tuple[bool, str]:
+    now = time.time()
+    compound = f'{sender}:{skill_id}:{idempotency_key}'
+    with _idempotency_lock:
+        expired = [k for k, exp in _idempotency_seen.items() if exp <= now]
+        for k in expired:
+            _idempotency_seen.pop(k, None)
+        if compound in _idempotency_seen:
+            return False, 'idempotency key replay'
+        _idempotency_seen[compound] = now + _IDEMPOTENCY_TTL_S
+    return True, 'accepted'
+
+
+def _validate_boundary_metadata(skill_id: str, sender: str, params: dict) -> Optional[dict]:
+    inp = params.get('input', {})
+    if not isinstance(inp, dict):
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='input must be an object',
+            skill_id=skill_id,
+            sender=sender,
+            lane='unknown',
+        )
+    boundary = inp.get('_boundary')
+    if boundary is None:
+        return None
+    if not isinstance(boundary, dict):
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='_boundary must be an object',
+            skill_id=skill_id,
+            sender=sender,
+            lane='unknown',
+        )
+
+    lane = str(boundary.get('lane', '')).strip()
+    if lane not in _BOUNDARY_LANE_SKILL_ALLOWLIST:
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='lane not allowlisted',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane or 'unknown',
+            metadata={'lane': lane},
+        )
+    if skill_id not in _BOUNDARY_LANE_SKILL_ALLOWLIST[lane]:
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='lane/skill mismatch',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+            metadata={'lane': lane},
+        )
+
+    idempotency_key = str(boundary.get('idempotency_key', '')).strip()
+    if not _IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='invalid idempotency_key format',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+        )
+
+    artifact_sha256 = str(boundary.get('artifact_sha256', '')).strip().lower()
+    if not _SHA256_HEX_RE.fullmatch(artifact_sha256):
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='invalid artifact_sha256 format',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+        )
+
+    artifact_payload = _artifact_payload_for_skill(skill_id, params)
+    if artifact_payload is None:
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='artifact payload missing or invalid',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+        )
+
+    computed_hash = hashlib.sha256(_json_dumps_stable(artifact_payload).encode('utf-8')).hexdigest()
+    if not hmac.compare_digest(artifact_sha256, computed_hash):
+        return _build_boundary_receipt(
+            accepted=False,
+            reason='artifact_sha256 mismatch',
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+            metadata={'expected': computed_hash, 'provided': artifact_sha256},
+        )
+
+    ok, reason = _validate_and_reserve_idempotency(sender, skill_id, idempotency_key)
+    if not ok:
+        return _build_boundary_receipt(
+            accepted=False,
+            reason=reason,
+            skill_id=skill_id,
+            sender=sender,
+            lane=lane,
+            metadata={'idempotency_key': idempotency_key},
+        )
+
+    return _build_boundary_receipt(
+        accepted=True,
+        reason='accepted',
+        skill_id=skill_id,
+        sender=sender,
+        lane=lane,
+        metadata={
+            'idempotency_key': idempotency_key,
+            'artifact_sha256': artifact_sha256,
+        },
+    )
 
 # ── FastAPI app + auth ──────────────────────────────────────────────────────────
 app = FastAPI(title=f'{AGENT_ID} A2A', version='0.1.0')
@@ -1041,6 +1232,23 @@ def _peer_targets() -> list[tuple[str, Optional[dict], Optional[str]]]:
 
 def _peer_task_payload(skill_id: str, message: str, inp: dict) -> dict:
     """Build the JSON-RPC tasks/send envelope used for every peer fan-out."""
+    if skill_id not in _PEER_FANOUT_ALLOWLIST:
+        raise ValueError(f'peer skill {skill_id!r} is not allowlisted')
+
+    lane = 'context_broadcast' if skill_id == 'memory_remember' else 'memory_prime'
+    artifact_source = _json_dumps_stable(_artifact_payload_for_skill(
+        skill_id,
+        {'message': message, 'input': inp},
+    ) or {})
+    boundary = {
+        'lane': lane,
+        'idempotency_key': str(uuid.uuid4()),
+        'artifact_sha256': hashlib.sha256(artifact_source.encode('utf-8')).hexdigest(),
+        'origin_agent_id': AGENT_ID,
+        'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    payload_input = dict(inp)
+    payload_input['_boundary'] = boundary
     return {
         'jsonrpc': '2.0',
         'id': str(uuid.uuid4()),
@@ -1048,7 +1256,7 @@ def _peer_task_payload(skill_id: str, message: str, inp: dict) -> dict:
         'params': {
             'skill_id': skill_id,
             'message':  message,
-            'input':    inp,
+            'input':    payload_input,
             'sender':   AGENT_ID,
         },
     }
@@ -1620,20 +1828,72 @@ async def get_task(task_id: str, sender: Optional[str] = None,
 
 
 async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
-    task_id  = str(uuid.uuid4())
+    if not isinstance(params, dict):
+        return JSONResponse({
+            'jsonrpc': '2.0', 'id': rpc_id,
+            'error': {'code': -32602, 'message': 'params must be an object'}
+        }, status_code=400)
+
     skill_id = params.get('skill_id', '')
-    message  = params.get('message', '')
-    sender   = params.get('sender', 'unknown')
+    if not isinstance(skill_id, str) or not skill_id.strip():
+        return JSONResponse({
+            'jsonrpc': '2.0', 'id': rpc_id,
+            'error': {'code': -32602, 'message': 'skill_id must be a non-empty string'}
+        }, status_code=400)
+    skill_id = skill_id.strip()
+
+    if skill_id not in _SKILL_MAP:
+        return JSONResponse({
+            'jsonrpc': '2.0', 'id': rpc_id,
+            'error': {'code': -32601, 'message': f"Unknown skill '{skill_id}'."}
+        }, status_code=404)
+
+    input_payload = params.get('input', {})
+    if input_payload is None:
+        input_payload = {}
+    if not isinstance(input_payload, dict):
+        return JSONResponse({
+            'jsonrpc': '2.0', 'id': rpc_id,
+            'error': {'code': -32602, 'message': 'input must be an object'}
+        }, status_code=400)
+
+    message = params.get('message', '')
+    if not isinstance(message, str):
+        return JSONResponse({
+            'jsonrpc': '2.0', 'id': rpc_id,
+            'error': {'code': -32602, 'message': 'message must be a string'}
+        }, status_code=400)
+
+    task_id  = str(uuid.uuid4())
+    sender_raw = params.get('sender', 'unknown')
+    sender = sender_raw if isinstance(sender_raw, str) else str(sender_raw)
+    boundary_receipt = _validate_boundary_metadata(
+        skill_id,
+        sender,
+        {'message': message, 'input': input_payload},
+    )
+    if boundary_receipt is not None:
+        _log_boundary_receipt(boundary_receipt)
+        if not boundary_receipt.get('accepted'):
+            return JSONResponse({
+                'jsonrpc': '2.0', 'id': rpc_id,
+                'error': {
+                    'code': -32600,
+                    'message': 'boundary validation failed',
+                    'data': boundary_receipt,
+                }
+            }, status_code=403)
 
     task = {
         'id':         task_id,
         'skill_id':   skill_id,
         'message':    message,
-        'input':      params.get('input', {}),
+        'input':      input_payload,
         'sender':     sender,
         'status':     'working',
         'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        'result':     None
+        'result':     None,
+        'boundary_receipt': boundary_receipt,
     }
     _store_task(task_id, task)
     log.info(f'Task [{task_id}] skill={skill_id} sender={sender}')

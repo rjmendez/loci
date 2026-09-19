@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import threading
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 from inv_store import _CONFIDENCE_RANK
 
@@ -32,6 +34,138 @@ _sparse_model_lock = threading.Lock()          # guards _sparse_model lazy-init 
 _qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
 _qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
 _QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except Exception:
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except Exception:
+        return default
+
+
+# Transport hardening (retry + bounded backoff + brownout circuit breaker).
+_EMBED_RETRY_ATTEMPTS = max(1, _int_env("LOCI_EMBED_RETRY_ATTEMPTS", 2))
+_QDRANT_QUERY_RETRY_ATTEMPTS = max(1, _int_env("LOCI_QDRANT_QUERY_RETRY_ATTEMPTS", 3))
+_TRANSPORT_BACKOFF_BASE_S = max(0.01, _float_env("LOCI_TRANSPORT_BACKOFF_BASE_S", 0.2))
+_TRANSPORT_BACKOFF_CAP_S = max(_TRANSPORT_BACKOFF_BASE_S, _float_env("LOCI_TRANSPORT_BACKOFF_CAP_S", 1.5))
+_TRANSPORT_BROWNOUT_THRESHOLD = max(2, _int_env("LOCI_TRANSPORT_BROWNOUT_THRESHOLD", 4))
+_TRANSPORT_BROWNOUT_SECONDS = max(1.0, _float_env("LOCI_TRANSPORT_BROWNOUT_SECONDS", 20.0))
+_TRANSPORT_READY_TIMEOUT_S = max(0.05, _float_env("LOCI_TRANSPORT_READY_TIMEOUT_S", 0.5))
+_TRANSPORT_READY_CACHE_SECONDS = max(0.2, _float_env("LOCI_TRANSPORT_READY_CACHE_SECONDS", 3.0))
+
+_transport_lock = threading.Lock()
+_transport_breakers = {
+    "embed": {"timeouts": 0, "opened_until": 0.0},
+    "qdrant_query": {"timeouts": 0, "opened_until": 0.0},
+}
+_endpoint_ready_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _taxonomy(exc: Exception) -> str:
+    low = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in low or "timed out" in low or "timeout" in name:
+        return "timeout"
+    if ("connection" in name) or ("connection" in low) or ("refused" in low) or ("reset" in low):
+        return "connection"
+    if "http" in name or "status" in low:
+        return "http"
+    return "other"
+
+
+def _backoff_sleep(attempt_index: int) -> float:
+    delay = min(_TRANSPORT_BACKOFF_CAP_S, _TRANSPORT_BACKOFF_BASE_S * (2 ** max(0, attempt_index)))
+    time.sleep(delay)
+    return delay
+
+
+def _endpoint_ready(url: str) -> bool:
+    if not url:
+        return False
+    now = time.monotonic()
+    cached = _endpoint_ready_cache.get(url)
+    if cached and (now - cached[0]) < _TRANSPORT_READY_CACHE_SECONDS:
+        return bool(cached[1])
+    ready = False
+    try:
+        u = urlparse(url)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        if host:
+            with socket.create_connection((host, port), timeout=_TRANSPORT_READY_TIMEOUT_S):
+                ready = True
+    except Exception:
+        ready = False
+    _endpoint_ready_cache[url] = (now, ready)
+    return ready
+
+
+def _breaker_is_open(op: str) -> tuple[bool, float]:
+    now = time.monotonic()
+    with _transport_lock:
+        state = _transport_breakers.setdefault(op, {"timeouts": 0, "opened_until": 0.0})
+        remaining = max(0.0, float(state.get("opened_until", 0.0)) - now)
+        return (remaining > 0.0), remaining
+
+
+def _breaker_success(op: str) -> None:
+    with _transport_lock:
+        state = _transport_breakers.setdefault(op, {"timeouts": 0, "opened_until": 0.0})
+        state["timeouts"] = 0
+        state["opened_until"] = 0.0
+
+
+def _breaker_failure(op: str, taxonomy: str) -> None:
+    with _transport_lock:
+        state = _transport_breakers.setdefault(op, {"timeouts": 0, "opened_until": 0.0})
+        if taxonomy == "timeout":
+            state["timeouts"] = int(state.get("timeouts", 0)) + 1
+            if state["timeouts"] >= _TRANSPORT_BROWNOUT_THRESHOLD:
+                state["opened_until"] = time.monotonic() + _TRANSPORT_BROWNOUT_SECONDS
+                logger.warning(
+                    "transport brownout opened op=%s threshold=%d hold_s=%.1f",
+                    op, _TRANSPORT_BROWNOUT_THRESHOLD, _TRANSPORT_BROWNOUT_SECONDS,
+                )
+        else:
+            state["timeouts"] = 0
+
+
+def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
+    if attempts < 1:
+        attempts = 1
+    open_now, remaining = _breaker_is_open(op)
+    if open_now:
+        raise RuntimeError(f"{op}_brownout:{remaining:.2f}s")
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = call()
+            _breaker_success(op)
+            if attempt > 1:
+                logger.info("transport recovered op=%s attempt=%d/%d", op, attempt, attempts)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            kind = _taxonomy(exc)
+            _breaker_failure(op, kind)
+            retryable = kind in {"timeout", "connection"}
+            logger.warning(
+                "transport failure op=%s taxonomy=%s attempt=%d/%d retryable=%s error=%s",
+                op, kind, attempt, attempts, retryable and (attempt < attempts), str(exc)[:180],
+            )
+            if retryable and attempt < attempts:
+                waited = _backoff_sleep(attempt - 1)
+                logger.info("transport retry op=%s next_attempt=%d backoff_s=%.2f", op, attempt + 1, waited)
+                continue
+            raise RuntimeError(f"{op}_{kind}") from exc
+    raise RuntimeError(f"{op}_failed") from last_exc
 
 
 def _get_sparse_embedder():
@@ -365,8 +499,20 @@ def _embed(text: str) -> list[float] | None:
         return cached
     if not _OLLAMA_BASE:
         return None
+    open_now, remaining = _breaker_is_open("embed")
+    if open_now:
+        logger.warning("embed brownout active; skipping request for %.2fs", remaining)
+        return None
+    if not _endpoint_ready(_OLLAMA_BASE):
+        logger.warning("embed readiness gate blocked request: endpoint unreachable (%s)", _OLLAMA_BASE)
+        return None
     try:
         import requests as _req
+    except Exception as exc:
+        logger.warning("embed failed: requests unavailable (%s)", exc)
+        return None
+
+    def _one_attempt():
         r = _req.post(
             f"{_OLLAMA_BASE.rstrip('/')}/v1/embeddings",
             json={"model": _EMBED_MODEL, "input": [text]},
@@ -375,16 +521,19 @@ def _embed(text: str) -> list[float] | None:
         )
         r.raise_for_status()
         data = r.json().get("data", [])
-        result = list(data[0]["embedding"]) if data else None
-        if result is not None:
-            with _embed_cache_lock:
-                if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
-                    _embed_cache.pop(next(iter(_embed_cache)))
-                _embed_cache[text] = result
-        return result
+        return list(data[0]["embedding"]) if data else None
+
+    try:
+        result = _query_points_with_retry(_one_attempt, attempts=_EMBED_RETRY_ATTEMPTS, op="embed")
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
         return None
+    if result is not None:
+        with _embed_cache_lock:
+            if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
+                _embed_cache.pop(next(iter(_embed_cache)))
+            _embed_cache[text] = result
+    return result
 
 
 def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
@@ -506,6 +655,10 @@ def _qdrant_similarity_search(
     client, col = _get_qdrant()
     if client is None:
         return {"ok": False, "reason": "qdrant_unavailable", "results": []}
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    if qdrant_url and not _endpoint_ready(qdrant_url):
+        logger.warning("qdrant readiness gate blocked query: endpoint unreachable (%s)", qdrant_url)
+        return {"ok": False, "reason": "qdrant_not_ready", "results": []}
 
     from qdrant_client.models import (
         Filter, FieldCondition, MatchValue,
@@ -536,28 +689,42 @@ def _qdrant_similarity_search(
 
     sparse_vec = _embed_sparse(query)
     if sparse_vec is not None:
-        result = client.query_points(
-            collection_name=col,
-            prefetch=[
-                Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2, filter=search_filter),
-                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2, filter=search_filter),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            limit=fetch_limit,
-            with_payload=True,
-            search_params=_search_params,
-        )
+        try:
+            result = _query_points_with_retry(
+                lambda: client.query_points(
+                    collection_name=col,
+                    prefetch=[
+                        Prefetch(query=dense_vec, using="dense", limit=fetch_limit * 2, filter=search_filter),
+                        Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2, filter=search_filter),
+                    ],
+                    query=FusionQuery(fusion=Fusion.RRF),
+                    limit=fetch_limit,
+                    with_payload=True,
+                    search_params=_search_params,
+                ),
+                attempts=_QDRANT_QUERY_RETRY_ATTEMPTS,
+                op="qdrant_query",
+            )
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc), "results": []}
         mode = "hybrid"
     else:
-        result = client.query_points(
-            collection_name=col,
-            query=dense_vec,
-            using="dense",
-            query_filter=search_filter,
-            limit=fetch_limit,
-            with_payload=True,
-            search_params=_search_params,
-        )
+        try:
+            result = _query_points_with_retry(
+                lambda: client.query_points(
+                    collection_name=col,
+                    query=dense_vec,
+                    using="dense",
+                    query_filter=search_filter,
+                    limit=fetch_limit,
+                    with_payload=True,
+                    search_params=_search_params,
+                ),
+                attempts=_QDRANT_QUERY_RETRY_ATTEMPTS,
+                op="qdrant_query",
+            )
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc), "results": []}
         mode = "semantic"
 
     rows = []
@@ -725,6 +892,9 @@ def _qdrant_search_collection(
     client, _default_col = _get_qdrant()
     if client is None:
         raise RuntimeError("qdrant_unavailable")
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    if qdrant_url and not _endpoint_ready(qdrant_url):
+        raise RuntimeError("qdrant_not_ready")
 
     dense_vec = _embed(query)
     if dense_vec is None:
@@ -753,37 +923,49 @@ def _qdrant_search_collection(
     _qsp = _quant_search_params()
 
     if has_named_vectors and has_sparse_index and sparse_vec is not None:
-        result = client.query_points(
-            collection_name=collection_name,
-            prefetch=[
-                Prefetch(query=dense_vec, using=dense_name, limit=fetch_limit * 2),
-                Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
+        result = _query_points_with_retry(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                prefetch=[
+                    Prefetch(query=dense_vec, using=dense_name, limit=fetch_limit * 2),
+                    Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=fetch_limit,
+                with_payload=True,
+                query_filter=query_filter,
+                search_params=_qsp,
+            ),
+            attempts=_QDRANT_QUERY_RETRY_ATTEMPTS,
+            op="qdrant_query",
         )
     elif has_named_vectors:
-        result = client.query_points(
-            collection_name=collection_name,
-            query=dense_vec,
-            using=dense_name,
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
+        result = _query_points_with_retry(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                query=dense_vec,
+                using=dense_name,
+                limit=fetch_limit,
+                with_payload=True,
+                query_filter=query_filter,
+                search_params=_qsp,
+            ),
+            attempts=_QDRANT_QUERY_RETRY_ATTEMPTS,
+            op="qdrant_query",
         )
     else:
         # Flat/unnamed vector collection (agent_core_chunks, gl_decision_library, etc.)
-        result = client.query_points(
-            collection_name=collection_name,
-            query=dense_vec,
-            limit=fetch_limit,
-            with_payload=True,
-            query_filter=query_filter,
-            search_params=_qsp,
+        result = _query_points_with_retry(
+            lambda: client.query_points(
+                collection_name=collection_name,
+                query=dense_vec,
+                limit=fetch_limit,
+                with_payload=True,
+                query_filter=query_filter,
+                search_params=_qsp,
+            ),
+            attempts=_QDRANT_QUERY_RETRY_ATTEMPTS,
+            op="qdrant_query",
         )
 
     rows = []
@@ -800,4 +982,3 @@ def _qdrant_search_collection(
     rows, _ = _ce_rerank(query, rows, limit)
 
     return rows
-

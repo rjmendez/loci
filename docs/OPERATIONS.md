@@ -319,6 +319,35 @@ Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`, and
 > [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
 > numbers and what more findings are actually worth.
 
+### Run executable chaos/adversarial hardening gates (pre-merge / pre-deploy)
+
+Generate fresh artifacts first (for example a chaos run log plus the red-team report),
+then gate them with one machine-readable check:
+
+```bash
+$LOCI_PY $LOCI/scripts/chaos_hardening_gate.py \
+  --chaos-events artifacts/chaos/latest-events.jsonl \
+  --adversarial-report scripts/redteam/reports/latest-sandbox-report.json \
+  --max-timeout-rate 0.05 \
+  --min-retry-recovery-rate 0.80 \
+  --max-duplicate-effect-rate 0.0 \
+  --min-provenance-completeness 0.99 \
+  --max-candidate-bypass 0
+```
+
+The script prints JSON with explicit per-gate `pass`/`fail`/`skipped` states and
+returns:
+
+- `0` when all evaluated gates pass
+- `1` when any gate fails (or when `--fail-on-skipped` is set and a gate is skipped)
+- `2` on invocation/config errors
+
+This makes it suitable for CI or release pipelines:
+
+```bash
+$LOCI_PY $LOCI/scripts/chaos_hardening_gate.py ... > hardening-gate.json
+```
+
 ### Benchmark local Ollama generation honestly
 
 `scripts/bench_local_models.py` is the latency/throughput harness for the local
