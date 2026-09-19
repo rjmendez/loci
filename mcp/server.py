@@ -6832,6 +6832,7 @@ def loci_health() -> str:
       warm:              whether the embed warm-ping has been fired this process
     """
     out: dict = {
+        "status": "ok",
         "code_version": "",
         "ladybug": "unavailable",
         "ollama_reachable": False,
@@ -6858,9 +6859,18 @@ def loci_health() -> str:
         import backends
         # Resolve each endpoint once and probe with a SHORT timeout so one dead backend cannot block or mask the others.
         _PROBE_T = 0.5
+        explicit_backend = {
+            "ollama": bool(os.environ.get("OLLAMA_BASE_URL")
+                           or os.environ.get("OLLAMA_URL")
+                           or backends._cfg("ollama", "url", "")),
+            "vllm": bool(os.environ.get("VLLM_BASE_URL")
+                         or backends._cfg("vllm", "url", "")),
+            "qdrant": bool(os.environ.get("QDRANT_URL")
+                           or backends._cfg("qdrant", "url", "")),
+        }
         for key, resolver in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
-            ("vllm_reachable", lambda: backends.vllm_url(_PROBE_T)),
+            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T)),
             ("qdrant_reachable", lambda: backends.qdrant()[0]),
         ):
             try:
@@ -6878,6 +6888,26 @@ def loci_health() -> str:
         except Exception as exc:
             logger.debug("loci_health: rerank_model probe failed: %r", exc)
             pass
+
+        failures = []
+        optional_down = []
+        for label, key in (("ollama", "ollama_reachable"),
+                           ("vllm", "vllm_reachable"),
+                           ("qdrant", "qdrant_reachable")):
+            if out[key]:
+                continue
+            if explicit_backend.get(label, False):
+                failures.append(f"{label}: configured/enabled but unreachable")
+            else:
+                optional_down.append(label)
+        if failures:
+            out["status"] = "unhealthy"
+            out["failures"] = failures
+            out["remediation"] = (
+                "Restore reachability for configured backends or remove explicit enablement."
+            )
+        elif optional_down:
+            out["optional_down"] = optional_down
     except Exception as exc:
         logger.debug("loci_health: backends import/probe block failed: %r", exc)
         pass

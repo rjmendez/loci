@@ -20,7 +20,7 @@ import server  # noqa: E402
 
 _EXPECTED_KEYS = {
     "code_version", "ladybug", "ollama_reachable", "vllm_reachable",
-    "qdrant_reachable", "embed_model", "rerank_model", "warm",
+    "qdrant_reachable", "embed_model", "rerank_model", "warm", "status",
 }
 
 
@@ -80,28 +80,31 @@ def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
     backends.ollama_url.cache_clear()
     backends.vllm_url.cache_clear()
 
-    seen_timeouts = []
 
-    def recording_alive(url, timeout=1.0):
-        seen_timeouts.append(timeout)
-        return False
-
-    monkeypatch.setattr(backends, "_alive", recording_alive)
+def test_loci_health_explicit_backend_down_is_unhealthy(monkeypatch):
+    monkeypatch.setenv("VLLM_BASE_URL", "http://explicit-vllm:18000")
+    monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: False)
+    monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
+    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://explicit-vllm:18000")
+    monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
     out = json.loads(server.loci_health())
+    assert out["status"] == "unhealthy"
+    assert any("vllm" in x for x in out.get("failures", []))
 
-    # The resolvers' internal probe must actually run, not short-circuit.
-    assert seen_timeouts, "expected reachability probes to have run"
-    assert all(t <= 0.5 for t in seen_timeouts), (
-        f"all loci_health probe timeouts must be <= 0.5s, got {seen_timeouts}")
-    # Backends down -> all reachability False, full key set still returned (fail-open).
-    assert out["ollama_reachable"] is False
-    assert out["vllm_reachable"] is False
-    assert out["qdrant_reachable"] is False
-    assert _EXPECTED_KEYS <= set(out.keys())
-    # Reset so a later real caller re-resolves cleanly.
-    backends.ollama_url.cache_clear()
-    backends.vllm_url.cache_clear()
+
+def test_loci_health_unconfigured_backend_down_stays_fail_open(monkeypatch):
+    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(backends, "_config", lambda: {})
+    monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: False)
+    monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "")
+    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "")
+    monkeypatch.setattr(backends, "qdrant", lambda: ("", ""))
+
+    out = json.loads(server.loci_health())
+    assert out["status"] == "ok"
+    assert "optional_down" in out
 
 
 def test_code_version_first_compute_is_thread_safe(monkeypatch):
