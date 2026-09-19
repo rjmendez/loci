@@ -1,4 +1,4 @@
-"""Tests for backends.py — the portable env -> local-probe -> config -> default resolution."""
+"""Tests for backends.py — the portable env -> config -> local-probe -> default resolution."""
 import os
 import sys
 
@@ -271,6 +271,21 @@ def test_fresh_install_full_config_resolves_all_backends(tmp_path, monkeypatch):
     assert B.rerank_model() == "cfg-rerank"
     assert B.qdrant() == ("http://cfg-qdrant:6333", "cfg-key")
     assert B.memory_dir() == "/cfg/mem"
+
+
+def test_vllm_config_wins_over_local_probe(tmp_path, monkeypatch):
+    """Configured vLLM URL must outrank localhost probing.
+
+    Prevents accidental self-targeting when localhost:8000 is the MCP server,
+    not an OpenAI-compatible vLLM endpoint.
+    """
+    _no_vllm_env(monkeypatch)
+    cfg = tmp_path / "backends.toml"
+    cfg.write_text('[vllm]\nurl = "http://cfg-vllm:18000"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: True)
+    B._reset_cache()
+    assert B.vllm_url() == "http://cfg-vllm:18000"
 
 
 def test_fresh_install_bare_defaults(monkeypatch):

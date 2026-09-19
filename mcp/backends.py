@@ -199,7 +199,7 @@ def _vllm_role_env(prefix: str, role: str) -> str:
 
 @functools.lru_cache(maxsize=32)
 def vllm_url(role: str | None = None, probe_timeout: float = 1.0) -> str:
-    """vLLM/OpenAI base URL: env -> local probe -> config -> '' (batched_gen falls back to Ollama).
+    """vLLM/OpenAI base URL: env -> config -> local probe -> '' (batched_gen falls back to Ollama).
 
     `probe_timeout` bounds the local reachability probe (see ollama_url)."""
     if role:
@@ -215,9 +215,12 @@ def vllm_url(role: str | None = None, probe_timeout: float = 1.0) -> str:
     env = os.environ.get("VLLM_BASE_URL")
     if env:
         return env
+    configured = _cfg("vllm", "url", "") or ""
+    if configured:
+        return configured
     if _alive(_LOCAL_VLLM, timeout=probe_timeout):
         return _LOCAL_VLLM
-    return _cfg("vllm", "url", "") or ""
+    return ""
 
 
 def embed_model() -> str:
