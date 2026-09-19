@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timezone
@@ -180,61 +181,96 @@ def _coordination_item_from_payload(payload: dict, *, require_id: bool = True) -
     item_id = str(item.get("id") or "").strip()
     if require_id and not item_id:
         raise ValueError("Queue item id is required.")
+
     scope_kind = str(item.get("scope_kind") or "investigation").strip().lower()
     if not scope_kind or not re.fullmatch(r"[A-Za-z0-9_.:-]+", scope_kind):
         raise ValueError("scope_kind must be a short stable identifier.")
+
     raw_targets = item.get("scope_targets")
-    if isinstance(raw_targets, str):
+    if raw_targets is None:
+        scope_targets = ["investigation"]
+    elif isinstance(raw_targets, str):
+        text = raw_targets.strip()
+        if not text:
+            raise ValueError("scope_targets must include at least one target.")
         try:
-            scope_targets = json.loads(raw_targets)
+            parsed_targets = json.loads(text)
         except json.JSONDecodeError:
-            scope_targets = [p.strip() for p in raw_targets.split(',') if p.strip()]
+            parsed_targets = [p.strip() for p in text.split(",") if p.strip()]
+        if isinstance(parsed_targets, str):
+            parsed_targets = [parsed_targets]
+        if not isinstance(parsed_targets, (list, tuple, set)):
+            raise ValueError("scope_targets must be a list of target IDs or a comma-separated string.")
+        scope_targets = [str(p).strip() for p in parsed_targets if str(p).strip()]
     elif isinstance(raw_targets, (list, tuple, set)):
         scope_targets = [str(p).strip() for p in raw_targets if str(p).strip()]
     else:
-        scope_targets = []
-    if not scope_targets:
-        scope_targets = ["investigation"]
-    scope_targets = [str(p).strip() for p in scope_targets if str(p).strip()]
+        raise ValueError("scope_targets must be a list of target IDs or a comma-separated string.")
     if not scope_targets:
         raise ValueError("scope_targets must include at least one target.")
-    state = str(item.get("state") or "queued").strip().lower()
+
+    state_raw = item.get("state")
+    if state_raw is None:
+        state = "queued"
+    elif not isinstance(state_raw, str):
+        raise ValueError("state must be one of queued, claimed, done, blocked, cancelled.")
+    else:
+        state = state_raw.strip().lower()
     if state not in {"queued", "claimed", "done", "blocked", "cancelled"}:
         raise ValueError("state must be one of queued, claimed, done, blocked, cancelled.")
+
     owner_session = item.get("owner_session")
     if owner_session is not None:
         owner_session = str(owner_session).strip() or None
-    dependencies = item.get("dependencies") or []
-    if isinstance(dependencies, str):
+
+    dependencies_raw = item.get("dependencies")
+    if dependencies_raw is None:
+        dependencies = []
+    elif isinstance(dependencies_raw, str):
         try:
-            dependencies = json.loads(dependencies)
+            parsed_deps = json.loads(dependencies_raw)
         except json.JSONDecodeError:
-            dependencies = [d.strip() for d in dependencies.split(',') if d.strip()]
-    if isinstance(dependencies, (list, tuple, set)):
-        dependencies = [str(d).strip() for d in dependencies if str(d).strip()]
+            parsed_deps = [d.strip() for d in dependencies_raw.split(",") if d.strip()]
+        if isinstance(parsed_deps, str):
+            parsed_deps = [parsed_deps]
+        if not isinstance(parsed_deps, (list, tuple, set)):
+            raise ValueError("dependencies must be a list of item IDs.")
+        dependencies = [str(d).strip() for d in parsed_deps if str(d).strip()]
+    elif isinstance(dependencies_raw, (list, tuple, set)):
+        dependencies = [str(d).strip() for d in dependencies_raw if str(d).strip()]
     else:
         raise ValueError("dependencies must be a list of item IDs.")
     if item_id in dependencies:
         raise ValueError("Item dependencies must not include the item itself.")
+
     notes = item.get("notes")
     notes = "" if notes is None else str(notes).strip()
+
+    lease_expires_at = item.get("lease_expires_at")
+    if lease_expires_at is not None:
+        if not isinstance(lease_expires_at, str):
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.")
+        lease_expires_at = lease_expires_at.strip()
+        if not lease_expires_at:
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.")
+        try:
+            datetime.fromisoformat(lease_expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("lease_expires_at must be an ISO 8601 datetime string or null.") from exc
+
     result = {
         "id": item_id,
         "scope_kind": scope_kind,
         "scope_targets": scope_targets,
         "state": state,
         "owner_session": owner_session,
-        "lease_expires_at": item.get("lease_expires_at") or None,
+        "lease_expires_at": lease_expires_at,
         "dependencies": dependencies,
         "notes": notes,
         "created_at": item.get("created_at") or _now(),
         "updated_at": item.get("updated_at") or _now(),
     }
-    if result["lease_expires_at"] is not None:
-        result["lease_expires_at"] = str(result["lease_expires_at"]).strip() or None
     return result
-
-
 def _coordination_payload_from_json(value, *, field_name: str) -> dict:
     if isinstance(value, dict):
         return value
@@ -276,7 +312,7 @@ def investigation_queue_enqueue(
     scope_targets: Optional[list | str] = None,
     notes: Optional[str] = None,
     dependencies: Optional[list | str] = None,
-    state: str = "queued",
+    state: Optional[str] = None,
     owner_session: Optional[str] = None,
 ) -> str:
     """Enqueue a deterministic work item into an investigation's coordination queue."""
@@ -333,8 +369,8 @@ def investigation_queue_claim(
         ttl = float(lease_seconds)
     except (TypeError, ValueError):
         return _coordination_error('lease_seconds must be a positive number.')
-    if ttl <= 0:
-        return _coordination_error('lease_seconds must be > 0.')
+    if not math.isfinite(ttl) or ttl <= 0:
+        return _coordination_error("lease_seconds must be a positive number.")
     item_id = str(item_id).strip()
     owner_session = str(owner_session).strip()
     if not item_id or not owner_session:
@@ -381,7 +417,11 @@ def investigation_queue_complete(
                 f"Queue item '{item_id}' is already final with state '{item['state']}'."
             )
     current_owner = item.get('owner_session')
-    if current_owner and owner_session and current_owner != owner_session and not _coordination_lease_expired(item):
+    if current_owner and owner_session is None:
+        return _coordination_error(
+            f"Queue item '{item_id}' is owned by session '{current_owner}' and requires owner_session to complete."
+        )
+    if current_owner and current_owner != owner_session:
         return _coordination_error(
             f"Queue item '{item_id}' is owned by session '{current_owner}' and cannot be completed by '{owner_session}'."
         )
@@ -396,7 +436,6 @@ def investigation_queue_complete(
     item['updated_at'] = _now()
     _save_manifest(manifest)
     return json.dumps({"updated": True, "item": item}, indent=2)
-
 
 def investigation_queue_release(
     investigation_id: str,
