@@ -26,8 +26,9 @@
                                             # than classify does — worth tuning independently.
 # guardian_model = "granite3-guardian:2b"  # optional: model for guardian.check_injection_risk's
                                             # jailbreak/prompt-injection classification. Does NOT
-                                            # fall back to gen_model when unset (defaults to
-                                            # "granite3-guardian:2b" instead) — Granite Guardian is
+                                            # fall back to gen_model when unset (resolver now tries
+                                            # installed guard/safety-friendly tags first, then
+                                            # "granite3-guardian:2b") — Granite Guardian is
                                             # a purpose-built safety classifier tuned on a specific
                                             # risk-definition prompt shape, and routing this check
                                             # through an arbitrary chat model would produce
@@ -39,8 +40,16 @@
 # redteam_model = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
                                             # optional: explicitly adversarial model for
                                             # scripts/local_deep_think.py's --red-team tier.
-                                            # Defaults to a heretic/abliterated Qwen3.8 build
-                                            # because aligned models often refuse or soften the
+                                            # Resolver defaults to a heretic/abliterated Qwen3.8
+                                            # build and, when that exact tag is absent, auto-picks
+                                            # an installed local heretic/abliterated tag.
+#
+# If gen_model is unset, resolver uses qwen2.5:3b when available, otherwise the first
+# installed non-embedding local tag (to avoid broken defaults on sparse local installs).
+# Explicit env/config still wins.
+# For benchmark-driven assignment, generate this block from:
+#   python3 scripts/assign_models_from_benchmark.py --benchmark-json <quality_run.json>
+                                            # Aligned models often refuse or soften the
                                             # "attack this proposal as an adversary would"
                                             # framing used there.
 #
