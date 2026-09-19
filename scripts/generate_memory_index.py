@@ -26,8 +26,9 @@ Usage:
                                       [--headroom-pct N] [--dry-run] [--check]
 
 `memory_dir` defaults to `backends.memory_dir()`, which resolves in order:
-`LOCI_MEMORY_MD_DIR` -> gitignored config `[memory].dir` -> `LOCI_MEMORY_DIR`
--> `HERMES_MEMORY_DIR` -> `''` (unconfigured). No host-specific path is hardcoded.
+`LOCI_MEMORY_MD_DIR` -> `LOCI_MEMORY_DIR` -> `HERMES_MEMORY_DIR`
+-> gitignored config `[memory].dir` -> `''` (unconfigured). No host-specific
+path is hardcoded.
 
 `--source` defaults to `<memory_dir>/MEMORY.md` when it exists so the default
 run preserves the current section grouping instead of collapsing to

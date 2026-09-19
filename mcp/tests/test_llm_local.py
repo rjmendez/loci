@@ -176,3 +176,61 @@ def test_no_base_url_fails_open(monkeypatch):
     r = L.generate("say hi")
     assert r["ok"] is False and r["text"] == ""
     assert "no Ollama endpoint" in r["why"]
+
+
+def test_embedding_model_config_is_replaced_by_local_generation_model(monkeypatch):
+    _ensure_base(monkeypatch)
+    import backends
+    monkeypatch.setattr(backends, "ollama_gen_model", lambda: "nomic-embed-text:latest")
+
+    import types
+    cap = {}
+
+    class _TagsResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+
+    def fake_post(url, json=None, timeout=None):  # noqa: A002
+        cap["model"] = json.get("model")
+        return _FakeResp({"response": "hi"})
+
+    fake_requests = types.SimpleNamespace(get=lambda *a, **k: _TagsResp(), post=fake_post)
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    r = L.generate("say hi")
+    assert r["ok"] is True
+    assert r["model"] == "qwen2.5:3b"
+    assert cap["model"] == "qwen2.5:3b"
+
+
+def test_generate_retries_with_discovered_model_after_initial_model_failure(monkeypatch):
+    _ensure_base(monkeypatch)
+    import backends
+    monkeypatch.setattr(backends, "ollama_gen_model", lambda: "bad-model:1")
+
+    import types
+    calls = {"post": []}
+
+    class _TagsResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+
+    def fake_post(url, json=None, timeout=None):  # noqa: A002
+        calls["post"].append(json.get("model"))
+        if len(calls["post"]) == 1:
+            raise RuntimeError("model not found")
+        return _FakeResp({"response": "ok"})
+
+    fake_requests = types.SimpleNamespace(get=lambda *a, **k: _TagsResp(), post=fake_post)
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    r = L.generate("say hi")
+    assert r["ok"] is True
+    assert r["model"] == "qwen2.5:3b"
+    assert calls["post"] == ["bad-model:1", "qwen2.5:3b"]

@@ -47,6 +47,7 @@ def _search(points, payload_has_id=False):
     with mock.patch.object(qdrant_ops, "_get_qdrant", lambda: (client, "c")), \
          mock.patch.object(qdrant_ops, "_embed", lambda _t: [0.1] * qdrant_ops.VECTOR_DIM), \
          mock.patch.object(qdrant_ops, "_embed_sparse", lambda _t: None), \
+         mock.patch.object(qdrant_ops, "_endpoint_ready", lambda _url: True), \
          mock.patch.object(qdrant_ops, "_ce_rerank", lambda q, rows, k: (rows[:k], False)):
         qdrant_ops._dense_name_cache.clear()
         return qdrant_ops._qdrant_search_collection("q", collection_name="c", limit=5)

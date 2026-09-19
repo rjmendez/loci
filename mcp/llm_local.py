@@ -22,8 +22,11 @@ temperature/keep_alive), so it can be passed directly as a gen_fn.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Optional
+
+_LOG = logging.getLogger("loci-mcp.llm_local")
 
 # GENERATION vars only, read at CALL time: OLLAMA_BASE_URL is the EMBEDDING endpoint, and loci_groom.load_env() rewrites it after import.
 def _gen_env() -> str:
@@ -46,6 +49,42 @@ def _resolve_ollama() -> str:
 
 # A cold model load is ~70s even with keep_alive, so 120s covers a cold load plus generation.
 _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
+
+
+def _looks_embedding_model(model: str) -> bool:
+    tag = (model or "").strip().lower()
+    return bool(tag) and ("embed" in tag or "embedding" in tag)
+
+
+def _discover_generation_model(base: str, exclude: str = "") -> str:
+    """Best-effort local model discovery for deployment-specific installs.
+
+    If the configured generation model is invalid for this machine (for example
+    an embedding tag), pick the first locally-installed non-embedding model.
+    Fail-open: any error returns ''.
+    """
+    try:
+        import requests
+        r = requests.get(f"{base}/api/tags", timeout=_TIMEOUT)
+        r.raise_for_status()
+        payload = r.json() if hasattr(r, "json") else {}
+        models = payload.get("models") if isinstance(payload, dict) else []
+        if not isinstance(models, list):
+            return ""
+        blocked = {exclude.strip().lower()} if exclude else set()
+        for item in models:
+            name = str((item or {}).get("name") or "").strip()
+            if not name:
+                continue
+            low = name.lower()
+            if low in blocked:
+                continue
+            if _looks_embedding_model(name):
+                continue
+            return name
+    except Exception:
+        return ""
+    return ""
 
 
 def generate(prompt: str,
@@ -104,6 +143,12 @@ def generate(prompt: str,
     if not base:
         return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
                     "returned nothing)")
+    if _looks_embedding_model(model):
+        discovered = _discover_generation_model(base, exclude=model)
+        if discovered:
+            _LOG.info("llm_local reroute: embedding-tag model '%s' replaced with '%s'",
+                      model, discovered)
+            model = discovered
 
     body = {
         "model": model,
@@ -129,6 +174,8 @@ def generate(prompt: str,
 
     try:
         import requests
+        _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
+                  model, fmt or "", max_tokens)
         r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         payload = r.json()
@@ -141,11 +188,36 @@ def generate(prompt: str,
             if isinstance(thinking, str) and thinking.strip():
                 text = thinking
     except Exception as exc:
-        fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
-                             temperature=temperature)
-        if fallback is not None:
-            return fallback
-        return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
+        _LOG.warning("llm_local ollama failed model=%s error=%s", model, exc)
+        discovered = _discover_generation_model(base, exclude=model)
+        if discovered:
+            retry_body = dict(body)
+            retry_body["model"] = discovered
+            try:
+                _LOG.info("llm_local retry tier=ollama model=%s", discovered)
+                r = requests.post(f"{base}/api/generate", json=retry_body, timeout=_TIMEOUT)
+                r.raise_for_status()
+                payload = r.json()
+                text = (payload.get("response") or "")
+                if not text.strip():
+                    thinking = payload.get("thinking")
+                    if isinstance(thinking, str) and thinking.strip():
+                        text = thinking
+                model = discovered
+            except Exception:
+                payload = None
+                text = ""
+        else:
+            payload = None
+            text = ""
+        if not text:
+            fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
+                                 temperature=temperature)
+            if fallback is not None:
+                _LOG.info("llm_local fallback tier=%s model=%s",
+                          fallback.get("tier", "unknown"), fallback.get("model", ""))
+                return fallback
+            return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
 
     if fmt == "json":
         # ok=True only if the body actually parses as JSON.

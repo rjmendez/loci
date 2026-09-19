@@ -51,6 +51,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -5508,32 +5509,38 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
     total_orphans = 0
     parse_errors: list[str] = []
     for inv in inv_targets:
-        inv_path = MEMORY_DIR / inv
-        findings = _read_jsonl(inv_path / "findings.jsonl")
-        valid_ids = {
-            str(f.get("id") or f.get("finding_id") or f"{inv}:{i}")
-            for i, f in enumerate(findings) if isinstance(f, dict)
-        }
-        ret_path = inv_path / "retractions.jsonl"
-        audit_path = inv_path / "retraction_audit.jsonl"
-        # parse-cleanliness: count raw non-empty lines vs parsed rows
-        for label, path in (("retractions.jsonl", ret_path),
-                            ("retraction_audit.jsonl", audit_path)):
-            if path.exists():
-                raw = [ln for ln in path.read_text().splitlines() if ln.strip()]
-                parsed = _read_jsonl(path)
-                if len(parsed) != len(raw):
-                    parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
-        active = _load_retracted_ids(inv) if ret_path.exists() else set()
-        orphans = sorted(fid for fid in active if fid not in valid_ids)
-        total_active += len(active)
-        total_orphans += len(orphans)
-        if active or orphans:
-            per_inv.append({
-                "investigation_id": inv,
-                "active_retractions": len(active),
-                "orphaned_retractions": orphans,
-            })
+        try:
+            inv_path = MEMORY_DIR / inv
+            findings = _read_jsonl(inv_path / "findings.jsonl")
+            valid_ids = {
+                str(f.get("id") or f.get("finding_id") or f"{inv}:{i}")
+                for i, f in enumerate(findings) if isinstance(f, dict)
+            }
+            ret_path = inv_path / "retractions.jsonl"
+            audit_path = inv_path / "retraction_audit.jsonl"
+            # parse-cleanliness: count raw non-empty lines vs parsed rows
+            for label, path in (("retractions.jsonl", ret_path),
+                                ("retraction_audit.jsonl", audit_path)):
+                if path.exists():
+                    raw = [ln for ln in path.read_text().splitlines() if ln.strip()]
+                    parsed = _read_jsonl(path)
+                    if len(parsed) != len(raw):
+                        parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
+            active = _load_retracted_ids(inv) if ret_path.exists() else set()
+            orphans = sorted(fid for fid in active if fid not in valid_ids)
+            total_active += len(active)
+            total_orphans += len(orphans)
+            if active or orphans:
+                per_inv.append({
+                    "investigation_id": inv,
+                    "active_retractions": len(active),
+                    "orphaned_retractions": orphans,
+                })
+        except ValueError:
+            # A pre-existing directory whose name fails today's id validation
+            # (e.g. a legacy "undefined" dir) — skip it rather than let one
+            # bad entry fail the integrity check for every other investigation.
+            continue
     detail = {
         "investigations_scanned": len(inv_targets),
         "active_retractions": total_active,
@@ -6832,6 +6839,7 @@ def loci_health() -> str:
       warm:              whether the embed warm-ping has been fired this process
     """
     out: dict = {
+        "status": "ok",
         "code_version": "",
         "ladybug": "unavailable",
         "ollama_reachable": False,
@@ -6858,9 +6866,18 @@ def loci_health() -> str:
         import backends
         # Resolve each endpoint once and probe with a SHORT timeout so one dead backend cannot block or mask the others.
         _PROBE_T = 0.5
+        explicit_backend = {
+            "ollama": bool(os.environ.get("OLLAMA_BASE_URL")
+                           or os.environ.get("OLLAMA_URL")
+                           or backends._cfg("ollama", "url", "")),
+            "vllm": bool(os.environ.get("VLLM_BASE_URL")
+                         or backends._cfg("vllm", "url", "")),
+            "qdrant": bool(os.environ.get("QDRANT_URL")
+                           or backends._cfg("qdrant", "url", "")),
+        }
         for key, resolver in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
-            ("vllm_reachable", lambda: backends.vllm_url(_PROBE_T)),
+            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T)),
             ("qdrant_reachable", lambda: backends.qdrant()[0]),
         ):
             try:
@@ -6878,6 +6895,26 @@ def loci_health() -> str:
         except Exception as exc:
             logger.debug("loci_health: rerank_model probe failed: %r", exc)
             pass
+
+        failures = []
+        optional_down = []
+        for label, key in (("ollama", "ollama_reachable"),
+                           ("vllm", "vllm_reachable"),
+                           ("qdrant", "qdrant_reachable")):
+            if out[key]:
+                continue
+            if explicit_backend.get(label, False):
+                failures.append(f"{label}: configured/enabled but unreachable")
+            else:
+                optional_down.append(label)
+        if failures:
+            out["status"] = "unhealthy"
+            out["failures"] = failures
+            out["remediation"] = (
+                "Restore reachability for configured backends or remove explicit enablement."
+            )
+        elif optional_down:
+            out["optional_down"] = optional_down
     except Exception as exc:
         logger.debug("loci_health: backends import/probe block failed: %r", exc)
         pass
@@ -6901,6 +6938,65 @@ def loci_health() -> str:
     except Exception as exc:
         logger.debug("loci_health: retention probe failed: %r", exc)
         pass
+
+    tmux_required = os.environ.get("LOCI_TMUX_COMPANION_REQUIRED", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    expected_raw = os.environ.get("LOCI_TMUX_COMPANION_SESSIONS", "claude,copilot")
+    expected = [s.strip() for s in expected_raw.split(",") if s.strip()]
+    out["tmux_companion_required"] = tmux_required
+    out["tmux_companion_expected"] = expected
+    try:
+        proc = subprocess.run(
+            ["tmux", "ls"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        out["tmux_available"] = True
+        listed = proc.stdout or ""
+        running = []
+        for ln in listed.splitlines():
+            name = ln.split(":", 1)[0].strip()
+            if name:
+                running.append(name)
+        running = sorted(set(running))
+        missing = [s for s in expected if s not in running]
+        out["tmux_companion_running"] = running
+        if missing:
+            out["tmux_companion_missing"] = missing
+            if tmux_required:
+                out["status"] = "unhealthy"
+                out.setdefault("failures", [])
+                out["failures"].append(
+                    "tmux companions required but missing: " + ", ".join(missing)
+                )
+                out["remediation"] = (
+                    "Start required tmux sessions or unset LOCI_TMUX_COMPANION_REQUIRED."
+                )
+            else:
+                out["tmux_companion_optional_down"] = missing
+    except FileNotFoundError:
+        out["tmux_available"] = False
+        out["tmux_companion_error"] = "tmux not installed"
+        if tmux_required:
+            out["status"] = "unhealthy"
+            out.setdefault("failures", [])
+            out["failures"].append("tmux required but not installed")
+            out["remediation"] = (
+                "Install tmux and start required sessions, or unset LOCI_TMUX_COMPANION_REQUIRED."
+            )
+    except Exception as exc:
+        out["tmux_available"] = False
+        out["tmux_companion_error"] = f"{type(exc).__name__}: {exc}"
+        if tmux_required:
+            out["status"] = "unhealthy"
+            out.setdefault("failures", [])
+            out["failures"].append("tmux companion probe failed while required")
+            out["remediation"] = (
+                "Resolve tmux probe failure or unset LOCI_TMUX_COMPANION_REQUIRED."
+            )
     return json.dumps(out, indent=2)
 
 

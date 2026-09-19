@@ -26,6 +26,8 @@ not live in the repo.
 | `LOCI_OLLAMA_GEN_MODEL` | auto (`qwen2.5:3b` if present, else first local non-embedding tag, else `qwen2.5:3b`) | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). Explicit env/config still wins. This auto-fallback prevents hardcoded defaults from silently pointing at missing local tags. |
 | `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M`, then local heretic/abliterated tag, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
 | `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
+| `LOCI_TMUX_COMPANION_REQUIRED` | `0` (off) | if set truthy (`1/true/yes/on`), `loci_health` fails loud when required tmux companion sessions are missing. Use this when Copilot/Claude tmux loops are part of required runtime posture |
+| `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
 
 **Diagnosed 2026-09-15, corrected in `~/.loci/backends.toml` (machine-specific,
 gitignored — not shown here):** this box's `[ollama].gen_url` had been pointed at a
@@ -428,6 +430,35 @@ Runs three scorers in sequence — `harness.py`, `grounding_gate_eval.py`, and
 > optimistic by roughly 2/3 of its margin over cosine. See
 > [grounding-corpus-limits.md](grounding-corpus-limits.md) for the leak-free
 > numbers and what more findings are actually worth.
+
+### Run executable chaos/adversarial hardening gates (pre-merge / pre-deploy)
+
+Generate fresh artifacts first (for example a chaos run log plus the red-team report),
+then gate them with one machine-readable check:
+
+```bash
+$LOCI_PY $LOCI/scripts/chaos_hardening_gate.py \
+  --chaos-events artifacts/chaos/latest-events.jsonl \
+  --adversarial-report scripts/redteam/reports/latest-sandbox-report.json \
+  --max-timeout-rate 0.05 \
+  --min-retry-recovery-rate 0.80 \
+  --max-duplicate-effect-rate 0.0 \
+  --min-provenance-completeness 0.99 \
+  --max-candidate-bypass 0
+```
+
+The script prints JSON with explicit per-gate `pass`/`fail`/`skipped` states and
+returns:
+
+- `0` when all evaluated gates pass
+- `1` when any gate fails (or when `--fail-on-skipped` is set and a gate is skipped)
+- `2` on invocation/config errors
+
+This makes it suitable for CI or release pipelines:
+
+```bash
+$LOCI_PY $LOCI/scripts/chaos_hardening_gate.py ... > hardening-gate.json
+```
 
 ### Benchmark local Ollama generation honestly
 

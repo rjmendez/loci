@@ -112,3 +112,16 @@ def test_a_fresh_install_gets_the_new_location(tmp_path):
     with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True):
         with mock.patch.object(pathlib.Path, "home", staticmethod(lambda: home)):
             assert mod.memory_dir() == home / ".loci" / "memory-sessions"
+
+
+def test_validate_hermes_endpoint_policy_allows_loopback():
+    mod = _load(MCP_COPY)
+    env = {"QDRANT_URL": "http://127.0.0.1:6333", "OLLAMA_BASE_URL": "http://localhost:11434"}
+    assert mod.validate_hermes_endpoint_policy(env, files=[]) == []
+
+
+def test_validate_hermes_endpoint_policy_rejects_private_bridge():
+    mod = _load(MCP_COPY)
+    env = {"QDRANT_URL": "http://172.21.171.198:6333"}
+    issues = mod.validate_hermes_endpoint_policy(env, files=[])
+    assert issues and "bridge/private" in issues[0]

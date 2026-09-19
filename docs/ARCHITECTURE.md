@@ -103,6 +103,14 @@ investigation JSONL above. Tables queried by this codebase:
 > `scripts/spreading_activation.py`, and `scripts/mnem_fix.py`. `annotations` may
 > exist in the Mnemosyne schema but is not directly queried by this repository.
 
+### Endpoint policy
+
+Hermes and Loci local backends must stay on loopback (`127.0.0.1` or `localhost`).
+Bridge/private IPs such as `10.x`, `172.16-31.x`, `192.168.x`, and other drifted
+LAN addresses are rejected for the local backend set; mixed loopback + bridge
+topologies fail startup and the `scripts/check_hermes_endpoints.py` guard. This
+prevents the stale dual-stack state that kept reintroducing stale bridge endpoints.
+
 ### Qdrant (configured via `QDRANT_URL`)
 
 Search index. Dense vectors are `MNEMOSYNE_EMBEDDING_DIM`-wide (default 768),
