@@ -1,0 +1,4 @@
+# Example batch. One JSON object per line; blank lines and #-comments are ignored.
+{"id":"summarize-a","model":"llama3.1:8b","est_vram_gb":6.0,"prompt":"Summarize the theory of relativity in two sentences.","options":{"temperature":0.3,"num_predict":256}}
+{"id":"summarize-b","endpoint":"gpu0","model":"llama3.1:8b","est_vram_gb":6.0,"prompt":"List three uses of a Kalman filter.","options":{"temperature":0.3,"num_predict":256}}
+{"id":"combine","model":"llama3.1:8b","est_vram_gb":6.0,"depends_on":["summarize-a","summarize-b"],"prompt":"Say DONE.","priority":1,"options":{"num_predict":8}}
