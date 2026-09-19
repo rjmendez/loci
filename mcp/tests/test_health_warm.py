@@ -125,6 +125,10 @@ def test_loci_health_tmux_required_missing_is_unhealthy(monkeypatch):
 def test_loci_health_tmux_optional_missing_stays_ok(monkeypatch):
     monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
     monkeypatch.setenv("LOCI_TMUX_COMPANION_SESSIONS", "claude,copilot")
+    monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: True)
+    monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
+    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
+    monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
     class _Proc:
         stdout = "claude: 1 windows (created ...)\n"
