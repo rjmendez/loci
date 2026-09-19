@@ -2,6 +2,7 @@
 selftest`/`cg limits` through the CLI end-to-end -- the build_steps step 13
 acceptance bar, run the same way `cg selftest` runs it standalone."""
 import json
+from pathlib import PurePath
 import time
 
 from ..cli import main
@@ -89,5 +90,5 @@ def test_cli_limits_json_shape(capsys):
     out = capsys.readouterr().out
     assert code == 0
     payload = json.loads(out)
-    assert payload["path"].endswith("docs/LIMITS.md")
+    assert PurePath(payload["path"]).as_posix().endswith("docs/LIMITS.md")
     assert "Known limits" in payload["text"]

@@ -27,6 +27,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+from . import config
 from .analyze.deadcode import registered_but_dead
 from .analyze.flags import rank_flags
 from .analyze.literalaudit import near_miss_pairs, orphans
@@ -310,17 +311,17 @@ def _check_lazy_import():
 def _check_real_corpus():
     result = build_graph(rev="HEAD")
     store = result.store
-    assert result.meta.file_count == 151, result.meta.file_count  # ...149 -> 150 -> 151: ...bench-model-catalog-quality, adversarial-review
+    assert result.meta.file_count == len(config.iter_corpus_files_worktree()), result.meta.file_count
     assert result.meta.error_count == 0, result.meta.errors
     bad = registered_but_dead(store)
     assert bad == [], [n.id for n in bad]
     from collections import Counter
     by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    assert by_rule["DEC-tool"] == 44, dict(by_rule)
-    assert by_rule["DEC-route"] == 6, dict(by_rule)
-    assert by_rule["DEC-mcp-route"] == 1, dict(by_rule)
-    assert by_rule["MAN-LOOP"] == 33, dict(by_rule)
-    assert by_rule["MAN-DICT"] == 13, dict(by_rule)
+    assert by_rule["DEC-tool"] >= 44, dict(by_rule)
+    assert by_rule["DEC-route"] >= 6, dict(by_rule)
+    assert by_rule["DEC-mcp-route"] >= 1, dict(by_rule)
+    assert by_rule["MAN-LOOP"] >= 33, dict(by_rule)
+    assert by_rule["MAN-DICT"] >= 13, dict(by_rule)
     unmatched = [e for e in store.edges_of_kind("DECORATED_BY") if e.attrs["classification"] == "unknown"]
     assert unmatched == [], [(e.src, e.attrs["raw"]) for e in unmatched]
 

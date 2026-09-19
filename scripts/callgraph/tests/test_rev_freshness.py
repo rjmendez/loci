@@ -13,6 +13,7 @@ edit scenario build_steps step 13 was written under (another workflow is
 mid-editing mcp/server.py while these tests run)."""
 
 from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+from .. import config
 from ..ingest import load_corpus
 
 
@@ -66,6 +67,6 @@ def test_rev_head_is_immune_to_a_concurrently_mid_edited_working_tree(tmp_path, 
     finally:
         monkeypatch.setattr(Path, "read_text", original_read_text)
     assert origin.startswith("rev ")
-    assert len(sources) == 151  # ...149 -> 150 -> 151: ...bench-model-catalog-quality, adversarial-review
+    assert len(sources) == len(config.iter_corpus_files_worktree())
     server = _source_for(sources, "mcp/server.py")
     assert server.error is None and "loci-mcp" in server.source[:200]
