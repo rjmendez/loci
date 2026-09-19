@@ -54,8 +54,15 @@ With optional Mnemosyne:
 | `QDRANT_URL` | _(unset — Qdrant search disabled)_ | Qdrant instance URL, e.g. `http://localhost:6333` |
 | `QDRANT_API_KEY` | _(none)_ | Qdrant API key if required |
 | `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Name of the shared findings collection (used verbatim, nothing is appended) |
+| `LOCI_QDRANT_TIMEOUT` | `20` | Qdrant client timeout (seconds) for searches/probes |
+| `LOCI_QDRANT_QUERY_RETRY_ATTEMPTS` | `3` | Bounded retry tier for transient Qdrant query failures |
 | `OLLAMA_BASE_URL` | _(unset — falls back to 384-dim fastembed, which mismatches the 768-dim collection unless `EMBED_DIM=384`)_ | Ollama instance URL, e.g. `http://localhost:11434` |
 | `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `LOCI_EMBED_RETRY_ATTEMPTS` | `2` | Bounded retry tier for transient embedding transport failures |
+| `LOCI_TRANSPORT_BACKOFF_BASE_S` | `0.2` | Base exponential backoff step for transport retries |
+| `LOCI_TRANSPORT_BACKOFF_CAP_S` | `1.5` | Maximum backoff delay per retry step |
+| `LOCI_TRANSPORT_BROWNOUT_THRESHOLD` | `4` | Consecutive timeout failures before brownout circuit opens |
+| `LOCI_TRANSPORT_BROWNOUT_SECONDS` | `20` | Brownout hold window before transport retries are allowed again |
 | `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | Local JSONL storage root |
 | `LOCI_MNEMO_BANK` | `default` | Mnemosyne bank name (optional) |
 | `LOCI_REFLECTION_INVESTIGATION` | `copilot-self-reflection-loop` | Default investigation for reflection loop |

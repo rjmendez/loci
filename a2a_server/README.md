@@ -11,6 +11,23 @@ Protocol: JSON-RPC 2.0 over HTTP POST to `/a2a`
 Auth: Bearer token (`LOCI_A2A_TOKEN`) + optional TOTP (`LOCI_A2A_TOTP_SEED`)
 Agent card: `GET /.well-known/agent.json`
 
+## Trust-boundary controls (b2b lanes)
+
+- `tasks/send` rejects malformed envelopes (`params` object, `skill_id` non-empty
+  string, `input` object, `message` string).
+- Command routing is explicit allowlist-only:
+  - inbound dispatch only from the local skill map
+  - outbound peer fan-out only to `memory_remember` / `memory_prime`
+- Peer lane envelopes include `_boundary` metadata with
+  `lane`, `idempotency_key`, `artifact_sha256`, `origin_agent_id`, and `ts`.
+- Inbound `_boundary` metadata is validated for lane/skill allowlist, artifact
+  SHA-256 integrity, and idempotency replay.
+- Accepted/rejected boundary operations emit structured `boundary_receipt` logs.
+
+Optional env:
+- `LOCI_A2A_IDEMPOTENCY_TTL_S` (default `3600`) sets replay window TTL for
+  `(sender, skill_id, idempotency_key)`.
+
 ## Skills
 
 | skill_id            | What it does |
