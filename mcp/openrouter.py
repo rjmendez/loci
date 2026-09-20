@@ -60,6 +60,13 @@ _MAX_INFLIGHT = int(os.environ.get("LOCI_OPENROUTER_CONCURRENCY", "6"))
 _TIMEOUT = float(os.environ.get("LOCI_OPENROUTER_TIMEOUT", "90"))
 
 
+def _max_tokens_cap() -> int:
+    try:
+        return max(0, int(os.environ.get("LOCI_OPENROUTER_MAX_TOKENS_PER_CALL", "0")))
+    except Exception:
+        return 0
+
+
 def credentials() -> tuple:
     """(base_url, api_key). Env first, then ~/.loci/backends.toml."""
     key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -180,6 +187,12 @@ def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int =
     """
     if not prompts:
         return []
+    cap = _max_tokens_cap()
+    if cap > 0 and max_tokens > cap:
+        logger.warning("openrouter: guardrail refused request max_tokens=%s cap=%s",
+                       max_tokens, cap)
+        return [{"text": "", "ok": False, "why": f"max_tokens cap exceeded ({max_tokens}>{cap})"}
+                for _ in prompts]
     base, key = credentials()
     if not key:
         logger.warning("openrouter: no API key configured — returning no generations")

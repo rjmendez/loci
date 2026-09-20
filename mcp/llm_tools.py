@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from importlib import util as importlib_util
 from pathlib import Path
 from typing import Literal, Optional
@@ -17,6 +18,37 @@ logger = logging.getLogger("loci-mcp")
 _SWARM_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "swarm_escalate.py"
 _SWARM_MODULE_NAME = "_loci_scripts_swarm_escalate"
 _SWARM_MODULE = None
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Read int env config with bounded fail-open fallback."""
+    try:
+        value = int((os.environ.get(name, "") or "").strip() or default)
+    except Exception:
+        value = int(default)
+    return max(minimum, min(maximum, value))
+
+
+_SWARM_MAX_FANOUT = _env_int("LOCI_SWARM_MAX_FANOUT", 64, minimum=1, maximum=256)
+_SWARM_MAX_SEEDS = _env_int("LOCI_SWARM_MAX_SEEDS", 8, minimum=1, maximum=32)
+_SWARM_MAX_SELF_CONSISTENCY_SAMPLES = _env_int(
+    "LOCI_SWARM_MAX_SELF_CONSISTENCY_SAMPLES", 5, minimum=1, maximum=16
+)
+_SWARM_MAX_REDUCE_GROUP_SIZE = _env_int(
+    "LOCI_SWARM_MAX_REDUCE_GROUP_SIZE", 32, minimum=1, maximum=128
+)
+_SWARM_MAX_INFLIGHT = _env_int("LOCI_SWARM_MAX_INFLIGHT", 2, minimum=1, maximum=32)
+_SWARM_INFLIGHT = threading.BoundedSemaphore(value=_SWARM_MAX_INFLIGHT)
+
+
+def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> tuple[int, int]:
+    """Return (requested, bounded) integer pair."""
+    try:
+        requested = int(value)
+    except Exception:
+        requested = int(default)
+    bounded = max(minimum, min(maximum, requested))
+    return requested, bounded
 
 
 def _env_bool(name: str) -> bool:
@@ -423,11 +455,38 @@ def swarm_reason(topic: str,
     Fail-open: import/runtime/validation errors return degraded JSON instead of
     raising, so downstream MCP clients can still inspect one well-formed result.
     """
+    if not _SWARM_INFLIGHT.acquire(blocking=False):
+        return json.dumps(
+            _degraded_swarm_result(
+                topic,
+                fanout_count=fanout_count,
+                error=(
+                    f"swarm_reason busy: global inflight limit {_SWARM_MAX_INFLIGHT} reached; "
+                    "try again later"
+                ),
+            ),
+            indent=2,
+        )
     try:
         swarm = _load_swarm_escalate()
-        resolved_seeds = max(1, int(seeds))
-        resolved_samples = max(1, int(self_consistency_samples))
-        resolved_reduce_group_size = max(0, int(reduce_group_size))
+        requested_fanout, resolved_fanout = _bounded_int(
+            fanout_count, default=20, minimum=1, maximum=_SWARM_MAX_FANOUT
+        )
+        requested_seeds, resolved_seeds = _bounded_int(
+            seeds, default=1, minimum=1, maximum=_SWARM_MAX_SEEDS
+        )
+        requested_samples, resolved_samples = _bounded_int(
+            self_consistency_samples,
+            default=1,
+            minimum=1,
+            maximum=_SWARM_MAX_SELF_CONSISTENCY_SAMPLES,
+        )
+        requested_reduce_group_size, resolved_reduce_group_size = _bounded_int(
+            reduce_group_size,
+            default=0,
+            minimum=0,
+            maximum=_SWARM_MAX_REDUCE_GROUP_SIZE,
+        )
         resolved_prior_context = bool(escalate_with_prior_context)
         resolved_synthesize_think = (
             bool(synthesize_think) if synthesize_think is not None
@@ -464,7 +523,7 @@ def swarm_reason(topic: str,
             escalate_model_explicit=bool(str(escalate_model or "").strip()),
             synthesize_model_explicit=bool(str(synthesize_model or "").strip()),
             subtasks=_coerce_labels(subtasks) or None,
-            fanout_count=max(1, int(fanout_count)),
+            fanout_count=resolved_fanout,
             seeds=resolved_seeds,
             auto_parallel=False,
             escalate_confidences=tuple(
@@ -485,6 +544,26 @@ def swarm_reason(topic: str,
         errors = list(swarm.validate_swarm_result(result))
         if errors:
             raise ValueError("; ".join(errors))
+        limits_applied = {}
+        if resolved_fanout != requested_fanout:
+            limits_applied["fanout_count"] = {"requested": requested_fanout, "applied": resolved_fanout}
+        if resolved_seeds != requested_seeds:
+            limits_applied["seeds"] = {"requested": requested_seeds, "applied": resolved_seeds}
+        if resolved_samples != requested_samples:
+            limits_applied["self_consistency_samples"] = {
+                "requested": requested_samples,
+                "applied": resolved_samples,
+            }
+        if resolved_reduce_group_size != requested_reduce_group_size:
+            limits_applied["reduce_group_size"] = {
+                "requested": requested_reduce_group_size,
+                "applied": resolved_reduce_group_size,
+            }
+        if limits_applied:
+            result["orchestration_limits"] = {
+                "global_inflight_limit": _SWARM_MAX_INFLIGHT,
+                "applied": limits_applied,
+            }
         return json.dumps(result, indent=2)
     except Exception as exc:
         logger.warning("swarm_reason degraded for topic %r: %s", topic, exc)
@@ -492,6 +571,8 @@ def swarm_reason(topic: str,
             _degraded_swarm_result(topic, fanout_count=fanout_count, error=str(exc)),
             indent=2,
         )
+    finally:
+        _SWARM_INFLIGHT.release()
 
 
 def adversarial_review(findings: list,

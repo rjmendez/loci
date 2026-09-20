@@ -186,6 +186,14 @@ class TestCredentials(unittest.TestCase):
     def test_an_empty_prompt_list_costs_nothing(self):
         self.assertEqual(openrouter.generate_batch([]), [])
 
+    def test_guardrail_blocks_excessive_max_tokens(self):
+        with mock.patch.dict("os.environ", {"LOCI_OPENROUTER_MAX_TOKENS_PER_CALL": "16"}), \
+             mock.patch.object(openrouter, "credentials", lambda: ("https://x", "k")):
+            out = openrouter.generate_batch(["p1", "p2"], model="m", max_tokens=64)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(not row["ok"] for row in out))
+        self.assertTrue(all("cap exceeded" in row.get("why", "") for row in out))
+
 
 if __name__ == "__main__":
     unittest.main()
