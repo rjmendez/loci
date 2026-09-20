@@ -11,6 +11,17 @@ export const meta = {
 }
 
 const INVALID_INVESTIGATION_ID_SENTINELS = new Set(['undefined', 'null', 'none'])
+const DEFAULT_TARGETS = [
+  { name: 'rooted-canary', focus: 'training/rooted_canary_e2e.py rooted-device telemetry canary + DGC-26 gate' },
+  { name: 'governance-gate', focus: 'training/governance_gate.py DGC checks, shadow-eval, fail-closed logic' },
+  { name: 'telemetry-ingest', focus: 'realtime ingest + gotchi_mqtt_bridge.py telemetry path and schema' },
+  { name: 'ant-training', focus: 'training/ant_trainer_base.py candidate export, publish, shadow-eval hook' },
+  { name: 'sensor-fusion', focus: 'android EskfFusion + sensors/tdoa_triangulation.py fusion correctness' },
+]
+const MAX_TARGETS = 12
+const TARGET_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/
+const COLLECTION_RE = /^[A-Za-z0-9_.:-]{1,128}$/
+const SHELL_SAFE_PATH_RE = /^\/[A-Za-z0-9._\/-]{1,220}$/
 
 function _invalidInvestigationId(fieldName, value) {
   const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value)
@@ -42,31 +53,128 @@ function investigationIdOrDefault(value, fallback, fieldName = 'run_id') {
   return requiredInvestigationId(value, fieldName)
 }
 
+function _invalidArg(fieldName, rule, value) {
+  const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value)
+  return new Error(`${meta.name}: invalid ${fieldName}: expected ${rule}, got ${rendered}`)
+}
+
+function parseWorkflowArgs(rawArgs) {
+  if (rawArgs === undefined || rawArgs === null) return {}
+  if (typeof rawArgs === 'string') {
+    const trimmed = rawArgs.trim()
+    if (!trimmed) return {}
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw _invalidArg('args', 'a JSON object', rawArgs)
+      }
+      return parsed
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(`${meta.name}: args must be valid JSON object text when provided as a string`)
+      }
+      throw error
+    }
+  }
+  if (Array.isArray(rawArgs) || typeof rawArgs !== 'object') {
+    throw _invalidArg('args', 'an object or JSON object string', rawArgs)
+  }
+  return rawArgs
+}
+
+function optionalText(value, fieldName, { maxLen = 180 } = {}) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string') throw _invalidArg(fieldName, `a string <= ${maxLen} chars`, value)
+  const trimmed = value.trim()
+  if (!trimmed) throw _invalidArg(fieldName, `a non-empty string <= ${maxLen} chars`, value)
+  if (trimmed.length > maxLen) throw _invalidArg(fieldName, `a string <= ${maxLen} chars`, value)
+  return trimmed
+}
+
+function intArg(value, fieldName, fallback, { min, max }) {
+  const resolved = value ?? fallback
+  if (!Number.isInteger(resolved) || resolved < min || resolved > max) {
+    throw _invalidArg(fieldName, `an integer in [${min}, ${max}]`, value)
+  }
+  return resolved
+}
+
+function numberArg(value, fieldName, fallback, { min, max }) {
+  const resolved = value ?? fallback
+  if (typeof resolved !== 'number' || !Number.isFinite(resolved) || resolved < min || resolved > max) {
+    throw _invalidArg(fieldName, `a finite number in [${min}, ${max}]`, value)
+  }
+  return resolved
+}
+
+function normalizeCollections(value) {
+  const resolved = value ?? ['dama_gotchi_code']
+  if (!Array.isArray(resolved) || resolved.length === 0 || resolved.length > 12) {
+    throw _invalidArg('rag_collections', 'a non-empty array of collection names (max 12)', value)
+  }
+  return resolved.map((entry) => {
+    if (typeof entry !== 'string') throw _invalidArg('rag_collections[]', 'a string collection name', entry)
+    const trimmed = entry.trim()
+    if (!trimmed || !COLLECTION_RE.test(trimmed)) {
+      throw _invalidArg('rag_collections[]', `a name matching ${COLLECTION_RE}`, entry)
+    }
+    return trimmed
+  })
+}
+
+function normalizeTargets(value) {
+  const resolved = value ?? DEFAULT_TARGETS
+  if (!Array.isArray(resolved) || resolved.length === 0 || resolved.length > MAX_TARGETS) {
+    throw _invalidArg('targets', `a non-empty array of {name,focus} (max ${MAX_TARGETS})`, value)
+  }
+  return resolved.map((target, index) => {
+    if (!target || Array.isArray(target) || typeof target !== 'object') {
+      throw _invalidArg(`targets[${index}]`, 'an object with {name, focus}', target)
+    }
+    const name = optionalText(target.name, `targets[${index}].name`, { maxLen: 64 })
+    const focus = optionalText(target.focus, `targets[${index}].focus`, { maxLen: 600 })
+    if (!TARGET_NAME_RE.test(name)) {
+      throw _invalidArg(`targets[${index}].name`, `a slug matching ${TARGET_NAME_RE}`, target.name)
+    }
+    return { name, focus }
+  })
+}
+
+function normalizeScratchRoot(value) {
+  const resolved = optionalText(value ?? '/tmp/deep_think_loci', 'scratch_root', { maxLen: 220 })
+  if (!SHELL_SAFE_PATH_RE.test(resolved) || resolved.includes('..') || resolved.includes('//')) {
+    throw _invalidArg('scratch_root', `an absolute UNIX-like path matching ${SHELL_SAFE_PATH_RE} with no '..'`, value)
+  }
+  return resolved.replace(/\/$/, '')
+}
+
+function shellQuote(value) {
+  return JSON.stringify(String(value))
+}
+
+function gateLabel(prefix, targetName) {
+  return `${prefix}_${targetName.replace(/[^A-Za-z0-9_-]/g, '_')}`
+}
+
 // ── parameters ──
-// The Workflow tool delivers `args` as a JSON STRING, not a parsed object — normalize it.
-const A = (typeof args === 'string') ? (() => { try { return JSON.parse(args) || {} } catch (e) { return {} } })() : (args || {})
+const A = parseWorkflowArgs(args)
 const RUN = investigationIdOrDefault(A.run_id, 'dt-loci-005', 'run_id')
-const TITLE = A.title || 'deep-think-loci v3 run'
-const CODE_COLLS = JSON.stringify(A.rag_collections || ['dama_gotchi_code'])
-const N_IDEAS = A.ideas_per_agent || 10
-const GATE = A.ground_gate || '/home/rjmendez/.hermes/specialists/grounding/ground_gate.py'
-const THRESH = A.ground_threshold || 0.59
-const TARGETS = A.targets || [
-  { name: 'rooted-canary', focus: 'training/rooted_canary_e2e.py rooted-device telemetry canary + DGC-26 gate' },
-  { name: 'governance-gate', focus: 'training/governance_gate.py DGC checks, shadow-eval, fail-closed logic' },
-  { name: 'telemetry-ingest', focus: 'realtime ingest + gotchi_mqtt_bridge.py telemetry path and schema' },
-  { name: 'ant-training', focus: 'training/ant_trainer_base.py candidate export, publish, shadow-eval hook' },
-  { name: 'sensor-fusion', focus: 'android EskfFusion + sensors/tdoa_triangulation.py fusion correctness' },
-]
+const TITLE = optionalText(A.title, 'title', { maxLen: 180 }) || 'deep-think-loci v3 run'
+const CODE_COLLS = JSON.stringify(normalizeCollections(A.rag_collections))
+const N_IDEAS = intArg(A.ideas_per_agent, 'ideas_per_agent', 10, { min: 1, max: 25 })
+const GATE = optionalText(A.ground_gate, 'ground_gate', { maxLen: 220 }) || '/home/rjmendez/.hermes/specialists/grounding/ground_gate.py'
+const THRESH = numberArg(A.ground_threshold, 'ground_threshold', 0.59, { min: 0.5, max: 0.95 })
+const TARGETS = normalizeTargets(A.targets)
+const SCRATCH_ROOT = normalizeScratchRoot(A.scratch_root)
 
 const tagStr = (phase, agent, model, extra) => `dt_run:${RUN},dt_phase:${phase},dt_agent:${agent},dt_model:${model}${extra ? ',' + extra : ''}`
 const SRC = (phase, agent) => `dt://${RUN}/${phase}/${agent}`
 const NO_FAB = `CRITICAL: every finding_id you return MUST come from an actual loci.investigation_store tool result — never invent one; return [] if a store did not happen.`
 // the reusable GROUND block: filter retrieved evidence through the cosine gate before reasoning
 const groundBlock = (focus, label) =>
-  `GROUNDING GATE (run BEFORE reasoning): after loci.investigation_search, write the retrieved findings as JSON [{"id","text"}] to /tmp/${label}_cand.json, then Bash:\n` +
-  `  python3 ${GATE} --query ${JSON.stringify(focus)} --threshold ${THRESH} --in /tmp/${label}_cand.json --out /tmp/${label}_kept.json\n` +
-  `Use ONLY the findings in /tmp/${label}_kept.json ("kept") as evidence — the gate drops cross-target similarity-bleed (the v1/v2 failure). Note in your output how many were dropped.`
+  `GROUNDING GATE (run BEFORE reasoning): after loci.investigation_search, write the retrieved findings as JSON [{"id","text"}] to ${SCRATCH_ROOT}/${label}_cand.json, then Bash:\n` +
+  `  mkdir -p ${shellQuote(SCRATCH_ROOT)} && python3 ${shellQuote(GATE)} --query ${JSON.stringify(focus)} --threshold ${THRESH} --in ${shellQuote(`${SCRATCH_ROOT}/${label}_cand.json`)} --out ${shellQuote(`${SCRATCH_ROOT}/${label}_kept.json`)}\n` +
+  `Use ONLY the findings in ${SCRATCH_ROOT}/${label}_kept.json ("kept") as evidence — the gate drops cross-target similarity-bleed (the v1/v2 failure). Note in your output how many were dropped.`
 const LOAD_GATE = `Then call loci.investigation_load(investigation_id="${RUN}", last_n_findings=80, include_retracted=true) and reconcile against tags; never synthesize a target that has no real findings.`
 
 // ── Init ──
@@ -81,7 +189,8 @@ const IDEA = { type: 'object', required: ['target', 'ideas'], properties: {
 const gens = (await parallel(TARGETS.map((t, i) => () =>
   agent(`Ideation generator a${i + 1} for TARGET "${t.name}" — ${t.focus}.\n` +
     `1) Ground via loci.rag_context_search(query="${t.focus}", collections=${CODE_COLLS}, limit=8).\n` +
-    `2) Return exactly ${N_IDEAS} concrete one-line improvement ideas. Do NOT store anything — just return them.`,
+    `2) ${groundBlock(t.focus, gateLabel(`ideate_a${i + 1}`, t.name))}\n` +
+    `3) Return exactly ${N_IDEAS} concrete one-line improvement ideas. Do NOT store anything — just return them.`,
     { label: `gen:${t.name}`, phase: 'Ideate', model: 'haiku', schema: IDEA })
 ))).filter(Boolean)
 const allIdeas = gens.flatMap(g => (g.ideas || []).map(idea => ({ target: g.target, idea })))
@@ -117,10 +226,17 @@ const halves = [TARGETS.slice(0, half), TARGETS.slice(half)]
 const SYN = { type: 'object', required: ['model', 'synthesis', 'finding_id'], properties: {
   model: { type: 'string' }, synthesis: { type: 'string' }, finding_id: { type: 'string' } } }
 const halfSyn = (await parallel(halves.map((hn, h) => () =>
-  agent(`FINAL synthesis (opus 4.8) half-${h === 0 ? 'A' : 'B'} for "${RUN}", targets ${JSON.stringify(hn.map(t => t.name))}. ${LOAD_GATE}\n` +
-    `Process EACH target SEPARATELY — NEVER blend targets into one gate query (a blended query diluted cosines and false-dropped a whole genuine target in v3). For each {name,focus} in ${JSON.stringify(hn)}: (a) loci.investigation_search(query=focus, investigation_id="${RUN}", limit=15); (b) write retrieved [{"id","text"}] to /tmp/half${h}_<name>.json and run Bash: python3 ${GATE} --query "<that target's focus>" --threshold ${THRESH} --in /tmp/half${h}_<name>.json --out /tmp/half${h}_<name>_kept.json ; use ONLY kept.\n` +
-    `You are ALSO the red-team for your targets: deliver the strongest SAFE ideas AND the genuine security nightmares (fail-open gates, bypasses, data-poisoning, etc.), grounded ONLY in the kept findings. Note any decision made in error from missing context. Store: loci.investigation_store(investigation_id="${RUN}", finding_type="inferred", text="<half synthesis>", source="${SRC('final', `half${h === 0 ? 'A' : 'B'}`)}", confidence="high", tags="${tagStr('final', `half${h === 0 ? 'A' : 'B'}`, 'opus')}", derived_from=<real ids>).\n${NO_FAB}`,
-    { label: `final:opus:half${h === 0 ? 'A' : 'B'}`, phase: 'Final', model: 'opus', effort: 'high', schema: SYN })
+  {
+    const perTargetGate = hn.map(target =>
+      `For target "${target.name}": ` +
+      `(a) loci.investigation_search(query=${JSON.stringify(target.focus)}, investigation_id="${RUN}", limit=15); ` +
+      `(b) ${groundBlock(target.focus, gateLabel(`half${h}_${target.name}`, target.name))}`
+    ).join('\n')
+    return agent(`FINAL synthesis (opus 4.8) half-${h === 0 ? 'A' : 'B'} for "${RUN}", targets ${JSON.stringify(hn.map(t => t.name))}. ${LOAD_GATE}\n` +
+      `Process EACH target SEPARATELY — NEVER blend targets into one gate query (a blended query diluted cosines and false-dropped a whole genuine target in v3).\n${perTargetGate}\n` +
+      `You are ALSO the red-team for your targets: deliver the strongest SAFE ideas AND the genuine security nightmares (fail-open gates, bypasses, data-poisoning, etc.), grounded ONLY in the kept findings. Note any decision made in error from missing context. Store: loci.investigation_store(investigation_id="${RUN}", finding_type="inferred", text="<half synthesis>", source="${SRC('final', `half${h === 0 ? 'A' : 'B'}`)}", confidence="high", tags="${tagStr('final', `half${h === 0 ? 'A' : 'B'}`, 'opus')}", derived_from=<real ids>).\n${NO_FAB}`,
+      { label: `final:opus:half${h === 0 ? 'A' : 'B'}`, phase: 'Final', model: 'opus', effort: 'high', schema: SYN })
+  }
 ))).filter(Boolean)
 const finalOut = await agent(
   `FINAL agent (opus 4.8), last word over "${RUN}". ${LOAD_GATE}\n` +

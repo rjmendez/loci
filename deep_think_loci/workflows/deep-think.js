@@ -70,6 +70,37 @@ const ADV_PROMPT   = A.adversarial_prompt || 'Are any of these ideas dangerous, 
 const ADV_URL      = A.adversarial_url    || null
 const ADV_MODEL    = A.adversarial_model  || null
 
+function _allowedAdversarialHosts() {
+  const raw = (typeof process !== 'undefined' && process && process.env && process.env.LOCI_ADVERSARIAL_ALLOWED_HOSTS)
+    ? process.env.LOCI_ADVERSARIAL_ALLOWED_HOSTS
+    : ''
+  return raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+}
+
+function _validateAdversarialUrl(urlValue) {
+  if (!urlValue) return null
+  let parsed = null
+  try {
+    parsed = new URL(urlValue)
+  } catch (_err) {
+    throw new Error(`${meta.name}: adversarial_url must be a valid URL`)
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`${meta.name}: adversarial_url protocol must be http/https`)
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${meta.name}: adversarial_url must not embed credentials`)
+  }
+  const host = (parsed.hostname || '').toLowerCase()
+  const allow = _allowedAdversarialHosts()
+  if (!allow.length || !allow.includes(host)) {
+    throw new Error(`${meta.name}: adversarial_url host "${host}" is not allowlisted (set LOCI_ADVERSARIAL_ALLOWED_HOSTS)`)
+  }
+  return parsed.toString()
+}
+
+const SAFE_ADV_URL = _validateAdversarialUrl(ADV_URL)
+
 if (!TARGETS.length) {
   log('No targets provided. Pass args.targets = [{name, focus}, ...] when invoking.')
   return { error: 'no_targets' }
@@ -223,12 +254,12 @@ await parallel(advTargets.map((t, i) => () => {
    )
    ${NO_FABRICATE}`
 
-  if (ADV_URL && ADV_MODEL) {
+  if (SAFE_ADV_URL && ADV_MODEL) {
     return agent(
       base + `
 
-   Build a curl request to the adversarial model:
-   curl -s --max-time 180 "${ADV_URL}" \\
+   Build a curl request to the adversarial model (host already allowlisted by workflow guard):
+   curl -s --max-time 180 "${SAFE_ADV_URL}" \\
      -H 'Content-Type: application/json' \\
      -d '{"model":"${ADV_MODEL}","messages":[{"role":"system","content":"Blunt red-team security and correctness reviewer."},{"role":"user","content":"<the retrieved ideas verbatim>\\n\\n${ADV_PROMPT}"}],"temperature":0.4}'
    Parse choices[0].message.content as the verdict.` + storeStep,

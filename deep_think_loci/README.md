@@ -2,7 +2,7 @@
 
 **A multi-tier reasoning engine that runs as a Claude Code Workflow over a shared Loci/qdrant memory corpus** — the supported replacement for the `deep_think` MCP server's reasoning surface. Tiered models fan out across a problem, persist their findings to a Loci investigation with position + lineage tagging, and an opus tier synthesizes a grounded final answer.
 
-> Status: **v3.2.0-beta**. The pure-Claude path is validated and reliable; see [CHANGELOG.md](./CHANGELOG.md) for the v1→v3.2 evolution and the empirical findings behind each change.
+> Status: **v3.2.1-beta**. The pure-Claude path is validated and reliable; see [CHANGELOG.md](./CHANGELOG.md) for the v1→v3.2 evolution and the empirical findings behind each change.
 
 ## Why
 
@@ -19,7 +19,7 @@ Final       2 opus half-syntheses (per-target grounding-gated, own the red-team)
             → 1 opus final (cross-target nightmares + integrity check)
 ```
 
-Every tier reasons **only over grounding-gated evidence** (see below). The opus tiers own the adversarial red-team — the external uncensored tier was removed in v3.2 (it never persisted across 4 runs and opus covers it; see CHANGELOG).
+Every tier reasons **only over grounding-gated evidence** (see below), including ideation generators. The opus tiers own the adversarial red-team — the external uncensored tier was removed in v3.2 (it never persisted across 4 runs and opus covers it; see CHANGELOG).
 
 ## The two load-bearing patterns
 
@@ -47,6 +47,14 @@ Parameterize via `args` (all optional):
 | `ideas_per_agent` | `10` | ideas per ideation generator |
 | `ground_gate` | `~/.hermes/specialists/grounding/ground_gate.py` | gate script path (installed location) |
 | `ground_threshold` | `0.59` | per-target cosine keep threshold |
+| `scratch_root` | `/tmp/deep_think_loci` | scratch dir for gate candidate/kept JSON files |
+
+Validation constraints (fail-closed with explicit errors):
+- `args` string input must be valid JSON object text (bad JSON is rejected).
+- `ideas_per_agent` must be an integer in `[1, 25]`.
+- `ground_threshold` must be a finite number in `[0.5, 0.95]`.
+- `targets` entries must be `{name, focus}` with `name` matching `[A-Za-z0-9_-]{1,64}`.
+- `scratch_root` must be an absolute unix-like path and cannot contain `..` or `//`.
 
 The gate also runs standalone:
 
