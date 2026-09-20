@@ -74,6 +74,116 @@ def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     assert B.qdrant() == ("q", "k") and B.memory_dir() == "/m"
 
 
+def test_openrouter_and_abliteration_resolve_from_config(tmp_path, monkeypatch):
+    for k in ("OPENROUTER_BASE_URL", "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+              "ABLITERATION_BASE_URL", "ABLITERATION_API_KEY", "ABLITERATION_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text(
+        '[openrouter]\nurl="https://or"\nkey="ork"\nmodel="or-default"\n'
+        '[openrouter.redteam]\nmodel="or-red"\n'
+        '[abliteration]\nurl="https://ab"\nkey="abk"\nmodel="ab-default"\n'
+        '[abliteration.redteam]\nmodel="ab-red"\n'
+    )
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.openrouter() == ("https://or", "ork")
+    assert B.openrouter_model() == "or-default"
+    assert B.openrouter_model("redteam") == "or-red"
+    assert B.abliteration() == ("https://ab", "abk")
+    assert B.abliteration_model() == "ab-default"
+    assert B.abliteration_model("redteam") == "ab-red"
+
+
+def test_cloud_tier_enabled_accepts_bool_and_string(monkeypatch, tmp_path):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text("[cloud]\nenabled=true\n")
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.cloud_tier_enabled() is True
+    monkeypatch.setenv("LOCI_CLOUD_TIER_ENABLED", "0")
+    assert B.cloud_tier_enabled() is False
+
+
+def test_cloud_guardrail_settings_resolve_from_config_then_env(monkeypatch, tmp_path):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text(
+        "[cloud]\n"
+        "max_tokens_per_call=320\n"
+        "daily_call_budget=11\n"
+        "daily_token_budget=8000\n"
+        "deny_providers=[\"abliteration\"]\n"
+        "deny_roles=[\"redteam\"]\n"
+        "allowed_roles=[\"triage\",\"coding\"]\n"
+        "budget_state_path=\"C:\\\\state\\\\cloud-budget.json\"\n"
+    )
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.cloud_max_tokens_per_call() == 320
+    assert B.cloud_daily_call_budget() == 11
+    assert B.cloud_daily_token_budget() == 8000
+    assert B.cloud_deny_providers() == {"abliteration"}
+    assert B.cloud_deny_roles() == {"redteam"}
+    assert B.cloud_allowed_roles() == {"triage", "coding"}
+    assert B.cloud_budget_state_path() == "C:\\state\\cloud-budget.json"
+
+    monkeypatch.setenv("LOCI_CLOUD_TIER_MAX_TOKENS_PER_CALL", "64")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_DAILY_CALL_BUDGET", "2")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_DAILY_TOKEN_BUDGET", "700")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_DENY_PROVIDERS", "openrouter")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_DENY_ROLES", "synthesis")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_ALLOWED_ROLES", "reasoning,triage")
+    monkeypatch.setenv("LOCI_CLOUD_TIER_BUDGET_STATE_PATH", "C:\\state\\cloud.json")
+    assert B.cloud_max_tokens_per_call() == 64
+    assert B.cloud_daily_call_budget() == 2
+    assert B.cloud_daily_token_budget() == 700
+    assert B.cloud_deny_providers() == {"openrouter"}
+    assert B.cloud_deny_roles() == {"synthesis"}
+    assert B.cloud_allowed_roles() == {"reasoning", "triage"}
+    assert B.cloud_budget_state_path() == "C:\\state\\cloud.json"
+
+
+def test_tmux_offload_defaults_preserve_current_behavior(monkeypatch):
+    for key in (
+        "LOCI_TMUX_OFFLOAD_ENABLED",
+        "LOCI_TMUX_OFFLOAD_ROLE_SESSIONS",
+        "LOCI_TMUX_OFFLOAD_EXPENSIVE_ROLES",
+        "LOCI_TMUX_OFFLOAD_REQUIRE_MAPPED_SESSION",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    B._reset_cache()
+    assert B.tmux_offload_enabled() is False
+    assert B.tmux_offload_role_sessions() == {}
+    assert B.tmux_offload_expensive_roles() == set()
+    assert B.tmux_offload_require_mapped_session() is False
+
+
+def test_tmux_offload_policy_resolves_from_config_then_env(monkeypatch, tmp_path):
+    cfg = tmp_path / "b.toml"
+    cfg.write_text(
+        "[tmux_offload]\n"
+        "enabled=true\n"
+        "role_sessions={triage=\"lane-fast\",reasoning=\"lane-deep\"}\n"
+        "expensive_roles=[\"reasoning\",\"synthesis\"]\n"
+        "require_mapped_session=true\n"
+    )
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.tmux_offload_enabled() is True
+    assert B.tmux_offload_role_sessions() == {"triage": "lane-fast", "reasoning": "lane-deep"}
+    assert B.tmux_offload_expensive_roles() == {"reasoning", "synthesis"}
+    assert B.tmux_offload_require_mapped_session() is True
+
+    monkeypatch.setenv("LOCI_TMUX_OFFLOAD_ENABLED", "0")
+    monkeypatch.setenv("LOCI_TMUX_OFFLOAD_ROLE_SESSIONS", "triage=lane-a,redteam=lane-r")
+    monkeypatch.setenv("LOCI_TMUX_OFFLOAD_EXPENSIVE_ROLES", "redteam,reasoning")
+    monkeypatch.setenv("LOCI_TMUX_OFFLOAD_REQUIRE_MAPPED_SESSION", "false")
+    assert B.tmux_offload_enabled() is False
+    assert B.tmux_offload_role_sessions() == {"triage": "lane-a", "redteam": "lane-r"}
+    assert B.tmux_offload_expensive_roles() == {"redteam", "reasoning"}
+    assert B.tmux_offload_require_mapped_session() is False
+
 def test_memory_dir_env_precedence_over_config(tmp_path, monkeypatch):
     cfg = tmp_path / "b.toml"
     cfg.write_text('[memory]\ndir="/cfg/mem"\n')
@@ -99,15 +209,16 @@ def _no_task_model_env(mp):
         mp.delenv(k, raising=False)
 
 
-def test_verify_and_compress_model_fall_back_to_gen_model_when_unset(monkeypatch):
+def test_verify_and_compress_model_use_explicit_hardened_defaults_when_unset(monkeypatch):
     _no_task_model_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     B._reset_cache()
-    assert B.ollama_verify_model() == B.ollama_gen_model()
-    assert B.ollama_compress_model() == B.ollama_gen_model()
+    assert B.ollama_gen_model() == "qwen2.5:3b"
+    assert B.ollama_verify_model() == "qwen3.8:latest"
+    assert B.ollama_compress_model() == "qwen3.8:latest"
 
 
-def test_verify_model_config_key_overrides_gen_model(tmp_path, monkeypatch):
+def test_verify_model_config_key_overrides_hardened_default(tmp_path, monkeypatch):
     _no_task_model_env(monkeypatch)
     cfg = tmp_path / "b.toml"
     cfg.write_text('[ollama]\ngen_model = "fast:1b"\nverify_model = "strong:27b"\n')
@@ -115,7 +226,7 @@ def test_verify_model_config_key_overrides_gen_model(tmp_path, monkeypatch):
     B._reset_cache()
     assert B.ollama_gen_model() == "fast:1b"
     assert B.ollama_verify_model() == "strong:27b"
-    assert B.ollama_compress_model() == "fast:1b"    # unset -> still falls back
+    assert B.ollama_compress_model() == "qwen3.8:latest"
 
 
 def test_compress_model_env_wins_over_config(tmp_path, monkeypatch):
@@ -126,6 +237,16 @@ def test_compress_model_env_wins_over_config(tmp_path, monkeypatch):
     B._reset_cache()
     monkeypatch.setenv("LOCI_OLLAMA_COMPRESS_MODEL", "env-model:latest")
     assert B.ollama_compress_model() == "env-model:latest"
+
+
+def test_critical_paths_can_still_use_qwen25_when_set_explicitly(tmp_path, monkeypatch):
+    _no_task_model_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nverify_model = "qwen2.5:3b"\ncompress_model = "qwen2.5:3b"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.ollama_verify_model() == "qwen2.5:3b"
+    assert B.ollama_compress_model() == "qwen2.5:3b"
 
 
 def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, monkeypatch):

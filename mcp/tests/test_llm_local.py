@@ -176,3 +176,49 @@ def test_no_base_url_fails_open(monkeypatch):
     r = L.generate("say hi")
     assert r["ok"] is False and r["text"] == ""
     assert "no Ollama endpoint" in r["why"]
+
+
+def test_tmux_offload_policy_prioritizes_expensive_role(monkeypatch):
+    import backends
+    monkeypatch.setattr(backends, "tmux_offload_enabled", lambda: True)
+    monkeypatch.setattr(backends, "tmux_offload_role_sessions", lambda: {"reasoning": "loci-reason"})
+    monkeypatch.setattr(backends, "tmux_offload_expensive_roles", lambda: {"reasoning", "synthesis", "redteam"})
+    monkeypatch.setattr(backends, "tmux_offload_require_mapped_session", lambda: False)
+    monkeypatch.setattr(L, "_tmux_session_available", lambda session: session == "loci-reason")
+
+    policy = L._tmux_offload_policy("reasoning")
+    assert policy["enabled"] is True
+    assert policy["session"] == "loci-reason"
+    assert policy["available"] is True
+    assert policy["priority"] == "expensive"
+
+
+def test_tmux_offload_is_noop_when_disabled(monkeypatch):
+    import backends
+    monkeypatch.setattr(backends, "tmux_offload_enabled", lambda: False)
+    monkeypatch.setattr(backends, "tmux_offload_role_sessions", lambda: {"redteam": "loci-redteam"})
+    monkeypatch.setattr(backends, "tmux_offload_expensive_roles", lambda: {"redteam"})
+    monkeypatch.setattr(backends, "tmux_offload_require_mapped_session", lambda: True)
+    assert L._tmux_offload_policy("redteam") == {
+        "enabled": False,
+        "role": "redteam",
+        "priority": "normal",
+        "session": None,
+        "available": False,
+        "require_mapped_session": False,
+        "reason": "feature disabled",
+    }
+
+
+def test_tmux_offload_strict_mode_fails_closed_when_session_missing(monkeypatch):
+    import backends
+    monkeypatch.setattr(backends, "tmux_offload_enabled", lambda: True)
+    monkeypatch.setattr(backends, "tmux_offload_role_sessions", lambda: {"synthesis": "loci-synth"})
+    monkeypatch.setattr(backends, "tmux_offload_expensive_roles", lambda: {"synthesis"})
+    monkeypatch.setattr(backends, "tmux_offload_require_mapped_session", lambda: True)
+    monkeypatch.setattr(L, "_tmux_session_available", lambda session: False)
+
+    r = L.generate("synthesize the design doc", role="synthesis")
+    assert r["ok"] is False
+    assert r["tier"] == "tmux-offload-refused"
+    assert r["tmux_session"] == "loci-synth"

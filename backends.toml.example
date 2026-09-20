@@ -17,11 +17,12 @@
                                         # silently (fail-open -> degraded=True everywhere upstream:
                                         # compress_text, classify_text, query_expand, verify_finding)
 # verify_model = "your-pulled-model:tag"   # optional: model for verify_finding's adversarial
-                                            # reasoning specifically, falls back to gen_model when
-                                            # unset. Live hard-tier benchmarking showed this task
-                                            # benefits from a stronger/slower model than classify.
+                                            # reasoning specifically. If unset, code now routes to
+                                            # qwen3.8:latest by default (hardening), not gen_model.
+                                            # Set explicitly if you want a different tier.
 # compress_model = "your-pulled-model:tag" # optional: model for compress_text's summarization
-                                            # specifically, falls back to gen_model when unset.
+                                            # specifically. If unset, code now routes to
+                                            # qwen3.8:latest by default (hardening), not gen_model.
                                             # Compress correctness varies far more across models
                                             # than classify does — worth tuning independently.
 # guardian_model = "granite3-guardian:2b"  # optional: model for guardian.check_injection_risk's
@@ -60,6 +61,29 @@
 # url = "http://gpu-host:8000"         # batched OpenAI-compatible server (omit -> Ollama fallback)
 # model = "Qwen/Qwen2.5-3B-Instruct"
 
+[cloud]
+# enabled = true                        # enable third-tier cloud fallback after local tiers fail
+# supervisor_model = "qwen3.8:latest"  # local supervisor that routes unspecified requests by role
+# max_tokens_per_call = 512             # hard per-call cap for cloud fallback (0 disables)
+# daily_call_budget = 200               # max cloud fallback calls/day UTC (0 disables)
+# daily_token_budget = 50000            # max requested cloud tokens/day UTC (0 disables)
+# deny_providers = ["abliteration"]     # optional deny-list: "openrouter", "abliteration"
+# deny_roles = ["redteam"]              # optional deny-list: triage/coding/reasoning/synthesis/redteam
+# allowed_roles = ["triage","coding"]   # optional allow-list; empty means all roles
+# budget_state_path = "C:\\Users\\you\\.loci\\cloud_tier_budget.json"
+
+[tmux_offload]
+# enabled = false                       # safe default: feature off preserves existing routing
+# role_sessions = {                     # role -> tmux session mapping (lane names are your choice)
+#   triage = "loci-fast",
+#   coding = "loci-code",
+#   reasoning = "loci-reason",
+#   synthesis = "loci-synth",
+#   redteam = "loci-redteam"
+# }
+# expensive_roles = ["reasoning","synthesis","redteam"]  # roles to prioritize into "expensive" lanes
+# require_mapped_session = false         # if true, fail closed when a mapped session is unavailable
+
 [rerank]
 # model = "BAAI/bge-reranker-v2-m3"    # default; or the lighter "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
@@ -69,3 +93,25 @@
 
 [memory]
 # dir = "/absolute/path/to/curated/MEMORY.md/dir"
+
+[openrouter]
+# url = "https://openrouter.ai/api/v1"
+# key = "or-..."
+# model = "qwen/qwen3.8-27b:free"      # shared cloud offload default when no role mapping is set
+# [openrouter.triage]
+# model = "qwen/qwen3.8-27b:free"
+# [openrouter.coding]
+# model = "prism-ml/ternary-bonsai-2-27b"
+# [openrouter.reasoning]
+# model = "z-ai/glm-5.3-flash"
+# [openrouter.synthesis]
+# model = "deepseek/deepseek-pro-latest"
+# [openrouter.redteam]
+# model = "qwen/qwen3.8-flash"
+
+[abliteration]
+# url = "https://api.abliteration.ai/v1"
+# key = "..."
+# model = "abliterated-model"          # heavy uncensored escalation default
+# [abliteration.redteam]
+# model = "abliterated-model-large-v2"
