@@ -4,6 +4,24 @@ All notable changes to the deep-think-loci reasoning engine. Versions track the
 engine iteration (v1 → v3.2); each was validated against real runs over the Loci
 corpus, and the empirical finding behind each change is recorded.
 
+## [3.2.1-beta] — 2026-09-19
+
+**Guardrail hardening for adversarial lane + unsafe inputs.**
+
+### Fixed
+- **Fail-closed args parsing.** String `args` must now be valid JSON object text; malformed JSON no longer silently falls back to defaults.
+- **Input constraints for unsafe surfaces.** Added explicit validation with clear errors for:
+  - `ideas_per_agent` (`[1, 25]`, integer)
+  - `ground_threshold` (`[0.5, 0.95]`, finite number)
+  - `targets` shape and target names (`[A-Za-z0-9_-]{1,64}`)
+  - `rag_collections` shape/name format
+  - `scratch_root` absolute unix-like path (rejects `..` and `//`)
+- **Shell-injection hardening.** Grounding-gate command paths and file paths are now shell-quoted in prompts; per-target gate labels are normalized.
+- **Ideation gate parity.** Ideation generators now run the same grounding gate discipline before reasoning, instead of relying only on final synthesis gating.
+
+### Changed
+- Added `scratch_root` workflow arg (default `/tmp/deep_think_loci`) to isolate gate intermediates and avoid unsafe free-form temp filenames.
+
 ## [3.2.0-beta] — 2026-06-19
 
 **All-Claude. External uncensored tier removed.**
