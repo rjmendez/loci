@@ -15,7 +15,7 @@ Design mirrors mcp/query_expand.py:
   shared gen_model — live adversarial benchmarking (ab_eval_local_model.py --difficulty
   hard) showed this reasoning task benefits from a stronger/slower model than the
   high-volume classify path; independently configurable via LOCI_OLLAMA_VERIFY_MODEL /
-  [ollama].verify_model (falls back to gen_model when unset).
+  [ollama].verify_model (defaults to qwen3.8:latest when unset).
 
   gen_fn contract (shared): gen_fn(prompt, *, fmt=None, max_tokens=256) -> {"text": str,
   "ok": bool}. ok=False signals the caller should fall back — we treat it as degraded.
@@ -113,7 +113,7 @@ def _lazy_generate(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 
     adversarial benchmarking (ab_eval_local_model.py --difficulty hard) showed
     verify_finding's reasoning task benefits from a stronger/slower model than the
     high-volume classify path, so it is opt-in configurable independently via
-    LOCI_OLLAMA_VERIFY_MODEL / [ollama].verify_model (falls back to gen_model unset).
+    LOCI_OLLAMA_VERIFY_MODEL / [ollama].verify_model (defaults to qwen3.8:latest when unset).
     """
     try:
         from llm_local import generate  # imported lazily so module import never needs it
