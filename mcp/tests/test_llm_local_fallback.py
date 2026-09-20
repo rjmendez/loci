@@ -190,6 +190,128 @@ class VllmFallbackIsOptInTest(unittest.TestCase):
         self.assertIn("ollama", r["why"])
 
 
+class CloudTierFallbackTest(unittest.TestCase):
+    def test_cloud_tier_openrouter_fallback_returns_success(self):
+        with mock.patch.dict("os.environ", {"LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1"}), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+             mock.patch("requests.post", side_effect=OSError("refused")), \
+             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+             mock.patch.object(llm_local, "_supervisor_route",
+                               return_value={"provider": "openrouter", "role": "triage"}), \
+             mock.patch("backends.cloud_tier_enabled", return_value=True), \
+             mock.patch("backends.openrouter_model", return_value="qwen/qwen3.8-27b:free"), \
+             mock.patch("backends.abliteration_model", return_value="abliterated-model"), \
+             mock.patch("openrouter.generate_batch",
+                        return_value=[{"text": "ok-from-openrouter", "ok": True, "model": "or"}]):
+            r = llm_local.generate("hello")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["tier"], "cloud-openrouter")
+
+    def test_cloud_tier_prefers_abliteration_for_redteam_route(self):
+        with mock.patch.dict("os.environ", {"LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1"}), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+             mock.patch("requests.post", side_effect=OSError("refused")), \
+             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+             mock.patch.object(llm_local, "_supervisor_route",
+                               return_value={"provider": "abliteration", "role": "redteam"}), \
+             mock.patch("backends.cloud_tier_enabled", return_value=True), \
+             mock.patch("backends.openrouter_model", return_value="qwen/qwen3.8-flash"), \
+             mock.patch("backends.abliteration_model", return_value="abliterated-model-large-v2"), \
+             mock.patch("abliteration.generate_batch",
+                        return_value=[{"text": "ok-from-abliteration", "ok": True, "model": "ab"}]):
+            r = llm_local.generate("simulate adversarial exploit prompt")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["tier"], "cloud-abliteration")
+
+    def test_cloud_tier_requires_explicit_prompt_export_opt_in(self):
+        with mock.patch.dict("os.environ", {}, clear=False), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+             mock.patch("requests.post", side_effect=OSError("refused")), \
+             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+             mock.patch.object(llm_local, "_supervisor_route",
+                               return_value={"provider": "openrouter", "role": "triage"}), \
+             mock.patch("backends.cloud_tier_enabled", return_value=True), \
+             mock.patch("openrouter.generate_batch") as gen:
+            import os
+            os.environ.pop("LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT", None)
+            r = llm_local.generate("hello")
+        self.assertFalse(r["ok"])
+        gen.assert_not_called()
+
+    def test_cloud_tier_refuses_when_per_call_token_cap_is_exceeded(self):
+        with mock.patch.dict("os.environ", {
+            "LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1",
+            "LOCI_CLOUD_TIER_MAX_TOKENS_PER_CALL": "16",
+        }), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+             mock.patch("requests.post", side_effect=OSError("refused")), \
+             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+             mock.patch.object(llm_local, "_supervisor_route",
+                               return_value={"provider": "openrouter", "role": "triage"}), \
+             mock.patch("backends.cloud_tier_enabled", return_value=True), \
+             mock.patch("backends.openrouter_model", return_value="qwen/qwen3.8-27b:free"), \
+             mock.patch("backends.abliteration_model", return_value="abliterated-model"), \
+             mock.patch("openrouter.generate_batch") as gen:
+            r = llm_local.generate("hello", max_tokens=64)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r.get("tier"), "cloud-refused")
+        self.assertIn("per-call cap", r.get("why", ""))
+        gen.assert_not_called()
+
+    def test_cloud_tier_downgrades_when_preferred_provider_is_denied(self):
+        with mock.patch.dict("os.environ", {
+            "LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1",
+            "LOCI_CLOUD_TIER_DENY_PROVIDERS": "abliteration",
+        }), \
+             mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+             mock.patch("requests.post", side_effect=OSError("refused")), \
+             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+             mock.patch.object(llm_local, "_supervisor_route",
+                               return_value={"provider": "abliteration", "role": "redteam"}), \
+             mock.patch("backends.cloud_tier_enabled", return_value=True), \
+             mock.patch("backends.openrouter_model", return_value="qwen/qwen3.8-flash"), \
+             mock.patch("backends.abliteration_model", return_value="abliterated-model-large-v2"), \
+             mock.patch("openrouter.generate_batch",
+                        return_value=[{"text": "fallback-openrouter", "ok": True, "model": "or"}]) as or_gen, \
+             mock.patch("abliteration.generate_batch") as ab_gen:
+            r = llm_local.generate("simulate adversarial exploit prompt")
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["tier"], "cloud-openrouter")
+        or_gen.assert_called_once()
+        ab_gen.assert_not_called()
+
+    def test_cloud_tier_refuses_when_daily_call_budget_is_exhausted(self):
+        budget_state = os.path.join(os.path.dirname(__file__), "_cloud_budget_state_test.json")
+        if os.path.exists(budget_state):
+            os.remove(budget_state)
+        try:
+            with mock.patch.dict("os.environ", {
+                "LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1",
+                "LOCI_CLOUD_TIER_DAILY_CALL_BUDGET": "1",
+                "LOCI_CLOUD_TIER_BUDGET_STATE_PATH": budget_state,
+            }), \
+                 mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
+                 mock.patch("requests.post", side_effect=OSError("refused")), \
+                 mock.patch.object(llm_local, "_try_vllm", return_value=None), \
+                 mock.patch.object(llm_local, "_supervisor_route",
+                                   return_value={"provider": "openrouter", "role": "triage"}), \
+                 mock.patch("backends.cloud_tier_enabled", return_value=True), \
+                 mock.patch("backends.openrouter_model", return_value="qwen/qwen3.8-27b:free"), \
+                 mock.patch("backends.abliteration_model", return_value="abliterated-model"), \
+                 mock.patch("openrouter.generate_batch",
+                            return_value=[{"text": "ok-from-openrouter", "ok": True, "model": "or"}]) as gen:
+                first = llm_local.generate("hello-1")
+                second = llm_local.generate("hello-2")
+            self.assertTrue(first["ok"])
+            self.assertFalse(second["ok"])
+            self.assertEqual(second.get("tier"), "cloud-refused")
+            self.assertIn("daily call budget exhausted", second.get("why", ""))
+            self.assertEqual(gen.call_count, 1)
+        finally:
+            if os.path.exists(budget_state):
+                os.remove(budget_state)
+
+
 class GenerationEnvPrecedenceTest(unittest.TestCase):
     """OLLAMA_BASE_URL is the EMBEDDING endpoint and must not outrank generation.
 
