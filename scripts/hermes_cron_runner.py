@@ -88,16 +88,33 @@ def _resolve_script(jobs_file: Path, job: dict[str, Any]) -> Path:
     script = str(job.get("script") or "").strip()
     if not script:
         raise ValueError("job has no script")
-    candidate = Path(script).expanduser()
+    candidate = Path(script)
     if candidate.is_absolute():
-        return candidate
-    if job.get("workdir"):
-        return Path(job["workdir"]).expanduser() / script
+        raise ValueError("absolute script paths are not allowed")
+    if ".." in candidate.parts:
+        raise ValueError("script path traversal is not allowed")
+
     repo_or_profile = jobs_file.resolve().parents[1]
-    preferred = repo_or_profile / "scripts" / script
-    if preferred.exists():
-        return preferred
-    return repo_or_profile / script
+    scripts_root = (repo_or_profile / "scripts").resolve()
+    if job.get("workdir"):
+        workdir = Path(job["workdir"]).expanduser().resolve()
+        try:
+            workdir.relative_to(repo_or_profile.resolve())
+        except ValueError as exc:
+            raise ValueError("workdir must stay under the profile/repo root") from exc
+        resolved = (workdir / candidate).resolve()
+    else:
+        resolved = (scripts_root / candidate).resolve()
+
+    try:
+        resolved.relative_to(scripts_root)
+    except ValueError as exc:
+        raise ValueError("script must resolve under <root>/scripts") from exc
+    if not resolved.exists():
+        raise ValueError(f"script does not exist: {resolved}")
+    if not resolved.is_file():
+        raise ValueError(f"script is not a file: {resolved}")
+    return resolved
 
 
 def _command_for(script: Path, python_executable: str) -> list[str]:
@@ -180,25 +197,30 @@ def tick(
                 continue
 
             next_run_at = _next_after(now + interval, due_at, interval).isoformat()
-            script = _resolve_script(jobs_file, job)
-            cmd = _command_for(script, python_executable)
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=str(script.parent),
-            )
-
             job["last_run_at"] = now.isoformat()
             job["next_run_at"] = next_run_at
-            if completed.returncode == 0:
+            try:
+                script = _resolve_script(jobs_file, job)
+                cmd = _command_for(script, python_executable)
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(script.parent),
+                )
+                ok = (completed.returncode == 0)
+                stderr = (completed.stderr or "").strip()
+                stdout = (completed.stdout or "").strip()
+                detail = stderr or stdout or f"exit {completed.returncode}"
+            except Exception as exc:
+                ok = False
+                detail = str(exc)
+
+            if ok:
                 job["last_status"] = "ok"
                 job["last_error"] = None
                 result.executed += 1
             else:
-                stderr = (completed.stderr or "").strip()
-                stdout = (completed.stdout or "").strip()
-                detail = stderr or stdout or f"exit {completed.returncode}"
                 job["last_status"] = "error"
                 job["last_error"] = detail
                 result.executed += 1

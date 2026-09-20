@@ -113,3 +113,57 @@ def test_job_failures_are_persisted_instead_of_silently_swallowed(tmp_path):
     saved = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
     assert saved["last_status"] == "error"
     assert "boom from cron job" in saved["last_error"]
+
+
+def test_absolute_script_path_is_rejected_and_recorded(tmp_path):
+    root = tmp_path / "profile"
+    jobs_file = root / "cron" / "jobs.json"
+    _write_jobs(
+        jobs_file,
+        {
+            "id": "job-abs",
+            "name": "absolute-script",
+            "script": str((root / "scripts" / "noop.py").resolve()),
+            "enabled": True,
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": "2026-08-25T10:55:00-04:00",
+            "last_run_at": "2026-08-25T10:50:00-04:00",
+            "last_status": "ok",
+            "last_error": None,
+        },
+    )
+    uut = _load()
+    result = uut.tick(jobs_file, now=datetime.fromisoformat("2026-08-25T11:00:00-04:00"),
+                      python_executable=sys.executable)
+    assert result.executed == 1
+    assert result.failed == 1
+    saved = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    assert saved["last_status"] == "error"
+    assert "absolute script paths are not allowed" in saved["last_error"]
+
+
+def test_parent_traversal_script_path_is_rejected_and_recorded(tmp_path):
+    root = tmp_path / "profile"
+    jobs_file = root / "cron" / "jobs.json"
+    _write_jobs(
+        jobs_file,
+        {
+            "id": "job-traversal",
+            "name": "traversal-script",
+            "script": "../outside.py",
+            "enabled": True,
+            "schedule": {"kind": "interval", "minutes": 5},
+            "next_run_at": "2026-08-25T10:55:00-04:00",
+            "last_run_at": "2026-08-25T10:50:00-04:00",
+            "last_status": "ok",
+            "last_error": None,
+        },
+    )
+    uut = _load()
+    result = uut.tick(jobs_file, now=datetime.fromisoformat("2026-08-25T11:00:00-04:00"),
+                      python_executable=sys.executable)
+    assert result.executed == 1
+    assert result.failed == 1
+    saved = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    assert saved["last_status"] == "error"
+    assert "path traversal" in saved["last_error"]
