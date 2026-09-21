@@ -36,3 +36,12 @@ def _isolate_the_audit_log(tmp_path, monkeypatch):
     autouse and unconditional: an opt-in fixture is one a new test file forgets.
     """
     monkeypatch.setenv("MEMCHECK_AUDIT_LOG", str(tmp_path / "memcheck-audit.jsonl"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_offload_audit(tmp_path, monkeypatch):
+    """offload_tool_loop writes per-run JSONL under MEMORY_DIR/../audit/offload by default.
+
+    Same rationale as _isolate_the_audit_log: no test may write into the operator's home.
+    """
+    monkeypatch.setenv("LOCI_OFFLOAD_AUDIT_DIR", str(tmp_path / "offload-audit"))

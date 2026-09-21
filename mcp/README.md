@@ -192,6 +192,7 @@ with links back here for full signatures.
 - `semantic_dedup(items, threshold?, text_key?)` — cluster near-duplicate items by embedding similarity
 - `semantic_relevance(texts, topic)` — cosine relevance of each text to a topic
 - `ground(...)` / `swarm_reason(topic, ...)` — structured grounding and bounded local-model swarm reasoning
+- `offload_tool_loop(task, allowed_tools?, max_steps?, max_tool_calls?, max_elapsed_s?, max_output_bytes?, model?, investigation_id?, dry_run?)` — let the local model drive a budgeted, audited, read-only tool loop; returns `done` + answer or `fallback` + a compact handoff (see docs/OPERATIONS.md)
 
 **Audit & health:**
 - `audit_log(tool_name, inputs_json, output, investigation_id?, embedding_text?)` — record a tool call in the audit trail

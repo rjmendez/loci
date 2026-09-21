@@ -93,7 +93,8 @@ def generate(prompt: str,
              max_tokens: int = 256,
              temperature: float = 0.2,
              keep_alive: str = "30m",
-             think: bool = False) -> dict:
+             think: bool = False,
+             timeout: Optional[float] = None) -> dict:
     """Generate text from the local Ollama model. Fail-open, never raises.
 
     Args:
@@ -115,6 +116,8 @@ def generate(prompt: str,
              Set True only for single, quality-critical calls (e.g. a deep-think synthesis
              or self-reflection pass) where the extra latency and larger max_tokens are
              worth the higher-quality result; do NOT enable for high-fanout/cheap tiers.
+        timeout: per-request HTTP timeout in seconds. Defaults to the module `_TIMEOUT`;
+             callers with their own deadline (offload_loop) pass a shorter one.
 
     Returns:
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
@@ -176,7 +179,8 @@ def generate(prompt: str,
         import requests
         _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
                   model, fmt or "", max_tokens)
-        r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
+        r = requests.post(f"{base}/api/generate", json=body,
+                          timeout=_TIMEOUT if timeout is None else float(timeout))
         r.raise_for_status()
         payload = r.json()
         text = (payload.get("response") or "")

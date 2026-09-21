@@ -602,6 +602,37 @@ def adversarial_review(findings: list,
                                               domain=domain), indent=2)
 
 
+def offload_tool_loop(task: str, allowed_tools: Optional[list] = None,
+                      max_steps: int = 8, max_tool_calls: int = 8,
+                      max_elapsed_s: float = 120.0, max_output_bytes: int = 32768,
+                      model: str = "", investigation_id: Optional[str] = None,
+                      dry_run: bool = False) -> str:
+    """
+    Let the LOCAL model work a multi-step, read-only tool loop so the calling cloud model
+    does not spend tokens on the intermediate steps. The local model emits one JSON intent
+    per turn; each is validated against a deny-by-default registry of read-only tools
+    (investigation_search, investigation_entity_lookup, investigation_list,
+    investigation_load, memory_health, code_graph_query), executed under budgets, and
+    fed back as untrusted data. ``allowed_tools`` can only NARROW that set (as can the
+    LOCI_OFFLOAD_TOOLS env var); ``investigation_id`` pins every call to one investigation.
+
+    Budgets are clamped to hard ceilings (20 steps, 20 tool calls, 300 s, 256 KiB). No
+    cloud model is ever called from inside the loop: a run that cannot finish returns
+    ``status="fallback"`` with a compact ``handoff`` for the caller to continue from.
+    Every run writes a JSONL audit trail (path in ``audit.path``). Fail-open: never raises.
+
+    Returns JSON ``{status: done|fallback, reason, answer (done), handoff (fallback),
+    steps, budget, metrics, audit, model, lane}``. ``answer`` is the local model's own
+    unverified claim. ``metrics.est_tokens_*`` are bytes/4 ESTIMATES, not billed tokens.
+    """
+    import offload_loop as _ol
+    return json.dumps(_ol.offload_entry(
+        task, allowed_tools=allowed_tools, max_steps=max_steps,
+        max_tool_calls=max_tool_calls, max_elapsed_s=max_elapsed_s,
+        max_output_bytes=max_output_bytes, model=model, investigation_id=investigation_id,
+        dry_run=dry_run), indent=2, default=str)
+
+
 def register(mcp):
     """Register every local-model passthrough tool on the shared FastMCP instance."""
     for fn in (
@@ -616,5 +647,6 @@ def register(mcp):
         semantic_relevance,
         ground,
         swarm_reason,
+        offload_tool_loop,
     ):
         mcp.tool()(fn)

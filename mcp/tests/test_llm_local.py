@@ -234,3 +234,12 @@ def test_generate_retries_with_discovered_model_after_initial_model_failure(monk
     assert r["ok"] is True
     assert r["model"] == "qwen2.5:3b"
     assert calls["post"] == ["bad-model:1", "qwen2.5:3b"]
+def test_timeout_kwarg_default_and_override(monkeypatch):
+    """generate() posts with _TIMEOUT unless the caller passes its own deadline."""
+    _ensure_base(monkeypatch)
+    cap = {}
+    _install_post(monkeypatch, resp=_FakeResp({"response": "hi"}), capture=cap)
+    L.generate("say hi")
+    assert cap["timeout"] == L._TIMEOUT
+    L.generate("say hi", timeout=7)
+    assert cap["timeout"] == 7.0

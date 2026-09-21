@@ -9201,7 +9201,7 @@ llm_tools.register(mcp)
 from llm_tools import (  # noqa: E402,F401
     llm_local, generate_batch, query_expand, verify_finding, adversarial_review,
     classify_text, compress_text, semantic_dedup, semantic_relevance, ground,
-    swarm_reason,
+    swarm_reason, offload_tool_loop,
 )
 
 # Memory root injected as a lambda over MEMORY_DIR; collaborators are passed in so investigation_tools never imports server.
@@ -9221,6 +9221,13 @@ from investigation_tools import (  # noqa: E402,F401
     investigation_queue_enqueue, investigation_queue_claim,
     investigation_queue_complete, investigation_queue_release,
     investigation_queue_status, investigation_queue_list,
+)
+
+# Real tools are injected into the offload loop here (server.py may run as __main__, so it cannot resolve them itself).
+import offload_loop  # noqa: E402
+offload_loop.bind_tools(
+    {n: globals()[n] for n in offload_loop.TOOL_SPECS if n in globals()},
+    lambda: MEMORY_DIR,
 )
 
 
