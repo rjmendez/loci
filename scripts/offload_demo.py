@@ -2,8 +2,10 @@
 """Offline demo of the offload tool loop (Loci issue #376).
 
 Default mode is deterministic and needs no GPU or network: a scripted "model" drives
-fake tools that return 2-6 KB payloads, and the metrics table shows what a cloud-driven
-loop would have paid versus what the cloud caller pays to read the offloaded result.
+fake tools that return 2-6 KB payloads. It exercises the loop mechanics only. It does NOT
+measure any cloud-token saving: the "model" is a script and the payloads are invented, so
+the printed sizes are fixed by this file. Acceptance criteria 1 (a real local lane
+completes a workflow) and 5 (a demonstrated cloud-spend reduction) are not met by it.
 
     python scripts/offload_demo.py
 
@@ -30,7 +32,8 @@ LIVE_HELP = """\
       max_steps=8)
 
 Warm the model first (scripts/gpu_warm.py) so the ~70s cold load does not eat the
-elapsed budget. Record status, metrics and the head of the audit JSONL (audit.path).
+elapsed budget. Record status, metrics and the head of the audit JSONL (audit.path). To evaluate cloud
+savings, compare against a measured cloud-driven run of the same task; the loop cannot.
 """ % TASK
 
 
@@ -80,12 +83,11 @@ def main() -> int:
     m = env["metrics"]
     print(f"status={env['status']} reason={env['reason']} steps={m['steps']} "
           f"tool_calls={m['tool_calls']}")
-    print("\nESTIMATE (bytes/4), not billed tokens")
-    rows = [("tool bytes produced (raw)", m["tool_bytes_raw"]),
-            ("est tokens, cloud-only loop (baseline)", m["est_cloud_baseline_tokens"]),
-            ("est tokens returned to cloud caller", m["est_tokens_returned"]),
-            ("est tokens saved", m["est_tokens_saved"]),
-            ("savings ratio", m["savings_ratio"])]
+    print("\nSCRIPTED MODEL, FAKE TOOLS: sizes below are set by this script, not measured.")
+    print("ESTIMATE (bytes/4) of local traffic, not billed tokens; no cloud saving is claimed.")
+    rows = [("tool bytes produced (raw, fake)", m["tool_bytes_raw"]),
+            ("est tokens, local model traffic", m["est_tokens_local"]),
+            ("est tokens returned to caller", m["est_tokens_returned"])]
     for label, val in rows:
         print(f"  {label:<42}{val:>10}")
     return 0 if env["status"] == "done" else 1

@@ -11,7 +11,8 @@ Everything is injected (model_fn, tools, clock, audit sink) so run_loop is testa
 offline. server.py wires the real tools once via bind_tools(); the registry itself is
 code, so no env var or argument can add a tool, only remove one.
 
-Token figures are ESTIMATES (bytes // 4) and a modelled baseline, never billed tokens.
+Token figures are ESTIMATES (bytes // 4) of local traffic, never billed tokens. No cloud
+saving is claimed: that needs a measured cloud-loop comparison this module cannot make.
 """
 from __future__ import annotations
 
@@ -82,6 +83,9 @@ class ToolSpec:
     requires_approval: bool = False
     params: dict = field(default_factory=dict)
     max_output_bytes: int = 4096
+    # False = the tool cannot be scoped to one investigation (no investigation_id param),
+    # so it is denied and hidden whenever a run is pinned.
+    scope_aware: bool = True
 
 
 def _s(max_len=200, required=False, enum=None, default=None):
@@ -107,7 +111,7 @@ TOOL_SPECS: dict = {s.name: s for s in (
         "investigation_id": _s(128),
         "limit": _i(1, 20, 10),
     }),
-    ToolSpec("investigation_list", True, params={
+    ToolSpec("investigation_list", True, scope_aware=False, params={
         "limit": _i(1, 50, 20),
         "offset": _i(0, 10000, 0),
     }),
@@ -119,7 +123,7 @@ TOOL_SPECS: dict = {s.name: s for s in (
     ToolSpec("memory_health", True, params={
         "investigation_id": _s(128),
     }),
-    ToolSpec("code_graph_query", True, params={
+    ToolSpec("code_graph_query", True, scope_aware=False, params={
         "cypher": _s(1000, required=True),
         "params": {"type": "dict", "required": False},
     }),
@@ -228,6 +232,10 @@ def decide(intent: dict, policy_ctx: dict) -> Decision:
         return _deny("not_allowed")
     if not spec.readonly:
         return Decision("needs_approval", "needs_approval", None)   # never executed
+    if policy_ctx.get("pinned") and not spec.scope_aware:
+        # Cannot be limited to the pinned investigation (lists all of them / free-form
+        # Cypher over every Finding, retracted ones included): deny, never run unscoped.
+        return _deny("pinned_unscoped")
     args = intent.get("args", {})
     if not isinstance(args, dict):
         return _deny("bad_args", "args_not_object")
@@ -391,7 +399,7 @@ def build_prompt(task: str, allow, transcript: list, steps_left: int, calls_left
             f"tool_calls_left: {calls_left}\n\nHistory:\n{history}\n\nYour reply (one JSON object):")
 
 
-def default_model_fn(model: str, max_tokens: int = 400) -> Callable:
+def default_model_fn(model: str, max_tokens: int = 1024) -> Callable:
     """Closure over llm_local.generate (imported lazily; the tool of that name shadows it)."""
     def _fn(prompt: str, timeout: float) -> dict:
         import llm_local
@@ -420,7 +428,7 @@ def jsonl_sink(directory, run_id: str) -> Callable[[dict], None]:
 
     def _write(event: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
+        with open(path, "a", encoding="utf-8", errors="replace") as fh:
             fh.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
             fh.flush()
 
@@ -466,6 +474,28 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
+def _scrub(obj):
+    """Replace unencodable code points (lone surrogates from JSON escapes) recursively."""
+    if isinstance(obj, str):
+        return obj.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {_scrub(k): _scrub(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub(v) for v in obj]
+    return obj
+
+
+def _is_error_payload(out: str) -> bool:
+    """Tools report most failures as a JSON object with a top-level ``error`` key."""
+    if not out or out.lstrip()[:1] != "{":
+        return False
+    try:
+        obj = json.loads(out)
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and "error" in obj
+
+
 def _canon(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -503,7 +533,10 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
     if memory_dir is None and _MEMORY_DIR_FN is not None:
         memory_dir = _MEMORY_DIR_FN
     mem_path = Path(memory_dir() if callable(memory_dir) else memory_dir) if memory_dir else None
-    ctx = {"allow": policy.allow, "pinned": pinned_investigation_id, "memory_dir": mem_path}
+    # A pinned run never sees tools that cannot be scoped to the pinned investigation.
+    allow = policy.allow if not pinned_investigation_id else frozenset(
+        n for n in policy.allow if n in TOOL_SPECS and TOOL_SPECS[n].scope_aware)
+    ctx = {"allow": allow, "pinned": pinned_investigation_id, "memory_dir": mem_path}
 
     def emit(etype: str, **payload) -> bool:
         st["seq"] += 1
@@ -530,11 +563,10 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                     "pending_intent": st["pending"], "run_id": run_id}
                 if extra.get("why"):
                     handoff["why"] = extra["why"]
-            returned = len((answer or "").encode()) + (
+            returned = len((answer or "").encode("utf-8", "replace")) + (
                 len(json.dumps(handoff, default=str).encode()) if handoff else 0)
             local = (st["prompt_bytes"] + st["completion_bytes"]) // 4
             est_ret = returned // 4
-            saved = max(0, local - est_ret)
             metrics = {
                 "steps": st["steps_done"], "tool_calls": st["tool_calls"],
                 "denied": st["denied"], "repeats": st["repeats"],
@@ -543,10 +575,9 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                 "prompt_bytes_local": st["prompt_bytes"],
                 "completion_bytes_local": st["completion_bytes"],
                 "returned_bytes": returned, "est_tokens_local": local,
-                "est_tokens_returned": est_ret, "est_cloud_baseline_tokens": local,
-                "est_tokens_saved": saved,
-                "savings_ratio": round(saved / local, 4) if local else 0.0,
-                "estimate_note": "est = bytes/4; modelled baseline, not billed tokens"}
+                "est_tokens_returned": est_ret,
+                "estimate_note": "est = bytes/4 of local traffic; not billed tokens and "
+                                 "not a measured cloud saving"}
             emit("run_end", status=status, reason=reason, steps=st["steps_done"],
                  metrics=metrics)
             env = {
@@ -568,6 +599,8 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
             env.update({k: v for k, v in extra.items() if k == "why"})
             return env
         except Exception as exc:   # last resort: still an envelope
+            emit("run_end", status="fallback", reason="wrapper_exception",
+                 why=type(exc).__name__, steps=st["steps_done"])
             return {"schema_version": 1, "run_id": run_id, "status": "fallback",
                     "reason": "wrapper_exception", "why": type(exc).__name__,
                     "steps": [], "lane": "local", "ignored_tools": []}
@@ -582,11 +615,13 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
     try:
         if not isinstance(task, str) or not task.strip():
             return finish("fallback", "bad_task")
-        if not emit("run_start", task=task, model=model, allow=sorted(policy.allow),
+        if not allow:
+            return finish("fallback", "no_tools_allowed")
+        if not emit("run_start", task=task, model=model, allow=sorted(allow),
                     budgets=policy.limits(), pinned_investigation_id=pinned_investigation_id,
-                    dry_run=dry_run, static_prompt=_static_prefix(task, policy.allow),
+                    dry_run=dry_run, static_prompt=_static_prefix(task, allow),
                     policy_fingerprint=_sha(",".join(sorted(TOOL_SPECS)) + "|"
-                                            + ",".join(sorted(policy.allow)))):
+                                            + ",".join(sorted(allow)))):
             return finish("fallback", "audit_unavailable")
 
         for n in range(1, policy.max_steps + 1):
@@ -595,7 +630,7 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                 return finish("fallback", "timeout")
             if st["fed"] >= policy.max_output_bytes:
                 return finish("fallback", "output_budget")
-            prompt = build_prompt(task, policy.allow, st["transcript"],
+            prompt = build_prompt(task, allow, st["transcript"],
                                   policy.max_steps - n + 1,
                                   policy.max_tool_calls - st["tool_calls"])
             pbytes = len(prompt.encode("utf-8", "replace"))
@@ -614,16 +649,30 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
             except Exception as exc:
                 res = {"ok": False, "text": "", "why": f"{type(exc).__name__}: {exc}"[:200]}
             text = res.get("text") or ""
+            if not isinstance(text, str):
+                text = str(text)
+            text = _scrub(text)
             st["completion_bytes"] += len(text.encode("utf-8", "replace"))
             st["model"] = res.get("model") or st["model"]
             emit("model_call_result", n=n, raw_text=text[:4096], ok=bool(res.get("ok")),
                  why=res.get("why"))
-            if not res.get("ok"):
+            # llm_local reports a reply that is not valid JSON (typically cut off by the
+            # token cap) as ok=False with the text kept: that is a bad turn, not an outage.
+            truncated_reply = (not res.get("ok") and bool(text.strip())
+                               and str(res.get("why") or "").startswith(
+                                   "response was not valid JSON"))
+            if not res.get("ok") and not truncated_reply:
                 step_rec(n, None, "model_unavailable", "model_unavailable")
                 st["unresolved"] = str(res.get("why") or "model unavailable")[:300]
                 return finish("fallback", "model_unavailable", why=res.get("why"))
 
-            intent, err, dropped = parse_intent(text)
+            if truncated_reply:
+                intent, err, dropped = (None, "reply was cut off or not valid JSON; "
+                                        "keep it short", [])
+            else:
+                intent, err, dropped = parse_intent(text)
+                if intent is not None:
+                    intent = _scrub(intent)
             if err:
                 st["bad_turns"] += 1
                 st["bad_turns_total"] += 1
@@ -663,7 +712,7 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                 st["unresolved"] = f"tool call denied: {dec.reason_code}"
                 if st["denied_streak"] >= MAX_DENIED:
                     return finish("fallback", "denied_streak")
-                note(json.dumps({"denied": dec.reason_code, "allowed": sorted(policy.allow)}))
+                note(json.dumps({"denied": dec.reason_code, "allowed": sorted(allow)}))
                 continue
 
             args = dec.args_clean
@@ -690,7 +739,7 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                 st["denied_streak"] += 1
                 if st["denied_streak"] >= MAX_DENIED:
                     return finish("fallback", "denied_streak")
-                note(json.dumps({"denied": "tool_unbound", "allowed": sorted(policy.allow)}))
+                note(json.dumps({"denied": "tool_unbound", "allowed": sorted(allow)}))
                 continue
 
             executed.add(h)
@@ -703,6 +752,8 @@ def run_loop(task: str, *, policy: Policy, model_fn: Callable, tools, memory_dir
                     fn, args, max(0.01, min(TOOL_TIMEOUT_S, policy.max_elapsed_s
                                             - (clock() - t0))))
             ms = int((clock() - started) * 1000)
+            if ok and _is_error_payload(out):
+                ok = False    # {"error": ...} is the tools' normal failure convention
             raw_bytes = len(out.encode("utf-8", "replace"))
             cap = TOOL_SPECS[name].max_output_bytes
             shown = out
@@ -755,7 +806,7 @@ def _early(reason: str, task, policy: Optional[Policy], ignored: list, why: str 
            "budget": {"limits": lim, "consumed": {"steps": 0, "tool_calls": 0,
                                                   "elapsed_s": 0.0, "fed_back_bytes": 0}},
            "metrics": {"steps": 0, "tool_calls": 0, "est_tokens_local": 0,
-                       "est_tokens_returned": 0, "est_tokens_saved": 0, "savings_ratio": 0.0},
+                       "est_tokens_returned": 0},
            "audit": {"path": None, "run_id": None, "degraded": False},
            "model": "", "lane": "local", "ignored_tools": ignored}
     if why:

@@ -614,7 +614,7 @@ def offload_tool_loop(task: str, allowed_tools: Optional[list] = None,
     (investigation_search, investigation_entity_lookup, investigation_list,
     investigation_load, memory_health, code_graph_query), executed under budgets, and
     fed back as untrusted data. ``allowed_tools`` can only NARROW that set (as can the
-    LOCI_OFFLOAD_TOOLS env var); ``investigation_id`` pins every call to one investigation.
+    LOCI_OFFLOAD_TOOLS env var); ``investigation_id`` pins the run to one investigation (tools that cannot be scoped, investigation_list and code_graph_query, are removed for that run).
 
     Budgets are clamped to hard ceilings (20 steps, 20 tool calls, 300 s, 256 KiB). No
     cloud model is ever called from inside the loop: a run that cannot finish returns

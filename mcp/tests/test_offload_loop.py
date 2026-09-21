@@ -586,29 +586,28 @@ def test_dry_run(tmp_path):
 
 # ---------------------------------------------------------------- AC5: metrics
 
-def test_metrics_and_token_savings(tmp_path):
-    """[AC5] Modelled cloud-only loop vs offloaded loop on a 4-step workflow.
-
-    Baseline = what a cloud-driven loop would pay running the same prompts and
-    completions; offloaded = what the cloud caller pays to read the returned answer.
-    Both are ESTIMATES (bytes // 4), not billed tokens.
-    """
-    payload = lambda kw: json.dumps({"q": kw, "rows": ["evidence line " * 8] * 55})  # ~6 KB
-    tool = Tool(payload)
-    assert len(payload({"query": "a"})) > 5500
+def test_metrics_report_local_traffic_only_no_savings_claim(tmp_path):
+    """[AC5, partial] Metrics are bytes//4 estimates of LOCAL traffic. No baseline, saved
+    or ratio figure is emitted: with a scripted model those were constant by
+    construction, and they were credited to fallback runs. AC5 (a measured reduction in
+    cloud spend) is NOT demonstrated by any offline test."""
+    tool = Tool(lambda kw: json.dumps({"q": kw, "rows": ["evidence line " * 8] * 55}))
     model = scripted(*[tc("investigation_search", query=f"lead {i}") for i in range(4)],
-                     final("Investigations A and B mention the host; A is open, B fixed."))
+                     final("Investigations A and B mention the host."))
     env = run(tmp_path, "which investigations mention the host?", model,
               mk_tools(investigation_search=tool))
     m = env["metrics"]
     assert env["status"] == "done" and m["tool_calls"] == 4
     assert m["est_tokens_local"] > 0
     assert m["est_tokens_returned"] == m["returned_bytes"] // 4
-    assert m["est_cloud_baseline_tokens"] == m["est_tokens_local"]
-    assert m["savings_ratio"] >= 0.7, (
-        f"savings_ratio={m['savings_ratio']} baseline={m['est_cloud_baseline_tokens']} "
-        f"returned={m['est_tokens_returned']} (estimates, bytes/4)")
+    for gone in ("est_cloud_baseline_tokens", "est_tokens_saved", "savings_ratio"):
+        assert gone not in m
     assert env["answer_provenance"] == "local_model_unverified"
+    # A fallback run must not carry any saving either.
+    env = run(tmp_path, "t", scripted(json.dumps({"action": "abort", "content": "no"})),
+              mk_tools(), run_id="r2")
+    assert env["status"] == "fallback"
+    assert not {"est_tokens_saved", "savings_ratio"} & set(env["metrics"])
 
 
 def test_aggregate_metrics(tmp_path):
@@ -670,3 +669,100 @@ def test_wrapper_registered_and_never_raises(tmp_path, monkeypatch):
     assert json.loads(llm_tools.offload_tool_loop(
         "t", investigation_id="bogus"))["reason"] == "unknown_investigation"
     assert not (tmp_path / "mem" / "bogus").exists()
+
+
+# ---------------------------------------------------------------- review fixes (#376)
+
+def test_pinned_run_denies_and_hides_unscoped_tools(tmp_path):
+    inv = mk_investigation(tmp_path, "inv-a")
+    lister = Tool(json.dumps({"investigations": [{"id": "inv-a"}, {"id": "secret-b"}]}))
+    cg = Tool(json.dumps({"rows": [["secret finding of investigation B"]]}))
+    model = scripted(tc("investigation_list"),
+                     tc("code_graph_query", cypher="MATCH (f:Finding) RETURN f.text"),
+                     final("x"))
+    env = run(tmp_path, "t", model, mk_tools(investigation_list=lister, code_graph_query=cg),
+              pinned_investigation_id=inv)
+    assert lister.n == 0 and cg.n == 0
+    assert [s["verdict"] for s in env["steps"][:2]] == ["deny", "deny"]
+    # Hidden from the prompt too.
+    assert "- investigation_list(" not in model.calls[0][0]
+    assert "- code_graph_query(" not in model.calls[0][0]
+    assert "- investigation_search(" in model.calls[0][0]
+    # Defence in depth: decide() itself refuses even if the allowlist still had them.
+    c = ctx(tmp_path, pinned=inv)
+    assert ol.decide({"tool": "investigation_list", "args": {}}, c).reason_code == \
+        "pinned_unscoped"
+    # Unpinned runs are unchanged.
+    assert ol.decide({"tool": "investigation_list", "args": {}}, ctx(tmp_path)).verdict == "allow"
+
+
+def test_pinned_run_with_only_unscoped_tools_has_nothing_to_run(tmp_path):
+    inv = mk_investigation(tmp_path, "inv-a")
+    model = scripted()
+    env = run(tmp_path, "t", model, mk_tools(investigation_list=Tool()),
+              allow={"investigation_list"}, pinned_investigation_id=inv)
+    assert env["status"] == "fallback" and env["reason"] == "no_tools_allowed"
+    assert model.calls == []
+
+
+def test_error_json_from_tool_counts_as_failure(tmp_path):
+    tool = Tool(lambda kw: json.dumps({"error": "kuzu unavailable"}))
+    model = scripted(*[tc("code_graph_query", cypher=f"MATCH (n) RETURN n LIMIT {i}")
+                       for i in range(1, 9)], final("done anyway"))
+    env = run(tmp_path, "t", model, mk_tools(code_graph_query=tool))
+    assert env["status"] == "fallback" and env["reason"] == "tool_error_streak"
+    assert tool.n == 2
+    assert all(s["reason_code"] == "tool_failed" for s in env["steps"])
+    rec = [r for r in read_audit(env["audit"]["path"]) if r["type"] == "tool_result"]
+    assert [r["ok"] for r in rec] == [False, False]
+    # A benign payload that merely mentions "error" deeper down is still a success.
+    ok_tool = Tool(json.dumps({"rows": [{"error": "in data"}]}))
+    env = run(tmp_path, "t", scripted(tc("memory_health"), final()),
+              mk_tools(memory_health=ok_tool), run_id="r2")
+    assert env["status"] == "done"
+
+
+def test_lone_surrogate_in_final_answer_is_survivable(tmp_path):
+    # JSON escape for a lone surrogate: json.loads accepts it, utf-8 cannot encode it.
+    model = scripted('{"action":"final_answer","content":"\\ud800 hi"}')
+    env = run(tmp_path, "t", model, mk_tools())
+    assert env["status"] == "done" and env["reason"] == "finished"
+    assert "hi" in env["answer"]
+    env["answer"].encode("utf-8")
+    types = [r["type"] for r in read_audit(env["audit"]["path"])]
+    assert types[0] == "run_start" and types[-1] == "run_end"
+    assert "intent" in types and "model_call_result" in types
+
+
+def test_lone_surrogate_in_tool_output_and_args(tmp_path):
+    # A raw lone surrogate character returned by a tool must not break the audit sink.
+    raw = Tool("bad \ud800 text")
+    env = run(tmp_path, "t", scripted(tc("memory_health"), final("ok")),
+              mk_tools(memory_health=raw), run_id="r2")
+    assert env["status"] == "done"
+    assert read_audit(env["audit"]["path"])[-1]["type"] == "run_end"
+
+
+def test_truncated_json_reply_is_a_bad_turn_not_an_outage(tmp_path):
+    truncated = '{"action":"final_answer","content":"this answer was cut o'
+    calls = []
+
+    def model_fn(prompt, timeout):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return {"ok": False, "text": truncated, "model": "fake",
+                    "why": "response was not valid JSON: Unterminated string"}
+        return {"ok": True, "text": final("short answer"), "model": "fake"}
+
+    env = run(tmp_path, "t", model_fn, mk_tools())
+    assert env["status"] == "done" and env["answer"] == "short answer"
+    assert "cut off" in calls[1]
+    # Repeated truncation ends as bad_turns, not model_unavailable.
+    env = run(tmp_path, "t", lambda p, timeout: {
+        "ok": False, "text": truncated, "why": "response was not valid JSON: x"},
+        mk_tools(), run_id="r2")
+    assert env["reason"] == "bad_turns"
+    # A real transport failure (no text) is still an outage.
+    env = run(tmp_path, "t", lambda p, timeout: {"ok": False, "text": "", "why": "conn refused"},
+              mk_tools(), run_id="r3")
+    assert env["reason"] == "model_unavailable"

@@ -584,8 +584,11 @@ and the caller continues from that.
 Read-only tools: `investigation_search`, `investigation_entity_lookup`,
 `investigation_list`, `investigation_load`, `memory_health`, `code_graph_query`
 (stricter Cypher guard: MATCH/WITH/UNWIND/RETURN only, no `;`, no CALL/LOAD/etc.).
-Model-supplied `investigation_id`s must already exist; `investigation_id=` on the tool
-pins every call to one investigation.
+Model-supplied `investigation_id`s must already exist. `investigation_id=` on the tool
+pins the run to one investigation: it overwrites the `investigation_id` argument of every
+tool that has one, and removes the tools that cannot be scoped (`investigation_list`,
+`code_graph_query`) from the allowlist for that run (they are also denied as
+`pinned_unscoped`).
 
 | Env var | Effect |
 |---|---|
@@ -603,7 +606,7 @@ Stop reasons (`reason`; only `finished` is `status="done"`): `finished`, `gave_u
 `max_steps`, `max_tool_calls`, `timeout`, `output_budget`, `prompt_budget`, `bad_turns`
 (3 consecutive unparseable replies), `denied_streak` (3), `repeat_call`, `no_progress`
 (3 identical results), `tool_error_streak` (2), `tool_timeout` (2 abandoned calls),
-`model_unavailable` (stops at step 1, no tool runs), `approval_required` (a non-read-only
+`model_unavailable` (transport failure or empty reply; a reply cut off mid-JSON counts as a bad turn instead), `approval_required` (a non-read-only
 spec was requested; never executed), `audit_unavailable`, `no_tools_allowed`,
 `disabled`, `tools_unbound`, `unknown_investigation`, `bad_task`, `wrapper_exception`.
 
@@ -615,12 +618,20 @@ by deleting old files. `offload_loop.aggregate_metrics(dir, days=7)` summarises
 `run_end` records (no MCP tool for it yet).
 
 Warm the model first (`scripts/gpu_warm.py`): a ~70 s cold load otherwise consumes the
-elapsed budget. `python scripts/offload_demo.py` shows the metrics offline.
+elapsed budget. `python scripts/offload_demo.py` runs the loop offline with a scripted model (mechanics only).
 
 Token figures in `metrics` are ESTIMATES, not billed tokens: `est_tokens_local =
-(prompt + completion bytes) // 4`; the baseline (`est_cloud_baseline_tokens`) is what a
-cloud-driven loop would pay running the same prompts and completions;
-`est_tokens_returned = returned_bytes // 4` is what the caller pays to read the result.
+(prompt + completion bytes) // 4` is the local model's traffic and `est_tokens_returned =
+returned_bytes // 4` is what the caller pays to read the result. No cloud saving or
+baseline is reported: a number derived from the local model's own traffic says nothing
+about what a cloud loop would have cost, and a fallback run may cost the cloud more.
+Measuring that needs a real cloud-driven run of the same task.
+
+Status of the acceptance criteria: the loop mechanics are tested offline with a scripted
+model and fake tools (`mcp/tests/test_offload_loop.py`, `scripts/offload_demo.py`).
+Criterion 1 (a real local lane completing a multi-step workflow) and criterion 5 (a
+demonstrated reduction in cloud token spend) are NOT demonstrated: no warmed-lane run
+against a real investigation is recorded yet.
 
 Residual risks: the `answer` is the local model's unverified claim
 (`answer_provenance: local_model_unverified`); Mnemosyne recall inside
