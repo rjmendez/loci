@@ -31,6 +31,8 @@ Tools:
     investigation_finding_provenance — trace a finding back to its root observed evidence
     investigation_list           — list all investigations
     audit_log                    — record a tool call/response pair (post-call hook)
+    memory_route_counterfactual_simulate — replay audited memory-route traces under alternate policies
+    memory_route_policy_optimize — derive conservative route-policy recommendations from audited outcomes
     memory_self_check            — provenance + contradiction self-check on investigation findings
     memory_retract               — soft-tombstone a hallucinated finding + its derived lineage
     memory_restore               — undo a retraction
@@ -81,6 +83,16 @@ from memcheck.checks import (  # noqa: E402
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
 from compact import compact_context_rows, compact_finding_row, compact_sources  # noqa: E402
 from model_json import extract_json_object  # noqa: E402
+from slow_neuromod import (
+    assert_confidence_policy_invariants,
+    assert_consolidation_policy_invariants,
+    assert_routing_policy_invariants,
+    consolidation_policy,
+    confidence_policy,
+    load_state,
+    observe,
+    routing_policy,
+)  # noqa: E402
 from untrusted_memory import wrap_untrusted_memory_text  # noqa: E402
 
 # Accept the legacy HERMES_* spelling of Loci's own variables.
@@ -237,6 +249,10 @@ from provenance_firewall import (  # noqa: E402
     assert_evidence_firewall,
     normalize_provenance_tier,
     provenance_fields,
+)
+from replay_fingerprint import (  # noqa: E402
+    apply_finding_fingerprints,
+    flybrain_audit_fingerprint,
 )
 
 
@@ -2412,6 +2428,15 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 _STORE_FINDING_TYPES = {"observed", "inferred", "assumed", "gap", "procedure"}
 _STORE_CONFIDENCES = {"high", "medium", "low"}
 _STORE_TIERS = {"hot", "warm", "cold"}
+_FLYBRAIN_CLAIM_SCOPE_KEYS = (
+    "dataset",
+    "dataset_version",
+    "sex",
+    "life_stage",
+    "annotation_completeness",
+    "circuit_class",
+    "experience_window",
+)
 
 
 def _store_validate(finding_type: str, confidence: str, tier: str, resolution: str) -> Optional[str]:
@@ -2450,6 +2475,186 @@ def _normalize_finding_metadata(metadata: Any) -> Optional[dict]:
         except Exception:
             return {"value": metadata}
     return {"value": metadata}
+
+
+def _is_valid_flybrain_scope_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+        return True
+    return False
+
+
+def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tuple[Optional[dict], Optional[str]]:
+    """Validate flybrain claim scope metadata fail-closed; keep non-flybrain fail-open."""
+    if not isinstance(metadata, dict) or not metadata:
+        return metadata, None
+
+    out = dict(metadata)
+    flybrain_prov = out.get("flybrain_provenance")
+    claim_scope = out.get("claim_scope")
+
+    # Accept either top-level metadata.claim_scope or the nested
+    # metadata.flybrain_provenance.claim_scope form, but normalize to both.
+    if claim_scope is None and isinstance(flybrain_prov, dict):
+        nested_scope = flybrain_prov.get("claim_scope")
+        if nested_scope is not None:
+            claim_scope = nested_scope
+
+    should_validate = ("claim_scope" in out) or ("flybrain_provenance" in out)
+    if not should_validate:
+        return out, None
+
+    if not isinstance(claim_scope, dict):
+        return None, (
+            "flybrain claim_scope must be a JSON object containing keys: "
+            + ", ".join(_FLYBRAIN_CLAIM_SCOPE_KEYS)
+        )
+
+    missing = [k for k in _FLYBRAIN_CLAIM_SCOPE_KEYS if k not in claim_scope]
+    if missing:
+        return None, (
+            "flybrain claim_scope is missing required key(s): "
+            + ", ".join(missing)
+        )
+
+    invalid = [k for k in _FLYBRAIN_CLAIM_SCOPE_KEYS if not _is_valid_flybrain_scope_value(claim_scope.get(k))]
+    if invalid:
+        return None, (
+            "flybrain claim_scope has invalid value(s) for key(s): "
+            + ", ".join(invalid)
+            + ". Values must be non-empty strings or scalar numbers/booleans."
+        )
+
+    normalized_scope = {
+        k: (claim_scope[k].strip() if isinstance(claim_scope[k], str) else claim_scope[k])
+        for k in _FLYBRAIN_CLAIM_SCOPE_KEYS
+    }
+    out["claim_scope"] = normalized_scope
+
+    if isinstance(flybrain_prov, dict):
+        flybrain_out = dict(flybrain_prov)
+        flybrain_out["claim_scope"] = dict(normalized_scope)
+        out["flybrain_provenance"] = flybrain_out
+
+    return out, None
+
+
+def _docs_ingest_summary_from_markdown(raw_text: str, *, title: str | None = None, max_chars: int = 600) -> str:
+    """Return a compact summary for a markdown doc using its headings and opening paragraphs."""
+    text = (raw_text or "").strip()
+    if not text:
+        return "Empty markdown document."
+    headings = re.findall(r"^#{1,6}\s+(.+)$", text, flags=re.M)
+    para_candidates = []
+    for block in re.split(r"\n\s*\n", text):
+        compact = re.sub(r"\s+", " ", block).strip()
+        if len(compact) > 40:
+            para_candidates.append(compact)
+    lead = para_candidates[0] if para_candidates else ""
+    if headings:
+        label = headings[0].strip()
+        summary = f"{label}. {lead}" if lead else label
+        if len(summary) > max_chars:
+            summary = summary[:max_chars - 1].rsplit(" ", 1)[0] + "…"
+        return summary
+    if lead:
+        summary = lead
+        if len(summary) > max_chars:
+            summary = summary[:max_chars - 1].rsplit(" ", 1)[0] + "…"
+        return summary
+    base = title or "Documentation"
+    return f"{base}: no useful body text was found."
+
+
+def _docs_ingest_targets(document_path: str) -> list[Path]:
+    """Resolve a file or directory to markdown targets; fail-open to [] if the path is invalid."""
+    p = Path(document_path).expanduser()
+    if not p.exists():
+        return []
+    if p.is_file():
+        return [p] if p.suffix.lower() in {".md", ".markdown", ".txt"} else []
+    if p.is_dir():
+        return sorted({x for x in p.rglob("*.md") if x.is_file()})
+    return []
+
+
+@mcp.tool()
+def docs_ingest_indexer(
+    document_path: str,
+    investigation_id: str = "loci-docs-index",
+    summary_only: bool = False,
+    source: str = "docs_ingest_indexer",
+    confidence: str = "medium",
+) -> str:
+    """Index markdown or text docs into the standard Loci investigation store with provenance."""
+    targets = _docs_ingest_targets(document_path)
+    if not targets:
+        return json.dumps({
+            "error": f"No readable markdown/text documents found under: {document_path}",
+            "stored": 0,
+            "investigation_id": investigation_id,
+        })
+
+    _ensure_investigation_exists(
+        investigation_id,
+        title=f"Docs index for {Path(document_path).name or 'markdown'}",
+        context="Markdown docs are indexed here through the standard Loci investigation-store provenance path.",
+    )
+
+    records: list[dict] = []
+    for doc_path in targets:
+        text = doc_path.read_text(encoding="utf-8", errors="replace")
+        raw = text.strip()
+        doc_title = doc_path.stem.replace("-", " ").replace("_", " ").strip() or doc_path.name
+        summary = _docs_ingest_summary_from_markdown(raw, title=doc_title)
+        metadata = {
+            "title": doc_title,
+            "source_path": str(doc_path),
+            "doc_kind": "markdown",
+            "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "content_length": len(raw),
+            "doc_summary": summary,
+            "provenance": {
+                "tool_name": "docs_ingest_indexer",
+                "tool_variant": "docs_ingest_indexer",
+                "source_path": str(doc_path),
+                "document_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                "content_length": len(raw),
+                "ingested_at": _now(),
+            },
+            "evidence_provenance_tier": "tool_verified",
+        }
+        if not summary_only:
+            metadata["content_excerpt"] = raw[:1200]
+
+        finding_text = f"{doc_title}: {summary}"
+        store_result = json.loads(investigation_store(
+            investigation_id=investigation_id,
+            finding_type="observed",
+            text=finding_text,
+            source=source,
+            confidence=confidence,
+            tags=["docs", "markdown", "loci-index"],
+            metadata=metadata,
+            evidence_provenance_tier="tool_verified",
+        ))
+        records.append({
+            "path": str(doc_path),
+            "stored": bool(store_result.get("stored")),
+            "finding_id": store_result.get("finding_id"),
+            "summary": summary,
+        })
+
+    return json.dumps({
+        "stored": sum(1 for r in records if r["stored"]),
+        "investigation_id": investigation_id,
+        "records": records,
+    })
 
 
 def _store_build_finding(investigation_id, finding_type, text, source, confidence, tags,
@@ -2492,6 +2697,9 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
             return None, json.dumps({"error": f"derived_from contains unknown parent id(s): {unknown}. Verify the parent findings exist before linking."})
         finding["derived_from"] = derived
     normalized_metadata = _normalize_finding_metadata(metadata)
+    normalized_metadata, flybrain_scope_error = _normalize_and_validate_flybrain_claim_scope(normalized_metadata)
+    if flybrain_scope_error:
+        return None, json.dumps({"error": flybrain_scope_error})
     if evidence_provenance_tier:
         normalized_metadata = normalized_metadata or {}
         normalized_metadata["evidence_provenance_tier"] = normalize_provenance_tier(
@@ -2501,6 +2709,11 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
         finding["metadata"] = normalized_metadata
         if normalized_metadata.get("evidence_provenance_tier"):
             finding["evidence_provenance_tier"] = normalized_metadata["evidence_provenance_tier"]
+        finding = apply_finding_fingerprints(
+            finding,
+            source=source,
+            explicit_provenance_tier=normalized_metadata.get("evidence_provenance_tier"),
+        )
 
     finding["entities"] = _extract_entities(text)
 
@@ -2546,6 +2759,17 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
     graph mirror is tier-agnostic, since the relationship graph carries findings
     regardless of index tier.
     """
+    finding_metadata = finding.get("metadata")
+    claim_scope = (
+        finding_metadata.get("claim_scope")
+        if isinstance(finding_metadata, dict) and isinstance(finding_metadata.get("claim_scope"), dict)
+        else None
+    )
+    flybrain_provenance = (
+        finding_metadata.get("flybrain_provenance")
+        if isinstance(finding_metadata, dict) and isinstance(finding_metadata.get("flybrain_provenance"), dict)
+        else None
+    )
     mnemo_stored = _mnemo_remember(
         text,
         importance={"high": 0.9, "medium": 0.7, "low": 0.5}.get(confidence, 0.6),
@@ -2556,6 +2780,8 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
             "confidence": confidence,
             "tags": finding["tags"],
             "finding_id": finding["id"],
+            **({"claim_scope": dict(claim_scope)} if claim_scope is not None else {}),
+            **({"flybrain_provenance": dict(flybrain_provenance)} if flybrain_provenance is not None else {}),
             # Carry the finding's own provenance tier so a later Mnemosyne recall
             # doesn't lose e.g. model_asserted and silently normalize it to the
             # legacy tool_verified default (see _mnemo_recall).
@@ -3749,6 +3975,8 @@ def investigation_search(
     Search findings by similarity.
     Resolution order: Mnemosyne recall (primary) → Qdrant semantic/hybrid
     enrichment (secondary, when needed) → local keyword scoring fallback.
+    A slow cross-session neuromodulation layer may gently bias recall/query
+    overfetch limits while preserving the same fail-open retrieval semantics.
 
     Soft-retracted findings (a known hallucination + its contaminated lineage)
     are excluded from results by default and counted under
@@ -3779,7 +4007,30 @@ def investigation_search(
 
     _, recall_fn = _get_mnemo_funcs()
     mnemo_enabled = recall_fn is not None
-    mnemo_rows = _mnemo_recall(query, top_k=max(limit * 4, 20), investigation_id=investigation_id)
+    _base_mnemo_top_k = max(limit * 4, 20)
+    _base_qdrant_limit = max(limit * 3, 20)
+    try:
+        _route_mod = routing_policy(
+            load_state(MEMORY_DIR),
+            mnemo_top_k=_base_mnemo_top_k,
+            qdrant_limit=_base_qdrant_limit,
+        )
+        assert_routing_policy_invariants(
+            _route_mod,
+            minimum_top_k=1,
+        )
+    except Exception as exc:
+        logger.warning("investigation_search slow-neuromod invariant failed; fail-closed baseline policy: %r", exc)
+        _route_mod = {
+            "routing_tone": 0.0,
+            "mnemo_top_k": _base_mnemo_top_k,
+            "qdrant_limit": _base_qdrant_limit,
+        }
+    mnemo_rows = _mnemo_recall(
+        query,
+        top_k=int(_route_mod.get("mnemo_top_k", _base_mnemo_top_k)),
+        investigation_id=investigation_id,
+    )
 
     deduped: list[dict] = []
     seen: set[str] = set()
@@ -3803,11 +4054,12 @@ def investigation_search(
         _add_row(row)
 
     qdrant = {"ok": False, "reason": "not_attempted", "results": []}
+    _pre_qdrant_count = len(deduped)
     if len(deduped) < limit:
         qdrant = _qdrant_similarity_search(
             query,
             investigation_id=investigation_id,
-            limit=max(limit * 3, 20),     # overfetch to absorb dedup losses
+            limit=int(_route_mod.get("qdrant_limit", _base_qdrant_limit)),  # overfetch to absorb dedup losses
             rerank_top_k=limit,           # but CE only ranks the original limit
             min_confidence=min_confidence if min_confidence != "low" else None,
         )
@@ -3842,6 +4094,16 @@ def investigation_search(
     mode = "mnemo_primary"
     if qdrant.get("ok"):
         mode = f"mnemo+{qdrant.get('reason')}" if mnemo_rows else str(qdrant.get("reason"))
+    try:
+        _qdrant_gain = max(0, len(deduped) - _pre_qdrant_count)
+        _routing_signal = 0.0
+        if _qdrant_gain > 0:
+            _routing_signal = min(0.35, 0.08 * _qdrant_gain)
+        elif mnemo_rows:
+            _routing_signal = -0.08
+        observe(MEMORY_DIR, event="investigation_search", routing_signal=_routing_signal)
+    except Exception as exc:
+        logger.debug("investigation_search slow-neuromod update failed (fail-open): %r", exc)
 
     return json.dumps({
         "mode": mode,
@@ -4656,6 +4918,9 @@ def audit_log(
         "inputs": inputs_json,
         "output": output,
     }
+    fb_audit_fp = flybrain_audit_fingerprint(tool_name, inputs_json, output)
+    if isinstance(fb_audit_fp, dict):
+        entry.update(fb_audit_fp)
     entry["entities"] = _extract_entities(embedding_text or output[:2000])
 
     # Global daily audit log
@@ -4686,6 +4951,8 @@ def audit_log(
             "tool": tool_name,
             "investigation_id": investigation_id,
             "source": "audit_log",
+            **({"flybrain_provenance": entry.get("flybrain_provenance")}
+               if isinstance(entry.get("flybrain_provenance"), dict) else {}),
         },
     )
 
@@ -7886,6 +8153,200 @@ def _run_consolidation_quality_audit(
     return {"sampled": sampled, "flagged": flagged, "degraded": degraded}
 
 
+_SLEEP_CONSOLIDATION_BURST_WINDOW_SECONDS = max(
+    300,
+    int(os.environ.get("LOCI_SLEEP_BURST_WINDOW_SECONDS", "5400") or "5400"),
+)
+_SLEEP_CONSOLIDATION_PROVENANCE_REF_LIMIT = max(
+    3,
+    int(os.environ.get("LOCI_SLEEP_PROVENANCE_REF_LIMIT", "10") or "10"),
+)
+
+
+def _parse_iso_to_epoch(raw_ts: str | None) -> float | None:
+    """Best-effort ISO timestamp parse, returning epoch seconds or None."""
+    text = str(raw_ts or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return float(dt.timestamp())
+
+
+def _sleep_like_burst_summary(
+    investigation_id: str | None,
+    findings: list[dict] | None,
+    *,
+    now_ts: float | None = None,
+) -> dict:
+    """Summarize whether consolidation follows an active recent reasoning burst."""
+    now_epoch = float(now_ts if now_ts is not None else time.time())
+    window_seconds = _SLEEP_CONSOLIDATION_BURST_WINDOW_SECONDS
+
+    findings = findings or []
+    type_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    reasoning_recent = 0
+    findings_recent = 0
+    burst_sources = {"investigation_reason", "swarm_reason", "reflection_loop_tick"}
+    finding_refs: list[dict] = []
+
+    for finding in findings:
+        finding_id = str(finding.get("id") or "")
+        record_type = str(finding.get("record_type") or finding.get("type") or "").lower()
+        source = str(finding.get("source") or "").lower()
+        ts_epoch = _parse_iso_to_epoch(str(finding.get("ts") or ""))
+        if ts_epoch is None or now_epoch - ts_epoch > window_seconds:
+            continue
+
+        findings_recent += 1
+        if record_type:
+            type_counts[record_type] += 1
+        if source:
+            source_counts[source] += 1
+        if record_type in {"inferred", "assumed", "procedure"} or source in burst_sources:
+            reasoning_recent += 1
+        finding_refs.append({
+            "finding_id": finding_id,
+            "record_type": record_type,
+            "source": source,
+            "ts": str(finding.get("ts") or ""),
+            **provenance_fields(finding),
+        })
+
+    reflection_recent = False
+    reflection_last_tick = None
+    try:
+        reflection_state = _load_reflection_state()
+        reflection_last_tick = reflection_state.get("last_tick")
+        tick = reflection_last_tick if isinstance(reflection_last_tick, dict) else None
+        tick_epoch = _parse_iso_to_epoch(str((tick or {}).get("ts") or ""))
+        if tick_epoch is not None and now_epoch - tick_epoch <= window_seconds:
+            reflection_recent = bool(
+                int((tick or {}).get("processed_items") or 0) > 0
+                or int((tick or {}).get("findings_written") or 0) > 0
+            )
+    except Exception as exc:
+        logger.debug("_sleep_like_burst_summary reflection read failed (fail-open): %r", exc)
+
+    finding_refs = finding_refs[:_SLEEP_CONSOLIDATION_PROVENANCE_REF_LIMIT]
+    provenance = {
+        "aggregation_method": "recent_finding_window_with_provenance_fields",
+        "refs_considered": findings_recent,
+        "refs_emitted": len(finding_refs),
+        "finding_refs": finding_refs,
+        "coverage_ratio": (len(finding_refs) / findings_recent) if findings_recent > 0 else 0.0,
+    }
+
+    return {
+        "window_seconds": window_seconds,
+        "active_burst": bool(reasoning_recent > 0 or reflection_recent),
+        "investigation_id": investigation_id,
+        "signals": {
+            "reasoning_findings_recent": reasoning_recent,
+            "reflection_tick_recent": reflection_recent,
+            "findings_recent_total": findings_recent,
+        },
+        "top_types": [{"type": kind, "count": count} for kind, count in type_counts.most_common(3)],
+        "top_sources": [{"source": src, "count": count} for src, count in source_counts.most_common(3)],
+        "provenance": provenance,
+        "reflection_last_tick": reflection_last_tick,
+    }
+
+
+def _assert_sleep_like_consolidation_invariants(report: dict) -> None:
+    """Fail-closed contract gate for sleep-like consolidation report invariants."""
+    if not isinstance(report, dict):
+        raise ValueError("sleep-like invariant failed: report must be a dict")
+    if not isinstance(report.get("active_burst"), bool):
+        raise ValueError("sleep-like invariant failed: active_burst must be bool")
+
+    phases = report.get("phases")
+    if not isinstance(phases, list) or len(phases) != 3:
+        raise ValueError("sleep-like invariant failed: phases must contain summarize/replay/stabilize")
+
+    expected_names = ("summarize", "replay", "stabilize")
+    observed_names = tuple(str((phase or {}).get("name") or "") for phase in phases)
+    if observed_names != expected_names:
+        raise ValueError(f"sleep-like invariant failed: phase order mismatch {observed_names!r}")
+
+    allowed_status = {
+        "summarize": {"ok"},
+        "replay": {"ok", "skipped"},
+        "stabilize": {"ok", "skipped"},
+    }
+    for phase in phases:
+        name = str((phase or {}).get("name") or "")
+        status = str((phase or {}).get("status") or "")
+        details = (phase or {}).get("details")
+        if status not in allowed_status.get(name, set()):
+            raise ValueError(f"sleep-like invariant failed: invalid status for {name}: {status!r}")
+        if not isinstance(details, dict):
+            raise ValueError(f"sleep-like invariant failed: {name} details must be dict")
+
+    summarize_details = phases[0]["details"]
+    provenance = summarize_details.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("sleep-like invariant failed: summarize.provenance missing")
+    refs = provenance.get("finding_refs")
+    if not isinstance(refs, list):
+        raise ValueError("sleep-like invariant failed: summarize.provenance.finding_refs must be list")
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise ValueError("sleep-like invariant failed: finding ref must be object")
+        if "evidence_provenance_tier" not in ref or "provenance_defaulted" not in ref:
+            raise ValueError("sleep-like invariant failed: finding ref missing provenance fields")
+
+
+def _sleep_like_consolidation_report(
+    *,
+    investigation_id: str | None,
+    findings: list[dict] | None,
+    min_findings_for_causal: int,
+    causal_edges_inferred: int,
+    quality_audit: dict | None,
+) -> dict:
+    """Structured summarize/replay/stabilize report for offline consolidation."""
+    burst_summary = _sleep_like_burst_summary(investigation_id, findings)
+    findings_count = len(findings or [])
+    replay_status = "ok" if investigation_id and findings_count >= int(min_findings_for_causal) else "skipped"
+
+    if quality_audit is None:
+        stabilize_status = "skipped"
+        stabilize_details: dict[str, Any] = {"reason": "quality audit unavailable"}
+    else:
+        stabilize_status = "ok"
+        stabilize_details = {
+            "sampled": int(quality_audit.get("sampled", 0) or 0),
+            "flagged_count": len(quality_audit.get("flagged") or []),
+            "degraded": bool(quality_audit.get("degraded")),
+        }
+
+    report = {
+        "active_burst": bool(burst_summary.get("active_burst")),
+        "phases": [
+            {"name": "summarize", "status": "ok", "details": burst_summary},
+            {
+                "name": "replay",
+                "status": replay_status,
+                "details": {
+                    "investigation_id": investigation_id,
+                    "findings_considered": findings_count,
+                    "causal_edges_inferred": int(causal_edges_inferred or 0),
+                    "min_findings_required": int(min_findings_for_causal),
+                },
+            },
+            {"name": "stabilize", "status": stabilize_status, "details": stabilize_details},
+        ],
+    }
+    _assert_sleep_like_consolidation_invariants(report)
+    return report
+
+
 @mcp.tool()
 def memory_consolidate(dry_run: bool = False) -> str:
     """
@@ -7894,7 +8355,7 @@ def memory_consolidate(dry_run: bool = False) -> str:
     Safe to run periodically (daily or after large investigation sessions).
 
     After the Mnemosyne pass, runs a causal inference slow path on the most
-    recently active investigation (if it has ≥3 findings), writing inferred
+    recently active investigation (if it has enough findings), writing inferred
     edges to causal_edges.jsonl.  The causal step is fail-open and never
     blocks the consolidation result.
 
@@ -7904,14 +8365,34 @@ def memory_consolidate(dry_run: bool = False) -> str:
     Returns JSON with consolidation stats and causal_edges_inferred count.
     On real (non-dry-run) consolidations, may also include an advisory-only
     consolidation_quality_audit field summarizing a bounded local-model spot-check
-    of just-created multi-entry merges. This never changes what Mnemosyne writes.
+    of just-created multi-entry merges, plus a ``sleep_like_consolidation`` phase
+    report (summarize/replay/stabilize) for offline post-burst consolidation.
+    These never change what Mnemosyne writes.
     """
     import json as _json
     causal_edges_inferred = 0
+    min_findings_for_causal = 3
     try:
         Mnemosyne = _load_mnemosyne_class()
         m = Mnemosyne()
+        inv_id: str | None = None
+        findings: list[dict] | None = None
+        mod_state = load_state(MEMORY_DIR)
+        try:
+            mod_consolidation = consolidation_policy(
+                mod_state,
+                default_min_findings=3,
+            )
+            assert_consolidation_policy_invariants(mod_consolidation)
+        except Exception as exc:
+            logger.warning("memory_consolidate slow-neuromod invariant failed; fail-closed baseline threshold: %r", exc)
+            mod_consolidation = {
+                "consolidation_tone": 0.0,
+                "min_findings_for_causal": 3,
+            }
+        min_findings_for_causal = int(mod_consolidation.get("min_findings_for_causal", 3))
         audit_baseline_rowid = None
+        quality_audit: dict | None = None
         if not dry_run:
             audit_baseline_rowid = _snapshot_sleep_consolidation_rowid(m)
         result = m.sleep_all_sessions(dry_run=dry_run)
@@ -7922,7 +8403,7 @@ def memory_consolidate(dry_run: bool = False) -> str:
         try:
             if not dry_run:
                 inv_id, findings = _find_most_recent_investigation()
-                if inv_id and findings and len(findings) >= 3:
+                if inv_id and findings and len(findings) >= int(min_findings_for_causal):
                     causal_edges_inferred = _run_causal_inference(inv_id, findings)
         except Exception as exc:
             # A feature that produces nothing should be able to say why.
@@ -7935,6 +8416,15 @@ def memory_consolidate(dry_run: bool = False) -> str:
             "dry_run": dry_run,
             "result": result if isinstance(result, dict) else str(result),
             "causal_edges_inferred": causal_edges_inferred,
+            "consolidation_aggregation": {
+                "method": "deterministic_sleep_summary_plus_slow_threshold",
+                "default_min_findings_for_causal": 3,
+                "applied_min_findings_for_causal": int(min_findings_for_causal),
+                "modulation": {
+                    "consolidation_tone": round(float(mod_consolidation.get("consolidation_tone", 0.0) or 0.0), 3),
+                    "provenance": "deterministic_derived",
+                },
+            },
         }
         if not dry_run:
             try:
@@ -7953,9 +8443,41 @@ def memory_consolidate(dry_run: bool = False) -> str:
                     "flagged": [],
                     "degraded": True,
                 }
+                quality_audit = payload["consolidation_quality_audit"]
+
+            payload["sleep_like_consolidation"] = _sleep_like_consolidation_report(
+                investigation_id=inv_id,
+                findings=findings,
+                min_findings_for_causal=min_findings_for_causal,
+                causal_edges_inferred=causal_edges_inferred,
+                quality_audit=quality_audit,
+            )
+            try:
+                result_items = int((result or {}).get("items_consolidated", 0) or 0)
+                consolidation_signal = 0.0
+                if result_items > 0:
+                    consolidation_signal += min(0.35, 0.05 * result_items)
+                if causal_edges_inferred > 0:
+                    consolidation_signal += 0.1
+                observe(
+                    MEMORY_DIR,
+                    event="memory_consolidate",
+                    consolidation_signal=max(-1.0, min(1.0, consolidation_signal)),
+                )
+            except Exception as exc:
+                logger.debug("memory_consolidate slow-neuromod update failed (fail-open): %r", exc)
 
         return _json.dumps(payload)
     except Exception as e:
+        try:
+            if not dry_run:
+                observe(
+                    MEMORY_DIR,
+                    event="memory_consolidate_error",
+                    consolidation_signal=-0.6,
+                )
+        except Exception:
+            pass
         return _json.dumps({
             "status": "error",
             "error": "internal error",
@@ -8327,6 +8849,9 @@ def memory_confidence(
       corroboration  — max occurrences across top hits (repeated evidence)
       trust          — mean confidence tier (high/medium/low) of top hits
 
+    A slow cross-session neuromodulation tone can apply a small bounded bias
+    to the final numeric confidence after cue aggregation.
+
     It also MAY include ``llm_entailment_note``: an advisory local-model verdict
     on whether the top memory hit actually supports the exact claim/query,
     considering subject, scope, negation, and modality. This is additive only:
@@ -8373,6 +8898,18 @@ def memory_confidence(
     top_text = cues["top_text"]
 
     confidence, basis, recommendation = _confidence_verdict(cues)
+    base_confidence = float(confidence)
+    try:
+        _confidence_bias = confidence_policy(load_state(MEMORY_DIR), confidence=base_confidence)
+        assert_confidence_policy_invariants(_confidence_bias)
+    except Exception as exc:
+        logger.warning("memory_confidence slow-neuromod invariant failed; fail-closed base confidence: %r", exc)
+        _confidence_bias = {
+            "confidence_tone": 0.0,
+            "delta": 0.0,
+            "confidence": base_confidence,
+        }
+    confidence = float(_confidence_bias.get("confidence", base_confidence))
     llm_entailment = _confidence_llm_entailment(query, top_text) if top_text else None
 
     payload = {
@@ -8387,6 +8924,25 @@ def memory_confidence(
         },
         "top_hit_preview": top_text,
         "recommendation": recommendation,
+        "confidence_aggregation": {
+            "method": "cue_verdict_plus_slow_modulation",
+            "base_confidence": round(base_confidence, 3),
+            "adjusted_confidence": round(confidence, 3),
+            "modulation": {
+                "confidence_tone": round(float(_confidence_bias.get("confidence_tone", 0.0) or 0.0), 3),
+                "delta": round(float(_confidence_bias.get("delta", 0.0) or 0.0), 3),
+                "provenance": "deterministic_derived",
+            },
+            "evidence_refs": [
+                {
+                    "finding_id": str(r.get("finding_id") or r.get("id") or ""),
+                    "source": str(r.get("source") or ""),
+                    "investigation_id": str(r.get("investigation_id") or ""),
+                    "score": round(_safe_float(r.get("score"), 0.0), 4),
+                }
+                for r in results[:5]
+            ],
+        },
     }
     if isinstance(llm_entailment, dict):
         payload["llm_entailment_note"] = {
@@ -8488,6 +9044,135 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
             logger.warning("manifest notes update failed (fail-open): %s", exc)
 
     return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tool: loci_validated_knowledge_promotion
+# ---------------------------------------------------------------------------
+
+
+def _finding_text_key(text: str) -> str:
+    """Normalize a finding string so repeated claims can be detected deterministically."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+@mcp.tool()
+def loci_validated_knowledge_promotion(
+    investigation_id: str,
+    finding_id: str,
+    target_tier: str = "warm",
+    *,
+    require_repeated_verification: bool = False,
+) -> str:
+    """
+    Enforce the verification gate before promoting a finding into trusted memory.
+
+    The promotion gate is intentionally conservative and reuses the repo's
+    existing investigation + provenance + verification code paths:
+      - find the target finding in the investigation
+      - reject resolved / retracted / empty findings up front
+      - verify the claim with verify_finding(), which applies the provenance firewall
+      - only permit promotion when verification is confirmed and the evidence passes
+        the model_asserted guard
+      - upgrade repeated verified claims to hot memory when they are seen more than once
+        or when the caller opts into repeated verification as a hard gate
+
+    This helper preserves the repo's fail-open/fail-closed contract:
+      - backend/model failures become ``uncertain`` and therefore block promotion
+      - model_asserted findings must be supported by independent evidence before a
+        verified promotion is allowed
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({"status": "blocked", "error": f"Investigation '{investigation_id}' not found."})
+
+    if not investigation_id or not finding_id:
+        return json.dumps({"status": "blocked", "error": "investigation_id and finding_id are required."})
+
+    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    finding = next((f for f in findings if str(f.get("id") or "") == str(finding_id)), None)
+    if not finding:
+        return json.dumps({"status": "blocked", "error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
+
+    if str(finding.get("resolution") or "open").lower() not in {"open", ""}:
+        return json.dumps({
+            "status": "blocked",
+            "reason": "resolved_finding",
+            "resolution": str(finding.get("resolution") or "open"),
+            "finding_id": finding_id,
+        })
+
+    if str(finding.get("text") or "").strip() == "":
+        return json.dumps({"status": "blocked", "reason": "empty_finding", "finding_id": finding_id})
+
+    retracted = _load_retracted_ids(investigation_id)
+    if str(finding_id) in retracted:
+        return json.dumps({"status": "blocked", "reason": "retracted_finding", "finding_id": finding_id})
+
+    text = str(finding.get("text") or "")
+    evidence_tier = str(finding.get("evidence_provenance_tier") or "tool_verified")
+    import verify as _v
+    verify_result = _v.verify_finding(
+        text,
+        investigation_id=investigation_id,
+        finding_id=finding_id,
+        candidate_provenance_tier=evidence_tier,
+    )
+
+    if verify_result.get("verdict") != "confirmed":
+        return json.dumps({
+            "status": "blocked",
+            "reason": "verification_gate_failed",
+            "finding_id": finding_id,
+            "verification": verify_result,
+            "promotion": None,
+        })
+
+    firewall = verify_result.get("provenance_firewall") or {}
+    if not firewall.get("allowed", False):
+        return json.dumps({
+            "status": "blocked",
+            "reason": "provenance_firewall",
+            "finding_id": finding_id,
+            "verification": verify_result,
+            "promotion": None,
+        })
+
+    normalized_text = _finding_text_key(text)
+    repeat_count = 0
+    for other in findings:
+        if str(other.get("id") or "") == str(finding_id):
+            continue
+        if str(other.get("resolution") or "open").lower() not in {"open", ""}:
+            continue
+        other_text = str(other.get("text") or "")
+        if _finding_text_key(other_text) == normalized_text:
+            repeat_count += 1
+
+    if require_repeated_verification and repeat_count == 0:
+        return json.dumps({
+            "status": "blocked",
+            "reason": "missing_repeat_verification",
+            "finding_id": finding_id,
+            "repeat_count": 0,
+            "verification": verify_result,
+            "promotion": None,
+        })
+
+    promoted_tier = "hot" if repeat_count > 0 else str(target_tier or "warm")
+    if promoted_tier not in {"hot", "warm", "cold"}:
+        promoted_tier = "warm"
+
+    promotion = json.loads(memory_promote(investigation_id, finding_id, promoted_tier))
+    return json.dumps({
+        "status": "promoted" if promotion.get("ok") else "blocked",
+        "reason": "verified_repeat_promoted" if repeat_count > 0 else "verified_promoted",
+        "finding_id": finding_id,
+        "target_tier": promoted_tier,
+        "repeat_count": repeat_count,
+        "verification": verify_result,
+        "promotion": promotion,
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -9026,10 +9711,10 @@ def _route_filter_by_agent(hits: list[dict], agent_id: str) -> list[dict]:
     return filtered
 
 
-def _route_dedup_by_overlap(hits: list[dict]) -> list[dict]:
+def _route_dedup_by_overlap(hits: list[dict], threshold: float = 0.80) -> list[dict]:
     """
-    Deduplicate memory_route hits by word-overlap (>80% overlap → keep the
-    highest-scoring hit). Assumes `hits` is already sorted by score
+    Deduplicate memory_route hits by word-overlap (>threshold overlap → keep
+    the highest-scoring hit). Assumes `hits` is already sorted by score
     (descending), so among an overlapping pair the later one in iteration
     order is always the lower-scoring one to suppress.
     """
@@ -9047,11 +9732,232 @@ def _route_dedup_by_overlap(hits: list[dict]) -> list[dict]:
             if not union:
                 continue
             overlap = len(words_a & words_b) / max(len(union), 1)
-            if overlap > 0.80:
+            if overlap > threshold:
                 # Suppress the lower-scoring one (raw_hits already sorted by score)
                 suppressed.add(j)
         kept.append(hit_a)
     return kept
+
+
+def _route_policy_trace_hit(hit: dict) -> dict:
+    """Compact replay-safe snapshot for route simulation and audit tracing."""
+    return {
+        "finding_id": hit.get("finding_id") or hit.get("id", ""),
+        "id": hit.get("id") or hit.get("finding_id", ""),
+        "investigation_id": hit.get("investigation_id", ""),
+        "text": hit.get("text", ""),
+        "source": hit.get("source", ""),
+        "authored_by": hit.get("authored_by", ""),
+        "score": _safe_float(hit.get("score"), 0.0),
+        "tier": hit.get("tier") or hit.get("record_type", "finding"),
+    }
+
+
+def _homeostatic_drive_value(value: object, *, name: str) -> float:
+    try:
+        numeric = float(value)
+    except Exception as exc:
+        raise ValueError(f"drive '{name}' must be numeric") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"drive '{name}' must be finite")
+    if numeric < 0.0 or numeric > 1.0:
+        raise ValueError(f"drive '{name}' must be between 0.0 and 1.0")
+    return numeric
+
+
+def _derive_homeostatic_drives(query: str, drive_state: Optional[dict]) -> dict:
+    if drive_state is not None and not isinstance(drive_state, dict):
+        raise ValueError("drive_state must be an object when provided")
+    drives = {"hunger": 0.0, "fatigue": 0.0, "urgency": 0.0}
+    if isinstance(drive_state, dict):
+        for key in tuple(drives.keys()):
+            if key in drive_state:
+                drives[key] = _homeostatic_drive_value(drive_state[key], name=key)
+
+    q = str(query or "").lower()
+    if q:
+        hunger_hits = (
+            "explore",
+            "unknown",
+            "novel",
+            "hypothesis",
+            "alternative",
+            "broaden",
+        )
+        fatigue_hits = ("quick", "triage", "summarize", "brief", "tldr")
+        urgency_hits = ("urgent", "critical", "sev1", "incident", "asap", "now")
+
+        drives["hunger"] = max(drives["hunger"], 0.35 if any(t in q for t in hunger_hits) else 0.0)
+        drives["fatigue"] = max(drives["fatigue"], 0.30 if any(t in q for t in fatigue_hits) else 0.0)
+        drives["urgency"] = max(drives["urgency"], 0.45 if any(t in q for t in urgency_hits) else 0.0)
+    return drives
+
+
+def _homeostatic_route_policy(drives: dict, top_k: int) -> dict:
+    hunger = _homeostatic_drive_value(drives.get("hunger", 0.0), name="hunger")
+    fatigue = _homeostatic_drive_value(drives.get("fatigue", 0.0), name="fatigue")
+    urgency = _homeostatic_drive_value(drives.get("urgency", 0.0), name="urgency")
+
+    candidate_multiplier = max(1.5, min(5.0, 3.0 + (1.5 * hunger) - (1.0 * fatigue) - (0.8 * urgency)))
+    priority_ratio = max(0.40, min(1.0, 1.0 - (0.45 * hunger) + (0.30 * fatigue) + (0.35 * urgency)))
+    cap = max(0, int(top_k))
+    candidate_limit = max(cap, int(round(max(1, cap) * candidate_multiplier)))
+    priority_slots = max(0, min(cap, int(math.floor(cap * priority_ratio))))
+    exploration_slots = max(0, cap - priority_slots)
+    return {
+        "drives": {"hunger": hunger, "fatigue": fatigue, "urgency": urgency},
+        "candidate_multiplier": candidate_multiplier,
+        "candidate_limit": candidate_limit,
+        "priority_ratio": priority_ratio,
+        "priority_slots": priority_slots,
+        "exploration_slots": exploration_slots,
+    }
+
+
+def _assert_route_policy_invariants(policy: dict, *, top_k: int) -> None:
+    required = ("candidate_limit", "priority_slots", "exploration_slots", "candidate_multiplier", "priority_ratio")
+    for key in required:
+        if key not in policy:
+            raise ValueError(f"routing policy invariant failed: missing {key}")
+    cap = max(0, int(top_k))
+    candidate_limit = int(policy["candidate_limit"])
+    priority_slots = int(policy["priority_slots"])
+    exploration_slots = int(policy["exploration_slots"])
+    if candidate_limit < cap:
+        raise ValueError("routing policy invariant failed: candidate_limit below top_k")
+    if priority_slots < 0 or priority_slots > cap:
+        raise ValueError("routing policy invariant failed: priority_slots out of range")
+    if exploration_slots < 0:
+        raise ValueError("routing policy invariant failed: exploration_slots negative")
+    if priority_slots + exploration_slots != cap:
+        raise ValueError("routing policy invariant failed: slot partition mismatch")
+    candidate_multiplier = float(policy["candidate_multiplier"])
+    if not math.isfinite(candidate_multiplier):
+        raise ValueError("routing policy invariant failed: candidate_multiplier not finite")
+    priority_ratio = float(policy["priority_ratio"])
+    if not math.isfinite(priority_ratio) or priority_ratio < 0.0 or priority_ratio > 1.0:
+        raise ValueError("routing policy invariant failed: priority_ratio out of range")
+
+
+def _route_aggregation_with_provenance(selected_hits: list[dict], candidate_hits: list[dict]) -> dict:
+    selected_ids: set[str] = set()
+    selected_refs: list[dict] = []
+    source_counts: dict[str, int] = {}
+    investigation_counts: dict[str, int] = {}
+
+    for rank, hit in enumerate(selected_hits, start=1):
+        finding_id = str(hit.get("finding_id") or hit.get("id") or "")
+        source = str(hit.get("source") or "unknown")
+        investigation_id = str(hit.get("investigation_id") or "")
+        score = _safe_float(hit.get("score"), 0.0)
+        if finding_id:
+            selected_ids.add(finding_id)
+        selected_refs.append({
+            "rank": rank,
+            "finding_id": finding_id,
+            "source": source,
+            "investigation_id": investigation_id,
+            "score": score,
+        })
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if investigation_id:
+            investigation_counts[investigation_id] = investigation_counts.get(investigation_id, 0) + 1
+
+    candidate_ids = {
+        str(hit.get("finding_id") or hit.get("id") or "")
+        for hit in (candidate_hits or [])
+        if str(hit.get("finding_id") or hit.get("id") or "")
+    }
+    return {
+        "selected_refs": selected_refs,
+        "source_counts": source_counts,
+        "investigation_counts": investigation_counts,
+        "coverage_ratio": (len(selected_ids & candidate_ids) / len(candidate_ids)) if candidate_ids else 0.0,
+    }
+
+
+def _route_select_priority_and_exploration(hits: list[dict], *, top_k: int, priority_slots: int) -> list[dict]:
+    cap = max(0, int(top_k))
+    if cap <= 0:
+        return []
+    if len(hits) <= cap:
+        return list(hits)
+
+    p_slots = max(0, min(cap, int(priority_slots)))
+    selected = list(hits[:p_slots])
+    remaining = cap - len(selected)
+    if remaining <= 0:
+        return selected
+
+    pool = list(hits[p_slots:])
+    if not pool:
+        return selected
+    if len(pool) <= remaining:
+        return selected + pool
+
+    if remaining == 1:
+        return selected + [pool[-1]]
+
+    max_idx = len(pool) - 1
+    step = max_idx / float(remaining - 1)
+    idxs = [int(round(i * step)) for i in range(remaining)]
+    deduped: list[int] = []
+    seen = set()
+    for idx in idxs:
+        idx = max(0, min(max_idx, idx))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        deduped.append(idx)
+    cursor = 0
+    while len(deduped) < remaining:
+        if cursor not in seen:
+            deduped.append(cursor)
+            seen.add(cursor)
+        cursor += 1
+    selected.extend(pool[idx] for idx in deduped[:remaining])
+    return selected
+
+
+def _route_apply_policy(
+    candidate_hits: list[dict],
+    *,
+    top_k: int,
+    deduplicate: bool,
+    dedup_threshold: float = 0.80,
+    agent_id: Optional[str] = None,
+    priority_slots: Optional[int] = None,
+) -> dict:
+    """Apply a routing policy deterministically over a captured candidate set."""
+    hits = list(candidate_hits or [])
+    filtered = _route_filter_by_agent(hits, agent_id) if agent_id else hits
+    deduped = filtered
+    if deduplicate and len(filtered) > 1:
+        threshold = _safe_float(dedup_threshold, 0.80)
+        threshold = max(0.0, min(1.0, threshold))
+        deduped = _route_dedup_by_overlap(filtered, threshold=threshold)
+    cap = max(0, int(top_k))
+    if priority_slots is None:
+        trimmed = deduped[:cap]
+        applied_priority_slots = cap
+    else:
+        trimmed = _route_select_priority_and_exploration(
+            deduped,
+            top_k=cap,
+            priority_slots=int(priority_slots),
+        )
+        applied_priority_slots = max(0, min(cap, int(priority_slots)))
+    return {
+        "hits": trimmed,
+        "metrics": {
+            "candidate_count": len(hits),
+            "after_agent_filter": len(filtered),
+            "after_dedup": len(deduped),
+            "priority_slots": applied_priority_slots,
+            "exploration_slots": max(0, cap - applied_priority_slots),
+            "after_top_k": len(trimmed),
+        },
+    }
 
 
 def _route_rows(hits: list[dict]) -> list[dict]:
@@ -9092,6 +9998,8 @@ def memory_route(
     agent_id: Optional[str] = None,
     top_k: int = 10,
     deduplicate: bool = True,
+    include_trace: bool = False,
+    drive_state: Optional[dict] = None,
 ) -> str:
     """
     Agent-mesh-aware search across ALL investigations — no investigation_id filter.
@@ -9106,6 +10014,10 @@ def memory_route(
         top_k:       Maximum results to return after deduplication (default 10).
         deduplicate: If True, remove near-duplicate findings (>80% word overlap).
                      Default True.
+        include_trace: If True, include candidate hits + active policy in
+                       `routing_trace` so audit logs can replay this decision.
+        drive_state: Optional homeostatic routing drives (`hunger`, `fatigue`,
+                     `urgency`, each 0..1) that steer exploration vs priority.
 
     Returns JSON with:
         {routed: [{finding_id, investigation_id, investigation_title, text, source,
@@ -9120,19 +10032,44 @@ def memory_route(
         })
 
     try:
+        drives = _derive_homeostatic_drives(query, drive_state)
+        homeostasis = _homeostatic_route_policy(drives, top_k=top_k)
+        _assert_route_policy_invariants(homeostasis, top_k=top_k)
+    except ValueError as exc:
+        return json.dumps({
+            "error": str(exc),
+            "routed": [],
+            "query": query,
+        })
+
+    try:
         client, _col = _get_qdrant()
         if client is None:
             return json.dumps({
                 "error": "memory_route requires Qdrant",
                 "routed": [],
             })
+        try:
+            slow_mod = routing_policy(
+                load_state(MEMORY_DIR),
+                mnemo_top_k=max(1, top_k),
+                qdrant_limit=max(1, int(homeostasis["candidate_limit"])),
+            )
+            assert_routing_policy_invariants(slow_mod, minimum_top_k=max(1, top_k))
+        except Exception as exc:
+            logger.warning("memory_route slow-neuromod invariant failed; fail-closed baseline policy: %r", exc)
+            slow_mod = {
+                "routing_tone": 0.0,
+                "mnemo_top_k": max(1, top_k),
+                "qdrant_limit": max(1, int(homeostasis["candidate_limit"])),
+            }
 
         # Step 1+2: Search across the whole collection (no investigation_id filter)
         try:
             raw_hits = _qdrant_search_collection(
                 query,
                 collection_name=QDRANT_COLLECTION_PREFIX,
-                limit=top_k * 3,
+                limit=int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
             )
         except RuntimeError as exc:
             return json.dumps({
@@ -9146,37 +10083,701 @@ def memory_route(
                 "routed": [],
             })
 
-        total_before_dedup = len(raw_hits)
-
-        # Step 3: Filter by agent_id if provided
-        if agent_id:
-            raw_hits = _route_filter_by_agent(raw_hits, agent_id)
-
-        # Step 4: Deduplicate by word-overlap (>80% overlap → keep highest score)
-        if deduplicate and len(raw_hits) > 1:
-            raw_hits = _route_dedup_by_overlap(raw_hits)
-
-        # Step 5: Trim to top_k
-        raw_hits = raw_hits[:top_k]
-        total_after_dedup = len(raw_hits)
+        policy_run = _route_apply_policy(
+            raw_hits,
+            top_k=top_k,
+            deduplicate=deduplicate,
+            dedup_threshold=0.80,
+            agent_id=agent_id,
+            priority_slots=homeostasis["priority_slots"],
+        )
+        final_hits = policy_run["hits"]
+        metrics = policy_run["metrics"]
+        aggregation = _route_aggregation_with_provenance(final_hits, raw_hits)
 
         # Step 6: Build response with provenance
-        routed = _route_rows(raw_hits)
-
-        return json.dumps({
+        routed = _route_rows(final_hits)
+        payload = {
             "routed": routed,
             "query": query,
             "agent_id": agent_id,
-            "total_before_dedup": total_before_dedup,
-            "total_after_dedup": total_after_dedup,
+            "total_before_dedup": metrics["candidate_count"],
+            "total_after_dedup": metrics["after_top_k"],
             "count": len(routed),
-        }, indent=2)
+            "routing_aggregation": aggregation,
+            "slow_modulation": {
+                "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
+                "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
+                "provenance": "deterministic_derived",
+            },
+        }
+        if include_trace:
+            payload["routing_trace"] = {
+                "version": 1,
+                "captured_at": _now(),
+                "policy": {
+                    "agent_id": agent_id,
+                    "top_k": int(top_k),
+                    "deduplicate": bool(deduplicate),
+                    "dedup_threshold": 0.80,
+                    "drive_state": homeostasis["drives"],
+                    "candidate_multiplier": homeostasis["candidate_multiplier"],
+                    "priority_ratio": homeostasis["priority_ratio"],
+                    "slow_modulation": {
+                        "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
+                        "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
+                        "provenance": "deterministic_derived",
+                    },
+                },
+                "candidate_hits": [_route_policy_trace_hit(hit) for hit in raw_hits],
+                "metrics": metrics,
+                "aggregation": aggregation,
+            }
+        try:
+            route_signal = 0.0
+            if int(metrics.get("after_top_k", 0)) > 0:
+                route_signal = min(0.3, 0.06 * int(metrics.get("after_top_k", 0)))
+                if deduplicate and int(metrics.get("after_dedup", 0)) < int(metrics.get("candidate_count", 0)):
+                    route_signal -= 0.05
+            observe(MEMORY_DIR, event="memory_route", routing_signal=route_signal)
+        except Exception as exc:
+            logger.debug("memory_route slow-neuromod update failed (fail-open): %r", exc)
+        return json.dumps(payload, indent=2)
 
+    except ValueError as exc:
+        return json.dumps({
+            "error": str(exc),
+            "routed": [],
+            "query": query,
+        })
     except Exception as exc:
         logger.exception("memory_route: unexpected error: %s", exc)
         return json.dumps({
             "error": f"memory_route failed: {exc}",
             "routed": [],
+        })
+
+
+def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) -> tuple[list[dict], int]:
+    """Extract replayable memory_route decisions from audit entries."""
+    decisions: list[dict] = []
+    skipped_missing_trace = 0
+    for idx, entry in enumerate(entries or []):
+        if len(decisions) >= max(0, int(limit)):
+            break
+        if not isinstance(entry, dict) or entry.get("tool") != "memory_route":
+            continue
+        raw_output = entry.get("output", "")
+        output_obj = None
+        if isinstance(raw_output, str):
+            try:
+                output_obj = json.loads(raw_output)
+            except Exception:
+                output_obj = None
+        elif isinstance(raw_output, dict):
+            output_obj = raw_output
+        if not isinstance(output_obj, dict):
+            continue
+        trace = output_obj.get("routing_trace")
+        if not isinstance(trace, dict):
+            skipped_missing_trace += 1
+            continue
+        candidates = trace.get("candidate_hits")
+        if not isinstance(candidates, list) or not candidates:
+            skipped_missing_trace += 1
+            continue
+        baseline_routed = output_obj.get("routed")
+        if not isinstance(baseline_routed, list):
+            baseline_routed = []
+        baseline_policy = trace.get("policy") if isinstance(trace.get("policy"), dict) else {}
+        query = output_obj.get("query", "")
+        decision_id = f"{entry.get('ts', 'unknown')}::{idx}"
+        decisions.append({
+            "decision_id": decision_id,
+            "ts": entry.get("ts"),
+            "query": query,
+            "baseline_policy": baseline_policy,
+            "baseline_routed": baseline_routed,
+            "candidate_hits": candidates,
+        })
+    return decisions, skipped_missing_trace
+
+
+@mcp.tool()
+def memory_route_counterfactual_simulate(
+    investigation_id: Optional[str] = None,
+    limit: int = 20,
+    deduplicate: Optional[bool] = None,
+    dedup_threshold: float = 0.80,
+    top_k: Optional[int] = None,
+    agent_id_override: Optional[str] = None,
+    routing_tone_override: Optional[float] = None,
+) -> str:
+    """
+    Replay audited memory_route decisions under an alternative policy.
+
+    This is a non-destructive simulation path: it never mutates findings,
+    manifests, or production routing behavior. It reads prior audited route
+    traces and compares baseline outputs vs a counterfactual policy, including
+    optional slow-neuromodulation routing-tone replay overrides.
+    """
+    try:
+        if investigation_id:
+            entries = list(reversed(_read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")))
+            source = f"investigation:{investigation_id}"
+        else:
+            entries = _collect_recent_global_audit(limit=max(int(limit) * 10, 100), days=7)
+            source = "global_recent_audit"
+
+        decisions, skipped_missing_trace = _route_counterfactual_decisions_from_audit(entries, limit)
+        if not decisions:
+            return json.dumps({
+                "source": source,
+                "simulated": 0,
+                "skipped_missing_trace": skipped_missing_trace,
+                "results": [],
+                "note": (
+                    "No replayable memory_route traces found. Capture traces by calling "
+                    "memory_route(..., include_trace=True) and auditing that output."
+                ),
+            }, indent=2)
+
+        comparisons: list[dict] = []
+        changed = 0
+        for decision in decisions:
+            baseline_policy = decision.get("baseline_policy") or {}
+            if deduplicate is None:
+                baseline_dedup = baseline_policy.get("deduplicate", True)
+                if isinstance(baseline_dedup, str):
+                    use_deduplicate = baseline_dedup.strip().lower() not in ("0", "false", "no")
+                else:
+                    use_deduplicate = bool(baseline_dedup)
+            else:
+                use_deduplicate = bool(deduplicate)
+            try:
+                use_top_k = int(baseline_policy.get("top_k", 10)) if top_k is None else int(top_k)
+            except Exception:
+                use_top_k = 10
+            use_agent_id = agent_id_override if agent_id_override is not None else baseline_policy.get("agent_id")
+            baseline_drive_state = baseline_policy.get("drive_state")
+            drives = _derive_homeostatic_drives(decision.get("query", ""), baseline_drive_state if isinstance(baseline_drive_state, dict) else None)
+            homeostasis = _homeostatic_route_policy(drives, top_k=use_top_k)
+            _assert_route_policy_invariants(homeostasis, top_k=use_top_k)
+            baseline_slow_mod = baseline_policy.get("slow_modulation")
+            baseline_tone = (
+                baseline_slow_mod.get("routing_tone", 0.0)
+                if isinstance(baseline_slow_mod, dict)
+                else 0.0
+            )
+            if routing_tone_override is not None:
+                baseline_tone = routing_tone_override
+            try:
+                counter_slow_mod = routing_policy(
+                    {"routing_tone": baseline_tone},
+                    mnemo_top_k=max(1, use_top_k),
+                    qdrant_limit=max(1, int(homeostasis["candidate_limit"])),
+                )
+                assert_routing_policy_invariants(counter_slow_mod, minimum_top_k=max(1, use_top_k))
+            except Exception as exc:
+                logger.warning("memory_route_counterfactual_simulate slow-neuromod invariant failed; fail-closed baseline policy: %r", exc)
+                counter_slow_mod = {
+                    "routing_tone": 0.0,
+                    "mnemo_top_k": max(1, use_top_k),
+                    "qdrant_limit": max(1, int(homeostasis["candidate_limit"])),
+                }
+            candidates_for_policy = list(decision.get("candidate_hits") or [])[
+                : max(1, int(counter_slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])))
+            ]
+            counter = _route_apply_policy(
+                candidates_for_policy,
+                top_k=use_top_k,
+                deduplicate=use_deduplicate,
+                dedup_threshold=dedup_threshold,
+                agent_id=use_agent_id,
+                priority_slots=homeostasis["priority_slots"],
+            )
+            counter_rows = _route_rows(counter["hits"])
+            counter_aggregation = _route_aggregation_with_provenance(counter["hits"], candidates_for_policy)
+            baseline_rows = decision.get("baseline_routed") or []
+            baseline_ids = [str(r.get("finding_id") or r.get("id") or "") for r in baseline_rows]
+            counter_ids = [str(r.get("finding_id") or r.get("id") or "") for r in counter_rows]
+            baseline_set = {x for x in baseline_ids if x}
+            counter_set = {x for x in counter_ids if x}
+            added = sorted(counter_set - baseline_set)
+            removed = sorted(baseline_set - counter_set)
+            if added or removed:
+                changed += 1
+            comparisons.append({
+                "decision_id": decision.get("decision_id"),
+                "ts": decision.get("ts"),
+                "query": decision.get("query", ""),
+                "baseline_count": len(baseline_rows),
+                "counterfactual": {
+                    "policy": {
+                        "agent_id": use_agent_id,
+                        "top_k": use_top_k,
+                        "deduplicate": use_deduplicate,
+                        "dedup_threshold": _safe_float(dedup_threshold, 0.80),
+                        "drive_state": homeostasis["drives"],
+                        "candidate_multiplier": homeostasis["candidate_multiplier"],
+                        "priority_ratio": homeostasis["priority_ratio"],
+                        "slow_modulation": {
+                            "routing_tone": round(float(counter_slow_mod.get("routing_tone", 0.0) or 0.0), 3),
+                            "qdrant_limit": int(counter_slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
+                            "provenance": "deterministic_derived",
+                        },
+                    },
+                    "count": len(counter_rows),
+                    "added_finding_ids": added[:25],
+                    "removed_finding_ids": removed[:25],
+                    "overlap_count": len(baseline_set & counter_set),
+                    "metrics": counter["metrics"],
+                    "aggregation": counter_aggregation,
+                },
+            })
+
+        return json.dumps({
+            "source": source,
+            "simulated": len(comparisons),
+            "changed": changed,
+            "skipped_missing_trace": skipped_missing_trace,
+            "counterfactual_overrides": {
+                "top_k": top_k,
+                "deduplicate": deduplicate,
+                "dedup_threshold": _safe_float(dedup_threshold, 0.80),
+                "agent_id_override": agent_id_override,
+                "routing_tone_override": routing_tone_override,
+            },
+            "results": comparisons,
+        }, indent=2)
+    except Exception as exc:
+        logger.exception("memory_route_counterfactual_simulate failed: %s", exc)
+        return json.dumps({
+            "error": f"memory_route_counterfactual_simulate failed: {exc}",
+            "results": [],
+        })
+
+
+def _route_baseline_policy_summary(decisions: list[dict]) -> dict:
+    top_k_values: list[int] = []
+    dedup_true = 0
+    dedup_false = 0
+    threshold_values: list[float] = []
+    for decision in decisions or []:
+        policy = decision.get("baseline_policy") if isinstance(decision, dict) else {}
+        if not isinstance(policy, dict):
+            continue
+        try:
+            top_k_values.append(max(0, int(policy.get("top_k", 10))))
+        except Exception:
+            top_k_values.append(10)
+        dedup_raw = policy.get("deduplicate", True)
+        dedup_value = (
+            dedup_raw.strip().lower() not in ("0", "false", "no")
+            if isinstance(dedup_raw, str)
+            else bool(dedup_raw)
+        )
+        if dedup_value:
+            dedup_true += 1
+        else:
+            dedup_false += 1
+        threshold_values.append(_safe_float(policy.get("dedup_threshold", 0.80), 0.80))
+    if not top_k_values:
+        top_k_values = [10]
+    if not threshold_values:
+        threshold_values = [0.80]
+    top_k_values = sorted(top_k_values)
+    threshold_values = sorted(threshold_values)
+    median_top_k = top_k_values[len(top_k_values) // 2]
+    median_threshold = threshold_values[len(threshold_values) // 2]
+    return {
+        "observed_decisions": len(decisions or []),
+        "top_k_median": int(median_top_k),
+        "deduplicate_majority": dedup_true >= dedup_false,
+        "dedup_threshold_median": max(0.0, min(1.0, _safe_float(median_threshold, 0.80))),
+    }
+
+
+def _route_collect_consolidation_outcomes(entries: list[dict]) -> dict:
+    sampled = 0
+    flagged = 0
+    degraded = 0
+    seen = 0
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("tool") != "memory_consolidate":
+            continue
+        raw_output = entry.get("output", "")
+        output_obj = None
+        if isinstance(raw_output, str):
+            try:
+                output_obj = json.loads(raw_output)
+            except Exception:
+                output_obj = None
+        elif isinstance(raw_output, dict):
+            output_obj = raw_output
+        if not isinstance(output_obj, dict):
+            continue
+        seen += 1
+        quality = output_obj.get("consolidation_quality_audit")
+        if not isinstance(quality, dict):
+            continue
+        sampled += max(0, int(quality.get("sampled", 0) or 0))
+        flagged += len(quality.get("flagged") or [])
+        degraded += 1 if bool(quality.get("degraded")) else 0
+    rate = (flagged / sampled) if sampled > 0 else 0.0
+    return {
+        "seen": seen,
+        "sampled": sampled,
+        "flagged": flagged,
+        "flagged_rate": max(0.0, min(1.0, _safe_float(rate, 0.0))),
+        "degraded_runs": degraded,
+    }
+
+
+def _route_policy_optimization_invariants(decisions: list[dict], consolidation: dict) -> dict:
+    """Fail-closed invariant gate for policy optimization inputs."""
+    violations: list[str] = []
+    checked = 0
+    for decision in decisions or []:
+        if not isinstance(decision, dict):
+            continue
+        checked += 1
+        decision_id = str(decision.get("decision_id") or f"decision-{checked}")
+        policy = decision.get("baseline_policy") if isinstance(decision.get("baseline_policy"), dict) else {}
+        top_k_raw = policy.get("top_k", 10)
+        top_k = int(_safe_float(top_k_raw, 10))
+        if top_k < 0:
+            violations.append(f"{decision_id}: baseline top_k is negative")
+        dedup_threshold = _safe_float(policy.get("dedup_threshold", 0.80), 0.80)
+        if dedup_threshold < 0.0 or dedup_threshold > 1.0:
+            violations.append(f"{decision_id}: baseline dedup_threshold out of range")
+        candidates = decision.get("candidate_hits")
+        if not isinstance(candidates, list) or not candidates:
+            violations.append(f"{decision_id}: candidate_hits missing or empty")
+            continue
+        candidate_ids = {
+            str(hit.get("finding_id") or hit.get("id") or "")
+            for hit in candidates
+            if isinstance(hit, dict)
+        }
+        candidate_ids = {x for x in candidate_ids if x}
+        if not candidate_ids:
+            violations.append(f"{decision_id}: candidate_hits contain no valid finding IDs")
+        baseline_rows = decision.get("baseline_routed")
+        if not isinstance(baseline_rows, list):
+            violations.append(f"{decision_id}: baseline_routed is not a list")
+            continue
+        for row in baseline_rows:
+            if not isinstance(row, dict):
+                continue
+            fid = str(row.get("finding_id") or row.get("id") or "")
+            if fid and fid not in candidate_ids:
+                violations.append(f"{decision_id}: baseline finding_id {fid} absent from candidate_hits")
+
+    sampled = max(0, int(consolidation.get("sampled", 0) or 0))
+    flagged = max(0, int(consolidation.get("flagged", 0) or 0))
+    if flagged > sampled:
+        violations.append("consolidation outcomes invalid: flagged exceeds sampled")
+
+    return {
+        "ok": len(violations) == 0,
+        "checked_decisions": checked,
+        "violations": violations[:25],
+    }
+
+
+def _route_policy_provenance_aggregation(decisions: list[dict], consolidation: dict, source: str) -> dict:
+    decision_refs: list[dict] = []
+    candidate_total = 0
+    baseline_total = 0
+    for decision in decisions or []:
+        if not isinstance(decision, dict):
+            continue
+        decision_refs.append({
+            "decision_id": decision.get("decision_id"),
+            "ts": decision.get("ts"),
+        })
+        candidate_hits = decision.get("candidate_hits") if isinstance(decision.get("candidate_hits"), list) else []
+        baseline_rows = decision.get("baseline_routed") if isinstance(decision.get("baseline_routed"), list) else []
+        candidate_total += len(candidate_hits)
+        baseline_total += len(baseline_rows)
+    return {
+        "source": source,
+        "decision_count": len(decision_refs),
+        "decision_refs": decision_refs[:25],
+        "candidate_hits_total": candidate_total,
+        "baseline_routed_total": baseline_total,
+        "consolidation_seen": max(0, int(consolidation.get("seen", 0) or 0)),
+        "consolidation_sampled": max(0, int(consolidation.get("sampled", 0) or 0)),
+    }
+
+
+def _route_candidate_grid(baseline: dict) -> list[dict]:
+    base_top_k = max(1, int(baseline.get("top_k_median", 10) or 10))
+    base_dedup = bool(baseline.get("deduplicate_majority", True))
+    base_threshold = max(0.0, min(1.0, _safe_float(baseline.get("dedup_threshold_median", 0.80), 0.80)))
+    top_k_values = sorted({max(1, base_top_k - 1), base_top_k, base_top_k + 1})
+    threshold_values = sorted({
+        max(0.0, min(1.0, round(base_threshold - 0.05, 2))),
+        base_threshold,
+        max(0.0, min(1.0, round(base_threshold + 0.05, 2))),
+    })
+    grid: list[dict] = []
+    for tk in top_k_values:
+        for dd in (base_dedup, not base_dedup):
+            for th in threshold_values:
+                # Keep a compact conservative grid: threshold only matters if dedup is on.
+                if not dd and th != base_threshold:
+                    continue
+                grid.append({
+                    "top_k": int(tk),
+                    "deduplicate": bool(dd),
+                    "dedup_threshold": max(0.0, min(1.0, _safe_float(th, 0.80))),
+                })
+    # Deterministic ordering and stable de-dup.
+    unique: list[dict] = []
+    seen: set[tuple[int, bool, float]] = set()
+    for cand in grid:
+        key = (cand["top_k"], cand["deduplicate"], cand["dedup_threshold"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cand)
+    return unique
+
+
+def _route_eval_candidate(
+    decisions: list[dict],
+    *,
+    top_k: int,
+    deduplicate: bool,
+    dedup_threshold: float,
+    consolidation_flagged_rate: float,
+) -> dict:
+    compared = 0
+    total_baseline = 0
+    total_counter = 0
+    removed = 0
+    added = 0
+    overlap = 0
+    for decision in decisions or []:
+        if not isinstance(decision, dict):
+            continue
+        counter = _route_apply_policy(
+            decision.get("candidate_hits") or [],
+            top_k=top_k,
+            deduplicate=deduplicate,
+            dedup_threshold=dedup_threshold,
+            agent_id=decision.get("baseline_policy", {}).get("agent_id"),
+        )
+        baseline_rows = decision.get("baseline_routed") or []
+        counter_rows = _route_rows(counter["hits"])
+        baseline_ids = {str(r.get("finding_id") or r.get("id") or "") for r in baseline_rows if isinstance(r, dict)}
+        counter_ids = {str(r.get("finding_id") or r.get("id") or "") for r in counter_rows if isinstance(r, dict)}
+        compared += 1
+        total_baseline += len(baseline_ids)
+        total_counter += len(counter_ids)
+        removed += len([x for x in (baseline_ids - counter_ids) if x])
+        added += len([x for x in (counter_ids - baseline_ids) if x])
+        overlap += len(baseline_ids & counter_ids)
+    compared = max(compared, 1)
+    # We optimize for stability first; modest compression is good, evidence loss is bad.
+    baseline_nonzero = max(total_baseline, 1)
+    stability = overlap / baseline_nonzero
+    compression = max(0.0, (total_baseline - total_counter) / baseline_nonzero)
+    removal_rate = removed / baseline_nonzero
+    addition_rate = added / baseline_nonzero
+    penalty_factor = 0.7 + max(0.0, min(1.0, _safe_float(consolidation_flagged_rate, 0.0)))
+    objective = (
+        stability
+        + (0.20 * compression)
+        - (penalty_factor * removal_rate)
+        - (0.20 * addition_rate)
+    )
+    return {
+        "policy": {
+            "top_k": int(top_k),
+            "deduplicate": bool(deduplicate),
+            "dedup_threshold": max(0.0, min(1.0, _safe_float(dedup_threshold, 0.80))),
+        },
+        "metrics": {
+            "decisions_compared": compared,
+            "baseline_ids": total_baseline,
+            "counter_ids": total_counter,
+            "overlap_ids": overlap,
+            "removed_ids": removed,
+            "added_ids": added,
+            "stability": round(stability, 6),
+            "compression": round(compression, 6),
+            "removal_rate": round(removal_rate, 6),
+            "addition_rate": round(addition_rate, 6),
+        },
+        "objective": round(float(objective), 6),
+    }
+
+
+def _append_route_policy_report(record: dict) -> None:
+    try:
+        path = MEMORY_DIR / "_policy" / "route_policy_optimization.jsonl"
+        _append_jsonl(path, record)
+    except Exception as exc:
+        logger.debug("_append_route_policy_report failed (fail-open): %r", exc)
+
+
+@mcp.tool()
+def memory_route_policy_optimize(
+    investigation_id: Optional[str] = None,
+    limit: int = 30,
+    days: int = 7,
+    min_decisions: int = 8,
+    persist: bool = False,
+) -> str:
+    """
+    Derive conservative memory_route policy recommendations from audited outcomes.
+
+    Reads audited `memory_route` traces (captured via `include_trace=True`) and
+    `memory_consolidate` advisory quality outcomes, evaluates a bounded policy
+    grid, and proposes at most one recommendation. Safe by default: no routing
+    behavior changes are applied automatically.
+    """
+    try:
+        if investigation_id:
+            entries = list(reversed(_read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")))
+            source = f"investigation:{investigation_id}"
+        else:
+            entries = _collect_recent_global_audit(limit=max(int(limit) * 20, 200), days=max(1, int(days)))
+            source = f"global_recent_audit_{max(1, int(days))}d"
+
+        decisions, skipped_missing_trace = _route_counterfactual_decisions_from_audit(entries, limit)
+        consolidation = _route_collect_consolidation_outcomes(entries)
+        if len(decisions) < max(1, int(min_decisions)):
+            return json.dumps({
+                "source": source,
+                "optimized": False,
+                "reason": "insufficient_decisions",
+                "decision_count": len(decisions),
+                "min_decisions": max(1, int(min_decisions)),
+                "skipped_missing_trace": skipped_missing_trace,
+                "consolidation_outcomes": consolidation,
+                "recommendation": None,
+            }, indent=2)
+
+        invariant_gate = _route_policy_optimization_invariants(decisions, consolidation)
+        if not invariant_gate.get("ok"):
+            return json.dumps({
+                "source": source,
+                "optimized": False,
+                "reason": "invariant_gate_failed",
+                "decision_count": len(decisions),
+                "min_decisions": max(1, int(min_decisions)),
+                "skipped_missing_trace": skipped_missing_trace,
+                "consolidation_outcomes": consolidation,
+                "invariant_gate": invariant_gate,
+                "recommendation": None,
+            }, indent=2)
+
+        provenance_aggregation = _route_policy_provenance_aggregation(decisions, consolidation, source)
+        baseline = _route_baseline_policy_summary(decisions)
+        candidates = _route_candidate_grid(baseline)
+        evaluations = [
+            _route_eval_candidate(
+                decisions,
+                top_k=c["top_k"],
+                deduplicate=c["deduplicate"],
+                dedup_threshold=c["dedup_threshold"],
+                consolidation_flagged_rate=consolidation["flagged_rate"],
+            )
+            for c in candidates
+        ]
+        evaluations.sort(
+            key=lambda row: (
+                _safe_float(row.get("objective"), -999.0),
+                _safe_float((row.get("metrics") or {}).get("stability"), 0.0),
+            ),
+            reverse=True,
+        )
+        best = evaluations[0] if evaluations else None
+        baseline_eval = next(
+            (
+                row for row in evaluations
+                if row.get("policy", {}).get("top_k") == baseline["top_k_median"]
+                and row.get("policy", {}).get("deduplicate") == baseline["deduplicate_majority"]
+                and abs(_safe_float(row.get("policy", {}).get("dedup_threshold"), 0.80) - baseline["dedup_threshold_median"]) < 1e-9
+            ),
+            None,
+        )
+        if baseline_eval is None:
+            baseline_eval = _route_eval_candidate(
+                decisions,
+                top_k=baseline["top_k_median"],
+                deduplicate=baseline["deduplicate_majority"],
+                dedup_threshold=baseline["dedup_threshold_median"],
+                consolidation_flagged_rate=consolidation["flagged_rate"],
+            )
+
+        baseline_score = _safe_float(baseline_eval.get("objective"), -999.0)
+        best_score = _safe_float(best.get("objective"), -999.0) if isinstance(best, dict) else -999.0
+        score_delta = best_score - baseline_score
+        best_metrics = (best or {}).get("metrics", {}) if isinstance(best, dict) else {}
+        safe_recommendation = (
+            isinstance(best, dict)
+            and score_delta >= 0.02
+            and _safe_float(best_metrics.get("stability"), 0.0) >= 0.85
+            and _safe_float(best_metrics.get("removal_rate"), 1.0) <= 0.15
+        )
+        recommendation = (best or {}).get("policy") if safe_recommendation else None
+        note = (
+            "recommended policy is conservative and simulation-backed"
+            if recommendation is not None
+            else "no safe improvement over baseline policy"
+        )
+        payload = {
+            "source": source,
+            "optimized": recommendation is not None,
+            "note": note,
+            "decision_count": len(decisions),
+            "min_decisions": max(1, int(min_decisions)),
+            "skipped_missing_trace": skipped_missing_trace,
+            "consolidation_outcomes": consolidation,
+            "baseline_policy_summary": baseline,
+            "baseline_objective": round(baseline_score, 6),
+            "best_objective": round(best_score, 6),
+            "score_delta": round(score_delta, 6),
+            "recommendation": recommendation,
+            "top_candidates": evaluations[:5],
+            "provenance_aggregation": provenance_aggregation,
+        }
+        if persist:
+            # Persist aggregate outcomes only (policy + metrics), never raw hit texts.
+            _append_route_policy_report({
+                "ts": _now(),
+                "source": source,
+                "decision_count": len(decisions),
+                "skipped_missing_trace": skipped_missing_trace,
+                "consolidation_outcomes": consolidation,
+                "baseline_policy_summary": baseline,
+                "baseline_objective": payload["baseline_objective"],
+                "best_objective": payload["best_objective"],
+                "score_delta": payload["score_delta"],
+                "recommendation": recommendation,
+                "top_candidates": payload["top_candidates"],
+                "provenance_aggregation": provenance_aggregation,
+            })
+            _event_log_append({
+                "op": "route_policy_optimize",
+                "source": source,
+                "decision_count": len(decisions),
+                "optimized": recommendation is not None,
+                "score_delta": payload["score_delta"],
+                "persisted": True,
+            })
+            payload["persisted"] = True
+        return json.dumps(payload, indent=2)
+    except Exception as exc:
+        logger.exception("memory_route_policy_optimize failed: %s", exc)
+        return json.dumps({
+            "error": f"memory_route_policy_optimize failed: {exc}",
+            "optimized": False,
         })
 
 

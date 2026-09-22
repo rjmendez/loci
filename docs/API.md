@@ -11,6 +11,9 @@ Loci is the repository's FastMCP server for persistent investigation memory, cod
 | Memory lifecycle and retrieval | [docs/API_MEMORY.md](./API_MEMORY.md) | Hot/warm/cold memory tiers, retraction and restore, health checks, surfacing and routing prior findings, consolidation, procedure recall, and retrieval/helper utilities. |
 | Swarm and local reasoning | [docs/API_SWARM_AND_REASONING.md](./API_SWARM_AND_REASONING.md) | `swarm_reason`, `llm_local`, reflection-loop tools, `memory_confidence`, the seed model, escalation stages, and the related CLI reasoning entry points. |
 
+For the policy envelope that governs deterministic escalation, budget limits, human
+review, and failure-mode fallbacks, see [docs/REASONING_POLICY_SPEC.md](./REASONING_POLICY_SPEC.md).
+
 ## Quickstart
 
 Loci's default MCP transport is **stdio**. Inside this repository, Claude Code can discover the checked-in server config from the repo-root `.mcp.json`, which launches:

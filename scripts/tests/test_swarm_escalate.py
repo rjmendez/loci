@@ -7,6 +7,8 @@ import re
 import sys
 import time
 
+import pytest
+
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
@@ -811,3 +813,90 @@ def test_hierarchical_reduce_groups_findings_and_fails_open_per_group():
     assert "group one summary" in final_prompts[0]
     assert "Reduced finding group 2" in final_prompts[0]
     assert len(result["findings"]) == 5
+
+
+def test_routing_contract_gate_fails_closed_on_out_of_range_flagged_index(monkeypatch):
+    def _bad_triage(_findings, _config):
+        return {
+            "flagged_indices": [99],
+            "flagged_count": 1,
+            "escalation_reasons": {"99": ["broken_index"]},
+            "similar_pairs": [],
+        }
+
+    monkeypatch.setattr(S, "triage_findings", _bad_triage)
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"ok","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"ok"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    with pytest.raises(S.SwarmContractError, match="routing_contract"):
+        S.run_swarm(_config(subtasks=["only"], fanout_count=1), deps={"generate_batch": _generate_batch})
+
+
+def test_escalation_contract_gate_fails_closed_on_mismatched_counts(monkeypatch):
+    monkeypatch.setattr(
+        S,
+        "escalate_findings",
+        lambda findings, triage, *, config, batch_fn: (
+            list(findings),
+            {"attempted": 1, "succeeded": 0, "failed_open": 0, "model": config.escalate_model},
+        ),
+    )
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"ok","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"ok"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    with pytest.raises(S.SwarmContractError, match="escalation_contract"):
+        S.run_swarm(_config(subtasks=["only"], fanout_count=1), deps={"generate_batch": _generate_batch})
+
+
+def test_consolidation_contract_gate_fails_closed_on_inconsistent_merge_report(monkeypatch):
+    monkeypatch.setattr(
+        S,
+        "_merge_findings",
+        lambda findings: (
+            list(findings),
+            {"input_count": len(findings), "merged_count": len(findings), "deduped_count": 99},
+        ),
+    )
+
+    def _generate_batch(prompts, model=None, max_tokens=256, fmt=None, think=False):  # noqa: ARG001
+        if model == "planner-model:latest":
+            seed = _seed_from_prompt(prompts[0])
+            return [{"ok": True, "text": f'{{"subtasks":["seed {seed} task"]}}'}]
+        if model == "cheap-model:latest":
+            return [{"ok": True, "text": '{"answer":"ok","confidence":"high"}'} for _ in prompts]
+        if model == "synth-model:latest":
+            return [{"ok": True, "text": '{"summary":"ok"}'}]
+        raise AssertionError(f"unexpected model: {model}")
+
+    config = _config(fanout_count=1)
+    config.subtasks = None
+    config.seeds = 2
+    with pytest.raises(S.SwarmContractError, match="consolidation_contract"):
+        S.run_swarm(config, deps={"generate_batch": _generate_batch})
+
+
+def test_publication_contract_gate_fails_closed_on_invalid_final_shape(monkeypatch):
+    monkeypatch.setattr(
+        S,
+        "_run_single_seed_result",
+        lambda config, batch_fn, guardian_fn: {
+            "schema_version": 1,
+            "topic": config.topic,
+            "findings": [],
+            "summary": "",
+            "stats": {"fanout_count": 0, "escalated_count": 0, "escalation_rate": 0.0},
+        },
+    )
+
+    with pytest.raises(S.SwarmContractError, match="publication_contract"):
+        S.run_swarm(_config(subtasks=["only"], fanout_count=1), deps={"generate_batch": lambda *a, **k: []})

@@ -52,6 +52,12 @@ Offload reasoning to local models before spending cloud tokens.
 
 All local tiers **fail open**: if a backend is down, you get degraded output, not a crash. Watch for `degraded=True` in results — an unpulled or misspelled model tag fails *silently* except for the `why` field.
 
+When you need the script-level deep-think lane (`scripts/local_deep_think.py`) versus swarm,
+use this rule: **deep-think** for investigation-centric claim building and verification;
+**swarm** for decomposition-heavy tasks where wide cheap fan-out plus selective escalation
+is the main value. See [../API_SWARM_AND_REASONING.md](../API_SWARM_AND_REASONING.md) for
+the detailed chooser.
+
 ## Verification: do not assert what you cannot support
 
 Loci gives you trust gates. Use them.

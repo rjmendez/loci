@@ -28,6 +28,8 @@ from inv_store import (
     _node_numeric_confidence,
     _NEUTRAL_NUMERIC_CONFIDENCE,
 )
+from provenance_firewall import provenance_fields
+from replay_fingerprint import apply_finding_fingerprints
 from untrusted_memory import wrap_untrusted_memory_text
 
 logger = logging.getLogger("loci-mcp")
@@ -64,11 +66,41 @@ def _wrap_finding_text(finding: dict, *, text_key: str = "text") -> dict:
 
 def _reflect_context_bullets(findings: list, investigation_id: str) -> str:
     """Bounded, wrapped finding context shared by reflect's model-authored passes."""
-    return "\n".join(
-        f"- [{f.get('type', '?')}] "
-        f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], origin='loci_memory', investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type') or f.get('record_type') or 'finding'), source=str(f.get('source') or 'investigation_reflect'))}"
-        for f in findings
-    )
+    rows: list[str] = []
+    for f in findings:
+        prov = provenance_fields(f)
+        derived = f.get("derived_from")
+        if isinstance(derived, (list, tuple, set)):
+            derived_ids = [str(d).strip() for d in derived if str(d).strip()]
+        elif derived:
+            derived_ids = [str(derived).strip()]
+        else:
+            derived_ids = []
+        meta = [
+            f"id={str(f.get('id') or '?')}",
+            f"type={str(f.get('type') or f.get('record_type') or '?')}",
+            f"source={str(f.get('source') or 'unknown')[:80]}",
+            f"confidence={str(f.get('confidence') or 'medium')}",
+            f"numeric_confidence={_node_numeric_confidence(f):.3f}",
+            f"provenance={prov.get('evidence_provenance_tier')}",
+        ]
+        if prov.get("provenance_defaulted"):
+            meta.append("provenance_defaulted=true")
+        if derived_ids:
+            preview = ",".join(derived_ids[:3])
+            if len(derived_ids) > 3:
+                preview += f",+{len(derived_ids) - 3} more"
+            meta.append(f"derived_from={preview}")
+        wrapped = wrap_untrusted_memory_text(
+            str(f.get("text", ""))[:300],
+            origin="loci_memory",
+            investigation_id=investigation_id,
+            finding_id=str(f.get("id") or ""),
+            kind=str(f.get("type") or f.get("record_type") or "finding"),
+            source=str(f.get("source") or "investigation_reflect"),
+        )
+        rows.append(f"- [{' | '.join(meta)}] {wrapped}")
+    return "\n".join(rows)
 
 
 def _coordination_error(message: str) -> str:
@@ -1163,17 +1195,35 @@ def investigation_reflect(investigation_id: str) -> str:
 
         # Deterministic fallback when LLM is unavailable or failed to produce output
         if not summary_l1:
-            summary_l1 = [
-                str(f.get("text", ""))[:100]
-                for f in findings[-5:]
-                if str(f.get("text", "")).strip()
-            ]
+            summary_l1 = []
+            for f in findings[-5:]:
+                text = str(f.get("text", "")).strip()
+                if not text:
+                    continue
+                prov = provenance_fields(f)
+                summary_l1.append(
+                    f"[{str(f.get('type') or f.get('record_type') or '?')}"
+                    f" source={str(f.get('source') or 'unknown')[:60]}"
+                    f" confidence={str(f.get('confidence') or 'medium')}"
+                    f" provenance={prov.get('evidence_provenance_tier')}] "
+                    f"{text[:100]}"
+                )
         if not summary_l2:
             n = len(findings)
             latest_text = str(findings[-1].get("text", "")) if findings else ""
+            latest_meta = ""
+            if findings:
+                latest = findings[-1]
+                latest_prov = provenance_fields(latest)
+                latest_meta = (
+                    f" [{str(latest.get('type') or latest.get('record_type') or '?')}"
+                    f" source={str(latest.get('source') or 'unknown')[:60]}"
+                    f" confidence={str(latest.get('confidence') or 'medium')}"
+                    f" provenance={latest_prov.get('evidence_provenance_tier')}]"
+                )
             summary_l2 = (
                 f"Investigation with {n} finding{'s' if n != 1 else ''}."
-                + (f" Latest: {latest_text[:200]}" if latest_text else "")
+                + (f" Latest{latest_meta}: {latest_text[:200]}" if latest_text else "")
             )
 
         # Persist to manifest (write-through cache via _save_manifest)
@@ -1539,7 +1589,23 @@ def investigation_export(
 
         inv_dir = _inv_dir(investigation_id)
 
-        findings = _read_jsonl(inv_dir / "findings.jsonl")
+        findings_raw = _read_jsonl(inv_dir / "findings.jsonl")
+        findings = [
+            (
+                apply_finding_fingerprints(
+                    finding,
+                    source=finding.get("source"),
+                    explicit_provenance_tier=(
+                        (finding.get("metadata") or {}).get("evidence_provenance_tier")
+                        if isinstance(finding.get("metadata"), dict)
+                        else None
+                    ),
+                )
+                if isinstance(finding, dict)
+                else finding
+            )
+            for finding in findings_raw
+        ]
         conflicts = _read_jsonl(inv_dir / "conflicts.jsonl")
         entities = _read_jsonl(inv_dir / "entities.jsonl")
 
