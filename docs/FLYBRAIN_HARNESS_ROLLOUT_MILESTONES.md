@@ -12,6 +12,40 @@ This sequencing is aligned with:
 - [FLYBRAIN_NEO4J_NEUPRINT_LOCAL_STACK_PLAN.md](./FLYBRAIN_NEO4J_NEUPRINT_LOCAL_STACK_PLAN.md)
 - [FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md](./FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md)
 
+## Current roadmap status (2026-09-23)
+
+The rollout is now in a staged operational posture, not a blank-slate plan:
+
+- **M0 dry-run inventory gate:** complete. Storage-path checks, dataset scope validation, and deterministic preflight proof are in place.
+- **M1 plan freeze gate:** complete. Stage plans, idempotency keys, and write-intent manifests are persisted before execute mode.
+- **M2 snapshot + manifest gate:** complete. Snapshot acquisition, checksum verification, and manifest-schema enforcement are part of the active contract.
+- **M3 first reproducible local query harness gate:** partial/in progress. The harness and guardrails are in place, but the final training/eval chain remains blocked by the dataset-builder and specialist-training outputs.
+- **Merge/deploy gate for testing:** PR stack is active, but production deployment stays behind merge readiness. The current stack is ordered: the base PR must land first, then the stacked PR can merge and deploy to test.
+
+### Current execution blockers
+
+The remaining roadmap blockers are not infrastructure-only; they are product/validation gates:
+
+1. `bc-trainlog-dataset-builder` must produce a reproducible dataset artifact with fingerprints, split metadata, and label balance notes.
+2. `bc-trainlog-train-specialists` must train the specialist models from the canonical corpus.
+3. `bc-trainlog-eval-and-gate` must validate the trained specialists with holdout/shadow checks and fail-closed promotion criteria.
+
+This keeps the rollout honest: no broad promotion or deployment before the output artifact and evaluation gate are green.
+
+## Roadmap updates vs. the original plan
+
+The original milestones remain valid, but the operational sequence is now explicit:
+
+1. **Preflight + inventory** (complete)
+2. **Plan freeze + resume-safe staging** (complete)
+3. **Snapshot / manifest verification** (complete)
+4. **Reproducible harness query run** (active)
+5. **Specialist dataset build** (active required dependency)
+6. **Specialist training + eval gate** (active required dependency)
+7. **Stacked PR merge + test deployment** (next operational gate)
+
+This order is intentionally conservative: it preserves fail-closed behavior and keeps deployment from racing ahead of data quality and evaluation evidence.
+
 ## Required variable contract
 
 No hardcoded drive letters or machine-specific absolute paths are allowed.
