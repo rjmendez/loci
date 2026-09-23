@@ -37,9 +37,46 @@ def test_create_layout_directories(monkeypatch, tmp_path):
         assert path.is_dir()
 
 
-def test_missing_storage_root_fails(monkeypatch):
+def test_uses_harness_data_root_alias(monkeypatch, tmp_path):
+    root = tmp_path / "alias-root"
     monkeypatch.delenv(fhs.ENV_FLYBRAIN_STORAGE_ROOT, raising=False)
-    with pytest.raises(ValueError, match=fhs.ENV_FLYBRAIN_STORAGE_ROOT):
+    monkeypatch.delenv("HARNESS_STORAGE_ROOT", raising=False)
+    monkeypatch.delenv(fhs.ENV_FLYBRAIN_ALLOWLIST_ROOT, raising=False)
+    monkeypatch.setenv("HARNESS_DATA_ROOT", str(root))
+    assert fhs.resolve_flybrain_storage_root() == root.resolve(strict=False)
+
+
+def test_uses_harness_storage_root_alias(monkeypatch, tmp_path):
+    root = tmp_path / "alias-root-2"
+    monkeypatch.delenv(fhs.ENV_FLYBRAIN_STORAGE_ROOT, raising=False)
+    monkeypatch.delenv("HARNESS_DATA_ROOT", raising=False)
+    monkeypatch.delenv(fhs.ENV_FLYBRAIN_ALLOWLIST_ROOT, raising=False)
+    monkeypatch.setenv("HARNESS_STORAGE_ROOT", str(root))
+    assert fhs.resolve_flybrain_storage_root() == root.resolve(strict=False)
+
+
+def test_uses_allowlisted_root_alias(monkeypatch, tmp_path):
+    root = tmp_path / "allowlisted-root"
+    monkeypatch.delenv(fhs.ENV_FLYBRAIN_STORAGE_ROOT, raising=False)
+    monkeypatch.delenv("HARNESS_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HARNESS_STORAGE_ROOT", raising=False)
+    monkeypatch.setenv(fhs.ENV_FLYBRAIN_ALLOWLIST_ROOT, str(root))
+    assert fhs.resolve_flybrain_storage_root() == root.resolve(strict=False)
+
+
+def test_rejects_invalid_alias_value(monkeypatch):
+    monkeypatch.delenv(fhs.ENV_FLYBRAIN_STORAGE_ROOT, raising=False)
+    monkeypatch.delenv("HARNESS_DATA_ROOT", raising=False)
+    monkeypatch.delenv("HARNESS_STORAGE_ROOT", raising=False)
+    monkeypatch.setenv(fhs.ENV_FLYBRAIN_ALLOWLIST_ROOT, "relative/flybrain")
+    with pytest.raises(ValueError, match="absolute"):
+        fhs.resolve_flybrain_storage_root()
+
+
+def test_missing_storage_root_fails(monkeypatch):
+    for key in (*fhs.ENV_FLYBRAIN_STORAGE_ROOT_ALIASES,):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(ValueError, match="No FlyBrain storage root configured"):
         fhs.resolve_flybrain_storage_root()
 
 
@@ -52,3 +89,16 @@ def test_rejects_relative_storage_root():
 def test_rejects_drive_root_on_windows():
     with pytest.raises(ValueError, match="drive root"):
         fhs.resolve_flybrain_storage_root(root_override="C:\\")
+
+
+def test_rejects_symlinked_storage_root(tmp_path):
+    target = tmp_path / "target-root"
+    target.mkdir()
+    link = tmp_path / "symlink-root"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation requires OS privileges")
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        fhs.resolve_flybrain_storage_root(root_override=link)

@@ -160,7 +160,7 @@ Every local query result must include:
     "dataset_symbol": "hb",
     "version_id": "neuprint_JRC_Hemibrain_1point2point1",
     "access_method": "local_graph_snapshot",
-    "query_type": "connectivity_adjacency",
+    "query_kind": "connectivity_lookup",
     "scope": {
       "sex": "female",
       "stage": "adult",
@@ -251,7 +251,7 @@ python3 scripts/flybrain_fetch_sync_pipeline.py \
    - Download or acquire graph export from Neuprint `neuprint_JRC_Hemibrain_1point2point1`.
    - Build candidate graph in `$LOCI_FLYBRAIN_STORAGE_ROOT/graph/hb/neuprint_JRC_Hemibrain_1point2point1/neo4j-store/candidate-<build_id>/`.
    - Run smoke tests (connectivity counts, traversal checks).
-   - Promote to active pointer in `$LOCI_FLYBRAIN_STORAGE_ROOT/graph/hb/neuprint_JRC_Hemibrain_1point2point1/promotion/active_link`.
+   - Require active promotion pointer at `$LOCI_FLYBRAIN_STORAGE_ROOT/graph/hb/neuprint_JRC_Hemibrain_1point2point1/promotion/active_pointer.json` with `{"active": true}` before query execution.
 
 2. **FlyWire Metadata (`fw`):**
    - Download metadata from VFB/FlyBrain dataset list for `flywire783`.
@@ -275,6 +275,16 @@ python3 scripts/flybrain_fetch_sync_pipeline.py \
 
 The pipeline will skip completed stages and resume partial downloads via byte-range requests.
 
+### Stage 2–5 hard fail-closed gates (before local query use)
+
+Do not route local queries to a snapshot unless all of these gates pass:
+
+1. `integrity.manifest_sha256` canonical self-hash verification passes.
+2. Every `integrity.files` entry resolves safely under artifact root and matches `sha256` (and `size_bytes` when present).
+3. `integrity.verification.status == "verified"` and `verified_at` is present.
+4. `refresh.decision != "rollback"` and `refresh.next_check_due` is not expired.
+5. `hb` active promotion pointer exists and is active (`active_pointer.json`).
+
 ---
 
 ## 4. Local Storage Layout After Population
@@ -288,20 +298,12 @@ $LOCI_FLYBRAIN_STORAGE_ROOT/
 │       └── neuprint_JRC_Hemibrain_1point2point1/
 │           ├── neo4j-store/
 │           │   ├── promotion/
-│           │   │   └── active_link -> candidate-<hash>/
+│           │   │   └── active_pointer.json
 │           │   └── candidate-<hash>/
 │           │       ├── store/
 │           │       ├── index/
 │           │       └── smoke-test-results.json
 │           └── schema.json
-├── datasets/
-│   └── fw/
-│       └── flywire783/
-│           ├── metadata/
-│           │   ├── entities.json
-│           │   ├── annotations.json
-│           │   └── index.json
-│           └── manifest.json
 ├── snapshots/
 │   ├── hb/
 │   │   └── neuprint_JRC_Hemibrain_1point2point1/
@@ -313,6 +315,10 @@ $LOCI_FLYBRAIN_STORAGE_ROOT/
 │   └── fw/
 │       └── flywire783/
 │           ├── source/
+│           ├── metadata/
+│           │   ├── entities.json
+│           │   ├── annotations.json
+│           │   └── index.json
 │           └── manifest/
 │               └── manifest.json
 ├── cache/
@@ -350,7 +356,7 @@ hb_adapter = HbGraphLocalAdapter(storage_root=storage_root)
 # Query 1: Connectivity lookup
 # "Which neurons connect to the Kenyon cell class in the hemibrain?"
 result = hb_adapter.query(
-    query_type='connectivity_adjacency',
+    query_type='connectivity_lookup',
     target_class='FBbt_00003686',  # Kenyon cell
     upstream=True,
     limit=100
@@ -364,7 +370,7 @@ result = hb_adapter.query(
 # Query 2: Class-neighbor traversal
 # "What are the direct presynaptic inputs to a Kenyon cell?"
 neighbors = hb_adapter.query(
-    query_type='class_neighbors',
+    query_type='neighborhood_traversal',
     target_class='FBbt_00003686',
     direction='presynaptic',
     threshold_weight=10
@@ -401,7 +407,7 @@ entity = fw_adapter.query(
 # Query 2: Annotation lookup
 # "Find all annotations tagged with 'descending neuron'"
 annotations = fw_adapter.query(
-    query_type='annotation_search',
+    query_type='annotation_lookup',
     tag='descending_neuron',
     limit=50
 )
@@ -430,7 +436,7 @@ remote_adapter = RemoteFallbackAdapter()
 # ONLY if you need male CNS data not in the local hb snapshot:
 male_data = remote_adapter.query(
     dataset='male_cns_v1_0',
-    query_type='connectivity_adjacency',
+    query_type='connectivity_lookup',
     target_class='FBbt_00003686',
     note='Male CNS fallback; not hemibrain scope'
 )
@@ -471,7 +477,7 @@ def query_connectivity_local(
     hb_adapter = HbGraphLocalAdapter(storage_root=storage_root)
     
     raw_result = hb_adapter.query(
-        query_type='connectivity_adjacency',
+        query_type='connectivity_lookup',
         target_class=target_class,
         upstream=upstream
     )
@@ -525,7 +531,7 @@ du -sh "$LOCI_FLYBRAIN_STORAGE_ROOT"
 
 # Expected breakdown after full population:
 # - graph/hb: ~15 GB (active graph store)
-# - datasets/fw: ~5 GB (metadata)
+# - snapshots/fw/metadata: ~5 GB (metadata)
 # - snapshots: ~20 GB (snapshot bundles with manifests)
 # - cache: ~2 GB (resumable partials, index caches)
 # - backups: ~1 GB (backup metadata)
@@ -623,6 +629,12 @@ python3 -c "from mcp.flybrain_harness_storage import validate_flybrain_path; pri
 ### Problem: Checksum mismatch on acquired files
 **Solution:** Hard failure; do not auto-retry. Check source data availability and clear `cache/downloads/<dataset>` before retry.
 
+### Problem: `integrity.verification.status` is not `verified`
+**Solution:** Treat as non-promotable and non-queryable. Re-run integrity verification, populate `verified_at`, and retry only after status is `verified`.
+
+### Problem: Missing or inactive hb `active_pointer.json`
+**Solution:** Do not query local hb data. Restore a valid active promotion pointer or rerun promotion for the pinned hb snapshot.
+
 ---
 
 ## 11. Next Steps and Future Scope
@@ -644,6 +656,15 @@ python3 -c "from mcp.flybrain_harness_storage import validate_flybrain_path; pri
 **Status:** Ready for local-first operational use.  
 **Document version:** 1.1 (2026-09-23)  
 **Last reviewed:** 2026-09-23
+
+## 11.1 Targeted test coverage for the guardrails
+
+- `mcp/tests/test_flybrain_hb_adapter.py`
+  - scope/fallback rejection
+  - manifest verification rollback enforcement
+- `mcp/tests/test_flybrain_fw_metadata_adapter.py`
+  - manifest self-hash mismatch rejection
+  - path-escape rejection for `integrity.files`
 
 ## 12. Bias and Failure-Mode Handling (hb/fw local stack)
 
@@ -802,4 +823,3 @@ Use this shape for final stored findings and user-facing summaries:
 ```
 
 If this contract cannot be filled with evidence from the executed query path, the answer should be downgraded to an explicit gap/assumption rather than presented as established fact.
-

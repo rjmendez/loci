@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Mapping
 
 ENV_FLYBRAIN_STORAGE_ROOT = "LOCI_FLYBRAIN_STORAGE_ROOT"
+ENV_FLYBRAIN_ALLOWLIST_ROOT = "LOCI_FLYBRAIN_ALLOWED_ROOT"
+ENV_FLYBRAIN_STORAGE_ROOT_ALIASES = (
+    ENV_FLYBRAIN_STORAGE_ROOT,
+    "HARNESS_DATA_ROOT",
+    "HARNESS_STORAGE_ROOT",
+    ENV_FLYBRAIN_ALLOWLIST_ROOT,
+)
 
 _ROOT_DRIVEN_SUBDIRS = (
     "graph",
@@ -70,21 +77,32 @@ def _iter_existing_components(path: Path):
             yield probe
 
 
-def _validate_root(root: Path) -> None:
+def _validate_root(root: Path, *, env_name: str = ENV_FLYBRAIN_STORAGE_ROOT) -> None:
     if not root.is_absolute():
-        raise ValueError("LOCI_FLYBRAIN_STORAGE_ROOT must resolve to an absolute path")
+        raise ValueError(f"{env_name} must resolve to an absolute path")
 
     if os.name == "nt":
         if str(root).startswith("\\\\"):
-            raise ValueError("LOCI_FLYBRAIN_STORAGE_ROOT must be a local-drive path, not UNC")
+            raise ValueError(f"{env_name} must be a local-drive path, not UNC")
         if root == Path(root.anchor):
-            raise ValueError("LOCI_FLYBRAIN_STORAGE_ROOT cannot be a drive root")
+            raise ValueError(f"{env_name} cannot be a drive root")
 
     for component in _iter_existing_components(root):
         if component.is_symlink() or _is_windows_reparse_point(component):
             raise ValueError(
-                f"LOCI_FLYBRAIN_STORAGE_ROOT may not traverse symlink/reparse path: {component}"
+                f"{env_name} may not traverse symlink/reparse path: {component}"
             )
+
+
+def _resolve_valid_root_value(raw: str, *, env_name: str) -> Path:
+    expanded = os.path.expandvars(os.path.expanduser(raw.strip()))
+    if not expanded:
+        raise ValueError(f"{env_name} is empty")
+    if not Path(expanded).is_absolute():
+        raise ValueError(f"{env_name} must resolve to an absolute path")
+    root = _expand_path(expanded)
+    _validate_root(root, env_name=env_name)
+    return root
 
 
 def resolve_flybrain_storage_root(
@@ -93,15 +111,25 @@ def resolve_flybrain_storage_root(
     env: Mapping[str, str] | None = None,
 ) -> Path:
     env_map = env if env is not None else os.environ
-    raw = str(root_override).strip() if root_override is not None else (env_map.get(ENV_FLYBRAIN_STORAGE_ROOT, "").strip())
-    if not raw:
-        raise ValueError(f"{ENV_FLYBRAIN_STORAGE_ROOT} is required")
-    expanded = os.path.expandvars(os.path.expanduser(raw))
-    if not Path(expanded).is_absolute():
-        raise ValueError("LOCI_FLYBRAIN_STORAGE_ROOT must be absolute before normalization")
-    root = _expand_path(raw)
-    _validate_root(root)
-    return root
+
+    if root_override is not None:
+        return _resolve_valid_root_value(str(root_override), env_name="root_override")
+
+    last_error: ValueError | None = None
+    for candidate in ENV_FLYBRAIN_STORAGE_ROOT_ALIASES:
+        value = str(env_map.get(candidate, "")).strip()
+        if not value:
+            continue
+        try:
+            return _resolve_valid_root_value(value, env_name=candidate)
+        except ValueError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+
+    allowed = ", ".join(ENV_FLYBRAIN_STORAGE_ROOT_ALIASES)
+    raise ValueError(f"No FlyBrain storage root configured. Set one of: {allowed}")
 
 
 def build_flybrain_harness_layout(

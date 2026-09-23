@@ -52,6 +52,14 @@ Supported query classes:
 - class-neighbor traversal
 - deterministic graph replay / smoke verification
 
+Execution gates (must all pass before execute):
+
+- manifest canonical self-hash matches `integrity.manifest_sha256`
+- each `integrity.files` entry passes path containment + sha256/size checks
+- `integrity.verification.status == "verified"` with `verified_at`
+- `promotion/active_pointer.json` exists and `active=true`
+- `refresh.decision != "rollback"` and `next_check_due` is not expired
+
 Not supported:
 
 - full-brain or non-hemibrain generalization without an explicit scope note
@@ -76,6 +84,13 @@ Supported query classes:
 Not supported:
 
 - local full FlyWire adjacency mirror in phase 1
+
+Execution gates (must all pass before execute):
+
+- manifest canonical self-hash matches `integrity.manifest_sha256`
+- `integrity.files` is non-empty and passes path containment + sha256/size checks
+- `integrity.verification.status == "verified"` with `verified_at`
+- `refresh.decision != "rollback"` and `next_check_due` is not expired
 
 ### 3. `RemoteFallbackAdapter`
 
@@ -163,12 +178,20 @@ Stop and require operator attention when:
 - requested dataset version does not match the pinned local snapshot
 - query scope violates a known dataset boundary
 - adapter capability says a local result is unsupported but remote fallback was not explicitly approved
+- any manifest/hash/file-integrity guard fails
+- hb active promotion pointer is missing/inactive
+- verification status is not `verified`
 
 Retry/resume is allowed only for transient issues such as:
 
 - lock contention
 - temporary network access to remote fallback
 - staged download/cache recovery
+
+Fail-closed rule:
+
+- do not return success-shaped local results when integrity/promotion gates fail.
+- return explicit adapter error and require operator remediation.
 
 ## Implementation checklist
 
@@ -179,9 +202,20 @@ Retry/resume is allowed only for transient issues such as:
 - validate query routing with deterministic unit tests
 - prune stale capability metadata on version pin updates
 
+Guardrail test references:
+
+- `mcp/tests/test_flybrain_hb_adapter.py`
+- `mcp/tests/test_flybrain_fw_metadata_adapter.py`
+
 ## Recommended next implementation step
 
 Implement the adapter registry and a minimal `hb` / `fw` capability manifest behind the storage root helper before adding a deeper query execution layer.
+
+---
+
+## Concrete hb adapter contract
+
+See [FLYBRAIN_HB_LOCAL_ADAPTER_CONTRACT.md](./FLYBRAIN_HB_LOCAL_ADAPTER_CONTRACT.md) for the execution-ready hb adapter contract, result envelope, provenance envelope, error codes, and rollback conditions.
 
 ---
 

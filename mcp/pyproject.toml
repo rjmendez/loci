@@ -46,6 +46,9 @@ py-modules = [
     "batched_gen",
     "embed_ops",
     "graph_tools",
+    "flybrain_harness_storage",
+    "flybrain_hb_adapter",
+    "replay_fingerprint",
     "grounding",
     "inv_store",
     "investigation_tools",
@@ -66,3 +69,5 @@ py-modules = [
     "verify",
     "wiring_obligation_scan",
 ]
+
+

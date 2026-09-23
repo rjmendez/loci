@@ -18,10 +18,10 @@ No script may bypass this policy with direct `os`, `pathlib`, `shutil`, or shell
 
 ## Canonical allowlisted root
 
-- **Configured root variable:** `LOCI_FLYBRAIN_STORAGE_ROOT`
-- **Guard variable alias (optional):** `LOCI_FLYBRAIN_ALLOWED_ROOT`
+- **Configured root variable (canonical):** `LOCI_FLYBRAIN_STORAGE_ROOT`
+- **Compatibility aliases accepted by runtime:** `HARNESS_DATA_ROOT`, `HARNESS_STORAGE_ROOT`, `LOCI_FLYBRAIN_ALLOWED_ROOT`
 - **Example workstation value:** `<configured-storage-root>\loci-data\flybrain`
-- Root must be absolute, local-drive, normalized, non-symlink/junction, and configured via a variable such as `$HARNESS_DATA_ROOT` or `$HARNESS_STORAGE_ROOT`.
+- Root must be absolute, local-drive, normalized, non-symlink/junction, and configured via an explicit env/config value.
 
 All effective paths must resolve to this root or a descendant of this root.
 
@@ -72,6 +72,22 @@ Every candidate path must pass all checks in this order:
    - Never allow deletion/rename of the root itself.
 
 Any failed check is a hard failure (no fail-open behavior). The root must be configured from an explicit env/config value rather than hardcoded to a single drive letter.
+
+## Manifest integrity-path guardrails (execution gate)
+
+Path safety also applies to manifest-driven integrity checks before any local
+query execution:
+
+- `artifact.relative_root` and `integrity.files[*].relative_path` must be safe
+  relative paths (no absolute path, drive prefix, or traversal).
+- Each integrity file path must resolve under the configured artifact root.
+- Duplicate paths after case-folding are rejected.
+- Partial artifact names (`.partial`, `.tmp`, `.inprogress`) are rejected.
+- Any path escape or missing file is fail-closed (`MANIFEST_INVALID`,
+  `MANIFEST_MISSING`, or `PATH_ESCAPE` depending on adapter).
+
+This is enforced in adapter manifest validation, not only in write-path
+preflight.
 
 ## Destructive-operation restrictions
 
@@ -167,3 +183,17 @@ The harness should prefer under-allocation and regular cleanup over long-lived g
 
 This policy is intentionally conservative because the same storage root can host unbacked photo/media content outside the FlyBrain allowlist and outside the harness's operational control; config-driven roots keep the rule portable across machines and shared-drive layouts.
 
+## Operator remediation for fail-closed path/integrity errors
+
+When path or integrity validation fails:
+
+1. stop execution (do not bypass guards),
+2. correct the path configuration and manifest file list,
+3. restore or re-fetch missing/corrupt files under the allowed root,
+4. regenerate manifest hash/checksum metadata,
+5. rerun validation and proceed only after all checks pass.
+
+## Targeted test coverage references
+
+- `mcp/tests/test_flybrain_hb_adapter.py` (manifest + integrity fail-closed)
+- `mcp/tests/test_flybrain_fw_metadata_adapter.py` (manifest hash mismatch and path escape rejection)
