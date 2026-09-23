@@ -113,3 +113,124 @@ def test_default_gen_fn_reuses_verify_lazy_generate(monkeypatch):
     assert result["verdict"] == "refuted"
     assert captured["fmt"] == "json"
     assert captured["max_tokens"] == 220
+
+
+def test_reflex_fastpath_confirms_exact_high_overlap_without_model_call():
+    calls = []
+
+    def _fn(*a, **k):
+        calls.append((a, k))
+        return {"text": "{}", "ok": True}
+
+    evidence = [{
+        "role": "support",
+        "evidence_id": "f-2",
+        "record_type": "observed",
+        "source": "test",
+        "text": "Host-b executed malware and established persistence.",
+    }]
+    result = E.check_claim_entailment(
+        "Host-b executed malware.",
+        evidence,
+        gen_fn=_fn,
+    )
+    assert result["available"] is True
+    assert result["verdict"] == "confirmed"
+    assert "reflex_fastpath" in result["rationale"]
+    assert calls == []
+
+
+def test_reflex_fastpath_is_deterministic_on_repeated_calls():
+    calls = []
+
+    def _fn(*a, **k):
+        calls.append((a, k))
+        return {"text": "{}", "ok": True}
+
+    evidence = [{
+        "role": "support",
+        "evidence_id": "f-2b",
+        "record_type": "observed",
+        "source": "test",
+        "text": "Host-b executed malware and established persistence.",
+    }]
+    first = E.check_claim_entailment("Host-b executed malware.", evidence, gen_fn=_fn)
+    second = E.check_claim_entailment("Host-b executed malware.", evidence, gen_fn=_fn)
+
+    assert first["available"] is True
+    assert first["verdict"] == "confirmed"
+    assert second == first
+    assert "reflex_fastpath" in first["rationale"]
+    assert calls == []
+
+
+def test_reflex_fastpath_fails_open_on_malformed_evidence():
+    calls = []
+
+    def _fn(*a, **k):
+        calls.append((a, k))
+        return {"text": "{}", "ok": True}
+
+    malformed = [
+        None,
+        "not a dict",
+        {"role": "support", "evidence_id": "f-4b", "record_type": "observed", "source": "test"},
+        {"role": "support", "text": None},
+    ]
+    result = E.check_claim_entailment("Host-b executed malware.", malformed, gen_fn=_fn)
+
+    assert result["available"] is False
+    assert result["verdict"] is None
+    assert result["degraded"] is True
+    assert calls == []
+
+
+def test_reflex_fastpath_refutes_strong_contradiction_without_model_call():
+    calls = []
+
+    def _fn(*a, **k):
+        calls.append((a, k))
+        return {"text": "{}", "ok": True}
+
+    evidence = [{
+        "role": "contradiction",
+        "evidence_id": "f-3",
+        "record_type": "observed",
+        "source": "test",
+        "text": "Host-b did not execute malware during the inspected window.",
+    }]
+    result = E.check_claim_entailment(
+        "Host-b executed malware during the inspected window.",
+        evidence,
+        gen_fn=_fn,
+    )
+    assert result["available"] is True
+    assert result["verdict"] == "refuted"
+    assert "reflex_fastpath" in result["rationale"]
+    assert calls == []
+
+
+def test_reflex_fastpath_prevalidated_support_short_circuits_model_call():
+    calls = []
+
+    def _fn(*a, **k):
+        calls.append((a, k))
+        return {"text": "{}", "ok": True}
+
+    evidence = [{
+        "role": "support",
+        "evidence_id": "f-4",
+        "record_type": "observed",
+        "source": "test",
+        "validation_status": "validated",
+        "text": "Host-b executed malware and wrote startup registry keys.",
+    }]
+    result = E.check_claim_entailment(
+        "Host-b executed malware.",
+        evidence,
+        gen_fn=_fn,
+    )
+    assert result["available"] is True
+    assert result["verdict"] == "confirmed"
+    assert "reflex_fastpath" in result["rationale"]
+    assert calls == []

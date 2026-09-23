@@ -25,6 +25,7 @@ Design mirrors guardian.py / verify.py:
 """
 from __future__ import annotations
 
+import re
 from typing import Callable, Optional
 
 from model_json import extract_json_object
@@ -34,6 +35,8 @@ GenFn = Callable[..., dict]
 _VALID_VERDICTS = ("confirmed", "refuted", "uncertain")
 _MAX_EVIDENCE_ITEMS = 8
 _MAX_EVIDENCE_CHARS = 1200
+_FASTPATH_MIN_OVERLAP = 0.72
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 _PROMPT_TMPL = (
     "You are checking whether cited investigation evidence REALLY supports an EXACT claim.\n"
@@ -84,6 +87,99 @@ def _unavailable(error: str = "", rationale: str = "") -> dict:
         "degraded": True,
         "error": err.strip(),
     }
+
+
+def _tokenize(text: str) -> set[str]:
+    if not isinstance(text, str):
+        return set()
+    return {m.group(0).lower() for m in _TOKEN_RE.finditer(text)}
+
+
+def _normalize_lexeme_text(text: str) -> str:
+    return " ".join(m.group(0).lower() for m in _TOKEN_RE.finditer(str(text or "")))
+
+
+def _lexical_overlap_ratio(claim: str, evidence_text: str) -> float:
+    claim_tokens = _tokenize(claim)
+    if not claim_tokens:
+        return 0.0
+    evidence_tokens = _tokenize(evidence_text)
+    if not evidence_tokens:
+        return 0.0
+    return len(claim_tokens & evidence_tokens) / float(len(claim_tokens))
+
+
+def _is_prevalidated_support(item: dict) -> bool:
+    """Best-effort marker check for support that was already validated upstream."""
+    if not isinstance(item, dict):
+        return False
+    if bool(item.get("prevalidated")) or bool(item.get("validated")):
+        return True
+    status = str(item.get("validation_status") or "").strip().lower()
+    if status in {"validated", "prevalidated", "verified", "tool_verified"}:
+        return True
+    strength = str(item.get("evidence_strength") or "").strip().lower()
+    return strength in {"validated", "release_blocking", "generalizable"}
+
+
+def _reflex_arc_fastpath(claim: str, evidence: list[dict]) -> dict | None:
+    """Deterministic low-latency short-circuit for obvious entailment outcomes.
+
+    Returns a full result payload when confidence gates are met, otherwise None.
+    Fail-safe by design: thresholds are conservative and non-matches fall back
+    to the model-backed check.
+    """
+    claim_text = str(claim or "").strip()
+    if not claim_text:
+        return None
+    claim_norm = _normalize_lexeme_text(claim_text)
+    supports = [row for row in (evidence or []) if isinstance(row, dict) and str(row.get("role") or "").lower() == "support"]
+    contradictions = [row for row in (evidence or []) if isinstance(row, dict) and str(row.get("role") or "").lower() == "contradiction"]
+
+    # Reflex rejection: strong lexical contradiction should not spend model latency.
+    for row in contradictions:
+        text = str(row.get("text") or row.get("snippet") or "").strip()
+        if not text:
+            continue
+        overlap = _lexical_overlap_ratio(claim_text, text)
+        if overlap >= _FASTPATH_MIN_OVERLAP:
+            return {
+                "available": True,
+                "verdict": "refuted",
+                "rationale": "reflex_fastpath: high-overlap contradiction evidence already present.",
+                "confidence": 0.93,
+                "degraded": False,
+                "error": "",
+            }
+
+    # Reflex acceptance: exact or near-exact support match with no contradiction.
+    if not contradictions:
+        for row in supports:
+            text = str(row.get("text") or row.get("snippet") or "").strip()
+            if not text:
+                continue
+            text_norm = _normalize_lexeme_text(text)
+            overlap = _lexical_overlap_ratio(claim_text, text)
+            exactish = (claim_norm in text_norm) or (text_norm in claim_norm)
+            if exactish and overlap >= 0.85:
+                return {
+                    "available": True,
+                    "verdict": "confirmed",
+                    "rationale": "reflex_fastpath: exact high-overlap support evidence; model bypassed.",
+                    "confidence": 0.97,
+                    "degraded": False,
+                    "error": "",
+                }
+            if _is_prevalidated_support(row) and overlap >= _FASTPATH_MIN_OVERLAP:
+                return {
+                    "available": True,
+                    "verdict": "confirmed",
+                    "rationale": "reflex_fastpath: prevalidated support evidence with strong lexical overlap.",
+                    "confidence": 0.9,
+                    "degraded": False,
+                    "error": "",
+                }
+    return None
 
 
 def _render_evidence(evidence: list[dict]) -> str:
@@ -140,6 +236,13 @@ def check_claim_entailment(
             gen_fn = verify._lazy_generate
         except Exception as exc:
             return _unavailable(f"verify import failed: {exc}"[:200])
+
+    try:
+        reflex = _reflex_arc_fastpath(text, evidence)
+    except Exception:
+        reflex = None
+    if isinstance(reflex, dict):
+        return reflex
 
     prompt = _PROMPT_TMPL.format(claim=text, evidence=rendered)
 

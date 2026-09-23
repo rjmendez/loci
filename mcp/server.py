@@ -237,7 +237,7 @@ inv_store.register(lambda: MEMORY_DIR)
 # Re-exported so server.<helper>() keeps resolving for callers and test patches.
 from inv_store import (  # noqa: E402,F401
     _now, _inv_dir, _manifest_cache, _load_manifest, _save_manifest,
-    _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
+    _load_manifest_fresh, _atomic_write_text, _append_jsonl, _read_jsonl, _finding_updates_path,
     _load_resolution_overrides, _load_retracted_ids, _make_ref, _tag_finding_ids,
     _summarise_finding, _safe_float, _CONFIDENCE_RANK, _RESOLUTION_STATES,
     _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
@@ -1235,24 +1235,26 @@ def _prune_signature_observations(observations: dict) -> dict:
 
 
 def _ensure_investigation_exists(investigation_id: str, *, title: str, context: str) -> None:
-    if _load_manifest(investigation_id):
-        return
-    manifest = {
-        "id": investigation_id,
-        "title": title,
-        "context": context,
-        "status": "active",
-        "created_at": _now(),
-        "updated_at": _now(),
-        "hypothesis": None,
-        "open_questions": [],
-        "next_step": None,
-        "checked_sources": {},
-        "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
-        "closed_at": None,
-        "closed_summary": None,
-    }
-    _save_manifest(manifest)
+    lock_path = _inv_dir(investigation_id) / ".lock"
+    with _locked_file(lock_path, "a+", exclusive=True):
+        if _load_manifest_fresh(investigation_id):
+            return
+        manifest = {
+            "id": investigation_id,
+            "title": title,
+            "context": context,
+            "status": "active",
+            "created_at": _now(),
+            "updated_at": _now(),
+            "hypothesis": None,
+            "open_questions": [],
+            "next_step": None,
+            "checked_sources": {},
+            "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
+            "closed_at": None,
+            "closed_summary": None,
+        }
+        _save_manifest(manifest)
 
 
 @dataclass
@@ -2437,32 +2439,31 @@ _FLYBRAIN_CLAIM_SCOPE_KEYS = (
     "circuit_class",
     "experience_window",
 )
-_FLYBRAIN_ALLOWED_LIFE_STAGES = {
-    "adult",
-    "larval",
-    "embryonic",
-    "pupal",
-    "l1",
-    "l2",
-    "l3",
-    "unknown",
-    "unspecified",
-}
-_FLYBRAIN_ALLOWED_EXPERIENCE_WINDOWS = {
-    "naive",
+_FLYBRAIN_CROSS_SEX_TOKENS = (
+    "cross-sex",
+    "across sex",
+    "both",
+    "male+female",
+    "male/female",
+    "all sexes",
+)
+_FLYBRAIN_CROSS_STAGE_TOKENS = (
+    "cross-stage",
+    "across stage",
+    "all stages",
+    "larval+adult",
+    "developmental",
+)
+_FLYBRAIN_DEVELOPMENT_PLASTICITY_TOKENS = (
+    "development",
+    "develop",
+    "larva",
+    "pupa",
+    "plastic",
+    "learning",
     "trained",
-    "sleep_deprived",
-    "starved",
-    "sated",
-    "mixed",
-    "unknown",
-    "unspecified",
-}
-_FLYBRAIN_LIFE_STAGE_ALIASES = {
-    "embryo": "embryonic",
-    "larva": "larval",
-    "pupa": "pupal",
-}
+    "experience-dependent",
+)
 
 
 def _store_validate(finding_type: str, confidence: str, tier: str, resolution: str) -> Optional[str]:
@@ -2503,70 +2504,95 @@ def _normalize_finding_metadata(metadata: Any) -> Optional[dict]:
     return {"value": metadata}
 
 
-def _normalize_flybrain_token(value: Any) -> str:
-    token = str(value or "").strip().lower()
-    token = re.sub(r"[_\-]+", "_", token)
-    token = re.sub(r"\s+", "_", token)
-    return token
-
-
-def _normalize_flybrain_dataset_version(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    if not re.search(r"[A-Za-z0-9]", cleaned):
-        return None
-    return cleaned
-
-
-def _normalize_flybrain_annotation_completeness(value: Any) -> Optional[float]:
+def _is_valid_flybrain_scope_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
     if isinstance(value, bool):
-        return None
-    parsed: float
+        return True
     if isinstance(value, (int, float)):
-        parsed = float(value)
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        if text.endswith("%"):
-            try:
-                parsed = float(text[:-1].strip()) / 100.0
-            except (TypeError, ValueError):
-                return None
-        else:
-            try:
-                parsed = float(text)
-            except (TypeError, ValueError):
-                return None
-    else:
-        return None
-    if not math.isfinite(parsed):
-        return None
-    if parsed < 0.0 or parsed > 1.0:
-        return None
-    return round(parsed, 6)
+        if isinstance(value, float) and not math.isfinite(value):
+            return False
+        return True
+    return False
 
 
-def _normalize_flybrain_life_stage(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    token = _normalize_flybrain_token(value)
-    token = _FLYBRAIN_LIFE_STAGE_ALIASES.get(token, token)
-    if token not in _FLYBRAIN_ALLOWED_LIFE_STAGES:
-        return None
-    return token
+def _contains_any_scope_token(value: Any, tokens: tuple[str, ...]) -> bool:
+    text = str(value or "").strip().lower()
+    return any(token in text for token in tokens)
 
 
-def _normalize_flybrain_experience_window(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
+def _validate_flybrain_stability_ceiling(metadata: dict, normalized_scope: dict) -> Optional[str]:
+    flybrain_prov = metadata.get("flybrain_provenance")
+    support = {}
+    if isinstance(flybrain_prov, dict):
+        gs = flybrain_prov.get("generalization_support")
+        if isinstance(gs, dict):
+            support = gs
+    cross_sex = _contains_any_scope_token(normalized_scope.get("sex"), _FLYBRAIN_CROSS_SEX_TOKENS)
+    cross_stage = _contains_any_scope_token(normalized_scope.get("life_stage"), _FLYBRAIN_CROSS_STAGE_TOKENS)
+    edge_case = _contains_any_scope_token(normalized_scope.get("life_stage"), _FLYBRAIN_DEVELOPMENT_PLASTICITY_TOKENS) or _contains_any_scope_token(
+        normalized_scope.get("experience_window"), _FLYBRAIN_DEVELOPMENT_PLASTICITY_TOKENS
+    )
+    if edge_case and cross_sex and support.get("cross_sex_validated") is not True:
+        return (
+            "flybrain claim_scope cross-sex generalization in development/plasticity scope "
+            "requires flybrain_provenance.generalization_support.cross_sex_validated=true"
+        )
+    if edge_case and cross_stage and support.get("cross_stage_validated") is not True:
+        return (
+            "flybrain claim_scope cross-stage generalization in development/plasticity scope "
+            "requires flybrain_provenance.generalization_support.cross_stage_validated=true"
+        )
+    return None
+
+
+def _flybrain_scope_hash(scope: Optional[dict]) -> Optional[str]:
+    """Return a deterministic hash for a FlyBrain scope payload or None."""
+    if not isinstance(scope, dict):
         return None
-    token = _normalize_flybrain_token(value)
-    if token not in _FLYBRAIN_ALLOWED_EXPERIENCE_WINDOWS:
+    stable = json.dumps(scope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def _emit_flybrain_claim_audit(investigation_id: Optional[str], *, decision: str, claim_scope: Optional[dict], reason: Optional[str], metadata: Optional[dict], tool_name: str = "flybrain_claim_scope_validator", tier: Optional[str] = None) -> Optional[dict]:
+    """Emit a single, deterministic audit record for FlyBrain claim scope decisions."""
+    if not isinstance(claim_scope, dict) and not isinstance(metadata, dict):
         return None
-    return token
+    scope = dict(claim_scope) if isinstance(claim_scope, dict) else {}
+    prov = metadata.get("flybrain_provenance") if isinstance(metadata, dict) and isinstance(metadata.get("flybrain_provenance"), dict) else {}
+    if isinstance(prov, dict):
+        nested_scope = prov.get("claim_scope")
+        if isinstance(nested_scope, dict) and not scope:
+            scope = dict(nested_scope)
+        prov = {k: v for k, v in prov.items() if k != "audit_hook" and k != "provenance"}
+    if not scope and not prov:
+        return None
+    payload = {
+        "audit_type": "flybrain_claim_scope_decision",
+        "decision": decision,
+        "tool_name": tool_name,
+        "reason": reason,
+        "tier": tier,
+        "claim_scope": scope,
+        "scope_hash": _flybrain_scope_hash(scope),
+        "provenance": prov,
+        "ts": _now(),
+    }
+    try:
+        audit_log(
+            tool_name=tool_name,
+            inputs_json=json.dumps({"audit_type": "flybrain_claim_scope_decision", "decision": decision, "claim_scope": scope}, sort_keys=True),
+            output=json.dumps(payload, sort_keys=True),
+            investigation_id=investigation_id,
+            embedding_text=(
+                f"FlyBrain claim decision={decision} "
+                f"reason={reason or 'scope_validated'} "
+                f"scope_hash={payload['scope_hash']}"
+            ),
+        )
+    except Exception as exc:  # fail-open: audit logging is advisory
+        logger.debug("flybrain claim audit hook failed (fail-open): %r", exc)
+    return payload
 
 
 def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tuple[Optional[dict], Optional[str]]:
@@ -2590,55 +2616,36 @@ def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tu
         return out, None
 
     if not isinstance(claim_scope, dict):
-        return None, (
+        error = (
             "flybrain claim_scope must be a JSON object containing keys: "
             + ", ".join(_FLYBRAIN_CLAIM_SCOPE_KEYS)
         )
+        _emit_flybrain_claim_audit(None, decision="rejected", claim_scope=None, reason=error, metadata=out, tool_name="flybrain_claim_scope_validator", tier="T0")
+        return None, error
 
     missing = [k for k in _FLYBRAIN_CLAIM_SCOPE_KEYS if k not in claim_scope]
     if missing:
-        return None, (
+        error = (
             "flybrain claim_scope is missing required key(s): "
             + ", ".join(missing)
         )
+        _emit_flybrain_claim_audit(None, decision="rejected", claim_scope=claim_scope, reason=error, metadata=out, tool_name="flybrain_claim_scope_validator", tier="T0")
+        return None, error
+
+    invalid = [k for k in _FLYBRAIN_CLAIM_SCOPE_KEYS if not _is_valid_flybrain_scope_value(claim_scope.get(k))]
+    if invalid:
+        error = (
+            "flybrain claim_scope has invalid value(s) for key(s): "
+            + ", ".join(invalid)
+            + ". Values must be non-empty strings or scalar numbers/booleans."
+        )
+        _emit_flybrain_claim_audit(None, decision="rejected", claim_scope=claim_scope, reason=error, metadata=out, tool_name="flybrain_claim_scope_validator", tier="T0")
+        return None, error
 
     normalized_scope = {
         k: (claim_scope[k].strip() if isinstance(claim_scope[k], str) else claim_scope[k])
         for k in _FLYBRAIN_CLAIM_SCOPE_KEYS
     }
-
-    scope_errors: list[str] = []
-    normalized_dataset_version = _normalize_flybrain_dataset_version(normalized_scope.get("dataset_version"))
-    if normalized_dataset_version is None:
-        scope_errors.append("dataset_version")
-    else:
-        normalized_scope["dataset_version"] = normalized_dataset_version
-
-    normalized_annotation = _normalize_flybrain_annotation_completeness(normalized_scope.get("annotation_completeness"))
-    if normalized_annotation is None:
-        scope_errors.append("annotation_completeness")
-    else:
-        normalized_scope["annotation_completeness"] = normalized_annotation
-
-    normalized_life_stage = _normalize_flybrain_life_stage(normalized_scope.get("life_stage"))
-    if normalized_life_stage is None:
-        scope_errors.append("life_stage")
-    else:
-        normalized_scope["life_stage"] = normalized_life_stage
-
-    normalized_experience_window = _normalize_flybrain_experience_window(normalized_scope.get("experience_window"))
-    if normalized_experience_window is None:
-        scope_errors.append("experience_window")
-    else:
-        normalized_scope["experience_window"] = normalized_experience_window
-
-    if scope_errors:
-        return None, (
-            "flybrain claim_scope has invalid value(s) for key(s): "
-            + ", ".join(scope_errors)
-            + ". dataset_version must be a non-empty version id; annotation_completeness must be a finite number in [0, 1] (or a percentage string); "
-            + "life_stage and experience_window must be normalized FlyBrain scope labels."
-        )
     out["claim_scope"] = normalized_scope
 
     if isinstance(flybrain_prov, dict):
@@ -2646,6 +2653,34 @@ def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tu
         flybrain_out["claim_scope"] = dict(normalized_scope)
         out["flybrain_provenance"] = flybrain_out
 
+    stability_ceiling_error = _validate_flybrain_stability_ceiling(out, normalized_scope)
+    if stability_ceiling_error:
+        audit = _emit_flybrain_claim_audit(
+            None,
+            decision="rejected",
+            claim_scope=normalized_scope,
+            reason=stability_ceiling_error,
+            metadata=out,
+            tool_name="flybrain_claim_scope_validator",
+            tier="T0",
+        )
+        if isinstance(out.get("flybrain_provenance"), dict):
+            out["flybrain_provenance"]["decision"] = "rejected"
+            out["flybrain_provenance"]["audit_hook"] = audit or {"decision": "rejected", "reason": stability_ceiling_error}
+        return None, stability_ceiling_error
+
+    audit = _emit_flybrain_claim_audit(
+        None,
+        decision="accepted",
+        claim_scope=normalized_scope,
+        reason="scope_validated",
+        metadata=out,
+        tool_name="flybrain_claim_scope_validator",
+        tier="T1",
+    )
+    if isinstance(out.get("flybrain_provenance"), dict):
+        out["flybrain_provenance"]["decision"] = "accepted"
+        out["flybrain_provenance"]["audit_hook"] = audit or {"decision": "accepted", "reason": "scope_validated"}
     return out, None
 
 
@@ -2676,58 +2711,44 @@ def _docs_ingest_summary_from_markdown(raw_text: str, *, title: str | None = Non
     return f"{base}: no useful body text was found."
 
 
-_DOCS_INGEST_SUFFIXES = {".md", ".markdown", ".txt"}
+def _docs_ingest_src_hash(raw_text: str) -> str:
+    """Return the deterministic content hash used to decide whether a doc changed."""
+    return hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
 
 
-def _docs_ingest_is_within_root(candidate: Path, root: Path) -> bool:
-    """Return True only when candidate resolves inside root."""
+def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, content_hash: str) -> str:
+    """Return 'new', 'changed', or 'unchanged' based on prior index metadata for the same path."""
     try:
-        candidate_real = candidate.resolve(strict=True)
-        root_real = root.resolve(strict=True)
-    except OSError:
-        return False
-    try:
-        candidate_real.relative_to(root_real)
-        return True
-    except ValueError:
-        return False
+        loaded = json.loads(investigation_load(investigation_id=investigation_id, last_n_findings=2000))
+    except Exception:
+        return "new"
+
+    for finding in loaded.get("recent_findings", []) or []:
+        metadata = finding.get("metadata") if isinstance(finding, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("source_path") != str(document_path):
+            continue
+        previous_hash = metadata.get("source_sha256") or metadata.get("provenance", {}).get("document_sha256")
+        if previous_hash == content_hash:
+            return "unchanged"
+        return "changed"
+    return "new"
 
 
 def _docs_ingest_targets(document_path: str) -> list[Path]:
-    """Resolve a file or directory to markdown/text targets while staying inside the ingest root."""
+    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid."""
     p = Path(document_path).expanduser()
     if not p.exists():
         return []
-
+    doc_exts = {".md", ".markdown", ".txt"}
     if p.is_file():
-        if p.suffix.lower() not in _DOCS_INGEST_SUFFIXES:
-            return []
-        return [p] if _docs_ingest_is_within_root(p, p.parent) else []
-
+        return [p] if p.suffix.lower() in doc_exts else []
     if p.is_dir():
-        # A symlinked directory root can point the ingest walk outside the path
-        # the caller actually supplied, so require a real directory entry here.
-        if p.is_symlink():
-            return []
-        root = p.resolve(strict=True)
-        matches: list[Path] = []
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
-            current = Path(dirpath)
-            dirnames[:] = sorted(
-                name for name in dirnames
-                if not (current / name).is_symlink()
-                and _docs_ingest_is_within_root(current / name, root)
-            )
-            for filename in sorted(filenames):
-                candidate = current / filename
-                if candidate.suffix.lower() not in _DOCS_INGEST_SUFFIXES:
-                    continue
-                if candidate.is_symlink():
-                    continue
-                if _docs_ingest_is_within_root(candidate, root):
-                    matches.append(candidate)
-        return matches
-
+        return sorted(
+            {x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in doc_exts},
+            key=lambda item: str(item),
+        )
     return []
 
 
@@ -2760,18 +2781,22 @@ def docs_ingest_indexer(
         raw = text.strip()
         doc_title = doc_path.stem.replace("-", " ").replace("_", " ").strip() or doc_path.name
         summary = _docs_ingest_summary_from_markdown(raw, title=doc_title)
+        content_hash = _docs_ingest_src_hash(raw)
+        change_state = _docs_ingest_state_for_path(investigation_id, doc_path, content_hash)
         metadata = {
             "title": doc_title,
             "source_path": str(doc_path),
             "doc_kind": "markdown",
-            "source_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "source_sha256": content_hash,
+            "source_mtime_ns": getattr(doc_path.stat(), "st_mtime_ns", None),
             "content_length": len(raw),
+            "change_state": change_state,
             "doc_summary": summary,
             "provenance": {
                 "tool_name": "docs_ingest_indexer",
                 "tool_variant": "docs_ingest_indexer",
                 "source_path": str(doc_path),
-                "document_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                "document_sha256": content_hash,
                 "content_length": len(raw),
                 "ingested_at": _now(),
             },
@@ -2779,6 +2804,17 @@ def docs_ingest_indexer(
         }
         if not summary_only:
             metadata["content_excerpt"] = raw[:1200]
+
+        if change_state == "unchanged":
+            records.append({
+                "path": str(doc_path),
+                "stored": False,
+                "changed": False,
+                "change_state": "unchanged",
+                "finding_id": None,
+                "summary": summary,
+            })
+            continue
 
         finding_text = f"{doc_title}: {summary}"
         store_result = json.loads(investigation_store(
@@ -2794,14 +2830,189 @@ def docs_ingest_indexer(
         records.append({
             "path": str(doc_path),
             "stored": bool(store_result.get("stored")),
+            "changed": change_state in {"new", "changed"},
+            "change_state": change_state,
             "finding_id": store_result.get("finding_id"),
             "summary": summary,
         })
 
     return json.dumps({
         "stored": sum(1 for r in records if r["stored"]),
+        "unmodified": sum(1 for r in records if r.get("change_state") == "unchanged"),
+        "changed": sum(1 for r in records if r.get("changed") is True),
         "investigation_id": investigation_id,
         "records": records,
+    })
+
+
+def _docs_search_matches_text(text: str, query: str) -> bool:
+    """Return True when a query matches an indexed document string."""
+    if not text or not query:
+        return False
+    haystack = text.lower()
+    needle = query.lower().strip()
+    if not needle:
+        return False
+    if needle in haystack:
+        return True
+    tokens = [token for token in re.findall(r"[A-Za-z0-9]+", needle) if token]
+    if not tokens:
+        return False
+    return any(token in haystack for token in tokens)
+
+
+@mcp.tool()
+def docs_search(
+    query: str,
+    investigation_id: str = "loci-docs-index",
+    limit: int = 5,
+    include_excerpt: bool = False,
+) -> str:
+    """Search stored markdown/text guidance by query and return concise hits."""
+    q = (query or "").strip()
+    if not q:
+        return json.dumps({
+            "error": "Query must be a non-empty string.",
+            "count": 0,
+            "results": [],
+            "investigation_id": investigation_id,
+        })
+
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return json.dumps({
+            "error": "limit must be an integer.",
+            "count": 0,
+            "results": [],
+            "q": q,
+            "investigation_id": investigation_id,
+        })
+    if n <= 0:
+        return json.dumps({
+            "error": "limit must be positive.",
+            "count": 0,
+            "results": [],
+            "q": q,
+            "investigation_id": investigation_id,
+        })
+
+    findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+    if not findings_path.exists():
+        return json.dumps({
+            "error": f"No indexed docs found for investigation_id: {investigation_id}",
+            "count": 0,
+            "results": [],
+            "query": q,
+            "investigation_id": investigation_id,
+        })
+
+    results: list[dict] = []
+    for finding in _read_jsonl(findings_path):
+        tags = {str(tag).lower() for tag in finding.get("tags", [])}
+        metadata = finding.get("metadata") or {}
+        if "docs" not in tags and not metadata.get("source_path"):
+            continue
+
+        doc_title = metadata.get("title") or (Path(str(metadata.get("source_path") or "")).stem or "Indexed document")
+        summary = metadata.get("doc_summary") or str(finding.get("text") or "").strip() or "No summary available."
+        search_text = " ".join([
+            str(finding.get("text") or ""),
+            str(metadata.get("doc_summary") or ""),
+            str(metadata.get("content_excerpt") or ""),
+        ])
+        if not _docs_search_matches_text(search_text, q):
+            continue
+
+        hit = {
+            "title": doc_title,
+            "path": str(metadata.get("source_path") or ""),
+            "summary": summary,
+            "finding_id": finding.get("id"),
+        }
+        if include_excerpt and metadata.get("content_excerpt"):
+            hit["excerpt"] = str(metadata["content_excerpt"])[:1000]
+        results.append(hit)
+
+        if len(results) >= n:
+            break
+
+    if not results:
+        return json.dumps({
+            "error": f"No matching docs found for query: {q}",
+            "count": 0,
+            "results": [],
+            "query": q,
+            "investigation_id": investigation_id,
+        })
+
+    return json.dumps({
+        "query": q,
+        "count": len(results),
+        "results": results,
+        "investigation_id": investigation_id,
+    })
+
+
+@mcp.tool()
+def docs_recall(
+    query: str,
+    investigation_id: str = "loci-docs-index",
+    limit: int = 5,
+    include_excerpt: bool = False,
+) -> str:
+    """Recall indexed docs guidance by query using the existing docs index/search path."""
+    q = (query or "").strip()
+    if not q:
+        return json.dumps({
+            "error": "Query must be a non-empty string.",
+            "count": 0,
+            "results": [],
+            "query": q,
+            "investigation_id": investigation_id,
+            "source": "docs_search",
+        })
+
+    try:
+        result = json.loads(docs_search(q, investigation_id=investigation_id, limit=limit, include_excerpt=include_excerpt))
+    except Exception as exc:
+        return json.dumps({
+            "error": f"docs recall failed: {exc}",
+            "count": 0,
+            "results": [],
+            "query": q,
+            "investigation_id": investigation_id,
+            "source": "docs_search",
+        })
+
+    docs_results = []
+    for item in result.get("results", []):
+        docs_results.append({
+            "title": item.get("title"),
+            "path": item.get("path"),
+            "summary": item.get("summary"),
+            "finding_id": item.get("finding_id"),
+            "excerpt": item.get("excerpt"),
+            "source": "docs_search",
+            "score": 0.95,
+        })
+
+    if result.get("error") and not docs_results:
+        return json.dumps({
+            "error": result["error"],
+            "count": 0,
+            "results": [],
+            "query": q,
+            "investigation_id": investigation_id,
+            "source": "docs_search",
+        })
+
+    return json.dumps({
+        "query": q,
+        "count": len(docs_results),
+        "results": docs_results,
+        "investigation_id": investigation_id,
+        "source": "docs_search",
     })
 
 
@@ -2848,6 +3059,20 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
     normalized_metadata, flybrain_scope_error = _normalize_and_validate_flybrain_claim_scope(normalized_metadata)
     if flybrain_scope_error:
         return None, json.dumps({"error": flybrain_scope_error})
+    if isinstance(normalized_metadata, dict) and isinstance(normalized_metadata.get("flybrain_provenance"), dict):
+        flybrain_prov = normalized_metadata["flybrain_provenance"]
+        if isinstance(flybrain_prov.get("audit_hook"), dict):
+            flybrain_prov["audit_hook"]["investigation_id"] = investigation_id
+            flybrain_prov["decision"] = flybrain_prov["audit_hook"].get("decision", flybrain_prov.get("decision", "accepted"))
+            _emit_flybrain_claim_audit(
+                investigation_id,
+                decision=str(flybrain_prov["audit_hook"].get("decision") or flybrain_prov.get("decision") or "accepted"),
+                claim_scope=flybrain_prov.get("claim_scope") or normalized_metadata.get("claim_scope"),
+                reason=flybrain_prov["audit_hook"].get("reason") or flybrain_prov.get("reason") or "scope_validated",
+                metadata=normalized_metadata,
+                tool_name="flybrain_claim_scope_validator",
+                tier=str(flybrain_prov["audit_hook"].get("tier") or flybrain_prov.get("tier") or "T1"),
+            )
     if evidence_provenance_tier:
         normalized_metadata = normalized_metadata or {}
         normalized_metadata["evidence_provenance_tier"] = normalize_provenance_tier(
@@ -2889,8 +3114,13 @@ def _store_commit(investigation_id: str, manifest: dict, finding: dict,
     """Append the finding and update the manifest under the per-investigation lock."""
     lock_path = _inv_dir(investigation_id) / ".lock"
     with _locked_file(lock_path, "a+", exclusive=True):
+        manifest = _load_manifest_fresh(investigation_id)
+        if manifest is None:
+            logger.debug("_store_commit: manifest vanished before commit for %s", investigation_id)
+            return
         _append_jsonl(_inv_dir(investigation_id) / "findings.jsonl", finding)
-        manifest["finding_counts"][finding_type] = manifest["finding_counts"].get(finding_type, 0) + 1
+        counts = manifest.setdefault("finding_counts", {})
+        counts[finding_type] = counts.get(finding_type, 0) + 1
         # Update hot-tier manifest notes
         if tier == "hot":
             snippet = text[:200]
@@ -5085,9 +5315,7 @@ def audit_log(
     investigation_logged = False
     if investigation_id and _load_manifest(investigation_id):
         try:
-            with _investigation_lock(investigation_id):
-                with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
-                    _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
+            _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
             investigation_logged = True
         except StoreBusyError as exc:
             logger.info("audit_log busy for investigation %s: %s", investigation_id, exc)
@@ -6626,30 +6854,34 @@ def memory_restore(
         return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
 
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
-    existing = _read_jsonl(retractions_path)
-
-    target_fid = str(finding_id).strip() if finding_id else ""
-    if not target_fid and retraction_id:
-        for e in existing:
-            if str(e.get("retraction_id", "")) == str(retraction_id):
-                target_fid = str(e.get("finding_id", ""))
-                break
-    if not target_fid:
-        return json.dumps({
-            "error": "provide finding_id, or a retraction_id that resolves to a finding"
-        })
-
-    if target_fid not in _load_retracted_ids(investigation_id):
-        return json.dumps({
-            "finding_id": target_fid,
-            "restored": False,
-            "note": "finding is not currently retracted — nothing to restore",
-        })
 
     ts = _now()
     try:
         with _investigation_lock(investigation_id):
-            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
+            with _locked_file(retractions_path, "a+", exclusive=True):
+                try:
+                    existing = _read_jsonl(retractions_path)
+                except PermissionError as exc:
+                    logger.info("memory_restore busy for %s/%s: %s", investigation_id, finding_id or retraction_id or "", exc)
+                    return _busy_result(exc, investigation_id=investigation_id, finding_id=str(finding_id or retraction_id or ""))
+                target_fid = str(finding_id).strip() if finding_id else ""
+                if not target_fid and retraction_id:
+                    for e in existing:
+                        if str(e.get("retraction_id", "")) == str(retraction_id):
+                            target_fid = str(e.get("finding_id", ""))
+                            break
+                if not target_fid:
+                    return json.dumps({
+                        "error": "provide finding_id, or a retraction_id that resolves to a finding"
+                    })
+
+                if target_fid not in _load_retracted_ids(investigation_id):
+                    return json.dumps({
+                        "finding_id": target_fid,
+                        "restored": False,
+                        "note": "finding is not currently retracted — nothing to restore",
+                    })
+
                 _append_jsonl(retractions_path, {
                     "retraction_id": str(uuid.uuid4()),
                     "finding_id": target_fid,
@@ -6745,6 +6977,9 @@ def contract_declare(
     }
     try:
         with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            manifest = _load_manifest_fresh(investigation_id)
+            if manifest is None:
+                return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
             _append_jsonl(inv_dir / "findings.jsonl", finding)
             manifest.setdefault("finding_counts", {})
             manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
@@ -6984,6 +7219,9 @@ def wiring_obligation_declare(
     }
     try:
         with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            manifest = _load_manifest_fresh(investigation_id)
+            if manifest is None:
+                return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
             _append_jsonl(inv_dir / "findings.jsonl", finding)
             manifest.setdefault("finding_counts", {})
             manifest["finding_counts"]["gap"] = manifest["finding_counts"].get("gap", 0) + 1
@@ -7080,31 +7318,38 @@ def wiring_obligation_resolve(
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
     jsonl_path = inv_dir / "findings.jsonl"
-    findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
-
-    target = next((f for f in reversed(findings) if f.get("id") == finding_id), None)
-    if target is None:
-        return json.dumps({"error": f"Finding '{finding_id}' not found in '{investigation_id}'."})
-
-    tags = target.get("tags") or []
-    if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(",")]
-    if "wiring_obligation" not in tags:
-        return json.dumps({"error": f"Finding '{finding_id}' is not a wiring_obligation."})
-    if target.get("record_type", "gap") != "gap":
-        return json.dumps({"error": f"Finding '{finding_id}' is already resolved."})
-
-    resolved_finding = {
-        **target,
-        "record_type": "observed",
-        "type": "observed",
-        "text": target["text"] + f" | RESOLVED: {evidence}",
-        "confidence": "high",
-        "ts": _now(),
-        "tags": [t for t in tags if t != "wiring_obligation"] + ["wiring_obligation", "wiring_obligation_resolved"],
-    }
     try:
-        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+        with _locked_file(jsonl_path, "a+", exclusive=True):
+            try:
+                findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
+            except PermissionError as exc:
+                logger.info("wiring_obligation_resolve busy for %s/%s: %s", investigation_id, finding_id, exc)
+                return _busy_result(exc, investigation_id=investigation_id, finding_id=finding_id)
+
+            target = next((f for f in reversed(findings) if f.get("id") == finding_id), None)
+            if target is None:
+                return json.dumps({"error": f"Finding '{finding_id}' not found in '{investigation_id}'."})
+
+            tags = target.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",")]
+            if "wiring_obligation" not in tags:
+                return json.dumps({"error": f"Finding '{finding_id}' is not a wiring_obligation."})
+            if target.get("record_type", "gap") != "gap":
+                return json.dumps({"error": f"Finding '{finding_id}' is already resolved."})
+
+            resolved_finding = {
+                **target,
+                "record_type": "observed",
+                "type": "observed",
+                "text": target["text"] + f" | RESOLVED: {evidence}",
+                "confidence": "high",
+                "ts": _now(),
+                "tags": [t for t in tags if t != "wiring_obligation"] + ["wiring_obligation", "wiring_obligation_resolved"],
+            }
+            manifest = _load_manifest_fresh(investigation_id)
+            if manifest is None:
+                return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
             _append_jsonl(jsonl_path, resolved_finding)
 
             counts = manifest.setdefault("finding_counts", {})
@@ -7795,6 +8040,27 @@ def memory_surface(
     try:
         client, _col = _get_qdrant()
         if client is None:
+            docs_hits = []
+            try:
+                docs_response = json.loads(docs_search(context, investigation_id=investigation_id or "loci-docs-index", limit=max(1, top_k), include_excerpt=True))
+                if isinstance(docs_response, dict) and docs_response.get("results"):
+                    for item in docs_response["results"]:
+                        docs_hits.append({
+                            "finding_id": item.get("finding_id") or item.get("title") or "doc-guidance",
+                            "text": str(item.get("summary") or item.get("title") or "").strip(),
+                            "source": "docs_search",
+                            "relevance_note": f"Related to: {context.strip().split()[:8]} (docs guidance)",
+                            "score": 0.95,
+                            "investigation_id": investigation_id or "loci-docs-index",
+                        })
+            except Exception as _docs_exc:
+                logger.debug("memory_surface docs recall failed (fail-open): %r", _docs_exc)
+            if docs_hits:
+                return json.dumps({
+                    "surfaced": docs_hits,
+                    "context_used": context[:200] if len(context) > 200 else context,
+                    "count": len(docs_hits),
+                }, indent=2)
             return json.dumps({
                 "error": "memory_surface requires Qdrant",
                 "surfaced": [],
@@ -7848,6 +8114,26 @@ def memory_surface(
         _ctx_prefix = " ".join(_ctx_words[:8])
 
         surfaced = _surface_rows(top_results, _ctx_prefix, investigation_id)
+
+        docs_hits = []
+        try:
+            docs_response = json.loads(docs_search(context, investigation_id=investigation_id or "loci-docs-index", limit=max(1, top_k), include_excerpt=True))
+            if isinstance(docs_response, dict) and docs_response.get("results"):
+                for item in docs_response["results"]:
+                    docs_hits.append({
+                        "finding_id": item.get("finding_id") or item.get("title") or "doc-guidance",
+                        "text": str(item.get("summary") or item.get("title") or "").strip(),
+                        "source": "docs_search",
+                        "relevance_note": f"Related to: {_ctx_prefix} (docs guidance)",
+                        "score": 0.95,
+                        "investigation_id": investigation_id or "loci-docs-index",
+                    })
+        except Exception as _docs_exc:
+            logger.debug("memory_surface docs recall failed (fail-open): %r", _docs_exc)
+
+        if docs_hits:
+            surfaced.extend(docs_hits)
+            surfaced = sorted(surfaced, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:top_k]
 
         return json.dumps({
             "surfaced": surfaced,
@@ -8256,6 +8542,38 @@ def _audit_summary_preview(text: str, limit: int = 240) -> str:
     return " ".join(str(text or "").split())[:limit]
 
 
+def _audit_source_entry_ids(source_entries: list[dict], limit: int = 8) -> list[str]:
+    ids: list[str] = []
+    for entry in source_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        raw = str(entry.get("id") or "").strip()
+        if not raw or raw in ids:
+            continue
+        ids.append(raw)
+        if len(ids) >= max(1, int(limit)):
+            break
+    return ids
+
+
+def _dedupe_quality_flags(flagged: list[dict]) -> list[dict]:
+    """Deterministically de-duplicate near-identical advisory findings."""
+    kept: list[dict] = []
+    seen: set[tuple[str, tuple[str, ...], str]] = set()
+    for row in flagged or []:
+        if not isinstance(row, dict):
+            continue
+        session_id = str(row.get("session_id") or "")
+        source_ids = tuple(str(x).strip() for x in (row.get("source_entry_ids") or []) if str(x).strip())
+        concern = " ".join(str(row.get("concern") or "").lower().split())
+        key = (session_id, source_ids, concern)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(row)
+    return kept
+
+
 def _run_consolidation_quality_audit(
     m,
     result: dict,
@@ -8263,7 +8581,11 @@ def _run_consolidation_quality_audit(
     *,
     gen_fn=None,
 ) -> dict | None:
-    """Best-effort advisory audit over a bounded sample of just-created merges."""
+    """Best-effort advisory audit over a bounded sample of just-created merges.
+
+    Flagged entries include source/session provenance and are de-duplicated to
+    reduce repeated noise across equivalent merge concerns.
+    """
     if not isinstance(result, dict):
         return None
     if int(result.get("items_consolidated", 0) or 0) <= 0:
@@ -8295,11 +8617,16 @@ def _run_consolidation_quality_audit(
             continue
         sampled += 1
         if verdict.get("verdict") == "lost_or_conflated":
+            source_ids = _audit_source_entry_ids(sample.get("source_entries") or [])
             flagged.append({
                 "summary": _audit_summary_preview(sample.get("merged_summary", "")),
                 "concern": str(verdict.get("concern") or "possible information loss"),
+                "session_id": str(sample.get("session_id") or ""),
+                "source_entry_ids": source_ids,
+                "source_entry_count": len(source_ids),
             })
 
+    flagged = _dedupe_quality_flags(flagged)
     return {"sampled": sampled, "flagged": flagged, "degraded": degraded}
 
 
@@ -8372,8 +8699,17 @@ def _sleep_like_burst_summary(
     reflection_last_tick = None
     try:
         reflection_state = _load_reflection_state()
-        reflection_last_tick = reflection_state.get("last_tick")
-        tick = reflection_last_tick if isinstance(reflection_last_tick, dict) else None
+        raw_last_tick = reflection_state.get("last_tick")
+        tick = raw_last_tick if isinstance(raw_last_tick, dict) else None
+        if tick is not None:
+            reflection_last_tick = {
+                "ts": str(tick.get("ts") or ""),
+                "processed_items": int(tick.get("processed_items") or 0),
+                "findings_written": int(tick.get("findings_written") or 0),
+            }
+            inv = str(tick.get("investigation_id") or "").strip()
+            if inv:
+                reflection_last_tick["investigation_id"] = inv
         tick_epoch = _parse_iso_to_epoch(str((tick or {}).get("ts") or ""))
         if tick_epoch is not None and now_epoch - tick_epoch <= window_seconds:
             reflection_recent = bool(
@@ -9122,46 +9458,57 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
     if new_tier not in {"hot", "warm", "cold"}:
         return {"error": "tier must be one of: hot, warm, cold"}
 
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return {"error": f"Investigation '{investigation_id}' not found."}
-
     findings_path = _inv_dir(investigation_id) / "findings.jsonl"
-    findings = _read_jsonl(findings_path)
-
-    target = None
-    for f in findings:
-        if str(f.get("id", "")) == finding_id:
-            target = f
-            break
-    if target is None:
-        return {"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."}
-
-    old_tier = target.get("tier", "warm")
-    if old_tier == new_tier:
-        return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
-
-    # Update the finding in-memory
-    for f in findings:
-        if str(f.get("id", "")) == finding_id:
-            f["tier"] = new_tier
 
     # Atomically rewrite the JSONL file
     _lock_path = _inv_dir(investigation_id) / ".lock"
     try:
         with _locked_file(_lock_path, "a+", exclusive=True):
+            findings = _read_jsonl(findings_path)
+            target = None
+            for f in findings:
+                if str(f.get("id", "")) == finding_id:
+                    target = f
+                    break
+            if target is None:
+                return {"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."}
+
+            old_tier = target.get("tier", "warm")
+            if old_tier == new_tier:
+                return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+
+            text = str(target.get("text", "") or "")
+            for f in findings:
+                if str(f.get("id", "")) == finding_id:
+                    f["tier"] = new_tier
+
             dir_ = findings_path.parent
-            with tempfile.NamedTemporaryFile("w", dir=dir_, delete=False, suffix=".tmp") as tf:
-                for f in findings:
-                    tf.write(json.dumps(f) + "\n")
-                tmp_path = Path(tf.name)
-            tmp_path.replace(findings_path)
+            tmp_fd, tmp_name = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+            try:
+                with os.fdopen(tmp_fd, "w") as tf:
+                    for f in findings:
+                        tf.write(json.dumps(f) + "\n")
+                tmp_path = Path(tmp_name)
+                tmp_path.replace(findings_path)
+            finally:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            # If promoting to hot, update manifest notes before releasing the lock.
+            if new_tier == "hot":
+                manifest = _load_manifest_fresh(investigation_id)
+                if manifest is None:
+                    raise FileNotFoundError(f"Investigation '{investigation_id}' not found.")
+                snippet = text[:200]
+                notes = manifest.get("notes") or ""
+                manifest["notes"] = (notes + "; " + snippet) if notes else snippet
+                _save_manifest(manifest)
     except StoreBusyError as exc:
         return _busy_payload(exc, investigation_id=investigation_id, finding_id=finding_id)
     except Exception as exc:
         return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
-
-    text = str(target.get("text", "") or "")
 
     # Handle Qdrant changes based on tier transition
     try:
@@ -9182,16 +9529,6 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
             _qdrant_upsert(finding_id, text, target)
     except Exception as exc:
         logger.warning("Qdrant tier-change operation failed (fail-open): %s", exc)
-
-    # If promoting to hot: append text snippet to manifest notes
-    if new_tier == "hot":
-        try:
-            snippet = text[:200]
-            notes = manifest.get("notes") or ""
-            manifest["notes"] = (notes + "; " + snippet) if notes else snippet
-            _save_manifest(manifest)
-        except Exception as exc:
-            logger.warning("manifest notes update failed (fail-open): %s", exc)
 
     return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
 

@@ -253,6 +253,9 @@ Queue state is persisted on the investigation manifest under `coordination.items
 `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled
 and is omitted from the table.
 
+For orchestration policy (triggered consolidation + grooming + maintenance),
+see [sleep-consolidation-scheduler-spec.md](./sleep-consolidation-scheduler-spec.md).
+
 These jobs are driven by `scripts/hermes_cron_runner.py`, intended for a 1-minute
 user timer or crontab entry. Issue #205 was a stale `next_run_at` loop in the live
 gateway scheduler: it fast-forwarded overdue runs in memory, never persisted the new

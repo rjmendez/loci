@@ -3,6 +3,8 @@ import multiprocessing as mp
 import os
 import sys
 import tempfile
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -164,6 +166,107 @@ def test_audit_log_global_contention_returns_retryable_busy(isolated_store):
     with _short_lock_timeout(), _held_lock(audit_path):
         result = _json(server.audit_log("unit_test", "{}", "output", investigation_id=inv_id))
     _assert_retryable_busy(result, investigation_id=inv_id, tool="unit_test")
+
+
+def test_wiring_obligation_declare_reloads_manifest_under_lock(isolated_store, monkeypatch):
+    inv_id = _start_investigation("manifest-race")
+
+    original_load = server._load_manifest_fresh
+    original_save = server._save_manifest
+    original_timeout = inv_store._STORE_LOCK_TIMEOUT_S
+    load_count = 0
+    load_count_lock = threading.Lock()
+    first_save_entered = threading.Event()
+    release_first_save = threading.Event()
+    inv_store._STORE_LOCK_TIMEOUT_S = 15.0
+    try:
+        def _wrapped_load(investigation_id: str):
+            nonlocal load_count
+            with load_count_lock:
+                load_count += 1
+            return original_load(investigation_id)
+
+        def _wrapped_save(manifest: dict) -> None:
+            first_save_entered.set()
+            if not release_first_save.wait(1.0):
+                raise AssertionError("timed out waiting to release manifest save")
+            original_save(manifest)
+
+        monkeypatch.setattr(server, "_load_manifest_fresh", _wrapped_load)
+        monkeypatch.setattr(server, "_save_manifest", _wrapped_save)
+
+        results: dict[str, dict] = {}
+
+        def _declare(suffix: str) -> None:
+            results[suffix] = _json(
+                server.wiring_obligation_declare(inv_id, f"Publisher{suffix}", f"send{suffix}", "emit the event")
+            )
+
+        threads = [threading.Thread(target=_declare, args=(suffix,)) for suffix in ("a", "b")]
+        for thread in threads:
+            thread.start()
+
+        assert first_save_entered.wait(1.0), "expected the first manifest save to block"
+        time.sleep(0.1)
+        assert load_count == 1, f"second writer should not load a stale manifest snapshot (count={load_count})"
+
+        release_first_save.set()
+        for thread in threads:
+            thread.join(15.0)
+        if any(thread.is_alive() for thread in threads):
+            release_first_save.set()
+            for thread in threads:
+                thread.join(15.0)
+        assert all(not thread.is_alive() for thread in threads), "manifest writers must finish"
+        assert all(row.get("stored") for row in results.values()), results
+
+        manifest = server._load_manifest_fresh(inv_id)
+        assert manifest is not None
+        assert manifest["finding_counts"]["gap"] == 2
+    finally:
+        inv_store._STORE_LOCK_TIMEOUT_S = original_timeout
+
+
+def test_memory_promote_preserves_concurrent_append_during_rewrite(isolated_store, monkeypatch):
+    inv_id = _start_investigation("rewrite-race")
+    finding_id = _store_finding(inv_id, tier="cold")
+    findings_path = server._inv_dir(inv_id) / "findings.jsonl"
+    original_timeout = inv_store._STORE_LOCK_TIMEOUT_S
+    inv_store._STORE_LOCK_TIMEOUT_S = 15.0
+    append_finished = threading.Event()
+
+    def _append_late() -> None:
+        time.sleep(0.05)
+        with server._locked_file(server._inv_dir(inv_id) / ".lock", "a+", exclusive=True):
+            server._append_jsonl(findings_path, {
+                "id": "late-append",
+                "investigation_id": inv_id,
+                "record_type": "observed",
+                "type": "observed",
+                "text": "late concurrent append",
+                "tier": "warm",
+            })
+        append_finished.set()
+
+    append_thread = threading.Thread(target=_append_late)
+    append_thread.start()
+
+    try:
+        result = _json(server.memory_promote(inv_id, finding_id, "hot"))
+        assert result["ok"] is True, result
+
+        assert append_finished.wait(15.0), "concurrent append must complete"
+        append_thread.join(15.0)
+        assert not append_thread.is_alive(), "append writer must finish"
+
+        rows = server._read_jsonl(findings_path)
+        ids = {row.get("id") for row in rows}
+        assert finding_id in ids
+        assert "late-append" in ids
+        promoted = next(row for row in rows if row.get("id") == finding_id)
+        assert promoted.get("tier") == "hot"
+    finally:
+        inv_store._STORE_LOCK_TIMEOUT_S = original_timeout
 
 
 def _append_worker(root_str: str, path_str: str, barrier, proc_idx: int, writes_per_proc: int) -> None:

@@ -208,6 +208,11 @@ def ollama_verify_model() -> str:
     return _task_model("LOCI_OLLAMA_VERIFY_MODEL", "verify_model")
 
 
+def ollama_classify_model() -> str:
+    """Model for classify_text's short-label routing. Env -> [ollama].classify_model -> gen_model."""
+    return _task_model("LOCI_OLLAMA_CLASSIFY_MODEL", "classify_model")
+
+
 def ollama_compress_model() -> str:
     """Model for compress_text's summarization. Env -> [ollama].compress_model -> gen_model."""
     return _task_model("LOCI_OLLAMA_COMPRESS_MODEL", "compress_model")
