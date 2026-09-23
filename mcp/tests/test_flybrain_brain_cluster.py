@@ -103,6 +103,17 @@ def test_coordinator_fail_closed_on_replay_fingerprint_mismatch():
     assert result.gate_reason.startswith("replay fingerprint mismatch")
 
 
+def test_coordinator_fail_closed_on_missing_replay_fingerprint():
+    router = fbc.DeterministicRegionRouter(routes_by_task_type={"verification": ["provenance_expert"]})
+    experts = [_StubExpert("provenance_expert", 0.95, ("finding-1",), fp_mode="missing")]
+    gates = [fbc.ReplayFingerprintGate()]
+    coordinator = fbc.BrainClusterCoordinator(router=router, experts=experts, gates=gates)
+
+    result = coordinator.run(_task())
+    assert result.decision == fbc.ClusterDecision.FAIL_CLOSED
+    assert result.gate_reason.startswith("missing replay fingerprint")
+
+
 def test_coordinator_fail_closed_on_low_confidence():
     router = fbc.DeterministicRegionRouter(routes_by_task_type={"verification": ["provenance_expert"]})
     experts = [_StubExpert("provenance_expert", 0.4, ("finding-1",))]
@@ -112,3 +123,14 @@ def test_coordinator_fail_closed_on_low_confidence():
     result = coordinator.run(_task())
     assert result.decision == fbc.ClusterDecision.FAIL_CLOSED
     assert fbc.ClusterState.FAIL_CLOSED in result.state_history
+
+
+def test_selected_expert_is_none_when_all_candidates_unavailable():
+    router = fbc.DeterministicRegionRouter(
+        routes_by_task_type={"verification": ["missing_expert_a", "missing_expert_b"]}
+    )
+    coordinator = fbc.BrainClusterCoordinator(router=router, experts=[], gates=[], max_attempts=2)
+
+    result = coordinator.run(_task())
+    assert result.decision == fbc.ClusterDecision.FAIL_CLOSED
+    assert result.selected_expert is None

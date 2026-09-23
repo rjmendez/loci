@@ -259,6 +259,9 @@ class ProvenanceRefsGate:
 
 
 class ReplayFingerprintGate:
+    def __init__(self, *, require_present: bool = True):
+        self.require_present = require_present
+
     def evaluate(
         self,
         task: ClusterTaskEnvelope,
@@ -267,6 +270,11 @@ class ReplayFingerprintGate:
         output: ExpertOutput,
     ) -> GateResult:
         artifact_fp = str(output.artifacts.get("replay_fingerprint", "")).strip()
+        if self.require_present and not artifact_fp:
+            return GateResult(
+                decision=ClusterDecision.FAIL_CLOSED,
+                reason="missing replay fingerprint in expert output artifacts",
+            )
         if artifact_fp and artifact_fp != provenance.replay_fingerprint:
             return GateResult(
                 decision=ClusterDecision.FAIL_CLOSED,
@@ -316,12 +324,12 @@ class BrainClusterCoordinator:
                 warnings.append("max attempts reached before evaluating all alternates")
                 break
             attempts += 1
-            selected_expert = expert_id
             expert = self.experts.get(expert_id)
             if expert is None:
                 warnings.append(f"expert '{expert_id}' unavailable")
                 continue
 
+            selected_expert = expert_id
             history.append(ClusterState.RUNNING_EXPERT)
             output = expert.infer(task, provenance)
             history.append(ClusterState.GATED)
@@ -399,4 +407,3 @@ class BrainClusterCoordinator:
             if verdict.decision != ClusterDecision.ACCEPT:
                 return verdict
         return GateResult(decision=ClusterDecision.ACCEPT, reason="all gates passed")
-

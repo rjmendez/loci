@@ -22,6 +22,7 @@ This spec defines an internal Loci architecture for region-specialized small mod
 Runtime module:
 
 - `mcp/flybrain_brain_cluster.py`
+- `mcp/flybrain_brain_cluster_training.py`
 
 Primary types:
 
@@ -101,6 +102,7 @@ Hard-stop flow:
 Tests:
 
 - `mcp/tests/test_flybrain_brain_cluster.py`
+- `mcp/tests/test_flybrain_brain_cluster_training.py`
 
 Current checks verify:
 
@@ -108,5 +110,18 @@ Current checks verify:
 - stable replay fingerprint generation
 - accept path when gates pass
 - retry-to-alternate behavior
-- fail-closed behavior for low confidence and replay mismatch
+- fail-closed behavior for low confidence, missing fingerprint, and replay mismatch
+- deterministic dataset manifest generation and train/val/test splits
+- golden-set construction per region and promotion-gate threshold evaluation
 
+## Training/test scaffold (P0 -> P1)
+
+`mcp/flybrain_brain_cluster_training.py` provides deterministic scaffolding so expert training and canary evaluation can be wired without external integrations:
+
+- `TrainingSample`: strict per-sample contract (region, label, confidence target, provenance refs).
+- `build_dataset_manifest(...)`: canonical sample digest + deterministic split IDs with a versioned manifest id.
+- `build_golden_set(...)`: bounded per-region canary sample selection.
+- `PredictionRecord` + `evaluate_predictions(...)`: promotion-gate metrics (accuracy, abstain rate, calibration error).
+- `PromotionGateThresholds`: explicit pass/fail thresholds for promotion decisions.
+
+This keeps early training and test workflows replayable and fail-closed while the expert models and router training loops are implemented.

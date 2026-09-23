@@ -48,6 +48,7 @@ py-modules = [
     "graph_tools",
     "flybrain_harness_storage",
     "flybrain_brain_cluster",
+    "flybrain_brain_cluster_training",
     "flybrain_hb_adapter",
     "replay_fingerprint",
     "grounding",
@@ -70,4 +71,3 @@ py-modules = [
     "verify",
     "wiring_obligation_scan",
 ]
-
