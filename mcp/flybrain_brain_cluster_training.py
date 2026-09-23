@@ -195,6 +195,19 @@ class RouterTrainingResult:
     metrics: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class SwarmStudentTrainingResult:
+    artifact_id: str
+    schema_version: str
+    artifact_path: str
+    metrics_path: str
+    model_fingerprint: str
+    metrics_fingerprint: str
+    consensus_train_count: int
+    consensus_eval_count: int
+    metrics: Mapping[str, Any]
+
+
 def deterministic_split_ids(
     sample_ids: Sequence[str],
     *,
@@ -942,5 +955,152 @@ def train_router_from_labeled_data(
         metrics_fingerprint=metrics_fingerprint,
         train_count=len(train_rows),
         val_count=len(val_rows),
+        metrics=metrics_payload,
+    )
+
+
+def train_swarm_consensus_student(
+    samples: Sequence[TrainingSample],
+    *,
+    manifest: DatasetManifest,
+    expert_results: Mapping[str, RegionExpertTrainingResult],
+    output_dir: str | Path,
+    min_vote_share: float = 0.6,
+    min_mean_confidence: float = 0.55,
+    min_consensus_samples: int = 30,
+    alpha: float = 1.0,
+    schema_version: str = "flybrain-brain-cluster-swarm-student/v1",
+) -> SwarmStudentTrainingResult:
+    if not (0.5 <= float(min_vote_share) <= 1.0):
+        raise ValueError("min_vote_share must be in [0.5, 1.0]")
+    if not (0.0 <= float(min_mean_confidence) <= 1.0):
+        raise ValueError("min_mean_confidence must be in [0.0, 1.0]")
+    if int(min_consensus_samples) < 1:
+        raise ValueError("min_consensus_samples must be >= 1")
+    if not expert_results:
+        raise ValueError("expert_results must be non-empty")
+
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    expert_models: dict[str, Mapping[str, Any]] = {}
+    for region_id, result in expert_results.items():
+        payload = json.loads(Path(result.artifact_path).read_text(encoding="utf-8"))
+        model = payload.get("model")
+        if not isinstance(model, Mapping):
+            raise ValueError(f"region expert artifact missing model payload for region_id='{region_id}'")
+        expert_models[region_id] = model
+
+    def _consensus_label(sample: TrainingSample) -> tuple[str, float, float]:
+        votes: dict[str, int] = {}
+        confidences: dict[str, list[float]] = {}
+        for model in expert_models.values():
+            label, conf = _predict_multinomial_nb(model, sample.input_text)
+            votes[label] = votes.get(label, 0) + 1
+            confidences.setdefault(label, []).append(float(conf))
+        ranked = sorted(votes.items(), key=lambda item: (-item[1], item[0]))
+        top_label, top_votes = ranked[0]
+        vote_share = float(top_votes) / float(len(expert_models))
+        mean_conf = sum(confidences.get(top_label, [0.0])) / max(1, len(confidences.get(top_label, [])))
+        return top_label, vote_share, mean_conf
+
+    train_ids = tuple(manifest.train_ids) + tuple(manifest.val_ids)
+    eval_ids = tuple(manifest.test_ids)
+    consensus_train_rows: list[tuple[str, str]] = []
+    consensus_eval_rows: list[tuple[str, str]] = []
+    consensus_audit: list[dict[str, Any]] = []
+
+    for sample_id in train_ids:
+        sample = sample_by_id.get(sample_id)
+        if sample is None:
+            continue
+        label, vote_share, mean_conf = _consensus_label(sample)
+        if vote_share >= float(min_vote_share) and mean_conf >= float(min_mean_confidence):
+            consensus_train_rows.append((sample.input_text, label))
+            consensus_audit.append(
+                {
+                    "sample_id": sample_id,
+                    "split": "train",
+                    "consensus_label": label,
+                    "vote_share": vote_share,
+                    "mean_confidence": mean_conf,
+                }
+            )
+
+    for sample_id in eval_ids:
+        sample = sample_by_id.get(sample_id)
+        if sample is None:
+            continue
+        label, vote_share, mean_conf = _consensus_label(sample)
+        if vote_share >= float(min_vote_share) and mean_conf >= float(min_mean_confidence):
+            consensus_eval_rows.append((sample.input_text, label))
+            consensus_audit.append(
+                {
+                    "sample_id": sample_id,
+                    "split": "eval",
+                    "consensus_label": label,
+                    "vote_share": vote_share,
+                    "mean_confidence": mean_conf,
+                }
+            )
+
+    if len(consensus_train_rows) < int(min_consensus_samples):
+        raise ValueError(
+            f"insufficient consensus samples for swarm student "
+            f"({len(consensus_train_rows)} < {int(min_consensus_samples)})"
+        )
+
+    model = _fit_multinomial_nb(consensus_train_rows, alpha=alpha)
+    train_metrics = _classification_metrics(consensus_train_rows, model)
+    eval_metrics = _classification_metrics(consensus_eval_rows, model) if consensus_eval_rows else {
+        "sample_count": 0,
+        "accuracy": 0.0,
+        "macro_f1": 0.0,
+        "mean_calibration_error": 1.0,
+        "labels": {},
+        "warning": "no consensus evaluation samples in test split",
+    }
+
+    model_payload = {
+        "schema_version": schema_version,
+        "artifact_kind": "swarm_consensus_student_model",
+        "manifest_id": manifest.manifest_id,
+        "dataset_fingerprint": manifest.samples_sha256,
+        "consensus_policy": {
+            "min_vote_share": float(min_vote_share),
+            "min_mean_confidence": float(min_mean_confidence),
+            "min_consensus_samples": int(min_consensus_samples),
+        },
+        "label_space": tuple(sorted({label for _, label in consensus_train_rows})),
+        "model": model,
+    }
+    metrics_payload = {
+        "schema_version": f"{schema_version}-metrics",
+        "manifest_id": manifest.manifest_id,
+        "dataset_fingerprint": manifest.samples_sha256,
+        "consensus_train_count": len(consensus_train_rows),
+        "consensus_eval_count": len(consensus_eval_rows),
+        "train_metrics": train_metrics,
+        "eval_metrics": eval_metrics,
+        "consensus_audit": consensus_audit[: min(200, len(consensus_audit))],
+    }
+    artifact_path, model_fingerprint = _write_versioned_json(
+        output_dir,
+        filename_prefix="swarm-student-model",
+        payload=model_payload,
+    )
+    metrics_path, metrics_fingerprint = _write_versioned_json(
+        output_dir,
+        filename_prefix="swarm-student-metrics",
+        payload=metrics_payload,
+    )
+    artifact_id = f"swarm-student-{model_fingerprint[:12]}"
+    return SwarmStudentTrainingResult(
+        artifact_id=artifact_id,
+        schema_version=schema_version,
+        artifact_path=artifact_path,
+        metrics_path=metrics_path,
+        model_fingerprint=model_fingerprint,
+        metrics_fingerprint=metrics_fingerprint,
+        consensus_train_count=len(consensus_train_rows),
+        consensus_eval_count=len(consensus_eval_rows),
         metrics=metrics_payload,
     )

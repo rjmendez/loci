@@ -254,6 +254,7 @@ class BrainClusterDryRunResult:
     dataset_manifest: Mapping[str, Any]
     region_artifacts: Mapping[str, Any]
     router_artifact: Mapping[str, Any]
+    swarm_student_artifact: Mapping[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
         status = "pass" if (self.pass_gate and self.pass_shadow and self.promoted and not self.rolled_back) else "fail"
@@ -273,6 +274,7 @@ class BrainClusterDryRunResult:
             "dataset_manifest": dict(self.dataset_manifest),
             "region_artifacts": dict(self.region_artifacts),
             "router_artifact": dict(self.router_artifact),
+            "swarm_student_artifact": dict(self.swarm_student_artifact),
         }
 
 
@@ -334,6 +336,15 @@ def run_brain_cluster_p0_dry_run(
         router_samples,
         split_seed=split_seed,
         output_dir=output_root / "router",
+    )
+    swarm_student_result = fbct.train_swarm_consensus_student(
+        normalized_samples,
+        manifest=dataset_manifest,
+        expert_results=region_artifacts,
+        output_dir=output_root / "swarm-student",
+        min_vote_share=0.5,
+        min_mean_confidence=0.0,
+        min_consensus_samples=max(1, min(10, len(dataset_manifest.train_ids) + len(dataset_manifest.val_ids))),
     )
 
     artifact_version = f"{dataset_manifest.manifest_id}-{router_result.model_fingerprint[:12]}"
@@ -449,6 +460,15 @@ def run_brain_cluster_p0_dry_run(
             "metrics_fingerprint": router_result.metrics_fingerprint,
             "train_count": router_result.train_count,
             "val_count": router_result.val_count,
+        },
+        swarm_student_artifact={
+            "artifact_id": swarm_student_result.artifact_id,
+            "artifact_path": swarm_student_result.artifact_path,
+            "metrics_path": swarm_student_result.metrics_path,
+            "model_fingerprint": swarm_student_result.model_fingerprint,
+            "metrics_fingerprint": swarm_student_result.metrics_fingerprint,
+            "consensus_train_count": swarm_student_result.consensus_train_count,
+            "consensus_eval_count": swarm_student_result.consensus_eval_count,
         },
     )
     return result.as_dict()

@@ -54,6 +54,7 @@ def test_p0_dry_run_executes_end_to_end_and_promotes(tmp_path):
     assert report["promotion_state"]["promoted"] is not None
     assert report["dataset_manifest"]["notes"]["objective"] == "custom"
     assert report["dataset_manifest"]["notes"]["label_counts"] == {"accept": 30, "reject": 10}
+    assert report["swarm_student_artifact"]["consensus_train_count"] > 0
     assert Path(report["artifact_manifest_path"]).exists()
     assert report["gate_report"]["exit_code"] == 0
     assert report["shadow_report"]["exit_code"] == 0
@@ -89,6 +90,8 @@ def test_p0_dry_run_is_deterministic_for_same_seed(tmp_path):
     assert first["shadow_report"]["metrics"] == second["shadow_report"]["metrics"]
     assert first["router_artifact"]["model_fingerprint"] == second["router_artifact"]["model_fingerprint"]
     assert first["router_artifact"]["metrics_fingerprint"] == second["router_artifact"]["metrics_fingerprint"]
+    assert first["swarm_student_artifact"]["model_fingerprint"] == second["swarm_student_artifact"]["model_fingerprint"]
+    assert first["swarm_student_artifact"]["metrics_fingerprint"] == second["swarm_student_artifact"]["metrics_fingerprint"]
 
     first_regions = first["region_artifacts"]
     second_regions = second["region_artifacts"]

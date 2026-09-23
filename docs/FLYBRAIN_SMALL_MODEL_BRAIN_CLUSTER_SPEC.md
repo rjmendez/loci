@@ -148,6 +148,9 @@ Current checks verify:
 - `build_golden_set(...)`: bounded per-region canary sample selection.
 - `PredictionRecord` + `evaluate_predictions(...)`: promotion-gate metrics (accuracy, abstain rate, calibration error).
 - `PromotionGateThresholds`: explicit pass/fail thresholds for promotion decisions.
+- `train_swarm_consensus_student(...)`: deterministic student training from
+  multi-expert consensus votes, so swarm knowledge is distilled into a bounded
+  artifact with explicit consensus policy metadata.
 
 This keeps early training and test workflows replayable and fail-closed while the expert models and router training loops are implemented.
 

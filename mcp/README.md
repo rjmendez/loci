@@ -43,6 +43,10 @@ pipeline for first-pass trainability checks:
 
 `train -> artifact manifest -> golden-set gate -> shadow replay -> promote/rollback`
 
+The training stage now includes a **swarm consensus student** distilled from
+multi-expert agreement, so swarm behavior is represented in both runtime policy
+and trained artifacts.
+
 CLI entrypoint:
 
 `braincluster-p0-dry-run --samples <samples.json> --output-dir <dir> --state-path <promotion-state.json> --split-seed <seed>`

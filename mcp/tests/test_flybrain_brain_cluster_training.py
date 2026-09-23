@@ -205,6 +205,63 @@ def test_train_router_from_labeled_data_writes_artifacts(tmp_path):
     assert metrics_payload["val_split_size"] >= 0
 
 
+def test_train_swarm_consensus_student_writes_artifacts(tmp_path):
+    samples = _samples()
+    manifest = fbct.build_dataset_manifest(samples, split_seed="swarm-seed")
+    experts = {}
+    for region_id in sorted(manifest.region_counts):
+        experts[region_id] = fbct.train_region_expert_from_manifest(
+            samples,
+            manifest=manifest,
+            region_id=region_id,
+            output_dir=tmp_path / "region",
+        )
+    result = fbct.train_swarm_consensus_student(
+        samples,
+        manifest=manifest,
+        expert_results=experts,
+        output_dir=tmp_path / "swarm-student",
+        min_consensus_samples=4,
+    )
+    assert result.schema_version == "flybrain-brain-cluster-swarm-student/v1"
+    assert result.consensus_train_count >= 4
+    assert os.path.exists(result.artifact_path)
+    assert os.path.exists(result.metrics_path)
+    with open(result.artifact_path, "r", encoding="utf-8") as fh:
+        model_payload = json.load(fh)
+    assert model_payload["artifact_kind"] == "swarm_consensus_student_model"
+    assert model_payload["consensus_policy"]["min_vote_share"] == 0.6
+
+
+def test_train_swarm_consensus_student_is_deterministic(tmp_path):
+    samples = _samples()
+    manifest = fbct.build_dataset_manifest(samples, split_seed="swarm-det")
+    experts = {}
+    for region_id in sorted(manifest.region_counts):
+        experts[region_id] = fbct.train_region_expert_from_manifest(
+            samples,
+            manifest=manifest,
+            region_id=region_id,
+            output_dir=tmp_path / "region",
+        )
+    first = fbct.train_swarm_consensus_student(
+        samples,
+        manifest=manifest,
+        expert_results=experts,
+        output_dir=tmp_path / "student-a",
+        min_consensus_samples=4,
+    )
+    second = fbct.train_swarm_consensus_student(
+        samples,
+        manifest=manifest,
+        expert_results=experts,
+        output_dir=tmp_path / "student-b",
+        min_consensus_samples=4,
+    )
+    assert first.model_fingerprint == second.model_fingerprint
+    assert first.metrics_fingerprint == second.metrics_fingerprint
+
+
 def test_gate_runner_pass_report():
     golden = fbct.build_golden_set(_samples(), max_per_region=10)
     predictions = [
