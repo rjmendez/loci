@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,6 +49,60 @@ def _coerce_list(value: Any) -> list[Any]:
     return [value]
 
 
+_CONFIDENCE_LABELS = {
+    "high": 0.9,
+    "medium": 0.6,
+    "low": 0.3,
+}
+
+
+def _safe_confidence_value(confidence: Any, *, default: float = 0.0) -> float:
+    if isinstance(confidence, bool):
+        return float(default)
+    if isinstance(confidence, (int, float)):
+        value = float(confidence)
+        return value if math.isfinite(value) else float(default)
+    label = str(confidence).strip().lower()
+    if label in _CONFIDENCE_LABELS:
+        return _CONFIDENCE_LABELS[label]
+    try:
+        value = float(label)
+    except (TypeError, ValueError):
+        return float(default)
+    return value if math.isfinite(value) else float(default)
+
+
+def _normalize_dataset_key(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    key = re.sub(r"[_\-]+", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return key
+
+
+def _annotation_fraction(value: Any, *, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return default
+        if raw.endswith("%"):
+            try:
+                parsed = float(raw[:-1].strip()) / 100.0
+            except (TypeError, ValueError):
+                return default
+        else:
+            try:
+                parsed = float(raw)
+            except (TypeError, ValueError):
+                return default
+    if not math.isfinite(parsed):
+        return default
+    return max(0.0, min(1.0, parsed))
+
+
 @dataclass(frozen=True)
 class ComparativeClaim: 
     dataset: str = "unknown"
@@ -72,15 +128,12 @@ class ComparativeClaim:
         sex = str(claim_scope.get("sex") or scope.get("sex") or "unspecified")
         life_stage = str(claim_scope.get("life_stage") or scope.get("life_stage") or "unspecified")
         ann = claim_scope.get("annotation_completeness")
-        try:
-            annotation_completeness = float(ann) if ann is not None else 0.0
-        except (TypeError, ValueError):
-            annotation_completeness = 0.0
+        annotation_completeness = _annotation_fraction(ann, default=0.0) if ann is not None else 0.0
         circuit_class = str(claim_scope.get("circuit_class") or scope.get("circuit_class") or "unknown")
         experience_window = str(claim_scope.get("experience_window") or scope.get("experience_window") or "unknown")
         provenance = dict(scope.get("provenance") if isinstance(scope.get("provenance"), Mapping) else {})
         evidence_strength = str(scope.get("evidence_strength") or scope.get("evidence") or "structural")
-        confidence = float(scope.get("confidence", 0.0) or 0.0)
+        confidence = _safe_confidence_value(scope.get("confidence", 0.0), default=0.0)
         scope_notes = tuple(str(v) for v in _coerce_list(scope.get("scope_notes")))
         return cls(
             dataset=dataset,
@@ -113,16 +166,32 @@ class ComparativeClaimTieringEngine:
 
     DATASET_WEIGHTS = {
         "fw": 1.0,
-        "FlyWire": 1.0,
+        "flywire": 1.0,
+        "fly wire": 1.0,
         "mc": 0.95,
-        "Male CNS": 0.95,
-        "BANC": 0.9,
+        "male cns": 0.95,
+        "banc": 0.9,
         "hb": 0.75,
-        "Hemibrain": 0.75,
+        "hemibrain": 0.75,
         "mv": 0.7,
         "ol": 0.65,
         "fafb": 0.9,
         "l1em": 0.85,
+    }
+    _DATASET_ALIASES = {
+        "fw": "flywire",
+        "flywire": "flywire",
+        "fly wire": "flywire",
+        "hb": "hemibrain",
+        "hemibrain": "hemibrain",
+        "mc": "mc",
+        "male cns": "mc",
+        "male central nervous system": "mc",
+        "banc": "banc",
+        "fafb": "fafb",
+        "l1em": "l1em",
+        "mv": "mv",
+        "ol": "ol",
     }
     EVIDENCE_WEIGHTS = {
         "structural": 0.35,
@@ -133,8 +202,9 @@ class ComparativeClaimTieringEngine:
     }
 
     def _dataset_weight(self, dataset: str) -> float:
-        key = str(dataset).strip()
-        return self.DATASET_WEIGHTS.get(key, self.DATASET_WEIGHTS.get(key.lower(), 0.5))
+        key = _normalize_dataset_key(dataset)
+        key = self._DATASET_ALIASES.get(key, key)
+        return self.DATASET_WEIGHTS.get(key, 0.5)
 
     def _scope_penalty(self, claim: ComparativeClaim) -> float:
         penalty = 0.0
@@ -156,6 +226,7 @@ class ComparativeClaimTieringEngine:
         scope_weight = self._dataset_weight(claim.dataset)
         base = (evidence_weight * 0.6) + (scope_weight * 0.3) + (claim.annotation_completeness * 0.25)
         score = max(0.0, min(1.0, base - self._scope_penalty(claim)))
+        score = round(score, 4)
         if claim.dataset_version == "unknown" or claim.experience_window in {"unspecified", "unknown"}:
             tier = "T0"
         elif score >= 0.9:
@@ -168,7 +239,7 @@ class ComparativeClaimTieringEngine:
             tier = "T0"
         return {
             "tier": tier,
-            "score": round(score, 4),
+            "score": score,
             "scope_hash": claim.scope_hash(),
             "dataset": claim.dataset,
             "dataset_version": claim.dataset_version,
@@ -288,24 +359,71 @@ class HemibrainFlyWireCompatLayer:
 class ResearchPriorityScoring:
     """Score and prioritize research paths by payoff, scope, confidence, and compatibility."""
 
+    _DATASET_WEIGHTS = {
+        "flywire": 1.0,
+        "hemibrain": 0.75,
+        "mc": 0.95,
+        "banc": 0.9,
+        "fafb": 0.9,
+        "l1em": 0.85,
+        "mv": 0.7,
+        "ol": 0.65,
+    }
+    _DATASET_ALIASES = {
+        "fw": "flywire",
+        "flywire": "flywire",
+        "fly wire": "flywire",
+        "hb": "hemibrain",
+        "hemibrain": "hemibrain",
+        "male cns": "mc",
+        "male central nervous system": "mc",
+        "mc": "mc",
+        "banc": "banc",
+        "fafb": "fafb",
+        "l1em": "l1em",
+        "mv": "mv",
+        "ol": "ol",
+    }
+
+    def _confidence_value(self, confidence: Any) -> float:
+        return _safe_confidence_value(confidence, default=0.0)
+
+    def _dataset_weight(self, payload: Mapping[str, Any]) -> float:
+        scope = _coerce_mapping(payload.get("scope") or payload.get("claim_scope"))
+        dataset = payload.get("dataset") or payload.get("dataset_symbol") or scope.get("dataset") or scope.get("dataset_symbol") or "unknown"
+        key = _normalize_dataset_key(dataset)
+        key = self._DATASET_ALIASES.get(key, key)
+        return self._DATASET_WEIGHTS.get(key, 0.5)
+
     def score(self, path: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = _coerce_mapping(path)
         payoff = float(payload.get("payoff", 0.0) or 0.0)
-        confidence = float(payload.get("confidence", 0.0) or 0.0)
+        confidence = self._confidence_value(payload.get("confidence", 0.0))
         scope_compatibility = float(payload.get("scope_compatibility", 0.0) or 0.0)
         evidence_strength = float(payload.get("evidence_strength", 0.0) or 0.0)
         risk = float(payload.get("risk", 0.0) or 0.0)
         latency = float(payload.get("latency", 0.0) or 0.0)
-        raw = (0.35 * payoff) + (0.3 * confidence) + (0.2 * scope_compatibility) + (0.15 * evidence_strength) - (0.1 * risk) - (0.05 * latency)
+        dataset_weight = self._dataset_weight(payload)
+        raw = (
+            (0.35 * payoff)
+            + (0.3 * confidence)
+            + (0.2 * scope_compatibility)
+            + (0.15 * evidence_strength)
+            + (0.05 * (dataset_weight - 0.5))
+            - (0.1 * risk)
+            - (0.05 * latency)
+        )
         score = max(0.0, min(1.0, raw))
+        rounded_score = round(score, 4)
         return {
-            "score": round(score, 4),
-            "priority": "high" if score >= 0.75 else "medium" if score >= 0.45 else "low",
+            "score": rounded_score,
+            "priority": "high" if rounded_score >= 0.75 else "medium" if rounded_score >= 0.45 else "low",
             "components": {
                 "payoff": payoff,
                 "confidence": confidence,
                 "scope_compatibility": scope_compatibility,
                 "evidence_strength": evidence_strength,
+                "dataset_weight": dataset_weight,
                 "risk": risk,
                 "latency": latency,
             },

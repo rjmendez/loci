@@ -53,11 +53,11 @@ Claims must carry dataset, version, and scope.
     def test_docs_ingest_indexer_accepts_directory_input(self):
         docs_dir = Path(self._tmp.name) / "flybrain_docs"
         docs_dir.mkdir()
-        (docs_dir / "one.md").write_text("""# One
+        (docs_dir / "one.markdown").write_text("""# One
 
 This is the first doc.
 """, encoding="utf-8")
-        (docs_dir / "two.md").write_text("""# Two
+        (docs_dir / "two.txt").write_text("""# Two
 
 This is the second doc.
 """, encoding="utf-8")
@@ -70,6 +70,36 @@ This is the second doc.
         )
         self.assertEqual(result["stored"], 2, result)
         self.assertEqual(len(result["records"]), 2)
+
+        loaded = json.loads(server.investigation_load("docs-ingest-directory-test"))
+        self.assertEqual(len(loaded["recent_findings"]), 2)
+        self.assertEqual(
+            {finding["metadata"]["source_path"] for finding in loaded["recent_findings"]},
+            {str(docs_dir / "one.markdown"), str(docs_dir / "two.txt")},
+        )
+        self.assertEqual(
+            {finding["metadata"]["provenance"]["tool_name"] for finding in loaded["recent_findings"]},
+            {"docs_ingest_indexer"},
+        )
+
+    def test_docs_ingest_indexer_rejects_symlinked_directory_root(self):
+        external = Path(self._tmp.name) / "external_docs"
+        external.mkdir()
+        (external / "outside.md").write_text("""# Outside
+
+This should not be traversed through a symlinked ingest root.
+""", encoding="utf-8")
+        docs_dir = Path(self._tmp.name) / "flybrain_docs_link"
+        docs_dir.symlink_to(external, target_is_directory=True)
+
+        result = json.loads(
+            server.docs_ingest_indexer(
+                str(docs_dir),
+                investigation_id="docs-ingest-symlink-test",
+            )
+        )
+        self.assertEqual(result["error"], f"No readable markdown/text documents found under: {docs_dir}", result)
+        self.assertEqual(result["stored"], 0, result)
 
 
 if __name__ == "__main__":

@@ -26,9 +26,9 @@ def _flybrain_claim_scope() -> dict:
         "dataset_version": "flywire783",
         "sex": "unspecified",
         "life_stage": "adult",
-        "annotation_completeness": "partial",
+        "annotation_completeness": 0.95,
         "circuit_class": "Kenyon cell",
-        "experience_window": "unspecified",
+        "experience_window": "naive",
     }
 
 

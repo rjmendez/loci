@@ -145,6 +145,60 @@ class FlybrainClaimScopeValidatorTest(unittest.TestCase):
         finding = loaded["recent_findings"][0]
         self.assertEqual(finding.get("metadata", {}).get("claim_scope"), _valid_claim_scope())
 
+    def test_rejects_invalid_scope_value_shapes_for_hardened_fields(self):
+        inv_id = "fb-scope-invalid-shapes"
+        _json(server.investigation_start(investigation_id=inv_id, title="invalid claim_scope values"))
+
+        invalid_cases = (
+            ("dataset_version", "  "),
+            ("annotation_completeness", "partial"),
+            ("annotation_completeness", 1.2),
+            ("life_stage", "adult!"),
+            ("experience_window", "after-training"),
+        )
+        for key, value in invalid_cases:
+            claim_scope = _valid_claim_scope()
+            claim_scope[key] = value
+            res = _json(server.investigation_store(
+                investigation_id=inv_id,
+                finding_type="observed",
+                text=f"flybrain invalid {key}",
+                source="virtual-fly-brain-query_connectivity",
+                metadata={
+                    "flybrain_provenance": {"tool_name": "query_connectivity"},
+                    "claim_scope": claim_scope,
+                },
+            ))
+            self.assertIn("error", res)
+            self.assertIn(key, res["error"])
+
+    def test_normalizes_life_stage_and_percentage_annotation(self):
+        inv_id = "fb-scope-normalized"
+        _json(server.investigation_start(investigation_id=inv_id, title="normalized claim_scope values"))
+
+        claim_scope = _valid_claim_scope()
+        claim_scope["life_stage"] = "Larva"
+        claim_scope["annotation_completeness"] = "95%"
+        claim_scope["experience_window"] = "sleep deprived"
+
+        res = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="flybrain claim with normalizable scope values",
+            source="virtual-fly-brain-query_connectivity",
+            metadata={
+                "flybrain_provenance": {"tool_name": "query_connectivity"},
+                "claim_scope": claim_scope,
+            },
+        ))
+        self.assertTrue(res.get("stored"), res)
+
+        loaded = _json(server.investigation_load(inv_id))
+        stored_scope = loaded["recent_findings"][0]["metadata"]["claim_scope"]
+        self.assertEqual(stored_scope["life_stage"], "larval")
+        self.assertEqual(stored_scope["experience_window"], "sleep_deprived")
+        self.assertEqual(stored_scope["annotation_completeness"], 0.95)
+
 
 if __name__ == "__main__":
     unittest.main()

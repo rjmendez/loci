@@ -2437,6 +2437,32 @@ _FLYBRAIN_CLAIM_SCOPE_KEYS = (
     "circuit_class",
     "experience_window",
 )
+_FLYBRAIN_ALLOWED_LIFE_STAGES = {
+    "adult",
+    "larval",
+    "embryonic",
+    "pupal",
+    "l1",
+    "l2",
+    "l3",
+    "unknown",
+    "unspecified",
+}
+_FLYBRAIN_ALLOWED_EXPERIENCE_WINDOWS = {
+    "naive",
+    "trained",
+    "sleep_deprived",
+    "starved",
+    "sated",
+    "mixed",
+    "unknown",
+    "unspecified",
+}
+_FLYBRAIN_LIFE_STAGE_ALIASES = {
+    "embryo": "embryonic",
+    "larva": "larval",
+    "pupa": "pupal",
+}
 
 
 def _store_validate(finding_type: str, confidence: str, tier: str, resolution: str) -> Optional[str]:
@@ -2477,16 +2503,70 @@ def _normalize_finding_metadata(metadata: Any) -> Optional[dict]:
     return {"value": metadata}
 
 
-def _is_valid_flybrain_scope_value(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
+def _normalize_flybrain_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    token = re.sub(r"[_\-]+", "_", token)
+    token = re.sub(r"\s+", "_", token)
+    return token
+
+
+def _normalize_flybrain_dataset_version(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not re.search(r"[A-Za-z0-9]", cleaned):
+        return None
+    return cleaned
+
+
+def _normalize_flybrain_annotation_completeness(value: Any) -> Optional[float]:
     if isinstance(value, bool):
-        return True
+        return None
+    parsed: float
     if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            return False
-        return True
-    return False
+        parsed = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("%"):
+            try:
+                parsed = float(text[:-1].strip()) / 100.0
+            except (TypeError, ValueError):
+                return None
+        else:
+            try:
+                parsed = float(text)
+            except (TypeError, ValueError):
+                return None
+    else:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    if parsed < 0.0 or parsed > 1.0:
+        return None
+    return round(parsed, 6)
+
+
+def _normalize_flybrain_life_stage(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = _normalize_flybrain_token(value)
+    token = _FLYBRAIN_LIFE_STAGE_ALIASES.get(token, token)
+    if token not in _FLYBRAIN_ALLOWED_LIFE_STAGES:
+        return None
+    return token
+
+
+def _normalize_flybrain_experience_window(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    token = _normalize_flybrain_token(value)
+    if token not in _FLYBRAIN_ALLOWED_EXPERIENCE_WINDOWS:
+        return None
+    return token
 
 
 def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tuple[Optional[dict], Optional[str]]:
@@ -2522,18 +2602,43 @@ def _normalize_and_validate_flybrain_claim_scope(metadata: Optional[dict]) -> tu
             + ", ".join(missing)
         )
 
-    invalid = [k for k in _FLYBRAIN_CLAIM_SCOPE_KEYS if not _is_valid_flybrain_scope_value(claim_scope.get(k))]
-    if invalid:
-        return None, (
-            "flybrain claim_scope has invalid value(s) for key(s): "
-            + ", ".join(invalid)
-            + ". Values must be non-empty strings or scalar numbers/booleans."
-        )
-
     normalized_scope = {
         k: (claim_scope[k].strip() if isinstance(claim_scope[k], str) else claim_scope[k])
         for k in _FLYBRAIN_CLAIM_SCOPE_KEYS
     }
+
+    scope_errors: list[str] = []
+    normalized_dataset_version = _normalize_flybrain_dataset_version(normalized_scope.get("dataset_version"))
+    if normalized_dataset_version is None:
+        scope_errors.append("dataset_version")
+    else:
+        normalized_scope["dataset_version"] = normalized_dataset_version
+
+    normalized_annotation = _normalize_flybrain_annotation_completeness(normalized_scope.get("annotation_completeness"))
+    if normalized_annotation is None:
+        scope_errors.append("annotation_completeness")
+    else:
+        normalized_scope["annotation_completeness"] = normalized_annotation
+
+    normalized_life_stage = _normalize_flybrain_life_stage(normalized_scope.get("life_stage"))
+    if normalized_life_stage is None:
+        scope_errors.append("life_stage")
+    else:
+        normalized_scope["life_stage"] = normalized_life_stage
+
+    normalized_experience_window = _normalize_flybrain_experience_window(normalized_scope.get("experience_window"))
+    if normalized_experience_window is None:
+        scope_errors.append("experience_window")
+    else:
+        normalized_scope["experience_window"] = normalized_experience_window
+
+    if scope_errors:
+        return None, (
+            "flybrain claim_scope has invalid value(s) for key(s): "
+            + ", ".join(scope_errors)
+            + ". dataset_version must be a non-empty version id; annotation_completeness must be a finite number in [0, 1] (or a percentage string); "
+            + "life_stage and experience_window must be normalized FlyBrain scope labels."
+        )
     out["claim_scope"] = normalized_scope
 
     if isinstance(flybrain_prov, dict):
@@ -2571,15 +2676,58 @@ def _docs_ingest_summary_from_markdown(raw_text: str, *, title: str | None = Non
     return f"{base}: no useful body text was found."
 
 
+_DOCS_INGEST_SUFFIXES = {".md", ".markdown", ".txt"}
+
+
+def _docs_ingest_is_within_root(candidate: Path, root: Path) -> bool:
+    """Return True only when candidate resolves inside root."""
+    try:
+        candidate_real = candidate.resolve(strict=True)
+        root_real = root.resolve(strict=True)
+    except OSError:
+        return False
+    try:
+        candidate_real.relative_to(root_real)
+        return True
+    except ValueError:
+        return False
+
+
 def _docs_ingest_targets(document_path: str) -> list[Path]:
-    """Resolve a file or directory to markdown targets; fail-open to [] if the path is invalid."""
+    """Resolve a file or directory to markdown/text targets while staying inside the ingest root."""
     p = Path(document_path).expanduser()
     if not p.exists():
         return []
+
     if p.is_file():
-        return [p] if p.suffix.lower() in {".md", ".markdown", ".txt"} else []
+        if p.suffix.lower() not in _DOCS_INGEST_SUFFIXES:
+            return []
+        return [p] if _docs_ingest_is_within_root(p, p.parent) else []
+
     if p.is_dir():
-        return sorted({x for x in p.rglob("*.md") if x.is_file()})
+        # A symlinked directory root can point the ingest walk outside the path
+        # the caller actually supplied, so require a real directory entry here.
+        if p.is_symlink():
+            return []
+        root = p.resolve(strict=True)
+        matches: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            current = Path(dirpath)
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if not (current / name).is_symlink()
+                and _docs_ingest_is_within_root(current / name, root)
+            )
+            for filename in sorted(filenames):
+                candidate = current / filename
+                if candidate.suffix.lower() not in _DOCS_INGEST_SUFFIXES:
+                    continue
+                if candidate.is_symlink():
+                    continue
+                if _docs_ingest_is_within_root(candidate, root):
+                    matches.append(candidate)
+        return matches
+
     return []
 
 
@@ -4937,7 +5085,9 @@ def audit_log(
     investigation_logged = False
     if investigation_id and _load_manifest(investigation_id):
         try:
-            _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
+            with _investigation_lock(investigation_id):
+                with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
+                    _append_jsonl(_inv_dir(investigation_id) / "audit.jsonl", entry)
             investigation_logged = True
         except StoreBusyError as exc:
             logger.info("audit_log busy for investigation %s: %s", investigation_id, exc)

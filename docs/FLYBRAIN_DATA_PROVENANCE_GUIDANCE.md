@@ -134,6 +134,7 @@ When these constraints are violated by missing metadata, emit constrained langua
 - `investigation_store` now enforces fail-closed validation for FlyBrain `claim_scope` metadata when either `metadata.claim_scope` or `metadata.flybrain_provenance` is present.
 - The required tuple keys are validated as:
   `(dataset, dataset_version, sex, life_stage, annotation_completeness, circuit_class, experience_window)`.
+- Validation is strict for stability-sensitive keys: `dataset_version` must be a non-empty version identifier, `annotation_completeness` must normalize to a finite fraction in `[0, 1]` (percent strings accepted), and `life_stage` / `experience_window` are normalized against controlled FlyBrain scope labels.
 - Validated scope is preserved through the memory pipeline by forwarding `claim_scope` into Mnemosyne metadata and surfacing it on Mnemosyne recall rows.
 
 ---
