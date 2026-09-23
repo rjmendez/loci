@@ -149,3 +149,11 @@ Current checks verify:
 - `PromotionGateThresholds`: explicit pass/fail thresholds for promotion decisions.
 
 This keeps early training and test workflows replayable and fail-closed while the expert models and router training loops are implemented.
+
+`mcp/flybrain_brain_cluster_pipeline.py` now provides a P0 execution harness that
+composes the scaffold into one deterministic dry-run:
+
+- train region experts and router model from the dataset manifest
+- emit fail-closed runtime artifact manifest (`router.json` + `experts.json`)
+- run golden-set gate and shadow replay thresholds
+- stage candidate + promote only when both checks pass (rollback path explicit)

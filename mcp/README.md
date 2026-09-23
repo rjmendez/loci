@@ -36,6 +36,21 @@ validation before pointers are switched. Invalid transitions (for example,
 promoting an already-active manifest) and missing transition prerequisites
 return explicit error codes.
 
+## Brain-cluster P0 dry-run pipeline
+
+`flybrain_brain_cluster_pipeline.py` provides a deterministic train/evaluate
+pipeline for first-pass trainability checks:
+
+`train -> artifact manifest -> golden-set gate -> shadow replay -> promote/rollback`
+
+CLI entrypoint:
+
+`braincluster-p0-dry-run --samples <samples.json> --output-dir <dir> --state-path <promotion-state.json> --split-seed <seed>`
+
+The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
+including dataset split fingerprints, expert/router artifact fingerprints,
+gate/shadow metrics, and final promotion-state pointers.
+
 ## Requirements
 
 - Python 3.11+
