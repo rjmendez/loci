@@ -283,11 +283,29 @@ def run_brain_cluster_p0_dry_run(
     candidate_shadow_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized_samples = _parse_samples(samples)
+    label_counts: dict[str, int] = {}
+    for sample in normalized_samples:
+        label_counts[sample.expected_label] = label_counts.get(sample.expected_label, 0) + 1
+    objective = str(normalized_samples[0].metadata.get("objective", "")).strip() if normalized_samples else ""
+    if not objective:
+        if all(label.startswith("dominant_") for label in label_counts):
+            objective = "neurotransmitter_dominance"
+        elif {"high_connectivity", "baseline_connectivity"}.issuperset(set(label_counts)):
+            objective = "connectivity_tier"
+        else:
+            objective = "custom"
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     state_file = Path(state_path)
 
-    dataset_manifest = fbct.build_dataset_manifest(normalized_samples, split_seed=split_seed)
+    dataset_manifest = fbct.build_dataset_manifest(
+        normalized_samples,
+        split_seed=split_seed,
+        notes={
+            "objective": objective,
+            "label_counts": dict(sorted(label_counts.items())),
+        },
+    )
     (output_root / "dataset-manifest.json").write_text(
         json.dumps(dataset_manifest.as_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
@@ -428,7 +446,7 @@ def run_brain_cluster_p0_dry_run(
     return result.as_dict()
 
 
-def _parse_thresholds_file(raw: str | None) -> Mapping[str, Any] | None:
+def _parse_thresholds_file(raw: str | None, *, section: str) -> Mapping[str, Any] | None:
     if raw is None:
         return None
     text = str(raw).strip()
@@ -440,6 +458,14 @@ def _parse_thresholds_file(raw: str | None) -> Mapping[str, Any] | None:
         payload = json.loads(Path(text).read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("thresholds payload must be a JSON object")
+    if section in payload and isinstance(payload.get(section), Mapping):
+        return dict(payload[section])
+    thresholds = payload.get("thresholds")
+    if isinstance(thresholds, Mapping):
+        key = "gate" if section == "gate" else "shadow_replay"
+        nested = thresholds.get(key)
+        if isinstance(nested, Mapping):
+            return dict(nested)
     return dict(payload)
 
 
@@ -463,8 +489,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=args.output_dir,
             state_path=args.state_path,
             split_seed=args.split_seed,
-            gate_thresholds=_parse_thresholds_file(args.gate_thresholds),
-            shadow_thresholds=_parse_thresholds_file(args.shadow_thresholds),
+            gate_thresholds=_parse_thresholds_file(args.gate_thresholds, section="gate"),
+            shadow_thresholds=_parse_thresholds_file(args.shadow_thresholds, section="shadow"),
             max_per_region=args.max_per_region,
             max_shadow_fixtures=args.max_shadow_fixtures,
             rollback_on_shadow_failure=not args.no_rollback_on_shadow_failure,

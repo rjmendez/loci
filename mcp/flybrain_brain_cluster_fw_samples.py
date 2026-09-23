@@ -25,6 +25,8 @@ class FwSampleBuildConfig:
     min_region_samples: int = 25
     high_connectivity_quantile: float = 0.75
     max_regions: int = 20
+    min_distinct_labels: int = 2
+    max_label_share: float = 0.9
 
 
 def _stable_json(value: Any) -> str:
@@ -72,6 +74,10 @@ def _validate_config(config: FwSampleBuildConfig) -> None:
         raise ValueError("high_connectivity_quantile must be in (0, 1)")
     if config.max_regions < 1:
         raise ValueError("max_regions must be >= 1")
+    if config.min_distinct_labels < 1:
+        raise ValueError("min_distinct_labels must be >= 1")
+    if not (0.0 < config.max_label_share <= 1.0):
+        raise ValueError("max_label_share must be in (0, 1]")
     if config.objective not in {"connectivity_tier", "neurotransmitter_dominance"}:
         raise ValueError("objective must be one of: connectivity_tier, neurotransmitter_dominance")
 
@@ -334,6 +340,17 @@ def build_fw_training_samples(config: FwSampleBuildConfig) -> dict[str, Any]:
     for sample in capped:
         label = str(sample["expected_label"])
         label_counts[label] = label_counts.get(label, 0) + 1
+    if len(label_counts) < int(config.min_distinct_labels):
+        raise ValueError(
+            f"label diversity below minimum ({len(label_counts)} < {config.min_distinct_labels}); "
+            "adjust objective filters or caps."
+        )
+    dominant_share = max(label_counts.values()) / float(len(capped))
+    if dominant_share > float(config.max_label_share):
+        raise ValueError(
+            f"label concentration too high ({dominant_share:.3f} > {config.max_label_share:.3f}); "
+            "dataset is too imbalanced for stable training."
+        )
 
     payload = {
         "samples": capped,
@@ -351,7 +368,10 @@ def build_fw_training_samples(config: FwSampleBuildConfig) -> dict[str, Any]:
             "min_region_samples": int(config.min_region_samples),
             "max_samples": int(config.max_samples),
             "max_regions": int(config.max_regions),
+            "min_distinct_labels": int(config.min_distinct_labels),
+            "max_label_share": float(config.max_label_share),
             "companion_pre_path": build_meta.get("companion_pre_path"),
+            "dominant_label_share": float(dominant_share),
             "input_fingerprint": hashlib.sha256(
                 _stable_json(
                     {
@@ -363,6 +383,8 @@ def build_fw_training_samples(config: FwSampleBuildConfig) -> dict[str, Any]:
                         "min_region_samples": config.min_region_samples,
                         "high_connectivity_quantile": config.high_connectivity_quantile,
                         "max_regions": config.max_regions,
+                        "min_distinct_labels": config.min_distinct_labels,
+                        "max_label_share": config.max_label_share,
                     }
                 ).encode("utf-8")
             ).hexdigest(),
@@ -396,6 +418,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--min-region-samples", type=int, default=25)
     parser.add_argument("--high-connectivity-quantile", type=float, default=0.75)
     parser.add_argument("--max-regions", type=int, default=20)
+    parser.add_argument("--min-distinct-labels", type=int, default=2)
+    parser.add_argument("--max-label-share", type=float, default=0.9)
     args = parser.parse_args(argv)
 
     config = FwSampleBuildConfig(
@@ -408,6 +432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_region_samples=args.min_region_samples,
         high_connectivity_quantile=args.high_connectivity_quantile,
         max_regions=args.max_regions,
+        min_distinct_labels=args.min_distinct_labels,
+        max_label_share=args.max_label_share,
     )
     try:
         payload = build_fw_training_samples(config)

@@ -171,3 +171,11 @@ dataset reformatting.
 The builder now supports two objectives:
 - `connectivity_tier`: binary label (`high_connectivity` / `baseline_connectivity`) from per-neuron neuropil counts.
 - `neurotransmitter_dominance`: multiclass label (`dominant_ach`, `dominant_gaba`, `dominant_glut`, `dominant_da`, `dominant_ser`, `dominant_oct`) derived from proofread connection neurotransmitter probabilities, with deterministic region mapping from dominant neuropil.
+
+Hardening guards in the builder enforce:
+- minimum distinct label count before training sample emission
+- maximum dominant-label share to block extreme class-collapse datasets
+
+`mcp/flybrain_brain_cluster_release_prep.py` calibrates objective-specific gate/shadow
+threshold bundles from historical `p0-report.json` runs and writes one versioned
+threshold file per objective for promotion-gate use.

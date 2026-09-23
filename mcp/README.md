@@ -59,6 +59,15 @@ Objectives currently supported:
 - `connectivity_tier` (default): labels `high_connectivity` vs `baseline_connectivity`
 - `neurotransmitter_dominance`: labels dominant transmitter class from FlyWire proofread connection probabilities
 
+Production guardrails on sample build:
+- label diversity floor (`--min-distinct-labels`, default `2`)
+- label concentration ceiling (`--max-label-share`, default `0.9`)
+- deterministic fingerprinted metadata for audit/replay
+
+Objective-specific threshold bundle generation from real run history:
+
+`braincluster-release-prep --runs-root F:\.flybrain\cache\braincluster-runs --output-dir F:\.flybrain\cache\braincluster-thresholds --min-reports-per-objective 2`
+
 The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
 including dataset split fingerprints, expert/router artifact fingerprints,
 gate/shadow metrics, and final promotion-state pointers.

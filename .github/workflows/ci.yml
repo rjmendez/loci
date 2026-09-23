@@ -69,6 +69,8 @@ jobs:
           pytest tests/test_flybrain_brain_cluster.py \
                  tests/test_flybrain_brain_cluster_training.py \
                  tests/test_flybrain_brain_cluster_pipeline.py \
+                 tests/test_flybrain_brain_cluster_fw_samples.py \
+                 tests/test_flybrain_brain_cluster_release_prep.py \
                  tests/test_flybrain_brain_cluster_thresholds.py \
                  -v --tb=short --timeout=60
 

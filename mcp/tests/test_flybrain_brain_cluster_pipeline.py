@@ -52,6 +52,8 @@ def test_p0_dry_run_executes_end_to_end_and_promotes(tmp_path):
     assert report["promoted"] is True
     assert report["rolled_back"] is False
     assert report["promotion_state"]["promoted"] is not None
+    assert report["dataset_manifest"]["notes"]["objective"] == "custom"
+    assert report["dataset_manifest"]["notes"]["label_counts"] == {"accept": 30, "reject": 10}
     assert Path(report["artifact_manifest_path"]).exists()
     assert report["gate_report"]["exit_code"] == 0
     assert report["shadow_report"]["exit_code"] == 0
@@ -102,3 +104,20 @@ def test_p0_dry_run_rejects_malformed_shadow_fixture_payload(tmp_path):
             split_seed="seed-bad-fixture",
             shadow_fixtures=[{"fixture_id": "broken", "task": {"cluster_id": "missing-fields"}}],
         )
+
+
+def test_parse_thresholds_file_supports_calibration_bundle_shape(tmp_path):
+    payload = {
+        "schema_version": "braincluster-threshold-calibration/v1",
+        "thresholds": {
+            "gate": {"min_accuracy": 0.71},
+            "shadow_replay": {"min_decision_match_rate": 0.88},
+        },
+    }
+    path = tmp_path / "thresholds.json"
+    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    gate = fbcp._parse_thresholds_file(str(path), section="gate")
+    shadow = fbcp._parse_thresholds_file(str(path), section="shadow")
+    assert gate["min_accuracy"] == 0.71
+    assert shadow["min_decision_match_rate"] == 0.88

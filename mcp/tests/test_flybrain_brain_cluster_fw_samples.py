@@ -99,3 +99,24 @@ def test_build_fw_training_samples_neurotransmitter_objective(tmp_path):
     assert labels <= {"dominant_ach", "dominant_gaba", "dominant_glut", "dominant_da", "dominant_ser", "dominant_oct"}
     assert any(label == "dominant_ach" for label in labels)
     assert any(label == "dominant_gaba" for label in labels)
+
+
+def test_build_fw_training_samples_rejects_overconcentrated_labels(tmp_path):
+    source = tmp_path / "per_neuron_neuropil_count_pre_783.feather"
+    _write_fixture(source)
+    try:
+        fw_samples.build_fw_training_samples(
+            fw_samples.FwSampleBuildConfig(
+                source_path=source,
+                max_samples=6,
+                min_total_count=1,
+                min_region_samples=1,
+                high_connectivity_quantile=0.01,
+                max_regions=5,
+                max_label_share=0.5,
+            )
+        )
+    except ValueError as exc:
+        assert "label concentration too high" in str(exc)
+        return
+    raise AssertionError("Expected concentrated labels to fail guard")
