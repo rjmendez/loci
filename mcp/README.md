@@ -51,6 +51,14 @@ The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dr
 including dataset split fingerprints, expert/router artifact fingerprints,
 gate/shadow metrics, and final promotion-state pointers.
 
+Threshold calibration entrypoint:
+
+`braincluster-threshold-calibrate --reports <reports.json> --output <thresholds.json>`
+
+Calibration emits `schema_version=braincluster-threshold-calibration/v1` with
+versioned gate + shadow threshold candidates derived from held-out run metrics
+and a reproducible input fingerprint.
+
 ## Requirements
 
 - Python 3.11+

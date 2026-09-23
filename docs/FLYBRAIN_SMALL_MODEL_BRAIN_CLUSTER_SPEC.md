@@ -157,3 +157,7 @@ composes the scaffold into one deterministic dry-run:
 - emit fail-closed runtime artifact manifest (`router.json` + `experts.json`)
 - run golden-set gate and shadow replay thresholds
 - stage candidate + promote only when both checks pass (rollback path explicit)
+
+`mcp/flybrain_brain_cluster_thresholds.py` calibrates threshold candidates from
+held-out dry-run reports and emits a versioned threshold bundle keyed by an
+input fingerprint. This keeps threshold changes measurable and reproducible.
