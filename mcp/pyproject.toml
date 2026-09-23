@@ -47,6 +47,7 @@ py-modules = [
     "embed_ops",
     "graph_tools",
     "flybrain_harness_storage",
+    "flybrain_brain_cluster",
     "flybrain_hb_adapter",
     "replay_fingerprint",
     "grounding",
@@ -69,5 +70,4 @@ py-modules = [
     "verify",
     "wiring_obligation_scan",
 ]
-
 

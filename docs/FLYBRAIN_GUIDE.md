@@ -72,6 +72,7 @@ The live, active reading path stays short. Use these first; deeper historical ma
 | [FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md](./FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md) | Implementation-ready layering for hb local graph + fw metadata adapters, explicit query contracts, and import promotion smoke gates. | Designing realistic local adapter/import behavior while preserving hard scope boundaries. |
 | [FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md](./FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md) | Final focused phase-1 experiment to validate whether hb+fw enrichment improves real local answer utility over hb-only while preserving fail-closed safety/provenance boundaries. | Running one practical go/no-go validation under real local phase-1 constraints. |
 | [FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md](./FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md) | Rigorous comparison of hemibrain v1.2.1 (`hb`) and FlyWire v783 (`fw`): coverage, annotation model, versioning, query ergonomics, error modes, and cross-dataset guardrails. | Deciding between hemibrain and FlyWire; gating cross-dataset claims. |
+| [FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md](./FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md) | Region-specialized small-model cluster architecture with deterministic routing, replay-safe provenance envelopes, and fail-closed gate behavior. | Building internal specialist-expert orchestration before external integrations. |
 | [FLYBRAIN_REASONING_GLOSSARY.md](./FLYBRAIN_REASONING_GLOSSARY.md) | Reference glossary for the FlyBrain and Loci terminology used across the evidence docs. | Terminology lookup while reading deeper sources. |
 | [FLYBRAIN_ARCHIVE.md](./FLYBRAIN_ARCHIVE.md) | Redirect index and archive home for the de-emphasized deep notes. | Reaching the retained historical material without dead ends. |
 
@@ -103,8 +104,9 @@ Legacy FlyBrain entry points should resolve to the short canonical docs above. T
 10. If you are implementing realistic hb/fw local adapters and promotion gates, read [FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md](./FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md).
 11. If you need the final practical go/no-go evaluation for hb/fw under local phase-1 constraints, read [FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md](./FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md).
 12. If you are comparing hemibrain (`hb`) and FlyWire (`fw`) specifically — coverage, annotation model, error modes, query ergonomics, or cross-dataset guardrails — read [FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md](./FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md).
-13. If you want the claim-to-evidence map, read [FLYBRAIN_EVIDENCE_MAP.md](./FLYBRAIN_EVIDENCE_MAP.md).
-14. If you need deeper historical or comparative context, start at [FLYBRAIN_ARCHIVE.md](./FLYBRAIN_ARCHIVE.md). The archive contains the dense FlyBrain notes that were intentionally retired from the active path.
+13. If you are implementing internal specialist-expert orchestration with replay-safe routing and fail-closed gates, read [FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md](./FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md).
+14. If you want the claim-to-evidence map, read [FLYBRAIN_EVIDENCE_MAP.md](./FLYBRAIN_EVIDENCE_MAP.md).
+15. If you need deeper historical or comparative context, start at [FLYBRAIN_ARCHIVE.md](./FLYBRAIN_ARCHIVE.md). The archive contains the dense FlyBrain notes that were intentionally retired from the active path.
 
 ## Why it matters for Loci
 
@@ -122,4 +124,3 @@ The most important Loci takeaway is: a finding is only trustworthy when its evid
 The deeper FlyBrain notes are kept as appendix/archive material for historical and technical reference. They are not the starting point for normal reading.
 
 See [FLYBRAIN_ARCHIVE.md](./FLYBRAIN_ARCHIVE.md) for the archive index and pointers to the retained deep notes.
-
