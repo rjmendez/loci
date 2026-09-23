@@ -59,6 +59,22 @@ def test_p0_dry_run_executes_end_to_end_and_promotes(tmp_path):
     assert report["shadow_report"]["exit_code"] == 0
 
 
+def test_router_runtime_payload_includes_parallel_swarm_policy():
+    samples = _sample_payload()["samples"]
+    normalized = [fbcp.fbct._normalize_training_sample(item) for item in samples]
+    router_samples = fbcp._derive_router_samples(normalized)
+    payload = fbcp._build_router_runtime_payload(
+        router_samples,
+        policy_version="braincluster-router-runtime/test",
+        model_fingerprint="abc123",
+    )
+    swarm = payload["swarm_policy"]
+    assert swarm["enabled"] is True
+    assert swarm["execution_mode"] == "parallel_fanout"
+    assert swarm["fanout_k"] >= 1
+    assert swarm["consensus"] == "gated_majority_then_confidence"
+
+
 def test_p0_dry_run_is_deterministic_for_same_seed(tmp_path):
     first = _run(tmp_path / "first", split_seed="seed-determinism")
     second = _run(tmp_path / "second", split_seed="seed-determinism")

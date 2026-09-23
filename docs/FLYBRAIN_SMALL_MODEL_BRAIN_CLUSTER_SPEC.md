@@ -14,8 +14,9 @@ This spec defines an internal Loci architecture for region-specialized small mod
 1. **Task envelope**: typed request contract carrying objective, task type, risk tier, inputs, routing features, and constraints.
 2. **Router**: deterministic policy producing primary + alternate experts and routing entropy.
 3. **Coordinator**: state machine that executes experts and gates outputs.
-4. **Gates**: independent checks (confidence, provenance refs, replay fingerprint consistency).
-5. **Provenance envelope**: immutable replay metadata bound to policy version and route seed.
+4. **Swarm policy**: bounded parallel fan-out (`fanout_k`) with deterministic consensus and fail-closed gating.
+5. **Gates**: independent checks (confidence, provenance refs, replay fingerprint consistency).
+6. **Provenance envelope**: immutable replay metadata bound to policy version and route seed.
 
 ## Reference implementation
 

@@ -71,6 +71,9 @@ Objective-specific threshold bundle generation from real run history:
 The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
 including dataset split fingerprints, expert/router artifact fingerprints,
 gate/shadow metrics, and final promotion-state pointers.
+Router runtime payloads now include a deterministic `swarm_policy`
+(`parallel_fanout`, bounded `fanout_k`, consensus mode) so parallel
+multi-expert execution is a first-class deployment contract.
 
 Threshold calibration entrypoint:
 

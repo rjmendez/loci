@@ -69,10 +69,18 @@ def _build_router_runtime_payload(
     if "default" not in routes_by_task_type:
         all_experts = sorted({row.expected_expert for row in router_samples})
         routes_by_task_type["default"] = all_experts or ["generalist"]
+    default_route = routes_by_task_type.get("default", [])
+    fanout_k = max(1, min(3, len(default_route)))
     return {
         "schema_version": "braincluster-router-runtime/v1",
         "policy_version": policy_version,
         "routes_by_task_type": routes_by_task_type,
+        "swarm_policy": {
+            "enabled": True,
+            "execution_mode": "parallel_fanout",
+            "fanout_k": fanout_k,
+            "consensus": "gated_majority_then_confidence",
+        },
         "training_artifact": {"model_fingerprint": model_fingerprint},
     }
 
