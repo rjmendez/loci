@@ -9,6 +9,7 @@ These are the docs to read first for normal work. They are intentionally short a
 - [FLYBRAIN_GUIDE.md](./FLYBRAIN_GUIDE.md) — the main entry point for FlyBrain in Loci.
 - [FLYBRAIN_EVIDENCE_MAP.md](./FLYBRAIN_EVIDENCE_MAP.md) — claim-to-evidence traceability map across the FlyBrain docs, tool surface, and provenance notes.
 - [FLYBRAIN_REASONING_GLOSSARY.md](./FLYBRAIN_REASONING_GLOSSARY.md) — short term lookup for dataset, provenance, and reasoning terminology.
+- [FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](./FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md) — allowlist-only path safety policy for FlyBrain harness writes under a configured storage root.
 - [FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md](./FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md) — rigorous hemibrain v1.2.1 vs. FlyWire v783 comparison: coverage, annotation model, versioning, query ergonomics, error modes, and cross-dataset guardrails.
 - [FLYBRAIN_PRUNE_PLAN.md](./FLYBRAIN_PRUNE_PLAN.md) — current retention and redirect policy for the FlyBrain doc set.
 
@@ -41,6 +42,14 @@ The redirect ledger is the single source of truth for these retired entry points
 ## Planning and active follow-up
 
 - [FLYBRAIN_RESEARCH_PRIORITIES.md](./FLYBRAIN_RESEARCH_PRIORITIES.md) — ranked research paths, execution order, and Loci subsystem hooks. Useful for planning, but not the default reader path.
+- [FLYBRAIN_QUEUE_CONTRACT_FREEZE_V1.md](./FLYBRAIN_QUEUE_CONTRACT_FREEZE_V1.md) — frozen queue item contract and compatibility boundary for FlyBrain operational work.
+- [FLYBRAIN_FAIL_BEHAVIOR_MATRIX.md](./FLYBRAIN_FAIL_BEHAVIOR_MATRIX.md) — fail-closed, fail-degraded, and recoverable behavior for pilot operations.
+- [FLYBRAIN_QUEUE_STATE_MACHINE_SPEC.md](./FLYBRAIN_QUEUE_STATE_MACHINE_SPEC.md) — canonical states, lease semantics, and reclaim rules for FlyBrain queue items.
+- [FLYBRAIN_REPLAY_ACCEPTANCE_TEST_SPEC.md](./FLYBRAIN_REPLAY_ACCEPTANCE_TEST_SPEC.md) — acceptance criteria for deterministic FlyBrain replay and provenance checks.
+- [FLYBRAIN_PILOT_SLOS_AND_TRIPWIRES.md](./FLYBRAIN_PILOT_SLOS_AND_TRIPWIRES.md) — SLOs, tripwires, and queue-pressure thresholds for the local pilot.
+- [FLYBRAIN_QUEUE_AND_PROMOTION_ROLLBACK_PLAYBOOK.md](./FLYBRAIN_QUEUE_AND_PROMOTION_ROLLBACK_PLAYBOOK.md) — operational rollback and promotion sequence for queue-driven FlyBrain work.
+- [FLYBRAIN_PR_SLICING_GUARDRAILS.md](./FLYBRAIN_PR_SLICING_GUARDRAILS.md) — guardrails for safe PR slicing and staged review when FlyBrain work is partitioned.
+- [FLYBRAIN_PILOT_GO_NO_GO_CHECKLIST.md](./FLYBRAIN_PILOT_GO_NO_GO_CHECKLIST.md) — pre-merge and launch readiness checklist with stop/go gates.
 
 ## Archive / dense or retired references
 

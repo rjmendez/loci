@@ -170,6 +170,19 @@ This is the implementation-ready path for the `benchmark-harness-spec`, `rollout
 | `SKILLS_DIR` | `~/.claude/skills` | skill_annotation_updater, skillops_maintenance, exif |
 | `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
 
+### FlyBrain harness write-path safety
+
+FlyBrain harness jobs must follow the allowlist-only path boundary in
+[FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](./FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md).
+
+Operationally:
+
+- Keep the effective write root at `LOCI_FLYBRAIN_STORAGE_ROOT` (or stricter approved override).
+- Block symlink/junction (reparse-point) escapes before any write/delete/move.
+- Never run destructive operations outside the allowlisted root.
+- Use the durable root structure in [FLYBRAIN_HARNESS_STORAGE_LAYOUT.md](./FLYBRAIN_HARNESS_STORAGE_LAYOUT.md): `graph\`, `snapshots\`, `cache\`, `backups\`, and `logs\` under `LOCI_FLYBRAIN_STORAGE_ROOT`.
+- Sequence operational gates using [FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md](./FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md), starting with `dry-run` inventory and ending at the first reproducible local query harness run.
+
 ### Tuning parameters
 
 | Variable | Default | Effect |

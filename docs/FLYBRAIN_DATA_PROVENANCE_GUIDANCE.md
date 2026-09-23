@@ -109,6 +109,8 @@ Use this pattern:
 
 The repo now tracks deterministic fingerprints and provenance fields for FlyBrain memory entries, including replay fingerprints and normalized dataset scope. That lets later checks confirm whether a claim can be replayed and whether the dataset scope still matches the evidence.
 
+For local harness artifact manifests (dataset snapshots/metadata bundles), use the canonical writer/reader contract in `docs/FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md`.
+
 ## Final guidance
 
 The safe default is not to say "this is generally true." The safe default is to say what the evidence actually supports, and to carry the dataset and query path along with it.

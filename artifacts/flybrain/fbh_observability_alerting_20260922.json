@@ -1,0 +1,113 @@
+{
+  "artifact": "fbh_observability_alerting",
+  "date": "2026-09-22",
+  "canonical_root_env": "LOCI_FLYBRAIN_STORAGE_ROOT",
+  "storage_layout_reference": "docs/FLYBRAIN_HARNESS_STORAGE_LAYOUT.md",
+  "storage_policy_reference": "docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md",
+  "sync_pipeline_reference": "docs/FLYBRAIN_FETCH_SYNC_PIPELINES_PLAN.md",
+  "config_driven_only": true,
+  "root_usage": {
+    "required_metrics": [
+      "flybrain_storage_root_bytes_total",
+      "flybrain_storage_root_bytes_used",
+      "flybrain_storage_root_bytes_free",
+      "flybrain_storage_root_utilization_pct",
+      "flybrain_storage_subtree_bytes",
+      "flybrain_storage_pressure_level"
+    ],
+    "subtrees": [
+      "graph",
+      "snapshots",
+      "cache",
+      "backups",
+      "logs"
+    ],
+    "root_env": "LOCI_FLYBRAIN_STORAGE_ROOT",
+    "example_pattern": "${LOCI_FLYBRAIN_STORAGE_ROOT}/logs",
+    "no_hardcoded_drive_letters": true
+  },
+  "job_health": {
+    "required_metrics": [
+      "flybrain_job_runs_total",
+      "flybrain_job_duration_seconds",
+      "flybrain_job_retries_total",
+      "flybrain_job_last_status",
+      "flybrain_dataset_sync_attempts_total",
+      "flybrain_dataset_sync_failures_total",
+      "flybrain_dataset_sync_success_total",
+      "flybrain_dataset_sync_latency_seconds",
+      "flybrain_dataset_sync_consecutive_failures",
+      "flybrain_dataset_sync_state"
+    ],
+    "labels": [
+      "job_name",
+      "dataset",
+      "version",
+      "stage",
+      "status",
+      "reason",
+      "run_id",
+      "root_env"
+    ],
+    "failure_classes": [
+      "network",
+      "integrity",
+      "policy",
+      "budget",
+      "transient",
+      "unknown"
+    ]
+  },
+  "alert_thresholds": {
+    "storage_pressure": {
+      "watch_gb": 150,
+      "soft_cap_gb": 160,
+      "critical_gb": 180,
+      "hard_stop_gb": 200,
+      "trigger_on": "mostly_used_bytes_under_configured_storage_root",
+      "action": [
+        "pause large downloads",
+        "archive stale cache artifacts",
+        "switch noncritical jobs to read-only mode",
+        "freeze nonessential writes",
+        "block all nonessential writes"
+      ]
+    },
+    "failed_syncs": {
+      "window_minutes": 30,
+      "failure_threshold": 3,
+      "consecutive_failures": 2,
+      "warning_rules": [
+        "2 or more failed syncs in the rolling window",
+        "1 dataset with 2 consecutive failures"
+      ],
+      "critical_rules": [
+        "3 or more failed syncs in the rolling window",
+        "2 consecutive failed attempts for the same dataset/version"
+      ],
+      "page_rules": [
+        "5 or more failed syncs in the rolling window",
+        "3 consecutive failures for the same dataset/version",
+        "any critical stage blocked while storage pressure is at hard-stop or critical"
+      ]
+    }
+  },
+  "config_keys": [
+    "LOCI_FLYBRAIN_STORAGE_ROOT",
+    "LOCI_FLYBRAIN_STORAGE_WATCH_GB",
+    "LOCI_FLYBRAIN_STORAGE_SOFT_CAP_GB",
+    "LOCI_FLYBRAIN_STORAGE_CRITICAL_GB",
+    "LOCI_FLYBRAIN_STORAGE_HARD_CAP_GB",
+    "LOCI_FLYBRAIN_SYNC_FAILURE_WINDOW_MINUTES",
+    "LOCI_FLYBRAIN_SYNC_FAILURE_THRESHOLD",
+    "LOCI_FLYBRAIN_SYNC_CONSECUTIVE_FAILURES",
+    "LOCI_FLYBRAIN_JOB_HEALTH_LOG_DIR"
+  ],
+  "implementation_guidance": [
+    "Resolve the configured storage root once via the repo's environment/config chain.",
+    "Compute usage from the canonical subtrees under that root instead of a local machine path.",
+    "Emit derived pressure state and failed-sync counters in both logs and metrics.",
+    "Keep all alert thresholds and actions in config rather than hardcoded host values.",
+    "Never assume a drive letter or writable local mount is safe to use as the canonical root."
+  ]
+}

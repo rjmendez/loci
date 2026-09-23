@@ -1,0 +1,138 @@
+{
+  "artifact": "fbh_fetch_sync_pipeline_plan",
+  "date": "2026-09-22",
+  "storage_root_env": "LOCI_FLYBRAIN_STORAGE_ROOT",
+  "run_modes": [
+    "dry-run",
+    "plan",
+    "execute"
+  ],
+  "phase1_scope": {
+    "datasets": [
+      {
+        "symbol": "hb",
+        "version_id": "neuprint_JRC_Hemibrain_1point2point1",
+        "sync_kind": "graph_snapshot_and_promotion"
+      },
+      {
+        "symbol": "fw",
+        "version_id": "flywire783",
+        "sync_kind": "metadata_snapshot"
+      }
+    ],
+    "excluded": [
+      "full_flywire_adjacency_mirror",
+      "mc_dataset_mirror",
+      "mv_dataset_mirror",
+      "BANC_dataset_mirror"
+    ]
+  },
+  "stages": [
+    {
+      "name": "preflight_gate",
+      "writes": [
+        "logs\\pipelines\\<run_id>\\preflight.json"
+      ],
+      "hard_fail": [
+        "path_guard_violation",
+        "invalid_scope",
+        "hard_stop_budget_violation"
+      ]
+    },
+    {
+      "name": "plan_and_keys",
+      "writes": [
+        "logs\\pipelines\\<run_id>\\plan.json"
+      ],
+      "idempotency_key_format": "<dataset_symbol>|<version_id>|<stage_name>|<source_fingerprint>|<pipeline_version>"
+    },
+    {
+      "name": "source_provenance_fetch",
+      "writes": [
+        "snapshots\\<dataset>\\<version>\\manifest\\source_provenance.json"
+      ],
+      "resume_strategy": "recompute_and_compare_then_skip_if_equal"
+    },
+    {
+      "name": "resumable_acquisition",
+      "writes": [
+        "cache\\downloads\\<dataset>\\<version>\\download_state.json",
+        "snapshots\\<dataset>\\<version>\\source\\*"
+      ],
+      "resume_strategy": "byte_or_chunk_resume_then_seal"
+    },
+    {
+      "name": "integrity_and_manifest",
+      "writes": [
+        "snapshots\\<dataset>\\<version>\\manifest\\manifest.json",
+        "snapshots\\<dataset>\\<version>\\manifest\\manifest.sha256"
+      ],
+      "schema_version": "fbh-manifest/v1",
+      "hard_fail": [
+        "checksum_mismatch",
+        "schema_missing_required_fields",
+        "absolute_path_in_manifest"
+      ]
+    },
+    {
+      "name": "sync_or_promotion",
+      "hb": {
+        "writes": [
+          "graph\\hb\\<version>\\neo4j-store\\candidate-<build_id>\\",
+          "graph\\hb\\<version>\\promotion\\*"
+        ],
+        "promotion_rule": "atomic_pointer_update_after_smoke_pass"
+      },
+      "fw": {
+        "writes": [
+          "snapshots\\fw\\<version>\\manifest\\*",
+          "snapshots\\fw\\<version>\\source\\*"
+        ],
+        "promotion_rule": "not_applicable_metadata_lane"
+      }
+    },
+    {
+      "name": "finalize",
+      "writes": [
+        "logs\\pipelines\\<run_id>\\summary.json"
+      ],
+      "destructive_allowed_only_under": [
+        "cache\\downloads\\<dataset>\\<version>\\"
+      ]
+    }
+  ],
+  "metadata_writes_required": [
+    "run_descriptor",
+    "config_fingerprint",
+    "per_stage_timeline",
+    "per_dataset_idempotency_keys",
+    "source_provenance",
+    "file_hashes",
+    "manifest_hash",
+    "refresh_decision",
+    "failure_records"
+  ],
+  "failure_policy": {
+    "always_stop": [
+      "path_policy_violation",
+      "root_protection_violation",
+      "required_checksum_mismatch",
+      "manifest_schema_violation",
+      "promotion_integrity_risk"
+    ],
+    "retryable": [
+      "transient_network_error",
+      "remote_throttling",
+      "temporary_lock_contention"
+    ],
+    "continue_on_dataset_failure_default": false
+  },
+  "references": [
+    "docs/FLYBRAIN_FETCH_SYNC_PIPELINES_PLAN.md",
+    "docs/FLYBRAIN_HARNESS_STORAGE_LAYOUT.md",
+    "docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md",
+    "docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md",
+    "docs/FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md",
+    "artifacts/flybrain/fbh_initial_dataset_snapshot_scope_20260922.md"
+  ]
+}

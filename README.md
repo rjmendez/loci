@@ -42,6 +42,8 @@ FlyBrain is the practical test for one of Loci's core promises: when evidence co
 
 Start with the short user-facing path in [docs/FLYBRAIN_GUIDE.md](docs/FLYBRAIN_GUIDE.md). Then use [docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md](docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md), [docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md](docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md), and [docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md](docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md) as the canonical follow-ups. Keep [docs/FLYBRAIN_REASONING_GLOSSARY.md](docs/FLYBRAIN_REASONING_GLOSSARY.md) open for quick term lookup, and use [docs/FLYBRAIN_ARCHIVE.md](docs/FLYBRAIN_ARCHIVE.md) only when you need the deeper historical or technical notes.
 
+For filesystem safety in FlyBrain harness jobs, enforce the allowlist-only write boundary documented in [docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md).
+
 The current VFB/FlyBrain tool surface supports this workflow in practice: `search_terms` finds the relevant neuron or anatomy, `get_term_info` and `get_hierarchy` confirm scope, `query_connectivity` and `run_query` compare evidence, and the provenance docs capture the dataset and version trail. If you are comparing results across datasets, the guide is the right starting point.
 
 Important caveat: FlyBrain results remain dataset-, version-, and query-scoped. Empty results, `count_status` warnings, or a stale cached response are not evidence of a biological absence. When a claim depends on VFB data, record the dataset symbols, version label, and query settings, and use `force_refresh` or explicit scope notes when the underlying tool output is ambiguous.
@@ -90,7 +92,10 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 | New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
 | FlyBrain overview and recommended reading path | [docs/FLYBRAIN_GUIDE.md](docs/FLYBRAIN_GUIDE.md) |
 | FlyBrain provenance and replay rules | [docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md](docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md) |
+| FlyBrain pilot queue / rollback / go-no-go controls | [docs/FLYBRAIN_QUEUE_CONTRACT_FREEZE_V1.md](docs/FLYBRAIN_QUEUE_CONTRACT_FREEZE_V1.md), [docs/FLYBRAIN_FAIL_BEHAVIOR_MATRIX.md](docs/FLYBRAIN_FAIL_BEHAVIOR_MATRIX.md), [docs/FLYBRAIN_QUEUE_STATE_MACHINE_SPEC.md](docs/FLYBRAIN_QUEUE_STATE_MACHINE_SPEC.md), [docs/FLYBRAIN_REPLAY_ACCEPTANCE_TEST_SPEC.md](docs/FLYBRAIN_REPLAY_ACCEPTANCE_TEST_SPEC.md), [docs/FLYBRAIN_PILOT_SLOS_AND_TRIPWIRES.md](docs/FLYBRAIN_PILOT_SLOS_AND_TRIPWIRES.md), [docs/FLYBRAIN_QUEUE_AND_PROMOTION_ROLLBACK_PLAYBOOK.md](docs/FLYBRAIN_QUEUE_AND_PROMOTION_ROLLBACK_PLAYBOOK.md), [docs/FLYBRAIN_PR_SLICING_GUARDRAILS.md](docs/FLYBRAIN_PR_SLICING_GUARDRAILS.md), [docs/FLYBRAIN_PILOT_GO_NO_GO_CHECKLIST.md](docs/FLYBRAIN_PILOT_GO_NO_GO_CHECKLIST.md) |
 | FlyBrain dataset boundary matrix | [docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md](docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md) |
+| FlyBrain harness write-path safety policy | [docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md) |
+| FlyBrain harness storage-root layout | [docs/FLYBRAIN_HARNESS_STORAGE_LAYOUT.md](docs/FLYBRAIN_HARNESS_STORAGE_LAYOUT.md) |
 | Repo-wide docs retention / archive policy | [docs/DOCS_RETENTION_POLICY.md](docs/DOCS_RETENTION_POLICY.md) |
 | FlyBrain architecture / implementation mapping | [docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md](docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md) |
 | FlyBrain glossary / quick term lookup | [docs/FLYBRAIN_REASONING_GLOSSARY.md](docs/FLYBRAIN_REASONING_GLOSSARY.md) |
@@ -293,4 +298,3 @@ loci/
 ├── backends.toml.example  Template for ~/.loci/backends.toml
 └── .env.example           Full environment variable reference for all components
 ```
-
