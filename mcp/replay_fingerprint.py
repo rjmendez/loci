@@ -53,6 +53,14 @@ def _stable_json(value: Any) -> str:
     )
 
 
+def _normalize_set_like(items: list[Any]) -> list[Any]:
+    unique: dict[str, Any] = {}
+    for item in items:
+        marker = _stable_json(item)
+        unique.setdefault(marker, item)
+    return [unique[key] for key in sorted(unique)]
+
+
 def _canonicalize(value: Any, *, key_name: str = '') -> Any:
     if isinstance(value, dict):
         items: list[tuple[str, Any]] = []
@@ -64,19 +72,10 @@ def _canonicalize(value: Any, *, key_name: str = '') -> Any:
     if isinstance(value, (list, tuple)):
         canonical_items = [_canonicalize(v, key_name=key_name) for v in value]
         if key_name in _SET_LIKE_KEYS:
-            unique: dict[str, Any] = {}
-            for item in canonical_items:
-                marker = _stable_json(item)
-                unique.setdefault(marker, item)
-            return [unique[key] for key in sorted(unique)]
+            return _normalize_set_like(canonical_items)
         return canonical_items
     if isinstance(value, set):
-        canonical_items = [_canonicalize(v, key_name=key_name) for v in value]
-        unique: dict[str, Any] = {}
-        for item in canonical_items:
-            marker = _stable_json(item)
-            unique.setdefault(marker, item)
-        return [unique[key] for key in sorted(unique)]
+        return _normalize_set_like([_canonicalize(v, key_name=key_name) for v in value])
     if isinstance(value, str):
         return _normalize_text(value)
     if value is None or isinstance(value, (bool, int, float)):
