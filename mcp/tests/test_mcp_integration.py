@@ -1531,18 +1531,16 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
 
         self._assert_reflect_core_fields(reflect_result)
         self.assertNotIn("self_critique", reflect_result)
-        self.assertEqual(
-            reflect_result["summary_l1"],
-            [
-                "Primary DB host 10.0.0.9 returns timeout errors during failover.",
-                "Traffic likely shifted to a stale replica after the timeout spike.",
-                "Replica routing logs have not yet been collected.",
-            ],
+        self.assertEqual(len(reflect_result["summary_l1"]), 3)
+        self.assertIn("source=test:db", reflect_result["summary_l1"][0])
+        self.assertIn("confidence=high", reflect_result["summary_l1"][0])
+        self.assertIn("provenance=tool_verified", reflect_result["summary_l1"][0])
+        self.assertIn(
+            "Primary DB host 10.0.0.9 returns timeout errors during failover.",
+            reflect_result["summary_l1"][0],
         )
-        self.assertEqual(
-            reflect_result["summary_l2"],
-            "Investigation with 3 findings. Latest: Replica routing logs have not yet been collected.",
-        )
+        self.assertIn("Latest [gap source=test:gap confidence=low provenance=tool_verified]:", reflect_result["summary_l2"])
+        self.assertIn("Replica routing logs have not yet been collected.", reflect_result["summary_l2"])
 
     def test_investigation_reflect_core_fields_are_unchanged_with_or_without_self_critique(self):
         base_inv = _new_id("ref-critique-base")
@@ -2143,6 +2141,20 @@ class TestMemoryRoute(unittest.TestCase):
         parsed = json.loads(result)
         self.assertIn("error", parsed)
         self.assertIn("routed", parsed)
+
+    def test_memory_route_invalid_drive_state_returns_error(self):
+        result = server.memory_route(query="auth", drive_state="not-an-object")
+        parsed = json.loads(result)
+        self.assertIn("error", parsed)
+        self.assertIn("drive_state must be an object", parsed["error"])
+        self.assertEqual(parsed.get("routed"), [])
+
+    def test_memory_route_out_of_range_drive_fails_closed(self):
+        result = server.memory_route(query="auth", drive_state={"hunger": 1.2})
+        parsed = json.loads(result)
+        self.assertIn("error", parsed)
+        self.assertIn("drive 'hunger' must be between 0.0 and 1.0", parsed["error"])
+        self.assertEqual(parsed.get("routed"), [])
 
     def test_memory_route_response_shape_on_success_or_unavailable(self):
         """Response always has 'routed', 'query', 'count' or 'error' keys."""

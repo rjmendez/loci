@@ -148,6 +148,19 @@ the benchmark and catalog tests green:
 python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py scripts/tests/test_model_catalog.py -q
 ```
 
+
+### Implementation verification and phased rollout
+
+See [docs/IMPLEMENTATION_VERIFICATION_AND_ROLLOUT.md](./IMPLEMENTATION_VERIFICATION_AND_ROLLOUT.md) for the end-to-end verification path that ties the benchmark harness, queue guardrails, acceptance gates, and audit-trace design together. The operational summary is:
+
+1. Run the benchmark harness and persist the JSON summary from `scripts/bench_model_catalog_quality.py`.
+2. Derive local role assignments with `scripts/assign_models_from_benchmark.py` and fail closed if a selected winner is not installed.
+3. Gate rollout with the phases below: dry-run -> shadow -> canary -> default-on -> rollback-ready.
+4. Verify each phase with the relevant pytest targets plus `ollama show` checks for the selected tags.
+5. Keep an immutable decision record in the audit lane: router inputs, model choice, verification outcome, memory writes, and any rollback reason.
+
+This is the implementation-ready path for the `benchmark-harness-spec`, `rollout-plan-spec`, `loci-implementation-verification-pass`, and `loci-audit-trace-architecture` work items.
+
 ### Memory store paths
 
 | Variable | Default | Used by |
@@ -236,7 +249,7 @@ Queue state is persisted on the investigation manifest under `coordination.items
 ---
 ## Cron jobs
 
-`cron/jobs.json` defines six jobs; the five enabled ones are below.
+`cron/jobs.json` defines seven jobs; the six enabled ones are below.
 `deep-think-loci-harvest` (`dtl_harvest.sh`, every 7d, `no_agent`) ships disabled
 and is omitted from the table.
 
@@ -260,6 +273,7 @@ Reference crontab line for the live profile copy:
 | `b40ae8101c2a` | mnemosyne-sleep-cli | 30m | `mnemosyne_sleep_all.sh` |
 | `c857cd706f67` | mnemosyne-qdrant-sync | 30m | `mnemosyne_qdrant_sync.py` |
 | `a9fc1ea0886a` | state-db-qdrant-sync | 5m | `state_db_qdrant_sync.py` |
+| `f3a4d7c9b8e1` | proactive-self-model-loop | 5m | `self_model_trigger_eval.py` |
 
 **mnemosyne-consolidation** and **mnemosyne-session-summarizer** both use
 `mnemosyne_activity_check.py` as the pre-flight gate script. They differ in the
@@ -269,6 +283,11 @@ session-summarizer archives structured session facts, triples, and scratchpad st
 **mnemosyne-sleep-cli** (`no_agent: true`) invokes the Mnemosyne CLI directly via
 shell and runs consolidation across all configured banks without spawning an LLM
 agent.
+
+**proactive-self-model-loop** refreshes the durable self-model, writes the
+introspection snapshot, and emits T1/T2/T3 alerts for queue floods, stale
+investigations, blocked work, and overdue daily summaries. It is intentionally
+fail-open and silent when idle.
 
 ---
 

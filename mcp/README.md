@@ -149,7 +149,9 @@ with links back here for full signatures.
 - `investigation_related_cases(entities, entity_type?, limit_per_entity?)` — find past investigations sharing the given entities
 - `rag_context_search(query, ...)` — cross-collection RAG search
 - `memory_surface(context, investigation_id?, top_k?)` — proactively surface prior findings for the current working context
-- `memory_route(query, agent_id?, top_k?, deduplicate?)` — agent-mesh search across all investigations
+- `memory_route(query, agent_id?, top_k?, deduplicate?, include_trace?, drive_state?)` — agent-mesh search across all investigations (`include_trace=true` captures replayable route traces); optional `drive_state={hunger,fatigue,urgency}` (0..1, fail-closed validation) steers priority vs exploration; includes `routing_aggregation` with provenance-preserving selected-hit refs
+- `memory_route_counterfactual_simulate(investigation_id?, limit?, deduplicate?, dedup_threshold?, top_k?, agent_id_override?)` — replay audited memory-route traces under alternate policies without changing production behavior
+- `memory_route_policy_optimize(investigation_id?, limit?, days?, min_decisions?, persist?)` — conservative policy-optimization loop over audited route + consolidation outcomes with a fail-closed invariant gate and provenance-only aggregation (advisory only; never auto-applies routing changes)
 - `memory_hints(investigation_id, limit?, since_ts?)` — recent findings as lightweight hints
 - `memory_confidence(query, top_k?)` — metamemory: how reliably memory knows a topic
 - `ground(title, focus?, case_ids?, entities?, code_refs?, budget_chars?, allow_keyword?, graph_available?)` — assemble a char-budgeted, provenance-tagged grounding block

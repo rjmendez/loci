@@ -173,6 +173,7 @@ Appends a finding to `findings.jsonl`, updates manifest counters, mirrors the re
   - `resolution`: Initial lifecycle state: `open`, `fixed`, `intentional`, `wontfix`, `superseded`.
   - `code_refs`: Explicit authoritative file refs. Passing `[]`/`""` means “no refs”; only `None` triggers best-effort extraction from text.
   - `evidence_provenance_tier`: Authority tier such as `human_authored`, `tool_verified`, `deterministic_derived`, `model_asserted`.
+  - `metadata.flybrain_provenance` (for FlyBrain-derived claims): reproducibility envelope carried through findings/memory/audit paths. Minimum stable fields are `tool_name`, `tool_variant`, `request`, `dataset_scope`, `result_contract`, and auto-stamped `replay_fingerprint` (+ version) for deterministic replay/de-dup across equivalent query paths.
 - **Returns**
   - `{"stored":true,"finding_id":"<uuid>","type":"<finding_type>","mnemo_stored":true|false,"conflict_detected":bool,"tier":"hot|warm|cold"}`
   - When conflict detection fires, `conflicting_finding_id` and `conflict_id` are included.
