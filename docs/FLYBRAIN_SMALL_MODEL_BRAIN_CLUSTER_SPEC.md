@@ -46,6 +46,9 @@ Provided defaults:
 - `ConfidenceGate`
 - `ProvenanceRefsGate`
 - `ReplayFingerprintGate`
+- `run_shadow_replay_fixtures_with_artifact(...)`
+- `compare_shadow_replay_runs(...)`
+- `run_brain_cluster_shadow_replay(...)`
 
 ## Coordinator state model
 
@@ -90,6 +93,24 @@ Hard-stop flow:
 - Gate rejection rate by gate type
 - Fail-closed rate and reason frequency
 - Replay mismatch incidence
+- Decision match rate between baseline/candidate artifacts
+- Confidence drift summary (signed/absolute deltas)
+- Fail-closed rate delta (candidate minus baseline)
+- Expert collapse concentration delta
+
+## Shadow replay harness (P1)
+
+`run_brain_cluster_shadow_replay(...)` executes replay fixtures through baseline and candidate artifact manifests, compares per-fixture decisions, and emits a deterministic JSON report:
+
+- `schema_version`: `braincluster-shadow-replay-report/v1`
+- `pass` / `status` / `exit_code`
+- `thresholds`: explicit pass/fail thresholds
+- `metrics`: decision match, confidence drift, fail-closed delta, routing entropy drift, collapse concentration
+- `failure_reasons`: threshold failure strings
+- `issue_flags`: drift/entropy/collapse flags
+- `fixtures`: per-fixture baseline-vs-candidate rows
+
+`serialize_brain_cluster_shadow_replay_report(...)` emits stable machine-readable JSON with sorted keys and newline termination for pipeline use.
 
 ## Phase rollout
 
@@ -113,6 +134,9 @@ Current checks verify:
 - fail-closed behavior for low confidence, missing fingerprint, and replay mismatch
 - deterministic dataset manifest generation and train/val/test splits
 - golden-set construction per region and promotion-gate threshold evaluation
+- deterministic shadow replay report output
+- threshold-based pass/fail replay gating and failure reasons
+- malformed replay fixture handling
 
 ## Training/test scaffold (P0 -> P1)
 

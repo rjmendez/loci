@@ -25,6 +25,17 @@ Collections:
 - `loci_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
 - `loci_verdicts` — pre-answer claim check verdicts; 384-dim hash vectors, schema owned by `memcheck/vectors.py`, created lazily on the first verdict write
 
+## Brain-cluster artifact promotion state
+
+`flybrain_brain_cluster.py` includes a durable promotion-state contract for
+artifact manifests. State is persisted as JSON with
+`schema_version=braincluster-promotion-state/v1`, timestamps, and candidate /
+promoted / previous_promoted pointers. Promotion and rollback are fail-closed:
+the target manifest must pass full `load_brain_cluster_artifacts(...)`
+validation before pointers are switched. Invalid transitions (for example,
+promoting an already-active manifest) and missing transition prerequisites
+return explicit error codes.
+
 ## Requirements
 
 - Python 3.11+

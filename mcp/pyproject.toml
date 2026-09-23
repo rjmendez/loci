@@ -33,6 +33,7 @@ test = [
 
 [project.scripts]
 loci-mcp = "server:main"
+braincluster-goldenset-gate-runner = "flybrain_brain_cluster_training:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
