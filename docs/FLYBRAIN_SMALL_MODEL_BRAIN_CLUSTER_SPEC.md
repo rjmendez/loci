@@ -161,3 +161,13 @@ composes the scaffold into one deterministic dry-run:
 `mcp/flybrain_brain_cluster_thresholds.py` calibrates threshold candidates from
 held-out dry-run reports and emits a versioned threshold bundle keyed by an
 input fingerprint. This keeps threshold changes measurable and reproducible.
+
+`mcp/flybrain_brain_cluster_fw_samples.py` builds deterministic `TrainingSample`
+payloads directly from the local FlyWire snapshot at
+`<storage_root>\snapshots\fw\flywire783\metadata\files\per_neuron_neuropil_count_pre_783.feather`
+so train/gate/shadow runs can execute against real local data without manual
+dataset reformatting.
+
+The builder now supports two objectives:
+- `connectivity_tier`: binary label (`high_connectivity` / `baseline_connectivity`) from per-neuron neuropil counts.
+- `neurotransmitter_dominance`: multiclass label (`dominant_ach`, `dominant_gaba`, `dominant_glut`, `dominant_da`, `dominant_ser`, `dominant_oct`) derived from proofread connection neurotransmitter probabilities, with deterministic region mapping from dominant neuropil.

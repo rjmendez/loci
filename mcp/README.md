@@ -47,6 +47,18 @@ CLI entrypoint:
 
 `braincluster-p0-dry-run --samples <samples.json> --output-dir <dir> --state-path <promotion-state.json> --split-seed <seed>`
 
+FlyWire raw-snapshot sample builder:
+
+`braincluster-build-fw-samples --storage-root F:\.flybrain --output <samples.json>`
+
+Additional objective for richer labels:
+
+`braincluster-build-fw-samples --storage-root F:\.flybrain --objective neurotransmitter_dominance --output <samples.json>`
+
+Objectives currently supported:
+- `connectivity_tier` (default): labels `high_connectivity` vs `baseline_connectivity`
+- `neurotransmitter_dominance`: labels dominant transmitter class from FlyWire proofread connection probabilities
+
 The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
 including dataset split fingerprints, expert/router artifact fingerprints,
 gate/shadow metrics, and final promotion-state pointers.
