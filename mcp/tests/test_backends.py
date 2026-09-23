@@ -101,16 +101,18 @@ def test_env_overrides_config_for_models(tmp_path, monkeypatch):
 
 
 def _no_task_model_env(mp):
-    for k in ("LOCI_OLLAMA_GEN_MODEL", "LOCI_OLLAMA_VERIFY_MODEL", "LOCI_OLLAMA_COMPRESS_MODEL"):
+    for k in ("LOCI_OLLAMA_GEN_MODEL", "LOCI_OLLAMA_VERIFY_MODEL",
+              "LOCI_OLLAMA_CLASSIFY_MODEL", "LOCI_OLLAMA_COMPRESS_MODEL"):
         mp.delenv(k, raising=False)
 
 
-def test_verify_and_compress_model_fall_back_to_gen_model_when_unset(monkeypatch):
+def test_verify_classify_and_compress_model_fall_back_to_gen_model_when_unset(monkeypatch):
     _no_task_model_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
     assert B.ollama_verify_model() == B.ollama_gen_model()
+    assert B.ollama_classify_model() == B.ollama_gen_model()
     assert B.ollama_compress_model() == B.ollama_gen_model()
 
 
@@ -133,6 +135,16 @@ def test_compress_model_env_wins_over_config(tmp_path, monkeypatch):
     B._reset_cache()
     monkeypatch.setenv("LOCI_OLLAMA_COMPRESS_MODEL", "env-model:latest")
     assert B.ollama_compress_model() == "env-model:latest"
+
+
+def test_classify_model_env_wins_over_config(tmp_path, monkeypatch):
+    _no_task_model_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nclassify_model = "cfg-classify:latest"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    monkeypatch.setenv("LOCI_OLLAMA_CLASSIFY_MODEL", "env-classify:latest")
+    assert B.ollama_classify_model() == "env-classify:latest"
 
 
 def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, monkeypatch):

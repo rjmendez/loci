@@ -1,3 +1,11 @@
+> Archived / retired from active navigation
+>
+> This page is kept only for historical continuity and searchability. It is no longer part of the default FlyBrain reading path.
+>
+> Canonical entry point: [FLYBRAIN_GUIDE.md](./FLYBRAIN_GUIDE.md)
+> Archive home: [ARCHITECTURE.md](./ARCHITECTURE.md)
+> For current guidance, use the guide and the evidence/provenance docs before digging into historical detail.
+>
 # Fly-Brain Input/Output to Loci Architecture Mapping
 ## Concrete Translation of Connectome Organization to Memory System Design
 
@@ -471,7 +479,8 @@ consolidation_batch:
 | Action Primitive | Loci Equivalent | Preconditions | Postconditions |
 |---|---|---|---|
 | Forward walk | xecute_investigation_step | Hypothesis confidence > 0.5 | Progress += 1 step; investigate_reason() if blocked. |
-| Turn | edirect_investigation | Contradiction detected OR hypothesis confidence < 0.3 | New hypothesis branch opened; progress reset. |
+| Turn | 
+edirect_investigation | Contradiction detected OR hypothesis confidence < 0.3 | New hypothesis branch opened; progress reset. |
 | Stop/Freeze | scalate_to_deep_think | Urgency too high OR contradictions irreconcilable | Investigation paused; awaiting deep-think completion. |
 | Groom | udit_findings | Periodic (every 20 findings) or on request | Check consistency, remove duplicates, merge related findings. |
 | Feed/Consolidate | consolidate_findings | Findings ready for persistence AND low urgency | Persist batch to investigation record. |

@@ -202,6 +202,21 @@ def _load_manifest(investigation_id: str) -> dict | None:
     return manifest
 
 
+def _load_manifest_fresh(investigation_id: str) -> dict | None:
+    """Load the manifest from disk without consulting the write-through cache."""
+    investigation_id = _validated_investigation_id(investigation_id)
+    p = _root() / investigation_id / "manifest.json"
+    if not p.exists():
+        return None
+    raw = p.read_text()
+    manifest = json.loads(raw)
+    if "owner" not in manifest:
+        manifest["owner"] = ""
+    if "acl" not in manifest:
+        manifest["acl"] = []
+    return manifest
+
+
 def _atomic_write_text(path: Path, data: str) -> None:
     """Write ``data`` to ``path`` atomically via a same-directory temp file.
 

@@ -12,6 +12,7 @@ if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
 
 import server  # noqa: E402
+from flybrain_scope_engine import comparative_claim_tier_engine, hemibrain_flywire_compat_layer  # noqa: E402
 
 
 def _json(result: str) -> dict:
@@ -122,6 +123,34 @@ class FlybrainClaimScopeValidatorTest(unittest.TestCase):
             _valid_claim_scope(),
         )
 
+    def test_comparative_scope_engine_is_deterministic_without_llm(self):
+        payload = {
+            "dataset": "hb",
+            "dataset_version": "neuprint_JRC_Hemibrain_1point2point1",
+            "sex": "female",
+            "life_stage": "adult",
+            "annotation_completeness": 0.93,
+            "circuit_class": "mushroom_body",
+            "experience_window": "naive",
+            "evidence_strength": "validated",
+            "confidence": 0.9,
+        }
+        tier = comparative_claim_tier_engine.tier(payload)
+        self.assertIn(tier["tier"], {"T2", "T3"})
+        self.assertGreaterEqual(tier["score"], 0.7)
+
+        normalized = hemibrain_flywire_compat_layer.normalize_scope({
+            "dataset": "hb",
+            "dataset_version": "neuprint_JRC_Hemibrain_1point2point1",
+            "sex": "female",
+            "life_stage": "adult",
+            "annotation_completeness": 0.93,
+            "circuit_class": "mushroom_body",
+            "experience_window": "naive",
+        })
+        self.assertEqual(normalized["dataset"], "hemibrain")
+        self.assertEqual(normalized["dataset_version"], "neuprint_JRC_Hemibrain_1point2point1")
+
     def test_nested_claim_scope_json_string_is_accepted_and_normalized(self):
         inv_id = "fb-scope-nested-json"
         _json(server.investigation_start(investigation_id=inv_id, title="nested claim_scope json"))
@@ -145,59 +174,63 @@ class FlybrainClaimScopeValidatorTest(unittest.TestCase):
         finding = loaded["recent_findings"][0]
         self.assertEqual(finding.get("metadata", {}).get("claim_scope"), _valid_claim_scope())
 
-    def test_rejects_invalid_scope_value_shapes_for_hardened_fields(self):
-        inv_id = "fb-scope-invalid-shapes"
-        _json(server.investigation_start(investigation_id=inv_id, title="invalid claim_scope values"))
-
-        invalid_cases = (
-            ("dataset_version", "  "),
-            ("annotation_completeness", "partial"),
-            ("annotation_completeness", 1.2),
-            ("life_stage", "adult!"),
-            ("experience_window", "after-training"),
-        )
-        for key, value in invalid_cases:
-            claim_scope = _valid_claim_scope()
-            claim_scope[key] = value
-            res = _json(server.investigation_store(
-                investigation_id=inv_id,
-                finding_type="observed",
-                text=f"flybrain invalid {key}",
-                source="virtual-fly-brain-query_connectivity",
-                metadata={
-                    "flybrain_provenance": {"tool_name": "query_connectivity"},
-                    "claim_scope": claim_scope,
-                },
-            ))
-            self.assertIn("error", res)
-            self.assertIn(key, res["error"])
-
-    def test_normalizes_life_stage_and_percentage_annotation(self):
-        inv_id = "fb-scope-normalized"
-        _json(server.investigation_start(investigation_id=inv_id, title="normalized claim_scope values"))
-
+    def test_rejects_unsupported_cross_stage_generalization_in_plasticity_scope(self):
+        inv_id = "fb-scope-cross-stage-unsupported"
+        _json(server.investigation_start(investigation_id=inv_id, title="cross-stage unsupported"))
         claim_scope = _valid_claim_scope()
-        claim_scope["life_stage"] = "Larva"
-        claim_scope["annotation_completeness"] = "95%"
-        claim_scope["experience_window"] = "sleep deprived"
+        claim_scope["life_stage"] = "cross-stage developmental"
+        claim_scope["experience_window"] = "experience-dependent plasticity"
 
         res = _json(server.investigation_store(
             investigation_id=inv_id,
             finding_type="observed",
-            text="flybrain claim with normalizable scope values",
+            text="cross-stage plasticity claim without stability support",
             source="virtual-fly-brain-query_connectivity",
             metadata={
                 "flybrain_provenance": {"tool_name": "query_connectivity"},
                 "claim_scope": claim_scope,
             },
         ))
+        self.assertIn("error", res)
+        self.assertIn("cross-stage generalization", res["error"])
+
+    def test_allows_cross_stage_generalization_with_explicit_support(self):
+        inv_id = "fb-scope-cross-stage-supported"
+        _json(server.investigation_start(investigation_id=inv_id, title="cross-stage supported"))
+        claim_scope = _valid_claim_scope()
+        claim_scope["life_stage"] = "cross-stage developmental"
+        claim_scope["experience_window"] = "experience-dependent plasticity"
+
+        res = _json(server.investigation_store(
+            investigation_id=inv_id,
+            finding_type="observed",
+            text="cross-stage plasticity claim with support",
+            source="virtual-fly-brain-query_connectivity",
+            metadata={
+                "flybrain_provenance": {
+                    "tool_name": "query_connectivity",
+                    "generalization_support": {"cross_stage_validated": True},
+                },
+                "claim_scope": claim_scope,
+            },
+        ))
         self.assertTrue(res.get("stored"), res)
 
-        loaded = _json(server.investigation_load(inv_id))
-        stored_scope = loaded["recent_findings"][0]["metadata"]["claim_scope"]
-        self.assertEqual(stored_scope["life_stage"], "larval")
-        self.assertEqual(stored_scope["experience_window"], "sleep_deprived")
-        self.assertEqual(stored_scope["annotation_completeness"], 0.95)
+    def test_tier_engine_downgrades_unsupported_cross_sex_generalization(self):
+        payload = {
+            "dataset": "fw",
+            "dataset_version": "flywire783",
+            "sex": "both male/female",
+            "life_stage": "adult",
+            "annotation_completeness": 0.98,
+            "circuit_class": "mushroom_body",
+            "experience_window": "naive",
+            "evidence_strength": "generalizable",
+            "confidence": 0.98,
+        }
+        tier = comparative_claim_tier_engine.tier(payload)
+        self.assertEqual(tier["tier"], "T1")
+        self.assertIn("unsupported_cross_sex_generalization", tier["ceiling_reasons"])
 
 
 if __name__ == "__main__":

@@ -36,6 +36,17 @@ data stays on your own infrastructure: Qdrant and Ollama run locally or on your 
 
 ---
 
+## Why FlyBrain matters to Loci
+
+FlyBrain is the practical test for one of Loci's core promises: when evidence comes from different datasets, stages, or interpretations, the system should keep each claim scoped instead of flattening it into a vague "fact."
+
+Start with the short user-facing path in [docs/FLYBRAIN_GUIDE.md](docs/FLYBRAIN_GUIDE.md). Then use [docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md](docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md), [docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md](docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md), and [docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md](docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md) as the canonical follow-ups. Keep [docs/FLYBRAIN_REASONING_GLOSSARY.md](docs/FLYBRAIN_REASONING_GLOSSARY.md) open for quick term lookup, and use [docs/FLYBRAIN_ARCHIVE.md](docs/FLYBRAIN_ARCHIVE.md) only when you need the deeper historical or technical notes.
+
+The current VFB/FlyBrain tool surface supports this workflow in practice: `search_terms` finds the relevant neuron or anatomy, `get_term_info` and `get_hierarchy` confirm scope, `query_connectivity` and `run_query` compare evidence, and the provenance docs capture the dataset and version trail. If you are comparing results across datasets, the guide is the right starting point.
+
+Important caveat: FlyBrain results remain dataset-, version-, and query-scoped. Empty results, `count_status` warnings, or a stale cached response are not evidence of a biological absence. When a claim depends on VFB data, record the dataset symbols, version label, and query settings, and use `force_refresh` or explicit scope notes when the underlying tool output is ambiguous.
+
+
 ## Quick start
 
 ![Three-step setup](docs/img/loci-quickstart.svg)
@@ -77,7 +88,14 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 | What you want | Where to look |
 |---|---|
 | New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
-| FlyBrain overview and dataset-scoping guide | [docs/FLYBRAIN_GUIDE.md](docs/FLYBRAIN_GUIDE.md) |
+| FlyBrain overview and recommended reading path | [docs/FLYBRAIN_GUIDE.md](docs/FLYBRAIN_GUIDE.md) |
+| FlyBrain provenance and replay rules | [docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md](docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md) |
+| FlyBrain dataset boundary matrix | [docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md](docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md) |
+| Repo-wide docs retention / archive policy | [docs/DOCS_RETENTION_POLICY.md](docs/DOCS_RETENTION_POLICY.md) |
+| FlyBrain architecture / implementation mapping | [docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md](docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md) |
+| FlyBrain glossary / quick term lookup | [docs/FLYBRAIN_REASONING_GLOSSARY.md](docs/FLYBRAIN_REASONING_GLOSSARY.md) |
+| FlyBrain archive and redirect index | [docs/FLYBRAIN_ARCHIVE.md](docs/FLYBRAIN_ARCHIVE.md) |
+| FlyBrain open-source tooling map | [docs/FLYBRAIN_OPEN_SOURCE_TOOLING_MAP.md](docs/FLYBRAIN_OPEN_SOURCE_TOOLING_MAP.md) |
 | How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | API overview by tool family | [docs/API.md](docs/API.md) |
 | Runtime registration and call paths | [docs/CALLGRAPH.md](docs/CALLGRAPH.md) |
@@ -87,6 +105,7 @@ See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide,
 | How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
 | How to deploy (Docker / systemd) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 | What the grounding corpus is worth | [docs/grounding-corpus-limits.md](docs/grounding-corpus-limits.md) |
+| GPU offload architecture map | [docs/GPU_OFFLOAD_ARCHITECTURE.md](docs/GPU_OFFLOAD_ARCHITECTURE.md) |
 
 ---
 
@@ -274,3 +293,4 @@ loci/
 ├── backends.toml.example  Template for ~/.loci/backends.toml
 └── .env.example           Full environment variable reference for all components
 ```
+

@@ -137,6 +137,7 @@ with links back here for full signatures.
 **Finding storage:**
 - `investigation_store(investigation_id, finding_type, text, source, confidence?, tags?, derived_from?)` — store a finding
   - `finding_type`: one of `observed | inferred | assumed | gap`
+  - FlyBrain guardrail: when `metadata.claim_scope`/`metadata.flybrain_provenance.claim_scope` is present, the scope tuple is required and development/plasticity cross-stage or cross-sex generalizations must include explicit `metadata.flybrain_provenance.generalization_support` validation flags.
   - Returns: `{"stored": true, "finding_id": "<uuid>", "type": "<finding_type>", "mnemo_stored": true}`
 - `memory_retract(investigation_id, target, reason?, dry_run?, scope_semantic?)` — soft-delete findings matching `target`; `dry_run=True` by default, pass `dry_run=False` to actually retract
 - `memory_restore(investigation_id, finding_id?, retraction_id?, reason?)` — undo a retraction
@@ -158,6 +159,7 @@ with links back here for full signatures.
 
 **Claim validation:**
 - `investigation_pre_answer_check(investigation_id, claims, ...)` — validate claims against evidence before answering
+  - Includes a deterministic reflex-arc fast path in the advisory entailment lane: obvious high-overlap support/contradiction and explicitly prevalidated evidence short-circuit model calls; everything else fail-safely falls back to normal local-model verification.
 - `investigation_evidence_precheck(investigation_id, proposed_query, min_similarity?)` — lightweight duplicate/evidence check
 - `verify_finding(claim, context?, investigation_id?)` — adversarially verify a claim with the local model
 - `investigation_verify_all(investigation_id, limit?)` — batch adversarial-verify the open findings

@@ -123,3 +123,55 @@ def test_memory_consolidate_fail_closed_when_sleep_like_report_violates_contract
 
     assert parsed["status"] == "error"
     assert parsed["type"] == "ValueError"
+
+
+def test_sleep_like_summary_reduces_reflection_noise_to_snapshot(monkeypatch):
+    now = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr(
+        server,
+        "_load_reflection_state",
+        lambda: {
+            "last_tick": {
+                "ts": now,
+                "processed_items": 4,
+                "findings_written": 2,
+                "investigation_id": "inv-123",
+                "queue": [{"path": "very/noisy.log"}],
+                "processed": {"very/noisy.log": "2026-09-22T00:00:00Z"},
+            },
+        },
+    )
+
+    out = server._sleep_like_burst_summary("inv-123", [])
+    tick = out["reflection_last_tick"]
+
+    assert tick == {
+        "ts": now,
+        "processed_items": 4,
+        "findings_written": 2,
+        "investigation_id": "inv-123",
+    }
+
+
+def test_memory_consolidate_does_not_overwrite_reflection_state(monkeypatch):
+    monkeypatch.setattr(server, "_load_mnemosyne_class", lambda: _FakeMnemosyne)
+    monkeypatch.setattr(server, "_find_most_recent_investigation", lambda: (None, None))
+    monkeypatch.setattr(server, "_run_causal_inference", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        server,
+        "_run_consolidation_quality_audit",
+        lambda *_args, **_kwargs: {"sampled": 0, "flagged": [], "degraded": False},
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_reflection_state",
+        lambda: {"last_tick": {"ts": datetime.now(timezone.utc).isoformat(), "processed_items": 1, "findings_written": 1}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_save_reflection_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not write reflection state")),
+    )
+
+    parsed = json.loads(server.memory_consolidate(dry_run=False))
+    assert parsed["status"] == "ok"
