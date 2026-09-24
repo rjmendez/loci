@@ -112,7 +112,6 @@ def test_queue_runtime_smoke_flow_is_deterministic_and_machine_friendly(tmp_path
     listed = _json(server.investigation_queue_list(investigation_id=inv_id, state="done"))
     assert listed == done_only
 
-
 def test_queue_happy_path_and_lease_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     inv_id = "q-happy"
@@ -239,10 +238,6 @@ def test_queue_release_alias_and_status_filter(tmp_path, monkeypatch):
     filtered = _json(server.investigation_queue_status(investigation_id=inv_id, state="blocked"))
     assert filtered["item_count"] == 1
     assert filtered["queue"][0]["id"] == "release-task"
-
-
-
-
 def test_queue_rejects_invalid_payload_values(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     inv_id = "q-invalid"
