@@ -892,7 +892,9 @@ def _verification_summary(investigation_id: str) -> Optional[dict]:
             refuted.append({"finding_id": fid, "confidence": conf, "ts": r.get("ts")})
 
     refuted.sort(key=lambda x: -x["confidence"])
-    out = {"counts": counts, "verified_findings": len(latest)}
+    # A degraded row means no verifier was reached: it is an attempt, not a verification.
+    out = {"counts": counts, "verified_findings": len(latest) - counts["degraded"],
+           "verification_attempts": len(latest)}
     if refuted:
         out["refuted"] = refuted
         out["hint"] = ("adversarial verdicts, advisory only — they do NOT change a "
