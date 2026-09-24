@@ -160,7 +160,7 @@ def _fetch_recent_memories(since: str, min_importance: float, max_items: int) ->
                     f"SELECT id, content, importance, created_at, source FROM {table} "
                     "WHERE REPLACE(created_at, ' ', 'T') > ? AND importance >= ?"
                     + echo_clause +
-                    " ORDER BY created_at DESC LIMIT ?",
+                    " ORDER BY REPLACE(created_at, ' ', 'T') DESC LIMIT ?",
                     (since_norm, min_importance, *params_tail, max_items)
                 ).fetchall()
             except sqlite3.OperationalError as e:
