@@ -2609,14 +2609,22 @@ class TestMemoryHints(unittest.TestCase):
     def test_memory_hints_respects_limit(self):
         inv_id = _new_id("hints-limit")
         n = 5
-        self._create_and_store(inv_id, n_findings=n)
+        ids = self._create_and_store(inv_id, n_findings=n)
 
-        limit = 2
-        result = _json(server.memory_hints(investigation_id=inv_id, limit=limit))
+        result = _json(server.memory_hints(investigation_id=inv_id, limit=2))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertLessEqual(len(result["hints"]), limit,
-                             f"Got {len(result['hints'])} hints; expected ≤ {limit}")
-        self.assertEqual(result["count"], len(result["hints"]))
+        # Exactly the two most recent, newest first.
+        self.assertEqual([h["finding_id"] for h in result["hints"]], [ids[4], ids[3]])
+        self.assertEqual(result["count"], 2)
+
+        # Cold path (JSONL tail) applies the same limit and order.
+        server._session_hints.pop(inv_id, None)
+        cold = _json(server.memory_hints(investigation_id=inv_id, limit=2))
+        self.assertEqual([h["finding_id"] for h in cold["hints"]], [ids[4], ids[3]])
+
+        # A limit above the population returns everything, newest first.
+        everything = _json(server.memory_hints(investigation_id=inv_id, limit=10))
+        self.assertEqual([h["finding_id"] for h in everything["hints"]], ids[::-1])
 
     def test_memory_hints_missing_investigation_returns_error(self):
         result = _json(server.memory_hints(investigation_id="no-such-inv-xyz"))
@@ -2640,33 +2648,37 @@ class TestMemoryHints(unittest.TestCase):
         from datetime import datetime, timezone as tz
         cutoff = datetime.now(tz.utc).isoformat()
         _time.sleep(0.01)
-        server.investigation_store(
+        second = _json(server.investigation_store(
             investigation_id=inv_id,
             finding_type="inferred",
             text="Second finding — should pass the since_ts filter.",
             source="test",
             confidence="high",
-        )
+        ))
         result = _json(server.memory_hints(
             investigation_id=inv_id,
             limit=10,
             since_ts=cutoff,
         ))
         self.assertNotIn("error", result)
-        for hint in result["hints"]:
-            self.assertGreater(hint["ts"], cutoff,
-                               f"Hint ts {hint['ts']!r} should be > cutoff {cutoff!r}")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual([h["finding_id"] for h in result["hints"]], [second["finding_id"]])
+        self.assertGreater(result["hints"][0]["ts"], cutoff)
+        # Positive twin: without since_ts both findings come back.
+        unfiltered = _json(server.memory_hints(investigation_id=inv_id, limit=10))
+        self.assertEqual(unfiltered["count"], 2)
 
     def test_memory_hints_cold_path_from_jsonl(self):
         """Hints should still work when the session ring buffer is empty (JSONL cold path)."""
         inv_id = _new_id("hints-cold")
-        self._create_and_store(inv_id, n_findings=2)
+        ids = self._create_and_store(inv_id, n_findings=2)
         # Clear the ring buffer to force the JSONL cold path.
         server._session_hints.pop(inv_id, None)
         result = _json(server.memory_hints(investigation_id=inv_id, limit=5))
         self.assertNotIn("error", result)
-        self.assertGreater(result["count"], 0,
-                           "Cold-path JSONL read returned no hints for an investigation with stored findings")
+        self.assertEqual([h["finding_id"] for h in result["hints"]], ids[::-1])
+        self.assertEqual(_unwrap(result["hints"][0]["text"]),
+                         "Finding number 1: something interesting happened here.")
 
 
 if __name__ == "__main__":
@@ -2707,11 +2719,19 @@ class TestEntityNodes(unittest.TestCase):
         ])
         result = _json(server.entity_list(investigation_id=inv_id))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entities", result)
-        self.assertIn("count", result)
-        self.assertIsInstance(result["entities"], list)
-        self.assertIsInstance(result["count"], int)
-        self.assertGreaterEqual(result["count"], 0)
+        by_name = {e["name"]: e for e in result["entities"]}
+        self.assertEqual(
+            {n: (e["type"], e["finding_count"]) for n, e in by_name.items()},
+            {
+                "Windows Server": ("system", 1),
+                "Azure AD": ("system", 1),
+                "192.168.1.1": ("location", 1),
+                "John Smith": ("person", 1),
+                "10.0.0.5": ("location", 1),
+            },
+        )
+        self.assertEqual(result["count"], 5)
+        self.assertTrue(all(e["entity_id"] for e in result["entities"]))
 
     def test_entity_list_missing_investigation_returns_error(self):
         result = _json(server.entity_list(investigation_id="does-not-exist-xyz"))
@@ -2724,41 +2744,37 @@ class TestEntityNodes(unittest.TestCase):
         ])
         result = _json(server.entity_list(investigation_id=inv_id, entity_type="system"))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entities", result)
-        # All returned entities should have type == "system"
-        for ent in result["entities"]:
-            self.assertEqual(ent.get("type"), "system")
+        self.assertEqual(sorted(e["name"] for e in result["entities"]),
+                         ["Azure AD", "Windows Server"])
+        self.assertEqual(result["count"], 2)
+        # Positive twin: the other type is there too, and the filter excludes it.
+        loc = _json(server.entity_list(investigation_id=inv_id, entity_type="location"))
+        self.assertEqual([e["name"] for e in loc["entities"]], ["192.168.1.1"])
 
     def test_entity_timeline_returns_valid_json(self):
         inv_id = _new_id("etimeline")
-        self._start_and_store(inv_id, [
+        ids = self._start_and_store(inv_id, [
             'Windows Server was observed sending traffic.',
             'Windows Server escalated privileges.',
         ])
-        # Get entity list first to find an entity_id
         list_result = _json(server.entity_list(investigation_id=inv_id))
-        entities = list_result.get("entities", [])
+        self.assertEqual([e["name"] for e in list_result["entities"]], ["Windows Server"])
+        entity_id = list_result["entities"][0]["entity_id"]
 
-        if not entities:
-            # No entities extracted — still must return valid JSON when called with bad id
-            result = _json(server.entity_timeline(
-                investigation_id=inv_id,
-                entity_id="nonexistent-id",
-            ))
-            self.assertIn("error", result)
-            return
-
-        entity_id = entities[0]["entity_id"]
         result = _json(server.entity_timeline(
             investigation_id=inv_id,
             entity_id=entity_id,
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entity", result)
-        self.assertIn("timeline", result)
-        self.assertIn("count", result)
-        self.assertIsInstance(result["timeline"], list)
-        self.assertIsInstance(result["count"], int)
+        self.assertEqual(result["entity"]["name"], "Windows Server")
+        self.assertEqual(result["count"], 2)
+        # Chronological: first stored first.
+        self.assertEqual([t["finding_id"] for t in result["timeline"]], ids)
+        self.assertEqual(
+            [t["text"] for t in result["timeline"]],
+            ['Windows Server was observed sending traffic.',
+             'Windows Server escalated privileges.'],
+        )
 
     def test_entity_timeline_missing_entity_returns_error(self):
         inv_id = _new_id("etimeline-miss")
@@ -2785,12 +2801,10 @@ class TestEntityNodes(unittest.TestCase):
             'Windows Server crashed.',
         ])
         list_result = _json(server.entity_list(investigation_id=inv_id))
-        entities = list_result.get("entities", [])
-        # Find "Windows Server" entity (if extracted)
-        ws_entities = [e for e in entities if "windows" in e.get("name", "").lower()]
-        if ws_entities:
-            # Should appear in multiple findings
-            self.assertGreaterEqual(ws_entities[0]["finding_count"], 1)
+        entities = list_result["entities"]
+        # One entity, referenced by all three findings (appended, not replaced).
+        self.assertEqual([(e["name"], e["finding_count"]) for e in entities],
+                         [("Windows Server", 3)])
 
 
 class TestContractDeclarationStore(unittest.TestCase):
