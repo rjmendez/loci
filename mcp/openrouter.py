@@ -24,20 +24,15 @@ import concurrent.futures
 import json
 import logging
 import os
-import sys
-from pathlib import Path
 from typing import Callable, Optional
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# route_audit is a sibling module in mcp/, which is already on sys.path whenever
+# this module is importable. Do not put the repo root on sys.path: its mcp/ dir
+# would then compete with the installed `mcp` SDK package for the name `mcp`.
 try:
-    from mcp.route_audit import record_route_event
-except Exception:
-    try:
-        from route_audit import record_route_event
-    except Exception:
-        record_route_event = None
+    from route_audit import record_route_event
+except Exception:  # pragma: no cover - audit is optional, never block generation
+    record_route_event = None
 
 logger = logging.getLogger("loci-mcp.openrouter")
 
@@ -241,7 +236,8 @@ def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int =
 
     candidates = list(ladder or ([model] if model else DEFAULT_LADDER))
     results: list = [{"text": "", "ok": False} for _ in prompts]
-    _log_route_event(tier="remote", route="openrouter", reason="batch_start", prompt="\n".join(prompts)[:4000], model=str(model or candidates[0]), degraded=False, ok=None)
+    _batch_prompt = "\n".join(str(p) for p in prompts)
+    _log_route_event(tier="remote", route="openrouter", reason="batch_start", prompt=_batch_prompt, model=str(model or (candidates[0] if candidates else "")), degraded=False, ok=None)
 
     for candidate in candidates:
         todo = [i for i, r in enumerate(results) if not r.get("ok")]
@@ -261,5 +257,5 @@ def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int =
                     results[i] = {"text": "", "ok": False}
 
     success = sum(1 for r in results if bool(r.get("ok")))
-    _log_route_event(tier="remote", route="openrouter", reason="batch_complete", prompt="\n".join(prompts)[:4000], model=str(model or (candidates[0] if candidates else "")), degraded=(success == 0), ok=(success > 0), status_code=200 if success else 0)
+    _log_route_event(tier="remote", route="openrouter", reason=f"batch_complete {success}/{len(prompts)} ok", prompt=_batch_prompt, model=str(model or (candidates[0] if candidates else "")), degraded=(success < len(prompts)), ok=(success > 0))
     return results

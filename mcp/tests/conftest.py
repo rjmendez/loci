@@ -59,3 +59,13 @@ def _isolate_the_audit_log(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("MEMCHECK_AUDIT_LOG", str(tmp_path / "memcheck-audit.jsonl"))
 
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_event_log(tmp_path, monkeypatch):
+    """No test may append route events to the operator's ~/.hermes/event_log.jsonl.
+
+    llm_local.generate() and openrouter.generate_batch() emit route events on
+    every call through route_audit, which reads LOCI_EVENT_LOG at call time.
+    """
+    monkeypatch.setenv("LOCI_EVENT_LOG", str(tmp_path / "event_log.jsonl"))
