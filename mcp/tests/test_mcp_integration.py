@@ -1843,7 +1843,9 @@ class TestInvestigationExportImport(unittest.TestCase):
         self.assertGreater(result.get("size_bytes", 0), 0)
 
         bundle = result.get("bundle", {})
-        self.assertEqual(bundle.get("schema_version"), "1.0")
+        self.assertEqual(bundle.get("schema_version"), "1.1")
+        for key in ("retractions", "finding_updates", "finding_verifications"):
+            self.assertIsInstance(bundle.get(key), list)
         self.assertIn("exported_at", bundle)
         self.assertIn("manifest", bundle)
         self.assertIn("findings", bundle)

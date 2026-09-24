@@ -128,14 +128,14 @@ investigation_unshare(
 )
 ```
 
-### `investigation_export(investigation_id: str, include_embeddings: bool = False) -> str`
-Exports a portable JSON bundle for one investigation. The current implementation includes manifest, findings, conflicts, and entities, but `include_embeddings` is only a forward-compatibility flag: embeddings are not exported yet.
+### `investigation_export(investigation_id: str, include_embeddings: bool = False, requesting_agent_id: Optional[str] = None) -> str`
+Exports a portable JSON bundle (schema `1.1`) for one investigation: manifest, findings, conflicts, entities, and the lifecycle logs (`retractions`, `finding_updates`, `finding_verifications`) so an import keeps retracted findings retracted and resolutions resolved. A case with a non-empty ACL is exported only to its owner or an ACL member. `include_embeddings` `include_embeddings` is only a forward-compatibility flag: embeddings are not exported yet.
 
 - **Key parameters**
   - `include_embeddings`: Accepted but currently ignored for payload content.
 - **Returns**
   - `{"exported":true,"investigation_id":...,"bundle":{...},"finding_count":N,"size_bytes":N}`
-  - `bundle` contains `schema_version`, `exported_at`, `manifest`, `findings`, `conflicts`, `entities`.
+  - `bundle` contains `schema_version` (`"1.1"`), `exported_at`, `manifest`, `findings`, `conflicts`, `entities`, `retractions`, `finding_updates`, `finding_verifications`.
 - **Example**
 ```python
 investigation_export(
@@ -145,13 +145,13 @@ investigation_export(
 ```
 
 ### `investigation_import(bundle_json: str, new_title: Optional[str] = None) -> str`
-Imports an exported investigation bundle under a fresh investigation ID. The original ID is preserved as `imported_from`, findings are copied into the new case directory, and text-bearing findings are best-effort re-indexed into Qdrant. The tool accepts either the raw exported `bundle` object or the entire `investigation_export` response wrapper.
+Imports an exported investigation bundle under a fresh investigation ID. The original ID is preserved as `imported_from`. Every finding gets a fresh id (the bundle id is kept as `imported_finding_id`, and `derived_from`, conflict, entity and lifecycle-log references are remapped), so an import never overwrites another investigation's Qdrant points. The importer owns the copy: `owner` is the local agent, `acl` is empty, coordination leases are dropped and `finding_counts` is recomputed. Retractions, resolutions and verifications in a `1.1` bundle are replayed; `1.0` bundles still import. Text-bearing findings are best-effort re-indexed into Qdrant, and `qdrant_indexed` counts only confirmed upserts. The tool accepts either the raw exported `bundle` object or the entire `investigation_export` response wrapper.
 
 - **Key parameters**
   - `bundle_json`: JSON string containing either the raw bundle or the full export response.
   - `new_title`: Optional manifest title override.
 - **Returns**
-  - `{"imported":true,"new_investigation_id":"<uuid>","original_investigation_id":...,"findings_imported":N,"qdrant_indexed":N}`
+  - `{"imported":true,"new_investigation_id":"<uuid>","original_investigation_id":...,"schema_version":...,"findings_imported":N,"skipped_invalid":N,"retractions_imported":N,"resolutions_imported":N,"verifications_imported":N,"qdrant_indexed":N,"qdrant_failed":N}`
   - Rejects bundles over 10 MB or with unsupported `schema_version`.
 - **Example**
 ```python
