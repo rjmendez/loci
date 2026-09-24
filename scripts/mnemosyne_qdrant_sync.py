@@ -3,6 +3,10 @@
 Sync Mnemosyne SQLite memories -> Qdrant `mnemosyne` collection.
 Embedding path: Ollama /v1/embeddings (primary, direct) or embed-worker (fallback).
 Run standalone or from cron.
+
+The collection is a mirror of SQLite: new and edited memories are (re-)embedded, and points
+this host wrote for memories since deleted from SQLite are removed (skip with --no-prune).
+Exits non-zero when the DB, Qdrant or the embedder fails, so cron does not record success.
 """
 import sqlite3, json, hashlib, sys, time, subprocess, os, base64, urllib.request
 
@@ -155,54 +159,127 @@ def load_memories(conn, tables=(("memories", "memory"), ("working_memory", "work
         print(f"[mnemosyne->qdrant]   {table}: {len(rows)} rows, {kept} new")
     return out
 
-def get_synced_ids():
-    """Return set of memory_ids already in the mnemosyne Qdrant collection.
-    Uses paginated scroll to handle collections with >10000 points."""
-    synced = set()
+class SyncError(RuntimeError):
+    """A backend call failed in a way that makes this run's result untrustworthy."""
+
+
+def get_synced_points():
+    """Return {memory_id: point} for every point this script wrote into the collection.
+
+    Uses paginated scroll to handle collections with >10000 points. Only points carrying a
+    ``memory_id`` payload are returned -- other writers (ebbinghaus, agentHER) use their own
+    payload keys and are never touched by the mirror. Raises SyncError when a scroll page
+    fails: curl() turns every HTTP/network error into {}, and reading that as "nothing synced
+    yet" is how an unreachable Qdrant used to end in "Sync complete" and exit 0.
+    """
+    synced = {}
     offset = None
     while True:
-        body = {"limit": 1000, "with_payload": ["memory_id"], "with_vector": False}
+        body = {"limit": 1000, "with_vector": False,
+                "with_payload": ["memory_id", "content", "agent_id", "profile"]}
         if offset:
             body["offset"] = offset
         data = curl("POST", f"{QDRANT}/collections/{COLLECTION}/points/scroll", body)
-        pts = data.get("result", {}).get("points", [])
-        for p in pts:
-            mid = (p.get("payload") or {}).get("memory_id")
+        if data.get("status") != "ok" or not isinstance(data.get("result"), dict):
+            raise SyncError(f"scroll of {COLLECTION} failed: {data or 'no response'}")
+        for p in data["result"].get("points", []):
+            payload = p.get("payload") or {}
+            mid = payload.get("memory_id")
             if mid:
-                synced.add(mid)
-        offset = data.get("result", {}).get("next_page_offset")
+                synced[mid] = {**payload, "id": p.get("id")}
+        offset = data["result"].get("next_page_offset")
         if not offset:
             break
     return synced
 
-def main():
+
+def plan_sync(memories, synced):
+    """Split the work into (to_upsert, orphan_point_ids).
+
+    to_upsert: memories missing from Qdrant, or whose stored content no longer matches SQLite
+    (an edited memory used to be skipped by memory_id and keep its stale vector forever).
+    orphan_point_ids: points this script wrote under this host's agent_id/profile whose memory
+    no longer exists in SQLite (forgotten or retracted). Points written under a different
+    agent_id/profile belong to another host sharing the collection and are left alone.
+    """
+    current = {m["id"] for m in memories}
+    to_upsert = [
+        m for m in memories
+        if m["id"] not in synced
+        or (synced[m["id"]].get("content") or "") != m["content"][:2048]
+    ]
+    orphans = [
+        pt["id"] for mid, pt in synced.items()
+        if mid not in current
+        and pt.get("id") is not None
+        and (pt.get("agent_id") or "") == AGENT_ID
+        and (pt.get("profile") or "") == PROFILE
+    ]
+    return to_upsert, orphans
+
+
+def main(argv=None):
+    """Mirror SQLite into Qdrant. Returns the exit code: 0 only if every step succeeded.
+
+    Pass --no-prune to skip deleting points whose memory is gone from SQLite.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    prune = "--no-prune" not in argv
+
+    if not os.path.exists(MNEMOSYNE_DB):
+        # sqlite3.connect() would silently create an empty DB here, and an empty source would
+        # then read as "every memory was deleted".
+        print(f"[mnemosyne->qdrant] ERROR: Mnemosyne DB not found at {MNEMOSYNE_DB}",
+              file=sys.stderr)
+        return 1
+
     ensure_collection()
 
-    conn = sqlite3.connect(MNEMOSYNE_DB)
+    conn = sqlite3.connect(f"file:{MNEMOSYNE_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    memories = load_memories(conn)
-    conn.close()
+    try:
+        tables_present = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('memories', 'working_memory')")]
+        memories = load_memories(conn)
+    finally:
+        conn.close()
     print(f"[mnemosyne->qdrant] Found {len(memories)} memories")
+    if not tables_present:
+        # Without a source table an empty result would prune the whole mirror.
+        print("[mnemosyne->qdrant] ERROR: no memory tables in the Mnemosyne DB; refusing to sync",
+              file=sys.stderr)
+        return 1
 
-    # Check what's already in mnemosyne collection (paginated)
-    existing_ids = get_synced_ids()
-    to_sync = [m for m in memories if m["id"] not in existing_ids]
-    # Count the actual delta, not len(memories) - len(existing_ids): existing_ids is every
-    # point in the collection, so that subtraction goes negative once the index outgrows
-    # whatever this run happens to read.
-    print(f"[mnemosyne->qdrant] {len(existing_ids)} already synced, {len(to_sync)} to add")
-    if not to_sync:
-        print("[mnemosyne->qdrant] All up to date.")
-        return
+    try:
+        synced = get_synced_points()
+    except SyncError as e:
+        print(f"[mnemosyne->qdrant] ERROR: {e}", file=sys.stderr)
+        return 1
+    to_sync, orphans = plan_sync(memories, synced)
+    # Count the actual delta, not len(memories) - len(synced): synced is every point in the
+    # collection, so that subtraction goes negative once the index outgrows whatever this run
+    # happens to read.
+    print(f"[mnemosyne->qdrant] {len(synced)} already synced, {len(to_sync)} to add/update, "
+          f"{len(orphans)} orphaned")
+
+    failures = 0
+    if orphans and prune:
+        res = curl("POST", f"{QDRANT}/collections/{COLLECTION}/points/delete", {"points": orphans})
+        if res.get("status") == "ok":
+            print(f"[mnemosyne->qdrant] deleted {len(orphans)} points whose memory is gone")
+        else:
+            failures += 1
+            print(f"[mnemosyne->qdrant] deleting {len(orphans)} orphaned points FAILED {res}",
+                  file=sys.stderr)
+    elif orphans:
+        print(f"[mnemosyne->qdrant] --no-prune: leaving {len(orphans)} orphaned points")
 
     total = 0
     for i in range(0, len(to_sync), BATCH):
         batch = to_sync[i:i+BATCH]
         chunks = [{"id": m["id"], "text": m["content"][:2048]} for m in batch]
         id_to_vec = embed_and_get_vector(chunks)
-        if not id_to_vec:
-            print(f"  Batch {i//BATCH}: embed returned nothing, skipping")
-            continue
 
         points = []
         for m in batch:
@@ -224,6 +301,10 @@ def main():
                 }
             })
 
+        if len(points) < len(batch):
+            failures += 1
+            print(f"  Batch {i//BATCH}: embedding failed for {len(batch) - len(points)} "
+                  f"of {len(batch)}", file=sys.stderr)
         if not points:
             continue
         res = curl("PUT", f"{QDRANT}/collections/{COLLECTION}/points", {"points": points})
@@ -231,10 +312,16 @@ def main():
             total += len(points)
             print(f"  Batch {i//BATCH}: upserted {len(points)} OK (total={total})")
         else:
-            print(f"  Batch {i//BATCH}: FAILED {res}")
+            failures += 1
+            print(f"  Batch {i//BATCH}: FAILED {res}", file=sys.stderr)
         time.sleep(0.2)  # mild rate limiting
 
-    print(f"[mnemosyne->qdrant] Sync complete. {total} new points added.")
+    if failures:
+        print(f"[mnemosyne->qdrant] Sync INCOMPLETE: {total} points added/updated, "
+              f"{failures} step(s) failed.", file=sys.stderr)
+        return 1
+    print(f"[mnemosyne->qdrant] Sync complete. {total} points added/updated.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
