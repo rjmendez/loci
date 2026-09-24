@@ -239,6 +239,7 @@ jobs:
           ruff check mcp/server.py mcp/memcheck/ \
                      a2a_server/server.py \
                      scripts/ \
+                     --target-version py311 \
                      --select E9,F401,F811,F821,F841 \
                      --ignore E402
 
