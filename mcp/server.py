@@ -2736,19 +2736,61 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
     return "new"
 
 
+_DOCS_INGEST_MAX_FILES = 500
+_DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
+
+
+def _docs_ingest_roots() -> list[Path]:
+    """Roots docs_ingest_indexer may read under: ``LOCI_DOCS_ROOTS``
+    (``os.pathsep``-separated), else the code root. Re-read each call."""
+    raw = os.environ.get("LOCI_DOCS_ROOTS", "")
+    roots = []
+    for part in raw.split(os.pathsep):
+        if part.strip():
+            try:
+                roots.append(Path(part.strip()).expanduser().resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return roots or [_code_root()]
+
+
+def _docs_ingest_confined(p: Path, roots: list[Path]) -> Optional[Path]:
+    """``p`` resolved (symlinks included) if it stays under a docs root, else None."""
+    try:
+        resolved = p.resolve(strict=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return resolved if any(resolved.is_relative_to(r) for r in roots) else None
+
+
 def _docs_ingest_targets(document_path: str) -> list[Path]:
-    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid."""
+    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid.
+
+    Only paths under a docs root (``_docs_ingest_roots``) are read, and each file
+    is checked after symlink resolution: a ``notes.md`` link to a secret outside
+    the roots, or to a non-doc file, is skipped. At most _DOCS_INGEST_MAX_FILES."""
+    roots = _docs_ingest_roots()
     p = Path(document_path).expanduser()
-    if not p.exists():
+    if not p.is_absolute():
+        p = _code_root() / p
+    if _docs_ingest_confined(p, roots) is None:
         return []
-    doc_exts = {".md", ".markdown", ".txt"}
+
+    def _ok(x: Path) -> bool:
+        target = _docs_ingest_confined(x, roots)
+        return (
+            target is not None and target.is_file()
+            and x.suffix.lower() in _DOCS_INGEST_EXTS
+            and target.suffix.lower() in _DOCS_INGEST_EXTS
+        )
+
     if p.is_file():
-        return [p] if p.suffix.lower() in doc_exts else []
+        return [p] if _ok(p) else []
     if p.is_dir():
         return sorted(
-            {x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in doc_exts},
+            {x for x in p.rglob("*") if x.is_file() and _ok(x)},
             key=lambda item: str(item),
-        )
+        )[:_DOCS_INGEST_MAX_FILES]
     return []
 
 
@@ -2760,11 +2802,21 @@ def docs_ingest_indexer(
     source: str = "docs_ingest_indexer",
     confidence: str = "medium",
 ) -> str:
-    """Index markdown or text docs into the standard Loci investigation store with provenance."""
+    """Index markdown or text docs into the standard Loci investigation store with provenance.
+
+    Only documents under the docs roots (``LOCI_DOCS_ROOTS``, ``os.pathsep``-separated;
+    default: the code root) are read, symlink targets included. Indexed findings are
+    tagged ``model_asserted``: the tool verifies which bytes it read (sha256), not
+    what the document claims, so its content is not independent evidence.
+    """
     targets = _docs_ingest_targets(document_path)
     if not targets:
         return json.dumps({
-            "error": f"No readable markdown/text documents found under: {document_path}",
+            "error": (
+                f"No readable markdown/text documents found under: {document_path} "
+                f"(only paths under the docs roots {[str(r) for r in _docs_ingest_roots()]} are read; "
+                "set LOCI_DOCS_ROOTS to widen them)"
+            ),
             "stored": 0,
             "investigation_id": investigation_id,
         })
@@ -2799,8 +2851,12 @@ def docs_ingest_indexer(
                 "document_sha256": content_hash,
                 "content_length": len(raw),
                 "ingested_at": _now(),
+                # The hash proves which bytes were read, not that their claims hold.
+                "content_verified": False,
             },
-            "evidence_provenance_tier": "tool_verified",
+            # Document text is an unverified claim of unknown authorship, so it takes
+            # the non-independent tier rather than tool_verified.
+            "evidence_provenance_tier": MODEL_ASSERTED,
         }
         if not summary_only:
             metadata["content_excerpt"] = raw[:1200]
@@ -2825,7 +2881,7 @@ def docs_ingest_indexer(
             confidence=confidence,
             tags=["docs", "markdown", "loci-index"],
             metadata=metadata,
-            evidence_provenance_tier="tool_verified",
+            evidence_provenance_tier=MODEL_ASSERTED,
         ))
         records.append({
             "path": str(doc_path),
