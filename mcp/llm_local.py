@@ -24,7 +24,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Optional
+
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+try:
+    from mcp.route_audit import record_route_event
+except Exception:
+    try:
+        from route_audit import record_route_event
+    except Exception:
+        record_route_event = None
 
 _LOG = logging.getLogger("loci-mcp.llm_local")
 
@@ -86,6 +99,25 @@ def _discover_generation_model(base: str, exclude: str = "") -> str:
         return ""
     return ""
 
+
+
+def _log_route_event(*, tier: str, route: str, reason: str, prompt: str, model: str, degraded: bool = False, ok: bool | None = None, fallback: str | None = None, status_code: int | None = None) -> None:
+    """Write a structured local-route audit event, but never block generation."""
+    try:
+        record_route_event(
+            tier=tier,
+            route=route,
+            reason=reason,
+            prompt=prompt,
+            model=model,
+            degraded=degraded,
+            ok=ok,
+            fallback=fallback,
+            status_code=status_code,
+            source="llm_local",
+        )
+    except Exception:
+        pass
 
 def generate(prompt: str,
              model: str = "",
@@ -176,6 +208,7 @@ def generate(prompt: str,
         import requests
         _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
                   model, fmt or "", max_tokens)
+        _log_route_event(tier="local", route="ollama", reason="generate_request", prompt=prompt, model=model, degraded=False, ok=None)
         r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         payload = r.json()
@@ -216,7 +249,9 @@ def generate(prompt: str,
             if fallback is not None:
                 _LOG.info("llm_local fallback tier=%s model=%s",
                           fallback.get("tier", "unknown"), fallback.get("model", ""))
+                _log_route_event(tier="local", route="vllm_fallback", reason="ollama_failure", prompt=prompt, model=model, degraded=True, ok=True, fallback=fallback.get("tier", "vllm"), status_code=0)
                 return fallback
+            _log_route_event(tier="local", route="ollama", reason=f"ollama {type(exc).__name__}", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
             return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
 
     if fmt == "json":
@@ -224,9 +259,11 @@ def generate(prompt: str,
         try:
             json.loads(text)
         except Exception as exc:
+            _log_route_event(tier="local", route="ollama", reason="json_invalid", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
             return {"text": text, "ok": False, "model": model,
                     "why": f"response was not valid JSON: {exc}"[:200]}
 
+    _log_route_event(tier="local", route="ollama", reason="generate_success", prompt=prompt, model=model, degraded=False, ok=True, status_code=0)
     return {"text": text, "ok": True, "model": model}
 
 
