@@ -205,3 +205,43 @@ the model's held-out accuracy is at least the best trivial accuracy plus `min_ma
 (default 0.01, CLI `--baseline-margin`). Both numbers are recorded in
 `gate_report.trivial_baseline`, in `trivial-baseline-report.json`, and in the
 `trivial_baseline` block of each threshold bundle.
+
+## Real learners, wiring features and the evaluation harness
+
+Three modules replace "NB over input_text tokens" as the default way to build an expert.
+The legacy NB pipeline above still runs unchanged.
+
+- `mcp/flybrain_learners.py`: one learner interface (`fit`, `predict_proba`, `predict`,
+  `describe`, `save`, `load`) with the backends `nb` (the legacy NB, reads `input_text`
+  only), `logreg`, `hgb` (native categorical features, grouped inner early stopping) and
+  `mlp` (plain torch). `CalibratedLearner` adds isotonic, sigmoid or temperature
+  calibration fitted on grouped out-of-fold probabilities. Artifacts are directories with a
+  `manifest.json` that lists the sha256 of every file. `load_learner` checks the directory
+  is inside `trusted_root`, then checks every hash and rejects missing, changed or unlisted
+  files, and only after that unpickles. The manifest is an integrity check, not a
+  signature, so artifacts may only be loaded from the harness root.
+- `mcp/flybrain_wiring_features.py`: per-neuron wiring features, streamed from any
+  edge table with pyarrow and cached as parquet under `cache/wiring-features/<dataset>/`.
+  Features cover degree, in/out partner-category composition, neuropil distribution,
+  reciprocity and optional 2-hop composition. Each objective declares the feature-name
+  patterns that define its label (`register_objective_exclusions`). The builder drops those
+  columns, and `assert_features_allowed` rejects them. When the partner category is the
+  target label, pass the val and test ids from `plan_grouped_split` as `mask_category_ids`
+  so held-out labels never reach the features of any node. 2-hop features always remove a
+  node's own i->j->i return path.
+- `mcp/flybrain_model_eval.py`: `run_evaluation(EvalDataset, EvalConfig)` runs the steps
+  below and writes `report.json`, `report.md` and model artifacts under
+  `logs/<run>/<dataset>/<target>/`:
+  1. Leakage check.
+  2. Grouped split, with no straddling groups asserted.
+  3. Trivial baselines for the view each model sees.
+  4. Grouped-CV tuning inside train.
+  5. Calibrated final fit.
+  6. One held-out test per final config, with cluster-bootstrap 95% CIs and a paired CI of
+     the gain over the best trivial rule, plus ECE and a reliability table.
+  7. Controls: label shuffle, a random-split leakage gap, and drop-one-family ablation
+     scored on val.
+
+  A model passes only if it beats the best trivial rule on test accuracy and on
+  macro-F1, the paired-gain CI lower bound is above 0, and the label-shuffle control
+  collapses to majority.
