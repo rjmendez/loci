@@ -4,9 +4,11 @@ Sync Mnemosyne SQLite memories -> Qdrant `mnemosyne` collection.
 Embedding path: Ollama /v1/embeddings (primary, direct) or embed-worker (fallback).
 Run standalone or from cron.
 
-The collection is a mirror of SQLite: new and edited memories are (re-)embedded, and points
-this host wrote for memories since deleted from SQLite are removed (skip with --no-prune).
-Exits non-zero when the DB, Qdrant or the embedder fails, so cron does not record success.
+New and edited memories are (re-)embedded. Deleting points this host wrote for memories since
+removed from SQLite is opt-in (--prune): it needs a non-empty HERMES_AGENT_ID and HERMES_PROFILE
+and refuses to remove more than PRUNE_MAX_FRACTION of this host's points unless --force-prune
+is also passed. Exits non-zero when the DB, Qdrant or the embedder fails, so cron does not
+record success.
 """
 import sqlite3, json, hashlib, sys, time, subprocess, os, base64, urllib.request
 
@@ -30,6 +32,8 @@ COLLECTION   = "mnemosyne"
 BATCH        = 8
 AGENT_ID     = os.environ.get("HERMES_AGENT_ID", "")
 PROFILE      = os.environ.get("HERMES_PROFILE", "")
+# A single --prune run may delete at most this fraction of this host's mirrored points.
+PRUNE_MAX_FRACTION = 0.5
 
 def get_key():
     env_key = os.environ.get("QDRANT_API_KEY", "")
@@ -131,7 +135,9 @@ def load_memories(conn, tables=(("memories", "memory"), ("working_memory", "work
 
     Rows with empty content are dropped (nothing to embed). An id present in more than one tier
     keeps its FIRST occurrence, so the durable `memories` copy wins over a staging duplicate.
-    A missing table is skipped rather than fatal -- schemas differ across hosts.
+    A missing table is skipped rather than fatal -- schemas differ across hosts. Any other
+    error reading a table that exists (a missing column, a locked or corrupt DB) raises
+    SyncError: reading it as "no memories" would make every mirrored point look orphaned.
     """
     out, seen = [], set()
     _ALLOWED_TABLES = {"memories", "working_memory"}
@@ -145,6 +151,8 @@ def load_memories(conn, tables=(("memories", "memory"), ("working_memory", "work
                 "WHERE content IS NOT NULL AND TRIM(content) != '' ORDER BY created_at ASC"
             ).fetchall()
         except sqlite3.OperationalError as e:
+            if not str(e).startswith("no such table"):
+                raise SyncError(f"cannot read {table}: {e}") from e
             print(f"[mnemosyne->qdrant] skipping {table}: {e}")
             continue
         kept = 0
@@ -221,10 +229,12 @@ def plan_sync(memories, synced):
 def main(argv=None):
     """Mirror SQLite into Qdrant. Returns the exit code: 0 only if every step succeeded.
 
-    Pass --no-prune to skip deleting points whose memory is gone from SQLite.
+    Pass --prune to delete points whose memory is gone from SQLite (off by default; --no-prune
+    is still accepted and means the default). --force-prune lifts the PRUNE_MAX_FRACTION cap.
     """
     argv = sys.argv[1:] if argv is None else argv
-    prune = "--no-prune" not in argv
+    prune = "--prune" in argv and "--no-prune" not in argv
+    force_prune = "--force-prune" in argv
 
     if not os.path.exists(MNEMOSYNE_DB):
         # sqlite3.connect() would silently create an empty DB here, and an empty source would
@@ -242,6 +252,9 @@ def main(argv=None):
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name IN ('memories', 'working_memory')")]
         memories = load_memories(conn)
+    except (SyncError, sqlite3.Error) as e:
+        print(f"[mnemosyne->qdrant] ERROR: {e}; refusing to sync", file=sys.stderr)
+        return 1
     finally:
         conn.close()
     print(f"[mnemosyne->qdrant] Found {len(memories)} memories")
@@ -264,7 +277,21 @@ def main(argv=None):
           f"{len(orphans)} orphaned")
 
     failures = 0
-    if orphans and prune:
+    host_points = sum(1 for pt in synced.values()
+                      if (pt.get("agent_id") or "") == AGENT_ID
+                      and (pt.get("profile") or "") == PROFILE)
+    if orphans and prune and not (AGENT_ID and PROFILE):
+        # Ownership is decided by agent_id/profile; with either unset, every host running on
+        # defaults matches every other such host's points and would prune them.
+        failures += 1
+        print(f"[mnemosyne->qdrant] ERROR: --prune needs HERMES_AGENT_ID and HERMES_PROFILE set; "
+              f"leaving {len(orphans)} orphaned points", file=sys.stderr)
+    elif orphans and prune and not force_prune and len(orphans) > PRUNE_MAX_FRACTION * host_points:
+        failures += 1
+        print(f"[mnemosyne->qdrant] ERROR: refusing to delete {len(orphans)} of {host_points} "
+              f"points this host mirrored (cap {PRUNE_MAX_FRACTION:.0%}); rerun with "
+              "--force-prune if that is intended", file=sys.stderr)
+    elif orphans and prune:
         res = curl("POST", f"{QDRANT}/collections/{COLLECTION}/points/delete", {"points": orphans})
         if res.get("status") == "ok":
             print(f"[mnemosyne->qdrant] deleted {len(orphans)} points whose memory is gone")
@@ -273,7 +300,8 @@ def main(argv=None):
             print(f"[mnemosyne->qdrant] deleting {len(orphans)} orphaned points FAILED {res}",
                   file=sys.stderr)
     elif orphans:
-        print(f"[mnemosyne->qdrant] --no-prune: leaving {len(orphans)} orphaned points")
+        print(f"[mnemosyne->qdrant] pruning off (pass --prune): leaving {len(orphans)} "
+              "orphaned points")
 
     total = 0
     for i in range(0, len(to_sync), BATCH):

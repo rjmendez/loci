@@ -190,6 +190,7 @@ This is the implementation-ready path for the `benchmark-harness-spec`, `rollout
 | `STATE_DIR` | `~/.claude/hook-state` | all hooks, skill_annotation_updater, score_trace, exif |
 | `SKILLS_DIR` | `~/.claude/skills` | skill_annotation_updater, skillops_maintenance, exif |
 | `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
+| `LOCI_DOCS_ROOTS` | `LOCI_CODE_ROOT`, else the service's cwd | docs_ingest_indexer: `os.pathsep`-separated roots it may read under (symlink targets must stay inside). Set it to ingest docs from any other repo; relative paths resolve against the code root. A directory ingest reads at most 500 files and reports `truncated: true` with `files_found` when it hits that cap. |
 
 ### FlyBrain harness write-path safety
 
@@ -683,6 +684,10 @@ curl -s -X POST $QDRANT_URL/collections/eval_scores/points/scroll \
 QDRANT_API_KEY=$QDRANT_API_KEY \
 $LOCI_PY $LOCI/scripts/mnemosyne_qdrant_sync.py
 ```
+
+This only adds and re-embeds. To also delete points whose memory is gone from SQLite, pass
+`--prune`; it requires `HERMES_AGENT_ID` and `HERMES_PROFILE` to be set and refuses to delete
+more than half of this host's points in one run unless `--force-prune` is also given.
 
 ### Run a groom pass by hand
 

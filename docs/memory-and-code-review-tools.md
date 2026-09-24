@@ -534,11 +534,15 @@ no LLM involved. Just calls the Mnemosyne CLI sleep command.
 Syncs Mnemosyne SQLite → Qdrant `mnemosyne` collection so the grounding hook
 can search Mnemosyne content without going through the MCP server on every turn.
 
-The collection is a mirror: new and edited memories are (re-)embedded, and points this
-host wrote (matching `memory_id` payload plus this host's `agent_id`/`profile`) for
-memories no longer in SQLite are deleted. Pass `--no-prune` to skip deletion. The script
-exits 1 if the DB is missing, Qdrant is unreachable, or any embed/upsert/delete step
-fails, so a failed cron run is not recorded as success.
+New and edited memories are (re-)embedded. Deleting points this host wrote (matching
+`memory_id` payload plus this host's `agent_id`/`profile`) for memories no longer in SQLite
+is opt-in: pass `--prune`. Pruning refuses to run unless `HERMES_AGENT_ID` and
+`HERMES_PROFILE` are both set (hosts on empty defaults would match each other's points),
+and refuses to delete more than half of this host's points in one run unless
+`--force-prune` is also passed. An unreadable memory table (e.g. a missing column) is a
+fatal error, not "no memories". The script exits 1 if the DB is missing or unreadable,
+Qdrant is unreachable, a prune is refused, or any embed/upsert/delete step fails, so a
+failed cron run is not recorded as success.
 
 ---
 
