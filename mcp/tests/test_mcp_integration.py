@@ -14,6 +14,7 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -133,6 +134,14 @@ class TestInvestigationLifecycle(unittest.TestCase):
             value="The bug is in the token expiry check.",
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(result["updated"], "hypothesis")
+        # Read back from disk through the public load path: the note must have
+        # been persisted to the hypothesis field and nowhere else.
+        manifest = _json(server.investigation_load(investigation_id=inv_id))["manifest"]
+        self.assertEqual(manifest["hypothesis"], "The bug is in the token expiry check.")
+        self.assertIn("hypothesis_ts", manifest)
+        self.assertNotEqual(manifest.get("next_step"), "The bug is in the token expiry check.")
+        self.assertNotEqual(manifest.get("context"), "The bug is in the token expiry check.")
 
     def test_investigation_note_updates_next_step(self):
         inv_id = _new_id("note-step")
@@ -143,6 +152,11 @@ class TestInvestigationLifecycle(unittest.TestCase):
             value="Check auth.py line 42",
         ))
         self.assertNotIn("error", result)
+        self.assertEqual(result["updated"], "next_step")
+        manifest = _json(server.investigation_load(investigation_id=inv_id))["manifest"]
+        self.assertEqual(manifest["next_step"], "Check auth.py line 42")
+        self.assertIn("next_step_ts", manifest)
+        self.assertNotEqual(manifest.get("hypothesis"), "Check auth.py line 42")
 
     def test_investigation_load_returns_findings(self):
         inv_id = _new_id("load")
@@ -480,20 +494,64 @@ class TestInvestigationLifecycle(unittest.TestCase):
 
 
 class TestMemoryHealth(unittest.TestCase):
-    """memory_health should always return valid JSON."""
+    """memory_health: every probe reported, a degraded substrate reported as
+    degraded, and the store inventory counts exactly what is on disk."""
+
+    _CHECK_NAMES = [
+        "qdrant_reachable", "qdrant_collections", "embeddings_dense",
+        "embeddings_sparse", "mnemo_mirror", "dimension_consistency",
+        "retraction_integrity", "store_counts",
+    ]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
 
     def test_returns_valid_json_without_qdrant(self):
+        inv_id = _new_id("health")
+        server.investigation_start(investigation_id=inv_id, title="Health inventory")
+        for text in ("Service A calls service B over gRPC.",
+                     "Service B caches tokens for 300 seconds."):
+            stored = _json(server.investigation_store(
+                investigation_id=inv_id, finding_type="observed",
+                text=text, source="test:health", confidence="high",
+            ))
+            self.assertTrue(stored.get("stored"), stored)
+
         result = _json(server.memory_health())
-        # Should have at minimum one of these keys
-        self.assertTrue(
-            any(k in result for k in ("status", "error", "qdrant", "sqlite")),
-            f"Unexpected health response shape: {result}",
+        self.assertNotIn("error", result)
+        self.assertEqual([c["name"] for c in result["checks"]], self._CHECK_NAMES)
+        checks = {c["name"]: c for c in result["checks"]}
+        # Hermetic env: Qdrant is unreachable. That is the degraded branch and
+        # it must be reported as such, never rolled up as ok.
+        self.assertEqual(checks["qdrant_reachable"]["status"], "fail")
+        self.assertIn("remediation", checks["qdrant_reachable"])
+        self.assertEqual(result["status"], "unhealthy")
+        self.assertEqual(result["scope"], "all")
+        # The store inventory is local, so it must be exact.
+        self.assertEqual(checks["store_counts"]["status"], "ok")
+        detail = checks["store_counts"]["detail"]
+        self.assertEqual(detail["investigations"], 1)
+        self.assertEqual(detail["totals"]["findings"], 2)
+        self.assertEqual(checks["retraction_integrity"]["status"], "ok")
+        self.assertEqual(
+            checks["retraction_integrity"]["detail"]["investigations_scanned"], 1
         )
 
     def test_with_missing_investigation_id(self):
-        # Should not raise; any valid JSON response is acceptable
         result = _json(server.memory_health(investigation_id="no-such-investigation"))
-        self.assertIsInstance(result, dict)
+        self.assertEqual(result["scope"], "no-such-investigation")
+        checks = {c["name"]: c for c in result["checks"]}
+        for name in ("retraction_integrity", "store_counts"):
+            self.assertEqual(checks[name]["status"], "warn")
+            self.assertEqual(
+                checks[name]["detail"], "investigation 'no-such-investigation' not found"
+            )
 
 
 class TestMemoryConfidence(unittest.TestCase):
@@ -509,17 +567,54 @@ class TestMemoryConfidence(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_returns_valid_json_for_empty_query(self):
-        # Empty query may return a confidence response or an error dict — both are valid.
         result = _json(server.memory_confidence(query=""))
-        self.assertIsInstance(result, dict)
+        self.assertEqual(result["basis"], "empty_query")
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(result["recommendation"], "verify")
+
+    def test_real_query_without_qdrant_is_reported_unavailable(self):
+        """Degraded branch: no Qdrant must be reported as such, never as a score."""
+        result = _json(server.memory_confidence(query="authentication token expiry"))
+        self.assertEqual(result["basis"], "qdrant_unavailable")
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(result["recommendation"], "verify")
 
     def test_returns_valid_json_for_real_query(self):
-        result = _json(server.memory_confidence(query="authentication token expiry"))
-        self.assertIsInstance(result, dict)
-        # When Qdrant is unavailable the response may be degraded but must be valid JSON
-        self.assertTrue(
-            any(k in result for k in ("confidence", "error", "status", "score")),
-            f"Unexpected confidence response shape: {result}",
+        """Success branch against an in-memory Qdrant: the cues and the top hit
+        must come from the stored findings."""
+        from loci_fakes import in_memory_qdrant
+
+        texts = [
+            "The auth service rejects expired tokens with HTTP 401.",
+            "Token expiry is checked in auth.py.",
+            "The billing cron runs nightly at 02:00.",
+        ]
+        with in_memory_qdrant() as q:
+            inv_id = _new_id("conf")
+            server.investigation_start(investigation_id=inv_id, title="Confidence")
+            ids = []
+            for t in texts:
+                stored = _json(server.investigation_store(
+                    investigation_id=inv_id, finding_type="observed", text=t,
+                    source="test:src", confidence="high",
+                ))
+                ids.append(stored["finding_id"])
+            self.assertEqual(len(q.points()), 3)
+            result = _json(server.memory_confidence(query="auth service expired tokens 401"))
+
+        self.assertNotIn(result["basis"], ("qdrant_unavailable", "embed_failed",
+                                           "search_failed", "no_trace"))
+        self.assertEqual(result["top_hit_preview"], texts[0])
+        refs = result["confidence_aggregation"]["evidence_refs"]
+        self.assertEqual([r["finding_id"] for r in refs], ids)
+        self.assertEqual({r["investigation_id"] for r in refs}, {inv_id})
+        self.assertEqual(result["cues"]["source_diversity"], 1)
+        self.assertEqual(result["cues"]["trust"], 1.0)
+        self.assertEqual(result["cues"]["fluency"], round(refs[0]["score"], 3))
+        self.assertGreater(result["confidence"], 0.0)
+        self.assertEqual(
+            result["confidence"],
+            result["confidence_aggregation"]["adjusted_confidence"],
         )
 
 
@@ -535,16 +630,37 @@ class TestAuditLog(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    def _global_rows(self):
+        audit_dir = server.MEMORY_DIR.parent / "audit"
+        rows = []
+        for p in sorted(audit_dir.glob("*.jsonl")):
+            rows.extend(json.loads(line) for line in p.read_text().splitlines() if line.strip())
+        return rows
+
     def test_returns_valid_json_with_required_args(self):
+        # MEMORY_DIR.parent is shared by every TemporaryDirectory, so give the
+        # global audit dir its own root for this test.
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        tool = _new_id("audit_tool_global")
         result = _json(server.audit_log(
-            tool_name="test_tool",
+            tool_name=tool,
             inputs_json='{"query": "test"}',
             output='{"result": "ok"}',
         ))
-        self.assertIsInstance(result, dict)
-        self.assertNotIn("error", result)
+        self.assertTrue(result["logged"])
+        self.assertEqual(result["tool"], tool)
+        self.assertIsNone(result["investigation_logged"])
+        # Hermetic env: no Qdrant, so nothing was indexed and it must say so.
+        self.assertFalse(result["qdrant_indexed"])
+        rows = [r for r in self._global_rows() if r["tool"] == tool]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["inputs"], '{"query": "test"}')
+        self.assertEqual(rows[0]["output"], '{"result": "ok"}')
+        self.assertEqual(rows[0]["ts"], result["ts"])
+        self.assertIsNone(rows[0]["investigation_id"])
 
     def test_with_investigation_id(self):
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
         inv_id = _new_id("audit")
         server.investigation_start(investigation_id=inv_id, title="Audit test")
         result = _json(server.audit_log(
@@ -553,8 +669,55 @@ class TestAuditLog(unittest.TestCase):
             output='{"status": "ok"}',
             investigation_id=inv_id,
         ))
-        self.assertIsInstance(result, dict)
-        self.assertNotIn("error", result)
+        self.assertTrue(result["logged"])
+        self.assertIs(result["investigation_logged"], True)
+        inv_rows = [
+            json.loads(line)
+            for line in (server._inv_dir(inv_id) / "audit.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(inv_rows), 1)
+        self.assertEqual(inv_rows[0]["tool"], "test_tool")
+        self.assertEqual(inv_rows[0]["inputs"], '{"param": "value"}')
+        self.assertEqual(inv_rows[0]["output"], '{"status": "ok"}')
+        self.assertEqual(inv_rows[0]["investigation_id"], inv_id)
+        # The same entry also lands in the global daily log.
+        self.assertEqual(
+            [r for r in self._global_rows() if r["investigation_id"] == inv_id], inv_rows
+        )
+
+    def test_unknown_investigation_is_not_reported_as_logged(self):
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        result = _json(server.audit_log(
+            tool_name="test_tool", inputs_json="{}", output="x",
+            investigation_id="no-such-investigation",
+        ))
+        self.assertTrue(result["logged"])
+        self.assertIs(result["investigation_logged"], False)
+
+    def test_qdrant_indexed_reflects_the_upsert(self):
+        """qdrant_indexed must be True only when the point was actually written."""
+        from loci_fakes import in_memory_qdrant
+
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        with in_memory_qdrant() as q:
+            ok = _json(server.audit_log(
+                tool_name="indexed_tool", inputs_json="{}", output="payload one",
+            ))
+            self.assertIs(ok["qdrant_indexed"], True)
+            audit_pts = [p for p in q.points() if p.payload.get("tool") == "indexed_tool"]
+            self.assertEqual(len(audit_pts), 1)
+            self.assertEqual(audit_pts[0].payload["record_type"], "audit")
+
+            # Embedder down: _qdrant_upsert writes nothing and returns False.
+            with mock.patch("qdrant_ops._embed", lambda *a, **k: None):
+                failed = _json(server.audit_log(
+                    tool_name="unindexed_tool", inputs_json="{}", output="payload two",
+                ))
+            self.assertEqual(
+                [p for p in q.points() if p.payload.get("tool") == "unindexed_tool"], []
+            )
+            self.assertIs(failed["qdrant_indexed"], False)
 
 
 class TestMemorySurface(unittest.TestCase):
@@ -685,27 +848,57 @@ class TestRagContextSearchDecayParam(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_rag_context_search_accepts_decay_param(self):
-        # With no Qdrant the function must return a JSON error dict, not raise.
+    def _rows(self):
+        """Two findings with the SAME similarity; the old one is listed first so
+        only time decay can put the fresh one on top."""
+        import time as _t
+        now = int(_t.time())
+        col = server.QDRANT_COLLECTION_PREFIX
+        return {col: [
+            {"id": "old-finding", "origin": col, "score": 0.9,
+             "text": "Token expiry was 3600 seconds (old).",
+             "created_at_ts": now - 200 * 86400},
+            {"id": "new-finding", "origin": col, "score": 0.9,
+             "text": "Token expiry is 900 seconds (current).",
+             "created_at_ts": now},
+        ]}
+
+    def _search(self, **kw):
+        from loci_fakes import fake_rag_retrieval
+        with fake_rag_retrieval(self._rows()) as rag:
+            out = _json(server.rag_context_search(
+                query="token expiry", expand_query=False, **kw))
+        self.assertEqual(len(rag.calls), 1)
+        self.assertEqual(out["mode"], "rag_hybrid")
+        return out
+
+    def test_rag_context_search_without_qdrant_reports_rag_required(self):
+        """Degraded branch: no Qdrant is reported as rag_required, not as results."""
         for decay_val in (True, False):
-            result = server.rag_context_search(query="authentication token", decay=decay_val)
-            try:
-                parsed = json.loads(result)
-            except json.JSONDecodeError:
-                self.fail(
-                    f"rag_context_search(decay={decay_val!r}) returned non-JSON: {result!r}"
-                )
-            self.assertIsInstance(parsed, dict, f"Expected dict for decay={decay_val!r}")
-            # Either a rag_required error (no Qdrant) or a real response — both are valid.
-            self.assertTrue(
-                any(k in parsed for k in ("mode", "error", "context", "results")),
-                f"Unexpected response shape for decay={decay_val!r}: {parsed}",
-            )
+            parsed = _json(server.rag_context_search(query="authentication token", decay=decay_val))
+            self.assertEqual(parsed["mode"], "rag_required")
+            self.assertIs(parsed["qdrant_available"], False)
+            self.assertEqual(parsed["results"], [])
+
+    def test_rag_context_search_accepts_decay_param(self):
+        on = self._search(decay=True)
+        self.assertEqual([s["id"] for s in on["sources"]], ["new-finding", "old-finding"])
+        scores = {s["id"]: s["score"] for s in on["sources"]}
+        self.assertEqual(scores["new-finding"], 0.9)
+        # 200 days at lambda=0.007: 0.9 * exp(-1.4) ~= 0.2219
+        self.assertAlmostEqual(scores["old-finding"], 0.9 * math.exp(-server._MEMORY_DECAY_LAMBDA * 200), places=3)
+
+        off = self._search(decay=False)
+        self.assertEqual([s["id"] for s in off["sources"]], ["old-finding", "new-finding"])
+        self.assertEqual({s["id"]: s["score"] for s in off["sources"]},
+                         {"old-finding": 0.9, "new-finding": 0.9})
 
     def test_rag_context_search_decay_default_is_true(self):
-        # Calling without decay kwarg must not raise — default decay=True is active.
-        result = server.rag_context_search(query="memory decay ebbinghaus")
-        self.assertIsInstance(json.loads(result), dict)
+        default = self._search()
+        explicit = self._search(decay=True)
+        self.assertEqual(default["sources"], explicit["sources"])
+        self.assertEqual(default["sources"][0]["id"], "new-finding")
+        self.assertLess(default["sources"][1]["score"], 0.9)
 
 
 if __name__ == "__main__":
