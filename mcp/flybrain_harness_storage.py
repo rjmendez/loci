@@ -98,10 +98,11 @@ def _resolve_valid_root_value(raw: str, *, env_name: str) -> Path:
     expanded = os.path.expandvars(os.path.expanduser(raw.strip()))
     if not expanded:
         raise ValueError(f"{env_name} is empty")
-    if not Path(expanded).is_absolute():
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
         raise ValueError(f"{env_name} must resolve to an absolute path")
+    _validate_root(candidate, env_name=env_name)
     root = _expand_path(expanded)
-    _validate_root(root, env_name=env_name)
     return root
 
 

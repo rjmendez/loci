@@ -179,10 +179,25 @@ def _inv_dir(investigation_id: str) -> Path:
 
 
 _manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
+_manifest_cache_root: str | None = None
 _MANIFEST_CACHE_MAXSIZE = 256
 
 
+def _sync_manifest_cache_scope() -> None:
+    """Keep the manifest cache scoped to the current memory root.
+
+    Tests and some runtime flows rebind the memory root between calls; a cache key
+    of only investigation_id can otherwise replay a manifest from a previous root.
+    """
+    global _manifest_cache_root
+    root = str(_root().resolve())
+    if _manifest_cache_root != root:
+        _manifest_cache.clear()
+        _manifest_cache_root = root
+
+
 def _load_manifest(investigation_id: str) -> dict | None:
+    _sync_manifest_cache_scope()
     investigation_id = _validated_investigation_id(investigation_id)
     raw = _manifest_cache.get(investigation_id)
     if raw is None:
@@ -204,6 +219,7 @@ def _load_manifest(investigation_id: str) -> dict | None:
 
 def _load_manifest_fresh(investigation_id: str) -> dict | None:
     """Load the manifest from disk without consulting the write-through cache."""
+    _sync_manifest_cache_scope()
     investigation_id = _validated_investigation_id(investigation_id)
     p = _root() / investigation_id / "manifest.json"
     if not p.exists():
@@ -238,6 +254,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
 
 
 def _save_manifest(manifest: dict) -> None:
+    _sync_manifest_cache_scope()
     manifest["updated_at"] = _now()
     p = _inv_dir(manifest["id"]) / "manifest.json"
     data = json.dumps(manifest, indent=2)
