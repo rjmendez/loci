@@ -498,21 +498,19 @@ def test_write_cache_swallows_an_unusable_cache_dir(hook, tmp_path):
     assert blocker.read_text() == "i am a file"
 
 
-def test_cached_msg_count_raises_when_the_cache_dir_cannot_be_created(hook, tmp_path):
-    """BUG: cache_path() is called *outside* cached_msg_count()'s try block, so
-    an unusable LOCI_SYNC_CACHE turns the "return -1 on anything" contract
-    into an uncaught exception."""
+def test_cached_msg_count_is_minus_one_when_the_cache_dir_cannot_be_created(hook, tmp_path):
+    """The "return -1 on anything" contract covers an unusable LOCI_SYNC_CACHE
+    too: cache_path()'s makedirs error must not escape."""
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file")
     hook.CACHE_DIR = str(blocker)
-    with pytest.raises(FileExistsError):
-        hook.cached_msg_count("s1")
+    assert hook.cached_msg_count("s1") == -1
+    assert blocker.read_text() == "i am a file"
 
 
-def test_cached_msg_count_raises_on_a_missing_parent_directory(hook):
+def test_cached_msg_count_is_minus_one_on_a_missing_parent_directory(hook):
     hook.CACHE_DIR = "/proc/no-such-parent/cache"
-    with pytest.raises(OSError):
-        hook.cached_msg_count("s1")
+    assert hook.cached_msg_count("s1") == -1
 
 
 def test_cache_keys_are_per_session(hook):
@@ -589,11 +587,32 @@ def test_embed_propagates_malformed_response(hook):
         p.stop()
 
 
-def test_embed_raises_when_ollama_base_url_is_unset(paths):
-    """With OLLAMA None the Request constructor blows up -- main() catches it."""
+def test_embed_raises_a_clear_error_when_no_endpoint_is_configured(paths):
+    """No endpoint configured: a RuntimeError naming the missing settings, with
+    no request attempted -- main() logs it and exits 0."""
     h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"]})
-    with pytest.raises(Exception):
-        h.embed("hi")
+    calls, p = patch_urlopen(h, AssertionError("must not be called"))
+    try:
+        with pytest.raises(RuntimeError,
+                           match="OLLAMA_BASE_URL or MNEMOSYNE_EMBEDDING_API_URL"):
+            h.embed("hi")
+    finally:
+        p.stop()
+    assert calls == []
+
+
+def test_main_without_an_embeddings_endpoint_logs_and_exits_zero(paths, capsys):
+    h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"],
+                   "LOCI_SYNC_CACHE": paths["cache"]})
+    upserts = []
+    h.ensure_collection = lambda: None
+    h.qdrant_upsert = lambda *a: upserts.append(a) or True
+    seed_session(h)
+    assert run_main(h, {"session_id": "s1"}) == 0
+    assert capsys.readouterr().err.strip() == (
+        "[session_end_sync] embed error: no embeddings endpoint configured "
+        "(set OLLAMA_BASE_URL or MNEMOSYNE_EMBEDDING_API_URL)")
+    assert upserts == []
 
 
 # ---------------------------------------------------------------------------
@@ -819,18 +838,33 @@ def test_wiring_dedup_keeps_only_one_entry_per_id(inv_env):
     assert payload["unresolved_wiring_obligation_samples"] == ["new"]
 
 
-def test_wiring_records_without_an_id_collapse_into_one(inv_env):
-    """BUG: a missing id defaults to "", so the empty string is the dedup key
-    and every id-less finding after the first is silently dropped."""
+def test_wiring_records_without_an_id_are_each_counted(inv_env):
+    """An id-less finding has nothing to be deduplicated against: three of them
+    are three obligations, not one."""
     write_findings(inv_env, "inv1", [
         {"text": "no-id one", "tags": ["wiring_obligation"], "record_type": "gap"},
         {"text": "no-id two", "tags": ["wiring_obligation"], "record_type": "gap"},
-        {"text": "no-id three", "tags": ["wiring_obligation"], "record_type": "gap"},
+        {"id": "", "text": "empty-id three", "tags": ["wiring_obligation"],
+         "record_type": "gap"},
+    ])
+    payload = {}
+    note = inv_env._check_wiring_obligations("inv1", payload)
+    assert note == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 3"
+    assert payload["unresolved_wiring_obligations"] == 3
+    assert payload["unresolved_wiring_obligation_samples"] == [
+        "empty-id three", "no-id two", "no-id one"]
+
+
+def test_wiring_id_less_records_do_not_disturb_id_dedup(inv_env):
+    write_findings(inv_env, "inv1", [
+        gap("f1", "old"),
+        {"text": "anonymous", "tags": ["wiring_obligation"], "record_type": "gap"},
+        gap("f1", "new"),
     ])
     payload = {}
     inv_env._check_wiring_obligations("inv1", payload)
-    assert payload["unresolved_wiring_obligations"] == 1
-    assert payload["unresolved_wiring_obligation_samples"] == ["no-id three"]
+    assert payload["unresolved_wiring_obligations"] == 2
+    assert payload["unresolved_wiring_obligation_samples"] == ["new", "anonymous"]
 
 
 def test_wiring_skips_unparseable_lines(inv_env):
@@ -1021,17 +1055,18 @@ def test_fast_path_still_calls_ensure_collection_first(wired):
     assert wired._rec["ensure"] == 1
 
 
-def test_main_crashes_if_the_cache_dir_is_unusable(wired, tmp_path):
-    """BUG (fail-open violated): every other degraded path exits 0, but an
-    unusable LOCI_SYNC_CACHE lets cache_path()'s makedirs error escape
-    main(), so the hook dies with a traceback and a non-zero status."""
+def test_main_still_syncs_when_the_cache_dir_is_unusable(wired, tmp_path, capsys):
+    """Fail-open: an unusable LOCI_SYNC_CACHE only costs the fast path. With no
+    readable count the session is treated as changed and synced as normal."""
     seed_session(wired)
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("x")
     wired.CACHE_DIR = str(blocker)
-    with pytest.raises(FileExistsError):
-        run_main(wired, {"session_id": "s1"})
-    assert wired._rec["embed"] == []       # it dies before embedding
+    assert run_main(wired, {"session_id": "s1"}) is None
+    assert len(wired._rec["embed"]) == 1
+    assert [u["payload"]["msg_count"] for u in wired._rec["upsert"]] == [2]
+    assert capsys.readouterr().out.startswith("[session_end_sync] synced s1 (2 msgs) in ")
+    assert blocker.read_text() == "x"
 
 
 def test_main_resyncs_when_the_message_count_changed(wired):
@@ -1102,32 +1137,44 @@ def test_main_appends_the_wiring_note_when_an_investigation_is_active(wired, pat
     assert "| ⚠ UNRESOLVED WIRING OBLIGATIONS: 1" in capsys.readouterr().out
 
 
-def test_wiring_payload_fields_never_reach_qdrant(wired, paths, capsys):
-    """BUG: _check_wiring_obligations() mutates `payload`, but it is called
-    *after* qdrant_upsert() has already serialised and sent it.  The
-    unresolved_wiring_obligations fields are therefore never persisted --
-    they only ever show up in the local stdout line."""
+def test_wiring_payload_fields_reach_qdrant(wired, paths, capsys):
+    """The unresolved-obligation fields are part of the point that is sent, not a
+    mutation applied to the dict after qdrant_upsert() has serialised it."""
     wired.ACTIVE_INV = "inv1"
     d = pathlib.Path(paths["loci"]) / "inv1"
     d.mkdir(parents=True)
     (d / "findings.jsonl").write_text(json.dumps(gap("f1", "wire me")) + "\n")
     seed_session(wired)
 
-    sent = {}
-
+    sent = []
     orig = wired.qdrant_upsert
 
     def spy(pid, vec, payload):
-        sent.update(payload)          # snapshot at send time
+        sent.append(json.loads(json.dumps(payload)))   # snapshot at send time
         return orig(pid, vec, payload)
 
     wired.qdrant_upsert = spy
     with mock.patch.dict(os.environ, {"LOCI_INVESTIGATIONS_DIR": paths["loci"]}):
-        run_main(wired, {"session_id": "s1"})
+        assert run_main(wired, {"session_id": "s1"}) is None
 
-    assert "unresolved_wiring_obligations" not in sent
-    # ...yet the very same dict object has been mutated after the fact
-    assert wired._rec["upsert"][0]["payload"]["unresolved_wiring_obligations"] == 1
+    assert len(sent) == 1
+    assert sent[0]["unresolved_wiring_obligations"] == 1
+    assert sent[0]["unresolved_wiring_obligation_samples"] == ["wire me"]
+    assert sent[0]["session_id"] == "s1"
+    assert "| ⚠ UNRESOLVED WIRING OBLIGATIONS: 1" in capsys.readouterr().out
+
+
+def test_wiring_note_is_not_printed_when_the_upsert_fails(wired, paths, capsys):
+    wired.ACTIVE_INV = "inv1"
+    d = pathlib.Path(paths["loci"]) / "inv1"
+    d.mkdir(parents=True)
+    (d / "findings.jsonl").write_text(json.dumps(gap("f1", "wire me")) + "\n")
+    seed_session(wired)
+    wired._rec["upsert_result"] = False
+    with mock.patch.dict(os.environ, {"LOCI_INVESTIGATIONS_DIR": paths["loci"]}):
+        run_main(wired, {"session_id": "s1"})
+    assert capsys.readouterr().out == ""
+    assert wired.cached_msg_count("s1") == -1
 
 
 def test_main_skips_the_wiring_check_without_an_active_investigation(wired, capsys):
@@ -1307,3 +1354,54 @@ def test_transcript_content_none_for_missing_or_empty(hook, tmp_path):
     # Records with no usable text are not a session.
     short = _write_transcript(tmp_path, [_msg("user", "hi")])
     assert hook.transcript_session_content(short, "s") is None
+
+
+# ---------------------------------------------------------------------------
+# main() over a Claude Code Stop payload
+# The session id is a Claude Code uuid that state.db has never heard of; the
+# transcript is the only record, and it is what must be synced.
+# ---------------------------------------------------------------------------
+
+def test_main_syncs_a_claude_code_session_from_its_transcript(wired, tmp_path, capsys):
+    make_db(wired.STATE_DB, session={"id": "some-hermes-session"},
+            messages=[{"session_id": "some-hermes-session", "role": "user",
+                       "content": "hermes-only message " + "h" * 30, "ts": 1}])
+    sid = "2f0c7c3e-cc-uuid-session"
+    path = _write_transcript(tmp_path, [
+        {"type": "ai-title", "aiTitle": "Fix the hooks"},
+        _msg("user", "please look at the hooks " + "u" * 30, ts="2026-09-24T10:00:00Z"),
+        _msg("assistant", "the hooks were reviewed " + "a" * 30, model="claude-opus-5-5"),
+        _msg("user", "ok"),     # too short to count
+    ])
+    assert run_main(wired, {"session_id": sid, "transcript_path": path}) is None
+
+    assert wired._rec["embed"] == [
+        "USER: please look at the hooks " + "u" * 30
+        + "\n\nASSISTANT: the hooks were reviewed " + "a" * 30]
+    (up,) = wired._rec["upsert"]
+    assert up["id"] == wired.stable_id(sid)
+    p = up["payload"]
+    assert (p["session_id"], p["title"], p["source"], p["model"], p["msg_count"],
+            p["started_at"]) == (sid, "Fix the hooks", "claude-code", "claude-opus-5-5", 2,
+                                 "2026-09-24T10:00:00Z")
+    assert "hermes-only" not in p["content_preview"]
+    assert wired.cached_msg_count(sid) == 2
+    assert capsys.readouterr().out.startswith(
+        f"[session_end_sync] synced {sid[:20]} (2 msgs) in ")
+
+
+def test_main_prefers_state_db_over_the_transcript(wired, tmp_path):
+    seed_session(wired, n=1)
+    path = _write_transcript(tmp_path, [_msg("user", "transcript text " + "t" * 30)])
+    run_main(wired, {"session_id": "s1", "transcript_path": path})
+    (up,) = wired._rec["upsert"]
+    assert up["payload"]["source"] == "web"
+    assert "transcript text" not in wired._rec["embed"][0]
+
+
+def test_main_exits_zero_when_neither_state_db_nor_transcript_has_the_session(wired, tmp_path):
+    make_db(wired.STATE_DB)
+    assert run_main(wired, {"session_id": "cc-uuid",
+                            "transcript_path": str(tmp_path / "missing.jsonl")}) == 0
+    assert wired._rec["embed"] == [] and wired._rec["upsert"] == []
+    assert wired._rec["ensure"] == 0

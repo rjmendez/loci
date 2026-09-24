@@ -299,8 +299,9 @@ def cache_path(session_id: str) -> str:
     return os.path.join(CACHE_DIR, hashlib.md5(session_id.encode()).hexdigest()[:12])
 
 def cached_msg_count(session_id: str) -> int:
-    p = cache_path(session_id)
     try:
+        # inside the try: an unusable cache dir only costs the fast path
+        p = cache_path(session_id)
         with open(p) as f:
             return int(f.read().strip())
     except Exception:
@@ -324,6 +325,9 @@ def _embed_headers() -> dict:
 
 
 def embed(text: str) -> list:
+    if not OLLAMA:
+        raise RuntimeError("no embeddings endpoint configured "
+                           "(set OLLAMA_BASE_URL or MNEMOSYNE_EMBEDDING_API_URL)")
     body = json.dumps({"model": EMBED_MODEL, "input": text}).encode()
     req = urllib.request.Request(OLLAMA, data=body, headers=_embed_headers(), method="POST")
     with urllib.request.urlopen(req, timeout=8) as resp:
@@ -381,9 +385,11 @@ def _check_wiring_obligations(investigation_id: str, payload: dict) -> "str | No
             if (rec.get("record_type") or rec.get("type") or "") == "access":
                 continue
             fid = rec.get("id", "")
-            if fid in seen_ids:
-                continue
-            seen_ids.add(fid)
+            # Only a real id can be deduplicated; id-less records are distinct.
+            if fid:
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
             tags = rec.get("tags", [])
             if "wiring_obligation" in tags and rec.get("record_type") == "gap":
                 unresolved.append(rec.get("text", fid)[:120])
@@ -451,6 +457,19 @@ def main():
         "agent_id":        AGENT_ID,
         "profile":         PROFILE,
     }
+
+    # Before the upsert: the check adds its fields to `payload`, and they only
+    # persist if they are there when the point is serialised.
+    unresolved_note = ""
+    if ACTIVE_INV:
+        try:
+            unresolved_note = _check_wiring_obligations(ACTIVE_INV, payload)
+        except Exception as e:
+            print(f"[session_end_sync] wiring-obligation check failed: {e}", file=sys.stderr)
+            unresolved_note = None
+        if unresolved_note is None:
+            unresolved_note = " | wiring-obligation check FAILED"
+
     try:
         ok = qdrant_upsert(point_id, vector, payload)
     except Exception as e:
@@ -460,16 +479,6 @@ def main():
     if ok:
         write_cache(session_id, sess["msg_count"])
         elapsed = time.monotonic() - t0
-
-        unresolved_note = ""
-        if ACTIVE_INV:
-            try:
-                unresolved_note = _check_wiring_obligations(ACTIVE_INV, payload)
-            except Exception as e:
-                print(f"[session_end_sync] wiring-obligation check failed: {e}", file=sys.stderr)
-                unresolved_note = None
-            if unresolved_note is None:
-                unresolved_note = " | wiring-obligation check FAILED"
 
         print(f"[session_end_sync] synced {session_id[:20]} ({sess['msg_count']} msgs) in {elapsed:.2f}s{unresolved_note}")
 
