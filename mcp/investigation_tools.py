@@ -196,10 +196,24 @@ def _coordination_now_plus(seconds: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
 
+_COORDINATION_DEFAULT_LEASE_SECONDS = 300  # same default as investigation_queue_claim
+
+
+def _coordination_unmet_dependencies(manifest: dict, item: dict) -> list[str]:
+    """Dependency ids that are missing or not yet ``done`` (all-of gating)."""
+    states = {
+        dep.get('id'): dep.get('state')
+        for dep in (manifest.get('coordination') or {}).get('items', [])
+    }
+    return [dep for dep in item.get('dependencies') or [] if states.get(dep) != 'done']
+
+
 def _coordination_lease_expired(item: dict) -> bool:
+    # A claim without a lease is not a live claim: treating it as held would let an
+    # enqueue/import with owner_session but no lease lock the item forever.
     expires = (item.get("lease_expires_at") or "").strip()
     if not expires:
-        return False
+        return True
     try:
         expires_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
         if expires_dt.tzinfo is None:
@@ -384,6 +398,15 @@ def investigation_queue_enqueue(
     item['updated_at'] = _now()
     if item['state'] not in {'queued', 'claimed'}:
         item['state'] = 'queued'
+    if item['state'] == 'claimed':
+        # Every claim carries a lease, so a crashed owner cannot hold the item forever.
+        if not item['owner_session']:
+            return _coordination_error("state='claimed' requires owner_session.")
+        if not item['lease_expires_at']:
+            item['lease_expires_at'] = _coordination_now_plus(_COORDINATION_DEFAULT_LEASE_SECONDS)
+    else:
+        item['owner_session'] = None
+        item['lease_expires_at'] = None
     coordination['items'].append(item)
     _save_manifest(manifest)
     return json.dumps({"queued": True, "item": item}, indent=2)
@@ -417,6 +440,11 @@ def investigation_queue_claim(
     if current_owner and current_owner != owner_session and not _coordination_lease_expired(item):
         return _coordination_error(
             f"Queue item '{item_id}' is already claimed by session '{current_owner}'."
+        )
+    unmet = _coordination_unmet_dependencies(manifest, item)
+    if unmet:
+        return _coordination_error(
+            f"Queue item '{item_id}' has unmet dependencies (must exist and be done): {', '.join(unmet)}"
         )
     item['owner_session'] = owner_session
     item['state'] = 'claimed'
@@ -478,14 +506,37 @@ def investigation_queue_release(
     owner_session: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> str:
-    """Alias for completing a queue item as blocked or cancelled."""
-    return investigation_queue_complete(
-        investigation_id=investigation_id,
-        item_id=item_id,
-        owner_session=owner_session,
-        state='blocked',
-        notes=notes,
-    )
+    """Give up a claim: return the item to ``queued`` with no owner or lease.
+
+    Release is not terminal; any session may claim the item again. To stop the line use
+    ``investigation_queue_complete(state='blocked')``.
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return _coordination_error(f"Investigation '{investigation_id}' not found.")
+    manifest = _coordination_manifest(manifest)
+    item_id = str(item_id).strip()
+    if not item_id:
+        return _coordination_error('item_id is required.')
+    owner_session = str(owner_session).strip() if owner_session is not None else None
+    item = _coordination_require_item(manifest, item_id)
+    if item['state'] in {'done', 'blocked', 'cancelled'}:
+        return _coordination_error(f"Queue item '{item_id}' is already final: {item['state']}")
+    current_owner = item.get('owner_session')
+    if current_owner and current_owner != owner_session:
+        return _coordination_error(
+            f"Queue item '{item_id}' is owned by session '{current_owner}' and cannot be released by '{owner_session}'."
+        )
+    if notes is not None:
+        notes = str(notes).strip()
+        if notes:
+            item['notes'] = notes
+    item['state'] = 'queued'
+    item['owner_session'] = None
+    item['lease_expires_at'] = None
+    item['updated_at'] = _now()
+    _save_manifest(manifest)
+    return json.dumps({"released": True, "item": item}, indent=2)
 
 
 def investigation_queue_status(
@@ -511,6 +562,18 @@ def investigation_queue_status(
                 'state filter must be one of queued, claimed, done, blocked, cancelled.'
             )
         items = [item for item in items if item.get('state') == value]
+    # Derived, read-only fields: the stored state stays 'claimed' after a lease lapses,
+    # so say explicitly whether the lease is live and whether the item can be claimed now.
+    view = []
+    for item in items:
+        lease_expired = item.get('state') == 'claimed' and _coordination_lease_expired(item)
+        open_state = item.get('state') == 'queued' or lease_expired
+        view.append(dict(
+            item,
+            lease_expired=lease_expired,
+            available=open_state and not _coordination_unmet_dependencies(manifest, item),
+        ))
+    items = view
     payload = {
         "investigation_id": investigation_id,
         "queue": items,

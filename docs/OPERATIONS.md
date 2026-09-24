@@ -235,13 +235,14 @@ Loci now supports a durable investigation-scoped coordination queue so parallel 
 2. Enqueue: `investigation_queue_enqueue(...)` with a stable item id, scope, and targets.
 3. Claim lease: `investigation_queue_claim(...)` with `owner_session` and bounded `lease_seconds`.
 4. Heartbeat/renew: re-run `investigation_queue_claim(...)` with the same owner before expiry.
-5. Complete/release: `investigation_queue_complete(...)` with `state=done|blocked|cancelled` (or `investigation_queue_release(...)` alias).
+5. Complete: `investigation_queue_complete(...)` with `state=done|blocked|cancelled`. To hand work back instead, `investigation_queue_release(...)` returns the item to `queued` for any session to claim.
 
 **Conflict-avoidance rules**
 - One owner per item while lease is active.
 - Claims from other sessions fail unless the lease is expired.
 - Completion by non-owners is rejected while another owner’s lease is still valid.
-- Use explicit `dependencies` to serialize truly dependent work only.
+- Use explicit `dependencies` to serialize truly dependent work only: a claim is refused until every dependency exists and is `done`.
+- A claim always carries a lease. A lease-less claim (legacy or imported) counts as expired; `investigation_queue_status` flags expired leases with `lease_expired: true` and claimable items with `available: true`.
 
 **Example MCP calls**
 
