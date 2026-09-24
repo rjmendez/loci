@@ -14,18 +14,22 @@ These fakes replace *dependencies* only, never the unit under test:
     dense embedder in place of the Ollama HTTP call. Texts that share words
     get a higher cosine; identical texts get 1.0.
 
-``FakeVerdictBackend``
-    Records every ``upsert_batch``/``search`` call so a test can assert both
+``fake_rag_retrieval(rows_by_collection)``
+    Scripts the per-collection search under ``rag_context_search`` and records
+    each call; the ranking/decay/assembly code under test runs for real.
+
+``fake_verdict_backend()`` / ``FakeVerdictBackend``
+    Installs a recording loci_verdicts backend so a test can assert both
     "persisted exactly these verdicts" and "was not called at all" (an empty
-    call list) without raising into fail-open code.
+    list) without raising into fail-open code.
+
+``fake_conflict_judge(verdict)``
+    Stand-in for the LLM contradiction judge used by conflict detection;
+    records the (new, neighbour) pairs it was asked about.
 
 ``fake_lazy_generate(responses)``
-    Stand-in for ``server._lazy_generate``: answers from a list (or a
-    callable), records each prompt, and never touches a model.
-
-``fake_conflict_verifier(verdict)``
-    Stand-in for the LLM entailment judge used by conflict detection; records
-    the (a, b) pairs it was asked about.
+    Stand-in for a ``_lazy_generate``/``gen_fn`` model call: answers from a
+    list (or a callable), records each prompt, and never touches a model.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import contextlib
 import hashlib
 import math
 import re
-from typing import Callable, Iterable
+from typing import Callable
 from unittest import mock
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -167,26 +171,28 @@ def fake_rag_retrieval(rows_by_collection: dict):
 
 
 class FakeVerdictBackend:
-    """Recording stand-in for memcheck's Qdrant verdict backend."""
+    """Recording stand-in for the loci_verdicts QdrantBackend (verdict_ops).
 
-    def __init__(self, search_results: Iterable | None = None):
-        self.upserts: list[list] = []
-        self.searches: list[tuple] = []
-        self._search_results = list(search_results or [])
+    ``record`` is async like memcheck's backend. ``recorded`` lists every
+    Verdict handed to it; a test that expects no persistence asserts it is
+    empty rather than making the backend raise into fail-open code.
+    """
 
-    def upsert_batch(self, verdicts) -> None:
-        self.upserts.append(list(verdicts))
+    def __init__(self):
+        self.recorded: list = []
 
-    def upsert(self, verdict) -> None:
-        self.upserts.append([verdict])
+    async def record(self, verdict) -> None:
+        self.recorded.append(verdict)
 
-    def search(self, *args, **kwargs):
-        self.searches.append((args, kwargs))
-        return list(self._search_results)
 
-    @property
-    def upserted(self) -> list:
-        return [v for batch in self.upserts for v in batch]
+@contextlib.contextmanager
+def fake_verdict_backend():
+    """Install a FakeVerdictBackend as verdict_ops' lazily-built backend."""
+    import verdict_ops
+
+    backend = FakeVerdictBackend()
+    with mock.patch.object(verdict_ops, "_get_verdict_backend", lambda: backend):
+        yield backend
 
 
 @contextlib.contextmanager

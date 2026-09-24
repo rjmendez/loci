@@ -1668,18 +1668,48 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
             confidence="high",
         )
 
-        reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+        # No model: the deterministic fallback ladder produces the summaries.
+        patches = self._patched_memcheck_llm(available=False)
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
         self.assertNotIn("error", reflect_result)
-        self.assertIn("summary_l1", reflect_result)
-        self.assertIn("summary_l2", reflect_result)
-        self.assertIsInstance(reflect_result["summary_l1"], list)
-        self.assertIsInstance(reflect_result["summary_l2"], str)
+        self.assertEqual(len(reflect_result["summary_l1"]), 1)
+        self.assertTrue(reflect_result["summary_l1"][0].endswith(
+            "The database connection pool is exhausted under load."))
+        self.assertTrue(reflect_result["summary_l2"].startswith("Investigation with 1 finding."))
 
-        # Verify the summaries were persisted to the manifest
-        load_result = _json(server.investigation_load(investigation_id=inv_id))
-        manifest = load_result["manifest"]
-        self.assertIn("summary_l1", manifest)
-        self.assertIn("summary_l2", manifest)
+        # Persisted: read manifest.json from disk (not the in-process cache,
+        # which reflect mutates in place) and compare with the reflect output.
+        on_disk = json.loads((server.MEMORY_DIR / inv_id / "manifest.json").read_text())
+        self.assertEqual(on_disk["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(on_disk["summary_l2"], reflect_result["summary_l2"])
+
+    def test_investigation_reflect_persists_model_summaries(self):
+        """With a (scripted) model the L1 bullets and L2 text are the model's, and
+        those exact values are what investigation_load(fidelity='summary') serves."""
+        inv_id = _new_id("ref-sum-llm")
+        self._setup_investigation_for_reflect(inv_id)
+        patches = self._patched_memcheck_llm(
+            available=True,
+            responses=[
+                json.dumps(["DB timeout observed on 10.0.0.9.", "Replica routing unverified."]),
+                "DB timeouts are established; replica routing is unverified.",
+                "- finding-3 marks the biggest gap.",
+            ],
+        )
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+        self.assertEqual(reflect_result["summary_l1"],
+                         ["DB timeout observed on 10.0.0.9.", "Replica routing unverified."])
+        self.assertEqual(reflect_result["summary_l2"],
+                         "DB timeouts are established; replica routing is unverified.")
+        on_disk = json.loads((server.MEMORY_DIR / inv_id / "manifest.json").read_text())
+        self.assertEqual(on_disk["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(on_disk["summary_l2"], reflect_result["summary_l2"])
+        server._manifest_cache.clear()
+        loaded = _json(server.investigation_load(investigation_id=inv_id, fidelity="summary"))
+        self.assertEqual(loaded["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(loaded["summary_l2"], reflect_result["summary_l2"])
 
     def test_investigation_reflect_populates_self_critique_when_model_available(self):
         inv_id = _new_id("ref-critique")
@@ -3311,17 +3341,36 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertIn("claim_results", result)
         self.assertGreater(len(result["claim_results"]), 0)
 
+    def _setup_tool_verified(self, text):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Pre-answer tool evidence")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id, finding_type="observed", text=text,
+            source="psql --version", confidence="high",
+            metadata={"evidence_provenance_tier": "tool_verified"},
+        ))
+        return inv_id, stored["finding_id"]
+
     def test_claim_supported_is_bool_or_numeric(self):
-        inv_id = self._setup_investigation("The database uses PostgreSQL 15.")
+        """Pin the verdict: tool-verified evidence supports the matching claim and
+        not an unrelated one (same investigation, positive and negative twin)."""
+        inv_id, fid = self._setup_tool_verified("The database uses PostgreSQL 15.")
         result = _json(server.investigation_pre_answer_check(
             investigation_id=inv_id,
-            claims="The database uses PostgreSQL.",
+            claims=["The database uses PostgreSQL 15.",
+                    "The cache layer is Memcached on port 11211."],
+            record=False,
         ))
-        self.assertIn("claim_results", result)
-        first = result["claim_results"][0]
-        # Each result has 'supported' (bool) and 'contradicted' (bool)
-        self.assertIn("supported", first)
-        self.assertIn(type(first["supported"]), (bool, int))
+        supported, unrelated = result["claim_results"]
+        self.assertIs(supported["supported"], True)
+        self.assertIs(supported["contradicted"], False)
+        self.assertEqual(supported["support_basis"], "lexical")
+        self.assertIn(fid, [r["evidence_id"] for r in supported["support_refs"]])
+        self.assertIs(unrelated["supported"], False)
+        self.assertEqual(unrelated["support_refs"], [])
+        self.assertEqual(result["support_count"], 1)
+        self.assertEqual(result["unsupported_claims"],
+                         ["The cache layer is Memcached on port 11211."])
 
     def test_missing_investigation_returns_error(self):
         result = _json(server.investigation_pre_answer_check(
@@ -3349,13 +3398,51 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertEqual(len(result["claim_results"]), 2)
 
     def test_record_false_skips_persistence(self):
-        inv_id = self._setup_investigation("Fact about the system.")
-        result = _json(server.investigation_pre_answer_check(
-            investigation_id=inv_id,
-            claims="Fact about the system.",
-            record=False,
-        ))
-        self.assertIn("claim_results", result)
+        """A working verdict backend is installed and record=False must not use it."""
+        from loci_fakes import fake_verdict_backend
+
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with fake_verdict_backend() as backend:
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims="The service listens on port 8443.",
+                record=False,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 0, "qdrant": "disabled"})
+        self.assertEqual(backend.recorded, [])
+        first = result["claim_results"][0]
+        self.assertIsNone(first["verdict_type"])
+        self.assertEqual(first["prior_occurrences"], 0)
+
+    def test_record_true_persists_one_verdict_per_claim(self):
+        """Positive twin of record=False on the same fixture."""
+        from loci_fakes import fake_verdict_backend
+
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with fake_verdict_backend() as backend:
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims=["The service listens on port 8443.", "The service is written in Rust."],
+                record=True,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 2, "qdrant": "ok"})
+        self.assertEqual([v.verdict_type for v in backend.recorded],
+                         ["claim_supported", "claim_unsupported"])
+        self.assertEqual([cr["verdict_type"] for cr in result["claim_results"]],
+                         ["claim_supported", "claim_unsupported"])
+        self.assertEqual(backend.recorded[0].subject_excerpt,
+                         f"{inv_id}: The service listens on port 8443.")
+
+    def test_record_true_without_backend_is_reported_unavailable(self):
+        """Degraded branch (hermetic, no Qdrant): reported, not silently 'ok'."""
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with mock.patch("verdict_ops._get_verdict_backend", lambda: None):
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims="The service listens on port 8443.",
+                record=True,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 0, "qdrant": "unavailable"})
 
     def test_model_asserted_support_only_reports_unsupported(self):
         inv_id = _new_id("pac")
