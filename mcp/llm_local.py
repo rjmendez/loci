@@ -24,20 +24,15 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
-from pathlib import Path
 from typing import Optional
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+# route_audit is a sibling module in mcp/, which is already on sys.path whenever
+# this module is importable. Do not put the repo root on sys.path: its mcp/ dir
+# would then compete with the installed `mcp` SDK package for the name `mcp`.
 try:
-    from mcp.route_audit import record_route_event
-except Exception:
-    try:
-        from route_audit import record_route_event
-    except Exception:
-        record_route_event = None
+    from route_audit import record_route_event
+except Exception:  # pragma: no cover - audit is optional, never block generation
+    record_route_event = None
 
 _LOG = logging.getLogger("loci-mcp.llm_local")
 
@@ -249,9 +244,9 @@ def generate(prompt: str,
             if fallback is not None:
                 _LOG.info("llm_local fallback tier=%s model=%s",
                           fallback.get("tier", "unknown"), fallback.get("model", ""))
-                _log_route_event(tier="local", route="vllm_fallback", reason="ollama_failure", prompt=prompt, model=model, degraded=True, ok=True, fallback=fallback.get("tier", "vllm"), status_code=0)
+                _log_route_event(tier="local", route="vllm_fallback", reason="ollama_failure", prompt=prompt, model=model, degraded=True, ok=True, fallback=fallback.get("tier", "vllm"))
                 return fallback
-            _log_route_event(tier="local", route="ollama", reason=f"ollama {type(exc).__name__}", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
+            _log_route_event(tier="local", route="ollama", reason=f"ollama {type(exc).__name__}", prompt=prompt, model=model, degraded=True, ok=False)
             return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
 
     if fmt == "json":
@@ -259,11 +254,11 @@ def generate(prompt: str,
         try:
             json.loads(text)
         except Exception as exc:
-            _log_route_event(tier="local", route="ollama", reason="json_invalid", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
+            _log_route_event(tier="local", route="ollama", reason="json_invalid", prompt=prompt, model=model, degraded=True, ok=False)
             return {"text": text, "ok": False, "model": model,
                     "why": f"response was not valid JSON: {exc}"[:200]}
 
-    _log_route_event(tier="local", route="ollama", reason="generate_success", prompt=prompt, model=model, degraded=False, ok=True, status_code=0)
+    _log_route_event(tier="local", route="ollama", reason="generate_success", prompt=prompt, model=model, degraded=False, ok=True)
     return {"text": text, "ok": True, "model": model}
 
 

@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_repo_root = str(Path(__file__).resolve().parent.parent)
-for _candidate in (_repo_root, str(Path(__file__).resolve().parent.parent / "mcp")):
-    if _candidate not in sys.path:
-        sys.path.insert(0, _candidate)
-try:
-    from mcp.route_audit import record_route_event
-except Exception:
+
+def _load_record_route_event():
+    """Load mcp/route_audit.py by file path.
+
+    Putting the repo root or mcp/ on sys.path from a script would let the repo's
+    mcp/ dir compete with the installed `mcp` SDK package, and let mcp/*.py
+    modules (server, verify, compact, ...) shadow unrelated imports.
+    """
     try:
-        from route_audit import record_route_event
+        path = Path(__file__).resolve().parent.parent / "mcp" / "route_audit.py"
+        spec = importlib.util.spec_from_file_location("_loci_route_audit", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.record_route_event
     except Exception:
-        record_route_event = None
+        return None
+
+
+record_route_event = _load_record_route_event()
 
 
 _VALID_PRIORITIES = {"P0", "P1", "P2"}
@@ -37,16 +47,17 @@ class RouteDecision:
 def _record_decision(decision: "RouteDecision") -> None:
     if record_route_event is None:
         return
-    record_route_event(
-        tier="hybrid_lane",
-        route=decision.lane_id,
-        reason=decision.reason,
-        prompt="",
-        model="",
-        degraded=decision.degraded,
-        ok=True,
-        source="hybrid_lane_router",
-    )
+    try:
+        record_route_event(
+            tier="hybrid_lane",
+            route=decision.lane_id,
+            reason=decision.reason,
+            degraded=decision.degraded,
+            source="hybrid_lane_router",
+        )
+    except Exception:
+        # Routing is a pure decision; auditing it must never change the answer.
+        pass
 
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
