@@ -145,7 +145,9 @@ class AccessRowsTest(unittest.TestCase):
             fh.write('{"id": "torn-record", "text": "half written\n')
         self._store("Beta finding about 10.3.3.3")
         n_before = len(self.fpath.read_text().splitlines())
-        r = _j(server.memory_promote(self.inv, a, "hot"))
+        # promote reports ok only once the point is indexed; stub a landed upsert.
+        with mock.patch.object(server, "_qdrant_upsert", lambda *a, **k: True):
+            r = _j(server.memory_promote(self.inv, a, "hot"))
         self.assertTrue(r.get("ok"), r)
         text = self.fpath.read_text()
         self.assertEqual(len(text.splitlines()), n_before)

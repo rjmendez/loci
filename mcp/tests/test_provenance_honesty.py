@@ -296,7 +296,8 @@ class PromotionGateTest(_Isolated):
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="observed", text="Host foo runs nginx 1.24",
             source="nmap", confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
-        with mock.patch.object(verify, "_lazy_generate", _confirmed_gen([])):
+        # Promotion is ok only once the point is indexed; stub a landed upsert.
+        with mock.patch.object(verify, "_lazy_generate", _confirmed_gen([])),              mock.patch.object(server, "_qdrant_upsert", lambda *a, **k: True):
             out = _j(server.loci_validated_knowledge_promotion(investigation_id=inv, finding_id=fid))
         self.assertEqual(out["status"], "promoted", out)
         self.assertEqual(out["reason"], "verified_promoted")

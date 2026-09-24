@@ -112,6 +112,7 @@ def test_rag_context_search_default_and_normal_are_identical(monkeypatch, tmp_pa
         "collections_searched": ["loci_memory"],
         "collections_failed": [],
         "excluded_retracted": 0,
+        "excluded_acl": 0,
         "retraction_filter": {"status": "ok"},
         "qdrant_available": True,
     }, indent=2)

@@ -231,6 +231,7 @@ AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 # ---------------------------------------------------------------------------
 
 import inv_store  # noqa: E402
+import caller_identity  # noqa: E402
 # Lambda, not the Path value: tests rebind server.MEMORY_DIR to a tmpdir.
 inv_store.register(lambda: MEMORY_DIR)
 # Re-exported so server.<helper>() keeps resolving for callers and test patches.
@@ -494,6 +495,7 @@ from ladybug_ops import (  # noqa: E402,F401
 import mnemo_ops  # noqa: E402,F401
 from mnemo_ops import (  # noqa: E402,F401
     _mnemo_bank, _get_mnemo_funcs, _mnemo_remember, _coerce_mnemo_results, _mnemo_recall,
+    _mnemo_set_retracted,
 )
 
 
@@ -1076,10 +1078,13 @@ def _apply_lifecycle(findings: list[dict], investigation_id: str) -> None:
     """In-place: stamp effective ``resolution`` (append-log override else stored/'open')
     and ``stale`` (only when the finding carries usable code_refs). Fail-open."""
     overrides = _load_resolution_overrides(investigation_id)
+    tiers = inv_store._load_provenance_overrides(investigation_id)
     for f in findings:
         if not isinstance(f, dict):
             continue
         fid = str(f.get("id", ""))
+        if fid and fid in tiers:
+            f.update(inv_store._apply_provenance_override(f, tiers[fid]))
         if fid and fid in overrides:
             f["resolution"] = overrides[fid]
         elif not f.get("resolution"):
@@ -1680,7 +1685,9 @@ def build_validation_evidence(
     investigation_id: str,
     min_confidence: str,
 ) -> tuple[list[dict], dict]:
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    # Backfilled provenance tiers (provenance_updates.jsonl) overlay untagged rows.
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     scoped_audit = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
     global_recent_audit = _collect_recent_global_audit(limit=150, days=2)
     audit_lane, scoped_audit, global_recent_audit = _audit_lane_state(
@@ -2953,20 +2960,31 @@ def docs_ingest_indexer(
     return json.dumps(out)
 
 
-def _docs_search_matches_text(text: str, query: str) -> bool:
-    """Return True when a query matches an indexed document string."""
+def _docs_search_score(text: str, query: str) -> float:
+    """Lexical match score of ``query`` against an indexed document string.
+
+    1.0 when the whole query occurs as a phrase; otherwise the fraction of
+    distinct query tokens that occur in the text (0.0 = no match). This is the
+    only relevance signal docs_search has. It is lexical, not semantic, and is
+    reported as such (``score_kind``) rather than presented as a similarity.
+    """
     if not text or not query:
-        return False
+        return 0.0
     haystack = text.lower()
     needle = query.lower().strip()
     if not needle:
-        return False
+        return 0.0
     if needle in haystack:
-        return True
-    tokens = [token for token in re.findall(r"[A-Za-z0-9]+", needle) if token]
+        return 1.0
+    tokens = sorted({token for token in re.findall(r"[A-Za-z0-9]+", needle) if token})
     if not tokens:
-        return False
-    return any(token in haystack for token in tokens)
+        return 0.0
+    return round(sum(1 for token in tokens if token in haystack) / len(tokens), 4)
+
+
+def _docs_search_matches_text(text: str, query: str) -> bool:
+    """Return True when a query matches an indexed document string."""
+    return _docs_search_score(text, query) > 0.0
 
 
 @mcp.tool()
@@ -3029,7 +3047,8 @@ def docs_search(
             str(metadata.get("doc_summary") or ""),
             str(metadata.get("content_excerpt") or ""),
         ])
-        if not _docs_search_matches_text(search_text, q):
+        score = _docs_search_score(search_text, q)
+        if score <= 0.0:
             continue
 
         hit = {
@@ -3037,13 +3056,17 @@ def docs_search(
             "path": str(metadata.get("source_path") or ""),
             "summary": summary,
             "finding_id": finding.get("id"),
+            "score": score,
+            "score_kind": "lexical",
+            "origin": "docs_search",
         }
         if include_excerpt and metadata.get("content_excerpt"):
             hit["excerpt"] = str(metadata["content_excerpt"])[:1000]
         results.append(hit)
 
-        if len(results) >= n:
-            break
+    # Best lexical match first; ties keep file order (the sort is stable).
+    results.sort(key=lambda h: -h["score"])
+    results = results[:n]
 
     if not results:
         return json.dumps({
@@ -3102,7 +3125,12 @@ def docs_recall(
             "finding_id": item.get("finding_id"),
             "excerpt": item.get("excerpt"),
             "source": "docs_search",
-            "score": 0.95,
+            # docs_search's own match score (lexical phrase/token overlap), never
+            # a constant: a fixed 0.95 read as a strong semantic hit even when
+            # one shared token was the only match.
+            "score": item.get("score"),
+            "score_kind": item.get("score_kind", "lexical"),
+            "origin": item.get("origin", "docs_search"),
         })
 
     if result.get("error") and not docs_results:
@@ -6893,6 +6921,104 @@ def _retract_quarantine_verdict(
         return False
 
 
+def _retract_propagation_enabled() -> bool:
+    return os.environ.get("LOCI_RETRACT_PROPAGATE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _qdrant_set_retracted(finding_ids: list[str], *, retracted: bool, ts: str) -> dict:
+    """Flag (or unflag) the findings' own Qdrant points as retracted. Soft.
+
+    Sets ``retracted`` (and ``retracted_at`` / ``restored_at``) on each point's
+    payload; the vector and the rest of the payload stay, so memory_restore
+    flips it back and nothing is deleted. Points are updated one at a time: a
+    finding with no point (cold tier, never indexed) is counted as ``missing``
+    rather than failing the batch.
+
+    Returns ``{status, updated, missing, failed}``; status is ``ok``,
+    ``unavailable`` (no client), ``partial`` or ``failed``.
+    """
+    ids = sorted({str(f) for f in finding_ids or [] if f})
+    out = {"status": "ok", "updated": 0, "missing": 0, "failed": 0}
+    if not ids:
+        return out
+    client, col = _get_qdrant()
+    if client is None:
+        return {**out, "status": "unavailable"}
+    payload = ({"retracted": True, "retracted_at": ts} if retracted
+               else {"retracted": False, "restored_at": ts})
+    errors: list[str] = []
+    for n, fid in enumerate(ids):
+        try:
+            client.set_payload(collection_name=col, payload=payload, points=[fid], wait=True)
+            out["updated"] += 1
+        except Exception as exc:
+            text = str(exc).lower()
+            if "not found" in text or "no point" in text or "404" in text:
+                out["missing"] += 1
+                continue
+            # Anything else (unreachable, timeout, auth) will fail for the rest
+            # too; this runs under the investigation lock, so stop here rather
+            # than wait out one client timeout per remaining id.
+            out["failed"] += len(ids) - n
+            errors.append(f"{fid}: {str(exc)[:120]}")
+            break
+    if out["failed"]:
+        out["status"] = "failed" if not out["updated"] else "partial"
+        out["errors"] = errors[:5]
+        logger.warning("retraction flag not propagated to %d Qdrant point(s): %s", out["failed"], errors[:3])
+    return out
+
+
+def _propagate_retraction(finding_ids: list[str], *, retracted: bool, ts: str,
+                          mnemo_stamps: Optional[list[str]] = None) -> dict:
+    """Push a retract/restore to the Qdrant point payload and Mnemosyne rows.
+
+    JSONL (retractions.jsonl) stays the source of truth and every read path
+    filters by it; this makes the stores that recall reads directly agree with
+    it. Fail-open per store, but never silent: each store reports its status.
+    """
+    if not _retract_propagation_enabled():
+        return {"qdrant": {"status": "disabled"}, "mnemosyne": {"status": "disabled"}}
+    try:
+        q = _qdrant_set_retracted(finding_ids, retracted=retracted, ts=ts)
+    except Exception as exc:  # never let propagation undo an applied tombstone
+        q = {"status": "failed", "error": str(exc)[:200]}
+    try:
+        m = _mnemo_set_retracted(finding_ids, retracted=retracted, stamps=mnemo_stamps)
+    except Exception as exc:
+        m = {"status": "failed", "error": str(exc)[:200]}
+    return {"qdrant": q, "mnemosyne": m}
+
+
+def _retraction_mnemo_stamps(investigation_id: str, finding_id: str) -> list[str]:
+    """Every Mnemosyne valid_until stamp memory_retract wrote for this finding."""
+    stamps: list[str] = []
+    for rec in _read_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl"):
+        if not isinstance(rec, dict) or rec.get("action") != "retract":
+            continue
+        if finding_id not in [str(x) for x in rec.get("retracted_finding_ids") or []]:
+            continue
+        stamp = ((rec.get("propagation") or {}).get("mnemosyne") or {}).get("stamp")
+        if stamp:
+            stamps.append(str(stamp))
+    return stamps
+
+
+def _owner_only_denied(manifest: dict, investigation_id: str) -> Optional[str]:
+    """Owner-only tools (retract/restore): a permission_denied reply, or None.
+
+    The caller is the transport-bound identity (per-agent MCP token, A2A
+    session) when there is one, else this process's AGENT_ID. No tool argument
+    can name a different caller.
+    """
+    _owner = manifest.get("owner", "")
+    _who = caller_identity.bound_agent_id() or AGENT_ID
+    if _owner and _owner != _who:
+        return json.dumps({"error": "permission_denied",
+                           "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    return None
+
+
 @mcp.tool()
 def memory_retract(
     investigation_id: str,
@@ -6940,9 +7066,9 @@ def memory_retract(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-    _owner = manifest.get("owner", "")
-    if _owner and _owner != AGENT_ID:
-        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    _denied = _owner_only_denied(manifest, investigation_id)
+    if _denied:
+        return _denied
     if not str(target or "").strip():
         return json.dumps({"error": "target must be a non-empty finding id or claim/entity string"})
 
@@ -6994,6 +7120,11 @@ def memory_retract(
                 # findings.jsonl is not rewritten: investigation_as_of reads the
                 # retraction intervals from retractions.jsonl, so restore is an exact inverse.
 
+                # Flag the findings' own index entries too, so a reader that goes
+                # to Qdrant or Mnemosyne directly (not through Loci's filters) also
+                # sees them as retracted. Soft: restore reverses both.
+                propagation = _propagate_retraction(contaminated_ids, retracted=True, ts=ts)
+
                 _append_jsonl(audit_path, {
                     "action": "retract",
                     "ts": ts,
@@ -7004,6 +7135,7 @@ def memory_retract(
                     "count": len(contaminated_ids),
                     "verdicts_forgotten": verdicts_forgotten,
                     "scope_semantic": scope_semantic,
+                    "propagation": propagation,
                 })
     except StoreBusyError as exc:
         logger.info("memory_retract busy for %s/%s: %s", investigation_id, target, exc)
@@ -7027,7 +7159,10 @@ def memory_retract(
         "verdicts_forgotten": verdicts_forgotten,
         "applied": True,
         "quarantine_verdict_recorded": quarantine_recorded,
-        "reversible": "only retractions.jsonl was appended; findings.jsonl is untouched; reverse with memory_restore",
+        "propagation": propagation,
+        "reversible": ("retractions.jsonl was appended and findings.jsonl is untouched; the Qdrant "
+                       "point payload is flagged retracted=true and matching Mnemosyne rows get "
+                       "valid_until (see propagation). Nothing is deleted; memory_restore reverses all of it."),
     }, indent=2)
 
 
@@ -7059,9 +7194,9 @@ def memory_restore(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-    _owner = manifest.get("owner", "")
-    if _owner and _owner != AGENT_ID:
-        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    _denied = _owner_only_denied(manifest, investigation_id)
+    if _denied:
+        return _denied
 
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
 
@@ -7104,11 +7239,16 @@ def memory_restore(
                     "ts": ts,
                     "active": False,
                 })
+                propagation = _propagate_retraction(
+                    [target_fid], retracted=False, ts=ts,
+                    mnemo_stamps=_retraction_mnemo_stamps(investigation_id, target_fid),
+                )
                 _append_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl", {
                     "action": "restore",
                     "ts": ts,
                     "finding_id": target_fid,
                     "reason": reason or "restore",
+                    "propagation": propagation,
                 })
     except StoreBusyError as exc:
         logger.info("memory_restore busy for %s/%s: %s", investigation_id, target_fid, exc)
@@ -7118,6 +7258,7 @@ def memory_restore(
         "finding_id": target_fid,
         "restored": True,
         "reason": reason or "restore",
+        "propagation": propagation,
     }, indent=2)
 
 
@@ -7614,7 +7755,8 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
 
     import verify as _v
 
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     overrides = _load_resolution_overrides(investigation_id)
     retracted = _load_retracted_ids(investigation_id)
 
@@ -8091,6 +8233,7 @@ def rag_context_search(
     decay: bool = True,
     expand_query: Optional[bool] = None,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Run hybrid RAG over Qdrant and return prompt-ready cited context.
@@ -8129,10 +8272,15 @@ def rag_context_search(
             ``+4% nDCG@10`` with no regression.
         mode: "normal" (default) for the legacy markdown block, or "compact" for
             deterministic cited one-liners plus slim source metadata.
+        requesting_agent_id: Optional agent_id to narrow ACL visibility. Hits
+            from an investigation whose ACL the caller cannot read are dropped
+            and counted in ``excluded_acl``. The caller is the transport-bound
+            identity (or this process); this argument can only narrow it.
 
     Returns:
         JSON ``{query, context, sources, total_chars, truncated, result_count,
-        mode, collections_searched, qdrant_available}``.
+        mode, collections_searched, qdrant_available, excluded_retracted,
+        excluded_acl}``.
     """
     if not query or not query.strip():
         return json.dumps({"error": "query must not be empty", "results": [], "query": query})
@@ -8183,6 +8331,8 @@ def rag_context_search(
         with_superseded=True,
     )
     all_results, _rag_excluded = _rfilter.split(all_results)
+    # ACL: hits from investigations the caller may not read never reach the context.
+    all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
 
     # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
     if decay:
@@ -8216,6 +8366,7 @@ def rag_context_search(
     ctx["collections_searched"] = _collections
     ctx["collections_failed"] = sorted(_failed_cols)
     ctx["excluded_retracted"] = len(_rag_excluded)
+    ctx["excluded_acl"] = _rag_acl_excluded
     ctx["retraction_filter"] = _rfilter.status()
     ctx["qdrant_available"] = True
     if expansion_info is not None:
@@ -8413,6 +8564,8 @@ def memory_surface(
             with_superseded=True,
         )
         candidates, _surface_excluded = _rfilter.split(candidates)
+        # ACL: never surface findings from an investigation the caller cannot read.
+        candidates, _surface_acl_excluded = inv_store._acl_filter_rows(candidates)
 
         # Apply lower score threshold (0.25) to allow tangentially relevant findings
         _SURFACE_SCORE_THRESHOLD = 0.25
@@ -8462,6 +8615,7 @@ def memory_surface(
             "context_used": context[:200] if len(context) > 200 else context,
             "count": len(surfaced),
             "excluded_retracted": len(_surface_excluded),
+            "excluded_acl": _surface_acl_excluded,
             "retraction_filter": _rfilter.status(),
         }, indent=2)
 
@@ -9795,7 +9949,8 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
 
     Rewrites findings.jsonl atomically, updating the tier field of the target
     finding. Returns a dict with {finding_id, old_tier, new_tier, ok} or {error}.
-    All Qdrant operations are fail-open.
+    Qdrant failures never undo the JSONL change, but they do set ok:false:
+    ``ok`` means the index matches the recorded tier.
     """
     if new_tier not in {"hot", "warm", "cold"}:
         return {"error": "tier must be one of: hot, warm, cold"}
@@ -9816,18 +9971,19 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
                 return {"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."}
 
             old_tier = target.get("tier", "warm")
-            if old_tier == new_tier:
-                return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
-
             text = str(target.get("text", "") or "")
-            # Line-preserving rewrite: a torn or unparseable line stays as it is.
-            inv_store._rewrite_jsonl_preserving(
-                findings_path,
-                lambda f: {**f, "tier": new_tier} if str(f.get("id", "")) == finding_id else None,
-            )
+            # Same tier: nothing to rewrite, but the index step below still runs.
+            # A promote whose upsert failed reports ok:false and must be
+            # retryable; returning ok:true here would skip the upsert on retry.
+            if old_tier != new_tier:
+                # Line-preserving rewrite: a torn or unparseable line stays as it is.
+                inv_store._rewrite_jsonl_preserving(
+                    findings_path,
+                    lambda f: {**f, "tier": new_tier} if str(f.get("id", "")) == finding_id else None,
+                )
 
             # If promoting to hot, update manifest notes before releasing the lock.
-            if new_tier == "hot":
+            if new_tier == "hot" and old_tier != "hot":
                 manifest = _load_manifest_fresh(investigation_id)
                 if manifest is None:
                     raise FileNotFoundError(f"Investigation '{investigation_id}' not found.")
@@ -9840,27 +9996,48 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
     except Exception as exc:
         return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
 
-    # Handle Qdrant changes based on tier transition
+    # Handle Qdrant changes based on tier transition. hot and warm are documented
+    # as "Qdrant indexed", so a tier change into them succeeds only when the
+    # upsert actually landed; _qdrant_upsert returns False on a swallowed failure
+    # (no client, embed failure, upsert exception).
+    result = {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
     try:
         if new_tier == "cold":
             # Remove from Qdrant vector index
             client, col = _get_qdrant()
-            if client is not None:
+            if client is None:
+                # Unknown, not "removed": the point may still be in the index.
+                result["qdrant_removed"] = None
+                result["degraded"] = True
+            else:
                 try:
                     from qdrant_client.models import PointIdsList
                     client.delete(col, points_selector=PointIdsList(points=[finding_id]))
+                    result["qdrant_removed"] = True
                 except Exception as exc:
                     logger.warning("Qdrant delete failed (demote to cold) — JSONL updated: %s", exc)
-        elif new_tier in ("warm", "hot") and old_tier == "cold":
-            # Re-index in Qdrant (was cold, now searchable)
-            _qdrant_upsert(finding_id, text, target)
-        elif new_tier == "hot" and old_tier == "warm":
-            # Already in Qdrant; just ensure it stays indexed (upsert is idempotent)
-            _qdrant_upsert(finding_id, text, target)
+                    result.update(ok=False, qdrant_removed=False, degraded=True,
+                                  error=f"tier recorded as cold but the Qdrant point was not removed: {exc}")
+        elif old_tier == "hot":
+            # hot -> hot/warm: the point is already indexed; nothing to re-assert.
+            pass
+        else:
+            # cold -> warm/hot re-indexes; warm -> hot and a same-tier retry
+            # re-assert the point (upsert is idempotent).
+            indexed = bool(_qdrant_upsert(finding_id, text, target))
+            result["qdrant_indexed"] = indexed
+            if not indexed:
+                result.update(
+                    ok=False, degraded=True, retryable=True,
+                    error=(f"tier recorded as {new_tier} but the finding was not indexed in "
+                           "Qdrant (unavailable, embedding failed or upsert failed); "
+                           "retry memory_promote once Qdrant is reachable"),
+                )
     except Exception as exc:
-        logger.warning("Qdrant tier-change operation failed (fail-open): %s", exc)
+        logger.warning("Qdrant tier-change operation failed: %s", exc)
+        result.update(ok=False, degraded=True, error=f"Qdrant tier-change operation failed: {exc}")
 
-    return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -9906,7 +10083,8 @@ def loci_validated_knowledge_promotion(
     if not investigation_id or not finding_id:
         return json.dumps({"status": "blocked", "error": "investigation_id and finding_id are required."})
 
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     finding = next((f for f in findings if str(f.get("id") or "") == str(finding_id)), None)
     if not finding:
         return json.dumps({"status": "blocked", "error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
@@ -10019,7 +10197,11 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
         tier: Target tier — "hot", "warm", or "cold".
 
     Returns:
-        JSON: {finding_id, old_tier, new_tier, ok: true}
+        JSON: {finding_id, old_tier, new_tier, ok, qdrant_indexed}
+        ``ok`` is true only when the finding reached the Qdrant index. When the
+        upsert fails (Qdrant down, embedding failed) the tier is still recorded
+        but the reply is ``ok:false, degraded:true, retryable:true``; calling
+        memory_promote again with the same tier retries the index write.
         On error: {error: "<message>"}
     """
     try:
@@ -10906,6 +11088,18 @@ def memory_route(
                 "routed": [],
             })
 
+        # Retracted findings keep their Qdrant point (flagged retracted=true);
+        # drop them, and every hit from an investigation the caller cannot read,
+        # before ranking, so neither they nor the include_trace candidate list
+        # leak. agent_id is caller-supplied and can only narrow the ACL identity.
+        _route_rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in raw_hits if r.get("investigation_id")},
+            with_texts=False,
+        )
+        raw_hits, _route_retracted = _route_rfilter.split(raw_hits)
+        raw_hits, _route_acl_excluded = inv_store._acl_filter_rows(raw_hits, agent_id)
+
         policy_run = _route_apply_policy(
             raw_hits,
             top_k=top_k,
@@ -10927,6 +11121,9 @@ def memory_route(
             "total_before_dedup": metrics["candidate_count"],
             "total_after_dedup": metrics["after_top_k"],
             "count": len(routed),
+            "excluded_retracted": len(_route_retracted),
+            "excluded_acl": _route_acl_excluded,
+            "retraction_filter": _route_rfilter.status(),
             "routing_aggregation": aggregation,
             "slow_modulation": {
                 "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
@@ -11667,14 +11864,34 @@ class _BearerAuthMiddleware:
 
     /health stays open so liveness probes work without the secret; it returns a
     fixed {"status": "ok"} and discloses nothing.
+
+    Per-agent tokens (``LOCI_MCP_AGENT_TOKENS``, ``{token: agent_id}`` here)
+    are what bind a caller's identity to the transport: a request presenting one
+    has that agent id written into the ASGI scope under
+    ``caller_identity.SCOPE_KEY``, which the ACL checks read in place of the
+    self-declared ``requesting_agent_id``. The shared token authenticates but
+    cannot tell callers apart, so it binds nothing.
     """
 
-    __slots__ = ("_app", "_token", "_exempt")
+    __slots__ = ("_app", "_token", "_exempt", "_agent_tokens")
 
-    def __init__(self, app, token: str, exempt_paths=frozenset({"/health"})):
+    def __init__(self, app, token: str, exempt_paths=frozenset({"/health"}), agent_tokens=None):
         self._app = app
-        self._token = token
+        self._token = token or ""
         self._exempt = exempt_paths
+        self._agent_tokens = dict(agent_tokens or {})
+
+    def _match(self, presented: str):
+        """(authenticated, bound agent id or None), checking every token."""
+        ok = False
+        agent = None
+        if self._token and hmac.compare_digest(presented, self._token):
+            ok = True
+        # No early exit: the loop's timing does not depend on which token matched.
+        for tok, agent_id in self._agent_tokens.items():
+            if hmac.compare_digest(presented, tok):
+                ok, agent = True, agent_id
+        return ok, agent
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http" or scope.get("path") in self._exempt:
@@ -11684,7 +11901,8 @@ class _BearerAuthMiddleware:
         value = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
         presented = value[7:] if value[:7].lower() == "bearer " else ""
         # compare_digest on both branches: == leaks token length/prefix, and an early return leaks whether a token was presented.
-        if not (presented and hmac.compare_digest(presented, self._token)):
+        ok, agent = self._match(presented) if presented else (False, None)
+        if not ok:
             body = b'{"error":"unauthorized"}'
             await send({"type": "http.response.start", "status": 401,
                         "headers": [(b"content-type", b"application/json"),
@@ -11692,6 +11910,11 @@ class _BearerAuthMiddleware:
                                     (b"www-authenticate", b"Bearer")]})
             await send({"type": "http.response.body", "body": body})
             return
+        scope = dict(scope)
+        if agent:
+            scope[caller_identity.SCOPE_KEY] = agent
+        else:
+            scope.pop(caller_identity.SCOPE_KEY, None)
         await self._app(scope, receive, send)
 
 
@@ -11710,7 +11933,14 @@ def main() -> None:
 
         # A token is what makes a NON-loopback bind defensible; without one we refuse rather than serve.
         token = os.environ.get("LOCI_MCP_TOKEN", "").strip()
-        if not token and not _is_loopback(mcp.settings.host):
+        try:
+            agent_tokens = caller_identity.load_agent_tokens()
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"refusing to start: LOCI_MCP_AGENT_TOKENS is unusable: {exc}")
+        if token and token in agent_tokens:
+            raise SystemExit("refusing to start: LOCI_MCP_TOKEN is also a per-agent token; "
+                             "a shared secret cannot also be one agent's identity")
+        if not token and not agent_tokens and not _is_loopback(mcp.settings.host):
             raise SystemExit(
                 f"refusing to serve {transport} on {mcp.settings.host} without "
                 "LOCI_MCP_TOKEN: this would expose every tool unauthenticated. "
@@ -11720,8 +11950,11 @@ def main() -> None:
 
         app = (mcp.streamable_http_app() if transport == "streamable-http"
                else mcp.sse_app())
-        if token:
-            app = _BearerAuthMiddleware(app, token)
+        if token or agent_tokens:
+            app = _BearerAuthMiddleware(app, token, agent_tokens=agent_tokens)
+            if agent_tokens:
+                logger.info("per-agent MCP tokens configured for %d agent(s); ACL identity "
+                            "is bound from the bearer token", len(set(agent_tokens.values())))
         else:
             logger.warning("LOCI_MCP_TOKEN is not set — serving %s on %s with no "
                            "authentication. Safe only because the bind is loopback.",

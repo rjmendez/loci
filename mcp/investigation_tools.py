@@ -16,13 +16,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import caller_identity
 from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
     _acl_access_denied,
     _append_jsonl,
     _inv_dir,
     _load_manifest,
+    _load_manifest_fresh,
     _load_retracted_ids,
+    _locked_file,
+    StoreBusyError,
     _now,
     _read_jsonl,
     _retraction_events,
@@ -353,6 +357,38 @@ def _coordination_require_item(manifest: dict, item_id: str) -> dict:
     return match[1]
 
 
+def _queue_locked(investigation_id: str, fn) -> str:
+    """Run one queue read-modify-write under the investigation's file lock.
+
+    The queue lives in manifest.json. Without the lock, two processes (or two
+    server workers) that claim the same item both read "queued", both write
+    "claimed", and the second write silently wins, so two sessions believe they
+    own the item. This takes the same per-investigation ``.lock`` that retract,
+    restore and tier changes use, re-reads the manifest from disk (the
+    in-process cache can be stale when another process wrote), and saves inside
+    the lock. A lock held past the bounded wait returns a retryable ``busy``.
+    """
+    try:
+        if not _load_manifest(investigation_id):
+            return _coordination_error(f"Investigation '{investigation_id}' not found.")
+        inv_dir = _inv_dir(investigation_id)
+    except ValueError as exc:
+        return _coordination_error(str(exc))
+    try:
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            manifest = _load_manifest_fresh(investigation_id)
+            if not manifest:
+                return _coordination_error(f"Investigation '{investigation_id}' not found.")
+            return fn(_coordination_manifest(manifest))
+    except StoreBusyError as exc:
+        return json.dumps({
+            "error": "busy",
+            "detail": str(exc),
+            "retryable": True,
+            "investigation_id": investigation_id,
+        })
+
+
 def investigation_queue_enqueue(
     investigation_id: str,
     item_id: Optional[str] = None,
@@ -365,10 +401,36 @@ def investigation_queue_enqueue(
     owner_session: Optional[str] = None,
 ) -> str:
     """Enqueue a deterministic work item into an investigation's coordination queue."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_enqueue_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            item_json=item_json,
+            scope_kind=scope_kind,
+            scope_targets=scope_targets,
+            notes=notes,
+            dependencies=dependencies,
+            state=state,
+            owner_session=owner_session,
+        ),
+    )
+
+
+def _queue_enqueue_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: Optional[str] = None,
+    item_json: Optional[str | dict] = None,
+    scope_kind: Optional[str] = None,
+    scope_targets: Optional[list | str] = None,
+    notes: Optional[str] = None,
+    dependencies: Optional[list | str] = None,
+    state: Optional[str] = None,
+    owner_session: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     try:
         payload = _coordination_payload_from_json(item_json, field_name='item_json') if item_json is not None else {}
     except ValueError as exc:
@@ -419,10 +481,26 @@ def investigation_queue_claim(
     lease_seconds: float | int = 300,
 ) -> str:
     """Claim / renew a queue item for a specific session with a lease TTL."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_claim_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            lease_seconds=lease_seconds,
+        ),
+    )
+
+
+def _queue_claim_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: str,
+    lease_seconds: float | int = 300,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     try:
         ttl = float(lease_seconds)
     except (TypeError, ValueError):
@@ -475,10 +553,28 @@ def investigation_queue_complete(
     notes: Optional[str] = None,
 ) -> str:
     """Finalize a queue item as done, blocked, or cancelled."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_complete_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            state=state,
+            notes=notes,
+        ),
+    )
+
+
+def _queue_complete_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    state: str = 'done',
+    notes: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     item_id = str(item_id).strip()
     if not item_id:
         return _coordination_error('item_id is required.')
@@ -524,10 +620,26 @@ def investigation_queue_release(
     Release is not terminal; any session may claim the item again. To stop the line use
     ``investigation_queue_complete(state='blocked')``.
     """
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_release_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            notes=notes,
+        ),
+    )
+
+
+def _queue_release_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     item_id = str(item_id).strip()
     if not item_id:
         return _coordination_error('item_id is required.')
@@ -826,11 +938,15 @@ def investigation_load(
             out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
-                             the investigation has a non-empty ACL, a requester
-                             that is neither the owner nor in the ACL gets
+                             the investigation has a non-empty ACL, the caller
+                             must be the owner or in the ACL, else
                              permission_denied; a member sees findings
-                             authored by ACL members or by itself. Omitted, the
-                             caller is the local agent (HERMES_AGENT_ID).
+                             authored by ACL members or by itself. The caller
+                             is the transport-bound identity (a per-agent MCP
+                             token or an A2A session), else the local agent
+                             (HERMES_AGENT_ID). This argument is self-declared,
+                             so it can only narrow: naming a member does not
+                             admit a caller that is not one.
         fidelity: Controls how much detail is returned. One of:
                   "full"    — manifest plus recent findings.
                   "summary" — manifest plus ``summary_l1`` and ``summary_l2``
@@ -902,11 +1018,12 @@ def investigation_load(
         findings = kept
 
     acl = manifest.get("acl") or []
-    if requesting_agent_id and acl:
+    viewer = requesting_agent_id or caller_identity.bound_agent_id()
+    if viewer and acl:
         acl_set = set(acl)
         findings = [
             f for f in findings
-            if f.get("authored_by", "") == requesting_agent_id
+            if f.get("authored_by", "") == viewer
             or f.get("authored_by", "") in acl_set
         ]
 
@@ -1005,6 +1122,7 @@ def _retracted_as_of(events: list[tuple[str, bool]], as_of_dt: datetime) -> bool
 def investigation_as_of(
     investigation_id: str,
     as_of_timestamp: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Return findings as they were believed at a specific time.
@@ -1021,6 +1139,10 @@ def investigation_as_of(
                          Findings created after this moment are excluded, and
                          findings whose valid_until is before this moment are
                          also excluded.
+        requesting_agent_id: Optional agent_id. Same ACL rule as
+                             investigation_load: the transport-bound (or local)
+                             caller must be allowed, and a named agent can only
+                             narrow that.
 
     Returns:
         JSON ``{"investigation_id","as_of","findings","count"}``, or
@@ -1030,6 +1152,9 @@ def investigation_as_of(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         try:
             as_of_dt = datetime.fromisoformat(as_of_timestamp)

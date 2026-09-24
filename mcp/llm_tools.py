@@ -216,9 +216,10 @@ def _finding_provenance_context(investigation_id: Optional[str], finding_id: Opt
     if not investigation_id or not finding_id:
         return None, None
     try:
-        from inv_store import _inv_dir, _read_jsonl
+        from inv_store import _fold_provenance_overrides, _inv_dir, _read_jsonl
         from provenance_firewall import firewall_candidate_tier
-        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+        findings = _fold_provenance_overrides(
+            _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
         target = next((f for f in findings if isinstance(f, dict)
                        and str(f.get("id") or "") == str(finding_id)), None)
         if target is None:
@@ -348,6 +349,7 @@ def ground(
     allow_keyword: bool = False,
     graph_available: bool = False,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Build a compact, provenance-tagged grounding block for a task. Call it once
@@ -376,6 +378,9 @@ def ground(
         graph_available: Enable the code-graph lane (default off; requires the
             LadybugDB graph).
         mode: "normal" (default) for the legacy block, or "compact" for terse tagged lines.
+        requesting_agent_id: Optional agent_id for the case and RAG lanes' ACL
+            checks. It can only narrow the transport-bound (or local) identity;
+            findings from investigations the caller cannot read are left out.
 
     Returns:
         JSON ``{block, sources, chars, degraded, degraded_lanes}``; ``degraded_lanes``
@@ -397,6 +402,8 @@ def ground(
     }
     if mode == "compact":
         opts["mode"] = "compact"
+    if requesting_agent_id:
+        opts["requestingAgentId"] = str(requesting_agent_id)
     return json.dumps(grounding.ground(task, opts), indent=2)
 
 

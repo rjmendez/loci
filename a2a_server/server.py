@@ -604,6 +604,15 @@ _BOOTSTRAP_SWEEP_AFTER = 1024
 _bootstrap_attempts_lock = threading.Lock()
 
 
+@contextmanager
+def _bind_authenticated_caller(auth: dict):
+    if auth.get('token_type') == 'session' and _caller_identity is not None:
+        with _caller_identity.bound(auth.get('sender') or None):
+            yield
+    else:
+        yield
+
+
 def _bound_sender(requested_sender: Optional[str], auth: dict) -> str:
     """Bind bootstrap-issued session tokens to their issuing agent_id."""
     if auth.get('token_type') == 'session':
@@ -1136,6 +1145,8 @@ async def skill_rag_search(task: dict) -> dict:
             seen.add(key)
             deduped.append(h)
 
+    deduped, excluded_retracted, excluded_acl = _visible_hits(deduped, task.get('sender'))
+
     reranked = await _rerank(query, deduped)
 
     return {
@@ -1144,7 +1155,75 @@ async def skill_rag_search(task: dict) -> dict:
         'collections_searched': collections,
         'reranked':             reranked,
         'total_hits':           len(deduped),
+        'excluded_retracted':   excluded_retracted,
+        'excluded_acl':         excluded_acl,
     }
+
+
+# ── investigation ACL + retraction visibility for Qdrant hits ────────────────────
+# rag_search reaches loci_memory, which holds investigation findings. Those carry
+# an investigation ACL and a soft-retraction flag, and a mesh caller must not read
+# around either. The caller identity is the one this server authenticated: a
+# /bootstrap session token is bound to its agent_id (caller_identity.bound, set
+# in a2a_endpoint); the primary token cannot tell callers apart, so there the
+# declared sender can only narrow what this node itself may read.
+try:
+    import caller_identity as _caller_identity
+    import inv_store as _inv_store_acl
+except Exception as _acl_import_exc:  # fail closed below: investigation hits are dropped
+    _caller_identity = None
+    _inv_store_acl = None
+    log.warning(f'ACL helpers unavailable ({_acl_import_exc!r}); investigation hits will be withheld')
+
+
+def _loci_memory_dir() -> str:
+    return os.path.expanduser(os.environ.get('LOCI_MEMORY_DIR', '~/.loci/memory-sessions'))
+
+
+def _investigation_hit_denied(inv_id: str, sender: Optional[str], cache: dict) -> bool:
+    """True when the caller may not read investigation ``inv_id``. Fails closed."""
+    if inv_id in cache:
+        return cache[inv_id]
+    denied = True
+    if _inv_store_acl is not None:
+        try:
+            inv_id_ok = _inv_store_acl._validated_investigation_id(inv_id)
+        except ValueError:
+            # Not a valid investigation id: no manifest, so no ACL, can exist for it.
+            cache[inv_id] = False
+            return False
+        try:
+            path = os.path.join(_loci_memory_dir(), inv_id_ok, 'manifest.json')
+            if not os.path.exists(path):
+                denied = False          # not an investigation this node governs
+            else:
+                with open(path) as fh:
+                    manifest = json.load(fh)
+                bound = _caller_identity.bound_agent_id() if _caller_identity else None
+                requested = None if bound else (sender if sender and sender != 'unknown' else None)
+                denied = bool(_inv_store_acl._acl_access_denied(manifest, requested))
+        except Exception as e:
+            log.warning(f'ACL check for investigation {inv_id!r} failed, withholding its hits: {e!r}')
+            denied = True
+    cache[inv_id] = denied
+    return denied
+
+
+def _visible_hits(hits: list, sender: Optional[str]) -> tuple:
+    """Drop retracted-flagged hits and hits from investigations the caller cannot read."""
+    kept, retracted, acl = [], 0, 0
+    cache: dict = {}
+    for h in hits:
+        pl = h.get('payload') or {}
+        if pl.get('retracted') is True:
+            retracted += 1
+            continue
+        inv_id = pl.get('investigation_id')
+        if inv_id and _investigation_hit_denied(str(inv_id), sender, cache):
+            acl += 1
+            continue
+        kept.append(h)
+    return kept, retracted, acl
 
 
 # ── skill: context_broadcast ─────────────────────────────────────────────────────
@@ -1798,7 +1877,11 @@ async def a2a_endpoint(request: Request,
     if method == 'tasks/send':
         params = dict(params)
         params['sender'] = _bound_sender(params.get('sender'), auth)
-        return await _handle_task_send(rpc_id, params)
+        # A session token's agent_id is authenticated: bind it for the ACL checks
+        # the skills run. The primary token authenticates the operator, not an
+        # agent, so nothing is bound and the declared sender can only narrow.
+        with _bind_authenticated_caller(auth):
+            return await _handle_task_send(rpc_id, params)
     if method == 'tasks/get':
         params = dict(params)
         params['sender'] = _bound_sender(params.get('sender'), auth)
