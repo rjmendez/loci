@@ -3488,20 +3488,17 @@ def procedure_attempt(
         success_count = target["procedure_meta"]["success_count"]
         success_rate = _procedure_success_rate(success_count, attempt_count)
 
-        # Atomic rewrite: write to temp file then rename
-        import tempfile as _tempfile
-        tmp_fd, tmp_path = _tempfile.mkstemp(dir=str(findings_path.parent), suffix=".jsonl.tmp")
-        try:
-            with os.fdopen(tmp_fd, "w") as tmp_fh:
-                for f in findings:
-                    tmp_fh.write(json.dumps(f) + "\n")
-            os.replace(tmp_path, str(findings_path))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except Exception as exc:
-                logger.debug("procedure_attempt: fail-open swallow: %r", exc)
-            raise
+        # Atomic, line-preserving rewrite of the first row for this id (the target).
+        # Unparseable lines and legacy access rows are kept verbatim.
+        _first = [True]
+
+        def _replace_target(f):
+            if _first[0] and f.get("id") == finding_id:
+                _first[0] = False
+                return target
+            return None
+
+        inv_store._rewrite_jsonl_preserving(findings_path, _replace_target)
 
         # Update Qdrant payload for the finding
         try:
@@ -6218,7 +6215,11 @@ def _health_probe_store_counts(inv_targets: list[str], inv_missing: str | None) 
     totals = {"findings": 0, "audit": 0, "retractions": 0}
     for inv in inv_targets:
         inv_path = MEMORY_DIR / inv
-        f_n = len(_read_jsonl(inv_path / "findings.jsonl"))
+        # Real findings only: _read_jsonl drops legacy access rows. Rows sharing
+        # an id count once, and each row with no id counts as its own finding.
+        f_rows = [f for f in _read_jsonl(inv_path / "findings.jsonl") if isinstance(f, dict)]
+        f_n = (len({str(f["id"]) for f in f_rows if f.get("id")})
+               + sum(1 for f in f_rows if not f.get("id")))
         a_n = len(_read_jsonl(inv_path / "audit.jsonl"))
         r_n = len(_read_jsonl(inv_path / "retractions.jsonl"))
         totals["findings"] += f_n
@@ -7766,8 +7767,10 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
 
 
 def _rag_record_access(results: list[dict], query: str) -> None:
-    """Append a last_accessed marker to each returned finding's JSONL.
+    """Append a last_accessed marker for each returned finding to access.jsonl.
 
+    The marker goes to the investigation's access log and never to
+    findings.jsonl, where it would reuse the finding's id and shadow it.
     Best-effort per row: this must never block the response.
     """
     access_ts = int(time.time())
@@ -7778,10 +7781,10 @@ def _rag_record_access(results: list[dict], query: str) -> None:
             finding_id, inv_id = r.get("id"), r.get("investigation_id")
             if not finding_id or not inv_id:
                 continue
-            findings_path = _inv_dir(inv_id) / "findings.jsonl"
-            if not findings_path.exists():
+            inv_path = _inv_dir(inv_id)
+            if not (inv_path / "findings.jsonl").exists():
                 continue
-            _append_jsonl(findings_path, {
+            _append_jsonl(inv_path / inv_store.ACCESS_LOG_NAME, {
                 "id": finding_id,
                 "investigation_id": inv_id,
                 "record_type": "access",
@@ -9478,23 +9481,11 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
                 return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
 
             text = str(target.get("text", "") or "")
-            for f in findings:
-                if str(f.get("id", "")) == finding_id:
-                    f["tier"] = new_tier
-
-            dir_ = findings_path.parent
-            tmp_fd, tmp_name = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-            try:
-                with os.fdopen(tmp_fd, "w") as tf:
-                    for f in findings:
-                        tf.write(json.dumps(f) + "\n")
-                tmp_path = Path(tmp_name)
-                tmp_path.replace(findings_path)
-            finally:
-                try:
-                    Path(tmp_name).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            # Line-preserving rewrite: a torn or unparseable line stays as it is.
+            inv_store._rewrite_jsonl_preserving(
+                findings_path,
+                lambda f: {**f, "tier": new_tier} if str(f.get("id", "")) == finding_id else None,
+            )
 
             # If promoting to hot, update manifest notes before releasing the lock.
             if new_tier == "hot":

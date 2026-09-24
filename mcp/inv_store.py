@@ -299,21 +299,72 @@ def _append_jsonl(path: Path, entry: dict) -> None:
         f.flush()
 
 
+# rag_context_search access bookkeeping lives in its own per-investigation log.
+# Older builds appended it to findings.jsonl under the finding's own id, so any
+# reader where the last row wins saw a text-less access row instead of the finding.
+FINDINGS_LOG_NAME = "findings.jsonl"
+ACCESS_LOG_NAME = "access.jsonl"
+_ACCESS_RECORD_TYPES = frozenset({"access"})
+
+
+def _is_access_row(rec) -> bool:
+    """True for an access-bookkeeping row. Such a row is not a finding."""
+    return (isinstance(rec, dict)
+            and (rec.get("record_type") or rec.get("type") or "") in _ACCESS_RECORD_TYPES)
+
+
 def _read_jsonl(path: Path) -> list[dict]:
+    """Parse a JSONL log. Legacy access rows are dropped from findings.jsonl."""
     if not path.exists():
         return []
     out = []
     bad = 0
+    drop_access = path.name == FINDINGS_LOG_NAME
     for line in path.read_text().splitlines():
         line = line.strip()
         if line:
             try:
-                out.append(json.loads(line))
+                rec = json.loads(line)
             except Exception:
                 bad += 1
+                continue
+            if drop_access and _is_access_row(rec):
+                continue
+            out.append(rec)
     if bad:
         logger.debug("_read_jsonl: skipped %d unparseable line(s) in %s", bad, path)
     return out
+
+
+def _rewrite_jsonl_preserving(path: Path, update) -> int:
+    """Atomically rewrite a JSONL log, changing only the rows ``update`` replaces.
+
+    ``update(rec)`` receives each parsed dict row and returns either a
+    replacement dict or None to keep the row as it is. All other lines are
+    written back byte-for-byte. That includes lines that do not parse and legacy
+    findings.jsonl access rows, because a rewrite must never be what deletes a
+    record. Returns the number of rows replaced.
+    """
+    skip_access = path.name == FINDINGS_LOG_NAME
+    new_lines = []
+    replaced = 0
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        rec = None
+        if stripped:
+            try:
+                rec = json.loads(stripped)
+            except Exception:
+                rec = None
+        if isinstance(rec, dict) and not (skip_access and _is_access_row(rec)):
+            new = update(rec)
+            if new is not None:
+                new_lines.append(json.dumps(new))
+                replaced += 1
+                continue
+        new_lines.append(line)
+    _atomic_write_text(path, "\n".join(new_lines) + ("\n" if new_lines else ""))
+    return replaced
 
 
 def _finding_updates_path(investigation_id: str) -> Path:
