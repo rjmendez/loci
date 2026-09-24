@@ -282,7 +282,8 @@ def _load_agent_tokens(environ: Optional[dict] = None, primary: str = '') -> dic
                     continue
                 if '=' not in part:
                     raise ValueError("has an entry with no '=token'")
-                pairs.append(tuple(part.split('=', 1)))
+                agent_part, _, token_part = part.partition('=')
+                pairs.append((agent_part, token_part))
         for agent, tok in pairs:
             agent, tok = str(agent).strip(), str(tok or '').strip()
             if not agent or not tok:
