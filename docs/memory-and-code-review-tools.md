@@ -216,9 +216,15 @@ New findings may set `metadata.evidence_provenance_tier` (or the
 a `model_asserted` claim is **UNVERIFIED** when its support is only other
 `model_asserted` findings. It needs at least one human-authored, tool-verified,
 or deterministically-derived residual (for example a matching file/quote/hash,
-passing test, parseable schema, or audit receipt). Legacy untagged findings
-default to `tool_verified` when used as evidence so old investigations and
-callers continue to work; refs surface `provenance_defaulted: true` for audit.
+passing test, parseable schema, or audit receipt for a non-model tool). The
+evidence must be linked to the claim (a `derived_from` parent or a lexical
+support match), not merely another finding in the investigation. Legacy
+untagged findings still display as `tool_verified`, but carry
+`provenance_defaulted: true` and never count as independent evidence.
+Loci's own writers (`investigation_reason`, `reflection_loop_tick`,
+`contract_declare`, `wiring_obligation_declare`) and untagged `assumed`/`gap`
+findings are stamped `model_asserted`; an audit receipt for a model tool
+(`llm_local`, `swarm_reason`, ...) is `model_asserted` too.
 
 **MCP tools provided by loci-mcp** — full registration composition and current
 count are canonical in [docs/CALLGRAPH.md](./CALLGRAPH.md).
@@ -527,6 +533,16 @@ no LLM involved. Just calls the Mnemosyne CLI sleep command.
 
 Syncs Mnemosyne SQLite → Qdrant `mnemosyne` collection so the grounding hook
 can search Mnemosyne content without going through the MCP server on every turn.
+
+New and edited memories are (re-)embedded. Deleting points this host wrote (matching
+`memory_id` payload plus this host's `agent_id`/`profile`) for memories no longer in SQLite
+is opt-in: pass `--prune`. Pruning refuses to run unless `HERMES_AGENT_ID` and
+`HERMES_PROFILE` are both set (hosts on empty defaults would match each other's points),
+and refuses to delete more than half of this host's points in one run unless
+`--force-prune` is also passed. An unreadable memory table (e.g. a missing column) is a
+fatal error, not "no memories". The script exits 1 if the DB is missing or unreadable,
+Qdrant is unreachable, a prune is refused, or any embed/upsert/delete step fails, so a
+failed cron run is not recorded as success.
 
 ---
 

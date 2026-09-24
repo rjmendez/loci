@@ -40,9 +40,10 @@ class TestImportKeepsFindingAge(unittest.TestCase):
         server.MEMORY_DIR = Path(self._tmp.name)
         self._orig_upsert = investigation_tools._qdrant_upsert
         self.upserts = []
+        # Mirrors qdrant_ops._qdrant_upsert: True means the point was written.
         investigation_tools._qdrant_upsert = lambda pid, text, payload: self.upserts.append(
             (pid, text, dict(payload))
-        )
+        ) or True
 
     def tearDown(self):
         investigation_tools._qdrant_upsert = self._orig_upsert

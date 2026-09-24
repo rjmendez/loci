@@ -16,7 +16,7 @@ Design contract: **fail-open everywhere.** If ``import ladybug`` fails, the db
 cannot be opened, or any query raises, public methods return ``False`` / ``[]``
 / ``{}`` and :meth:`available` stays ``False`` — nothing propagates out. The
 sole intentional exception is :meth:`code_query`, which raises ``ValueError`` on
-a write-shaped query before touching the database.
+any query outside its read-only allowlist before touching the database.
 """
 
 from __future__ import annotations
@@ -82,9 +82,117 @@ except Exception:  # pragma: no cover - environment without ladybug
 __all__ = ["LadybugStore"]
 
 # Query shapes that mutate the graph — rejected by code_query's read-only guard.
+# Kept as a fast first check; the allowlist below (_read_only_violation) is the
+# actual boundary.
 _WRITE_GUARD_RE = re.compile(
     r"\b(CREATE|DELETE|SET|DROP|COPY|ALTER|MERGE)\b", re.IGNORECASE
 )
+
+# code_query's read-only guard is an ALLOWLIST over the engine's clause grammar.
+# A keyword denylist let LOAD FROM (host file read), EXPORT DATABASE (host file
+# write), INSTALL / LOAD EXTENSION (native code download) and httpfs (outbound
+# HTTP) through, because the read-only database handle blocks graph mutation but
+# not statements that act on the host.
+_READ_START_KEYWORDS = frozenset({"MATCH", "OPTIONAL", "WITH", "UNWIND", "RETURN", "CALL"})
+# The reading clauses (MATCH / OPTIONAL MATCH / WHERE / WITH / UNWIND / RETURN /
+# ORDER BY / SKIP / LIMIT / UNION, and CALL of an allowlisted procedure) are the
+# only ones accepted. Every other clause/statement keyword of the Cypher /
+# LadybugDB grammar is listed here; a query naming any of them (outside a string
+# literal) is not read-only.
+_NON_READ_CLAUSE_KEYWORDS = frozenset({
+    "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "ALTER", "COPY",
+    "LOAD", "EXPORT", "IMPORT", "INSTALL", "UNINSTALL", "ATTACH", "USE", "CHECKPOINT",
+    "BEGIN", "COMMIT", "ROLLBACK", "FOREACH", "PROJECT", "EXTENSION", "DATABASE",
+    "TRANSACTION", "COMMENT", "MACRO", "SEQUENCE",
+})
+# Read-only introspection procedures CALL may name. Every other table function
+# (READ_CSV_*, READ_PARQUET, READ_NPY, FILE_INFO, COPY_*, PROJECT_GRAPH, ...)
+# reads the host filesystem or changes engine state.
+_READ_ONLY_CALL_PROCEDURES = frozenset({
+    "SHOW_TABLES", "TABLE_INFO", "SHOW_CONNECTION", "DB_VERSION", "CURRENT_SETTING",
+    "SHOW_FUNCTIONS", "SHOW_INDEXES", "CATALOG_VERSION", "STORAGE_VERSION",
+})
+# Functions that are not read-only in any position: host-file table functions
+# and the scalar functions that advance engine state.
+_NON_READ_FUNCTIONS = frozenset({
+    "READ_CSV_PARALLEL", "READ_CSV_SERIAL", "READ_NPY", "READ_PANDAS", "READ_PARQUET",
+    "READ_JSON", "FILE_INFO", "DISK_INFO", "DISK_SIZE_INFO", "COPY_CSV", "COPY_PARQUET",
+    "PROJECT_GRAPH", "PROJECT_GRAPH_CYPHER", "DROP_PROJECTED_GRAPH", "CLEAR_WARNINGS",
+    "_CACHE_ARRAY_COLUMN_LOCALLY", "NEXTVAL", "SETSEED",
+})
+
+
+def _cypher_tokens(cypher: str) -> list[tuple[str, str]]:
+    """Lex ``cypher`` into (kind, value) tokens, skipping string literals and
+    backtick identifiers the way the engine does (backslash escapes, doubled
+    backticks). Raises ValueError on comments or unterminated literals, since a
+    lexer that disagrees with the engine is how keywords get hidden."""
+    toks: list[tuple[str, str]] = []
+    i, n = 0, len(cypher)
+    while i < n:
+        ch = cypher[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n and cypher[j] != ch:
+                j += 2 if cypher[j] == "\\" else 1
+            if j >= n:
+                raise ValueError("unterminated string literal")
+            toks.append(("str", ""))
+            i = j + 1
+            continue
+        if ch == "`":
+            j = i + 1
+            while True:
+                j = cypher.find("`", j)
+                if j == -1:
+                    raise ValueError("unterminated backtick identifier")
+                if j + 1 < n and cypher[j + 1] == "`":
+                    j += 2
+                    continue
+                break
+            toks.append(("ident", ""))
+            i = j + 1
+            continue
+        if cypher.startswith("//", i) or cypher.startswith("/*", i):
+            raise ValueError("comments are not accepted")
+        if ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (cypher[j].isalnum() or cypher[j] == "_"):
+                j += 1
+            toks.append(("word", cypher[i:j].upper()))
+            i = j
+            continue
+        if not ch.isspace():
+            toks.append(("punct", ch))
+        i += 1
+    return toks
+
+
+def _read_only_violation(cypher: str) -> Optional[str]:
+    """Return why ``cypher`` is not an allowlisted read-only query, or None."""
+    try:
+        toks = _cypher_tokens(cypher)
+    except ValueError as exc:
+        return str(exc)
+    while toks and toks[-1] == ("punct", ";"):
+        toks.pop()
+    if ("punct", ";") in toks:
+        return "multiple statements are not accepted"
+    if not toks or toks[0][0] != "word" or toks[0][1] not in _READ_START_KEYWORDS:
+        return "query must start with MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN or CALL"
+    for idx, (kind, val) in enumerate(toks):
+        if kind != "word" or (idx and toks[idx - 1] == ("punct", "$")):
+            continue  # $params are names, not keywords
+        if val in _NON_READ_CLAUSE_KEYWORDS:
+            return f"{val} is not a read-only clause"
+        if val in _NON_READ_FUNCTIONS:
+            return f"{val} is not a read-only function"
+        if val == "CALL":
+            nxt = toks[idx + 1] if idx + 1 < len(toks) else ("", "")
+            after = toks[idx + 2] if idx + 2 < len(toks) else ("", "")
+            if nxt[0] != "word" or nxt[1] not in _READ_ONLY_CALL_PROCEDURES or after != ("punct", "("):
+                return "CALL may only name a read-only introspection procedure"
+    return None
 
 # The duck-typing call fallback must NOT fire on these: a shared name is a stdlib call.
 _DUCK_STOPWORDS = frozenset({
@@ -275,6 +383,8 @@ class LadybugStore:
         # sample it around a call to tell "the graph held no rows" from "the query
         # never ran" — an empty list on its own says both.
         self.code_query_failures = 0
+        self.code_query_last_error = ""  # repr of the most recent swallowed read error
+        self._read_miss = threading.local()  # per-thread "_rows found no session" flag
         if not _HAS_LADYBUG:
             logger.info("ladybug not importable; LadybugStore unavailable")
 
@@ -394,13 +504,29 @@ class LadybugStore:
             return False
 
     def lock_holder_pid(self) -> Optional[int]:
-        """Best-effort PID of whoever holds the lease writer stamp (diagnostics)."""
+        """Best-effort PID of whoever holds the lease writer stamp (diagnostics).
+
+        The stamp is written on acquire and never cleared on release, so it outlives
+        its writer; a PID that is no longer running is reported as None rather than
+        as the current holder.
+        """
         try:
             with open(self._lease_path, "r") as f:
                 tok = f.read().split()
-            return int(tok[0]) if tok else None
+            pid = int(tok[0]) if tok else None
         except Exception:
             return None
+        if pid is None or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)  # signal 0: existence check only, nothing is delivered
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # alive, owned by another user
+        except Exception:
+            return None
+        return pid
 
     # ------------------------------------------------------------------ #
     # Schema
@@ -468,9 +594,16 @@ class LadybugStore:
 
     def _rows(self, cypher: str, params: Optional[dict] = None) -> list[list]:
         """Read rows in a leased READ-ONLY session (many readers share). Drains AND closes
-        the result INSIDE the session — the QueryResult is invalid once the conn closes."""
+        the result INSIDE the session — the QueryResult is invalid once the conn closes.
+
+        Returns [] when no session could be opened (read lease timed out, or an existing
+        store could not be opened) and records that on this thread (``_read_missed``), so
+        code_query can tell a query that never ran from one that matched nothing. A graph
+        that was never created is not a miss: there is nothing to match."""
         with self._session(write=False) as conn:
             if conn is None:
+                if os.path.exists(self.db_path):
+                    self._read_miss.flag = True
                 return []
             res = conn.execute(cypher) if params is None else conn.execute(cypher, params)
             out: list[list] = []
@@ -1074,12 +1207,21 @@ class LadybugStore:
                 "code_query is read-only; write keywords "
                 "(CREATE/DELETE/SET/DROP/COPY/ALTER/MERGE) are rejected"
             )
+        violation = _read_only_violation(cypher)
+        if violation:
+            raise ValueError(f"code_query is read-only; {violation}")
         if not self.ok:
             return []
         try:
-            return self._rows(cypher, params)
+            self._read_miss.flag = False
+            rows = self._rows(cypher, params)
+            if self._read_miss.flag:
+                raise RuntimeError("graph read session unavailable "
+                                   "(read-lease timeout or store not openable)")
+            return rows
         except Exception as exc:
             logger.debug("code_query failed: %s", exc)
+            self.code_query_last_error = repr(exc)[:500]
             self.code_query_failures += 1
             return []
 
