@@ -68,6 +68,16 @@ def run():
         return
     pairs = [json.loads(l) for l in DATASET.read_text().splitlines() if l.strip()]
     topical = [p for p in pairs if p.get("signal") == "topical"]
+    if harness.DRY_RUN:
+        # Stored cosines only, no network. A row with no stored cosine is not a
+        # row with cosine 0.0: scoring it 0.0 is a guaranteed miss for a positive
+        # and biased every dry-run metric down. Leave such rows out, and say so.
+        measured = [p for p in topical
+                    if isinstance(p.get("cos"), (int, float)) and not isinstance(p.get("cos"), bool)]
+        if len(measured) != len(topical):
+            print(f"[gate-eval] dry run: {len(topical) - len(measured)} topical pairs carry no "
+                  "stored cosine and are excluded")
+        topical = measured
     if not topical:
         print("[gate-eval] no topical pairs in dataset")
         return
@@ -75,7 +85,7 @@ def run():
 
     print(f"[gate-eval] run_date={run_date} pairs={len(topical)} thr={THRESHOLD} dry_run={harness.DRY_RUN}")
     if harness.DRY_RUN:
-        cos = [float(p.get("cos", 0.0)) for p in topical]  # stored cosines, no network
+        cos = [float(p["cos"]) for p in topical]
     else:
         harness.ensure_collection()
         cos = _cosines_live(topical)
