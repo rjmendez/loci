@@ -114,6 +114,26 @@ def _http_probe(url: str, path: str = "", timeout: float = 1.0,
         return False, None
 
 
+def _http_status(url: str, path: str = "", timeout: float = 1.0,
+                 headers: "dict | None" = None) -> "int | None":
+    """HTTP status of a bounded GET of ``url + path`` (4xx/5xx included), or None
+    when nothing answered (refused, timeout, DNS). Never raises."""
+    if not url:
+        return None
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(url.rstrip("/") + path, headers=headers or {}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — operator-configured URL
+                return int(resp.status)
+        except urllib.error.HTTPError as exc:
+            return int(exc.code)
+    except Exception as exc:
+        logger.debug("_http_status %s%s failed: %r", url, path, exc)
+        return None
+
+
 @functools.lru_cache(maxsize=1)
 def _ollama_local_tags() -> set[str]:
     """Best-effort local Ollama tag inventory. Never raises."""

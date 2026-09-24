@@ -217,7 +217,7 @@ def _finding_provenance_context(investigation_id: Optional[str], finding_id: Opt
         return None, None
     try:
         from inv_store import _inv_dir, _read_jsonl
-        from provenance_firewall import normalize_provenance_tier
+        from provenance_firewall import firewall_candidate_tier
         findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
         target = next((f for f in findings if isinstance(f, dict)
                        and str(f.get("id") or "") == str(finding_id)), None)
@@ -231,7 +231,8 @@ def _finding_provenance_context(investigation_id: Optional[str], finding_id: Opt
     except Exception as exc:
         logger.debug("verify_finding: linked-evidence lookup failed (no linked evidence): %r", exc)
         evidence_rows = []
-    return normalize_provenance_tier(target), evidence_rows
+    # An untagged (defaulted) finding is gated like model_asserted.
+    return firewall_candidate_tier(target), evidence_rows
 
 
 def verify_finding(claim: str,

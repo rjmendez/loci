@@ -284,6 +284,42 @@ def test_ground_rag_lane_does_not_inject_retracted_finding(store, monkeypatch):
     assert "telemetry.deepthink.internal" not in g["block"]
 
 
+def test_torn_retractions_line_does_not_void_the_tombstones(store, monkeypatch):
+    """Review follow-up (probe P3b): one non-UTF-8 byte in retractions.jsonl made
+    _read_jsonl raise, every tombstone in the investigation was dropped, and ground()
+    served the retracted text with degraded=False."""
+    inv = _start("torn")
+    bad = _store(inv, "Host 10.4.4.44 runs the backdoor 4444")
+    _retract(inv, bad)
+    with open(server._inv_dir(inv) / "retractions.jsonl", "ab") as fh:
+        fh.write(b"\xff\xfe torn\n")
+    _qdrant_hits(monkeypatch, [_hit(inv, bad, "Host 10.4.4.44 runs the backdoor 4444")])
+    r = _j(server.rag_context_search("backdoor 4444", expand_query=False))
+    assert r["excluded_retracted"] == 1 and r["retraction_filter"]["status"] == "ok", r
+    g = grounding.ground({"title": "backdoor 4444"}, {"memoryDir": ""})
+    assert "4444" not in g["block"], g
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "geteuid") or __import__("os").geteuid() == 0,
+                    reason="root ignores file permissions")
+def test_ground_is_degraded_when_retractions_are_unreadable(store, monkeypatch):
+    """Review follow-up (probe P3): an unreadable retractions.jsonl leaves that
+    investigation unfiltered; ground() must say so instead of degraded=False."""
+    inv = _start("eacces")
+    bad = _store(inv, "Host 10.5.5.55 runs the backdoor 5555")
+    _retract(inv, bad)
+    log = server._inv_dir(inv) / "retractions.jsonl"
+    log.chmod(0)
+    try:
+        _qdrant_hits(monkeypatch, [_hit(inv, bad, "Host 10.5.5.55 runs the backdoor 5555")])
+        g = grounding.ground({"title": "backdoor 5555"}, {"memoryDir": ""})
+    finally:
+        log.chmod(0o600)
+    assert g["degraded"] is True, g
+    assert any(d["lane"] == "rag" and "retraction filter degraded" in d["reason"]
+               for d in g["degraded_lanes"]), g
+
+
 def test_memory_surface_drops_retracted_hits(store, monkeypatch):
     inv = _start("sf")
     bad = _store(inv, "Endpoint /api/v9/debug exists on alpha host")
@@ -301,6 +337,27 @@ def test_rag_marks_superseded_hits(store, monkeypatch):
     _qdrant_hits(monkeypatch, [_hit(inv, old, "Root cause is the cache TTL of 5 seconds")])
     r = _j(server.rag_context_search("root cause", expand_query=False))
     assert "superseded" in r["context"]
+
+
+def test_recall_filter_caches_per_query_parse_and_sees_new_state(store, monkeypatch):
+    """Review follow-up: every rag/surface/ground call re-parsed findings.jsonl just to
+    find superseded ids. The parse is cached until a log changes, and a change is seen."""
+    import recall_filter
+    inv = _start("rfc")
+    a = _store(inv, "first claim about the cache TTL")
+    b = _store(inv, "second claim about the session writer")
+    _retract(inv, b)
+    reads = []
+    real = recall_filter._read_jsonl
+    monkeypatch.setattr(recall_filter, "_read_jsonl", lambda p: reads.append(p.name) or real(p))
+    rf1 = recall_filter.build_recall_filter(store, [inv], with_superseded=True)
+    assert rf1.superseded == {} and rf1.retracted_texts[inv] == {"second claim about the session writer"}
+    reads.clear()
+    recall_filter.build_recall_filter(store, [inv], with_superseded=True)
+    assert "findings.jsonl" not in reads, reads
+    server.finding_resolve(inv, a, "superseded")
+    rf3 = recall_filter.build_recall_filter(store, [inv], with_superseded=True)
+    assert rf3.superseded == {inv: {a}}
 
 
 def test_ground_case_lane_marks_superseded_finding(store):

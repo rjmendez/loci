@@ -247,6 +247,7 @@ from provenance_firewall import (  # noqa: E402
     MODEL_ASSERTED,
     assert_evidence_firewall,
     audit_provenance_fields,
+    firewall_candidate_tier,
     normalize_provenance_tier,
     provenance_fields,
 )
@@ -1685,9 +1686,17 @@ def build_validation_evidence(
     audit_lane, scoped_audit, global_recent_audit = _audit_lane_state(
         investigation_id, findings, scoped_audit, global_recent_audit
     )
+    # A retracted finding is not evidence for anything (pre_answer_check support,
+    # the provenance firewall's linked evidence, verify_all, promotion).
+    _rf = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False)
+    _retracted = _rf.all_retracted
+    excluded_retracted = 0
 
     evidence: list[dict] = []
     for idx, finding in enumerate(findings):
+        if str(finding.get("id") or "") in _retracted:
+            excluded_retracted += 1
+            continue
         conf = str(finding.get("confidence", "low")).lower()
         if not _confidence_allowed(conf, min_confidence):
             continue
@@ -1734,7 +1743,8 @@ def build_validation_evidence(
                 "origin": "global_audit_jsonl",
                 **audit_provenance_fields(entry.get("tool")),
             })
-    return evidence, {"audit": audit_lane}
+    return evidence, {"audit": audit_lane,
+                      "retraction": {"excluded_retracted": excluded_retracted, **_rf.status()}}
 
 
 def _search_qdrant_claim_evidence(
@@ -1777,9 +1787,14 @@ def _search_qdrant_claim_evidence(
         pool_scores = [float(point.score) for point in points]
         pool_median = _median(pool_scores)
         claim_tokens = tokenize(claim)
+        # memory_retract keeps the Qdrant point: a retracted finding is not evidence.
+        _retracted = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False).all_retracted
         matches = []
         for point in points[:surfaced]:
             payload = point.payload or {}
+            if str(payload.get("id") or point.id) in _retracted:
+                status["excluded_retracted"] = status.get("excluded_retracted", 0) + 1
+                continue
             text = str(payload.get("text") or payload.get("output") or "")
             score = round(float(point.score), 4)
             matches.append({
@@ -2795,6 +2810,11 @@ def _docs_ingest_targets(document_path: str) -> list[Path]:
     Only paths under a docs root (``_docs_ingest_roots``) are read, and each file
     is checked after symlink resolution: a ``notes.md`` link to a secret outside
     the roots, or to a non-doc file, is skipped. At most _DOCS_INGEST_MAX_FILES."""
+    return _docs_ingest_all_targets(document_path)[:_DOCS_INGEST_MAX_FILES]
+
+
+def _docs_ingest_all_targets(document_path: str) -> list[Path]:
+    """Every target _docs_ingest_targets would pick, before the file cap."""
     roots = _docs_ingest_roots()
     p = Path(document_path).expanduser()
     if not p.is_absolute():
@@ -2816,7 +2836,7 @@ def _docs_ingest_targets(document_path: str) -> list[Path]:
         return sorted(
             {x for x in p.rglob("*") if x.is_file() and _ok(x)},
             key=lambda item: str(item),
-        )[:_DOCS_INGEST_MAX_FILES]
+        )
     return []
 
 
@@ -2835,7 +2855,8 @@ def docs_ingest_indexer(
     tagged ``model_asserted``: the tool verifies which bytes it read (sha256), not
     what the document claims, so its content is not independent evidence.
     """
-    targets = _docs_ingest_targets(document_path)
+    all_targets = _docs_ingest_all_targets(document_path)
+    targets = all_targets[:_DOCS_INGEST_MAX_FILES]
     if not targets:
         return json.dumps({
             "error": (
@@ -2918,13 +2939,18 @@ def docs_ingest_indexer(
             "summary": summary,
         })
 
-    return json.dumps({
+    out = {
         "stored": sum(1 for r in records if r["stored"]),
         "unmodified": sum(1 for r in records if r.get("change_state") == "unchanged"),
         "changed": sum(1 for r in records if r.get("changed") is True),
         "investigation_id": investigation_id,
         "records": records,
-    })
+    }
+    if len(all_targets) > len(targets):
+        # The file cap cut the tree short: say so rather than read as complete.
+        out.update(truncated=True, files_found=len(all_targets),
+                   files_ingested=len(targets), max_files=_DOCS_INGEST_MAX_FILES)
+    return json.dumps(out)
 
 
 def _docs_search_matches_text(text: str, query: str) -> bool:
@@ -4633,14 +4659,17 @@ def _pre_answer_lexical_refs(
     return claim_support_refs, claim_contradiction_refs
 
 
-def _firewall_linked_evidence(investigation_id: str, finding: dict) -> list[dict]:
+def _firewall_linked_evidence(investigation_id: str, finding: dict,
+                              pool: Optional[list] = None) -> list[dict]:
     """Evidence rows actually linked to ``finding``'s claim, for the provenance firewall.
 
     Its ``derived_from`` parents plus the rows the pre_answer_check lexical lane
     counts as support (findings and audit receipts). Never "every other finding":
     an unrelated row says nothing about this claim. No link -> [] (fails closed).
+    ``pool`` lets a batch caller build the validation evidence once.
     """
-    pool, _ = build_validation_evidence(investigation_id, min_confidence="low")
+    if pool is None:
+        pool, _ = build_validation_evidence(investigation_id, min_confidence="low")
     fid = str(finding.get("id") or "")
     parents = set(_normalize_derived_from(finding.get("derived_from")))
     others = [e for e in pool if str(e.get("evidence_id") or "") != fid]
@@ -7614,6 +7643,10 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             open_findings.append(f)
 
     results = []
+    # One evidence pool for the batch; verify_all writes only to the verifications log,
+    # so the pool stays current across the loop.
+    _linked_pool = (build_validation_evidence(investigation_id, min_confidence="low")[0]
+                    if open_findings else [])
     for f in open_findings:
         fid = str(f.get("id", ""))
         # Thread this finding's own stored provenance tier plus the evidence actually
@@ -7628,8 +7661,8 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             # WHICH checkout its source lives in; without them the skeptic reasons
             # over prose while the file sits on disk.
             code_refs=f.get("code_refs"),
-            candidate_provenance_tier=normalize_provenance_tier(f),
-            evidence_rows=_firewall_linked_evidence(investigation_id, f),
+            candidate_provenance_tier=firewall_candidate_tier(f),
+            evidence_rows=_firewall_linked_evidence(investigation_id, f, pool=_linked_pool),
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
@@ -7663,6 +7696,15 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     }, indent=2)
 
 
+def _embed_probe_headers() -> dict:
+    """Auth headers the embed client sends (EMBED_API_KEY), for health probes. Never raises."""
+    try:
+        import qdrant_ops
+        return {k: v for k, v in qdrant_ops._embed_auth_headers().items() if k != "Content-Type"}
+    except Exception:
+        return {}
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -7680,8 +7722,10 @@ def loci_health() -> str:
                          writer lock right now (transient with per-op leasing).
       ladybug_writer_pid: (optional) PID stamped as the write-lease holder, only while
                          that process is alive
-      ollama_reachable:  the resolved Ollama (embed) endpoint answers GET /api/tags
-      ollama_gen_reachable: the generation endpoint (ollama_gen_url) answers GET /api/tags
+      ollama_reachable:  the resolved Ollama (embed) endpoint answers GET /api/tags; a
+                         non-Ollama OpenAI-compatible embeddings host (no /api/tags)
+                         counts when it answers that GET with a 4xx
+      ollama_gen_reachable: the generation endpoint (ollama_gen_url), same rule
       ollama_gen_model_present: (optional) the configured gen model is listed there
       vllm_reachable:    the resolved vLLM endpoint answers GET /health
       qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
@@ -7753,6 +7797,13 @@ def loci_health() -> str:
                 out[key] = False
                 if backends._alive(url, timeout=_PROBE_T):
                     ok, body = backends._http_probe(url, path, timeout=_HTTP_T, headers=headers)
+                    if not ok and key in ("ollama_reachable", "ollama_gen_reachable"):
+                        # OLLAMA_BASE_URL may name any OpenAI-compatible embeddings host, which
+                        # has no /api/tags: a 4xx still proves it answers HTTP. A 5xx (e.g. a
+                        # relay whose upstream is dead) or no answer does not.
+                        _st = backends._http_status(url, path, timeout=_HTTP_T,
+                                                    headers=_embed_probe_headers())
+                        ok = _st is not None and 400 <= _st < 500
                     out[key] = bool(ok)
                     http_answers[key] = body
             except Exception as exc:
@@ -9876,8 +9927,9 @@ def loci_validated_knowledge_promotion(
         return json.dumps({"status": "blocked", "reason": "retracted_finding", "finding_id": finding_id})
 
     text = str(finding.get("text") or "")
-    # Same reader as verify_all: honours metadata.provenance_tier / evidence_kind aliases.
-    evidence_tier = normalize_provenance_tier(finding)
+    # Same reader as verify_all: honours metadata.provenance_tier / evidence_kind aliases;
+    # an untagged (defaulted) finding is gated like model_asserted.
+    evidence_tier = firewall_candidate_tier(finding)
     import verify as _v
     verify_result = _v.verify_finding(
         text,

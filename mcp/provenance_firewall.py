@@ -72,23 +72,31 @@ def _metadata(row: Any) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _asserted_raw_tier(row: dict) -> Any:
+    """The caller-asserted tier value normalize_provenance_tier reads first, or None."""
+    meta = _metadata(row)
+    return (
+        row.get("evidence_provenance_tier")
+        or row.get("provenance_tier")
+        or meta.get("evidence_provenance_tier")
+        or meta.get("provenance_tier")
+        or row.get("evidence_kind")
+        or meta.get("evidence_kind")
+    )
+
+
+def _is_known_tier(raw: Any) -> bool:
+    key = str(raw or "").strip().lower().replace(" ", "_")
+    return bool(key) and (key in _ALIASES or key in PROVENANCE_TIERS)
+
+
 def normalize_provenance_tier(row: Any, *, default: str = LEGACY_UNTAGGED_DEFAULT) -> str:
     """Return a canonical provenance tier for a finding/evidence row; never raises."""
     try:
         if isinstance(row, str):
             raw = row
         elif isinstance(row, dict):
-            meta = _metadata(row)
-            raw = (
-                row.get("evidence_provenance_tier")
-                or row.get("provenance_tier")
-                or meta.get("evidence_provenance_tier")
-                or meta.get("provenance_tier")
-                or row.get("evidence_kind")
-                or meta.get("evidence_kind")
-                or row.get("tier")
-                or default
-            )
+            raw = _asserted_raw_tier(row) or row.get("tier") or default
         else:
             raw = default
         key = str(raw or default).strip().lower().replace(" ", "_")
@@ -102,20 +110,31 @@ def provenance_fields(row: Any, *, default: str = LEGACY_UNTAGGED_DEFAULT) -> di
 
     A row already flagged ``provenance_defaulted=True`` (e.g. Mnemosyne
     metadata written from a defaulted finding) stays defaulted: the tier key it
-    carries is the stored default, not an assertion.
+    carries is the stored default, not an assertion. So does a row whose tier
+    field holds a value that is not a known tier (``evidence_kind="log_excerpt"``):
+    it normalises to the default, and nobody asserted that default.
     """
     tier = normalize_provenance_tier(row, default=default)
     explicit = isinstance(row, str)
     if isinstance(row, dict):
         meta = _metadata(row)
-        explicit = any(
-            row.get(k) is not None or meta.get(k) is not None
-            for k in ("evidence_provenance_tier", "provenance_tier", "evidence_kind")
-        ) and True not in (row.get("provenance_defaulted"), meta.get("provenance_defaulted"))
+        explicit = _is_known_tier(_asserted_raw_tier(row)) and True not in (
+            row.get("provenance_defaulted"), meta.get("provenance_defaulted"))
     return {
         "evidence_provenance_tier": tier,
         "provenance_defaulted": not explicit,
     }
+
+
+def firewall_candidate_tier(row: Any) -> str:
+    """Tier to gate a stored finding with when it is the *candidate* claim.
+
+    A defaulted (untagged) finding is displayed as tool_verified, but nobody
+    asserted that, so as a candidate it is gated like model_asserted: it needs
+    linked independent evidence before a verifier or promotion accepts it.
+    """
+    fields = provenance_fields(row)
+    return MODEL_ASSERTED if fields["provenance_defaulted"] else fields["evidence_provenance_tier"]
 
 
 def assert_evidence_firewall(candidate: Any, evidence_rows: Any, *, phase: str = "") -> dict:
@@ -129,7 +148,8 @@ def assert_evidence_firewall(candidate: Any, evidence_rows: Any, *, phase: str =
     finding".  Any unexpected shape fails open with ``allowed=True``.
     """
     try:
-        candidate_tier = normalize_provenance_tier(candidate)
+        candidate_tier = (firewall_candidate_tier(candidate) if isinstance(candidate, dict)
+                          else normalize_provenance_tier(candidate))
         rows = evidence_rows if isinstance(evidence_rows, (list, tuple, set)) else []
         fields = [provenance_fields(row) for row in rows]
         evidence_tiers = frozenset(f["evidence_provenance_tier"] for f in fields)

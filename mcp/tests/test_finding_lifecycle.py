@@ -316,8 +316,10 @@ class FindingLifecycleTest(unittest.TestCase):
 
     def test_verify_all_returns_per_finding_verdicts_with_stub(self):
         inv_id = self._start()
-        fid1 = self._store(inv_id, "claim one")
-        fid2 = self._store(inv_id, "claim two")
+        # Explicitly tool_verified: an untagged (defaulted) finding is gated like
+        # model_asserted and, with no linked evidence, never reaches the verifier.
+        fid1 = self._store(inv_id, "claim one", evidence_provenance_tier="tool_verified")
+        fid2 = self._store(inv_id, "claim two", evidence_provenance_tier="tool_verified")
 
         calls = []
 

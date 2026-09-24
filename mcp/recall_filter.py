@@ -44,8 +44,60 @@ def _safe_child(root: Path, name: str) -> Optional[Path]:
     return path
 
 
+# Per-investigation cache for _final_resolutions, keyed on the two logs' stat.
+# rag_context_search / memory_surface (and so every ground() call) otherwise
+# re-parse findings.jsonl on each query just to find superseded ids.
+_RESOLUTIONS_CACHE: dict[str, tuple[tuple, dict[str, str]]] = {}
+_RESOLUTIONS_CACHE_MAX = 512
+
+
+def _stat_key(path: Path) -> Optional[tuple]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def _final_resolutions(inv_path: Path) -> dict[str, str]:
-    """``{finding_id: resolution}`` from findings.jsonl then finding_updates.jsonl (last wins)."""
+    """``{finding_id: resolution}`` from findings.jsonl then finding_updates.jsonl (last wins).
+
+    Cached per directory until either log's inode, size or mtime changes. The
+    returned dict is shared: callers must not mutate it.
+    """
+    key = (_stat_key(inv_path / "findings.jsonl"), _stat_key(inv_path / "finding_updates.jsonl"))
+    cached = _RESOLUTIONS_CACHE.get(str(inv_path))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    out = _read_final_resolutions(inv_path)
+    if len(_RESOLUTIONS_CACHE) >= _RESOLUTIONS_CACHE_MAX:
+        _RESOLUTIONS_CACHE.clear()
+    _RESOLUTIONS_CACHE[str(inv_path)] = (key, out)
+    return out
+
+
+_TEXTS_CACHE: dict[str, tuple[tuple, set[str]]] = {}
+
+
+def _retracted_texts(inv_path: Path, rids: set[str]) -> set[str]:
+    """Texts of the retracted findings, cached until findings.jsonl or the id set changes."""
+    key = (_stat_key(inv_path / "findings.jsonl"), frozenset(rids))
+    cached = _TEXTS_CACHE.get(str(inv_path))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    texts: set[str] = set()
+    for f in _read_jsonl(inv_path / "findings.jsonl"):
+        if isinstance(f, dict) and str(f.get("id", "")) in rids:
+            t = str(f.get("text", "") or "").strip()
+            if t:
+                texts.add(t)
+    if len(_TEXTS_CACHE) >= _RESOLUTIONS_CACHE_MAX:
+        _TEXTS_CACHE.clear()
+    _TEXTS_CACHE[str(inv_path)] = (key, texts)
+    return texts
+
+
+def _read_final_resolutions(inv_path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for f in _read_jsonl(inv_path / "findings.jsonl"):
         if not isinstance(f, dict) or f.get("record_type") == "access":
@@ -167,13 +219,7 @@ def build_recall_filter(
             if rids:
                 rf.retracted[name] = rids
             if with_texts and rids:
-                texts: set[str] = set()
-                for f in _read_jsonl(inv_path / "findings.jsonl"):
-                    if isinstance(f, dict) and str(f.get("id", "")) in rids:
-                        t = str(f.get("text", "") or "").strip()
-                        if t:
-                            texts.add(t)
-                rf.retracted_texts[name] = texts
+                rf.retracted_texts[name] = _retracted_texts(inv_path, rids)
             if with_superseded:
                 sup = {fid for fid, res in _final_resolutions(inv_path).items() if res == "superseded"}
                 if sup:

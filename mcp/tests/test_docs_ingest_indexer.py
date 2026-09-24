@@ -116,6 +116,21 @@ This is the second doc.
         self.assertEqual(result["stored"], 2, result)
         self.assertEqual(len(result["records"]), 2)
 
+    def test_docs_ingest_reports_file_cap_truncation(self):
+        # Review follow-up: the file cap silently truncated large doc trees.
+        docs_dir = Path(self._tmp.name) / "big_tree"
+        docs_dir.mkdir()
+        for i in range(3):
+            (docs_dir / f"d{i}.md").write_text(f"# Doc {i}\n\nBody {i}.\n", encoding="utf-8")
+        with mock.patch.object(server, "_DOCS_INGEST_MAX_FILES", 2):
+            result = json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-cap"))
+        self.assertEqual(len(result["records"]), 2, result)
+        self.assertIs(result.get("truncated"), True, result)
+        self.assertEqual(result.get("files_found"), 3, result)
+        with mock.patch.object(server, "_DOCS_INGEST_MAX_FILES", 5):
+            full = json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-cap"))
+        self.assertNotIn("truncated", full)
+
     def test_docs_ingest_indexer_accepts_text_and_markdown_directory_extensions(self):
         docs_dir = Path(self._tmp.name) / "mixed_doc_sources"
         docs_dir.mkdir()

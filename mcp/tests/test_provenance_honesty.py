@@ -473,5 +473,101 @@ class FlyBrainUncalibratedConfidenceTest(unittest.TestCase):
         self.assertEqual(gate.evaluate(task, prov, None, ok).decision, fbc.ClusterDecision.ACCEPT)
 
 
+# --- review follow-ups: retracted evidence, defaulted candidates, unknown tier aliases
+
+
+class ReviewFollowUpTest(_Isolated):
+
+    def setUp(self):
+        super().setUp()
+        for name, value in {
+            "_retract_quarantine_verdict": lambda *a, **k: False,
+            "_forget_finding_verdicts": lambda *a, **k: 0,
+            "_semantic_neighbor_ids": lambda *a, **k: [],
+            "_event_log_append": lambda *a, **k: None,
+        }.items():
+            p = mock.patch.object(server, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _retract(self, inv, fid):
+        r = _j(server.memory_retract(inv, fid, reason="hallucination", dry_run=False,
+                                     scope_semantic=False))
+        self.assertTrue(r.get("applied"), r)
+
+    def test_retracted_finding_is_not_pre_answer_support(self):
+        # Probe P1: the retracted row still gave support_count=1.
+        inv = "prov-rev-p1"
+        self._start(inv)
+        fid = _j(server.investigation_store(
+            investigation_id=inv, finding_type="observed", text=CLAIM, source="redis-cli",
+            confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+        self._retract(inv, fid)
+        out = _j(server.investigation_pre_answer_check(investigation_id=inv, claims=[CLAIM], record=False))
+        self.assertEqual(out["support_count"], 0, out)
+        self.assertNotIn(fid, json.dumps(out["claim_results"]))
+        self.assertEqual(out["evidence_lanes"]["retraction"]["excluded_retracted"], 1)
+
+    def test_retracted_finding_is_not_linked_firewall_evidence(self):
+        # Probe P6: the retracted tool_verified row cleared the firewall for a model claim.
+        inv = "prov-rev-p6"
+        self._start(inv)
+        bad = _j(server.investigation_store(
+            investigation_id=inv, finding_type="observed",
+            text="Service X memory grows 2GB per hour in heap profile", source="pprof",
+            confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+        self._retract(inv, bad)
+        fid = _j(server.investigation_store(
+            investigation_id=inv, finding_type="inferred",
+            text="Service X memory grows per hour: heap leak", source="llm",
+            confidence="high", evidence_provenance_tier="model_asserted"))["finding_id"]
+        self.assertEqual(server._firewall_linked_evidence(inv, self._row(inv, fid)), [])
+        calls = []
+        with mock.patch.object(server, "_verify_gen_fn", _confirmed_gen(calls)):
+            out = _j(server.investigation_verify_all(investigation_id=inv, limit=20))
+        res = next(r for r in out["results"] if r["finding_id"] == fid)
+        self.assertEqual(res["verdict"], "uncertain")
+        self.assertEqual(calls, [])
+
+    def test_untagged_candidate_needs_linked_evidence(self):
+        # Probe P7: an untagged inferred finding reached the verifier as tool_verified
+        # with zero linked evidence and came back 'confirmed'.
+        inv = "prov-rev-p7"
+        self._start(inv)
+        fid = _j(server.investigation_store(
+            investigation_id=inv, finding_type="inferred",
+            text="Therefore host delta is compromised", source="agent"))["finding_id"]
+        self.assertTrue(provenance_fields(self._row(inv, fid))["provenance_defaulted"])
+        calls = []
+        with mock.patch.object(server, "_verify_gen_fn", _confirmed_gen(calls)):
+            out = _j(server.investigation_verify_all(investigation_id=inv, limit=20))
+        res = next(r for r in out["results"] if r["finding_id"] == fid)
+        self.assertEqual(res["verdict"], "uncertain")
+        self.assertEqual(calls, [])
+        with mock.patch.object(verify, "_lazy_generate", _confirmed_gen(calls)):
+            promo = _j(server.loci_validated_knowledge_promotion(investigation_id=inv, finding_id=fid))
+        self.assertEqual(promo["status"], "blocked", promo)
+        self.assertEqual(promo["reason"], "provenance_firewall")
+        self.assertEqual(calls, [])
+
+    def test_unknown_tier_alias_is_still_defaulted(self):
+        # Probes P4/P5: evidence_kind='log_excerpt'/'hunch' made an untagged row look asserted.
+        f = provenance_fields({"metadata": {"evidence_kind": "log_excerpt"}})
+        self.assertEqual(f, {"evidence_provenance_tier": "tool_verified", "provenance_defaulted": True})
+        fw = assert_evidence_firewall({"evidence_provenance_tier": "model_asserted"},
+                                      [{"text": "x", "metadata": {"evidence_kind": "log_excerpt"}}])
+        self.assertFalse(fw["allowed"])
+        # Known aliases still count as asserted.
+        self.assertFalse(provenance_fields({"metadata": {"evidence_kind": "tool"}})["provenance_defaulted"])
+        self.assertEqual(provenance_fields({"evidence_kind": "llm"}),
+                         {"evidence_provenance_tier": "model_asserted", "provenance_defaulted": False})
+        inv = "prov-rev-p5"
+        self._start(inv)
+        fid = _j(server.investigation_store(
+            investigation_id=inv, finding_type="inferred", text="a hunch about foo",
+            source="agent", metadata={"evidence_kind": "hunch"}))["finding_id"]
+        self.assertTrue(provenance_fields(self._row(inv, fid))["provenance_defaulted"])
+
+
 if __name__ == "__main__":
     unittest.main()

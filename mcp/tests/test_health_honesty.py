@@ -376,6 +376,51 @@ def test_loci_health_flags_a_gen_endpoint_without_the_gen_model(monkeypatch):
     assert out["status"] == "unhealthy"
 
 
+def _status_server(code):
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(dict(self.headers))
+            self.send_response(code)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}", seen
+
+
+@pytest.mark.parametrize("code,reachable", [(404, True), (401, True), (502, False)])
+def test_loci_health_non_ollama_embedder_is_judged_by_http_answer(monkeypatch, code, reachable):
+    """Review follow-up: OLLAMA_BASE_URL may be any OpenAI-compatible embeddings host,
+    which has no /api/tags. A 4xx proves it answers; a 5xx (dead relay upstream) does not."""
+    srv, url, seen = _status_server(code)
+    try:
+        monkeypatch.setenv("OLLAMA_BASE_URL", url)
+        monkeypatch.setattr(qdrant_ops, "_EMBED_API_KEY", "sk-test")
+        monkeypatch.setattr(qdrant_ops, "_EMBED_API_KEY_HEADER", "Authorization")
+        for var in ("LOCI_OLLAMA_GEN_URL", "OLLAMA_GEN_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: url)
+        monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: url)
+        monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "")
+        monkeypatch.setattr(backends, "qdrant", lambda: ("", ""))
+        monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
+        out = json.loads(server.loci_health())
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert out["ollama_reachable"] is reachable, out
+    assert out["ollama_gen_reachable"] is reachable, out
+    ollama_failures = [f for f in out.get("failures", []) if f.startswith("ollama")]
+    assert bool(ollama_failures) is (not reachable), out
+    assert any(h.get("Authorization") == "Bearer sk-test" for h in seen), seen
+
+
 def test_http_probe_never_raises_and_reads_json():
     srv, url = _stub_embedder(dim=2)
     srv.shutdown()

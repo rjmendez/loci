@@ -320,7 +320,9 @@ def _read_jsonl(path: Path) -> list[dict]:
     out = []
     bad = 0
     drop_access = path.name == FINDINGS_LOG_NAME
-    for line in path.read_text().splitlines():
+    # Decode per line: one torn, non-UTF-8 append must cost that line, not the whole log
+    # (for retractions.jsonl that would void every tombstone in the investigation).
+    for line in path.read_bytes().decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if line:
             try:

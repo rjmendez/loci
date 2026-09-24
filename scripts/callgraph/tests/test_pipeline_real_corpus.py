@@ -247,7 +247,7 @@ def test_name_get_ladybug_write_and_injection_and_reads(head_build):
     global_stmt_writes = [w for w in writes if w.attrs["via"] == "global-stmt"]
     assert len(global_stmt_writes) == 1
     assert global_stmt_writes[0].src == "fn:mcp/graph_tools.py::register"
-    assert global_stmt_writes[0].attrs["line"] == 386  # shifted by docstring/comment trim in mcp/graph_tools.py
+    assert global_stmt_writes[0].attrs["line"] == 399  # shifted by docstring/comment trim, then +13 lines (code_graph_query error path) in mcp/graph_tools.py
 
     injects = store.in_edges(nid, "INJECTS")
     assert len(injects) == 1

@@ -262,11 +262,14 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     def fail(lane: str, exc: BaseException) -> None:
         mark(lane, "timeout" if isinstance(exc, _LaneTimeout) else f"raised: {exc!r}")
 
-    def add(tag: str, text: str, slice_frac: float) -> None:
+    def add(tag: str, text: str, slice_frac: float, framed: bool = False) -> None:
+        # framed=True: ``text`` was composed here or by rag_context_search from
+        # wrap_untrusted_memory_text frames, so compact mode must keep those frames.
         if remaining[0] <= 0 or not text:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
-        chunk = compact_text(text, cap, preserve_sentence_boundary=not compact_mode) if compact_mode else _truncate(text, cap)
+        chunk = (compact_text(text, cap, preserve_sentence_boundary=not compact_mode, keep_frames=framed)
+                 if compact_mode else _truncate(text, cap))
         if compact_mode:
             chunk = re.sub(r"\s+", " ", chunk).strip()
         block = f"[{tag}] {chunk}"
@@ -310,6 +313,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                         source="investigation_load",
                     ),
                     0.12,
+                    framed=True,
                 )
                 for f in (data.get("recent_findings") or [])[:3]:
                     if isinstance(f, dict):
@@ -328,6 +332,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                             f"case:{cid}:finding" + ("" if res == "open" else f":{res}"),
                             wrapped,
                             0.08,
+                            framed=True,
                         )
         except Exception as exc:
             logger.debug("grounding: case lane failed for %r: %r", cid, exc)
@@ -377,7 +382,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             fail("resolved", exc)
             continue
     if resolved_known:
-        add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15)
+        add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15, framed=True)
 
     # 3. Exact entities -> entity_lookup (O(1), no embedding). Fail-open per entity.
     for ent in (task.get("entities") or [])[:5]:
@@ -425,7 +430,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             res = _jload(call(S.rag_context_search, q, **rag_kwargs))
             ctx = (res or {}).get("context", "") if isinstance(res, dict) else ""
             if ctx and (res.get("result_count") or 0) > 0:
-                add("rag", ctx, _RAG_BUDGET_FRACTION)
+                add("rag", ctx, _RAG_BUDGET_FRACTION, framed=True)
             # Independent of whether some context came back: a partial failure still degrades.
             if isinstance(res, dict):
                 if not res.get("qdrant_available", True):
@@ -436,6 +441,11 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                     mark("rag", str(res.get("error")))
                 elif res.get("collections_failed"):
                     mark("rag", f"collections failed: {res.get('collections_failed')}")
+                _rf = res.get("retraction_filter") or {}
+                if isinstance(_rf, dict) and _rf.get("status", "ok") != "ok":
+                    # Some investigation's retractions could not be read, so its hits were
+                    # served unfiltered: the block may carry retracted findings.
+                    mark("rag", f"retraction filter degraded: {_rf.get('skipped_investigations')}")
         except Exception as exc:
             logger.debug("grounding: rag lane failed for %r: %r", task.get("title", ""), exc)
             fail("rag", exc)
@@ -473,6 +483,9 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
             res = _jload(call(S.investigation_search, f"{task.get('title','')} {task.get('focus','')}", limit=8))
             if isinstance(res, dict) and res.get("error"):
                 mark("keyword", str(res.get("error")))
+            _rf = res.get("retraction_filter") if isinstance(res, dict) else None
+            if isinstance(_rf, dict) and _rf.get("status", "ok") != "ok":
+                mark("keyword", f"retraction filter degraded: {_rf.get('skipped_investigations')}")
             items = (res or {}).get("results", []) if isinstance(res, dict) else []
             for r in items[:8]:
                 r["_wrapped_text"] = _wrap_untrusted_memory_text(
@@ -483,7 +496,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                     source=str(r.get("source") or "investigation_search"),
                 )
             for it in filter_noise([{"text": r.get("_wrapped_text"), "source": r.get("source")} for r in items])[:3]:
-                add("recall", str(it.get("text", "")), 0.10)
+                add("recall", str(it.get("text", "")), 0.10, framed=True)
         except Exception as exc:
             logger.debug("grounding: keyword fallback lane failed for %r: %r", task.get("title", ""), exc)
             fail("keyword", exc)
