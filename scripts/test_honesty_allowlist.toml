@@ -35,7 +35,6 @@ file = "eval/tests/test_eval.py"
 entries = [
   { test = "test_embed_raises_keyerror_when_response_lacks_embedding", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
   { test = "test_run_propagates_keyerror_for_a_malformed_task", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_stable_point_id_is_deterministic_and_bounded", rule = "or-true", reason = "pre-existing at 3a1ad78: 'or True' makes the assert unfalsifiable (audit C3); audit mlops-eval-deepthink weak_confirmed C1; owner: mlops track" },
 ]
 
 [[allow]]
@@ -61,7 +60,6 @@ entries = [
 [[allow]]
 file = "mcp/tests/test_flybrain_brain_cluster_banc_samples.py"
 entries = [
-  { test = "test_invalid_config_values", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-3 weak_confirmed C4; owner: FlyBrain owners" },
   { test = "test_real_snapshot_smoke", rule = "env-skipif", reason = "pre-existing at 3a1ad78: always skipped in CI: gated on LOCI_FLYBRAIN_STORAGE_ROOT, a real snapshot not in the repo (audit C5). Needs a checked-in schema-sample fixture that always runs; owner: FlyBrain owners" },
 ]
 
@@ -81,14 +79,12 @@ entries = [
 [[allow]]
 file = "mcp/tests/test_flybrain_brain_cluster_mc_samples.py"
 entries = [
-  { test = "test_invalid_config_values", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-6 hollow_confirmed C4; owner: FlyBrain owners" },
   { test = "test_real_snapshot_smoke", rule = "env-skipif", reason = "pre-existing at 3a1ad78: always skipped in CI: gated on LOCI_FLYBRAIN_STORAGE_ROOT, a real snapshot not in the repo (audit C5). Needs a checked-in schema-sample fixture that always runs; audit mcp-6 weak_confirmed C5; owner: FlyBrain owners" },
 ]
 
 [[allow]]
 file = "mcp/tests/test_flybrain_brain_cluster_mv_samples.py"
 entries = [
-  { test = "test_config_validation", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-2 weak_confirmed C4/C3; owner: FlyBrain owners" },
   { test = "test_leakage_guard_rejects_forbidden_and_unexpected_keys", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: FlyBrain owners" },
   { test = "test_real_snapshot_smoke", rule = "env-skipif", reason = "pre-existing at 3a1ad78: always skipped in CI: gated on LOCI_FLYBRAIN_STORAGE_ROOT, a real snapshot not in the repo (audit C5). Needs a checked-in schema-sample fixture that always runs; audit mcp-2 hollow_confirmed C5; owner: FlyBrain owners" },
 ]
@@ -96,7 +92,6 @@ entries = [
 [[allow]]
 file = "mcp/tests/test_flybrain_brain_cluster_ol_samples.py"
 entries = [
-  { test = "test_invalid_config_values", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-3 weak_confirmed C4; owner: FlyBrain owners" },
   { test = "test_real_snapshot_smoke", rule = "env-skipif", reason = "pre-existing at 3a1ad78: always skipped in CI: gated on LOCI_FLYBRAIN_STORAGE_ROOT, a real snapshot not in the repo (audit C5). Needs a checked-in schema-sample fixture that always runs; owner: FlyBrain owners" },
 ]
 
@@ -161,32 +156,16 @@ entries = [
 ]
 
 [[allow]]
-file = "mcp/tests/test_verdict_vector_contract.py"
-entries = [
-  { test = "test_an_unreachable_qdrant_is_not_treated_as_absent", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-5 weak_confirmed C4; owner: mcp owners" },
-]
-
-[[allow]]
 file = "mlops/embedding/tests/test_embedding.py"
 entries = [
-  { test = "test_baseline_spearman_returns_a_dict_despite_its_float_annotation", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mlops-eval-deepthink hollow_confirmed C7; owner: mlops track" },
   { test = "test_embed_raises_keyerror_when_response_lacks_embedding", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
   { test = "test_make_examples_requires_label_claim_evidence", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_sample_texts_non_string_text_value_raises_typeerror", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
 ]
 
 [[allow]]
 file = "mlops/finetune/tests/test_finetune.py"
 entries = [
   { test = "test_deduplicate_raises_keyerror_when_a_record_has_no_id", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_pairs_from_corrections_crashes_on_null_content", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-]
-
-[[allow]]
-file = "mlops/grounding/tests/test_grounding.py"
-entries = [
-  { test = "test_extract_topic_bench_with_null_text_raises", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_zscore_json_null_in_history_raises", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
 ]
 
 [[allow]]
@@ -199,28 +178,17 @@ entries = [
 file = "mlops/tests/test_loop.py"
 entries = [
   { test = "test_append_history_propagates_non_serialisable_record", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_main_list_state_file_raises_type_error", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
-  { test = "test_main_null_cv_f1_mean_in_metrics_crashes_the_loop", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mlops-eval-deepthink hollow_confirmed C7; owner: mlops track" },
-  { test = "test_main_partial_state_file_raises_key_error", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mlops track" },
 ]
 
 [[allow]]
 file = "scripts/hooks/tests/test_pre_llm_grounding.py"
 entries = [
   { test = "test_mmr_select_requires_ms_score", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: security-hooks track" },
-  { test = "test_multi_signal_score_requires_score_key_even_when_fused_present", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: security-hooks track" },
   { test = "test_search_collection_non_numeric_importance_raises", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: security-hooks track" },
-  { test = "test_search_collection_null_result_raises_typeerror", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit hooks-callgraph-a2a-root hollow_confirmed C7/C4; owner: security-hooks track" },
 ]
 
 [[allow]]
 file = "scripts/hooks/tests/test_pre_tool_grounding.py"
 entries = [
   { test = "test_rotate_swallows_all_exceptions", rule = "no-assertions", reason = "pre-existing at 3a1ad78: test asserts nothing (audit C1); owner: security-hooks track" },
-]
-
-[[allow]]
-file = "scripts/hooks/tests/test_session_end_sync.py"
-entries = [
-  { test = "test_embed_raises_when_ollama_base_url_is_unset", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit hooks-callgraph-a2a-root inconclusive C4; owner: security-hooks track" },
 ]

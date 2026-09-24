@@ -27,7 +27,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from . import config
 from .analyze.deadcode import registered_but_dead
 from .analyze.flags import rank_flags
 from .analyze.literalaudit import near_miss_pairs, orphans
