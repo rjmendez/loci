@@ -37,6 +37,14 @@ _MAX_EVIDENCE_ITEMS = 8
 _MAX_EVIDENCE_CHARS = 1200
 _FASTPATH_MIN_OVERLAP = 0.72
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+# Polarity cues. The reflex only compares tokens, so "No evidence that X" contains X
+# verbatim; a support row whose negation cues differ from the claim's is left to the model.
+_NEGATION_TOKENS = frozenset({
+    "no", "not", "never", "none", "nothing", "nobody", "neither", "nor", "without",
+    "false", "untrue", "cannot", "cant", "didn", "doesn", "don", "isn", "wasn", "weren",
+    "aren", "hasn", "haven", "hadn", "won", "wouldn", "couldn", "shouldn",
+    "refuted", "disproved", "disproven", "unconfirmed",
+})
 
 _PROMPT_TMPL = (
     "You are checking whether cited investigation evidence REALLY supports an EXACT claim.\n"
@@ -154,10 +162,13 @@ def _reflex_arc_fastpath(claim: str, evidence: list[dict]) -> dict | None:
 
     # Reflex acceptance: exact or near-exact support match with no contradiction.
     if not contradictions:
+        claim_negations = _tokenize(claim_text) & _NEGATION_TOKENS
         for row in supports:
             text = str(row.get("text") or row.get("snippet") or "").strip()
             if not text:
                 continue
+            if (_tokenize(text) & _NEGATION_TOKENS) != claim_negations:
+                continue  # polarity differs: lexical overlap cannot tell support from denial
             text_norm = _normalize_lexeme_text(text)
             overlap = _lexical_overlap_ratio(claim_text, text)
             exactish = (claim_norm in text_norm) or (text_norm in claim_norm)

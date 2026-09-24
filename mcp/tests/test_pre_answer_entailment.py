@@ -4,6 +4,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest  # noqa: E402
+
 import pre_answer_entailment as E  # noqa: E402
 
 
@@ -233,4 +235,76 @@ def test_reflex_fastpath_prevalidated_support_short_circuits_model_call():
     assert result["available"] is True
     assert result["verdict"] == "confirmed"
     assert "reflex_fastpath" in result["rationale"]
+    assert calls == []
+
+
+# --- negation must never be confirmed by the lexical reflex -------------------------
+
+def _recording(text):
+    calls = []
+
+    def _fn(prompt, *, fmt=None, max_tokens=256):
+        calls.append(prompt)
+        return {"text": text, "ok": True}
+
+    return _fn, calls
+
+
+_MODEL_REFUTES = '{"verdict": "refuted", "rationale": "the evidence negates the claim", "confidence": 0.6}'
+
+
+@pytest.mark.parametrize("row", [
+    # exact containment, full overlap: the claim appears verbatim inside a negation
+    {"role": "support", "text": "No evidence that Host-b executed malware."},
+    {"role": "support", "text": "It is false that host-b executed malware."},
+    {"role": "support", "text": "Host-b executed malware? Not observed."},
+    # prevalidated support with strong overlap but opposite polarity
+    {"role": "support", "validation_status": "validated", "text": "Host-b never executed malware."},
+    {"role": "support", "prevalidated": True, "text": "Host-b did not execute malware."},
+])
+def test_reflex_fastpath_never_confirms_negated_support(row):
+    evidence = [dict(row, evidence_id="f-neg", record_type="observed", source="test")]
+    assert E._reflex_arc_fastpath("Host-b executed malware.", evidence) is None
+
+    fn, calls = _recording(_MODEL_REFUTES)
+    result = E.check_claim_entailment("Host-b executed malware.", evidence, gen_fn=fn)
+    assert len(calls) == 1                      # the model, not the reflex, decides
+    assert result["verdict"] == "refuted"
+    assert result["confidence"] == 0.6
+    assert "reflex_fastpath" not in result["rationale"]
+
+
+def test_reflex_fastpath_never_confirms_a_negated_claim_from_affirmative_evidence():
+    evidence = [{"role": "support", "validation_status": "validated",
+                 "text": "Host-b did execute malware from the startup folder."}]
+    assert E._reflex_arc_fastpath("Host-b did not execute malware.", evidence) is None
+
+
+def test_reflex_fastpath_confirms_when_claim_and_evidence_share_the_negation():
+    # Positive twin: matching polarity is still an exact, model-free confirmation.
+    evidence = [{"role": "support", "evidence_id": "f-5", "record_type": "observed", "source": "test",
+                 "text": "Host-b did not execute malware during the window."}]
+    result = E._reflex_arc_fastpath("Host-b did not execute malware.", evidence)
+    assert result == {
+        "available": True,
+        "verdict": "confirmed",
+        "rationale": "reflex_fastpath: exact high-overlap support evidence; model bypassed.",
+        "confidence": 0.97,
+        "degraded": False,
+        "error": "",
+    }
+
+
+def test_reflex_fastpath_skips_malformed_rows_and_still_uses_the_good_one():
+    # Direct call: the isinstance/text filters let a good row through malformed ones.
+    good = {"role": "support", "evidence_id": "f-6", "record_type": "observed", "source": "test",
+            "text": "Host-b executed malware and established persistence."}
+    rows = [None, "not a dict", 7, {"role": "support", "text": None}, {"role": None}, good]
+    result = E._reflex_arc_fastpath("Host-b executed malware.", rows)
+    assert result is not None
+    assert (result["verdict"], result["confidence"]) == ("confirmed", 0.97)
+
+    fn, calls = _recording("{}")
+    via_tool = E.check_claim_entailment("Host-b executed malware.", rows, gen_fn=fn)
+    assert via_tool == result
     assert calls == []
