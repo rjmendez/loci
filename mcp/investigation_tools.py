@@ -18,6 +18,7 @@ from typing import Optional
 from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
     _append_jsonl,
+    _acl_access_denied,
     _inv_dir,
     _load_manifest,
     _load_retracted_ids,
@@ -746,9 +747,11 @@ def investigation_load(
             out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
-                             provided and the investigation has a non-empty ACL,
-                             findings are filtered to those authored by agents
-                             in the ACL or by the requesting agent itself.
+                             the investigation has a non-empty ACL, a requester
+                             that is neither the owner nor in the ACL gets
+                             permission_denied; a member sees findings
+                             authored by ACL members or by itself. Omitted, the
+                             caller is the local agent (HERMES_AGENT_ID).
         fidelity: Controls how much detail is returned. One of:
                   "full"    — manifest plus recent findings.
                   "summary" — manifest plus ``summary_l1`` and ``summary_l2``
@@ -770,6 +773,9 @@ def investigation_load(
         })
     manifest = _coordination_migrate_manifest(manifest)
 
+    denied = _acl_access_denied(manifest, requesting_agent_id)
+    if denied:
+        return json.dumps({"error": "permission_denied", "detail": denied})
     # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
     summary_l1 = manifest.get("summary_l1") or []
     summary_l2 = manifest.get("summary_l2") or ""
@@ -1484,16 +1490,19 @@ def investigation_share(
     investigation_id: str,
     agent_ids: list,
 ) -> str:
+    requesting_agent_id: Optional[str] = None,
     """
     Grant investigation access to one or more agents.
 
     Adds ``agent_ids`` to the investigation ACL. Idempotent: already-present
-    agents are left as-is.
+    agents are left as-is. Only the owner or an existing ACL member may change
+    the ACL (an unnamed caller is the local agent, ``HERMES_AGENT_ID``).
 
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to add to the ACL.
 
+        requesting_agent_id: Optional agent_id of the caller.
     Returns:
         JSON: {"shared_with": [...], "total_acl": N}
         On error: {"error": "<message>"}
@@ -1503,6 +1512,9 @@ def investigation_share(
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
         current_acl = list(manifest.get("acl") or [])
         current_set = set(current_acl)
         added = []
@@ -1527,15 +1539,18 @@ def investigation_unshare(
     investigation_id: str,
     agent_ids: list,
 ) -> str:
+    requesting_agent_id: Optional[str] = None,
     """
     Revoke investigation access from one or more agents.
 
     Removes ``agent_ids`` from the ACL. Idempotent: missing agents are ignored.
 
+    Only the owner or an existing ACL member may change the ACL.
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to remove from the ACL.
 
+        requesting_agent_id: Optional agent_id of the caller.
     Returns:
         JSON: {"removed": [...], "total_acl": N}
         On error: {"error": "<message>"}
@@ -1545,6 +1560,9 @@ def investigation_unshare(
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
 
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
         current_acl = list(manifest.get("acl") or [])
         remove_set = set(agent_ids or [])
         removed = [a for a in current_acl if a in remove_set]
@@ -1582,6 +1600,7 @@ def investigation_export(
                "finding_count": int, "size_bytes": int}
         On error: {"error": str}
     """
+    requesting_agent_id: Optional[str] = None,
     try:
         manifest = _load_manifest(investigation_id)
         if not manifest:
@@ -1597,6 +1616,9 @@ def investigation_export(
                     source=finding.get("source"),
                     explicit_provenance_tier=(
                         (finding.get("metadata") or {}).get("evidence_provenance_tier")
+        requesting_agent_id: Optional agent_id of the caller. An investigation
+                             with a non-empty ACL is exported only to its owner
+                             or an ACL member.
                         if isinstance(finding.get("metadata"), dict)
                         else None
                     ),
@@ -1607,6 +1629,9 @@ def investigation_export(
             for finding in findings_raw
         ]
         conflicts = _read_jsonl(inv_dir / "conflicts.jsonl")
+        denied = _acl_access_denied(manifest, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
         entities = _read_jsonl(inv_dir / "entities.jsonl")
 
         bundle = {

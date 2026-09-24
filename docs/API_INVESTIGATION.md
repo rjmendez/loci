@@ -26,12 +26,12 @@ investigation_start(
 ```
 
 ### `investigation_load(investigation_id: str, last_n_findings: int = 20, include_retracted: bool = False, requesting_agent_id: Optional[str] = None, fidelity: str = "full") -> str`
-Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and can enforce ACL visibility when `requesting_agent_id` is supplied.
+Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and enforces the ACL: when the case has a non-empty ACL, a requester that is neither the owner nor an ACL member gets `{"error":"permission_denied"}` (an omitted `requesting_agent_id` means the local agent, `HERMES_AGENT_ID`).
 
 - **Key parameters**
   - `last_n_findings`: Recent window size. Older `gap` and `assumed` findings may be promoted into the window so open obligations do not age out silently.
   - `include_retracted`: Surfaces retracted findings instead of filtering them.
-  - `requesting_agent_id`: Applies manifest ACL filtering when the case is shared.
+  - `requesting_agent_id`: The caller. Non-members of a non-empty ACL are refused; members see findings authored by ACL members or themselves.
   - `fidelity`: `full`, `summary`, or `brief`.
 - **Returns**
   - `full`: `{"manifest":...,"fidelity":"full","total_findings":N,"recent_findings":[...],"field_invariants":...,"excluded_retracted":N,...}`
@@ -98,8 +98,8 @@ Lists investigation manifests, newest-updated first. Summary mode is the default
 investigation_list(limit=25, offset=0, summary=False)
 ```
 
-### `investigation_share(investigation_id: str, agent_ids: list) -> str`
-Adds agents to an investigation’s ACL so later `investigation_load(..., requesting_agent_id=...)` calls can see shared findings. The operation is additive and idempotent: already-present IDs stay in place and are not repeated in `shared_with`.
+### `investigation_share(investigation_id: str, agent_ids: list, requesting_agent_id: Optional[str] = None) -> str`
+Adds agents to an investigation’s ACL so later `investigation_load(..., requesting_agent_id=...)` calls can see shared findings. The operation is additive and idempotent: already-present IDs stay in place and are not repeated in `shared_with`. Only the owner or an existing ACL member may change the ACL; anyone else gets `permission_denied`.
 
 - **Key parameters**
   - `agent_ids`: List of agent IDs to grant access.
@@ -113,8 +113,8 @@ investigation_share(
 )
 ```
 
-### `investigation_unshare(investigation_id: str, agent_ids: list) -> str`
-Removes agents from an investigation ACL. Missing IDs are ignored, so the tool is safe to use as an idempotent cleanup step after a handoff or review.
+### `investigation_unshare(investigation_id: str, agent_ids: list, requesting_agent_id: Optional[str] = None) -> str`
+Removes agents from an investigation ACL. Same caller rule as `investigation_share`. Missing IDs are ignored, so the tool is safe to use as an idempotent cleanup step after a handoff or review.
 
 - **Key parameters**
   - `agent_ids`: List of agent IDs to revoke.

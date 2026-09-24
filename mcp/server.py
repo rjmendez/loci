@@ -4404,6 +4404,7 @@ def investigation_search(
     include_retracted: bool = False,
     min_confidence: str = "low",
     resolution: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Search findings by similarity.
@@ -4426,11 +4427,32 @@ def investigation_search(
                     open/fixed/intentional/wontfix/superseded, only findings in that
                     resolution state are returned. Omit (default) to return all.
                     Each result row surfaces its ``resolution`` (absent -> "open").
+        requesting_agent_id: Optional agent_id of the caller. Rows from an
+                    investigation with a non-empty ACL that the caller is neither
+                    owner nor member of are dropped and counted under
+                    ``excluded_acl``.
 
     Returns:
         JSON list of matching findings with investigation context.
     """
     min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
+
+    _acl_denied_by_inv: dict[str, Optional[str]] = {}
+
+    def _acl_denied(inv_id: str) -> Optional[str]:
+        if inv_id not in _acl_denied_by_inv:
+            try:
+                manifest = _load_manifest(inv_id) if inv_id else None
+            except Exception:  # noqa: BLE001 — a malformed row id has no manifest, hence no ACL
+                manifest = None
+            _acl_denied_by_inv[inv_id] = (
+                inv_store._acl_access_denied(manifest, requesting_agent_id) if manifest else None
+            )
+        return _acl_denied_by_inv[inv_id]
+
+    if investigation_id and _acl_denied(str(investigation_id)):
+        return json.dumps({"error": "permission_denied", "detail": _acl_denied(str(investigation_id))})
+    _excluded_acl = {"n": 0}
 
     # Fail-safe: an empty retracted map filters nothing.
     _retracted_by_inv, _retracted_text_by_inv = (
@@ -4472,6 +4494,9 @@ def investigation_search(
     def _add_row(row: dict) -> None:
         if _search_row_is_retracted(row, _retracted_by_inv, _retracted_text_by_inv):
             _excluded_retracted["n"] += 1
+            return
+        if _acl_denied(str(row.get("investigation_id") or "")):
+            _excluded_acl["n"] += 1
             return
         key = "|".join([
             str(row.get("investigation_id", "")),
@@ -4523,7 +4548,11 @@ def investigation_search(
         )
 
     if not deduped:
-        return _search_empty_response(qdrant, mnemo_enabled)
+        empty = _search_empty_response(qdrant, mnemo_enabled)
+        if _excluded_acl["n"]:
+            # Everything matched was withheld by an ACL; say so rather than "no matches".
+            empty = json.dumps({**json.loads(empty), "excluded_acl": _excluded_acl["n"]}, indent=2)
+        return empty
 
     mode = "mnemo_primary"
     if qdrant.get("ok"):
@@ -4543,6 +4572,7 @@ def investigation_search(
         "mode": mode,
         "results": deduped[: max(1, min(limit, 200))],
         "excluded_retracted": _excluded_retracted["n"],
+        **({"excluded_acl": _excluded_acl["n"]} if _excluded_acl["n"] else {}),
         "include_retracted": include_retracted,
         "resolution_filter": resolution,
         "mnemo_status": {

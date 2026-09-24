@@ -416,6 +416,34 @@ def _tag_finding_ids(findings: list[dict], investigation_id: str) -> list[dict]:
     return tagged
 
 
+def _acl_access_denied(manifest: dict, requesting_agent_id=None, *, open_when_acl_empty: bool = True):
+    """Return why the requester may not access this investigation, or None.
+
+    A non-empty ACL restricts access to the owner and the ACL members. An
+    explicit ``requesting_agent_id`` must be one of them. A caller that names no
+    agent is this process (``HERMES_AGENT_ID``), held to the owner rule that
+    memory_retract uses: refused only when a different owner is set and the local
+    agent is not a member. ``open_when_acl_empty=False`` applies the same test to
+    an investigation with an empty ACL (used for ACL changes, so a stranger cannot
+    claim an open investigation by sharing it with itself).
+    """
+    raw_acl = manifest.get("acl") if isinstance(manifest, dict) else None
+    acl = {str(a) for a in raw_acl if a} if isinstance(raw_acl, list) else set()
+    if open_when_acl_empty and not acl:
+        return None
+    owner = str((manifest or {}).get("owner") or "")
+    inv = (manifest or {}).get("id")
+    if requesting_agent_id:
+        who = str(requesting_agent_id)
+        if who == owner or who in acl:
+            return None
+        return f"agent {who!r} is neither the owner nor in the ACL of investigation {inv!r}"
+    local = os.environ.get("HERMES_AGENT_ID", "")
+    if not owner or owner == local or (local and local in acl):
+        return None
+    return f"investigation {inv!r} is owned by {owner!r} and the local agent is not in its ACL"
+
+
 def register(get_memory_dir):
     """Inject the memory-root accessor. Must be called before any store call."""
     global _get_memory_dir
