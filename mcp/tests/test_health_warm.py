@@ -50,8 +50,11 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
         return False
 
     monkeypatch.setattr(backends, "_alive", fake_alive)
+    # Past the TCP gate each endpoint must also answer HTTP; stub that as answering.
+    monkeypatch.setattr(backends, "_http_probe", lambda *a, **k: (True, {}))
     # Resolvers now accept a probe_timeout arg (loci_health passes a short one).
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
+    monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: "http://localhost:11434")
     monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
@@ -126,7 +129,9 @@ def test_loci_health_tmux_optional_missing_stays_ok(monkeypatch):
     monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
     monkeypatch.setenv("LOCI_TMUX_COMPANION_SESSIONS", "claude,copilot")
     monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: True)
+    monkeypatch.setattr(backends, "_http_probe", lambda *a, **k: (True, {}))
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
+    monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: "http://localhost:11434")
     monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 

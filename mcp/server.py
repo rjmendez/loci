@@ -212,7 +212,7 @@ from qdrant_ops import (  # noqa: E402,F401
     _get_sparse_embedder, _get_cross_encoder, _embed_sparse, _create_payload_indexes,
     _purge_old_records, _get_qdrant, _embed_auth_headers, _embed, _qdrant_upsert,
     _qdrant_degraded_mode, _ce_rerank, _qdrant_similarity_search, _qdrant_search_collection,
-    probe_collection,
+    probe_collection, _embed_uncached, _qdrant_client_readonly,
 )
 from qdrant_ops import RERANK_MAX_CHARS as _RERANK_MAX_CHARS  # noqa: E402
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
@@ -1884,7 +1884,8 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     Pure over the JSONL — does NOT require qdrant. Returns the raw verdict lists
     keyed by check, plus a derived ``hallucination_candidates`` list. Already-
     retracted findings are excluded so a cleaned-up hallucination stops being
-    re-surfaced. Fail-open: a check error degrades to an empty list.
+    re-surfaced. Fail-open: a check error degrades to an empty list, and
+    ``check_status`` records which checks ran ok, failed, or fell back.
 
     When ``llm_verify`` is set (the deep_think -> loci merge path), the lexical
     contradiction verdicts are run through an embedding subject gate + LLM
@@ -1902,6 +1903,10 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     audit_entries = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
     audit_lane = _audit_lane_status(findings, audit_entries)
 
+    # Per-check outcome: a crashed check yields [] exactly like a clean store, so the
+    # caller must be told which lists are real results and which are failures.
+    check_status: dict = {}
+
     try:
         unsupported = run_provenance(
             findings,
@@ -1909,9 +1914,11 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             tokenizer=tokenize,
             lexical_score=_lexical_match_score,
         )
+        check_status["provenance"] = "ok"
     except Exception as exc:  # fail-open — advisory check must never break the caller
-        logger.debug("provenance check failed, degrading to none: %r", exc)
+        logger.warning("provenance check failed, degrading to none: %r", exc)
         unsupported = []
+        check_status["provenance"] = f"failed: {exc!r}"
 
     try:
         contradictions = run_contradiction(
@@ -1919,31 +1926,40 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             negation_re=_NEGATION_RE,
             tokenizer=tokenize,
         )
+        check_status["contradiction"] = "ok"
     except Exception as exc:  # fail-open
-        logger.debug("contradiction check failed, degrading to none: %r", exc)
+        logger.warning("contradiction check failed, degrading to none: %r", exc)
         contradictions = []
+        check_status["contradiction"] = f"failed: {exc!r}"
 
     if llm_verify:
         try:
             from memcheck.checks.contradiction_llm import verify_and_merge
 
             contradictions = verify_and_merge(findings, contradictions)
+            check_status["llm_verify"] = "applied"
         except Exception as exc:  # fail-open — keep lexical verdicts on any error
-            logger.debug("llm contradiction verify failed, keeping lexical: %r", exc)
+            logger.warning("llm contradiction verify failed, keeping lexical: %r", exc)
+            check_status["llm_verify"] = f"fallback_lexical: {exc!r}"
 
     try:
         candidates = _hallucination_candidates(
             findings, audit_entries, unsupported, contradictions
         )
+        # Candidates need both inputs; a failed input makes an empty list meaningless.
+        inputs_ok = check_status["provenance"] == "ok" and check_status["contradiction"] == "ok"
+        check_status["hallucination_candidates"] = "ok" if inputs_ok else "incomplete"
     except Exception as exc:  # fail-open
-        logger.debug("hallucination-candidate surfacing failed, degrading: %r", exc)
+        logger.warning("hallucination-candidate surfacing failed, degrading: %r", exc)
         candidates = []
+        check_status["hallucination_candidates"] = f"failed: {exc!r}"
 
     return {
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
         "hallucination_candidates": candidates,
         "audit_lane": audit_lane,
+        "check_status": check_status,
     }
 
 
@@ -5463,7 +5479,10 @@ def memory_self_check(
             through if embeddings or the LLM are unavailable.
 
     Returns:
-        JSON with advisory verdicts and per-investigation counts.
+        JSON with advisory verdicts and per-investigation counts. ``degraded`` is
+        true and ``degraded_checks`` names each check that crashed (its count is
+        then 0 because it did not run, not because the store is clean);
+        ``llm_verify_applied`` says whether the LLM path actually ran.
     """
     llm_verify = llm_verify or os.environ.get(
         "MEMCHECK_LLM_CONTRADICTION", ""
@@ -5490,9 +5509,20 @@ def memory_self_check(
     all_verdicts: list = []
     all_candidates: list[dict] = []
     per_investigation: list[dict] = []
+    degraded_checks: list[str] = []
 
     for inv_id in targets:
         computed = _compute_self_check(inv_id, llm_verify=llm_verify)
+        status_map = computed.get("check_status") or {}
+        relevant = set(requested)
+        if {"provenance", "contradiction"} <= requested:
+            relevant.add("hallucination_candidates")
+        if llm_verify and "contradiction" in requested:
+            relevant.add("llm_verify")
+        for name in sorted(relevant):
+            state = status_map.get(name, "ok")
+            if state not in ("ok", "applied"):
+                degraded_checks.append(f"{inv_id}:{name}: {state}")
         inv_verdicts: list = []
         if "provenance" in requested:
             inv_verdicts.extend(computed["unsupported_observed"])
@@ -5549,7 +5579,12 @@ def memory_self_check(
         "hallucination_candidates": all_candidates,
         "recorded": recorded,
         "qdrant": "ok" if qdrant_available else "unavailable",
+        # A crashed check reports zero verdicts; degraded says those zeros are not clean.
+        "degraded": bool(degraded_checks),
+        "degraded_checks": degraded_checks,
     }
+    if llm_verify:
+        result["llm_verify_applied"] = not any(":llm_verify:" in d for d in degraded_checks)
     if investigation_id is not None:
         result["investigation_id"] = investigation_id
         result["verdicts"] = per_investigation[0]["verdicts"] if per_investigation else []
@@ -5995,11 +6030,10 @@ def _health_probe_mnemo_mirror():
 def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
     """memory_health probe 1: is QDRANT_URL set and the server answering?
 
-    On a successful ``_get_qdrant()`` this publishes ``sink["client"]`` and
-    ``sink["main_col"]`` for probe 2. The assignment happens only *after*
-    ``_get_qdrant()`` returns, so if it raises the sink keeps its ``None``
-    initialisers and ``_health_check`` synthesizes the ``fail`` entry — the same
-    fail-open behaviour the ``nonlocal`` version had.
+    Uses ``_qdrant_client_readonly()`` (never creates the main collection, unlike
+    ``_get_qdrant()``) and makes a live ``get_collections`` call, so a cached client
+    cannot report "connected" while Qdrant is down. Publishes ``sink["client"]``
+    and ``sink["main_col"]`` for probe 2 only after that call succeeds.
     """
     if not qdrant_url:
         return (
@@ -6008,15 +6042,18 @@ def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
             "to mnemosyne/keyword search.",
             "set QDRANT_URL if vector search is expected; otherwise this is benign",
         )
-    client, main_col = _get_qdrant()
-    sink["client"], sink["main_col"] = client, main_col
+    unreachable_hint = ("confirm the qdrant container is up and reachable at QDRANT_URL "
+                        "(docker ps; curl $QDRANT_URL/healthz)")
+    client, main_col = _qdrant_client_readonly()
     if client is None:
-        return (
-            "fail",
-            f"QDRANT_URL={qdrant_url} is set but the server is unreachable.",
-            "confirm the qdrant container is up and reachable at QDRANT_URL "
-            "(docker ps; curl $QDRANT_URL/healthz)",
-        )
+        return ("fail", f"QDRANT_URL={qdrant_url} is set but no client could be built.",
+                unreachable_hint)
+    try:
+        client.get_collections()  # live round trip, not the cached client object
+    except Exception as exc:
+        return ("fail", f"QDRANT_URL={qdrant_url} is set but the server did not answer: {exc!r}",
+                unreachable_hint)
+    sink["client"], sink["main_col"] = client, main_col
     return ("ok", f"connected to qdrant at {qdrant_url}", None)
 
 
@@ -6082,12 +6119,21 @@ def _health_probe_embeddings_dense(sink: dict) -> tuple:
 
     Publishes ``sink["embed_dim"]`` for the dimension-consistency probe.
     """
-    vec = _embed("memory_health probe")  # transient throwaway, never stored
+    # Uncached: through the embed cache this fixed string hit the embedder once per
+    # process and then reported "ok" from memory for the rest of any outage.
+    vec = _embed_uncached("memory_health probe")  # transient throwaway, never stored
     if not vec:
+        brownout = ""
+        try:
+            open_now, left = qdrant_ops._breaker_is_open("embed")
+            if open_now:
+                brownout = f" (embed brownout breaker open for another {left:.0f}s)"
+        except Exception as exc:
+            logger.debug("embeddings_dense probe: breaker state unreadable: %r", exc)
         return (
             "fail",
             "dense embedder (Ollama) unavailable — semantic/hybrid search "
-            "is disabled; the server runs on keyword fallback only.",
+            "is disabled; the server runs on keyword fallback only." + brownout,
             "ensure Ollama is running and the nomic-embed-text model is available "
             "(OLLAMA_BASE_URL and EMBED_MODEL env vars can override defaults).",
         )
@@ -6262,7 +6308,7 @@ def _selftest_rollup(rows: list[dict]) -> tuple[str, str]:
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    broken = counts.get("width_mismatch", 0) + counts.get("error", 0)
+    broken = counts.get("width_mismatch", 0) + counts.get("error", 0) + counts.get("missing", 0)
     if broken and broken >= len(rows):
         status = "unhealthy"
     elif broken:
@@ -6287,7 +6333,7 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
 
     For each collection it reports points, dense width, sparse presence, and hit
     count, classifying results as ``ok`` | ``empty`` | ``no_results`` |
-    ``width_mismatch`` | ``error`` and rolling them up to ``ok`` |
+    ``width_mismatch`` | ``error`` | ``missing`` and rolling them up to ``ok`` |
     ``degraded`` | ``unhealthy``. Remediations are deduplicated because one
     missing width mapping often explains many collections.
 
@@ -6313,7 +6359,8 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
     Returns:
         JSON ``{status, summary, scope, collections, remediations}``.
     """
-    client, _col = _get_qdrant()
+    # Read-only client: _get_qdrant() would recreate a lost main collection empty.
+    client, _col = _qdrant_client_readonly()
     if client is None:
         return json.dumps({
             "status": "unhealthy",
@@ -6332,6 +6379,8 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
             names, in_scope = present, set(queried)
         else:
             names, in_scope = [n for n in queried if n in present], set(queried)
+        # A collection this server queries but that does not exist is a fault, not "nothing to probe".
+        missing = [] if collections else [n for n in queried if n not in present]
     except Exception as exc:
         return json.dumps({
             "status": "unhealthy",
@@ -6340,19 +6389,25 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
             "remediations": ["Check Qdrant connectivity and API key scope."],
         }, indent=2)
 
-    if not names:
+    if not names and not missing:
         return json.dumps({
             "status": "ok", "summary": "no collections exist",
             "collections": [], "remediations": [],
         }, indent=2)
 
-    try:
-        query_vec = _embed(query)
-    except Exception as exc:
-        logger.warning("retrieval_selftest: embed failed: %r", exc)
-        query_vec = None
+    query_vec = None
+    if names:
+        try:
+            query_vec = _embed_uncached(query)  # live: a cached default query hides an outage
+        except Exception as exc:
+            logger.warning("retrieval_selftest: embed failed: %r", exc)
 
     rows = [probe_collection(query_vec, client, name, limit=limit) for name in names]
+    rows += [{"collection": n, "hits": 0, "status": "missing",
+              "detail": "queried by this server but does not exist in Qdrant",
+              "remediation": (f"'{n}' is missing; if it existed before, its index was lost. "
+                              "Restore it from backup or re-run the backfill.")}
+             for n in missing]
     for r in rows:
         r["queried_by_server"] = r["collection"] in in_scope
     # Only the collections this server actually retrieves from can make it unhealthy.
@@ -7492,10 +7547,14 @@ def loci_health() -> str:
                          — reflects the graph store state via a READ-ONLY probe (never
                          grabs the writer lock). 'contended' = another process holds the
                          writer lock right now (transient with per-op leasing).
-      ladybug_writer_pid: (optional) PID stamped as the current write-lease holder
-      ollama_reachable:  TCP reachability of the resolved Ollama endpoint
-      vllm_reachable:    TCP reachability of the resolved vLLM endpoint
-      qdrant_reachable:  TCP reachability of the resolved Qdrant endpoint
+      ladybug_writer_pid: (optional) PID stamped as the write-lease holder, only while
+                         that process is alive
+      ollama_reachable:  the resolved Ollama (embed) endpoint answers GET /api/tags
+      ollama_gen_reachable: the generation endpoint (ollama_gen_url) answers GET /api/tags
+      ollama_gen_model_present: (optional) the configured gen model is listed there
+      vllm_reachable:    the resolved vLLM endpoint answers GET /health
+      qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
+                         (each is a short TCP gate followed by a bounded HTTP request)
       embed_model:       configured embedding model
       rerank_model:      configured cross-encoder rerank model
       warm:              whether the embed warm-ping has been fired this process
@@ -7505,6 +7564,7 @@ def loci_health() -> str:
         "code_version": "",
         "ladybug": "unavailable",
         "ollama_reachable": False,
+        "ollama_gen_reachable": False,
         "vllm_reachable": False,
         "qdrant_reachable": False,
         "embed_model": "",
@@ -7537,16 +7597,45 @@ def loci_health() -> str:
             "qdrant": bool(os.environ.get("QDRANT_URL")
                            or backends._cfg("qdrant", "url", "")),
         }
-        for key, resolver in (
-            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
-            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T)),
-            ("qdrant_reachable", lambda: backends.qdrant()[0]),
+        # Generation has its own endpoint (backends.ollama_gen_url); it falls back to the embed one.
+        _gen_explicit = bool(os.environ.get("LOCI_OLLAMA_GEN_URL") or os.environ.get("OLLAMA_GEN_URL")
+                             or backends._cfg("ollama", "gen_url", ""))
+        explicit_backend["ollama_gen"] = _gen_explicit or explicit_backend["ollama"]
+        # TCP accept is not an answer: a hung server or a relay with a dead upstream passes
+        # it. After a short TCP gate, each endpoint must answer a bounded HTTP GET.
+        _HTTP_T = 1.0
+        _qdrant_key = ""
+        try:
+            _qdrant_key = backends.qdrant()[1]
+        except Exception as exc:
+            logger.debug("loci_health: qdrant key resolve failed: %r", exc)
+        http_answers: dict = {}
+        for key, resolver, path, headers in (
+            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T), "/api/tags", None),
+            ("ollama_gen_reachable", lambda: backends.ollama_gen_url(_PROBE_T), "/api/tags", None),
+            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T), "/health", None),
+            ("qdrant_reachable", lambda: backends.qdrant()[0], "/readyz",
+             {"api-key": _qdrant_key} if _qdrant_key else None),
         ):
             try:
-                out[key] = bool(backends._alive(resolver(), timeout=_PROBE_T))
+                url = resolver()
+                out[key] = False
+                if backends._alive(url, timeout=_PROBE_T):
+                    ok, body = backends._http_probe(url, path, timeout=_HTTP_T, headers=headers)
+                    out[key] = bool(ok)
+                    http_answers[key] = body
             except Exception as exc:
                 logger.debug("loci_health: reachability probe %s failed: %r", key, exc)
                 pass
+        # When a generation model is configured, the gen endpoint must actually carry it.
+        _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        _tags = http_answers.get("ollama_gen_reachable")
+        if (out.get("ollama_gen_reachable") and _gen_model and isinstance(_tags, dict)
+                and isinstance(_tags.get("models"), list)):
+            names = {str(m.get("name") or m.get("model") or "")
+                     for m in _tags["models"] if isinstance(m, dict)}
+            out["ollama_gen_model_present"] = bool(
+                _gen_model in names or f"{_gen_model}:latest" in names)
         try:
             out["embed_model"] = backends.embed_model()
         except Exception as exc:
@@ -7561,14 +7650,17 @@ def loci_health() -> str:
         failures = []
         optional_down = []
         for label, key in (("ollama", "ollama_reachable"),
+                           ("ollama_gen", "ollama_gen_reachable"),
                            ("vllm", "vllm_reachable"),
                            ("qdrant", "qdrant_reachable")):
-            if out[key]:
+            if out.get(key):
                 continue
             if explicit_backend.get(label, False):
                 failures.append(f"{label}: configured/enabled but unreachable")
             else:
                 optional_down.append(label)
+        if out.get("ollama_gen_model_present") is False:
+            failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
         if failures:
             out["status"] = "unhealthy"
             out["failures"] = failures
@@ -8050,7 +8142,9 @@ def memory_surface(
                             "text": str(item.get("summary") or item.get("title") or "").strip(),
                             "source": "docs_search",
                             "relevance_note": f"Related to: {context.strip().split()[:8]} (docs guidance)",
-                            "score": 0.95,
+                            # docs_search is lexical and carries no similarity score; never invent one.
+                            "score": item.get("score"),
+                            "origin": "docs_search",
                             "investigation_id": investigation_id or "loci-docs-index",
                         })
             except Exception as _docs_exc:
@@ -8060,6 +8154,10 @@ def memory_surface(
                     "surfaced": docs_hits,
                     "context_used": context[:200] if len(context) > 200 else context,
                     "count": len(docs_hits),
+                    # Memory surfacing did not run; these are docs guidance only.
+                    "degraded": True,
+                    "fallback": "docs_search",
+                    "reason": "qdrant unavailable",
                 }, indent=2)
             return json.dumps({
                 "error": "memory_surface requires Qdrant",
@@ -8125,15 +8223,17 @@ def memory_surface(
                         "text": str(item.get("summary") or item.get("title") or "").strip(),
                         "source": "docs_search",
                         "relevance_note": f"Related to: {_ctx_prefix} (docs guidance)",
-                        "score": 0.95,
+                        "score": item.get("score"),  # lexical hit: no similarity score to report
+                        "origin": "docs_search",
                         "investigation_id": investigation_id or "loci-docs-index",
                     })
         except Exception as _docs_exc:
             logger.debug("memory_surface docs recall failed (fail-open): %r", _docs_exc)
 
         if docs_hits:
-            surfaced.extend(docs_hits)
-            surfaced = sorted(surfaced, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:top_k]
+            # Docs guidance only fills slots the memory hits left free: an unscored lexical
+            # hit must not outrank (and so displace) a finding with a real similarity score.
+            surfaced = (surfaced + docs_hits)[:top_k]
 
         return json.dumps({
             "surfaced": surfaced,
