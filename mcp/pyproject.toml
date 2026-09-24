@@ -27,8 +27,20 @@ dependencies = [
 mnemosyne = [
     "mnemosyne-memory[mcp]",
 ]
+# pyarrow reads the FlyWire .feather snapshots in flybrain_brain_cluster_fw_samples
+# (the braincluster-build-fw-samples entry point) and converts them with
+# Table.to_pandas(), which needs pandas. Both are imported lazily there,
+# so the MCP server runs without them, but that module's tests build feather
+# fixtures: without pyarrow they fail collection (aborting the whole pytest
+# run), and without pandas every sample build raises.
+flybrain = [
+    "pyarrow>=14",
+    "pandas>=2",
+]
 test = [
     "hypothesis>=6.0",
+    "pyarrow>=14",
+    "pandas>=2",
 ]
 
 [project.scripts]
