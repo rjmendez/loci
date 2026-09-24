@@ -37,6 +37,7 @@ braincluster-goldenset-gate-runner = "flybrain_brain_cluster_training:main"
 braincluster-p0-dry-run = "flybrain_brain_cluster_pipeline:main"
 braincluster-threshold-calibrate = "flybrain_brain_cluster_thresholds:main"
 braincluster-build-fw-samples = "flybrain_brain_cluster_fw_samples:main"
+braincluster-build-banc-samples = "flybrain_brain_cluster_banc_samples:main"
 braincluster-release-prep = "flybrain_brain_cluster_release_prep:main"
 
 [tool.setuptools.packages.find]
@@ -59,6 +60,14 @@ py-modules = [
     "flybrain_brain_cluster_fw_samples",
     "flybrain_brain_cluster_release_prep",
     "flybrain_hb_adapter",
+    "flybrain_fw_metadata_adapter",
+    "flybrain_scope_engine",
+    "flybrain_dataset_registry",
+    "flybrain_brain_cluster_samples",
+    "flybrain_banc_adapter",
+    "flybrain_brain_cluster_banc_samples",
+    "flybrain_l1em_adapter",
+    "flybrain_brain_cluster_l1em_samples",
     "replay_fingerprint",
     "grounding",
     "inv_store",

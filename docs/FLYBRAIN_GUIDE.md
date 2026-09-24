@@ -71,10 +71,25 @@ The live, active reading path stays short. Use these first; deeper historical ma
 | [FLYBRAIN_RISK_REGISTER.md](./FLYBRAIN_RISK_REGISTER.md) | Consolidated phase-1 risk register with owners, severity, trigger conditions, mitigations, and explicit stop/go responses across safety, integrity, provenance, and operations. | Rollout governance and go/no-go decisions for the local harness. |
 | [FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md](./FLYBRAIN_HB_FW_LOCAL_INDEX_QUERY_IMPORT_STRATEGY.md) | Implementation-ready layering for hb local graph + fw metadata adapters, explicit query contracts, and import promotion smoke gates. | Designing realistic local adapter/import behavior while preserving hard scope boundaries. |
 | [FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md](./FLYBRAIN_HB_FW_PHASE1_LOCAL_VALUE_EXPERIMENT.md) | Final focused phase-1 experiment to validate whether hb+fw enrichment improves real local answer utility over hb-only while preserving fail-closed safety/provenance boundaries. | Running one practical go/no-go validation under real local phase-1 constraints. |
+| [FLYBRAIN_HB_LOCAL_ADAPTER_CONTRACT.md](./FLYBRAIN_HB_LOCAL_ADAPTER_CONTRACT.md), [FLYBRAIN_FW_METADATA_ADAPTER_CONTRACT.md](./FLYBRAIN_FW_METADATA_ADAPTER_CONTRACT.md), [FLYBRAIN_BANC_ADAPTER_CONTRACT.md](./FLYBRAIN_BANC_ADAPTER_CONTRACT.md), [FLYBRAIN_L1EM_ADAPTER_CONTRACT.md](./FLYBRAIN_L1EM_ADAPTER_CONTRACT.md), [FLYBRAIN_FAFB_LANE_DECISION.md](./FLYBRAIN_FAFB_LANE_DECISION.md) | Per-dataset fail-closed adapter contracts (manifest, integrity, licence, region vocabulary, label hygiene) and the decision to defer the CATMAID FAFB lane as a redundant alias of `fw`. | Adding or auditing a dataset lane; checking what each snapshot is allowed to feed. |
 | [FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md](./FLYBRAIN_HEMIBRAIN_VS_FLYWIRE.md) | Rigorous comparison of hemibrain v1.2.1 (`hb`) and FlyWire v783 (`fw`): coverage, annotation model, versioning, query ergonomics, error modes, and cross-dataset guardrails. | Deciding between hemibrain and FlyWire; gating cross-dataset claims. |
 | [FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md](./FLYBRAIN_SMALL_MODEL_BRAIN_CLUSTER_SPEC.md) | Region-specialized small-model cluster architecture with deterministic routing, replay-safe provenance envelopes, and fail-closed gate behavior. | Building internal specialist-expert orchestration before external integrations. |
 | [FLYBRAIN_REASONING_GLOSSARY.md](./FLYBRAIN_REASONING_GLOSSARY.md) | Reference glossary for the FlyBrain and Loci terminology used across the evidence docs. | Terminology lookup while reading deeper sources. |
 | [FLYBRAIN_ARCHIVE.md](./FLYBRAIN_ARCHIVE.md) | Redirect index and archive home for the de-emphasized deep notes. | Reaching the retained historical material without dead ends. |
+
+## Dataset registry and training-sample schemas
+
+`mcp/flybrain_dataset_registry.py` is the single source of truth for dataset symbols, pinned snapshot versions, organism stage, region vocabulary, licence and the per-dataset objective allow-list. `mcp/flybrain_brain_cluster_samples.py` dispatches `build_training_samples(symbol, objective, config)` to per-dataset builders and validates every payload, including that it is stamped for the dataset it was dispatched for.
+
+| Symbol | Snapshot | Status | Objectives with a builder | Payload `schema_version` |
+|---|---|---|---|---|
+| `fw` | `snapshots/fw/flywire783` | active | `connectivity_tier`, `neurotransmitter_dominance` | `flybrain-fw-training-samples/v1` |
+| `hb` | `snapshots/hb/neuprint_JRC_Hemibrain_1point2point1` | active | none yet (fails closed with `BUILDER_NOT_REGISTERED`) | `flybrain-hb-training-samples/v1` (reserved) |
+| `banc` | `snapshots/BANC/banc_888` | planned (CC-BY-4.0) | `connectivity_tier`, `neurotransmitter_dominance` | `flybrain-banc-training-samples/v1` |
+| `l1em` | `snapshots/l1em/catmaid_l1em` | planned (CC-BY-4.0) | `connectivity_tier` | `flybrain-l1em-training-samples/v1` |
+| `fafb` | `snapshots/fafb/catmaid_fafb` | deferred (never active) | none | none |
+
+Planned datasets need `allow_planned=True` until their promotion gates (SC3 threshold reports, grouped-split baseline, AB AC1-AC5) pass. Larval (`l1em`) regions are never mapped to adult neuropils.
 
 ## Evidence map and traceability
 
