@@ -38,6 +38,7 @@ from typing import Callable, Iterable
 from unittest import mock
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+FAKE_QDRANT_URL = "http://fake-qdrant.invalid:6333"
 
 
 def bow_embed(text: str, dim: int) -> list[float]:
@@ -99,8 +100,18 @@ def in_memory_qdrant():
         return client
 
     handle = InMemoryQdrantHandle(client, qdrant_ops.QDRANT_COLLECTION_PREFIX, qdrant_ops.VECTOR_DIM)
+    real_ready = qdrant_ops._endpoint_ready
+
+    def _ready(url: str) -> bool:
+        # Only the fake Qdrant URL is "up"; every other endpoint keeps the real probe.
+        return True if url == FAKE_QDRANT_URL else real_ready(url)
+
     with contextlib.ExitStack() as stack:
-        stack.enter_context(mock.patch.dict("os.environ", {"QDRANT_URL": "http://fake-qdrant:6333"}))
+        stack.enter_context(mock.patch.dict("os.environ", {"QDRANT_URL": FAKE_QDRANT_URL}))
+        stack.enter_context(mock.patch.object(qdrant_ops, "_endpoint_ready", _ready))
+        # The reranker is a multi-GB model download; ranking stays the fake cosine.
+        stack.enter_context(mock.patch.object(qdrant_ops, "_get_cross_encoder", lambda: None))
+        stack.enter_context(mock.patch.object(server, "_get_cross_encoder", lambda: None))
         stack.enter_context(mock.patch.object(qdrant_client, "QdrantClient", _factory))
         stack.enter_context(mock.patch.object(qdrant_ops, "_qdrant_client", None))
         stack.enter_context(mock.patch.object(qdrant_ops, "_qdrant_failed_at", None))

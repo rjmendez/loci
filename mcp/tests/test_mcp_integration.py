@@ -2305,14 +2305,47 @@ class TestMemoryRoute(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    _DUP_A = "the auth gateway rejects expired session tokens with http status 401 always"
+    _DUP_B = "the auth gateway rejects expired session tokens with http status 401 always now"
+    _CACHE = "auth gateway token cache holds entries for 300 seconds"
+    _BILLING = "billing cron runs nightly at 02:00 utc"
+
+    def _seed(self):
+        """Two investigations; _DUP_B is a >80% word-overlap near-duplicate of _DUP_A."""
+        ids = {}
+        server.investigation_start(investigation_id="route-auth", title="Auth outage")
+        server.investigation_start(investigation_id="route-bill", title="Billing")
+        for inv, text in (("route-auth", self._DUP_A), ("route-bill", self._DUP_B),
+                          ("route-bill", self._BILLING), ("route-auth", self._CACHE)):
+            stored = _json(server.investigation_store(
+                investigation_id=inv, finding_type="observed", text=text,
+                source="test:route", confidence="high",
+            ))
+            ids[text] = stored["finding_id"]
+        return ids
+
     def test_memory_route_returns_valid_json(self):
-        """memory_route returns parseable JSON whether Qdrant is available or not."""
-        result = server.memory_route(query="authentication failure patterns")
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
-            self.fail(f"memory_route returned non-JSON: {result!r}")
-        self.assertIsInstance(parsed, dict)
+        """Success branch against in-memory Qdrant: cross-investigation hits,
+        ranked by similarity, with titles resolved from the manifests."""
+        from loci_fakes import in_memory_qdrant
+
+        with in_memory_qdrant():
+            ids = self._seed()
+            parsed = _json(server.memory_route(
+                query="auth gateway expired session tokens", top_k=5, deduplicate=False))
+        self.assertNotIn("error", parsed)
+        self.assertEqual(
+            [r["finding_id"] for r in parsed["routed"]],
+            [ids[self._DUP_A], ids[self._DUP_B], ids[self._CACHE], ids[self._BILLING]],
+        )
+        self.assertEqual(
+            [r["investigation_title"] for r in parsed["routed"]],
+            ["Auth outage", "Billing", "Auth outage", "Billing"],
+        )
+        self.assertEqual(parsed["count"], 4)
+        self.assertEqual(parsed["total_before_dedup"], 4)
+        scores = [r["score"] for r in parsed["routed"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_memory_route_qdrant_unavailable_returns_error_json(self):
         """When Qdrant is unavailable, memory_route returns an error dict with 'routed' key."""
@@ -2355,16 +2388,29 @@ class TestMemoryRoute(unittest.TestCase):
         self.assertEqual(parsed.get("routed"), [])
 
     def test_memory_route_response_shape_on_success_or_unavailable(self):
-        """Response always has 'routed', 'query', 'count' or 'error' keys."""
-        result = server.memory_route(query="cross-investigation routing test", top_k=5)
-        parsed = json.loads(result)
-        self.assertIsInstance(parsed, dict)
-        # Either a successful result or a graceful error — never a bare exception
-        if "error" not in parsed:
-            self.assertIn("routed", parsed)
-            self.assertIn("query", parsed)
-            self.assertIn("count", parsed)
-            self.assertIsInstance(parsed["routed"], list)
+        """Success shape with dedup and top_k: the near-duplicate is dropped,
+        the cap applies, and the trace carries every candidate."""
+        from loci_fakes import in_memory_qdrant
+
+        with in_memory_qdrant():
+            ids = self._seed()
+            parsed = _json(server.memory_route(
+                query="auth gateway expired session tokens", top_k=2, include_trace=True))
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["query"], "auth gateway expired session tokens")
+        self.assertIsNone(parsed["agent_id"])
+        self.assertEqual([r["finding_id"] for r in parsed["routed"]],
+                         [ids[self._DUP_A], ids[self._CACHE]])
+        self.assertEqual(parsed["count"], 2)
+        self.assertEqual(parsed["total_before_dedup"], 4)
+        self.assertEqual(parsed["total_after_dedup"], 2)
+        self.assertEqual(parsed["excluded_retracted"], 0)
+        self.assertEqual(parsed["excluded_acl"], 0)
+        trace = parsed["routing_trace"]
+        self.assertEqual(trace["metrics"]["after_dedup"], 3)
+        self.assertEqual({h["finding_id"] for h in trace["candidate_hits"]}, set(ids.values()))
+        self.assertEqual(trace["policy"]["top_k"], 2)
+        self.assertTrue(trace["policy"]["deduplicate"])
 
 
 if __name__ == "__main__":
@@ -2383,17 +2429,59 @@ class TestMemoryConsolidateCausalInference(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    # B restates A's opening (>10 chars) with a causal keyword -> one caused_by edge A->B.
+    _A = "The cache was full and stopped accepting writes"
+    _B = "Writes were rejected because the cache was full and stopped accepting writes"
+    _C = "Service latency spiked"
+
+    class _FakeMnemosyne:
+        """Stands in for mnemosyne's Mnemosyne (a dependency); records sleep calls."""
+        calls: list = []
+
+        def sleep_all_sessions(self, dry_run=False):
+            type(self).calls.append(dry_run)
+            return {"status": "nothing_to_consolidate", "items_consolidated": 0}
+
+    def _consolidate(self, dry_run):
+        self._FakeMnemosyne.calls = []
+        with mock.patch.object(server, "_load_mnemosyne_class", lambda: self._FakeMnemosyne), \
+             mock.patch("memcheck.llm.llm_available", lambda: False):
+            return _json(server.memory_consolidate(dry_run=dry_run))
+
+    def _seed_causal_investigation(self):
+        inv_id = _new_id("consolidate")
+        server.investigation_start(investigation_id=inv_id, title="Consolidate causal")
+        ids = []
+        for text in (self._A, self._B, self._C):
+            stored = _json(server.investigation_store(
+                investigation_id=inv_id, finding_type="observed", text=text,
+                source="test:causal", confidence="high",
+            ))
+            ids.append(stored["finding_id"])
+        return inv_id, ids
+
     def test_memory_consolidate_returns_valid_json(self):
-        """memory_consolidate must always return valid JSON with causal_edges_inferred >= 0."""
-        result = server.memory_consolidate(dry_run=True)
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
-            self.fail(f"memory_consolidate returned non-JSON: {result!r}")
-        self.assertIsInstance(parsed, dict)
-        # causal_edges_inferred must be present and non-negative
-        self.assertIn("causal_edges_inferred", parsed)
-        self.assertGreaterEqual(parsed["causal_edges_inferred"], 0)
+        """A real consolidation runs causal inference on the most recent
+        investigation and reports the exact number of edges it wrote."""
+        inv_id, (id_a, id_b, _id_c) = self._seed_causal_investigation()
+        parsed = self._consolidate(dry_run=False)
+        self.assertEqual(parsed["status"], "ok")
+        self.assertEqual(self._FakeMnemosyne.calls, [False])
+        self.assertEqual(parsed["causal_edges_inferred"], 1)
+        replay = parsed["sleep_like_consolidation"]["phases"][1]
+        self.assertEqual(replay["status"], "ok")
+        self.assertEqual(replay["details"]["investigation_id"], inv_id)
+        self.assertEqual(replay["details"]["causal_edges_inferred"], 1)
+        edges = _json(server.causal_edges_list(investigation_id=inv_id))["edges"]
+        self.assertEqual([(e["source_id"], e["target_id"]) for e in edges], [(id_a, id_b)])
+
+    def test_memory_consolidate_dry_run_infers_nothing(self):
+        inv_id, _ids = self._seed_causal_investigation()
+        parsed = self._consolidate(dry_run=True)
+        self.assertEqual(parsed["status"], "ok")
+        self.assertEqual(self._FakeMnemosyne.calls, [True])
+        self.assertEqual(parsed["causal_edges_inferred"], 0)
+        self.assertEqual(_json(server.causal_edges_list(investigation_id=inv_id))["count"], 0)
 
     def test_causal_edges_list_empty_for_new_investigation(self):
         """causal_edges_list returns empty edges list for an investigation with no edges."""
@@ -2420,32 +2508,45 @@ class TestMemoryConsolidateCausalInference(unittest.TestCase):
         import uuid as _uuid
         inv_id = _new_id("heuristic")
         server.investigation_start(investigation_id=inv_id, title="Heuristic causal test")
-        # Create findings where B references A by keyword + snippet.
+        # B restates A's opening with a causal keyword; C is unrelated.
         id_a = str(_uuid.uuid4())
         id_b = str(_uuid.uuid4())
         id_c = str(_uuid.uuid4())
-        findings_path = Path(self._tmp.name) / inv_id / "findings.jsonl"
-        import json as _json_local
-        with open(findings_path, "a") as f:
-            f.write(_json_local.dumps({"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"}) + "\n")
-            f.write(_json_local.dumps({"id": id_b, "text": "Because the cache was full", "type": "inferred"}) + "\n")
-            f.write(_json_local.dumps({"id": id_c, "text": "Service latency spiked", "type": "observed"}) + "\n")
-        # Run causal inference directly.
-        n = server._run_causal_inference(inv_id, [
-            {"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"},
-            {"id": id_b, "text": "Because the cache was full", "type": "inferred"},
-            {"id": id_c, "text": "Service latency spiked", "type": "observed"},
-        ])
-        # causal_edges_list should now return edges.
+        findings = [
+            {"id": id_a, "text": self._A, "type": "observed"},
+            {"id": id_b, "text": self._B, "type": "inferred"},
+            {"id": id_c, "text": self._C, "type": "observed"},
+        ]
+        # The LLM slow path is a dependency; force the heuristic lane.
+        with mock.patch("memcheck.llm.llm_available", lambda: False):
+            n = server._run_causal_inference(inv_id, findings)
+        self.assertEqual(n, 1)
         result = _json(server.causal_edges_list(investigation_id=inv_id))
-        self.assertEqual(result["count"], n)
-        if n > 0:
-            edge = result["edges"][0]
-            self.assertIn("source_id", edge)
-            self.assertIn("target_id", edge)
-            self.assertIn("edge_type", edge)
-            self.assertIn("confidence", edge)
-            self.assertIn("inferred_at", edge)
+        self.assertEqual(result["count"], 1)
+        edge = result["edges"][0]
+        self.assertEqual(edge["source_id"], id_a)
+        self.assertEqual(edge["target_id"], id_b)
+        self.assertEqual(edge["edge_type"], "caused_by")
+        self.assertEqual(edge["confidence"], 0.5)
+        self.assertTrue(edge["inferred_at"])
+        on_disk = [json.loads(line) for line in
+                   (server.MEMORY_DIR / inv_id / "causal_edges.jsonl").read_text().splitlines()]
+        self.assertEqual([e["method"] for e in on_disk], ["heuristic"])
+
+    def test_heuristic_causal_inference_ignores_unrelated_findings(self):
+        """Negative twin (same shape): no restated snippet, no id reference -> no edge."""
+        import uuid as _uuid
+        inv_id = _new_id("heuristic-neg")
+        server.investigation_start(investigation_id=inv_id, title="Heuristic negative")
+        findings = [
+            {"id": str(_uuid.uuid4()), "text": self._A, "type": "observed"},
+            {"id": str(_uuid.uuid4()), "text": "Because the disk was slow", "type": "inferred"},
+            {"id": str(_uuid.uuid4()), "text": self._C, "type": "observed"},
+        ]
+        with mock.patch("memcheck.llm.llm_available", lambda: False):
+            n = server._run_causal_inference(inv_id, findings)
+        self.assertEqual(n, 0)
+        self.assertEqual(_json(server.causal_edges_list(investigation_id=inv_id))["count"], 0)
 
 
 if __name__ == "__main__":
