@@ -166,7 +166,7 @@ def test_provider_auth_check_uses_bearer_key(monkeypatch):
         def __enter__(self):
             return self
 
-        def __exit__(self, exc_type, exc, tb):
+        def __exit__(self, *_exc_info):
             return False
 
     def fake_urlopen(req, timeout=0):

@@ -6,7 +6,6 @@ import io
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest import mock
 
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
