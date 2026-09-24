@@ -75,8 +75,12 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     """
     Run a read-only Cypher query against the LadybugDB graph and return rows.
 
-    Write-shaped queries (``CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER``) are
-    rejected: this tool never mutates the graph. Use it for traversal or impact
+    Only a single read query is accepted: it must start with MATCH, OPTIONAL
+    MATCH, WITH, UNWIND, RETURN or CALL of a read-only introspection procedure
+    (e.g. ``show_tables()``), and may use only reading clauses. Write clauses,
+    LOAD FROM, COPY, EXPORT/IMPORT DATABASE, INSTALL/LOAD EXTENSION, ATTACH,
+    file-reading table functions, comments and ``;``-chained statements are
+    rejected. Pass literals via ``params``. Use it for traversal or impact
     analysis, e.g. callers of a symbol, symbols defined by a file, or findings
     that reference a ``CodeSymbol``.
 

@@ -72,8 +72,14 @@ investigation queries.
 
 **Key parameters**
 
-- `cypher`: Read-only query string.
-- `params`: Optional parameter map for `$name`-style placeholders.
+- `cypher`: Read-only query string. Only a single statement starting with
+  `MATCH`, `OPTIONAL MATCH`, `WITH`, `UNWIND`, `RETURN` or `CALL` of a read-only
+  introspection procedure (`show_tables()`, `table_info()`, ...) is accepted.
+  Write clauses, `LOAD FROM`, `COPY`, `EXPORT`/`IMPORT DATABASE`,
+  `INSTALL`/`LOAD EXTENSION`, `ATTACH`, file-reading table functions, comments
+  and `;`-chained statements are rejected before they reach the engine.
+- `params`: Optional parameter map for `$name`-style placeholders. Pass literals
+  here rather than inline.
 
 **Return shape**
 
