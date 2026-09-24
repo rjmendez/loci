@@ -121,6 +121,19 @@ def test_memory_consolidate_dry_run_shape_and_behavior_are_unchanged(monkeypatch
 
     parsed = json.loads(server.memory_consolidate(dry_run=True))
 
+    # consolidation_aggregation was added to EVERY memory_consolidate response
+    # (dry-run included) by the slow-neuromodulation work in 46fcf49 and is
+    # pinned by test_slow_neuromodulation. It is deterministic provenance for the
+    # causal threshold, not audit output, so it is checked separately here; what
+    # this test guards is that the quality audit adds nothing to a dry run and
+    # the pre-existing fields are untouched.
+    aggregation = parsed.pop("consolidation_aggregation")
+    assert aggregation["method"] == "deterministic_sleep_summary_plus_slow_threshold"
+    assert aggregation["default_min_findings_for_causal"] == 3
+    assert isinstance(aggregation["applied_min_findings_for_causal"], int)
+    assert aggregation["modulation"]["provenance"] == "deterministic_derived"
+    assert "consolidation_quality_audit" not in parsed
+
     assert parsed == {
         "status": "ok",
         "dry_run": True,

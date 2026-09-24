@@ -9105,6 +9105,26 @@ def _confidence_retrieve(query: str, top_k: int) -> tuple[list, Optional[str]]:
     return results, None
 
 
+def _confidence_evidence_ref(r) -> dict:
+    """One evidence_refs row for memory_confidence from a Qdrant search result.
+
+    Results are ScoredPoint-shaped (``.id``/``.score``/``.payload``), exactly as
+    _confidence_cues reads them -- not dicts. Plain dicts are still accepted so a
+    caller that hands in pre-flattened rows keeps working.
+    """
+    if isinstance(r, dict):
+        pl, point_id, score = r, r.get("id"), r.get("score")
+    else:
+        pl = dict(getattr(r, "payload", None) or {})
+        point_id, score = getattr(r, "id", None), getattr(r, "score", None)
+    return {
+        "finding_id": str(pl.get("finding_id") or pl.get("id") or point_id or ""),
+        "source": str(pl.get("source") or ""),
+        "investigation_id": str(pl.get("investigation_id") or ""),
+        "score": round(_safe_float(score, 0.0), 4),
+    }
+
+
 def _confidence_cues(results: list) -> dict:
     """
     Compute the five metamemory cues for memory_confidence from a list of
@@ -9419,15 +9439,7 @@ def memory_confidence(
                 "delta": round(float(_confidence_bias.get("delta", 0.0) or 0.0), 3),
                 "provenance": "deterministic_derived",
             },
-            "evidence_refs": [
-                {
-                    "finding_id": str(r.get("finding_id") or r.get("id") or ""),
-                    "source": str(r.get("source") or ""),
-                    "investigation_id": str(r.get("investigation_id") or ""),
-                    "score": round(_safe_float(r.get("score"), 0.0), 4),
-                }
-                for r in results[:5]
-            ],
+            "evidence_refs": [_confidence_evidence_ref(r) for r in results[:5]],
         },
     }
     if isinstance(llm_entailment, dict):

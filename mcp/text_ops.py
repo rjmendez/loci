@@ -214,7 +214,7 @@ def _single_explicit_label_mention(text: str, labels: list[str]) -> Optional[str
         if not item:
             continue
         if re.search(r"(?<!\w)" + re.escape(item.lower()) + r"(?!\w)", low):
-            hits.append(item)
+            hits.append(label)  # canonical spelling, as classify() documents
     if len(hits) == 1:
         return hits[0]
     return None
