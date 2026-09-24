@@ -288,12 +288,20 @@ def evaluate_adversarial_gates(
         counts = summary.get("classification_counts")
         if isinstance(counts, dict):
             parsed = _coerce_int(counts.get("candidate_bypass"))
-    if parsed is None:
+    if parsed is None and isinstance(findings, list):
         parsed = 0
-        if isinstance(findings, list):
-            for item in findings:
-                if isinstance(item, dict) and str(item.get("classification", "")).strip().lower() == "candidate_bypass":
-                    parsed += 1
+        for item in findings:
+            if isinstance(item, dict) and str(item.get("classification", "")).strip().lower() == "candidate_bypass":
+                parsed += 1
+    if parsed is None:
+        # No count and no findings to count: unmeasured, not zero bypasses.
+        return [GateResult(
+            name="adversarial_candidate_bypass",
+            status="skipped",
+            observed={},
+            threshold={"max_candidate_bypass": max_candidate_bypass},
+            reason="Report has no candidate_bypass_count, classification_counts or findings list.",
+        )]
 
     ok = parsed <= max_candidate_bypass
     return [GateResult(
