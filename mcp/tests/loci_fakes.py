@@ -116,6 +116,10 @@ def in_memory_qdrant():
         # The reranker is a multi-GB model download; ranking stays the fake cosine.
         stack.enter_context(mock.patch.object(qdrant_ops, "_get_cross_encoder", lambda: None))
         stack.enter_context(mock.patch.object(server, "_get_cross_encoder", lambda: None))
+        # No sparse model either (a network download under a temp HOME): upserts
+        # carry the dense vector only and search takes the dense-only branch.
+        stack.enter_context(mock.patch.object(qdrant_ops, "_embed_sparse", lambda _text: None))
+        stack.enter_context(mock.patch.object(server, "_embed_sparse", lambda _text: None))
         stack.enter_context(mock.patch.object(qdrant_client, "QdrantClient", _factory))
         stack.enter_context(mock.patch.object(qdrant_ops, "_qdrant_client", None))
         stack.enter_context(mock.patch.object(qdrant_ops, "_qdrant_failed_at", None))
