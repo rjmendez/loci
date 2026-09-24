@@ -25,6 +25,7 @@ Design mirrors guardian.py / verify.py:
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Callable, Optional
 
@@ -73,14 +74,24 @@ def _coerce_verdict(raw) -> str:
 
 
 def _coerce_confidence(raw) -> float:
-    """Coerce confidence to [0,1]; invalid values degrade to 0.0."""
+    """Coerce confidence to [0,1]; invalid or non-finite values degrade to 0.0."""
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    if value != value:
+    if not math.isfinite(value):
         return 0.0
     return max(0.0, min(1.0, value))
+
+
+def _is_nonfinite_confidence(raw) -> bool:
+    """True for a confidence that parses as a number but is NaN, +/-inf or overflows."""
+    try:
+        return not math.isfinite(float(raw))
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _unavailable(error: str = "", rationale: str = "") -> dict:
@@ -271,6 +282,9 @@ def check_claim_entailment(
     obj = extract_json_object(raw)
     if obj is None:
         return _unavailable(f"unparseable response: {str(raw)[:120]!r}")
+
+    if _is_nonfinite_confidence(obj.get("confidence")):
+        return _unavailable(f"non-finite confidence: {str(raw)[:120]!r}")
 
     rationale = obj.get("rationale")
     if not isinstance(rationale, str) or not rationale.strip():

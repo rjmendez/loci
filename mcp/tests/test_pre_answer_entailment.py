@@ -308,3 +308,20 @@ def test_reflex_fastpath_skips_malformed_rows_and_still_uses_the_good_one():
     via_tool = E.check_claim_entailment("Host-b executed malware.", rows, gen_fn=fn)
     assert via_tool == result
     assert calls == []
+
+
+@pytest.mark.parametrize("raw_conf", ["NaN", "Infinity", '"inf"', "1" + "0" * 400],
+                         ids=["NaN", "Infinity", "str-inf", "int-10e400"])
+def test_nonfinite_model_confidence_marks_the_check_unavailable(raw_conf):
+    raw = '{"verdict": "confirmed", "rationale": "ok", "confidence": %s}' % raw_conf
+    result = E.check_claim_entailment("Host-b executed malware.", _EVIDENCE, gen_fn=_ok(raw))
+    assert result["available"] is False
+    assert result["verdict"] is None
+    assert result["confidence"] == 0.0
+    assert result["degraded"] is True
+    assert result["error"].startswith("non-finite confidence")
+
+
+def test_coerce_confidence_rejects_nonfinite_and_keeps_finite():
+    assert [E._coerce_confidence(x) for x in (float("nan"), float("inf"), "-inf", 10 ** 400)] == [0.0] * 4
+    assert [E._coerce_confidence(x) for x in (0.25, "0.5", 3, -1)] == [0.25, 0.5, 1.0, 0.0]
