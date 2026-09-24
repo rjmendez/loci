@@ -1,8 +1,9 @@
-"""Characterization tests for mlops/memory/ — decay.py and live_evo.py.
+"""Contract tests for mlops/memory/ — decay.py and live_evo.py.
 
-These pin the CURRENT behaviour of the two memory-maintenance jobs, warts included.
-Several assertions deliberately lock in behaviour that is arguably wrong (marked
-``BUG:``); they exist so that a later refactor cannot change it silently.
+These used to pin the behaviour of the day, warts included (a floor that raised
+importance, a live_evo penalty that the next decay run erased, a missing DB
+reported as a clean run). Those pins are replaced by the contract the two jobs
+now meet.
 
 No external services are touched. Both modules talk only to a local SQLite file and
 the filesystem, so every test builds its own throwaway inputs under ``tmp_path``.
@@ -107,10 +108,14 @@ def test_weibull_known_values():
     assert D.weibull_retention(90) == pytest.approx(0.0899748866078, rel=1e-9)
 
 
-def test_weibull_docstring_7day_claim_is_wrong():
-    # BUG (doc): the module docstring advertises "7 days -> 80% retention" but the
-    # implementation yields ~73%. Pinned so the numbers cannot drift unnoticed.
-    assert D.weibull_retention(7) < 0.75
+def test_weibull_docstring_table_matches_the_function():
+    """The module docstring advertised "7 days -> 80%" while the function gives
+    73%. Every row of the table must be what the defaults compute."""
+    import re
+    rows = re.findall(r"(\d+) days?\s*\S\s*(\d+)% retention", D.__doc__)
+    assert [int(d) for d, _ in rows] == [7, 30, 90]
+    for days, pct in rows:
+        assert int(pct) == round(100 * D.weibull_retention(int(days)))
 
 
 def test_weibull_is_strictly_decreasing_in_age():
@@ -276,17 +281,19 @@ def test_apply_decay_dry_run_computes_but_does_not_write(tmp_path):
     assert _read_importance(db)[1] == 0.8
 
 
-def test_apply_decay_zero_importance_is_raised_to_the_floor(tmp_path):
-    # BUG: max(min_importance, current * retention) is a floor, not a clamp, so a
-    # decay pass *increases* the importance of any row already below min_importance
-    # and counts that increase in n_decayed.
+def test_apply_decay_never_raises_a_row_that_sits_below_the_floor(tmp_path):
+    """max(min_importance, base * retention) RAISED any row authored below the
+    floor -- a decay pass that increased importance, counted in n_decayed."""
     db = _make_db(tmp_path / "m.db", [
         (1, "zero", 0.0, _ago(30), "s1"),
         (2, "tiny", 0.001, _ago(30), "s1"),
+        (3, "normal", 0.8, _ago(30), "s1"),
     ])
     res = D.apply_decay(db)
-    assert res["n_decayed"] == 2
-    assert _read_importance(db) == {1: 0.05, 2: 0.05}
+    assert res["n_decayed"] == 1
+    imp = _read_importance(db)
+    assert (imp[1], imp[2]) == (0.0, 0.001)
+    assert imp[3] == pytest.approx(0.8 * math.exp(-1.0), rel=1e-4)
 
 
 def test_apply_decay_stops_at_the_floor(tmp_path):
@@ -397,14 +404,17 @@ def test_decay_main_prints_summary_and_writes_out_file(tmp_path, monkeypatch):
     assert _read_importance(db)[1] == 0.8        # --dry-run really did not write
 
 
-def test_decay_main_on_missing_db_reports_zero_retention(tmp_path, monkeypatch):
-    # The error stub has no mean_retention key, so the `.get(..., 0)` default prints
-    # 0.000 — i.e. "total loss" — for a DB that simply does not exist.
+def test_decay_main_on_missing_db_is_an_error_not_a_zero_retention_run(tmp_path, monkeypatch,
+                                                                       capsys):
+    """It printed "mean_retention=0.000" -- total loss -- and exited 0 for a DB
+    that does not exist."""
     monkeypatch.setattr(sys, "argv", ["decay", "--db", str(tmp_path / "nope.db")])
-    buf = io.StringIO()
-    with redirect_stdout(buf):
+    with pytest.raises(SystemExit) as exc:
         D.main()
-    assert "n_rows=0 n_decayed=0 mean_retention=0.000 min_retention=0.000" in buf.getvalue()
+    assert exc.value.code == 1
+    cap = capsys.readouterr()
+    assert f"[decay] ERROR: db not found: {tmp_path / 'nope.db'}" in cap.err
+    assert "mean_retention" not in cap.out
 
 
 # ======================================================================================
@@ -677,18 +687,19 @@ def test_adapt_appends_a_differently_named_record_to_the_log(tmp_path, _isolate_
     datetime.fromisoformat(rec["run_at"])  # tz-aware ISO timestamp
 
 
-def test_adapt_zero_importance_entry_is_raised_to_the_floor(tmp_path):
-    # BUG: same floor-not-clamp problem as decay — "penalising" an entry whose
-    # importance is below the floor RAISES it, and counts as a penalty.
+def test_adapt_never_raises_an_entry_that_sits_below_the_floor(tmp_path):
+    """A penalty RAISED any entry below the floor to it, and counted that as a
+    penalty."""
     db = _make_db(tmp_path / "m.db", [
         (1, "zero", 0.0, _ago(1), "s1"),
         (2, "tiny", 0.001, _ago(1), "s1"),
         (3, "atfloor", 0.05, _ago(1), "s1"),
+        (4, "normal", 0.5, _ago(1), "s1"),
     ])
     res = L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}])
-    assert res["n_correlated"] == 3
-    assert res["n_penalized"] == 2  # id=3 is already at the floor, no delta
-    assert _read_importance(db) == {1: 0.05, 2: 0.05, 3: 0.05}
+    assert res["n_correlated"] == 4
+    assert res["n_penalized"] == 1
+    assert _read_importance(db) == pytest.approx({1: 0.0, 2: 0.001, 3: 0.05, 4: 0.5 * 0.85})
 
 
 def test_adapt_penalty_zero_correlates_but_penalizes_nothing(tmp_path):
@@ -750,13 +761,15 @@ def test_live_evo_main_prints_summary(tmp_path, monkeypatch):
     assert _read_importance(db)[1] == 0.8
 
 
-def test_live_evo_main_on_missing_db_prints_none_for_penalized(tmp_path, monkeypatch):
-    # the missing-db stub has no n_penalized key, so .get() yields None
+def test_live_evo_main_on_missing_db_is_an_error(tmp_path, monkeypatch, capsys):
+    """It printed "penalized=None" and exited 0 for a DB that does not exist."""
     monkeypatch.setattr(sys, "argv", ["live_evo", "--db", str(tmp_path / "nope.db")])
-    buf = io.StringIO()
-    with redirect_stdout(buf):
+    with pytest.raises(SystemExit) as exc:
         L.main()
-    assert buf.getvalue() == "[live_evo] failures=0 correlated=0 penalized=None dry_run=False\n"
+    assert exc.value.code == 1
+    cap = capsys.readouterr()
+    assert f"[live_evo] ERROR: db not found: {tmp_path / 'nope.db'}" in cap.err
+    assert cap.out == ""
 
 
 def test_apply_decay_dry_run_does_not_alter_the_schema(tmp_path):
@@ -767,3 +780,56 @@ def test_apply_decay_dry_run_does_not_alter_the_schema(tmp_path):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(working_memory)")}
     conn.close()
     assert "base_importance" not in cols
+
+
+# ======================================================================================
+# decay and live_evo together
+# ======================================================================================
+
+def _base_and_importance(db_path: str, rid: int):
+    conn = sqlite3.connect(db_path)
+    out = conn.execute("SELECT base_importance, importance FROM working_memory WHERE id=?",
+                       (rid,)).fetchone()
+    conn.close()
+    return out
+
+
+def test_a_live_evo_penalty_survives_the_next_decay_run(tmp_path):
+    """decay recomputes importance from base_importance, and live_evo penalised
+    only `importance` -- so the next decay run erased the penalty (0.680 back up
+    to ~0.800). The penalty has to land on the baseline too."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, fresh, "s1"),
+                                      (2, "miss", 0.8, fresh, "s2")])
+    D.apply_decay(db)                                   # seeds the baseline
+    retention = D.weibull_retention(1 / 24)
+    assert _base_and_importance(db, 1) == pytest.approx((0.8, 0.8 * retention), rel=1e-3)
+
+    L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}])
+    assert _base_and_importance(db, 1) == pytest.approx((0.8 * 0.85, 0.8 * retention * 0.85),
+                                                        rel=1e-3)
+
+    D.apply_decay(db)
+    base, imp = _base_and_importance(db, 1)
+    assert imp == pytest.approx(0.8 * 0.85 * retention, rel=1e-3), "decay erased the penalty"
+    assert _base_and_importance(db, 2) == pytest.approx((0.8, 0.8 * retention), rel=1e-3)
+
+
+def test_adapt_dry_run_leaves_the_baseline_alone(tmp_path):
+    db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
+    D.apply_decay(db)
+    before = _base_and_importance(db, 1)
+    L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}], dry_run=True)
+    assert _base_and_importance(db, 1) == before
+
+
+def test_adapt_on_a_db_decay_never_touched_does_not_add_a_baseline(tmp_path):
+    """No base_importance column yet: only importance is penalised, and decay's
+    first run will seed the baseline from the penalised value."""
+    db = _make_db(tmp_path / "m.db", [(1, "hit", 0.8, _ago(1), "s1")])
+    L.adapt(db, [{"event": "retraction", "session_id": "s1", "content": ""}])
+    conn = sqlite3.connect(db)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(working_memory)")}
+    conn.close()
+    assert "base_importance" not in cols
+    assert _read_importance(db)[1] == pytest.approx(0.68)

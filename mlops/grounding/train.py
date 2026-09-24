@@ -105,6 +105,9 @@ def _save_cache(cache: dict) -> None:
 
 
 def embed_texts(texts: list, ollama_base: str, cache: dict) -> np.ndarray:
+    if not texts:
+        # np.array([]) is 1-D, and normalising it along axis 1 raised AxisError.
+        return np.zeros((0, 0), dtype=np.float32)
     url = ollama_base.rstrip("/") + "/v1/embeddings"
     need = [t for t in texts if _sha(t) not in cache]
     for i in range(0, len(need), 16):
@@ -271,18 +274,11 @@ def oos_from_findings(
             c.fit(X_tr_arr, Y_tr_arr)
             fold_clfs[name] = c
 
-        topics = sorted({x["topic"] for recs in runs.values() for x in recs})
+        # All pairs inside the held-out run. (A dead per-topic loop used to sit
+        # here; it indexed the (text, topic) tuples with a string key and raised
+        # TypeError on every realistic corpus, so no retrain with
+        # --findings-glob -- which loop.py always passes -- ever finished.)
         X_te, Y_te, cos_te = [], [], []
-        for topic in topics:
-            topic_emb = np.mean([emb_map[x["text"]] for x in train_recs if x[1] == topic] or
-                                [np.zeros(embs_arr.shape[1])], axis=0)
-            norm = np.linalg.norm(topic_emb) + 1e-9
-            topic_emb /= norm
-            for x in test_recs:
-                fv, cos = feat_pair(topic_emb if False else x["text"], x["text"])
-                # use cross-finding similarity directly
-                pass
-        # Simpler: all pairs in test findings
         test_pairs = list(itertools.combinations(test_recs, 2))
         if not test_pairs:
             continue
@@ -324,7 +320,7 @@ def _extract_topic(rec: dict) -> str:
     if tg.get("dt_target"):
         return tg["dt_target"]
     if tg.get("dt_phase") == "bench":
-        m = re.match(r"\s*([^:]{3,40}):", rec.get("text", ""))
+        m = re.match(r"\s*([^:]{3,40}):", rec.get("text") or "")
         return ("bench:" + m.group(1).strip().lower()) if m else "bench:misc"
     if tg.get("dt_phase") in ("final", "adversarial"):
         return "synthesis:" + tg["dt_phase"]
@@ -547,8 +543,11 @@ def main():
         "feature_dim": X.shape[1],
         "threshold": round(best_thresh, 4),
         "trained_at": datetime.now(timezone.utc).isoformat(),
+        # fit_seconds was measured and then dropped; it is the number that
+        # says which candidate costs the hour.
         "all_models": {
-            name: {"cv_f1_mean": round(r["mean"], 4), "cv_f1_std": round(r["std"], 4)}
+            name: {"cv_f1_mean": round(r["mean"], 4), "cv_f1_std": round(r["std"], 4),
+                   "fit_seconds": r["fit_seconds"]}
             for name, r in cv_results.items()
         },
     }

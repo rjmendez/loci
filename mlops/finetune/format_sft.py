@@ -26,17 +26,32 @@ def _sha256(s: str) -> str:
 # Pair builders
 # ---------------------------------------------------------------------------
 
+def _correction_sides(rec: dict) -> tuple[str, str] | None:
+    """(failed, corrected) from a correction envelope, or None if it is not one.
+
+    Only JSONDecodeError/KeyError were caught, so valid JSON that was not an
+    object (AttributeError) or a null content (TypeError) killed the whole run.
+    """
+    try:
+        sides = json.loads(rec["content"])
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+    if not isinstance(sides, dict):
+        return None
+    failed, corrected = sides.get("failed"), sides.get("corrected")
+    return (failed if isinstance(failed, str) else "",
+            corrected if isinstance(corrected, str) else "")
+
+
 def pairs_from_corrections(records: list[dict]) -> list[dict]:
     pairs = []
     for rec in records:
         if rec.get("type") != "correction":
             continue
-        try:
-            sides = json.loads(rec["content"])
-        except (json.JSONDecodeError, KeyError):
+        sides = _correction_sides(rec)
+        if sides is None:
             continue
-        failed = sides.get("failed", "")
-        corrected = sides.get("corrected", "")
+        failed, corrected = sides
         if len(failed) < MIN_CONTENT_LEN or len(corrected) < MIN_CONTENT_LEN:
             continue
         pairs.append({
@@ -94,12 +109,10 @@ def pairs_from_corrections_dpo(records: list[dict]) -> list[dict]:
     for rec in records:
         if rec.get("type") != "correction":
             continue
-        try:
-            sides = json.loads(rec["content"])
-        except (json.JSONDecodeError, KeyError):
+        sides = _correction_sides(rec)
+        if sides is None:
             continue
-        failed = sides.get("failed", "")
-        corrected = sides.get("corrected", "")
+        failed, corrected = sides
         if len(failed) < MIN_CONTENT_LEN or len(corrected) < MIN_CONTENT_LEN:
             continue
         if failed == corrected:
@@ -186,8 +199,10 @@ def main() -> None:
     if args.mode in ("dpo", "both"):
         dpo_pairs = pairs_from_corrections_dpo(records)
         unique_dpo, n_deduped_dpo = deduplicate_dpo(dpo_pairs)
-        dpo_path = args.out.replace(".jsonl", "_dpo.jsonl")
-        if dpo_path == args.out:
+        # Only the suffix: str.replace rewrote every ".jsonl" in the path.
+        if args.out.endswith(".jsonl"):
+            dpo_path = args.out[: -len(".jsonl")] + "_dpo.jsonl"
+        else:
             dpo_path = args.out + ".dpo.jsonl"
         with open(dpo_path, "w") as f:
             for pair in unique_dpo:

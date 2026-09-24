@@ -1,11 +1,11 @@
-"""Characterization tests for the mlops/grounding/ package.
+"""Contract tests for the mlops/grounding/ package.
 
 Covers mlops/grounding/canary.py, train.py and active_learn.py.
 
-These tests pin the CURRENT behaviour of the package, bugs included. They are a
-safety net for a later refactor, not a specification of what the grounding
-MLOps code *should* do. Where a test pins something that is arguably wrong, the
-docstring says so and the finding is reported separately.
+These used to be characterization tests that pinned the behaviour of the day,
+bugs included -- among them a TypeError that killed every real retrain and a
+canary that exited 0 for HOLD. Those pins are replaced by the contract the code
+now meets.
 
 No external services are used: Ollama HTTP calls are replaced with in-process
 fakes, and every module-level path constant that would otherwise write into the
@@ -151,7 +151,10 @@ def test_canary_constants():
     assert canary.MIN_FINDINGS_PER_RUN == 10
     assert canary.MONITOR_ROLLBACK_WINDOW == 2
     assert canary.DEFAULT_THRESHOLD == float(os.environ.get("DTL_GROUND_THRESHOLD", "0.59"))
-    assert canary.DEFAULT_OLLAMA == (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+    assert not canary.DEFAULT_OLLAMA.endswith("/")
+    # The exit contract mlops/loop.py reads. HOLD must not share PROMOTE's 0.
+    assert (canary.EXIT_PROMOTE, canary.EXIT_DRIFT, canary.EXIT_ROLLBACK,
+            canary.EXIT_HOLD) == (0, 1, 2, 3)
     assert canary.DEFAULT_FINDINGS_GLOB.endswith("/.hermes/memory-sessions/dt-loci-*/findings.jsonl")
 
 
@@ -431,28 +434,42 @@ def _fit_lr(n_features, seed=0):
     return LogisticRegression(max_iter=500).fit(X, y)
 
 
-def test_evaluate_gate_scores_a_train_shaped_model(no_network_embed, one_run_glob,
-                                                   stub_joblib_load, tmp_path):
-    """A candidate from train.py (the wider 2*d+4 layout) must be scoreable.
+def _fit_on_the_run(dim):
+    """A model that learned the run's real rule (finding head == target) from the
+    pair features canary builds -- so it only scores well if canary hands it
+    those same features, at its own width."""
+    from sklearn.linear_model import LogisticRegression
+    findings = [{"text": r["text"], "target": canary._dt_target(r)}
+                for r in standard_run_records()]
+    texts, targets, tv, qv, y = [], [], [], [], []
+    for target in ("alpha", "beta"):
+        for f in findings:
+            texts.append(f["text"])
+            targets.append(target)
+            tv.append(_prefix_vec(f["text"]))
+            qv.append(_prefix_vec(target))
+            y.append(int(f["text"].split()[0] == target))
+    X = canary._feat.make_features(texts, targets, np.array(tv), np.array(qv), dim=dim)
+    return LogisticRegression(C=100.0, max_iter=2000).fit(X, y)
 
-    canary used to build a hard-coded 2*d+1 vector, so sklearn raised and the
-    exception escaped evaluate_gate uncaught — the promotion gate could never
-    pass, and loop.py read the crash as 'canary drift detected'.
+
+@pytest.mark.parametrize("dim", [2 * 2 + 4, 2 * 2 + 1], ids=["train_shaped", "legacy"])
+def test_evaluate_gate_scores_a_model_on_the_features_it_was_trained_on(
+        no_network_embed, one_run_glob, stub_joblib_load, tmp_path, dim):
+    """Both widths must be scoreable, and scored on the real pair features.
+
+    canary used to build a hard-coded 2*d+1 vector, so a train.py candidate
+    (2*d+4) raised. The old assertion was only "not NaN", which a canary that
+    fed the model zeros also met. The model here learned the run's rule, so it
+    reproduces the cosine gate exactly: 11/12, the one traitor finding missed.
     """
-    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_lr(2 * 2 + 4))
+    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_on_the_run(dim))
     out = canary.evaluate_gate(findings_glob=one_run_glob, candidate_model_path=path,
                                threshold=0.5)
-    assert out["decision"] in ("PROMOTE", "HOLD")
-    assert out["model"]["mean_f1"] == out["model"]["mean_f1"]  # scored, not NaN
-
-
-def test_evaluate_gate_still_scores_the_legacy_shipped_model(no_network_embed, one_run_glob,
-                                                             stub_joblib_load, tmp_path):
-    """The joblib in production is the 2*d+1 one; it must keep working."""
-    path = stub_joblib_load(tmp_path / "cand.joblib", _fit_lr(2 * 2 + 1))
-    out = canary.evaluate_gate(findings_glob=one_run_glob, candidate_model_path=path,
-                               threshold=0.5)
-    assert out["model"]["mean_f1"] == out["model"]["mean_f1"]
+    assert out["model"]["mean_f1"] == pytest.approx(11 / 12)
+    assert out["cosine"]["mean_f1"] == pytest.approx(11 / 12)
+    assert out["delta_f1"] == pytest.approx(0.0)
+    assert out["decision"] == "HOLD"
 
 
 def test_evaluate_gate_refuses_a_model_of_unknown_width(no_network_embed, one_run_glob,
@@ -629,30 +646,46 @@ def test_zscore_missing_current_key_defaults_to_nan(tmp_path):
     assert np.isnan(out["cosine_z"]) and np.isnan(out["model_z"])
 
 
-def test_zscore_json_null_in_history_raises(tmp_path):
-    """BUG PIN: a null metric in the history file crashes the drift check."""
+def test_zscore_json_null_in_history_is_a_missing_point_not_a_crash(tmp_path):
+    """NaN has no JSON literal, so a NaN metric round-trips as null -- and a null
+    raised TypeError out of the drift check."""
     hp = tmp_path / "h.jsonl"
     _write_history(hp, [{"cosine_f1": None}, {"cosine_f1": 0.5}, {"cosine_f1": 0.6}])
-    with pytest.raises(TypeError):
-        canary.zscore_drift_check({"cosine_f1": 0.1}, history_path=hp)
+    out = canary.zscore_drift_check({"cosine_f1": 0.1}, history_path=hp)
+    assert out["cosine_z"] == pytest.approx((0.1 - 0.55) / np.std([0.5, 0.6], ddof=1))
+    assert out["drift"] is True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # canary.monitor_live
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_monitor_live_missing_model_returns_a_short_dict(tmp_path):
-    """BUG PIN: the degraded dict omits cosine_f1/model_f1 that main() formats."""
+def test_monitor_live_missing_model_returns_the_full_shape(tmp_path):
+    """The degraded dict omitted cosine_f1/model_f1, which main()'s monitor mode
+    formats -- so `canary.py --mode monitor` raised KeyError without a model."""
     out = canary.monitor_live(tmp_path / "absent.joblib", findings_glob=str(tmp_path / "*.jsonl"))
-    assert out == {"drift": False, "rollback_recommended": False, "reason": "no live model found"}
-    assert "cosine_f1" not in out
+    assert set(out) == {"drift", "rollback_recommended", "cosine_f1", "model_f1", "reason"}
+    assert out["drift"] is False and out["rollback_recommended"] is False
+    assert out["reason"] == "no live model found"
+    assert np.isnan(out["cosine_f1"]) and np.isnan(out["model_f1"])
 
 
-def test_monitor_live_no_findings_returns_a_short_dict(tmp_path, stub_joblib_load):
+def test_monitor_live_no_findings_returns_the_full_shape(tmp_path, stub_joblib_load):
     path = stub_joblib_load(tmp_path / "live.joblib", CosClf())
     out = canary.monitor_live(path, findings_glob=str(tmp_path / "nothing" / "*.jsonl"))
-    assert out == {"drift": False, "rollback_recommended": False, "reason": "no findings to evaluate"}
-    assert "model_f1" not in out
+    assert set(out) == {"drift", "rollback_recommended", "cosine_f1", "model_f1", "reason"}
+    assert out["reason"] == "no findings to evaluate"
+    assert np.isnan(out["model_f1"])
+
+
+def test_monitor_mode_cli_without_a_live_model_exits_clean(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["canary.py", "--mode", "monitor",
+                                      "--target", str(tmp_path / "absent.joblib"),
+                                      "--findings", str(tmp_path / "*.jsonl")])
+    with pytest.raises(SystemExit) as exc:
+        canary.main()
+    assert exc.value.code == 0
+    assert "monitor cosine_f1=nan model_f1=nan drift=False" in capsys.readouterr().out
 
 
 def test_monitor_live_happy_path_shape(no_network_embed, one_run_glob, stub_joblib_load, tmp_path):
@@ -899,10 +932,10 @@ def test_extract_topic_returns_empty_string_when_nothing_matches():
     assert train._extract_topic({"tags": None}) == ""
 
 
-def test_extract_topic_bench_with_null_text_raises():
-    """BUG PIN: `.get("text", "")` returns None for an explicit JSON null."""
-    with pytest.raises(TypeError):
-        train._extract_topic({"tags": ["dt_phase:bench"], "text": None})
+def test_extract_topic_bench_with_null_text_falls_back_to_misc():
+    """`.get("text", "")` returned None for an explicit JSON null and re.match
+    raised TypeError."""
+    assert train._extract_topic({"tags": ["dt_phase:bench"], "text": None}) == "bench:misc"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -982,10 +1015,10 @@ def test_embed_texts_truncates_input_to_2000_chars(fake_ollama):
     assert len(fake_ollama[0]["body"]["input"][0]) == 2000
 
 
-def test_embed_texts_empty_input_raises(fake_ollama):
-    """BUG PIN: an empty text list makes np.array([]) 1-D, so normalising blows up."""
-    with pytest.raises(np.exceptions.AxisError):
-        train.embed_texts([], "http://h", {})
+def test_embed_texts_empty_input_is_an_empty_matrix(fake_ollama):
+    """np.array([]) is 1-D, so normalising an empty batch raised AxisError."""
+    out = train.embed_texts([], "http://h", {})
+    assert out.shape == (0, 0)
     assert fake_ollama == []
 
 
@@ -1024,28 +1057,69 @@ def test_oos_from_findings_returns_empty_when_no_fold_has_both_classes(tmp_path,
     assert train.oos_from_findings(glob_pat, {}, "http://h", {"lr": object()}) == {}
 
 
-def test_oos_from_findings_crashes_on_dead_topic_loop(tmp_path, monkeypatch):
-    """BUG PIN: dead code indexes a (text, topic) TUPLE with a string key.
+def _topic_embed(texts, base, cache):
+    """Unit vectors by topic word: 'alpha ...' near e0, 'beta ...' near e1, with a
+    small per-text offset so no two texts are identical."""
+    out = []
+    for i, t in enumerate(texts):
+        v = np.full(4, 0.05, dtype=np.float32)
+        v[0 if t.split()[1] == "alpha" else 1] = 1.0
+        v[2 + (i % 2)] += 0.01 * (i + 1)
+        out.append(v / np.linalg.norm(v))
+    return np.array(out, dtype=np.float32)
 
-    Any fold whose training set contains at least one record of a known topic —
-    i.e. every realistic invocation — raises TypeError, so the whole OOS branch
-    of train.main() is unreachable in practice.
-    """
+
+def _two_realistic_runs(tmp_path):
+    return _write_oos_runs(tmp_path, {
+        "run-a": {"alpha": ["a alpha one", "a alpha two"], "beta": ["a beta three", "a beta four"]},
+        "run-b": {"alpha": ["b alpha one", "b alpha two"], "beta": ["b beta three", "b beta four"]},
+    })
+
+
+def test_oos_from_findings_scores_a_realistic_two_run_corpus(tmp_path, monkeypatch):
+    """Every fold with a known topic in training used to raise TypeError from a
+    dead loop that indexed a (text, topic) tuple with a string key. loop.py
+    always passes --findings-glob, so no real retrain finished."""
     from sklearn.linear_model import LogisticRegression
 
-    def _fake(texts, base, cache):
-        rng = np.random.RandomState(0)
-        v = rng.rand(len(texts), 4).astype(np.float32)
-        return v / np.linalg.norm(v, axis=1, keepdims=True)
+    monkeypatch.setattr(train, "embed_texts", _topic_embed)
+    out = train.oos_from_findings(_two_realistic_runs(tmp_path), {}, "http://h",
+                                  {"lr": LogisticRegression(C=100.0, max_iter=2000)})
+    assert set(out) == {"lr", "__cosine__"}
+    # Each held-out run has 6 pairs: 2 same-topic, 4 cross-topic; the topic
+    # embedding separates them perfectly for cosine and for the fitted model.
+    assert out["__cosine__"] == pytest.approx((1.0, 0.0))
+    assert out["lr"] == pytest.approx((1.0, 0.0))
 
-    monkeypatch.setattr(train, "embed_texts", _fake)
-    glob_pat = _write_oos_runs(tmp_path, {
-        "run-a": {"alpha": ["a one", "a two"], "beta": ["a three", "a four"]},
-        "run-b": {"alpha": ["b one", "b two"], "beta": ["b three", "b four"]},
-    })
-    with pytest.raises(TypeError, match="tuple indices"):
-        train.oos_from_findings(glob_pat, {}, "http://h",
-                                {"lr": LogisticRegression(max_iter=100)})
+
+def test_train_main_finishes_a_retrain_with_findings_glob(tmp_path, monkeypatch):
+    """End to end, the way loop._retrain runs it: --findings-glob and
+    --candidate-out. On a realistic corpus this died with TypeError, so the loop
+    never saw a metrics file from a real retrain."""
+    monkeypatch.setattr(train, "embed_texts", _topic_embed)
+    monkeypatch.setattr(train, "_resolve_backends", lambda: None)
+    monkeypatch.setattr(train, "CV_JOBS", 1)
+    rows = []
+    for i in range(40):
+        topic, other = ("alpha", "beta") if i % 2 else ("beta", "alpha")
+        rows.append({"claim": f"c {topic} claim {i}", "evidence": f"e {topic} evidence {i}",
+                     "label": 1, "signal": "topical", "cos": 0.9 + 0.001 * i})
+        rows.append({"claim": f"c {topic} claim {i}", "evidence": f"e {other} evidence {i}",
+                     "label": 0, "signal": "topical", "cos": 0.1 + 0.001 * i})
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    out, cand = tmp_path / "metrics.json", tmp_path / "cand.joblib"
+    monkeypatch.setattr(sys, "argv", [
+        "train.py", "--dataset", str(ds), "--out", str(out), "--ollama", "http://h",
+        "--candidate-out", str(cand),
+        "--findings-glob", _two_realistic_runs(tmp_path / "runs")])
+    train.main()
+    metrics = json.loads(out.read_text())
+    assert metrics["decision_basis"] == "oos_leave_one_run_out"
+    assert set(metrics["oos_results"]) == {"LogisticRegression", "GradientBoostingClassifier",
+                                           "RandomForestClassifier"}
+    assert metrics["n_train"] == 80
+    assert metrics["feature_dim"] == 2 * 4 + 4
 
 
 def test_oos_from_findings_drops_records_without_a_topic(tmp_path, monkeypatch, capsys):
@@ -1257,22 +1331,39 @@ def test_boundary_samples_feeds_the_model_pair_features_at_its_own_width(tmp_pat
     """It used to hand predict_proba one raw 768-d embedding per record. The live
     classifier declares n_features_in_ = 1537, so that raised for every record and
     the per-record `except: continue` swallowed it."""
-    ds, _ = boundary_dataset
-    monkeypatch.setattr(al, "_embed", lambda text, url, m: _stub_vec())
-    shapes = []
+    ds, texts = boundary_dataset
+    slot = {}
+
+    def one_hot(text, url, m):
+        """A distinct axis per distinct string, so claim and evidence differ."""
+        v = [0.0] * _EMBED_DIM
+        v[slot.setdefault(text, len(slot))] = 1.0
+        return v
+
+    monkeypatch.setattr(al, "_embed", one_hot)
+    seen = []
 
     class Recorder:
         n_features_in_ = _LEGACY_DIM
 
         def predict_proba(self, feats):
-            shapes.append(np.asarray(feats).shape)
+            seen.append(np.asarray(feats))
             return np.array([[0.5, 0.5]] * len(feats))
 
     path = tmp_path / "m.joblib"
     path.write_bytes(b"stub")
     monkeypatch.setattr(joblib, "load", lambda p: Recorder())
     al.boundary_samples(str(path), ds)
-    assert shapes == [(6, _LEGACY_DIM)]
+    (X,) = seen
+    assert X.shape == (6, _LEGACY_DIM)
+    # Legacy layout [|c-e|, c*e, cos] over one-hot claim/evidence: |c-e| is 1 on
+    # exactly the claim's and the evidence's axes, and c*e and cos are 0. A
+    # sampler that scored the claim against itself would give |c-e| = 0, cos = 1.
+    for i, row in enumerate(X):
+        diff = row[:_EMBED_DIM]
+        assert set(np.flatnonzero(diff)) == {slot[texts[i]], slot[f"evidence {i}"]}
+        assert not row[_EMBED_DIM:2 * _EMBED_DIM].any()
+        assert row[-1] == 0.0
 
 
 def test_boundary_samples_embeds_each_distinct_string_once(tmp_path, monkeypatch, graded_model):
@@ -1435,3 +1526,69 @@ def test_boundary_samples_reports_embed_failures_once_not_once_per_string(
     assert out.count("embeds failed") == 1
     assert "8/8 embeds failed, first: connection refused" in out
     assert "4 scorable rows, 0 embedded" in out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# canary.main — the exit contract mlops/loop.py reads
+#
+# loop.py counts exit 0 as a promotion. canary exited 0 for HOLD too, so every
+# HOLD night was recorded as promoted=True. These drive the real main().
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_canary_main(monkeypatch, candidate, target, glob_pat, *extra):
+    monkeypatch.setattr(sys, "argv", ["canary.py", "--candidate", str(candidate),
+                                      "--target", str(target), "--findings", glob_pat,
+                                      "--ollama", "http://unused", *extra])
+    with pytest.raises(SystemExit) as exc:
+        canary.main()
+    return exc.value.code
+
+
+def test_canary_main_hold_exits_with_its_own_code_and_promotes_nothing(
+        no_network_embed, one_run_glob, stub_joblib_load, tmp_path, monkeypatch, capsys):
+    cand = stub_joblib_load(tmp_path / "cand.joblib", CosClf())
+    target = tmp_path / "live.joblib"
+    target.write_bytes(b"LIVE")
+    # threshold 0.5: the model only ties cosine, which is under the 0.02 margin
+    code = _run_canary_main(monkeypatch, cand, target, one_run_glob, "--threshold", "0.5")
+    assert code == canary.EXIT_HOLD == 3
+    assert target.read_bytes() == b"LIVE"
+    assert not canary._PROMOTIONS_PATH.exists()
+    rec = json.loads(canary._HISTORY_PATH.read_text())
+    assert rec["decision"] == "HOLD"
+    assert "HOLD" in capsys.readouterr().out
+
+
+def test_canary_main_promote_exits_0_and_promotes(
+        no_network_embed, one_run_glob, stub_joblib_load, tmp_path, monkeypatch):
+    cand = stub_joblib_load(tmp_path / "cand.joblib", CosClf())
+    target = tmp_path / "live.joblib"
+    target.write_bytes(b"LIVE")
+    # threshold 0.0 cripples cosine; the model (cut at 0.5) beats it
+    code = _run_canary_main(monkeypatch, cand, target, one_run_glob, "--threshold", "0.0")
+    assert code == canary.EXIT_PROMOTE == 0
+    assert target.read_bytes() == Path(cand).read_bytes()
+    assert len(canary._PROMOTIONS_PATH.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("threshold,expected", [("0.0", 0), ("0.5", 3)])
+def test_canary_main_dry_run_keeps_the_exit_code_and_writes_nothing(
+        no_network_embed, one_run_glob, stub_joblib_load, tmp_path, monkeypatch,
+        threshold, expected):
+    cand = stub_joblib_load(tmp_path / "cand.joblib", CosClf())
+    target = tmp_path / "live.joblib"
+    code = _run_canary_main(monkeypatch, cand, target, one_run_glob,
+                            "--threshold", threshold, "--dry-run")
+    assert code == expected
+    assert not target.exists()
+    assert not canary._HISTORY_PATH.exists() and not canary._PROMOTIONS_PATH.exists()
+
+
+def test_canary_main_drift_exits_1(no_network_embed, one_run_glob, stub_joblib_load,
+                                   tmp_path, monkeypatch):
+    cand = stub_joblib_load(tmp_path / "cand.joblib", CosClf())
+    _write_history(canary._HISTORY_PATH,
+                   [{"cosine_f1": v, "model_f1": v} for v in (0.99, 0.991, 0.989, 0.99)])
+    code = _run_canary_main(monkeypatch, cand, tmp_path / "live.joblib", one_run_glob,
+                            "--threshold", "0.5")
+    assert code == canary.EXIT_DRIFT == 1

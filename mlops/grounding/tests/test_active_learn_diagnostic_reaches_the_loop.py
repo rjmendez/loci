@@ -74,21 +74,26 @@ def test_the_reason_reaches_the_nightly_log(tmp_path, capfd):
     assert "boundary=0" in printed, printed
 
 
-def test_the_diagnostic_is_not_written_where_the_loop_discards_it():
-    """Pins the mechanism rather than the wording: _run echoes stdout and drops
-    stderr, so a diagnostic on stderr is invisible however well it reads."""
-    src = SCRIPT.read_text()
-    assert "file=sys.stderr" not in src, (
-        "a diagnostic on stderr never reaches the nightly log; use _say()"
-    )
-
-
-def test_a_crashing_sampler_is_reported_rather_than_skipped(tmp_path):
-    """The other half: when it exits non-zero, _run_active_learn must say so."""
+def test_a_crashing_sampler_is_reported_rather_than_skipped(tmp_path, monkeypatch, capfd):
+    """The other half: when the sampler exits non-zero, _run_active_learn must
+    record a failed step. Driven through the real _run_active_learn and a real
+    child that crashes, not by grepping loop.py for the call."""
     loop = _loop_module()
-    result = loop._run([sys.executable, "-c", "import sys; sys.exit(3)"])
-    assert result.returncode == 3
-    assert "_fail(\"active_learn\"" in (REPO / "mlops" / "loop.py").read_text(), (
-        "a non-zero exit from the sampler leaves the previous candidates file in "
-        "place; the step has to report it like dataset-rebuild and train.py do"
-    )
+    mlops = tmp_path / "mlops"
+    (mlops / "grounding").mkdir(parents=True)
+    (mlops / "grounding" / "active_learn.py").write_text(
+        "import sys\n"
+        "sys.stderr.write('Traceback (most recent call last):\\n'\n"
+        "                 'ValueError: sampler blew up\\n')\n"
+        "sys.exit(3)\n")
+    live = tmp_path / "clf.joblib"
+    live.write_bytes(b"model")
+    monkeypatch.setattr(loop, "MLOPS", mlops)
+    monkeypatch.setattr(loop, "LIVE_MODEL", live)
+    monkeypatch.setattr(loop, "DATASET", _unscorable_corpus(tmp_path))
+    monkeypatch.setattr(loop, "ACTIVE_CANDIDATES", tmp_path / "cands.jsonl")
+    loop.FAILED_STEPS.clear()
+
+    assert loop._run_active_learn("http://127.0.0.1:1") == {"exit_code": 3}
+    assert loop.FAILED_STEPS == ["active_learn"]
+    assert "active_learn failed: ValueError: sampler blew up" in capfd.readouterr().out
