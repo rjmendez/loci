@@ -104,6 +104,13 @@ class BrainClusterPromotionState:
     promoted: BrainClusterPromotionPointer | None = None
     previous_promoted: BrainClusterPromotionPointer | None = None
 
+    def __post_init__(self) -> None:
+        if self.previous_promoted is not None and self.promoted is None:
+            raise BrainClusterPromotionStateError(
+                BrainClusterPromotionStateErrorCode.STATE_INVALID,
+                "previous_promoted cannot be set without promoted.",
+            )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -332,6 +339,12 @@ def _validate_brain_cluster_manifest(
                 BrainClusterArtifactErrorCode.PATH_ESCAPE,
                 "Manifest integrity file escapes artifact root.",
                 details={"logical_name": logical_name, "relative_path": relative_path},
+            )
+        if artifact_path.is_symlink():
+            raise BrainClusterArtifactError(
+                BrainClusterArtifactErrorCode.PATH_ESCAPE,
+                "Manifest integrity file is a symlink.",
+                details={"logical_name": logical_name, "path": str(artifact_path)},
             )
         if not artifact_path.exists() or not artifact_path.is_file():
             raise BrainClusterArtifactError(
