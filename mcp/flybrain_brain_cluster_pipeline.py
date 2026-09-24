@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import flybrain_brain_cluster as fbc
+import flybrain_brain_cluster_baselines as fbb
 import flybrain_brain_cluster_training as fbct
 
 
@@ -20,6 +22,13 @@ def _sha256_hex(text: str) -> str:
 
 
 def _parse_samples(raw: Sequence[fbct.TrainingSample | Mapping[str, Any]] | Mapping[str, Any] | str | Path) -> list[fbct.TrainingSample]:
+    return _parse_samples_and_metadata(raw)[0]
+
+
+def _parse_samples_and_metadata(
+    raw: Sequence[fbct.TrainingSample | Mapping[str, Any]] | Mapping[str, Any] | str | Path,
+) -> tuple[list[fbct.TrainingSample], dict[str, Any]]:
+    """Samples plus the builder payload's top-level ``metadata`` (empty for bare lists)."""
     if isinstance(raw, (str, bytes, Path)):
         payload = fbct._load_json_value(raw, label="samples")
     else:
@@ -28,7 +37,118 @@ def _parse_samples(raw: Sequence[fbct.TrainingSample | Mapping[str, Any]] | Mapp
     samples = [fbct._normalize_training_sample(item) for item in rows]
     if not samples:
         raise ValueError("samples must be non-empty")
-    return samples
+    metadata = payload.get("metadata") if isinstance(payload, Mapping) else None
+    return samples, dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+UNKNOWN_DATASET = "unknown"
+# Per-sample ``metadata.dataset`` spellings used by builders -> registry symbol.
+_SAMPLE_DATASET_ALIASES = {"flywire": "fw", "flywire783": "fw", "hemibrain": "hb"}
+_SCHEMA_DATASET_RE = re.compile(r"^flybrain-([a-z0-9]+)-training-samples/v[0-9]+$")
+
+
+def _resolve_dataset(
+    samples: Sequence[fbct.TrainingSample],
+    payload_metadata: Mapping[str, Any],
+    explicit_symbol: str | None,
+) -> dict[str, Any]:
+    """Resolve ``{dataset_symbol, dataset_version, source}`` for a run (roadmap B3).
+
+    Sources, in order: the explicit argument, ``payload.metadata.dataset_symbol``,
+    the payload schema_version, then every sample's ``metadata.dataset``. Mixed
+    datasets in one run fail closed; nothing resolvable gives ``unknown``, which
+    release_prep refuses to calibrate.
+    """
+    from flybrain_dataset_registry import get_dataset, normalize_symbol
+
+    candidates: list[tuple[str, str]] = []
+    if explicit_symbol:
+        candidates.append(("argument", normalize_symbol(explicit_symbol)))
+    if payload_metadata.get("dataset_symbol"):
+        candidates.append(("payload_metadata", normalize_symbol(str(payload_metadata["dataset_symbol"]))))
+    schema_match = _SCHEMA_DATASET_RE.match(str(payload_metadata.get("schema_version") or ""))
+    if schema_match:
+        candidates.append(("payload_schema_version", normalize_symbol(schema_match.group(1))))
+    sample_values = {
+        str(sample.metadata.get("dataset", "")).strip().lower()
+        for sample in samples
+        if isinstance(sample.metadata, Mapping)
+    }
+    sample_values.discard("")
+    if sample_values:
+        mapped = {_SAMPLE_DATASET_ALIASES.get(value, value) for value in sample_values}
+        if len(mapped) > 1:
+            raise ValueError(f"samples mix datasets {sorted(mapped)}; runs must be single-dataset")
+        if not all(str(sample.metadata.get("dataset", "")).strip() for sample in samples):
+            raise ValueError("some samples carry metadata.dataset and some do not; runs must be single-dataset")
+        candidates.append(("sample_metadata", normalize_symbol(next(iter(mapped)))))
+    symbols = {symbol for _, symbol in candidates}
+    if len(symbols) > 1:
+        raise ValueError(f"dataset sources disagree: {candidates}")
+    if not symbols:
+        return {"dataset_symbol": UNKNOWN_DATASET, "dataset_version": None, "source": None}
+    symbol = symbols.pop()
+    versions = {
+        str(sample.metadata.get("dataset_version")).strip()
+        for sample in samples
+        if isinstance(sample.metadata, Mapping) and sample.metadata.get("dataset_version")
+    }
+    if payload_metadata.get("dataset_version"):
+        versions.add(str(payload_metadata["dataset_version"]).strip())
+    if len(versions) > 1:
+        raise ValueError(f"samples mix dataset versions {sorted(versions)}; runs must be single-version")
+    pinned = get_dataset(symbol).pinned_version
+    version = versions.pop() if versions else pinned
+    if pinned and version != pinned:
+        raise ValueError(f"dataset version {version!r} does not match the registry pin {pinned!r} for {symbol}")
+    return {"dataset_symbol": symbol, "dataset_version": version, "source": candidates[0][0]}
+
+
+def _split_group_keys_for(dataset_symbol: str) -> tuple[str, ...]:
+    from flybrain_dataset_registry import split_group_keys
+
+    keys = [fbct.GENERIC_SPLIT_GROUP_KEY]
+    if dataset_symbol != UNKNOWN_DATASET:
+        keys.extend(split_group_keys(dataset_symbol))
+    return tuple(dict.fromkeys(keys))
+
+
+def _heldout_ids(manifest: fbct.DatasetManifest) -> tuple[str, tuple[str, ...]]:
+    if manifest.test_ids:
+        return "test", tuple(manifest.test_ids)
+    return "val", tuple(manifest.val_ids)
+
+
+def _trivial_baseline_report(
+    samples: Sequence[fbct.TrainingSample],
+    *,
+    manifest: fbct.DatasetManifest,
+    predictions: Sequence[fbct.PredictionRecord],
+    config: fbb.BaselineGateConfig | Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Model vs trivial rules on the held-out split (test, else val). Abstentions count as wrong."""
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    split_name, heldout = _heldout_ids(manifest)
+    train_rows = [(sample_by_id[i].input_text, sample_by_id[i].expected_label) for i in manifest.train_ids]
+    heldout_rows = [(sample_by_id[i].input_text, sample_by_id[i].expected_label) for i in heldout]
+    pred_by_id = {record.sample_id: record for record in predictions}
+    model_accuracy: float | None = None
+    if heldout:
+        correct = 0
+        for sample_id in heldout:
+            record = pred_by_id.get(sample_id)
+            if record is not None and not record.abstained and record.predicted_label == sample_by_id[sample_id].expected_label:
+                correct += 1
+        model_accuracy = correct / float(len(heldout))
+    baselines = fbb.evaluate_trivial_baselines(train_rows, heldout_rows) if train_rows and heldout_rows else None
+    report = fbb.trivial_baseline_gate(
+        model_heldout_accuracy=model_accuracy,
+        baselines=baselines,
+        heldout_count=len(heldout),
+        config=config,
+    )
+    report["heldout_split"] = split_name
+    return report
 
 
 def _derive_router_samples(samples: Sequence[fbct.TrainingSample]) -> list[fbct.RouterTrainingSample]:
@@ -96,10 +216,21 @@ def _build_experts_runtime_payload(
         expert_id = f"{region_id}_expert"
         result = expert_results[region_id]
         val_metrics = result.metrics.get("val_metrics", {}) if isinstance(result.metrics, Mapping) else {}
-        confidence = float(val_metrics.get("accuracy", 0.82))
-        confidence = max(0.0, min(1.0, confidence if confidence > 0.0 else 0.82))
+        # Confidence is the measured validation accuracy, 0.0 included. With no
+        # validation samples there is no measurement: say so, and fail the gate.
+        try:
+            sample_count = int(val_metrics.get("sample_count", 1))
+        except (TypeError, ValueError):
+            sample_count = 0
+        if "accuracy" in val_metrics and sample_count > 0:
+            confidence = max(0.0, min(1.0, float(val_metrics["accuracy"])))
+            calibration = "validation_accuracy"
+        else:
+            confidence = 0.0
+            calibration = fbc.UNCALIBRATED_CONFIDENCE
         shadow_behavior = {
             "confidence": confidence,
+            "confidence_calibration": calibration,
             "provenance_refs": [f"dataset:{manifest.manifest_id}:{region_id}"],
             "replay_fingerprint_mode": "match",
         }
@@ -255,6 +386,8 @@ class BrainClusterDryRunResult:
     region_artifacts: Mapping[str, Any]
     router_artifact: Mapping[str, Any]
     swarm_student_artifact: Mapping[str, Any]
+    trivial_baseline: Mapping[str, Any] = field(default_factory=dict)
+    dataset: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         status = "pass" if (self.pass_gate and self.pass_shadow and self.promoted and not self.rolled_back) else "fail"
@@ -275,6 +408,8 @@ class BrainClusterDryRunResult:
             "region_artifacts": dict(self.region_artifacts),
             "router_artifact": dict(self.router_artifact),
             "swarm_student_artifact": dict(self.swarm_student_artifact),
+            "trivial_baseline": dict(self.trivial_baseline),
+            "dataset": dict(self.dataset),
         }
 
 
@@ -291,12 +426,18 @@ def run_brain_cluster_p0_dry_run(
     rollback_on_shadow_failure: bool = True,
     shadow_fixtures: Sequence[Mapping[str, Any]] | None = None,
     candidate_shadow_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    dataset_symbol: str | None = None,
+    baseline_gate: fbb.BaselineGateConfig | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    normalized_samples = _parse_samples(samples)
+    normalized_samples, payload_metadata = _parse_samples_and_metadata(samples)
+    dataset_info = _resolve_dataset(normalized_samples, payload_metadata, dataset_symbol)
+    baseline_config = fbb.BaselineGateConfig.from_value(baseline_gate)
     label_counts: dict[str, int] = {}
     for sample in normalized_samples:
         label_counts[sample.expected_label] = label_counts.get(sample.expected_label, 0) + 1
-    objective = str(normalized_samples[0].metadata.get("objective", "")).strip() if normalized_samples else ""
+    objective = str(payload_metadata.get("objective", "")).strip()
+    if not objective:
+        objective = str(normalized_samples[0].metadata.get("objective", "")).strip() if normalized_samples else ""
     if not objective:
         if all(label.startswith("dominant_") for label in label_counts):
             objective = "neurotransmitter_dominance"
@@ -308,14 +449,19 @@ def run_brain_cluster_p0_dry_run(
     output_root.mkdir(parents=True, exist_ok=True)
     state_file = Path(state_path)
 
+    group_keys = _split_group_keys_for(dataset_info["dataset_symbol"])
     dataset_manifest = fbct.build_dataset_manifest(
         normalized_samples,
         split_seed=split_seed,
         notes={
             "objective": objective,
+            "dataset_symbol": dataset_info["dataset_symbol"],
+            "dataset_version": dataset_info["dataset_version"],
             "label_counts": dict(sorted(label_counts.items())),
         },
+        group_keys=group_keys,
     )
+    fbct.assert_grouped_split(normalized_samples, dataset_manifest, group_keys=group_keys)
     (output_root / "dataset-manifest.json").write_text(
         json.dumps(dataset_manifest.as_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
@@ -396,6 +542,29 @@ def run_brain_cluster_p0_dry_run(
         thresholds=gate_thresholds,
         max_per_region=max_per_region,
     )
+    # AC6: the promotion gate also requires beating the trivial rules on held-out data.
+    trivial_baseline = _trivial_baseline_report(
+        normalized_samples,
+        manifest=dataset_manifest,
+        predictions=predictions,
+        config=baseline_config,
+    )
+    (output_root / "trivial-baseline-report.json").write_text(
+        json.dumps(trivial_baseline, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    gate_report = dict(gate_report)
+    gate_report["trivial_baseline"] = {
+        key: trivial_baseline[key]
+        for key in ("pass", "model_heldout_accuracy", "best_trivial_rule", "best_trivial_accuracy",
+                    "required_accuracy", "heldout_count", "heldout_split", "config")
+    }
+    if not trivial_baseline["pass"]:
+        gate_report["failure_reasons"] = list(gate_report.get("failure_reasons", [])) + list(
+            trivial_baseline["failure_reasons"]
+        )
+        gate_report["pass"] = False
+        gate_report["status"] = "fail"
+        gate_report["exit_code"] = 1
     pass_gate = bool(gate_report.get("pass", False))
 
     baseline_manifest_path: str | None = None
@@ -470,6 +639,8 @@ def run_brain_cluster_p0_dry_run(
             "consensus_train_count": swarm_student_result.consensus_train_count,
             "consensus_eval_count": swarm_student_result.consensus_eval_count,
         },
+        trivial_baseline=trivial_baseline,
+        dataset=dataset_info,
     )
     return result.as_dict()
 
@@ -508,6 +679,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-per-region", type=int, default=20)
     parser.add_argument("--max-shadow-fixtures", type=int, default=50)
     parser.add_argument("--no-rollback-on-shadow-failure", action="store_true")
+    parser.add_argument("--dataset", help="Dataset symbol (default: read from the samples payload)")
+    parser.add_argument("--baseline-margin", type=float, default=fbb.BaselineGateConfig().min_margin,
+                        help="Held-out accuracy the model must add over the best trivial rule")
     parser.add_argument("--report", help="Optional report output path")
     args = parser.parse_args(argv)
 
@@ -522,6 +696,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_per_region=args.max_per_region,
             max_shadow_fixtures=args.max_shadow_fixtures,
             rollback_on_shadow_failure=not args.no_rollback_on_shadow_failure,
+            dataset_symbol=args.dataset,
+            baseline_gate={"min_margin": args.baseline_margin},
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError, fbc.BrainClusterArtifactError, fbc.BrainClusterPromotionStateError) as exc:
         payload = {

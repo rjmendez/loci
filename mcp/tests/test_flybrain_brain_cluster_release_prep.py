@@ -2,13 +2,17 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import flybrain_brain_cluster_release_prep as prep  # noqa: E402
 
 
-def _report(*, accuracy: float, abstain: float, calibration: float, decision: float) -> dict[str, object]:
-    return {
+def _report(*, accuracy: float, abstain: float, calibration: float, decision: float,
+            dataset: str | None = None, objective: str | None = None,
+            baseline_pass: bool | None = None) -> dict[str, object]:
+    report: dict[str, object] = {
         "gate_report": {
             "metrics": {
                 "sample_count": 120,
@@ -30,59 +34,115 @@ def _report(*, accuracy: float, abstain: float, calibration: float, decision: fl
             }
         },
     }
+    notes: dict[str, object] = {}
+    if dataset is not None:
+        notes["dataset_symbol"] = dataset
+    if objective is not None:
+        notes["objective"] = objective
+    if notes:
+        report["dataset_manifest"] = {"notes": notes}
+    if baseline_pass is not None:
+        report["trivial_baseline"] = {
+            "pass": baseline_pass,
+            "model_heldout_accuracy": 0.9,
+            "best_trivial_rule": "majority",
+            "best_trivial_accuracy": 0.7 if baseline_pass else 0.95,
+            "required_accuracy": 0.71 if baseline_pass else 0.96,
+            "heldout_count": 30,
+        }
+    return report
 
 
-def _write_run(run_root, name: str, objective: str, report: dict[str, object]) -> None:
+def _write_run(run_root, name: str, report: dict[str, object], *, sample_metadata: dict | None = None) -> None:
     directory = run_root / name
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "p0-report.json").write_text(json.dumps(report), encoding="utf-8")
-    sample_payload = {
-        "samples": [],
-        "metadata": {"objective": objective},
-    }
-    (directory / f"{name}-samples.json").write_text(json.dumps(sample_payload), encoding="utf-8")
+    if sample_metadata is not None:
+        payload = {"samples": [], "metadata": sample_metadata}
+        (directory / f"{name}-samples.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_calibrate_thresholds_from_runs_groups_by_objective(tmp_path):
-    runs = tmp_path / "runs"
-    out = tmp_path / "out"
-    _write_run(runs, "run-a", "connectivity_tier", _report(accuracy=0.91, abstain=0.05, calibration=0.08, decision=0.97))
-    _write_run(runs, "run-b", "connectivity_tier", _report(accuracy=0.89, abstain=0.06, calibration=0.09, decision=0.96))
-    _write_run(runs, "run-c", "neurotransmitter_dominance", _report(accuracy=0.86, abstain=0.07, calibration=0.12, decision=0.94))
-    _write_run(runs, "run-d", "neurotransmitter_dominance", _report(accuracy=0.87, abstain=0.06, calibration=0.11, decision=0.95))
+def _good(**kwargs):
+    return _report(accuracy=0.9, abstain=0.05, calibration=0.08, decision=0.96, **kwargs)
 
-    summary = prep.calibrate_thresholds_from_runs(
-        prep.ReleasePrepConfig(
-            runs_root=runs,
-            output_dir=out,
-            min_reports_per_objective=2,
-        )
+
+def _calibrate(tmp_path, min_reports: int = 2):
+    return prep.calibrate_thresholds_from_runs(
+        prep.ReleasePrepConfig(runs_root=tmp_path / "runs", output_dir=tmp_path / "out",
+                               min_reports_per_objective=min_reports)
     )
 
-    assert summary["status"] == "ok"
-    objectives = summary["objectives_calibrated"]
-    assert sorted(objectives) == ["connectivity_tier", "neurotransmitter_dominance"]
-    for objective, row in objectives.items():
-        threshold_path = row["threshold_file"]
-        assert os.path.exists(threshold_path)
-        payload = json.loads((out / f"braincluster-thresholds-{objective}.json").read_text(encoding="utf-8"))
-        assert payload["schema_version"] == "braincluster-threshold-calibration/v1"
 
-
-def test_calibrate_thresholds_from_runs_rejects_when_insufficient_reports(tmp_path):
+def test_groups_by_dataset_and_objective(tmp_path):
     runs = tmp_path / "runs"
-    out = tmp_path / "out"
-    _write_run(runs, "run-a", "connectivity_tier", _report(accuracy=0.91, abstain=0.05, calibration=0.08, decision=0.97))
+    _write_run(runs, "fw-a", _good(dataset="fw", objective="connectivity_tier", baseline_pass=True))
+    _write_run(runs, "fw-b", _good(dataset="fw", objective="connectivity_tier", baseline_pass=False))
+    _write_run(runs, "fw-nt-a", _good(), sample_metadata={"schema_version": "flybrain-fw-training-samples/v1",
+                                                          "objective": "neurotransmitter_dominance"})
+    _write_run(runs, "fw-nt-b", _good(), sample_metadata={"dataset_symbol": "fw",
+                                                          "objective": "neurotransmitter_dominance"})
 
-    try:
-        prep.calibrate_thresholds_from_runs(
-            prep.ReleasePrepConfig(
-                runs_root=runs,
-                output_dir=out,
-                min_reports_per_objective=2,
-            )
-        )
-    except ValueError as exc:
-        assert "minimum report count" in str(exc)
-        return
-    raise AssertionError("Expected ValueError when no objective reaches minimum reports.")
+    summary = _calibrate(tmp_path)
+
+    assert summary["schema_version"] == prep.RELEASE_PREP_SCHEMA_VERSION
+    assert sorted(summary["groups_calibrated"]) == ["fw/connectivity_tier", "fw/neurotransmitter_dominance"]
+    row = summary["groups_calibrated"]["fw/connectivity_tier"]
+    assert row["dataset_symbol"] == "fw" and row["objective"] == "connectivity_tier"
+    assert row["trivial_baseline_pass_count"] == 1 and row["trivial_baseline_all_passed"] is False
+    path = tmp_path / "out" / "braincluster-thresholds-fw-connectivity_tier.json"
+    assert row["threshold_file"] == str(path.resolve())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "braincluster-threshold-calibration/v1"
+    assert payload["dataset_symbol"] == "fw" and payload["objective"] == "connectivity_tier"
+    assert payload["trivial_baseline"]["recorded_count"] == 2
+    assert {run["best_trivial_accuracy"] for run in payload["trivial_baseline"]["runs"]} == {0.7, 0.95}
+
+
+def test_other_dataset_does_not_count_toward_fw_minimum(tmp_path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "fw-a", _good(dataset="fw", objective="connectivity_tier"))
+    _write_run(runs, "hb-a", _good(dataset="hb", objective="connectivity_tier"))
+    _write_run(runs, "hb-b", _good(dataset="hb", objective="connectivity_tier"))
+
+    summary = _calibrate(tmp_path)
+
+    assert list(summary["groups_calibrated"]) == ["hb/connectivity_tier"]
+    skipped = summary["groups_skipped"]["fw/connectivity_tier"]
+    assert skipped["reason"] == "insufficient_reports" and skipped["report_count"] == 1
+    assert not (tmp_path / "out" / "braincluster-thresholds-fw-connectivity_tier.json").exists()
+
+
+@pytest.mark.parametrize(
+    "dataset,objective",
+    [(None, "connectivity_tier"), ("unknown", "connectivity_tier"), ("mouse", "connectivity_tier"),
+     ("fw", "custom"), ("fw", None)],
+)
+def test_unresolved_dataset_or_objective_fails_closed(tmp_path, dataset, objective):
+    runs = tmp_path / "runs"
+    for name in ("a", "b", "c"):
+        _write_run(runs, name, _good(dataset=dataset, objective=objective))
+    with pytest.raises(ValueError, match="resolved \\(dataset, objective\\)"):
+        _calibrate(tmp_path)
+
+
+def test_unresolved_runs_are_listed_not_pooled(tmp_path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "fw-a", _good(dataset="fw", objective="connectivity_tier"))
+    _write_run(runs, "fw-b", _good(dataset="fw", objective="connectivity_tier"))
+    _write_run(runs, "anon", _good(objective="connectivity_tier"))
+    summary = _calibrate(tmp_path)
+    assert summary["groups_calibrated"]["fw/connectivity_tier"]["report_count"] == 2
+    assert [row["dataset_symbol"] for row in summary["unresolved_runs"]] == ["unknown"]
+
+
+def test_rejects_when_insufficient_reports(tmp_path):
+    _write_run(tmp_path / "runs", "run-a", _good(dataset="fw", objective="connectivity_tier"))
+    with pytest.raises(ValueError, match="minimum report count"):
+        _calibrate(tmp_path)
+
+
+def test_cli_error_payload_uses_v2_schema(tmp_path, capsys):
+    code = prep.main(["--runs-root", str(tmp_path / "missing"), "--output-dir", str(tmp_path / "out")])
+    assert code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == prep.RELEASE_PREP_SCHEMA_VERSION and payload["status"] == "error"

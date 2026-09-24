@@ -23,6 +23,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import caller_identity
+
 logger = logging.getLogger("loci-mcp")
 
 _get_memory_dir = None  # injected by register(); returns the memory root Path
@@ -311,27 +313,140 @@ def _append_jsonl(path: Path, entry: dict) -> None:
         f.flush()
 
 
+# rag_context_search access bookkeeping lives in its own per-investigation log.
+# Older builds appended it to findings.jsonl under the finding's own id, so any
+# reader where the last row wins saw a text-less access row instead of the finding.
+FINDINGS_LOG_NAME = "findings.jsonl"
+ACCESS_LOG_NAME = "access.jsonl"
+_ACCESS_RECORD_TYPES = frozenset({"access"})
+
+
+def _is_access_row(rec) -> bool:
+    """True for an access-bookkeeping row. Such a row is not a finding."""
+    return (isinstance(rec, dict)
+            and (rec.get("record_type") or rec.get("type") or "") in _ACCESS_RECORD_TYPES)
+
+
 def _read_jsonl(path: Path) -> list[dict]:
+    """Parse a JSONL log. Legacy access rows are dropped from findings.jsonl."""
     if not path.exists():
         return []
     out = []
     bad = 0
-    for line in path.read_text().splitlines():
+    drop_access = path.name == FINDINGS_LOG_NAME
+    # Decode per line: one torn, non-UTF-8 append must cost that line, not the whole log
+    # (for retractions.jsonl that would void every tombstone in the investigation).
+    for line in path.read_bytes().decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if line:
             try:
-                out.append(json.loads(line))
+                rec = json.loads(line)
             except Exception:
                 bad += 1
+                continue
+            if drop_access and _is_access_row(rec):
+                continue
+            out.append(rec)
     if bad:
         logger.debug("_read_jsonl: skipped %d unparseable line(s) in %s", bad, path)
     return out
+
+
+def _rewrite_jsonl_preserving(path: Path, update) -> int:
+    """Atomically rewrite a JSONL log, changing only the rows ``update`` replaces.
+
+    ``update(rec)`` receives each parsed dict row and returns either a
+    replacement dict or None to keep the row as it is. All other lines are
+    written back byte-for-byte. That includes lines that do not parse and legacy
+    findings.jsonl access rows, because a rewrite must never be what deletes a
+    record. Returns the number of rows replaced.
+    """
+    skip_access = path.name == FINDINGS_LOG_NAME
+    new_lines = []
+    replaced = 0
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        rec = None
+        if stripped:
+            try:
+                rec = json.loads(stripped)
+            except Exception:
+                rec = None
+        if isinstance(rec, dict) and not (skip_access and _is_access_row(rec)):
+            new = update(rec)
+            if new is not None:
+                new_lines.append(json.dumps(new))
+                replaced += 1
+                continue
+        new_lines.append(line)
+    _atomic_write_text(path, "\n".join(new_lines) + ("\n" if new_lines else ""))
+    return replaced
 
 
 def _finding_updates_path(investigation_id: str) -> Path:
     """Resolution overrides log — scanned by every read path (load/search), so it
     stays SMALL: only finding_resolve appends here (last-write-wins resolutions)."""
     return _inv_dir(investigation_id) / "finding_updates.jsonl"
+
+
+#: Append-only provenance-tier assertions for findings stored without one, written
+#: by scripts/backfill_provenance_tiers.py. Kept out of finding_updates.jsonl,
+#: which every load/search scans and must stay small.
+PROVENANCE_UPDATES_NAME = "provenance_updates.jsonl"
+
+
+def _load_provenance_overrides(investigation_id: str) -> dict[str, dict]:
+    """``{finding_id: record}`` from provenance_updates.jsonl, last-write-wins.
+
+    Only ``record_type == "provenance_tier"`` records naming a known tier count.
+    Fail-open to ``{}``: a finding with no usable record keeps its stored (or
+    defaulted) tier, which is the conservative reading.
+    """
+    from provenance_firewall import PROVENANCE_TIERS
+
+    out: dict[str, dict] = {}
+    try:
+        for rec in _read_jsonl(_inv_dir(investigation_id) / PROVENANCE_UPDATES_NAME):
+            if not isinstance(rec, dict) or rec.get("record_type") != "provenance_tier":
+                continue
+            fid = str(rec.get("finding_id") or "")
+            tier = str(rec.get("evidence_provenance_tier") or "")
+            if fid and tier in PROVENANCE_TIERS:
+                out[fid] = rec
+    except Exception as exc:  # noqa: BLE001 — never block a read on the overrides log
+        logger.debug("provenance overrides load failed (fail-open): %r", exc)
+    return out
+
+
+def _apply_provenance_override(finding: dict, rec: dict) -> dict:
+    """A copy of ``finding`` carrying the backfilled tier, if it has no explicit one.
+
+    An explicit tier the writer asserted always wins over a backfill record.
+    """
+    from provenance_firewall import provenance_fields
+
+    if not provenance_fields(finding)["provenance_defaulted"]:
+        return finding
+    out = {**finding,
+           "evidence_provenance_tier": rec["evidence_provenance_tier"],
+           "provenance_defaulted": False,
+           "provenance_source": f"backfill:{rec.get('rule') or 'unknown'}"}
+    meta = finding.get("metadata")
+    if isinstance(meta, dict) and meta.get("provenance_defaulted") is True:
+        out["metadata"] = {**meta, "provenance_defaulted": False}
+    return out
+
+
+def _fold_provenance_overrides(findings: list, investigation_id: str) -> list:
+    """Return ``findings`` with backfilled tiers overlaid on untagged rows (copies)."""
+    overrides = _load_provenance_overrides(investigation_id)
+    if not overrides:
+        return findings
+    return [
+        _apply_provenance_override(f, overrides[str(f.get("id") or "")])
+        if isinstance(f, dict) and str(f.get("id") or "") in overrides else f
+        for f in findings
+    ]
 
 
 def _load_resolution_overrides(investigation_id: str) -> dict[str, str]:
@@ -364,16 +479,32 @@ def _load_retracted_ids(investigation_id: str) -> set[str]:
     it in order and the last entry per finding id wins. Fail-safe: a missing or
     malformed log yields an empty set, never raises.
     """
-    path = _inv_dir(investigation_id) / "retractions.jsonl"
-    state: dict[str, bool] = {}
+    return _fold_retracted_ids(_inv_dir(investigation_id) / "retractions.jsonl")
+
+
+def _retraction_events(path: Path) -> dict[str, list[tuple[str, bool]]]:
+    """Replay ``retractions.jsonl`` into ``{finding_id: [(ts, active), ...]}`` in log order.
+
+    Path-level so read-only callers can fold a directory whose name fails
+    today's id validation (e.g. a legacy ``undefined`` dir) instead of
+    skipping its retractions. Never raises on a missing or malformed log.
+    """
+    events: dict[str, list[tuple[str, bool]]] = {}
     for entry in _read_jsonl(path):
         if not isinstance(entry, dict):
             continue
         fid = entry.get("finding_id")
         if not fid:
             continue
-        state[str(fid)] = bool(entry.get("active", True))
-    return {fid for fid, active in state.items() if active}
+        events.setdefault(str(fid), []).append(
+            (str(entry.get("ts") or ""), bool(entry.get("active", True)))
+        )
+    return events
+
+
+def _fold_retracted_ids(path: Path) -> set[str]:
+    """Currently-retracted ids for one log path: the last entry per id wins."""
+    return {fid for fid, evs in _retraction_events(path).items() if evs[-1][1]}
 
 
 # Corroboration evidence carried alongside a dense-similarity score. Every lane
@@ -426,6 +557,94 @@ def _tag_finding_ids(findings: list[dict], investigation_id: str) -> list[dict]:
         fid = f.get("id") or f.get("finding_id") or f"{investigation_id}:{index}"
         tagged.append({**f, "id": str(fid)})
     return tagged
+
+
+def _acl_access_denied(manifest: dict, requesting_agent_id=None, *, open_when_acl_empty: bool = True):
+    """Return why the caller may not access this investigation, or None.
+
+    A non-empty ACL restricts access to the owner and the ACL members.
+
+    The identity checked first is the one the transport vouches for
+    (``caller_identity.bound_agent_id()``: a per-agent MCP bearer token, or the
+    A2A session's sender). It must be the owner or an ACL member. Where the
+    transport binds no identity (stdio, a shared token, unauthenticated
+    loopback) the caller is this process (``HERMES_AGENT_ID``), held to the
+    owner rule memory_retract uses: refused only when a different owner is set
+    and the local agent is not a member.
+
+    ``requesting_agent_id`` is caller-supplied, so it can only narrow: when it
+    names a different agent, that agent must *also* be the owner or a member.
+    Naming a member never admits a caller that is not one.
+
+    ``open_when_acl_empty=False`` applies the same test to an investigation with
+    an empty ACL (used for ACL changes, so a stranger cannot claim an owned
+    investigation by sharing it with itself). An investigation with neither an
+    owner nor an ACL is open to everyone, ACL changes included.
+    """
+    raw_acl = manifest.get("acl") if isinstance(manifest, dict) else None
+    acl = {str(a) for a in raw_acl if a} if isinstance(raw_acl, list) else set()
+    if open_when_acl_empty and not acl:
+        return None
+    owner = str((manifest or {}).get("owner") or "")
+    inv = (manifest or {}).get("id")
+
+    def _allowed(who: str) -> bool:
+        return who == owner or who in acl or (not owner and not acl)
+
+    bound = caller_identity.bound_agent_id()
+    if bound:
+        if not _allowed(bound):
+            return (f"authenticated agent {bound!r} is neither the owner nor in the ACL "
+                    f"of investigation {inv!r}")
+        base = bound
+    else:
+        local = caller_identity.process_agent_id()
+        if owner and owner != local and not (local and local in acl):
+            return f"investigation {inv!r} is owned by {owner!r} and the local agent is not in its ACL"
+        base = local
+    if requesting_agent_id and str(requesting_agent_id) != base:
+        who = str(requesting_agent_id)
+        if not _allowed(who):
+            return f"agent {who!r} is neither the owner nor in the ACL of investigation {inv!r}"
+    return None
+
+
+def _acl_filter_rows(rows, requesting_agent_id=None) -> tuple[list, int]:
+    """Drop rows from investigations the caller may not read.
+
+    Rows carry ``investigation_id``; rows without one (static corpora, code
+    chunks) are not investigation data and pass. Returns ``(kept, excluded)``.
+    A manifest that cannot be read fails closed for that investigation.
+    """
+    kept: list = []
+    excluded = 0
+    verdicts: dict[str, bool] = {}
+    for row in rows or []:
+        inv = str(row.get("investigation_id") or "") if isinstance(row, dict) else ""
+        if not inv:
+            kept.append(row)
+            continue
+        if inv not in verdicts:
+            try:
+                _validated_investigation_id(inv)
+            except ValueError:
+                # Not a valid investigation id, so no manifest (and no ACL) can exist for it.
+                verdicts[inv] = True
+                kept.append(row)
+                continue
+            try:
+                manifest = _load_manifest(inv)
+            except Exception as exc:  # unreadable/corrupt manifest: fail closed
+                logger.debug("_acl_filter_rows: manifest for %r unreadable: %r", inv, exc)
+                verdicts[inv] = False
+            else:
+                # No manifest on disk: not an investigation this store governs.
+                verdicts[inv] = (not manifest) or not _acl_access_denied(manifest, requesting_agent_id)
+        if verdicts[inv]:
+            kept.append(row)
+        else:
+            excluded += 1
+    return kept, excluded
 
 
 def register(get_memory_dir):

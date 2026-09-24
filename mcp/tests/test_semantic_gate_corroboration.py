@@ -70,6 +70,10 @@ def _ref(score, overlap, pool_size, pool_median, evidence_id="ev-1"):
         "pool_size": pool_size,
         "margin": round(score - pool_median, 4),
         "snippet": "",
+        # Real refs carry provenance_fields(payload); a tagged tool finding here, so
+        # the semantic gate (not the provenance firewall) decides these tests.
+        "evidence_provenance_tier": "tool_verified",
+        "provenance_defaulted": False,
     }
 
 

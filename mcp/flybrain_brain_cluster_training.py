@@ -235,6 +235,180 @@ def deterministic_split_ids(
     return tuple(ordered[:train_end]), tuple(ordered[train_end:val_end]), tuple(ordered[val_end:])
 
 
+# Metadata values that carry no grouping information (never tie samples together).
+_UNKNOWN_GROUP_VALUES = frozenset({"", "unknown", "none", "nan", "null", "<na>", "n/a", "na"})
+# Always honoured, whatever the dataset registry lists: a builder-declared group.
+GENERIC_SPLIT_GROUP_KEY = "split_group"
+
+
+def _group_value(metadata: Mapping[str, Any], key: str) -> str | None:
+    if key not in metadata:
+        return None
+    raw = metadata[key]
+    if raw is None or isinstance(raw, (dict, list, tuple, set)):
+        return None
+    if isinstance(raw, float) and raw != raw:
+        return None
+    text = str(raw).strip()
+    if text.lower() in _UNKNOWN_GROUP_VALUES:
+        return None
+    return text
+
+
+def split_group_components(
+    samples: Sequence[TrainingSample],
+    *,
+    group_keys: Sequence[str],
+) -> dict[str, str]:
+    """Map each sample_id to its split component id.
+
+    Two samples are in the same component when they share a known value of
+    any key in ``group_keys`` (transitively: union-find over all keys), e.g. the
+    same cell type, the same hemilineage, or the same left/right pair. A sample
+    with no known group value is its own component, keyed by its sample_id.
+    """
+    keys = tuple(dict.fromkeys(str(key).strip() for key in group_keys if str(key).strip()))
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        parent.setdefault(node, node)
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # Deterministic: the lexicographically smaller root wins.
+            if rb < ra:
+                ra, rb = rb, ra
+            parent[rb] = ra
+
+    for sample in samples:
+        node = f"s:{sample.sample_id.strip()}"
+        find(node)
+        metadata = sample.metadata if isinstance(sample.metadata, Mapping) else {}
+        for key in keys:
+            value = _group_value(metadata, key)
+            if value is not None:
+                union(f"g:{key}={value}", node)
+
+    members: dict[str, list[str]] = {}
+    for sample in samples:
+        members.setdefault(find(f"s:{sample.sample_id.strip()}"), []).append(sample.sample_id)
+    smallest_group: dict[str, str] = {}
+    for node in list(parent):
+        if node.startswith("g:"):
+            root = find(node)
+            if root not in smallest_group or node < smallest_group[root]:
+                smallest_group[root] = node
+    component_of: dict[str, str] = {}
+    for root, ids in members.items():
+        # A component tied by any group value is named after its smallest group
+        # value; an ungrouped sample keeps its own id (identical to the legacy split).
+        component_id = smallest_group.get(root) or ids[0].strip()
+        for sample_id in ids:
+            component_of[sample_id] = component_id
+    return component_of
+
+
+def grouped_split_ids(
+    samples: Sequence[TrainingSample],
+    *,
+    group_keys: Sequence[str],
+    split_seed: str,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+    """Deterministic split that never lets a group straddle train/val/test.
+
+    Components (``split_group_components``) are ordered by
+    ``sha256(split_seed:component_id)`` and assigned whole: a component goes to
+    train while fewer than ``int(n * train_ratio)`` samples are in train, then
+    to val, then to test. With no grouping metadata every component is one
+    sample and the result equals ``deterministic_split_ids``.
+
+    Returns ``(train, val, test, info)``; ``info`` records the grouping, the
+    achieved split sizes, and how many multi-sample components the legacy
+    per-sample split would have straddled (the leakage it prevents).
+    """
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError("train_ratio must be in (0, 1)")
+    if not (0.0 <= val_ratio < 1.0):
+        raise ValueError("val_ratio must be in [0, 1)")
+    if train_ratio + val_ratio >= 1.0:
+        raise ValueError("train_ratio + val_ratio must be < 1.0")
+    keys = tuple(dict.fromkeys(str(key).strip() for key in group_keys if str(key).strip()))
+    ids = [sample.sample_id for sample in samples]
+    component_of = split_group_components(samples, group_keys=keys)
+    members: dict[str, list[str]] = {}
+    for sample_id in ids:
+        members.setdefault(component_of[sample_id], []).append(sample_id)
+    for component_id in members:
+        members[component_id].sort(key=lambda sid: _sha256_hex(f"{split_seed}:{sid.strip()}"))
+    ordered_components = sorted(members, key=lambda cid: _sha256_hex(f"{split_seed}:{cid}"))
+
+    n = len(ids)
+    train_end = int(n * train_ratio)
+    val_end = train_end + int(n * val_ratio)
+    train: list[str] = []
+    val: list[str] = []
+    test: list[str] = []
+    assigned = 0
+    for component_id in ordered_components:
+        bucket = train if assigned < train_end else val if assigned < val_end else test
+        bucket.extend(members[component_id])
+        assigned += len(members[component_id])
+
+    multi = {cid: rows for cid, rows in members.items() if len(rows) > 1}
+    legacy_train, legacy_val, _ = deterministic_split_ids(
+        ids, split_seed=split_seed, train_ratio=train_ratio, val_ratio=val_ratio
+    )
+    legacy_split = {sid: 0 for sid in legacy_train}
+    legacy_split.update({sid: 1 for sid in legacy_val})
+    straddling = sum(1 for rows in multi.values() if len({legacy_split.get(sid, 2) for sid in rows}) > 1)
+    info = {
+        "strategy": "grouped",
+        "group_keys": list(keys),
+        "component_count": len(members),
+        "multi_sample_components": len(multi),
+        "grouped_sample_count": sum(len(rows) for rows in multi.values()),
+        "largest_component_size": max((len(rows) for rows in members.values()), default=0),
+        "achieved_counts": {"train": len(train), "val": len(val), "test": len(test)},
+        "per_sample_split_straddling_components": straddling,
+    }
+    return tuple(train), tuple(val), tuple(test), info
+
+
+def assert_grouped_split(
+    samples: Sequence[TrainingSample],
+    manifest: "DatasetManifest",
+    *,
+    group_keys: Sequence[str],
+) -> None:
+    """Fail closed if any known group value appears in more than one split."""
+    split_of: dict[str, str] = {}
+    for name, split_ids in (("train", manifest.train_ids), ("val", manifest.val_ids), ("test", manifest.test_ids)):
+        for sample_id in split_ids:
+            split_of[sample_id] = name
+    seen: dict[tuple[str, str], set[str]] = {}
+    for sample in samples:
+        split = split_of.get(sample.sample_id)
+        if split is None:
+            continue
+        metadata = sample.metadata if isinstance(sample.metadata, Mapping) else {}
+        for key in group_keys:
+            value = _group_value(metadata, key)
+            if value is not None:
+                seen.setdefault((key, value), set()).add(split)
+    straddling = sorted(f"{key}={value}" for (key, value), splits in seen.items() if len(splits) > 1)
+    if straddling:
+        raise ValueError(f"split groups straddle splits: {', '.join(straddling[:10])}")
+
+
 def build_dataset_manifest(
     samples: Sequence[TrainingSample],
     *,
@@ -243,7 +417,15 @@ def build_dataset_manifest(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     notes: Mapping[str, Any] | None = None,
+    group_keys: Sequence[str] | None = None,
 ) -> DatasetManifest:
+    """Validate samples and split them deterministically.
+
+    With ``group_keys`` the split is grouped (``grouped_split_ids``): samples
+    that share a known value of any listed metadata key always land in the same
+    split, and ``notes["split"]`` records the grouping and its leakage stats.
+    ``group_keys=None`` keeps the legacy per-sample split.
+    """
     if not samples:
         raise ValueError("samples must be non-empty")
     validated: list[TrainingSample] = []
@@ -259,12 +441,23 @@ def build_dataset_manifest(
 
     canonical_samples = [sample.as_dict() for sample in sorted(validated, key=lambda s: s.sample_id)]
     digest = _sha256_hex(_stable_json(canonical_samples))
-    train_ids, val_ids, test_ids = deterministic_split_ids(
-        [sample.sample_id for sample in validated],
-        split_seed=split_seed,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-    )
+    manifest_notes = dict(notes or {})
+    if group_keys is None:
+        train_ids, val_ids, test_ids = deterministic_split_ids(
+            [sample.sample_id for sample in validated],
+            split_seed=split_seed,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+        )
+    else:
+        train_ids, val_ids, test_ids, split_info = grouped_split_ids(
+            validated,
+            group_keys=group_keys,
+            split_seed=split_seed,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+        )
+        manifest_notes["split"] = split_info
 
     manifest_payload = {
         "schema_version": schema_version,
@@ -287,7 +480,7 @@ def build_dataset_manifest(
         train_ids=train_ids,
         val_ids=val_ids,
         test_ids=test_ids,
-        notes=dict(notes or {}),
+        notes=manifest_notes,
     )
 
 

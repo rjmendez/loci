@@ -198,35 +198,42 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
     return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
 
 
+# Set by server.py after register(): (investigation_id, finding) -> evidence rows
+# linked to that finding's claim (server._firewall_linked_evidence). Unset -> no
+# linked evidence, so a model_asserted finding fails closed.
+linked_evidence_fn = None
+
+
 def _finding_provenance_context(investigation_id: Optional[str], finding_id: Optional[str]):
-    """Look up a stored finding's own provenance tier plus its investigation's
-    other findings, to thread into ``verify.verify_finding``'s provenance
-    firewall. Fail-open: any lookup problem (missing investigation/finding,
-    corrupt storage) returns ``(None, None)`` so the caller falls back to
-    verify_finding's own legacy-default behavior instead of raising or wrongly
-    gating a claim it could not resolve.
+    """Look up a stored finding's own provenance tier plus the evidence linked to
+    its claim (derived_from parents, lexical support), to thread into
+    ``verify.verify_finding``'s provenance firewall. Unrelated findings are not
+    evidence. Fail-open: a missing investigation/finding or corrupt storage
+    returns ``(None, None)`` so the caller falls back to verify_finding's own
+    legacy-default behavior instead of raising or wrongly gating a claim it
+    could not resolve.
     """
     if not investigation_id or not finding_id:
         return None, None
     try:
-        from inv_store import _inv_dir, _read_jsonl
-        from provenance_firewall import normalize_provenance_tier
-        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-        target = None
-        evidence_rows = []
-        for f in findings:
-            if not isinstance(f, dict):
-                continue
-            if target is None and str(f.get("id") or "") == str(finding_id):
-                target = f
-            else:
-                evidence_rows.append(f)
+        from inv_store import _fold_provenance_overrides, _inv_dir, _read_jsonl
+        from provenance_firewall import firewall_candidate_tier
+        findings = _fold_provenance_overrides(
+            _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
+        target = next((f for f in findings if isinstance(f, dict)
+                       and str(f.get("id") or "") == str(finding_id)), None)
         if target is None:
             return None, None
-        return normalize_provenance_tier(target), evidence_rows
     except Exception as exc:
         logger.debug("verify_finding: provenance lookup failed (fail-open): %r", exc)
         return None, None
+    try:
+        evidence_rows = list(linked_evidence_fn(investigation_id, target)) if linked_evidence_fn else []
+    except Exception as exc:
+        logger.debug("verify_finding: linked-evidence lookup failed (no linked evidence): %r", exc)
+        evidence_rows = []
+    # An untagged (defaulted) finding is gated like model_asserted.
+    return firewall_candidate_tier(target), evidence_rows
 
 
 def verify_finding(claim: str,
@@ -342,6 +349,7 @@ def ground(
     allow_keyword: bool = False,
     graph_available: bool = False,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Build a compact, provenance-tagged grounding block for a task. Call it once
@@ -370,9 +378,13 @@ def ground(
         graph_available: Enable the code-graph lane (default off; requires the
             LadybugDB graph).
         mode: "normal" (default) for the legacy block, or "compact" for terse tagged lines.
+        requesting_agent_id: Optional agent_id for the case and RAG lanes' ACL
+            checks. It can only narrow the transport-bound (or local) identity;
+            findings from investigations the caller cannot read are left out.
 
     Returns:
-        JSON ``{block, sources, chars, degraded}``.
+        JSON ``{block, sources, chars, degraded, degraded_lanes}``; ``degraded_lanes``
+        names each lane that raised, errored or hit the deadline (LOCI_GROUND_DEADLINE_S).
     """
     if not title or not title.strip():
         return json.dumps({"error": "title must not be empty",
@@ -390,6 +402,8 @@ def ground(
     }
     if mode == "compact":
         opts["mode"] = "compact"
+    if requesting_agent_id:
+        opts["requestingAgentId"] = str(requesting_agent_id)
     return json.dumps(grounding.ground(task, opts), indent=2)
 
 

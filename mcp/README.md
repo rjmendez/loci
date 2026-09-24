@@ -68,7 +68,7 @@ Production guardrails on sample build:
 - label concentration ceiling (`--max-label-share`, default `0.9`)
 - deterministic fingerprinted metadata for audit/replay
 
-Objective-specific threshold bundle generation from real run history:
+Per-(dataset, objective) threshold bundle generation from real run history (`--min-reports-per-objective` counts reports per group):
 
 `braincluster-release-prep --runs-root F:\.flybrain\cache\braincluster-runs --output-dir F:\.flybrain\cache\braincluster-thresholds --min-reports-per-objective 2`
 

@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Callable, Optional
 
-from inv_store import _atomic_write_text, _inv_dir, _locked_file, _read_jsonl, _save_manifest
+from inv_store import _inv_dir, _locked_file, _read_jsonl, _rewrite_jsonl_preserving, _save_manifest
 from qdrant_ops import _qdrant_upsert
 from text_ops import classify
 
@@ -156,9 +156,17 @@ def _normalized_procedure_meta(existing) -> dict:
     }
 
 
-def _rewrite_findings(path: Path, findings: list[dict]) -> None:
-    lines = "\n".join(json.dumps(f) for f in findings)
-    _atomic_write_text(path, lines + ("\n" if lines else ""))
+def _rewrite_finding(path: Path, target: dict) -> None:
+    """Replace the first row that has target's id. Every other line is kept verbatim."""
+    first = [True]
+
+    def _replace(f: dict):
+        if first[0] and str(f.get("id") or "") == str(target.get("id") or ""):
+            first[0] = False
+            return target
+        return None
+
+    _rewrite_jsonl_preserving(path, _replace)
 
 
 def maybe_promote_to_procedure(investigation_id: str,
@@ -204,7 +212,7 @@ def maybe_promote_to_procedure(investigation_id: str,
             target["type"] = "procedure"
             target["procedure_meta"] = _normalized_procedure_meta(target.get("procedure_meta"))
 
-            _rewrite_findings(findings_path, findings)
+            _rewrite_finding(findings_path, target)
 
             try:
                 manifest = _fresh_manifest(inv_dir)

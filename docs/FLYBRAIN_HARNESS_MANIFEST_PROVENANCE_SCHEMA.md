@@ -185,7 +185,7 @@ Notes:
 
 - Paths must remain under the canonical root subtrees: `graph\`, `snapshots\`, `cache\`, `backups\`, or `logs\`.
 - `datasets\...` is not a canonical writable layout in phase 1.
-- `dataset.symbol` must be one of the known VFB symbols and phase-1 execution currently allows only `hb` and `fw`.
+- `dataset.symbol` must be one of the known VFB symbols and phase-1 execution currently allows only `hb` and `fw`. Verified local-snapshot manifests (read-only adapter use, not phase-1 query execution) also exist for `BANC` (`relative_root` `snapshots/BANC/banc_888`, see `FLYBRAIN_BANC_ADAPTER_CONTRACT.md`) and `l1em` (`snapshots/l1em/catmaid_l1em`, see `FLYBRAIN_L1EM_ADAPTER_CONTRACT.md`). Both adapters require the `manifest/manifest.sha256` sidecar to be present and to match.
 
 ## Resolved ambiguities and edge-case rules (required before first execute run)
 
