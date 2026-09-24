@@ -287,7 +287,9 @@ specific endpoints and keys belong there, not in this repo.
 | Variable | Service | Purpose |
 |---|---|---|
 | `LOCI_A2A_TOKEN` | hermes-a2a | Bearer token read directly by `server.py` |
-| `LOCI_MCP_TOKEN` | hermes-mcp | Bearer token for the HTTP transports. Required — startup refuses — when `LOCI_MCP_HOST` is not loopback. Unused by the stdio transport |
+| `LOCI_MCP_TOKEN` | hermes-mcp | Bearer token for the HTTP transports. Required — startup refuses — when `LOCI_MCP_HOST` is not loopback (unless per-agent tokens are set). Unused by the stdio transport. Shared by every client, so it binds no ACL identity |
+| `LOCI_MCP_AGENT_TOKENS` / `LOCI_MCP_AGENT_TOKENS_FILE` | hermes-mcp | Per-agent bearer tokens, as JSON `{"agent_id": "token"}` or `agent=token,...` (the `_FILE` form names a JSON file). A request with one of them is bound to that agent id, and investigation ACLs check that id. `requesting_agent_id` can then only narrow it. Startup refuses a file that does not parse, or a token equal to `LOCI_MCP_TOKEN` |
+| `LOCI_RETRACT_PROPAGATE` | hermes-mcp | `1` (default) makes `memory_retract` / `memory_restore` flag the Qdrant point payload (`retracted`) and Mnemosyne `valid_until`. `0` leaves those stores untouched |
 
 Set `LOCI_A2A_TOKEN` in your `.env` file (or export it in the environment) regardless of deployment method.
 
