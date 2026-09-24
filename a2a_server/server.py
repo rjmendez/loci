@@ -47,6 +47,12 @@ Optional / tunable:
   LOCI_A2A_PRIVILEGED_SENDERS comma-separated sender IDs allowed to call
     DESTRUCTIVE_SKILLS (memory_remember, memory_sleep, context_broadcast,
     mnemosyne_triple_add). Default: '' so destructive skills are effectively disabled.
+    The sender must also be the agent the credential authenticates: a
+    LOCI_A2A_AGENT_TOKENS token or /bootstrap session token for that agent_id,
+    or the primary LOCI_A2A_TOKEN for this node's own HERMES_AGENT_ID only.
+  LOCI_A2A_AGENT_TOKENS per-agent bearer tokens: JSON {"agent": "token"} or
+    agent=token,agent2=token2. Each token authenticates (and binds the sender to)
+    one agent_id; a peer that fans out memory_remember needs one here. Default: ''
   PEER_A2A_URLS comma-separated peer A2A base URLs for fan-out skills
     (memory_broadcast, memory_prime). Default: ''
   PEER_A2A_TOKEN shared ****** for every peer. Default: ''
@@ -242,6 +248,59 @@ _IDEMPOTENCY_TTL_S = max(60, int(os.environ.get('LOCI_A2A_IDEMPOTENCY_TTL_S', '3
 _PRIVILEGED_SENDERS: frozenset[str] = frozenset(
     s.strip() for s in os.getenv('LOCI_A2A_PRIVILEGED_SENDERS', '').split(',') if s.strip()
 )
+
+
+def _load_agent_tokens(environ: Optional[dict] = None, primary: str = '') -> dict[str, str]:
+    """Return ``{token: agent_id}`` from ``LOCI_A2A_AGENT_TOKENS``.
+
+    Same forms as the MCP server's ``LOCI_MCP_AGENT_TOKENS``: a JSON object
+    ``{"agent": "token"}`` or ``agent=token`` pairs separated by commas. A token
+    authenticates exactly one agent_id, which is what lets that agent hold
+    privilege; the shared primary token cannot. Malformed input, an empty entry,
+    a token shared by two agents or equal to the primary token fails closed to
+    no per-agent tokens (logged, secrets not echoed).
+    """
+    env = os.environ if environ is None else environ
+    raw = str(env.get('LOCI_A2A_AGENT_TOKENS', '') or '').strip()
+    if not raw:
+        return {}
+    mapping: dict[str, str] = {}
+    try:
+        if raw[0] in '{[':
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                raise ValueError('is not valid JSON') from None
+            if not isinstance(obj, dict):
+                raise ValueError('must be a JSON object of agent -> token')
+            pairs = list(obj.items())
+        else:
+            pairs = []
+            for part in raw.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if '=' not in part:
+                    raise ValueError("has an entry with no '=token'")
+                pairs.append(tuple(part.split('=', 1)))
+        for agent, tok in pairs:
+            agent, tok = str(agent).strip(), str(tok or '').strip()
+            if not agent or not tok:
+                raise ValueError('has an empty agent id or token')
+            if tok in mapping and mapping[tok] != agent:
+                raise ValueError('maps one token to two agents')
+            if primary and hmac.compare_digest(tok, primary):
+                raise ValueError('reuses the primary LOCI_A2A_TOKEN')
+            mapping[tok] = agent
+    except ValueError as e:
+        log.error(f'LOCI_A2A_AGENT_TOKENS {e} (entries not echoed: they are secrets); '
+                  f'per-agent tokens disabled')
+        return {}
+    return mapping
+
+
+# Per-agent bearer tokens: token -> agent_id. See _load_agent_tokens.
+_AGENT_TOKENS: dict[str, str] = _load_agent_tokens(primary=A2A_TOKEN)
 
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
 AGENT_CARD = {
@@ -576,12 +635,38 @@ def _is_live_session_token(tok: str) -> bool:
     return bool(exp and exp > datetime.datetime.now(datetime.timezone.utc))
 
 
+def _agent_for_token(tok: str) -> Optional[str]:
+    """The agent_id a LOCI_A2A_AGENT_TOKENS token authenticates, or None."""
+    agent = None
+    for known, agent_id in _AGENT_TOKENS.items():
+        if hmac.compare_digest(tok, known):
+            agent = agent_id
+    return agent
+
+
+def _authenticated_agent(auth: dict) -> Optional[str]:
+    """The agent identity the credential proves; the only identity privilege may use.
+
+    A per-agent or /bootstrap session token proves its agent_id. The primary
+    token proves this node's operator, i.e. the local agent (HERMES_AGENT_ID),
+    never a sender it merely declares.
+    """
+    if auth.get('token_type') in ('session', 'agent'):
+        return auth.get('sender') or None
+    if auth.get('token_type') == 'primary':
+        return AGENT_ID
+    return None
+
+
 def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
     if not creds:
         raise HTTPException(status_code=401, detail='Unauthorized — missing bearer token')
     tok = creds.credentials
     if hmac.compare_digest(tok, A2A_TOKEN):
         return {'token_type': 'primary', 'sender': None}
+    agent = _agent_for_token(tok)
+    if agent:
+        return {'token_type': 'agent', 'sender': agent}
     if _is_live_session_token(tok):
         return {'token_type': 'session', 'sender': _session_token_agents.get(tok, 'unknown')}
     raise HTTPException(status_code=401, detail='Unauthorized — invalid or expired token')
@@ -606,7 +691,7 @@ _bootstrap_attempts_lock = threading.Lock()
 
 @contextmanager
 def _bind_authenticated_caller(auth: dict):
-    if auth.get('token_type') == 'session' and _caller_identity is not None:
+    if auth.get('token_type') in ('session', 'agent') and _caller_identity is not None:
         with _caller_identity.bound(auth.get('sender') or None):
             yield
     else:
@@ -614,13 +699,13 @@ def _bind_authenticated_caller(auth: dict):
 
 
 def _bound_sender(requested_sender: Optional[str], auth: dict) -> str:
-    """Bind bootstrap-issued session tokens to their issuing agent_id."""
-    if auth.get('token_type') == 'session':
+    """Bind session and per-agent tokens to the agent_id they authenticate."""
+    if auth.get('token_type') in ('session', 'agent'):
         sender = auth.get('sender') or 'unknown'
         if requested_sender and requested_sender != sender:
             raise HTTPException(
                 status_code=403,
-                detail='Bootstrap session tokens are bound to their issuing agent_id',
+                detail='Session and per-agent tokens are bound to their issuing agent_id',
             )
         return sender
     return requested_sender or 'unknown'
@@ -1035,7 +1120,8 @@ async def _rerank(query: str, hits: list) -> bool:
 
     Fails open: unset URL, unreachable server, malformed response, or a short /
     oversized result list leave cosine order untouched and return `False`.
-    Return `True` only when the order changed.
+    Return `True` when the cross-encoder order was applied (each hit then carries
+    `rerank_score` and `cosine_score`), even if it matches the cosine order.
     """
     url = os.environ.get('RERANK_HTTP_URL', '').strip()
     if not url or len(hits) < 2:
@@ -1881,7 +1967,8 @@ async def a2a_endpoint(request: Request,
         # the skills run. The primary token authenticates the operator, not an
         # agent, so nothing is bound and the declared sender can only narrow.
         with _bind_authenticated_caller(auth):
-            return await _handle_task_send(rpc_id, params)
+            return await _handle_task_send(rpc_id, params,
+                                           authenticated_agent=_authenticated_agent(auth))
     if method == 'tasks/get':
         params = dict(params)
         params['sender'] = _bound_sender(params.get('sender'), auth)
@@ -1910,7 +1997,8 @@ async def get_task(task_id: str, sender: Optional[str] = None,
     return JSONResponse(task)
 
 
-async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
+async def _handle_task_send(rpc_id: str, params: dict,
+                            authenticated_agent: Optional[str] = None) -> JSONResponse:
     if not isinstance(params, dict):
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
@@ -1982,8 +2070,11 @@ async def _handle_task_send(rpc_id: str, params: dict) -> JSONResponse:
     log.info(f'Task [{task_id}] skill={skill_id} sender={sender}')
 
     if skill_id in DESTRUCTIVE_SKILLS:
-        if sender not in _PRIVILEGED_SENDERS:
-            log.warning(f'Blocked destructive skill {skill_id!r} from unprivileged sender {sender!r}')
+        # Privilege follows the credential: the declared sender must be the agent
+        # the token authenticated (see _authenticated_agent), not merely a name.
+        if sender not in _PRIVILEGED_SENDERS or sender != authenticated_agent:
+            log.warning(f'Blocked destructive skill {skill_id!r} from sender {sender!r} '
+                        f'(authenticated as {authenticated_agent!r})')
             return JSONResponse({
                 'jsonrpc': '2.0', 'id': rpc_id,
                 'error': {'code': -32600, 'message': f'skill {skill_id!r} requires elevated privilege'}

@@ -67,7 +67,13 @@ class TestDestructiveSkillBlocked(unittest.TestCase):
 
 
 class TestDestructiveSkillAllowed(unittest.TestCase):
-    """Privileged senders must be able to call destructive skills (skill dispatched)."""
+    """A privileged sender that the credential AUTHENTICATES runs destructive skills.
+
+    Naming a privileged sender is not enough (that was the live spoof: a
+    primary-token caller could declare any privileged sender). The endpoint
+    passes the credential's agent as ``authenticated_agent``; see
+    test_privilege_binding.py for the HTTP-level spoof-refusal tests.
+    """
 
     PRIVILEGED = "trusted-agent"
 
@@ -77,7 +83,7 @@ class TestDestructiveSkillAllowed(unittest.TestCase):
         ).start()
         self.addCleanup(mock.patch.stopall)
 
-    def _call_with_mock_dispatch(self, skill_id: str, dispatch_result: dict):
+    def _call(self, skill_id: str, dispatch_result: dict, authenticated_agent):
         rpc_id = "test-rpc-2"
         params = {
             "skill_id": skill_id,
@@ -85,21 +91,38 @@ class TestDestructiveSkillAllowed(unittest.TestCase):
             "sender": self.PRIVILEGED,
             "input": {},
         }
-        with mock.patch.object(a2a_server, '_dispatch', return_value=dispatch_result) as m:
-            resp = _run(a2a_server._handle_task_send(rpc_id, params))
-            m.assert_called_once()
-        return resp
+        calls = []
+
+        async def recording_dispatch(sid, task):
+            calls.append((sid, task["sender"]))
+            return dispatch_result
+
+        with mock.patch.object(a2a_server, '_dispatch', recording_dispatch):
+            resp = _run(a2a_server._handle_task_send(
+                rpc_id, params, authenticated_agent=authenticated_agent))
+        return resp, calls
 
     def test_memory_remember_dispatched(self):
         import json
-        resp = self._call_with_mock_dispatch("memory_remember", {"stored": True})
+        resp, calls = self._call("memory_remember", {"stored": True}, self.PRIVILEGED)
         self.assertEqual(resp.status_code, 200)
         body = json.loads(resp.body)
         self.assertEqual(body["result"]["output"], {"stored": True})
+        self.assertEqual(calls, [("memory_remember", self.PRIVILEGED)])
 
     def test_mnemosyne_triple_add_dispatched(self):
-        resp = self._call_with_mock_dispatch("mnemosyne_triple_add", {"ok": True})
+        resp, calls = self._call("mnemosyne_triple_add", {"ok": True}, self.PRIVILEGED)
         self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls, [("mnemosyne_triple_add", self.PRIVILEGED)])
+
+    def test_privileged_sender_authenticated_as_someone_else_is_refused(self):
+        import json
+        for authenticated in ("some-other-agent", None):
+            with self.subTest(authenticated=authenticated):
+                resp, calls = self._call("memory_remember", {"stored": True}, authenticated)
+                self.assertEqual(resp.status_code, 403)
+                self.assertEqual(json.loads(resp.body)["error"]["code"], -32600)
+                self.assertEqual(calls, [])
 
 
 class TestNonDestructiveSkillOpen(unittest.TestCase):
