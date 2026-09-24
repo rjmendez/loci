@@ -4,6 +4,8 @@ from __future__ import annotations
 import re
 from typing import Callable, Optional
 
+from untrusted_memory import _FRAME_TAG_RE, neutralize_frame_tags
+
 TRUNCATION_MARKER = " …[truncated]"
 _WS_RE = re.compile(r"\s+")
 _UNTRUSTED_RE = re.compile(
@@ -48,8 +50,15 @@ def compact_text(
     if max_chars <= 0:
         return ""
     m = _UNTRUSTED_RE.match(body)
+    if m and _FRAME_TAG_RE.search(m.group("body")):
+        # A frame with raw frame tags inside is not one Loci emitted (bodies are
+        # always neutralised): keeping its open tag would keep forged attributes
+        # and let the inner close tag end the frame early.
+        m = None
     if not m:
-        return _clip_plain_text(body, max_chars, preserve_sentence_boundary=preserve_sentence_boundary)
+        return _clip_plain_text(
+            neutralize_frame_tags(body), max_chars, preserve_sentence_boundary=preserve_sentence_boundary
+        )
     open_tag = m.group("open")
     close_tag = m.group("close")
     shell = len(open_tag) + len(close_tag) + 1
