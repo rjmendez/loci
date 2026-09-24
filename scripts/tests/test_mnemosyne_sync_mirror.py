@@ -154,8 +154,9 @@ class MirrorSyncTest(unittest.TestCase):
 
     def test_missing_db_fails_without_touching_qdrant(self):
         fake = FakeQdrant([_point("m1", "kept")])
-        missing = os.path.join(tempfile.gettempdir(), "definitely-missing-mnemosyne.db")
-        self.assertFalse(os.path.exists(missing))
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        missing = os.path.join(tmpdir.name, "mnemosyne.db")
         rc = self._run(missing, fake)
         self.assertEqual(rc, 1)
         self.assertFalse(os.path.exists(missing), "sync must not create an empty DB")
