@@ -62,15 +62,19 @@ def _sample_texts(dataset_path: str, n: int) -> list[str]:
             for line in fh:
                 try:
                     rec = json.loads(line.strip())
-                    # grounding_dataset.jsonl rows are {claim, evidence, label,
-                    # signal, cos} — none of text/content/query exists on any of
-                    # them, so this sampled nothing and the anchor was never built.
-                    t = (rec.get("text") or rec.get("claim") or rec.get("content")
-                         or rec.get("query", ""))
-                    if len(t) > 30:
-                        texts.append(t)
                 except json.JSONDecodeError:
                     continue
+                # A valid line that is not an object (AttributeError) or a
+                # non-string text (TypeError) used to crash the whole sample.
+                if not isinstance(rec, dict):
+                    continue
+                # grounding_dataset.jsonl rows are {claim, evidence, label,
+                # signal, cos} — none of text/content/query exists on any of
+                # them, so this sampled nothing and the anchor was never built.
+                t = (rec.get("text") or rec.get("claim") or rec.get("content")
+                     or rec.get("query", ""))
+                if isinstance(t, str) and len(t) > 30:
+                    texts.append(t)
     except FileNotFoundError:
         return []
     random.seed(42)
@@ -185,8 +189,10 @@ def main() -> None:
 
     result = measure_drift(a.anchor, a.ollama, a.model, a.threshold)
     if "error" in result:
+        # Not 1: that is "drift exceeded", and a caller must be able to tell
+        # "Ollama is down" from "the model drifted" by the exit code alone.
         print(f"[drift] ERROR: {result['error']}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
     print(f"[drift] mean_cosine={result['mean_cosine']:.4f} drift_score={result['drift_score']:.4f} "
           f"n_drifted={result['n_drifted_095']}/{result['n_texts']} exceeded={result['exceeded']}")

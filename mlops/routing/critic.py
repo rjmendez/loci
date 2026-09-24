@@ -99,9 +99,13 @@ class RetrievalCritic:
         with open(_LABELS_PATH) as fh:
             for line in fh:
                 try:
-                    rows.append(json.loads(line.strip()))
+                    row = json.loads(line.strip())
                 except json.JSONDecodeError:
                     continue
+                # A line that parses to null/a number/an array used to count
+                # toward the quota and then AttributeError the whole run.
+                if isinstance(row, dict):
+                    rows.append(row)
         if len(rows) < min_samples:
             return {"trained": False, "reason": f"need {min_samples} samples, have {len(rows)}"}
         try:
@@ -121,8 +125,17 @@ class RetrievalCritic:
 
             clf = LogisticRegression(max_iter=500)
             clf.fit(X, y)
-            with open(_MODEL_PATH, "wb") as fh:
-                pickle.dump(clf, fh)
+            # Temp + replace: opening the model "wb" truncated the good model
+            # before dump ran, so a failed dump left a 0-byte file and the next
+            # process started with no classifier at all.
+            tmp = _MODEL_PATH.with_name(_MODEL_PATH.name + ".tmp")
+            try:
+                with open(tmp, "wb") as fh:
+                    pickle.dump(clf, fh)
+                os.replace(tmp, _MODEL_PATH)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
             self._clf = clf
             return {"trained": True, "n_samples": len(rows)}
         except ImportError:
