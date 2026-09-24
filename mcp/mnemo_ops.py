@@ -142,6 +142,10 @@ def _mnemo_recall(query: str, *, top_k: int = 10, investigation_id: Optional[str
             # untagged (pre-fix) rows, but flags it via provenance_defaulted.
             **provenance_fields(metadata),
         }
+        # _store_index stores the finding id; without it, resolution and
+        # retraction lookups fall back to "open" and exact-text matching.
+        if metadata.get("finding_id"):
+            row["finding_id"] = str(metadata["finding_id"])
         claim_scope = metadata.get("claim_scope")
         if isinstance(claim_scope, dict):
             row["claim_scope"] = dict(claim_scope)

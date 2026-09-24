@@ -238,15 +238,20 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                 )
                 for f in (data.get("recent_findings") or [])[:3]:
                     if isinstance(f, dict):
+                        # A superseded/fixed finding must not read as a current case fact.
+                        res = str(f.get("resolution") or "open").lower()
+                        wrapped = _wrap_untrusted_memory_text(
+                            str(f.get("text", "")),
+                            investigation_id=cid,
+                            finding_id=str(f.get("id") or ""),
+                            kind=str(f.get("record_type") or f.get("type") or "finding"),
+                            source=str(f.get("source") or "investigation_load"),
+                        )
+                        if res != "open":
+                            wrapped = f"[{res}: not current; do not rely on it] " + wrapped
                         add(
-                            f"case:{cid}:finding",
-                            _wrap_untrusted_memory_text(
-                                str(f.get("text", "")),
-                                investigation_id=cid,
-                                finding_id=str(f.get("id") or ""),
-                                kind=str(f.get("record_type") or f.get("type") or "finding"),
-                                source=str(f.get("source") or "investigation_load"),
-                            ),
+                            f"case:{cid}:finding" + ("" if res == "open" else f":{res}"),
+                            wrapped,
                             0.08,
                         )
         except Exception as exc:

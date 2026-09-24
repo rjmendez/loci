@@ -61,7 +61,8 @@ def test_context_assemble_normal_fixture_is_unchanged():
     ) == expected
 
 
-def test_rag_context_search_default_and_normal_are_identical(monkeypatch):
+def test_rag_context_search_default_and_normal_are_identical(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)  # the retraction filter reads it
     monkeypatch.setattr(server, "_get_qdrant", lambda: (object(), "loci_memory"))
     monkeypatch.setattr(server, "_rag_search_collections", lambda *a, **k: [_row("stored auth token finding")])
     monkeypatch.setattr(server, "_rag_cross_encode", lambda *a, **k: None)
@@ -110,6 +111,8 @@ def test_rag_context_search_default_and_normal_are_identical(monkeypatch):
         "mode": "rag_hybrid",
         "collections_searched": ["loci_memory"],
         "collections_failed": [],
+        "excluded_retracted": 0,
+        "retraction_filter": {"status": "ok"},
         "qdrant_available": True,
     }, indent=2)
     assert default_out == normal_out == expected

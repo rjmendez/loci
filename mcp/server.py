@@ -243,6 +243,7 @@ from inv_store import (  # noqa: E402,F401
     _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
     StoreBusyError, _locked_file,
 )
+from recall_filter import build_recall_filter  # noqa: E402
 from provenance_firewall import (  # noqa: E402
     MODEL_ASSERTED,
     TOOL_VERIFIED,
@@ -4194,59 +4195,11 @@ def _search_retraction_scope(
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """Precompute retracted finding ids (and their texts) per investigation in scope.
 
-    Fail-safe: on any error both maps come back empty, which means nothing is
-    filtered rather than everything.
+    Thin view over the shared recall filter. A malformed or unreadable
+    investigation dir is handled per dir, so it never empties the whole map.
     """
-    retracted_by_inv: dict[str, set[str]] = {}
-    retracted_text_by_inv: dict[str, set[str]] = {}
-    try:
-        scope_invs = (
-            [investigation_id] if investigation_id
-            else ([p.name for p in MEMORY_DIR.iterdir() if p.is_dir()] if MEMORY_DIR.exists() else [])
-        )
-        for _inv in scope_invs:
-            rids = _load_retracted_ids(_inv)
-            if not rids:
-                continue
-            retracted_by_inv[_inv] = rids
-            texts: set[str] = set()
-            for f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
-                if str(f.get("id", "")) in rids:
-                    t = str(f.get("text", "") or "").strip()
-                    if t:
-                        texts.add(t)
-            retracted_text_by_inv[_inv] = texts
-    except Exception as exc:  # fail-safe — never block search on filtering
-        logger.debug("retraction scope precompute failed, not filtering: %r", exc)
-        return {}, {}
-    return retracted_by_inv, retracted_text_by_inv
-
-
-def _search_row_is_retracted(
-    row: dict,
-    rids_by_inv: dict[str, set[str]],
-    texts_by_inv: dict[str, set[str]],
-) -> bool:
-    """True when a search row names — or repeats the text of — a retracted finding.
-
-    An empty ``rids_by_inv`` means no filtering is in effect (either nothing is
-    retracted in scope, the precompute failed, or the caller asked for retracted
-    rows to be included).
-    """
-    if not rids_by_inv:
-        return False
-    inv = str(row.get("investigation_id", ""))
-    rids = rids_by_inv.get(inv)
-    rtexts = texts_by_inv.get(inv)
-    if not rids and not rtexts:
-        return False
-    rid = row.get("finding_id") or row.get("id")
-    if rid is not None and str(rid) in (rids or set()):
-        return True
-    text = str(row.get("text", "") or "").strip()
-    if text and rtexts and text in rtexts:
-        return True
-    return False
+    rf = build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+    return rf.retracted, rf.retracted_texts
 
 
 def _search_normalize_filters(min_confidence: str, resolution: Optional[str]) -> tuple[str, Optional[str]]:
@@ -4312,9 +4265,25 @@ def _search_annotate_rows(rows: list[dict]) -> None:
                 r["stale"] = _st
 
 
-def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
-    """Build the JSON payload for an empty investigation_search result set."""
+def _search_empty_response(
+    qdrant: dict,
+    mnemo_enabled: bool,
+    excluded_retracted: int = 0,
+    include_retracted: bool = False,
+    retraction_filter: Optional[dict] = None,
+) -> str:
+    """Build the JSON payload for an empty investigation_search result set.
+
+    An empty result is only ``no_matches`` when every lane answered and
+    nothing matched. Rows filtered as retracted report ``all_retracted`` and a
+    failed Qdrant lane (e.g. ``embedding_unavailable``) reports ``rag_degraded``.
+    """
     qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
+    honesty = {
+        "excluded_retracted": excluded_retracted,
+        "include_retracted": include_retracted,
+        "retraction_filter": retraction_filter or {"status": "ok"},
+    }
     # rag_required only when Qdrant is down; empty results with Qdrant up is a normal no-match.
     if not qdrant_avail or (qdrant.get("reason") == "qdrant_unavailable"):
         return json.dumps({
@@ -4323,18 +4292,31 @@ def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
             "results": [],
             "qdrant_enabled": qdrant_avail,
             "error": "RAG_REQUIRED: Qdrant unavailable. Check QDRANT_URL and QDRANT_API_KEY.",
+            **honesty,
         }, indent=2)
-    return json.dumps({
-        "mode": "no_matches",
-        "reason": str(qdrant.get("reason") or "no_matches"),
+    _reason = str(qdrant.get("reason") or "no_matches")
+    _qdrant_failed = not qdrant.get("ok") and _reason != "not_attempted"
+    if _qdrant_failed:
+        mode = "rag_degraded"
+    elif excluded_retracted:
+        mode = "all_retracted"
+    else:
+        mode = "no_matches"
+    payload = {
+        "mode": mode,
+        "reason": _reason,
         "results": [],
         "qdrant_enabled": qdrant_avail,
+        **honesty,
         "mnemo_status": {
             "enabled": mnemo_enabled,
             "bank": _mnemo_bank() if mnemo_enabled else None,
             "match_count": 0,
         },
-    }, indent=2)
+    }
+    if _qdrant_failed:
+        payload["error"] = f"Qdrant search failed ({_reason}); an empty result is not evidence of no matches."
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -4373,12 +4355,13 @@ def investigation_search(
     """
     min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
 
-    # Fail-safe: an empty retracted map filters nothing.
-    _retracted_by_inv, _retracted_text_by_inv = (
-        _search_retraction_scope(investigation_id) if not include_retracted else ({}, {})
+    # Per-dir fail-safe: a malformed dir is reported, never disables filtering.
+    _rfilter = (
+        build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+        if not include_retracted else None
     )
 
-    _excluded_retracted = {"n": 0}
+    _excluded_retracted: set[str] = set()  # distinct findings, not duplicate rows
 
     _, recall_fn = _get_mnemo_funcs()
     mnemo_enabled = recall_fn is not None
@@ -4411,8 +4394,8 @@ def investigation_search(
     seen: set[str] = set()
 
     def _add_row(row: dict) -> None:
-        if _search_row_is_retracted(row, _retracted_by_inv, _retracted_text_by_inv):
-            _excluded_retracted["n"] += 1
+        if _rfilter is not None and _rfilter.is_retracted(row):
+            _excluded_retracted.add(_rfilter.finding_key(row))
             return
         key = "|".join([
             str(row.get("investigation_id", "")),
@@ -4463,8 +4446,11 @@ def investigation_search(
             source=row.get("source"),
         )
 
+    _rfilter_status = _rfilter.status() if _rfilter is not None else {"status": "ok"}
     if not deduped:
-        return _search_empty_response(qdrant, mnemo_enabled)
+        return _search_empty_response(
+            qdrant, mnemo_enabled, len(_excluded_retracted), include_retracted, _rfilter_status
+        )
 
     mode = "mnemo_primary"
     if qdrant.get("ok"):
@@ -4483,8 +4469,9 @@ def investigation_search(
     return json.dumps({
         "mode": mode,
         "results": deduped[: max(1, min(limit, 200))],
-        "excluded_retracted": _excluded_retracted["n"],
+        "excluded_retracted": len(_excluded_retracted),
         "include_retracted": include_retracted,
+        "retraction_filter": _rfilter_status,
         "resolution_filter": resolution,
         "mnemo_status": {
             "enabled": mnemo_enabled,
@@ -5487,9 +5474,17 @@ def memory_self_check(
     all_verdicts: list = []
     all_candidates: list[dict] = []
     per_investigation: list[dict] = []
+    skipped_investigations: list[dict] = []
 
     for inv_id in targets:
-        computed = _compute_self_check(inv_id, llm_verify=llm_verify)
+        try:
+            computed = _compute_self_check(inv_id, llm_verify=llm_verify)
+        except Exception as exc:
+            if investigation_id is not None:
+                raise
+            # Per-dir: a malformed dir (e.g. a legacy 'undefined') is reported, not fatal.
+            skipped_investigations.append({"investigation_id": inv_id, "reason": str(exc)})
+            continue
         inv_verdicts: list = []
         if "provenance" in requested:
             inv_verdicts.extend(computed["unsupported_observed"])
@@ -5551,8 +5546,9 @@ def memory_self_check(
         result["investigation_id"] = investigation_id
         result["verdicts"] = per_investigation[0]["verdicts"] if per_investigation else []
     else:
-        result["investigation_ids"] = targets
+        result["investigation_ids"] = [e["investigation_id"] for e in per_investigation]
         result["investigations"] = per_investigation
+        result["skipped_investigations"] = skipped_investigations
 
     return json.dumps(result, indent=2)
 
@@ -6150,7 +6146,16 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
     total_active = 0
     total_orphans = 0
     parse_errors: list[str] = []
+    malformed: list[dict] = []
+    skipped: list[dict] = []
+    scanned = 0
     for inv in inv_targets:
+        try:
+            inv_store._validated_investigation_id(inv)
+        except ValueError as exc:
+            # A legacy dir (e.g. "undefined") is still scanned by path, and reported:
+            # its retractions are real and other global tools must tolerate it.
+            malformed.append({"investigation_id": inv, "reason": str(exc)})
         try:
             inv_path = MEMORY_DIR / inv
             findings = _read_jsonl(inv_path / "findings.jsonl")
@@ -6168,27 +6173,31 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
                     parsed = _read_jsonl(path)
                     if len(parsed) != len(raw):
                         parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
-            active = _load_retracted_ids(inv) if ret_path.exists() else set()
+            active = inv_store._fold_retracted_ids(ret_path) if ret_path.exists() else set()
             orphans = sorted(fid for fid in active if fid not in valid_ids)
             total_active += len(active)
             total_orphans += len(orphans)
+            scanned += 1
             if active or orphans:
                 per_inv.append({
                     "investigation_id": inv,
                     "active_retractions": len(active),
                     "orphaned_retractions": orphans,
                 })
-        except ValueError:
-            # A pre-existing directory whose name fails today's id validation
-            # (e.g. a legacy "undefined" dir) — skip it rather than let one
-            # bad entry fail the integrity check for every other investigation.
+        except Exception as exc:
+            # Per-dir: one unreadable dir is reported, never fails the rest.
+            skipped.append({"investigation_id": inv, "reason": repr(exc)})
             continue
     detail = {
-        "investigations_scanned": len(inv_targets),
+        "investigations_scanned": scanned,
         "active_retractions": total_active,
         "orphaned_retractions": total_orphans,
         "per_investigation": per_inv,
     }
+    if malformed:
+        detail["malformed_investigations"] = malformed
+    if skipped:
+        detail["skipped_investigations"] = skipped
     if parse_errors:
         detail["parse_errors"] = parse_errors
         return (
@@ -6203,6 +6212,14 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
             detail,
             "orphaned retraction(s): a retraction references a finding id "
             "not present in findings.jsonl — verify the finding wasn't lost",
+        )
+    if skipped or malformed:
+        return (
+            "warn",
+            detail,
+            "investigation dir(s) with an invalid name or unreadable logs — see "
+            "malformed_investigations / skipped_investigations; tools that scan "
+            "every investigation must tolerate them",
         )
     return ("ok", detail, None)
 
@@ -6647,22 +6664,6 @@ def _retract_write_tombstones(
     return retracted_records, verdicts_forgotten
 
 
-def _retract_stamp_valid_until(investigation_id: str, contaminated_ids: list[str], ts: str) -> None:
-    """Bi-temporal hook: stamp valid_until on retracted findings so that
-    investigation_as_of queries exclude them from any future as-of view.
-    Fails open — never propagates."""
-    try:
-        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
-        _rewrite_jsonl_set_field(
-            findings_path,
-            set(contaminated_ids),
-            "valid_until",
-            ts,
-        )
-    except Exception as exc:  # fail-open
-        logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
-
-
 def _retract_quarantine_verdict(
     seeds: list[dict], seed_anchor: str, reason: str, contaminated_ids: list[str]
 ) -> bool:
@@ -6701,8 +6702,10 @@ def memory_retract(
     contaminated. This tool finds that lineage through shared distinctive
     entities, semantic proximity in Qdrant, and forward ``derived_from`` links,
     then soft-tombstones it so it drops out of recall, search, and reflect.
-    Nothing is hard-deleted: ``findings.jsonl`` stays append-only, and
-    ``memory_restore`` reverses retractions.
+    Nothing is hard-deleted or rewritten: only ``retractions.jsonl`` is
+    appended, ``findings.jsonl`` is left as-is, and ``memory_restore``
+    reverses retractions exactly (``investigation_as_of`` reads the
+    retraction intervals from the log).
 
     Advisory-first: ``dry_run`` defaults to ``True`` and changes nothing. It
     returns the proposed cluster for review; re-run with ``dry_run=False`` to
@@ -6782,8 +6785,8 @@ def memory_retract(
                 retracted_records, verdicts_forgotten = _retract_write_tombstones(
                     retractions_path, contaminated_ids, by_id, reasons, seed_anchor, reason, ts
                 )
-
-                _retract_stamp_valid_until(investigation_id, contaminated_ids, ts)
+                # findings.jsonl is not rewritten: investigation_as_of reads the
+                # retraction intervals from retractions.jsonl, so restore is an exact inverse.
 
                 _append_jsonl(audit_path, {
                     "action": "retract",
@@ -6818,7 +6821,7 @@ def memory_retract(
         "verdicts_forgotten": verdicts_forgotten,
         "applied": True,
         "quarantine_verdict_recorded": quarantine_recorded,
-        "reversible": "findings.jsonl is untouched (append-only); reverse with memory_restore",
+        "reversible": "only retractions.jsonl was appended; findings.jsonl is untouched; reverse with memory_restore",
     }, indent=2)
 
 
@@ -6857,9 +6860,13 @@ def memory_restore(
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
 
     ts = _now()
+    target_fid = str(finding_id or retraction_id or "")
     try:
         with _investigation_lock(investigation_id):
-            with _locked_file(retractions_path, "a+", exclusive=True):
+            # Serialise on the per-investigation .lock like memory_retract does:
+            # holding a flock on retractions.jsonl itself made the _append_jsonl
+            # below wait on this thread's own lock and always return "busy".
+            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
                 try:
                     existing = _read_jsonl(retractions_path)
                 except PermissionError as exc:
@@ -7320,7 +7327,9 @@ def wiring_obligation_resolve(
 
     jsonl_path = inv_dir / "findings.jsonl"
     try:
-        with _locked_file(jsonl_path, "a+", exclusive=True):
+        # Serialise on inv_dir/.lock and let _append_jsonl take the findings.jsonl
+        # flock: holding that flock here made the append wait on this thread's own lock.
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
             try:
                 findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
             except PermissionError as exc:
@@ -7766,6 +7775,19 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
         logger.debug('Final CE re-pass failed: %s', exc)
 
 
+_SUPERSEDED_MARK = "[superseded: a later finding replaced this; do not rely on it] "
+
+
+def _rag_mark_superseded(rows: list[dict], rfilter) -> None:
+    """Tag superseded findings in place so they never read as current context."""
+    for r in rows:
+        if rfilter.is_superseded(r):
+            r["resolution"] = "superseded"
+            key = "text" if r.get("text") else "content"
+            if not str(r.get(key) or "").startswith(_SUPERSEDED_MARK):
+                r[key] = _SUPERSEDED_MARK + str(r.get(key) or "")
+
+
 def _rag_record_access(results: list[dict], query: str) -> None:
     """Append a last_accessed marker for each returned finding to access.jsonl.
 
@@ -7889,6 +7911,15 @@ def rag_context_search(
     # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
     all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
+    # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
+    # before ranking, access tracking and assembly; mark superseded ones.
+    _rfilter = build_recall_filter(
+        MEMORY_DIR,
+        {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
+        with_superseded=True,
+    )
+    all_results, _rag_excluded = _rfilter.split(all_results)
+
     # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
     if decay:
         _rag_apply_decay(all_results)
@@ -7901,6 +7932,7 @@ def rag_context_search(
 
     # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
+    _rag_mark_superseded(all_results, _rfilter)
 
     ctx = context_assemble(
         all_results,
@@ -7919,6 +7951,8 @@ def rag_context_search(
         ctx["mode"] = "rag_hybrid"
     ctx["collections_searched"] = _collections
     ctx["collections_failed"] = sorted(_failed_cols)
+    ctx["excluded_retracted"] = len(_rag_excluded)
+    ctx["retraction_filter"] = _rfilter.status()
     ctx["qdrant_available"] = True
     if expansion_info is not None:
         ctx["query_expansion"] = expansion_info
@@ -8101,6 +8135,15 @@ def memory_surface(
                 "count": 0,
             })
 
+        # Retracted findings keep their Qdrant point: drop them by id here.
+        _rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in candidates if r.get("investigation_id")}
+            | ({investigation_id} if investigation_id else set()),
+            with_superseded=True,
+        )
+        candidates, _surface_excluded = _rfilter.split(candidates)
+
         # Apply lower score threshold (0.25) to allow tangentially relevant findings
         _SURFACE_SCORE_THRESHOLD = 0.25
         filtered = [r for r in candidates if float(r.get("score") or 0.0) >= _SURFACE_SCORE_THRESHOLD]
@@ -8117,6 +8160,10 @@ def memory_surface(
         _ctx_prefix = " ".join(_ctx_words[:8])
 
         surfaced = _surface_rows(top_results, _ctx_prefix, investigation_id)
+        for _row in surfaced:
+            if _rfilter.is_superseded(_row):
+                _row["resolution"] = "superseded"
+                _row["text"] = _SUPERSEDED_MARK + _row["text"]
 
         docs_hits = []
         try:
@@ -8142,6 +8189,8 @@ def memory_surface(
             "surfaced": surfaced,
             "context_used": context[:200] if len(context) > 200 else context,
             "count": len(surfaced),
+            "excluded_retracted": len(_surface_excluded),
+            "retraction_filter": _rfilter.status(),
         }, indent=2)
 
     except Exception as _top_exc:
@@ -8171,7 +8220,11 @@ def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, No
         for d in MEMORY_DIR.iterdir():
             if not d.is_dir():
                 continue
-            manifest = _load_manifest(d.name)
+            try:
+                manifest = _load_manifest(d.name)
+            except Exception as exc:  # per-dir: a malformed dir (e.g. 'undefined') is skipped
+                logger.debug("consolidate: skipping investigation dir %r: %r", d.name, exc)
+                continue
             if manifest is None:
                 continue
             ts = str(manifest.get("updated_at") or "")
@@ -8181,7 +8234,12 @@ def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, No
         if best_id is None:
             return None, None
         findings_path = MEMORY_DIR / best_id / "findings.jsonl"
-        findings = _read_jsonl(findings_path)
+        # Findings only, minus retracted ones: causal edges must not be inferred from them.
+        retracted = build_recall_filter(MEMORY_DIR, [best_id], with_texts=False).all_retracted
+        findings = [
+            f for f in investigation_tools._only_findings(_read_jsonl(findings_path))
+            if str(f.get("id", "")) not in retracted
+        ]
         return best_id, findings[-10:] if len(findings) > 10 else findings
     except Exception:
         return None, None
@@ -9049,7 +9107,16 @@ def causal_edges_list(investigation_id: str) -> str:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found"})
     try:
         edges_path = inv_path / "causal_edges.jsonl"
-        raw = _read_jsonl(edges_path)
+        # An edge touching a retracted finding is dropped (and counted), not served.
+        _retracted = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False).all_retracted
+        raw = [e for e in _read_jsonl(edges_path) if isinstance(e, dict)]
+        _kept = [
+            e for e in raw
+            if str(e.get("source_id") or "") not in _retracted
+            and str(e.get("target_id") or "") not in _retracted
+        ]
+        _excluded_edges = len(raw) - len(_kept)
+        raw = _kept
         edges = [
             {
                 "id": str(e.get("id") or ""),
@@ -9062,7 +9129,7 @@ def causal_edges_list(investigation_id: str) -> str:
             for e in raw
             if isinstance(e, dict)
         ]
-        return json.dumps({"edges": edges, "count": len(edges)})
+        return json.dumps({"edges": edges, "count": len(edges), "excluded_retracted_edges": _excluded_edges})
     except Exception as exc:
         return json.dumps({"error": str(exc), "edges": [], "count": 0})
 

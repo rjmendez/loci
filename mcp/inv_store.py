@@ -403,16 +403,32 @@ def _load_retracted_ids(investigation_id: str) -> set[str]:
     it in order and the last entry per finding id wins. Fail-safe: a missing or
     malformed log yields an empty set, never raises.
     """
-    path = _inv_dir(investigation_id) / "retractions.jsonl"
-    state: dict[str, bool] = {}
+    return _fold_retracted_ids(_inv_dir(investigation_id) / "retractions.jsonl")
+
+
+def _retraction_events(path: Path) -> dict[str, list[tuple[str, bool]]]:
+    """Replay ``retractions.jsonl`` into ``{finding_id: [(ts, active), ...]}`` in log order.
+
+    Path-level so read-only callers can fold a directory whose name fails
+    today's id validation (e.g. a legacy ``undefined`` dir) instead of
+    skipping its retractions. Never raises on a missing or malformed log.
+    """
+    events: dict[str, list[tuple[str, bool]]] = {}
     for entry in _read_jsonl(path):
         if not isinstance(entry, dict):
             continue
         fid = entry.get("finding_id")
         if not fid:
             continue
-        state[str(fid)] = bool(entry.get("active", True))
-    return {fid for fid, active in state.items() if active}
+        events.setdefault(str(fid), []).append(
+            (str(entry.get("ts") or ""), bool(entry.get("active", True)))
+        )
+    return events
+
+
+def _fold_retracted_ids(path: Path) -> set[str]:
+    """Currently-retracted ids for one log path: the last entry per id wins."""
+    return {fid for fid, evs in _retraction_events(path).items() if evs[-1][1]}
 
 
 # Corroboration evidence carried alongside a dense-similarity score. Every lane
