@@ -41,6 +41,27 @@ def test_parallel_deliberation_prefers_high_confidence_conflict_resolution():
     assert result['provenance'][1]['agent_id'] == 'agent-b'
 
 
+def test_confidence_outranks_input_order_and_agent_name():
+    # In the test above the high-confidence agent is also first in the input and
+    # first alphabetically, so a ranking that ignored confidence still picked it.
+    # Here the high-confidence opinion comes from agent-z, listed last.
+    controller = ParallelDeliberationController()
+    result = controller.deliberate(
+        'auth and cache policy',
+        [
+            {'agent_id': 'agent-a', 'subtask': 'Check auth MFA', 'claim': 'Auth requires MFA for privileged access.',
+             'confidence': 'low', 'evidence': 'hunch', 'provenance': {'source': 'cheap-tier'}},
+            {'agent_id': 'agent-m', 'subtask': 'Check auth MFA', 'claim': 'Auth requires MFA for privileged access.',
+             'confidence': 'medium', 'evidence': 'Policy check', 'provenance': {'source': 'cheap-tier'}},
+            {'agent_id': 'agent-z', 'subtask': 'Check auth MFA', 'claim': 'Auth does not require MFA.',
+             'confidence': 'high', 'evidence': 'Config says MFA optional', 'provenance': {'source': 'escalated-tier'}},
+        ],
+    )
+
+    assert result['subtasks'][0]['winner']['agent_id'] == 'agent-z'
+    assert result['subtasks'][0]['winner']['claim'] == 'Auth does not require MFA.'
+
+
 def test_parallel_deliberation_fails_open_on_empty_input():
     controller = ParallelDeliberationController()
     result = controller.deliberate('cache policy', [])

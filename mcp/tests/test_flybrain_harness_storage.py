@@ -85,6 +85,21 @@ def test_rejects_relative_storage_root():
         fhs.resolve_flybrain_storage_root(root_override="relative\\flybrain")
 
 
+@pytest.mark.parametrize("spelling", ["{anchor}", "{anchor}.", "{anchor}tmp/.."])
+def test_rejects_the_filesystem_root_on_every_os(spelling, tmp_path):
+    # "/" (or "C:\\") as the storage root would put harness data at the top of
+    # the filesystem. The guard existed only under os.name == "nt", and its
+    # test was Windows-only, so on POSIX "/" was accepted and nothing noticed.
+    raw = spelling.format(anchor=tmp_path.anchor)
+    with pytest.raises(ValueError, match="root_override cannot be a drive root or the filesystem root"):
+        fhs.resolve_flybrain_storage_root(root_override=raw)
+
+
+def test_a_directory_just_below_the_root_is_still_accepted(tmp_path):
+    # Positive twin: the guard is about the root itself, not about shallow paths.
+    assert fhs.resolve_flybrain_storage_root(root_override=tmp_path) == tmp_path.resolve()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-specific guard")
 def test_rejects_drive_root_on_windows():
     with pytest.raises(ValueError, match="drive root"):

@@ -17,7 +17,7 @@ def _load():
     return mod
 
 
-def test_chaos_gate_passes_with_healthy_metrics(tmp_path):
+def test_chaos_gate_passes_with_healthy_metrics(tmp_path, capsys):
     mod = _load()
     events = [
         {"timed_out": False, "retry_count": 1, "success": True, "duplicate_effect": False, "provenance_complete": True},
@@ -33,6 +33,55 @@ def test_chaos_gate_passes_with_healthy_metrics(tmp_path):
 
     rc = mod.main(["--chaos-events", str(path), "--adversarial-report", str(report_path)])
     assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    # Every gate was measured and passed: a gate that could not read its fields
+    # is "skipped", which also exits 0, so the statuses are the claim here.
+    assert out["ok"] is True
+    assert out["summary"]["passed"] == 5
+    assert out["summary"]["skipped"] == 0
+    assert out["summary"]["failed"] == 0
+    observed = {g["name"]: g["observed"] for g in out["gates"]}
+    assert observed["timeouts"] == {"timeouts": 0, "measured": 2, "timeout_rate": 0.0}
+    assert observed["retries"] == {"retried_records": 2, "recovered_after_retry": 2, "recovery_rate": 1.0}
+    assert observed["duplicate_effects"] == {"duplicate_effects": 0, "measured": 3, "duplicate_effect_rate": 0.0}
+    assert observed["provenance_completeness"] == {"complete": 3, "measured": 3, "completeness_rate": 1.0}
+    assert observed["adversarial_candidate_bypass"] == {"candidate_bypass_count": 0}
+
+
+def _gate_for_report(mod, tmp_path, capsys, report, *extra):
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    rc = mod.main(["--adversarial-report", str(report_path), *extra])
+    out = json.loads(capsys.readouterr().out)
+    (gate,) = out["gates"]
+    return rc, gate
+
+
+def test_report_without_any_bypass_count_is_not_a_pass(tmp_path, capsys):
+    # A summary with no candidate_bypass_count, no classification_counts and no
+    # findings list says nothing about bypasses. It used to be read as 0 -> pass.
+    mod = _load()
+    rc, gate = _gate_for_report(mod, tmp_path, capsys, {"summary": {"total_probes": 12}})
+    assert gate["status"] == "skipped"
+    assert gate["observed"] == {}
+    assert rc == 0
+
+    rc, gate = _gate_for_report(mod, tmp_path, capsys, {"summary": {"total_probes": 12}}, "--fail-on-skipped")
+    assert gate["status"] == "skipped"
+    assert rc == 1
+
+
+def test_report_counted_from_findings_list(tmp_path, capsys):
+    mod = _load()
+    report = {"summary": {}, "findings": [
+        {"classification": "candidate_bypass"}, {"classification": "blocked"}, {"classification": " Candidate_Bypass "},
+    ]}
+    rc, gate = _gate_for_report(mod, tmp_path, capsys, report, "--max-candidate-bypass", "2")
+    assert (rc, gate["status"], gate["observed"]) == (0, "pass", {"candidate_bypass_count": 2})
+
+    report = {"summary": {}, "findings": []}
+    rc, gate = _gate_for_report(mod, tmp_path, capsys, report, "--fail-on-skipped")
+    assert (rc, gate["status"], gate["observed"]) == (0, "pass", {"candidate_bypass_count": 0})
 
 
 def test_chaos_gate_fails_when_thresholds_are_breached(tmp_path, capsys):

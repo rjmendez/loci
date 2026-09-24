@@ -14,7 +14,11 @@ any test module, and so before ``server`` is imported -- and does three things:
 1. Points every store at a fresh temp root: HOME, HERMES_HOME, LOCI_CONFIG,
    LOCI_MEMORY_DIR, MNEMOSYNE_DATA_DIR; backend URLs at an unreachable port;
    API keys removed; any inherited variable whose value lies under the real
-   ~/.loci or ~/.hermes removed.
+   ~/.loci or ~/.hermes removed. The process temp dir (tempfile.tempdir and
+   TMPDIR) moves under that root too: server.audit_log writes the global log
+   to MEMORY_DIR.parent / "audit", and the many tests that set MEMORY_DIR to a
+   bare mkdtemp() otherwise wrote /tmp/audit on the shared machine, where it
+   outlived the run and was read back by later runs.
 2. Stops ``dotenv.load_dotenv`` from reading this checkout's own .env files,
    which would otherwise put the live QDRANT_URL/QDRANT_API_KEY back.
    Explicit paths (a test's tmp_path) still load.
@@ -241,6 +245,14 @@ def install() -> dict:
     })
     for key in _UNREACHABLE_URLS:
         os.environ[key] = UNREACHABLE
+
+    # mkdtemp()/TemporaryDirectory() land under the root, so MEMORY_DIR.parent of
+    # a test's temp store (where the global audit log goes) is the root's tmp/,
+    # not the machine-wide /tmp.
+    tmp = root / "tmp"
+    tmp.mkdir()
+    os.environ["TMPDIR"] = str(tmp)
+    tempfile.tempdir = str(tmp)
 
     _guard_dotenv()
     _state.update(root=root, forbidden=forbidden, installed=True)

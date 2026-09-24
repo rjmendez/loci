@@ -968,6 +968,20 @@ def supervise_and_correct(
                     "converged": False,
                     "rounds": round_index,
                 }
+            if verdict_result.get("fail_open"):
+                # A degraded review (unparseable reply, model error) comes back as
+                # neutral all-clean verdicts. Those are a placeholder, not a pass:
+                # report the fail-open instead of converging on them.
+                reason = str((verdicts[0].get("rationale") if verdicts else "") or "supervisor review degraded")
+                return {
+                    "fail_open": True,
+                    "error": reason,
+                    "findings": original_findings,
+                    "verdicts": _neutral_verdicts(original_findings, reason)["verdicts"],
+                    "audit_trail": audit,
+                    "converged": False,
+                    "rounds": round_index,
+                }
             if strict_tripwire and verdict_result.get("tripwire_triggered"):
                 for idx, verdict in enumerate(verdicts):
                     audit[idx]["rounds"].append({

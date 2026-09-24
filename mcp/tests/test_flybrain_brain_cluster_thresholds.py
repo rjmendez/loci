@@ -44,6 +44,41 @@ def test_calibration_is_deterministic_for_same_input():
     assert first == second
     assert first["schema_version"] == "braincluster-threshold-calibration/v1"
     assert first["input_report_count"] == 10
+    assert first["calibration_id"] == "braincluster-thresholds-" + first["input_fingerprint"][:16]
+
+
+def test_calibration_fingerprint_changes_with_params_and_rows():
+    base = fbthr.calibrate_thresholds_from_reports(_reports())
+    other_margin = fbthr.calibrate_thresholds_from_reports(_reports(), safety_margin=0.03)
+    fewer_rows = fbthr.calibrate_thresholds_from_reports(_reports()[:9])
+    assert len({base["input_fingerprint"], other_margin["input_fingerprint"], fewer_rows["input_fingerprint"]}) == 3
+
+
+# Hand-computed for _reports(): each metric is linear in i = 1..10 (v = a + b*i),
+# and _quantile(p=0.2 / 0.8) takes the inclusive 20th / 80th percentile, which
+# for ten evenly spaced points sits at i = 2.8 / 8.2. So with a 0.01 margin:
+#   min_accuracy       = (0.84 + 0.01*2.8)  - 0.01 = 0.858
+#   max_abstain_rate   = (0.02 + 0.005*8.2) + 0.01 = 0.071
+#   max_calib_error    = (0.05 + 0.01*8.2)  + 0.01 = 0.142
+#   min_samples        = round(40 + 2.8)           = 43
+#   min_decision_match = (0.90 + 0.009*2.8) - 0.01 = 0.9152
+#   drift / fail-closed / entropy / concentration / concentration delta at 8.2:
+#     0.02+0.004*8.2+0.01, 0.006*8.2+0.01, 0.01+0.003*8.2+0.01,
+#     0.40+0.03*8.2+0.01, 0.02+0.01*8.2+0.01
+EXPECTED_GATE = {
+    "min_accuracy": 0.858,
+    "max_abstain_rate": 0.071,
+    "max_confidence_calibration_error": 0.142,
+    "min_samples": 43,
+}
+EXPECTED_SHADOW = {
+    "min_decision_match_rate": 0.9152,
+    "max_mean_abs_confidence_drift": 0.0628,
+    "max_fail_closed_rate_delta": 0.0592,
+    "max_mean_abs_routing_entropy_delta": 0.0446,
+    "max_selected_expert_concentration": 0.656,
+    "max_selected_expert_concentration_delta": 0.112,
+}
 
 
 def test_calibration_thresholds_have_expected_shape_and_ranges():
@@ -51,17 +86,25 @@ def test_calibration_thresholds_have_expected_shape_and_ranges():
     gate = result["thresholds"]["gate"]
     shadow = result["thresholds"]["shadow_replay"]
 
-    assert 0.0 <= gate["min_accuracy"] <= 1.0
-    assert 0.0 <= gate["max_abstain_rate"] <= 1.0
-    assert 0.0 <= gate["max_confidence_calibration_error"] <= 1.0
-    assert gate["min_samples"] > 0
+    assert set(gate) >= set(EXPECTED_GATE)
+    assert set(shadow) >= set(EXPECTED_SHADOW)
+    for key, value in EXPECTED_GATE.items():
+        assert gate[key] == pytest.approx(value, abs=1e-9), key
+    for key, value in EXPECTED_SHADOW.items():
+        assert shadow[key] == pytest.approx(value, abs=1e-9), key
 
-    assert 0.0 <= shadow["min_decision_match_rate"] <= 1.0
-    assert shadow["max_mean_abs_confidence_drift"] >= 0.0
-    assert shadow["max_fail_closed_rate_delta"] >= 0.0
-    assert shadow["max_mean_abs_routing_entropy_delta"] >= 0.0
-    assert 0.0 <= shadow["max_selected_expert_concentration"] <= 1.0
-    assert shadow["max_selected_expert_concentration_delta"] >= 0.0
+
+def test_calibration_clamps_rates_into_the_unit_interval():
+    # A margin larger than the headroom must clamp, not produce a rate above 1
+    # or a minimum below 0.
+    result = fbthr.calibrate_thresholds_from_reports(_reports(), lower_quantile=0.2, upper_quantile=0.8, safety_margin=0.95)
+    gate = result["thresholds"]["gate"]
+    shadow = result["thresholds"]["shadow_replay"]
+    assert gate["min_accuracy"] == 0.0
+    assert gate["max_abstain_rate"] == pytest.approx(1.0)
+    assert shadow["min_decision_match_rate"] == 0.0
+    assert shadow["max_selected_expert_concentration"] == pytest.approx(1.0)
+    assert shadow["max_mean_abs_confidence_drift"] == pytest.approx(0.0328 + 0.02 + 0.95)
 
 
 def test_calibration_rejects_malformed_reports():

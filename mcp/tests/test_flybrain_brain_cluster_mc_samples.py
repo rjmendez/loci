@@ -309,7 +309,10 @@ def test_label_concentration_gate(tmp_path):
     ],
 )
 def test_invalid_config_values(tmp_path, bad):
-    with pytest.raises(ValueError):
+    # Every validation message starts with the parameter it rejects, so a
+    # deleted check cannot pass on some later, unrelated ValueError.
+    (key,) = bad
+    with pytest.raises(ValueError, match=rf"^{key} must "):
         _build(tmp_path, **bad)
 
 

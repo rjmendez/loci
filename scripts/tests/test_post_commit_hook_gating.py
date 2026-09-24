@@ -74,6 +74,19 @@ def _commit_py(wt: Path, env: dict[str, str], name: str) -> str:
     return proc.stdout + proc.stderr
 
 
+_SPAWN_LINE = "triggering loci-codebase re-ingest"
+
+
+def _assert_not_spawned(out: str, common_git_dir: Path, marker: Path) -> None:
+    """Deterministic: the hook prints the spawn line and creates the log dir
+    synchronously, before it backgrounds `claude`, and git commit returns only
+    after the hook exits. A 0.5 s poll of the marker instead missed a spawn that
+    happened a little later (switch removed + `sleep 1` passed)."""
+    assert _SPAWN_LINE not in out, out
+    assert not (common_git_dir / "loci-hook-logs").exists()
+    assert not (marker.exists() and marker.read_text().strip())
+
+
 def _called(marker: Path, wait: float) -> bool:
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
@@ -88,7 +101,8 @@ def test_main_in_primary_worktree_ingests_and_logs_under_common_dir(tmp_path):
     env = _env(tmp_path, marker)
     repo = tmp_path / "repo"
     _init(repo, env)
-    _commit_py(repo, env, "a")
+    out = _commit_py(repo, env, "a")
+    assert _SPAWN_LINE in out
     assert _called(marker, 5.0)
     assert (repo / ".git" / "loci-hook-logs" / "loci-post-commit-ingest.log").exists()
 
@@ -100,8 +114,8 @@ def test_feature_branch_skips(tmp_path):
     _init(repo, env)
     _git(repo, env, "checkout", "-q", "-b", "feature/x")
     out = _commit_py(repo, env, "a")
-    assert "skipping ingest" in out
-    assert not _called(marker, 0.5)
+    assert "[post-commit] branch 'feature/x' is not 'main'; skipping ingest." in out
+    _assert_not_spawned(out, repo / ".git", marker)
 
 
 def test_linked_worktree_skips_even_on_ingest_branch(tmp_path):
@@ -117,7 +131,7 @@ def test_linked_worktree_skips_even_on_ingest_branch(tmp_path):
     env = _env(tmp_path, marker, LOCI_HOOK_INGEST_BRANCH="wtbranch")
     out = _commit_py(wt, env, "b")
     assert "linked worktree" in out
-    assert not _called(marker, 0.5)
+    _assert_not_spawned(out, repo / ".git", marker)
 
 
 def test_detached_clone_skips(tmp_path):
@@ -134,7 +148,7 @@ def test_detached_clone_skips(tmp_path):
     env = _env(tmp_path, marker)
     out = _commit_py(clone, env, "b")
     assert "detached" in out
-    assert not _called(marker, 0.5)
+    _assert_not_spawned(out, clone / ".git", marker)
 
 
 def test_disable_switch(tmp_path):
@@ -142,5 +156,6 @@ def test_disable_switch(tmp_path):
     env = _env(tmp_path, marker, LOCI_HOOK_INGEST="0")
     repo = tmp_path / "repo"
     _init(repo, env)
-    _commit_py(repo, env, "a")
-    assert not _called(marker, 0.5)
+    out = _commit_py(repo, env, "a")
+    assert "[post-commit] LOCI_HOOK_INGEST=0; skipping ingest." in out
+    _assert_not_spawned(out, repo / ".git", marker)

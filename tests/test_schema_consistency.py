@@ -9,6 +9,7 @@ Run standalone:  python3 tests/test_schema_consistency.py
 Run via pytest:  pytest tests/test_schema_consistency.py -v
 """
 
+import importlib.util
 import re
 import sqlite3
 import sys
@@ -216,10 +217,6 @@ class TestSchemaConsistency(unittest.TestCase):
         errors = self._check_file("scripts/amem_consolidation.py")
         self.assertEqual(errors, [], "\n".join(["Column name mismatches:"] + errors))
 
-    def test_spreading_activation_column_names(self):
-        errors = self._check_file("scripts/spreading_activation.py")
-        self.assertEqual(errors, [], "\n".join(["Column name mismatches:"] + errors))
-
     def test_glymphatic_sweep_queries_execute(self):
         errors = self._run_queries("scripts/glymphatic_sweep.py")
         self.assertEqual(errors, [], "\n".join(["Query execution errors:"] + errors))
@@ -228,22 +225,158 @@ class TestSchemaConsistency(unittest.TestCase):
         errors = self._run_queries("scripts/amem_consolidation.py")
         self.assertEqual(errors, [], "\n".join(["Query execution errors:"] + errors))
 
-    def test_spreading_activation_queries_execute(self):
-        errors = self._run_queries("scripts/spreading_activation.py")
-        self.assertEqual(errors, [], "\n".join(["Query execution errors:"] + errors))
+    def test_the_extractor_sees_sql_in_every_checked_file(self):
+        # spreading_activation.py builds its SQL in a variable, so the regex
+        # extracted 0 fragments and both of its checks passed vacuously. Every
+        # file the static checks cover must yield SQL; spreading_activation is
+        # covered by running its real queries below instead.
+        for rel_path in ("scripts/glymphatic_sweep.py", "scripts/amem_consolidation.py"):
+            fragments = _extract_sql_fragments((REPO / rel_path).read_text())
+            static = [f for f in fragments if not ("{" in f and "}" in f)]
+            self.assertGreater(len(static), 0, f"no executable SQL extracted from {rel_path}")
 
-    def test_schema_has_expected_tables(self):
-        expected = {"working_memory", "episodic_memory", "graph_edges", "conflicts", "memories"}
-        self.assertTrue(
-            expected.issubset(self.columns.keys()),
-            f"Missing tables: {expected - set(self.columns.keys())}",
-        )
 
-    def test_graph_edges_uses_source_not_source_id(self):
-        self.assertIn("source", self.columns.get("graph_edges", set()))
-        self.assertNotIn("source_id", self.columns.get("graph_edges", set()))
-        self.assertIn("target", self.columns.get("graph_edges", set()))
-        self.assertNotIn("target_id", self.columns.get("graph_edges", set()))
+# ---------------------------------------------------------------------------
+# The embedded SCHEMA_SQL above is this file's own copy. Checking scripts
+# against it is only meaningful while it agrees with what Mnemosyne really
+# creates, so compare it with Mnemosyne's DDL when the package is installed.
+# ---------------------------------------------------------------------------
+
+def _mnemosyne_schema_db(path: Path) -> bool:
+    """Create Mnemosyne's real tables at ``path``; False when not installed."""
+    try:
+        from mnemosyne.core import beam, episodic_graph
+    except Exception:
+        return False
+    beam.init_beam(path)
+    graph = episodic_graph.EpisodicGraph(db_path=path)
+    graph.conn.close()
+    return True
+
+
+def _embedded_schema_db(path: Path) -> bool:
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA_SQL)
+    conn.commit()
+    conn.close()
+    return True
+
+
+_SCHEMA_BUILDERS = {"embedded": _embedded_schema_db, "mnemosyne": _mnemosyne_schema_db}
+
+
+class TestEmbeddedSchemaMatchesMnemosyne(unittest.TestCase):
+
+    def test_embedded_columns_exist_in_the_real_tables(self):
+        with tempfile.TemporaryDirectory() as td:
+            real = Path(td) / "real.db"
+            if not _mnemosyne_schema_db(real):
+                self.skipTest("mnemosyne is not installed (optional extra: mcp[mnemosyne])")
+            conn = sqlite3.connect(real)
+            real_cols = _get_all_columns(conn)
+            conn.close()
+        embedded = TestSchemaConsistency.columns
+        for table in ("working_memory", "episodic_memory", "graph_edges"):
+            self.assertIn(table, real_cols)
+            missing = embedded[table] - real_cols[table]
+            self.assertEqual(missing, set(), f"{table}: embedded schema invents {missing}")
+        self.assertTrue({"source", "target"} <= real_cols["graph_edges"])
+        self.assertFalse({"source_id", "target_id"} & real_cols["graph_edges"])
+
+
+class TestSpreadingActivationQueries(unittest.TestCase):
+    """Run scripts/spreading_activation.py's own queries against a real schema.
+
+    Graph (default knobs: floor 0.4, threshold 0.5, 2 hops, fan effect on):
+      A -> B  1.0 semantic_link      A -> C 0.7 caused_by (w' = 0.5 * 1.3)
+      A -> D  0.9 contradicts (excluded from the standard pass)
+      A -> E  0.3 (below the floor)  B -> F 1.0   C -> F 1.0
+    Hop 1 (A out-degree 2): B = 0.5, C = 0.325.  Hop 2: F = 0.5 + 0.325 = 0.825.
+    """
+
+    EDGES = [
+        ("A", "B", 1.0, "semantic_link"),
+        ("A", "C", 0.7, "caused_by"),
+        ("A", "D", 0.9, "contradicts"),
+        ("A", "E", 0.3, "semantic_link"),
+        ("B", "F", 1.0, "semantic_link"),
+        ("C", "F", 1.0, "semantic_link"),
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "spreading_activation_under_test", REPO / "scripts" / "spreading_activation.py")
+        cls.sa = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.sa)
+
+    def _db(self, schema: str) -> str:
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / "sa.db"
+        if not _SCHEMA_BUILDERS[schema](path):
+            self.skipTest("mnemosyne is not installed (optional extra: mcp[mnemosyne])")
+        conn = sqlite3.connect(path)
+        for src, dst, weight, etype in self.EDGES:
+            conn.execute("INSERT INTO graph_edges (source, target, weight, edge_type) VALUES (?,?,?,?)",
+                         (src, dst, weight, etype))
+        conn.execute("INSERT INTO working_memory (id, content, importance) VALUES (?,?,?)",
+                     ("B", "working row B", 0.6))
+        conn.execute("INSERT INTO episodic_memory (id, content, importance) VALUES (?,?,?)",
+                     ("F", "episodic row F", 0.9))
+        conn.commit()
+        conn.close()
+        return str(path)
+
+    def _knobs(self):
+        from unittest import mock
+        for name, value in (("SA_EDGE_FLOOR", 0.4), ("SA_ACTIVATION_THRESHOLD", 0.5),
+                            ("SA_MAX_HOPS", 2), ("SA_FAN_EFFECT", True)):
+            patcher = mock.patch.object(self.sa, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _for_each_schema(self, check):
+        """Run ``check(db_path)`` on the embedded schema (always) and on
+        Mnemosyne's real DDL (skipped as a subtest when not installed)."""
+        for schema in ("embedded", "mnemosyne"):
+            with self.subTest(schema=schema):
+                check(self._db(schema))
+
+    def test_fetch_edges_applies_the_floor_and_the_type_filter(self):
+        def check(db):
+            conn = sqlite3.connect(db)
+            try:
+                got = sorted(self.sa._fetch_edges(conn, ["A"], 0.4))
+                self.assertEqual(got, [("A", "B", 1.0, "semantic_link"), ("A", "C", 0.7, "caused_by")])
+                only = self.sa._fetch_edges(conn, ["A"], 0.4, edge_types=["contradicts"])
+                self.assertEqual(only, [("A", "D", 0.9, "contradicts")])
+            finally:
+                conn.close()
+        self._for_each_schema(check)
+
+    def test_fetch_content_falls_back_to_episodic_memory(self):
+        def check(db):
+            conn = sqlite3.connect(db)
+            try:
+                got = self.sa._fetch_content(conn, ["B", "F", "missing"])
+            finally:
+                conn.close()
+            self.assertEqual(got, {"B": {"content": "working row B", "importance": 0.6},
+                                   "F": {"content": "episodic row F", "importance": 0.9}})
+        self._for_each_schema(check)
+
+    def test_two_hop_activation_end_to_end(self):
+        self._knobs()
+
+        def check(db):
+            got = self.sa.run_spreading_activation(db, ["A"], {"A": 1.0}, max_results=5)
+            self.assertEqual([r["memory_id"] for r in got], ["F", "B"])
+            self.assertAlmostEqual(got[0]["activation"], 0.825)
+            self.assertAlmostEqual(got[1]["activation"], 0.5)
+            self.assertEqual((got[0]["content"], got[0]["importance"]), ("episodic row F", 0.9))
+            self.assertEqual((got[1]["content"], got[1]["importance"]), ("working row B", 0.6))
+        self._for_each_schema(check)
 
 
 if __name__ == "__main__":

@@ -380,7 +380,10 @@ def test_partial_explicit_paths_rejected(tmp_path):
     ],
 )
 def test_config_validation(tmp_path, overrides):
-    with pytest.raises(ValueError):
+    # Every validation message starts with the parameter it rejects, so a
+    # deleted check cannot pass on some later, unrelated ValueError.
+    (key,) = overrides
+    with pytest.raises(ValueError, match=rf"^{key} must "):
         mv_samples.build_mv_training_samples(CONN, _config(tmp_path, CONN, **overrides))
 
 

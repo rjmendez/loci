@@ -81,11 +81,12 @@ def _validate_root(root: Path, *, env_name: str = ENV_FLYBRAIN_STORAGE_ROOT) -> 
     if not root.is_absolute():
         raise ValueError(f"{env_name} must resolve to an absolute path")
 
-    if os.name == "nt":
-        if str(root).startswith("\\\\"):
-            raise ValueError(f"{env_name} must be a local-drive path, not UNC")
-        if root == Path(root.anchor):
-            raise ValueError(f"{env_name} cannot be a drive root")
+    if os.name == "nt" and str(root).startswith("\\\\"):
+        raise ValueError(f"{env_name} must be a local-drive path, not UNC")
+    # A drive root on Windows and "/" on POSIX alike: harness data never goes at
+    # the top of a filesystem. This was checked on Windows only.
+    if root == Path(root.anchor):
+        raise ValueError(f"{env_name} cannot be a drive root or the filesystem root")
 
     for component in _iter_existing_components(root):
         if component.is_symlink() or _is_windows_reparse_point(component):
