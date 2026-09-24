@@ -6856,9 +6856,13 @@ def memory_restore(
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
 
     ts = _now()
+    target_fid = str(finding_id or retraction_id or "")
     try:
         with _investigation_lock(investigation_id):
-            with _locked_file(retractions_path, "a+", exclusive=True):
+            # Serialise on the per-investigation .lock like memory_retract does:
+            # holding a flock on retractions.jsonl itself made the _append_jsonl
+            # below wait on this thread's own lock and always return "busy".
+            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
                 try:
                     existing = _read_jsonl(retractions_path)
                 except PermissionError as exc:
@@ -7319,7 +7323,9 @@ def wiring_obligation_resolve(
 
     jsonl_path = inv_dir / "findings.jsonl"
     try:
-        with _locked_file(jsonl_path, "a+", exclusive=True):
+        # Serialise on inv_dir/.lock and let _append_jsonl take the findings.jsonl
+        # flock: holding that flock here made the append wait on this thread's own lock.
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
             try:
                 findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
             except PermissionError as exc:
