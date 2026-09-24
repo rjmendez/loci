@@ -45,6 +45,11 @@ def _run(builder, monkeypatch, tmp_path, rows, out):
         return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
 
     monkeypatch.setattr(builder, "embed", fake_embed)
+    # main() calls _resolve_backends(), which reads ~/.loci/backends.toml and the
+    # repo .env through mcp/backends.load_env and writes the result into
+    # os.environ for the rest of the process. The embedder is stubbed, so the
+    # endpoint is irrelevant here, and a test must not read the live config.
+    monkeypatch.setattr(builder, "_resolve_backends", lambda: None)
     monkeypatch.setattr(sys, "argv", [
         "build_grounding_dataset.py",
         "--findings", _findings(tmp_path, rows),
