@@ -666,15 +666,41 @@ def _ungrounded_deps():
 
 
 def test_default_mode_unaffected_by_ungrounded_run():
+    # Default mode adds no caveat or tag for an ungrounded run (that is what
+    # --strict-grounding is for). But in this fixture the provenance firewall
+    # blocks the only idea, so nothing survives verify: a synthesis built on zero
+    # verified findings must not be stored at "high" confidence.
     deps, stores = _ungrounded_deps()
     result = L.run_chain(_config(self_reflect=False, strict_grounding=False), deps=deps)
 
+    assert result["verify"]["survivor_count"] == 0
     synthesis = result["synthesis"]
     assert synthesis["grounding_status"] == "ungrounded"
     assert synthesis["summary"] == "Confident-sounding synthesis."
     assert "ungrounded" not in (synthesis.get("tags") or [])
     synth_store = stores[-1]
-    assert synth_store["confidence"] == "high"
+    assert synth_store["source"].endswith("#synthesize/synth-model:latest")
+    assert synth_store["confidence"] == "low"
+
+
+def test_default_mode_synthesis_with_a_verified_survivor_is_high():
+    # Positive twin of the zero-survivor case: same default mode and fixture, but
+    # the gate keeps evidence, so both ideas (one per ideate model) are confirmed
+    # and survive, and the synthesis keeps "high".
+    deps, stores = _ungrounded_deps()
+    deps["gate"] = _gate
+
+    def _store(**kwargs):
+        stores.append(kwargs)
+        return f'{{"stored": true, "finding_id": "id{len(stores)}"}}'
+
+    deps["store"] = _store
+    result = L.run_chain(_config(self_reflect=False, strict_grounding=False), deps=deps)
+
+    assert result["verify"]["survivor_finding_ids"] == ["id3", "id4"]
+    assert len(stores) == 5
+    assert stores[-1]["source"].endswith("#synthesize/synth-model:latest")
+    assert stores[-1]["confidence"] == "high"
 
 
 def test_strict_grounding_downgrades_ungrounded_synthesis():
