@@ -68,6 +68,17 @@ def test_queue_runtime_smoke_flow_is_deterministic_and_machine_friendly(tmp_path
     updated_second = int(enqueued_item["updated_at"][17:19])
     assert updated_second == created_second + 1
 
+    # flow-1 depends on flow-0, which does not exist yet: the claim must wait for it.
+    gated = _json(server.investigation_queue_claim(
+        investigation_id=inv_id,
+        item_id="flow-1",
+        owner_session="session-smoke",
+        lease_seconds=30,
+    ))
+    assert "unmet dependencies" in gated["error"]
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="flow-0"))
+    _json(server.investigation_queue_complete(investigation_id=inv_id, item_id="flow-0", state="done"))
+
     claimed = _json(server.investigation_queue_claim(
         investigation_id=inv_id,
         item_id="flow-1",
@@ -105,9 +116,9 @@ def test_queue_runtime_smoke_flow_is_deterministic_and_machine_friendly(tmp_path
     assert completed["item"]["notes"] == "flow completed"
 
     done_only = _json(server.investigation_queue_status(investigation_id=inv_id, state="done"))
-    assert done_only["item_count"] == 1
-    assert [item["id"] for item in done_only["queue"]] == ["flow-1"]
-    assert [item["state"] for item in done_only["queue"]] == ["done"]
+    assert done_only["item_count"] == 2
+    assert [item["id"] for item in done_only["queue"]] == ["flow-1", "flow-0"]
+    assert [item["state"] for item in done_only["queue"]] == ["done", "done"]
 
     listed = _json(server.investigation_queue_list(investigation_id=inv_id, state="done"))
     assert listed == done_only
@@ -129,6 +140,8 @@ def test_queue_happy_path_and_lease_lifecycle(tmp_path, monkeypatch):
     ))
     assert "error" not in enq
     assert enq["item"]["state"] == "queued"
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="task-0"))
+    _json(server.investigation_queue_complete(investigation_id=inv_id, item_id="task-0", state="done"))
 
     claim = _json(server.investigation_queue_claim(
         investigation_id=inv_id, item_id="task-1", owner_session="session-a", lease_seconds=30
@@ -137,7 +150,7 @@ def test_queue_happy_path_and_lease_lifecycle(tmp_path, monkeypatch):
     assert claim["item"]["owner_session"] == "session-a"
     assert claim["item"]["lease_expires_at"]
 
-    status = _json(server.investigation_queue_status(investigation_id=inv_id))
+    status = _json(server.investigation_queue_status(investigation_id=inv_id, item_id="task-1"))
     assert status["item_count"] == 1
     assert status["queue"][0]["id"] == "task-1"
 
@@ -225,19 +238,37 @@ def test_queue_invalid_json_and_legacy_manifest_migration(tmp_path, monkeypatch)
     assert queued["item_count"] == 0
 
 
-def test_queue_release_alias_and_status_filter(tmp_path, monkeypatch):
+def test_queue_release_returns_item_to_queue_and_status_filter(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     inv_id = "q-release"
-    server.investigation_start(investigation_id=inv_id, title="Queue release alias")
+    server.investigation_start(investigation_id=inv_id, title="Queue release")
     _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="release-task", scope_kind="investigation", scope_targets=[inv_id]))
     _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="release-task", owner_session="session-z", lease_seconds=20))
 
-    released = _json(server.investigation_queue_release(investigation_id=inv_id, item_id="release-task", owner_session="session-z", notes="blocked by dependency"))
-    assert released["item"]["state"] == "blocked"
+    released = _json(server.investigation_queue_release(investigation_id=inv_id, item_id="release-task", owner_session="session-z", notes="giving this up"))
+    assert released["released"] is True
+    assert released["item"]["state"] == "queued"
+    assert released["item"]["owner_session"] is None
+    assert released["item"]["lease_expires_at"] is None
+    assert released["item"]["notes"] == "giving this up"
 
-    filtered = _json(server.investigation_queue_status(investigation_id=inv_id, state="blocked"))
+    filtered = _json(server.investigation_queue_status(investigation_id=inv_id, state="queued"))
     assert filtered["item_count"] == 1
     assert filtered["queue"][0]["id"] == "release-task"
+    assert filtered["queue"][0]["available"] is True
+
+    reclaimed = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="release-task", owner_session="session-y", lease_seconds=20))
+    assert reclaimed["claimed"] is True
+    assert reclaimed["item"]["owner_session"] == "session-y"
+
+    # Stop-the-line is still available, explicitly, through complete(state="blocked").
+    blocked = _json(server.investigation_queue_complete(investigation_id=inv_id, item_id="release-task", owner_session="session-y", state="blocked"))
+    assert blocked["item"]["state"] == "blocked"
+    filtered = _json(server.investigation_queue_status(investigation_id=inv_id, state="blocked"))
+    assert filtered["item_count"] == 1
+    assert filtered["queue"][0]["available"] is False
+    final_release = _json(server.investigation_queue_release(investigation_id=inv_id, item_id="release-task", owner_session="session-y"))
+    assert "already final" in final_release["error"]
 def test_queue_rejects_invalid_payload_values(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     inv_id = "q-invalid"
@@ -404,4 +435,122 @@ def test_queue_expiry_boundary_requires_current_owner_for_completion_and_release
         notes="blocked by stale owner",
     ))
     assert "error" in released
-    assert "cannot be completed" in released["error"].lower()
+    assert "cannot be released" in released["error"].lower()
+
+
+def _expire_lease(tmp_path, inv_id, item_id):
+    manifest_path = tmp_path / inv_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for item in manifest["coordination"]["items"]:
+        if item["id"] == item_id:
+            item["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    server._manifest_cache.clear()
+
+
+def test_queue_claimed_enqueue_always_has_a_lease(tmp_path, monkeypatch):
+    # Audit repro: enqueue(state='claimed', owner_session=S) stored no lease, and a missing
+    # lease counted as never expiring, so the item was locked by S forever.
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "q-ghost"
+    server.investigation_start(investigation_id=inv_id, title="Queue ghost claim")
+    ghost = _json(server.investigation_queue_enqueue(
+        investigation_id=inv_id, item_id="ghost", state="claimed", owner_session="crashed-session",
+    ))
+    assert ghost["item"]["state"] == "claimed"
+    assert ghost["item"]["lease_expires_at"]
+
+    ownerless = _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="nobody", state="claimed"))
+    assert "requires owner_session" in ownerless["error"]
+
+    _expire_lease(tmp_path, inv_id, "ghost")
+    taken = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="ghost", owner_session="B", lease_seconds=1))
+    assert taken["claimed"] is True
+    assert taken["item"]["owner_session"] == "B"
+
+
+def test_queue_claim_without_lease_is_reclaimable(tmp_path, monkeypatch):
+    # Legacy/imported manifests can carry a claimed item with an owner but no lease.
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "q-no-lease"
+    server.investigation_start(investigation_id=inv_id, title="Queue lease-less claim")
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="stuck"))
+    manifest_path = tmp_path / inv_id / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["coordination"]["items"][0].update(state="claimed", owner_session="gone", lease_expires_at=None)
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    server._manifest_cache.clear()
+
+    status = _json(server.investigation_queue_status(investigation_id=inv_id, item_id="stuck"))
+    assert status["queue"][0]["lease_expired"] is True
+    assert status["queue"][0]["available"] is True
+    taken = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="stuck", owner_session="B", lease_seconds=30))
+    assert taken["claimed"] is True
+
+
+def test_queue_claim_enforces_dependencies(tmp_path, monkeypatch):
+    # Audit repro: a child whose dependencies ['parent', 'does-not-exist'] were unmet was claimed.
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "q-deps"
+    server.investigation_start(investigation_id=inv_id, title="Queue dependencies")
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="parent"))
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="child", dependencies=["parent", "does-not-exist"]))
+
+    blocked = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="child", owner_session="B", lease_seconds=60))
+    assert "unmet dependencies" in blocked["error"]
+    assert "parent" in blocked["error"] and "does-not-exist" in blocked["error"]
+    status = _json(server.investigation_queue_status(investigation_id=inv_id, item_id="child"))
+    assert status["queue"][0]["state"] == "queued"
+    assert status["queue"][0]["available"] is False
+
+    _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="parent", owner_session="A", lease_seconds=60))
+    _json(server.investigation_queue_complete(investigation_id=inv_id, item_id="parent", owner_session="A", state="done"))
+    still_blocked = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="child", owner_session="B", lease_seconds=60))
+    assert still_blocked["error"].endswith("does-not-exist")
+
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="does-not-exist"))
+    _json(server.investigation_queue_complete(investigation_id=inv_id, item_id="does-not-exist", state="cancelled"))
+    # A cancelled dependency is not a satisfied one.
+    assert "error" in _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="child", owner_session="B", lease_seconds=60))
+
+
+def test_queue_release_is_not_terminal(tmp_path, monkeypatch):
+    # Audit repro: release(parent) set 'blocked', and a reclaim by C failed with 'already final'.
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "q-release-reclaim"
+    server.investigation_start(investigation_id=inv_id, title="Queue release reclaim")
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="parent"))
+    _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="parent", owner_session="A", lease_seconds=60))
+    released = _json(server.investigation_queue_release(investigation_id=inv_id, item_id="parent", owner_session="A"))
+    assert released["item"]["state"] == "queued"
+    reclaimed = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="parent", owner_session="C", lease_seconds=60))
+    assert reclaimed["claimed"] is True
+    assert reclaimed["item"]["owner_session"] == "C"
+
+
+def test_queue_status_reports_expired_lease(tmp_path, monkeypatch):
+    # Audit repro: an item whose lease had expired was reported as plainly 'claimed' by D.
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "q-status-expired"
+    server.investigation_start(investigation_id=inv_id, title="Queue status expiry")
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="short"))
+    _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="short", owner_session="D", lease_seconds=60))
+
+    live = _json(server.investigation_queue_status(investigation_id=inv_id, item_id="short"))["queue"][0]
+    assert live["state"] == "claimed"
+    assert live["lease_expired"] is False
+    assert live["available"] is False
+
+    _expire_lease(tmp_path, inv_id, "short")
+    expired = _json(server.investigation_queue_list(investigation_id=inv_id, item_id="short"))["queue"][0]
+    assert expired["state"] == "claimed"
+    assert expired["owner_session"] == "D"
+    assert expired["lease_expired"] is True
+    assert expired["available"] is True
+
+    # Derived fields are a view only; they must not leak into the stored manifest
+    # (status reads the cached manifest, and the next mutation saves it).
+    _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="other"))
+    stored =json.loads((tmp_path / inv_id / "manifest.json").read_text())
+    assert "lease_expired" not in stored["coordination"]["items"][0]
+    assert "available" not in stored["coordination"]["items"][0]
