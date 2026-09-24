@@ -56,6 +56,20 @@ def head_build():
     return build_graph(rev="HEAD")
 
 
+# The revision the corpus census numbers were hand-validated against (#161,
+# the commit that introduced this tool). HEAD's counts move every time code
+# lands, so a gate on HEAD can only be a loose density band; a gate on this
+# FIXED revision is deterministic and still catches what it is for -- a change
+# to the TOOL that makes it resolve less (or count differently). Built from
+# git blobs, so it needs history (CI checks out with fetch-depth: 0).
+VALIDATED_REV = "235720c"
+
+
+@pytest.fixture(scope="session")
+def validated_build():
+    return build_graph(rev=VALIDATED_REV)
+
+
 @pytest.fixture(scope="session")
 def head_sources():
     sources, _ = load_corpus(rev="HEAD")
