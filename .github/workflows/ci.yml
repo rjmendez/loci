@@ -39,6 +39,41 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=60
 
+  test-flybrain-braincluster-gates:
+    name: FlyBrain brain-cluster merge gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: mcp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            mcp/requirements.txt
+            mcp/pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[test]"
+          pip install pytest pytest-timeout
+
+      - name: Run brain-cluster contract tests
+        run: |
+          pytest tests/test_flybrain_brain_cluster.py \
+                 tests/test_flybrain_brain_cluster_training.py \
+                 tests/test_flybrain_brain_cluster_pipeline.py \
+                 tests/test_flybrain_brain_cluster_fw_samples.py \
+                 tests/test_flybrain_brain_cluster_release_prep.py \
+                 tests/test_flybrain_brain_cluster_thresholds.py \
+                 -v --tb=short --timeout=60
+
   test-a2a:
     name: A2A server tests
     runs-on: ubuntu-latest

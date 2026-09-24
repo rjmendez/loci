@@ -73,6 +73,27 @@ Use the following rule when writing FlyBrain-derived findings or summarizing PR 
 - Persist `exclude_dbs`, `group_by_class`, and result warnings when relevant.
 - Cap wording to dataset-local or dataset-version-local scope unless the evidence spans multiple datasets with matching sex/stage/anatomy constraints.
 
+## Initial local dataset/snapshot scope for harness rollout
+
+To align with the local graph-first strategy and current storage guardrails, start with a two-dataset local scope and defer full multi-dataset mirroring.
+
+| dataset/snapshot | version pin strategy | refresh cadence | expected size class | intended query use | local path contract (variable-driven) |
+|---|---|---|---|---|---|
+| Hemibrain local graph (`hb`) | Pin `neuprint_JRC_Hemibrain_1point2point1` and record immutable checksums in a snapshot manifest. Treat as frozen until an explicit version upgrade PR. | Quarterly integrity re-check (checksum + manifest replay), not content refresh. | **M** (tens of GB) | Default local connectivity and structural graph queries; deterministic offline replay for harness tests. | `$LOCI_FLYBRAIN_STORAGE_ROOT\graph\hb\neuprint_JRC_Hemibrain_1point2point1\` |
+| FlyWire metadata snapshot (`fw`) | Pin `flywire783` for rollout and capture per-file checksums + extraction manifest (`version_id`, `generated_at`, `source_uri`). | Monthly metadata refresh check; only promote to a newer snapshot via explicit pin bump (for example `flywire7xx` -> `flywire7yy`). | **S-M** (single-digit to low tens of GB) | Cross-dataset entity normalization, class/annotation lookup, provenance checks; no full local FlyWire adjacency graph in phase 1. | `$LOCI_FLYBRAIN_STORAGE_ROOT\snapshots\fw\flywire783\metadata\` |
+
+### Why this scope is safe for rollout
+
+- Keeps the always-on local graph to one stable frozen dataset (`hb`) for predictable harness behavior.
+- Preserves FlyWire coverage through metadata/provenance lanes without committing to high-churn full-graph storage in phase 1.
+- Fits the current budget policy in `docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md` and `artifacts/flybrain/fbh_storage_budget_guardrails_20260922.md`: target steady-state storage below the soft cap and avoid large expansion until retention automation is proven.
+- Maintains provenance safety by requiring every local snapshot to include: dataset symbol, version-bearing ID, source access path, checksum manifest, and refresh decision log.
+
+### Phase-1 exclusion (explicit)
+
+- Do **not** mirror full FlyWire adjacency/chunkedgraph data locally in the initial rollout scope.
+- Do **not** add additional large datasets (`mc`, `mv`, `BANC`) until storage telemetry confirms stable headroom under the soft cap for at least one full refresh cycle.
+
 ## Validation summary
 
 This matrix is validated against the current repo evidence:
