@@ -2107,6 +2107,13 @@ def _hallucination_candidates(
 
 mcp = FastMCP("loci")
 
+# Sync tools run on a worker thread, not inline on the event loop: one slow
+# backend call (Ollama, Qdrant) used to freeze /health and every client's
+# handshake. Must precede the first @mcp.tool() below.
+import tool_offload  # noqa: E402
+
+tool_offload.install(mcp)
+
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(request):  # noqa: ARG001

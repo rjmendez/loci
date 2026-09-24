@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -52,13 +53,33 @@ def _resolve_ollama() -> str:
 # A cold model load is ~70s even with keep_alive, so 120s covers a cold load plus generation.
 _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
 
+# One generate() call used to be able to spend 120s on the configured model, 120s
+# more on a discovered one, 45s on the supervisor route, then vLLM and cloud: 5+
+# minutes against a GPU-starved Ollama. This caps the whole call. A later tier is
+# attempted only when at least _MIN_ATTEMPT_S of budget is left.
+_DEFAULT_DEADLINE_S = 150.0
+_MIN_ATTEMPT_S = 5.0
+
+
+def _deadline_s() -> float:
+    """Total budget for one generate() call, read at call time (LOCI_LLM_DEADLINE_S)."""
+    raw = os.environ.get("LOCI_LLM_DEADLINE_S", "").strip()
+    if not raw:
+        return _DEFAULT_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        _LOG.warning("LOCI_LLM_DEADLINE_S=%r is not a number; using %.0fs", raw, _DEFAULT_DEADLINE_S)
+        return _DEFAULT_DEADLINE_S
+    return value if value > 0 else _DEFAULT_DEADLINE_S
+
 
 def _looks_embedding_model(model: str) -> bool:
     tag = (model or "").strip().lower()
     return bool(tag) and ("embed" in tag or "embedding" in tag)
 
 
-def _discover_generation_model(base: str, exclude: str = "") -> str:
+def _discover_generation_model(base: str, exclude: str = "", timeout: Optional[float] = None) -> str:
     """Best-effort local model discovery for deployment-specific installs.
 
     If the configured generation model is invalid for this machine (for example
@@ -67,7 +88,7 @@ def _discover_generation_model(base: str, exclude: str = "") -> str:
     """
     try:
         import requests
-        r = requests.get(f"{base}/api/tags", timeout=_TIMEOUT)
+        r = requests.get(f"{base}/api/tags", timeout=_TIMEOUT if timeout is None else timeout)
         r.raise_for_status()
         payload = r.json() if hasattr(r, "json") else {}
         models = payload.get("models") if isinstance(payload, dict) else []
@@ -294,9 +315,14 @@ def generate(prompt: str,
         role: generation role used for route selection and tmux offload policy.
         timeout: per-request HTTP timeout in seconds. Defaults to the module `_TIMEOUT`;
              callers with their own deadline (offload_loop) pass a shorter one.
+             The whole call (every retry and fallback tier) is additionally capped by
+             LOCI_LLM_DEADLINE_S (default 150s); vLLM and cloud tiers are only tried
+             while at least 5s of that budget remains, and their own client timeouts
+             still apply once started.
 
     Returns:
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
+        When the budget runs out the failure also carries deadline_exceeded=True.
     """
     normalized_role = _normalize_role(role)
     tmux_policy = _tmux_offload_policy(normalized_role or _heuristic_route(prompt).get("role"))
@@ -342,8 +368,25 @@ def generate(prompt: str,
     if not base:
         return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
                     "returned nothing)")
+
+    started = time.monotonic()
+    budget = _deadline_s()
+    per_request = _TIMEOUT if timeout is None else float(timeout)
+
+    def remaining() -> float:
+        return budget - (time.monotonic() - started)
+
+    def attempt_timeout() -> float:
+        return max(0.1, min(per_request, remaining()))
+
+    def deadline_fail(last_error: str) -> dict:
+        out = fail(f"LLM deadline {budget:.0f}s exhausted after "
+                   f"{time.monotonic() - started:.1f}s; last error: {last_error}"[:300])
+        out["deadline_exceeded"] = True
+        return out
+
     if _looks_embedding_model(model):
-        discovered = _discover_generation_model(base, exclude=model)
+        discovered = _discover_generation_model(base, exclude=model, timeout=attempt_timeout())
         if discovered:
             _LOG.info("llm_local reroute: embedding-tag model '%s' replaced with '%s'",
                       model, discovered)
@@ -375,7 +418,7 @@ def generate(prompt: str,
         import requests
         _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
                   model, fmt or "", max_tokens)
-        r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT if timeout is None else float(timeout))
+        r = requests.post(f"{base}/api/generate", json=body, timeout=attempt_timeout())
         r.raise_for_status()
         payload = r.json()
         text = (payload.get("response") or "")
@@ -388,13 +431,16 @@ def generate(prompt: str,
                 text = thinking
     except Exception as exc:
         _LOG.warning("llm_local ollama failed model=%s error=%s", model, exc)
-        discovered = _discover_generation_model(base, exclude=model)
-        if discovered:
+        last_error = f"ollama {type(exc).__name__}: {exc}"
+        if remaining() < _MIN_ATTEMPT_S:
+            return deadline_fail(last_error)
+        discovered = _discover_generation_model(base, exclude=model, timeout=attempt_timeout())
+        if discovered and remaining() >= _MIN_ATTEMPT_S:
             retry_body = dict(body)
             retry_body["model"] = discovered
             try:
                 _LOG.info("llm_local retry tier=ollama model=%s", discovered)
-                r = requests.post(f"{base}/api/generate", json=retry_body, timeout=_TIMEOUT if timeout is None else float(timeout))
+                r = requests.post(f"{base}/api/generate", json=retry_body, timeout=attempt_timeout())
                 r.raise_for_status()
                 payload = r.json()
                 text = (payload.get("response") or "")
@@ -403,20 +449,28 @@ def generate(prompt: str,
                     if isinstance(thinking, str) and thinking.strip():
                         text = thinking
                 model = discovered
-            except Exception:
+            except Exception as retry_exc:
+                last_error = f"ollama retry {type(retry_exc).__name__}: {retry_exc}"
                 payload = None
                 text = ""
         else:
             payload = None
             text = ""
         if not text:
-            route = _supervisor_route(prompt, fmt=fmt, max_tokens=max_tokens) if model_was_unspecified else None
+            if remaining() < _MIN_ATTEMPT_S:
+                return deadline_fail(last_error)
+            route = (_supervisor_route(prompt, fmt=fmt, max_tokens=max_tokens, timeout=attempt_timeout())
+                     if model_was_unspecified else None)
+            if remaining() < _MIN_ATTEMPT_S:
+                return deadline_fail(last_error)
             fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
                                  temperature=temperature, endpoint_role=(route or {}).get("role"))
             if fallback is not None:
                 _LOG.info("llm_local fallback tier=%s model=%s",
                           fallback.get("tier", "unknown"), fallback.get("model", ""))
                 return fallback
+            if remaining() < _MIN_ATTEMPT_S:
+                return deadline_fail(last_error)
             cloud = _try_cloud_tier(prompt, fmt=fmt, max_tokens=max_tokens,
                                     temperature=temperature, route=route, model=model)
             if cloud is not None:
@@ -482,7 +536,8 @@ def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
     return {"text": first.get("text", ""), "ok": True, "model": served, "tier": "vllm"}
 
 
-def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int) -> Optional[dict]:
+def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
+                      timeout: Optional[float] = None) -> Optional[dict]:
     """Use a stronger local supervisor to route unspecified calls across cloud tier options."""
     try:
         import backends
@@ -513,7 +568,9 @@ def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int) -> Op
     }
     try:
         import requests
-        r = requests.post(f"{base}/api/generate", json=body, timeout=min(_TIMEOUT, 45))
+        cap = min(_TIMEOUT, 45)
+        r = requests.post(f"{base}/api/generate", json=body,
+                          timeout=cap if timeout is None else min(cap, timeout))
         r.raise_for_status()
         text = (r.json() or {}).get("response") or ""
         parsed = json.loads(text)

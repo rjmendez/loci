@@ -277,6 +277,8 @@ Operationally:
 | `AGENTHER_GEN_MODEL` | `llama3.2:latest` | Ollama model for failure relabeling |
 | `EXIF_GEN_MODEL` | `llama3.2:latest` | Ollama model for skill gap analysis |
 | `TOP_K_PER_LEVEL` | `3` | Results per level in MemGAS search; used by memgas_hierarchy.py |
+| `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
+| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route, vLLM and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 
 ---
 
