@@ -178,21 +178,33 @@ def _inv_dir(investigation_id: str) -> Path:
     return candidate
 
 
-_manifest_cache: dict[str, str] = {}  # investigation_id → raw JSON string (write-through)
+# manifest.json path -> raw JSON string (write-through). Keyed by the resolved
+# PATH, not the bare investigation_id: the memory root is injected (register())
+# and can change within one process, and an id-keyed entry from the old root made
+# _load_manifest report a manifest that does not exist under the new one --
+# investigation_start then "resumed" a case with no manifest on disk, and
+# investigation_store returned stored=True while _store_commit (which re-reads
+# the manifest fresh) silently dropped the finding.
+_manifest_cache: dict[str, str] = {}
 _MANIFEST_CACHE_MAXSIZE = 256
+
+
+def _manifest_cache_key(investigation_id: str) -> str:
+    return str(_root() / investigation_id / "manifest.json")
 
 
 def _load_manifest(investigation_id: str) -> dict | None:
     investigation_id = _validated_investigation_id(investigation_id)
-    raw = _manifest_cache.get(investigation_id)
+    key = _manifest_cache_key(investigation_id)
+    raw = _manifest_cache.get(key)
     if raw is None:
-        p = _root() / investigation_id / "manifest.json"
+        p = Path(key)
         if not p.exists():
             return None
         raw = p.read_text()
         if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
             _manifest_cache.pop(next(iter(_manifest_cache)))
-        _manifest_cache[investigation_id] = raw
+        _manifest_cache[key] = raw
     manifest = json.loads(raw)
     # Backward compat: initialize ACL fields if missing (old investigations)
     if "owner" not in manifest:
@@ -244,7 +256,7 @@ def _save_manifest(manifest: dict) -> None:
     _atomic_write_text(p, data)
     if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
         _manifest_cache.pop(next(iter(_manifest_cache)))
-    _manifest_cache[manifest["id"]] = data  # keep cache in sync with what we wrote
+    _manifest_cache[_manifest_cache_key(manifest["id"])] = data  # keep cache in sync with what we wrote
 
 
 def _acquire_file_lock(fd: int, path: Path, *, exclusive: bool, timeout_s: float | None = None) -> None:
