@@ -108,6 +108,7 @@ py-modules = [
     "retrieval_eval",
     "server",
     "text_ops",
+    "tool_offload",
     "verdict_ops",
     "verify",
     "wiring_obligation_scan",
