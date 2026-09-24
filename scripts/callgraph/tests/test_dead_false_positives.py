@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from ..analyze.deadcode import dead_functions, registered_but_dead
 from .conftest import VALIDATED_REV, needs_git_history
-from .helpers import build_fixture_store
+from .helpers import build_fixture_store, mcp_tool_functions, registration_census, source_at
 
 # Measured: 66/1144 = 5.8% at VALIDATED_REV, 186/2294 = 8.1% at HEAD when this
 # band was introduced. A resolution collapse drives this far past 15%.
@@ -43,8 +43,10 @@ def test_no_registered_function_is_ever_reported_dead(head_build):
     1 resource, 1 custom_route = 96 registered functions. None may be dead."""
     store = head_build.store
     registered = {e.dst for e in store.edges_of_kind("REGISTERS")}
-    # Floor from the validated baseline; new tools can grow this.
-    assert len(registered) >= 97, f"registration surface unexpectedly small: {len(registered)}"
+    # Exact against a plain-ast census of the same source (no pipeline code),
+    # not a ">= 97" floor that a registrar silently losing tools still passed.
+    census = registration_census(head_build.sources)
+    assert len(registered) == sum(census.values()), (len(registered), census)
 
     offenders = registered_but_dead(store)
     assert offenders == [], (
@@ -53,7 +55,7 @@ def test_no_registered_function_is_ever_reported_dead(head_build):
     )
 
 
-def test_mcp_tool_and_manifest_surfaces_specifically(head_build):
+def test_mcp_tool_and_manifest_surfaces_specifically(head_build, head_sources):
     """The two shapes named in the brief, asserted by name rather than folded
     into the aggregate above, so a failure says WHICH surface broke."""
     store = head_build.store
@@ -65,20 +67,21 @@ def test_mcp_tool_and_manifest_surfaces_specifically(head_build):
                 if (src := store.get(e.src)) is not None
                 and src.attrs.get("mechanism") == "manifest-tuple"}
 
-    assert len(tools) >= 43, f"@mcp.tool() count unexpectedly small: {len(tools)}"
-    assert len(manifest) >= 33, f"register() manifest count unexpectedly small: {len(manifest)}"
+    expected_tools = mcp_tool_functions(source_at(head_sources, "mcp/server.py").source)
+    assert {t.split("::", 1)[1] for t in tools} == expected_tools
+    assert len(manifest) == registration_census(head_build.sources)["MAN-LOOP"]
     assert tools & dead_ids == set()
     assert manifest & dead_ids == set()
 
 
 @needs_git_history
 def test_dead_row_count_does_not_regress(validated_build):
-    """A ceiling, not a target, measured on the FIXED revision the 66 was
+    """Exact, measured on the FIXED revision the 66 was
     hand-validated against (down from 165 before the five resolution fixes +
     the dunder filter). Pinning the revision makes this deterministic: new
     code landing on HEAD cannot move it, only a change to the tool can. If it
     climbs, a resolution path has broken and the query is filling up with
-    noise again.
+    noise again; if it drops, something now hides genuinely dead code.
 
     It used to run on HEAD with the same ceiling and went red for the wrong
     reason: HEAD grew from 114 to 175 files (FlyBrain adapters, memcheck) and
@@ -86,7 +89,7 @@ def test_dead_row_count_does_not_regress(validated_build):
     reported exactly 66.
     """
     n = len(dead_functions(validated_build.store))
-    assert n <= 66, (
+    assert n == 66, (
         f"`cg dead` reports {n} unreachable functions at {VALIDATED_REV} (was 66 "
         "when validated). A jump means a dispatch shape stopped resolving — find "
         "it before raising this number."
