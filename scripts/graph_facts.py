@@ -27,10 +27,16 @@ def _find_graph() -> str | None:
     # (LOCI_MEMORY_DIR, else ~/.loci/memory-sessions, else the legacy
     # ~/.hermes/memory-sessions). Globbing ~/.hermes only missed LOCI_MEMORY_DIR
     # and every ~/.loci install, and could pick up a graph the server never opens.
+    # The literal stays inline in the .exists() receiver so `cg literals` still
+    # pairs this consumer with the server's `MEMORY_DIR / "graph.ladybug"`.
+    from pathlib import Path
+
     from legacy_env import memory_dir
 
-    path = os.path.join(os.fspath(memory_dir()), "graph.ladybug")
-    return path if os.path.exists(path) else None
+    root = Path(memory_dir())
+    if (root / "graph.ladybug").exists():
+        return str(root / "graph.ladybug")
+    return None
 
 
 def _summarize_impact(sym: str, r: dict) -> str:
