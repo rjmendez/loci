@@ -83,13 +83,56 @@ def test_find_graph_looks_where_the_server_actually_writes(tmp_path, monkeypatch
     agreement between them was broken.
     """
     home = tmp_path / "home"
-    (home / ".hermes" / "memory-sessions" / "graph.ladybug").mkdir(parents=True)
+    legacy = home / ".hermes" / "memory-sessions" / "graph.ladybug"
+    legacy.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LOCI_MEMORY_DIR", raising=False)
+    monkeypatch.delenv("HERMES_MEMORY_DIR", raising=False)
 
     found = GF._find_graph()
 
-    assert found is not None, (
+    assert found == str(legacy), (
         "_find_graph did not locate the server's graph directory — it is globbing "
         "a name the server does not create"
     )
-    assert found.endswith("graph.ladybug")
+
+
+def _server_graph_path():
+    """Where mcp/server.py puts the graph: MEMORY_DIR / "graph.ladybug", with
+    MEMORY_DIR from legacy_env.memory_dir() (the server's own resolver)."""
+    import legacy_env
+    return str(legacy_env.memory_dir() / "graph.ladybug")
+
+
+def test_find_graph_honours_loci_memory_dir_over_a_legacy_graph(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".hermes" / "memory-sessions" / "graph.ladybug").mkdir(parents=True)
+    custom = tmp_path / "custom-memory"
+    (custom / "graph.ladybug").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(custom))
+
+    assert GF._find_graph() == str(custom / "graph.ladybug") == _server_graph_path()
+
+
+def test_find_graph_finds_a_fresh_install_under_dot_loci(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    graph = home / ".loci" / "memory-sessions" / "graph.ladybug"
+    graph.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LOCI_MEMORY_DIR", raising=False)
+    monkeypatch.delenv("HERMES_MEMORY_DIR", raising=False)
+
+    assert GF._find_graph() == str(graph) == _server_graph_path()
+
+
+def test_find_graph_is_none_when_the_server_dir_has_no_graph(tmp_path, monkeypatch):
+    # A graph elsewhere under ~/.hermes is not the one the server opens.
+    home = tmp_path / "home"
+    (home / ".hermes" / "old-profile" / "graph.ladybug").mkdir(parents=True)
+    empty = tmp_path / "empty-memory"
+    empty.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(empty))
+
+    assert GF._find_graph() is None
