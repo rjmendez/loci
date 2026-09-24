@@ -1983,8 +1983,8 @@ class TestConflictTools(unittest.TestCase):
         ))
         self.assertIn("error", result)
 
-    def test_investigation_store_includes_conflict_detected_field(self):
-        """investigation_store response always includes conflict_detected field."""
+    def test_investigation_store_without_qdrant_reports_no_conflict(self):
+        """Degraded branch: no Qdrant means no neighbour search, so no conflict."""
         inv_id = _new_id("store-conflict-field")
         server.investigation_start(investigation_id=inv_id, title="Conflict field test")
         result = _json(server.investigation_store(
@@ -1995,9 +1995,65 @@ class TestConflictTools(unittest.TestCase):
             confidence="medium",
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("conflict_detected", result)
-        # Without Qdrant, conflict detection is skipped → always False in tests
-        self.assertFalse(result["conflict_detected"])
+        self.assertIs(result["conflict_detected"], False)
+        self.assertNotIn("conflict_id", result)
+
+    _GAP = "auth token check enforced on every request"
+    _OBS = "auth token check enforced on every request today"
+
+    def _store(self, inv_id, finding_type, text):
+        return _json(server.investigation_store(
+            investigation_id=inv_id, finding_type=finding_type, text=text,
+            source="test:conflict", confidence="high",
+        ))
+
+    def test_investigation_store_includes_conflict_detected_field(self):
+        """Success branch: an observed finding that fills a near-identical gap is
+        reported as a conflict, and the conflict record is persisted."""
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-gap")
+        server.investigation_start(investigation_id=inv_id, title="Conflict gap")
+        with in_memory_qdrant(), fake_conflict_judge("consistent") as judge:
+            gap = self._store(inv_id, "gap", self._GAP)
+            self.assertIs(gap["conflict_detected"], False)
+            obs = self._store(inv_id, "observed", self._OBS)
+
+        self.assertIs(obs["conflict_detected"], True)
+        self.assertEqual(obs["conflicting_finding_id"], gap["finding_id"])
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+        listed = _json(server.conflict_list(investigation_id=inv_id))
+        self.assertEqual(listed["count"], 1)
+        row = listed["conflicts"][0]
+        self.assertEqual(row["id"], obs["conflict_id"])
+        self.assertEqual((row["finding_id_a"], row["finding_id_b"]),
+                         (obs["finding_id"], gap["finding_id"]))
+        self.assertEqual(row["status"], "open")
+
+    def test_investigation_store_conflict_from_llm_contradiction(self):
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-llm")
+        server.investigation_start(investigation_id=inv_id, title="Conflict llm")
+        with in_memory_qdrant(), fake_conflict_judge("contradict") as judge:
+            first = self._store(inv_id, "observed", self._GAP)
+            second = self._store(inv_id, "observed", self._OBS)
+        self.assertIs(second["conflict_detected"], True)
+        self.assertEqual(second["conflicting_finding_id"], first["finding_id"])
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+
+    def test_investigation_store_consistent_neighbour_is_not_a_conflict(self):
+        """Negative twin (same fixture, same types): the judge ran and said consistent."""
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-none")
+        server.investigation_start(investigation_id=inv_id, title="Conflict none")
+        with in_memory_qdrant(), fake_conflict_judge("consistent") as judge:
+            self._store(inv_id, "observed", self._GAP)
+            second = self._store(inv_id, "observed", self._OBS)
+        self.assertIs(second["conflict_detected"], False)
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+        self.assertEqual(_json(server.conflict_list(investigation_id=inv_id))["count"], 0)
 
 
 if __name__ == "__main__":

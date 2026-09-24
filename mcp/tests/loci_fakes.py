@@ -189,6 +189,31 @@ class FakeVerdictBackend:
         return [v for batch in self.upserts for v in batch]
 
 
+@contextlib.contextmanager
+def fake_conflict_judge(verdict: "str | None | Callable[[dict, dict], dict]" = None):
+    """Replace the LLM contradiction judge behind conflict detection.
+
+    ``verdict`` is a fixed verdict string ("contradict", "consistent", ...), None
+    (judge unavailable), or a callable ``(new, neighbor) -> dict``. The handle's
+    ``calls`` records every ``(new_text, neighbor_text)`` pair judged.
+    """
+    import server
+
+    class _Judge:
+        calls: list = []
+
+        def __call__(self, new_finding, neighbor, *, gen_fn=None):  # noqa: ARG002
+            self.calls.append((str(new_finding.get("text", "")), str(neighbor.get("text", ""))))
+            if callable(verdict):
+                return verdict(new_finding, neighbor)
+            return {"verdict": verdict, "reason": f"scripted:{verdict}", "ok": verdict is not None}
+
+    judge = _Judge()
+    judge.calls = []
+    with mock.patch.object(server, "_judge_conflict_pair", judge):
+        yield judge
+
+
 def fake_lazy_generate(responses: "list[str] | Callable[[str], str]"):
     """Build a ``_lazy_generate`` replacement. ``.prompts`` records every call."""
     queue = None if callable(responses) else list(responses)
