@@ -14,6 +14,7 @@ Run: pytest mcp/tests/test_mcp_integration.py -v
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -133,6 +134,14 @@ class TestInvestigationLifecycle(unittest.TestCase):
             value="The bug is in the token expiry check.",
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
+        self.assertEqual(result["updated"], "hypothesis")
+        # Read back from disk through the public load path: the note must have
+        # been persisted to the hypothesis field and nowhere else.
+        manifest = _json(server.investigation_load(investigation_id=inv_id))["manifest"]
+        self.assertEqual(manifest["hypothesis"], "The bug is in the token expiry check.")
+        self.assertIn("hypothesis_ts", manifest)
+        self.assertNotEqual(manifest.get("next_step"), "The bug is in the token expiry check.")
+        self.assertNotEqual(manifest.get("context"), "The bug is in the token expiry check.")
 
     def test_investigation_note_updates_next_step(self):
         inv_id = _new_id("note-step")
@@ -143,6 +152,11 @@ class TestInvestigationLifecycle(unittest.TestCase):
             value="Check auth.py line 42",
         ))
         self.assertNotIn("error", result)
+        self.assertEqual(result["updated"], "next_step")
+        manifest = _json(server.investigation_load(investigation_id=inv_id))["manifest"]
+        self.assertEqual(manifest["next_step"], "Check auth.py line 42")
+        self.assertIn("next_step_ts", manifest)
+        self.assertNotEqual(manifest.get("hypothesis"), "Check auth.py line 42")
 
     def test_investigation_load_returns_findings(self):
         inv_id = _new_id("load")
@@ -480,20 +494,64 @@ class TestInvestigationLifecycle(unittest.TestCase):
 
 
 class TestMemoryHealth(unittest.TestCase):
-    """memory_health should always return valid JSON."""
+    """memory_health: every probe reported, a degraded substrate reported as
+    degraded, and the store inventory counts exactly what is on disk."""
+
+    _CHECK_NAMES = [
+        "qdrant_reachable", "qdrant_collections", "embeddings_dense",
+        "embeddings_sparse", "mnemo_mirror", "dimension_consistency",
+        "retraction_integrity", "store_counts",
+    ]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
 
     def test_returns_valid_json_without_qdrant(self):
+        inv_id = _new_id("health")
+        server.investigation_start(investigation_id=inv_id, title="Health inventory")
+        for text in ("Service A calls service B over gRPC.",
+                     "Service B caches tokens for 300 seconds."):
+            stored = _json(server.investigation_store(
+                investigation_id=inv_id, finding_type="observed",
+                text=text, source="test:health", confidence="high",
+            ))
+            self.assertTrue(stored.get("stored"), stored)
+
         result = _json(server.memory_health())
-        # Should have at minimum one of these keys
-        self.assertTrue(
-            any(k in result for k in ("status", "error", "qdrant", "sqlite")),
-            f"Unexpected health response shape: {result}",
+        self.assertNotIn("error", result)
+        self.assertEqual([c["name"] for c in result["checks"]], self._CHECK_NAMES)
+        checks = {c["name"]: c for c in result["checks"]}
+        # Hermetic env: Qdrant is unreachable. That is the degraded branch and
+        # it must be reported as such, never rolled up as ok.
+        self.assertEqual(checks["qdrant_reachable"]["status"], "fail")
+        self.assertIn("remediation", checks["qdrant_reachable"])
+        self.assertEqual(result["status"], "unhealthy")
+        self.assertEqual(result["scope"], "all")
+        # The store inventory is local, so it must be exact.
+        self.assertEqual(checks["store_counts"]["status"], "ok")
+        detail = checks["store_counts"]["detail"]
+        self.assertEqual(detail["investigations"], 1)
+        self.assertEqual(detail["totals"]["findings"], 2)
+        self.assertEqual(checks["retraction_integrity"]["status"], "ok")
+        self.assertEqual(
+            checks["retraction_integrity"]["detail"]["investigations_scanned"], 1
         )
 
     def test_with_missing_investigation_id(self):
-        # Should not raise; any valid JSON response is acceptable
         result = _json(server.memory_health(investigation_id="no-such-investigation"))
-        self.assertIsInstance(result, dict)
+        self.assertEqual(result["scope"], "no-such-investigation")
+        checks = {c["name"]: c for c in result["checks"]}
+        for name in ("retraction_integrity", "store_counts"):
+            self.assertEqual(checks[name]["status"], "warn")
+            self.assertEqual(
+                checks[name]["detail"], "investigation 'no-such-investigation' not found"
+            )
 
 
 class TestMemoryConfidence(unittest.TestCase):
@@ -509,17 +567,54 @@ class TestMemoryConfidence(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_returns_valid_json_for_empty_query(self):
-        # Empty query may return a confidence response or an error dict — both are valid.
         result = _json(server.memory_confidence(query=""))
-        self.assertIsInstance(result, dict)
+        self.assertEqual(result["basis"], "empty_query")
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(result["recommendation"], "verify")
+
+    def test_real_query_without_qdrant_is_reported_unavailable(self):
+        """Degraded branch: no Qdrant must be reported as such, never as a score."""
+        result = _json(server.memory_confidence(query="authentication token expiry"))
+        self.assertEqual(result["basis"], "qdrant_unavailable")
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(result["recommendation"], "verify")
 
     def test_returns_valid_json_for_real_query(self):
-        result = _json(server.memory_confidence(query="authentication token expiry"))
-        self.assertIsInstance(result, dict)
-        # When Qdrant is unavailable the response may be degraded but must be valid JSON
-        self.assertTrue(
-            any(k in result for k in ("confidence", "error", "status", "score")),
-            f"Unexpected confidence response shape: {result}",
+        """Success branch against an in-memory Qdrant: the cues and the top hit
+        must come from the stored findings."""
+        from loci_fakes import in_memory_qdrant
+
+        texts = [
+            "The auth service rejects expired tokens with HTTP 401.",
+            "Token expiry is checked in auth.py.",
+            "The billing cron runs nightly at 02:00.",
+        ]
+        with in_memory_qdrant() as q:
+            inv_id = _new_id("conf")
+            server.investigation_start(investigation_id=inv_id, title="Confidence")
+            ids = []
+            for t in texts:
+                stored = _json(server.investigation_store(
+                    investigation_id=inv_id, finding_type="observed", text=t,
+                    source="test:src", confidence="high",
+                ))
+                ids.append(stored["finding_id"])
+            self.assertEqual(len(q.points()), 3)
+            result = _json(server.memory_confidence(query="auth service expired tokens 401"))
+
+        self.assertNotIn(result["basis"], ("qdrant_unavailable", "embed_failed",
+                                           "search_failed", "no_trace"))
+        self.assertEqual(result["top_hit_preview"], texts[0])
+        refs = result["confidence_aggregation"]["evidence_refs"]
+        self.assertEqual([r["finding_id"] for r in refs], ids)
+        self.assertEqual({r["investigation_id"] for r in refs}, {inv_id})
+        self.assertEqual(result["cues"]["source_diversity"], 1)
+        self.assertEqual(result["cues"]["trust"], 1.0)
+        self.assertEqual(result["cues"]["fluency"], round(refs[0]["score"], 3))
+        self.assertGreater(result["confidence"], 0.0)
+        self.assertEqual(
+            result["confidence"],
+            result["confidence_aggregation"]["adjusted_confidence"],
         )
 
 
@@ -535,16 +630,37 @@ class TestAuditLog(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    def _global_rows(self):
+        audit_dir = server.MEMORY_DIR.parent / "audit"
+        rows = []
+        for p in sorted(audit_dir.glob("*.jsonl")):
+            rows.extend(json.loads(line) for line in p.read_text().splitlines() if line.strip())
+        return rows
+
     def test_returns_valid_json_with_required_args(self):
+        # MEMORY_DIR.parent is shared by every TemporaryDirectory, so give the
+        # global audit dir its own root for this test.
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        tool = _new_id("audit_tool_global")
         result = _json(server.audit_log(
-            tool_name="test_tool",
+            tool_name=tool,
             inputs_json='{"query": "test"}',
             output='{"result": "ok"}',
         ))
-        self.assertIsInstance(result, dict)
-        self.assertNotIn("error", result)
+        self.assertTrue(result["logged"])
+        self.assertEqual(result["tool"], tool)
+        self.assertIsNone(result["investigation_logged"])
+        # Hermetic env: no Qdrant, so nothing was indexed and it must say so.
+        self.assertFalse(result["qdrant_indexed"])
+        rows = [r for r in self._global_rows() if r["tool"] == tool]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["inputs"], '{"query": "test"}')
+        self.assertEqual(rows[0]["output"], '{"result": "ok"}')
+        self.assertEqual(rows[0]["ts"], result["ts"])
+        self.assertIsNone(rows[0]["investigation_id"])
 
     def test_with_investigation_id(self):
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
         inv_id = _new_id("audit")
         server.investigation_start(investigation_id=inv_id, title="Audit test")
         result = _json(server.audit_log(
@@ -553,8 +669,55 @@ class TestAuditLog(unittest.TestCase):
             output='{"status": "ok"}',
             investigation_id=inv_id,
         ))
-        self.assertIsInstance(result, dict)
-        self.assertNotIn("error", result)
+        self.assertTrue(result["logged"])
+        self.assertIs(result["investigation_logged"], True)
+        inv_rows = [
+            json.loads(line)
+            for line in (server._inv_dir(inv_id) / "audit.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(inv_rows), 1)
+        self.assertEqual(inv_rows[0]["tool"], "test_tool")
+        self.assertEqual(inv_rows[0]["inputs"], '{"param": "value"}')
+        self.assertEqual(inv_rows[0]["output"], '{"status": "ok"}')
+        self.assertEqual(inv_rows[0]["investigation_id"], inv_id)
+        # The same entry also lands in the global daily log.
+        self.assertEqual(
+            [r for r in self._global_rows() if r["investigation_id"] == inv_id], inv_rows
+        )
+
+    def test_unknown_investigation_is_not_reported_as_logged(self):
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        result = _json(server.audit_log(
+            tool_name="test_tool", inputs_json="{}", output="x",
+            investigation_id="no-such-investigation",
+        ))
+        self.assertTrue(result["logged"])
+        self.assertIs(result["investigation_logged"], False)
+
+    def test_qdrant_indexed_reflects_the_upsert(self):
+        """qdrant_indexed must be True only when the point was actually written."""
+        from loci_fakes import in_memory_qdrant
+
+        server.MEMORY_DIR = Path(self._tmp.name) / "sessions"
+        with in_memory_qdrant() as q:
+            ok = _json(server.audit_log(
+                tool_name="indexed_tool", inputs_json="{}", output="payload one",
+            ))
+            self.assertIs(ok["qdrant_indexed"], True)
+            audit_pts = [p for p in q.points() if p.payload.get("tool") == "indexed_tool"]
+            self.assertEqual(len(audit_pts), 1)
+            self.assertEqual(audit_pts[0].payload["record_type"], "audit")
+
+            # Embedder down: _qdrant_upsert writes nothing and returns False.
+            with mock.patch("qdrant_ops._embed", lambda *a, **k: None):
+                failed = _json(server.audit_log(
+                    tool_name="unindexed_tool", inputs_json="{}", output="payload two",
+                ))
+            self.assertEqual(
+                [p for p in q.points() if p.payload.get("tool") == "unindexed_tool"], []
+            )
+            self.assertIs(failed["qdrant_indexed"], False)
 
 
 class TestMemorySurface(unittest.TestCase):
@@ -685,27 +848,57 @@ class TestRagContextSearchDecayParam(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_rag_context_search_accepts_decay_param(self):
-        # With no Qdrant the function must return a JSON error dict, not raise.
+    def _rows(self):
+        """Two findings with the SAME similarity; the old one is listed first so
+        only time decay can put the fresh one on top."""
+        import time as _t
+        now = int(_t.time())
+        col = server.QDRANT_COLLECTION_PREFIX
+        return {col: [
+            {"id": "old-finding", "origin": col, "score": 0.9,
+             "text": "Token expiry was 3600 seconds (old).",
+             "created_at_ts": now - 200 * 86400},
+            {"id": "new-finding", "origin": col, "score": 0.9,
+             "text": "Token expiry is 900 seconds (current).",
+             "created_at_ts": now},
+        ]}
+
+    def _search(self, **kw):
+        from loci_fakes import fake_rag_retrieval
+        with fake_rag_retrieval(self._rows()) as rag:
+            out = _json(server.rag_context_search(
+                query="token expiry", expand_query=False, **kw))
+        self.assertEqual(len(rag.calls), 1)
+        self.assertEqual(out["mode"], "rag_hybrid")
+        return out
+
+    def test_rag_context_search_without_qdrant_reports_rag_required(self):
+        """Degraded branch: no Qdrant is reported as rag_required, not as results."""
         for decay_val in (True, False):
-            result = server.rag_context_search(query="authentication token", decay=decay_val)
-            try:
-                parsed = json.loads(result)
-            except json.JSONDecodeError:
-                self.fail(
-                    f"rag_context_search(decay={decay_val!r}) returned non-JSON: {result!r}"
-                )
-            self.assertIsInstance(parsed, dict, f"Expected dict for decay={decay_val!r}")
-            # Either a rag_required error (no Qdrant) or a real response — both are valid.
-            self.assertTrue(
-                any(k in parsed for k in ("mode", "error", "context", "results")),
-                f"Unexpected response shape for decay={decay_val!r}: {parsed}",
-            )
+            parsed = _json(server.rag_context_search(query="authentication token", decay=decay_val))
+            self.assertEqual(parsed["mode"], "rag_required")
+            self.assertIs(parsed["qdrant_available"], False)
+            self.assertEqual(parsed["results"], [])
+
+    def test_rag_context_search_accepts_decay_param(self):
+        on = self._search(decay=True)
+        self.assertEqual([s["id"] for s in on["sources"]], ["new-finding", "old-finding"])
+        scores = {s["id"]: s["score"] for s in on["sources"]}
+        self.assertEqual(scores["new-finding"], 0.9)
+        # 200 days at lambda=0.007: 0.9 * exp(-1.4) ~= 0.2219
+        self.assertAlmostEqual(scores["old-finding"], 0.9 * math.exp(-server._MEMORY_DECAY_LAMBDA * 200), places=3)
+
+        off = self._search(decay=False)
+        self.assertEqual([s["id"] for s in off["sources"]], ["old-finding", "new-finding"])
+        self.assertEqual({s["id"]: s["score"] for s in off["sources"]},
+                         {"old-finding": 0.9, "new-finding": 0.9})
 
     def test_rag_context_search_decay_default_is_true(self):
-        # Calling without decay kwarg must not raise — default decay=True is active.
-        result = server.rag_context_search(query="memory decay ebbinghaus")
-        self.assertIsInstance(json.loads(result), dict)
+        default = self._search()
+        explicit = self._search(decay=True)
+        self.assertEqual(default["sources"], explicit["sources"])
+        self.assertEqual(default["sources"][0]["id"], "new-finding")
+        self.assertLess(default["sources"][1]["score"], 0.9)
 
 
 if __name__ == "__main__":
@@ -1475,18 +1668,48 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
             confidence="high",
         )
 
-        reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+        # No model: the deterministic fallback ladder produces the summaries.
+        patches = self._patched_memcheck_llm(available=False)
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
         self.assertNotIn("error", reflect_result)
-        self.assertIn("summary_l1", reflect_result)
-        self.assertIn("summary_l2", reflect_result)
-        self.assertIsInstance(reflect_result["summary_l1"], list)
-        self.assertIsInstance(reflect_result["summary_l2"], str)
+        self.assertEqual(len(reflect_result["summary_l1"]), 1)
+        self.assertTrue(reflect_result["summary_l1"][0].endswith(
+            "The database connection pool is exhausted under load."))
+        self.assertTrue(reflect_result["summary_l2"].startswith("Investigation with 1 finding."))
 
-        # Verify the summaries were persisted to the manifest
-        load_result = _json(server.investigation_load(investigation_id=inv_id))
-        manifest = load_result["manifest"]
-        self.assertIn("summary_l1", manifest)
-        self.assertIn("summary_l2", manifest)
+        # Persisted: read manifest.json from disk (not the in-process cache,
+        # which reflect mutates in place) and compare with the reflect output.
+        on_disk = json.loads((server.MEMORY_DIR / inv_id / "manifest.json").read_text())
+        self.assertEqual(on_disk["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(on_disk["summary_l2"], reflect_result["summary_l2"])
+
+    def test_investigation_reflect_persists_model_summaries(self):
+        """With a (scripted) model the L1 bullets and L2 text are the model's, and
+        those exact values are what investigation_load(fidelity='summary') serves."""
+        inv_id = _new_id("ref-sum-llm")
+        self._setup_investigation_for_reflect(inv_id)
+        patches = self._patched_memcheck_llm(
+            available=True,
+            responses=[
+                json.dumps(["DB timeout observed on 10.0.0.9.", "Replica routing unverified."]),
+                "DB timeouts are established; replica routing is unverified.",
+                "- finding-3 marks the biggest gap.",
+            ],
+        )
+        with patches[0], patches[1]:
+            reflect_result = _json(server.investigation_reflect(investigation_id=inv_id))
+        self.assertEqual(reflect_result["summary_l1"],
+                         ["DB timeout observed on 10.0.0.9.", "Replica routing unverified."])
+        self.assertEqual(reflect_result["summary_l2"],
+                         "DB timeouts are established; replica routing is unverified.")
+        on_disk = json.loads((server.MEMORY_DIR / inv_id / "manifest.json").read_text())
+        self.assertEqual(on_disk["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(on_disk["summary_l2"], reflect_result["summary_l2"])
+        server._manifest_cache.clear()
+        loaded = _json(server.investigation_load(investigation_id=inv_id, fidelity="summary"))
+        self.assertEqual(loaded["summary_l1"], reflect_result["summary_l1"])
+        self.assertEqual(loaded["summary_l2"], reflect_result["summary_l2"])
 
     def test_investigation_reflect_populates_self_critique_when_model_available(self):
         inv_id = _new_id("ref-critique")
@@ -1790,8 +2013,8 @@ class TestConflictTools(unittest.TestCase):
         ))
         self.assertIn("error", result)
 
-    def test_investigation_store_includes_conflict_detected_field(self):
-        """investigation_store response always includes conflict_detected field."""
+    def test_investigation_store_without_qdrant_reports_no_conflict(self):
+        """Degraded branch: no Qdrant means no neighbour search, so no conflict."""
         inv_id = _new_id("store-conflict-field")
         server.investigation_start(investigation_id=inv_id, title="Conflict field test")
         result = _json(server.investigation_store(
@@ -1802,9 +2025,65 @@ class TestConflictTools(unittest.TestCase):
             confidence="medium",
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("conflict_detected", result)
-        # Without Qdrant, conflict detection is skipped → always False in tests
-        self.assertFalse(result["conflict_detected"])
+        self.assertIs(result["conflict_detected"], False)
+        self.assertNotIn("conflict_id", result)
+
+    _GAP = "auth token check enforced on every request"
+    _OBS = "auth token check enforced on every request today"
+
+    def _store(self, inv_id, finding_type, text):
+        return _json(server.investigation_store(
+            investigation_id=inv_id, finding_type=finding_type, text=text,
+            source="test:conflict", confidence="high",
+        ))
+
+    def test_investigation_store_includes_conflict_detected_field(self):
+        """Success branch: an observed finding that fills a near-identical gap is
+        reported as a conflict, and the conflict record is persisted."""
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-gap")
+        server.investigation_start(investigation_id=inv_id, title="Conflict gap")
+        with in_memory_qdrant(), fake_conflict_judge("consistent") as judge:
+            gap = self._store(inv_id, "gap", self._GAP)
+            self.assertIs(gap["conflict_detected"], False)
+            obs = self._store(inv_id, "observed", self._OBS)
+
+        self.assertIs(obs["conflict_detected"], True)
+        self.assertEqual(obs["conflicting_finding_id"], gap["finding_id"])
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+        listed = _json(server.conflict_list(investigation_id=inv_id))
+        self.assertEqual(listed["count"], 1)
+        row = listed["conflicts"][0]
+        self.assertEqual(row["id"], obs["conflict_id"])
+        self.assertEqual((row["finding_id_a"], row["finding_id_b"]),
+                         (obs["finding_id"], gap["finding_id"]))
+        self.assertEqual(row["status"], "open")
+
+    def test_investigation_store_conflict_from_llm_contradiction(self):
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-llm")
+        server.investigation_start(investigation_id=inv_id, title="Conflict llm")
+        with in_memory_qdrant(), fake_conflict_judge("contradict") as judge:
+            first = self._store(inv_id, "observed", self._GAP)
+            second = self._store(inv_id, "observed", self._OBS)
+        self.assertIs(second["conflict_detected"], True)
+        self.assertEqual(second["conflicting_finding_id"], first["finding_id"])
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+
+    def test_investigation_store_consistent_neighbour_is_not_a_conflict(self):
+        """Negative twin (same fixture, same types): the judge ran and said consistent."""
+        from loci_fakes import fake_conflict_judge, in_memory_qdrant
+
+        inv_id = _new_id("store-conflict-none")
+        server.investigation_start(investigation_id=inv_id, title="Conflict none")
+        with in_memory_qdrant(), fake_conflict_judge("consistent") as judge:
+            self._store(inv_id, "observed", self._GAP)
+            second = self._store(inv_id, "observed", self._OBS)
+        self.assertIs(second["conflict_detected"], False)
+        self.assertEqual(judge.calls, [(self._OBS, self._GAP)])
+        self.assertEqual(_json(server.conflict_list(investigation_id=inv_id))["count"], 0)
 
 
 if __name__ == "__main__":
@@ -2112,14 +2391,47 @@ class TestMemoryRoute(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    _DUP_A = "the auth gateway rejects expired session tokens with http status 401 always"
+    _DUP_B = "the auth gateway rejects expired session tokens with http status 401 always now"
+    _CACHE = "auth gateway token cache holds entries for 300 seconds"
+    _BILLING = "billing cron runs nightly at 02:00 utc"
+
+    def _seed(self):
+        """Two investigations; _DUP_B is a >80% word-overlap near-duplicate of _DUP_A."""
+        ids = {}
+        server.investigation_start(investigation_id="route-auth", title="Auth outage")
+        server.investigation_start(investigation_id="route-bill", title="Billing")
+        for inv, text in (("route-auth", self._DUP_A), ("route-bill", self._DUP_B),
+                          ("route-bill", self._BILLING), ("route-auth", self._CACHE)):
+            stored = _json(server.investigation_store(
+                investigation_id=inv, finding_type="observed", text=text,
+                source="test:route", confidence="high",
+            ))
+            ids[text] = stored["finding_id"]
+        return ids
+
     def test_memory_route_returns_valid_json(self):
-        """memory_route returns parseable JSON whether Qdrant is available or not."""
-        result = server.memory_route(query="authentication failure patterns")
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
-            self.fail(f"memory_route returned non-JSON: {result!r}")
-        self.assertIsInstance(parsed, dict)
+        """Success branch against in-memory Qdrant: cross-investigation hits,
+        ranked by similarity, with titles resolved from the manifests."""
+        from loci_fakes import in_memory_qdrant
+
+        with in_memory_qdrant():
+            ids = self._seed()
+            parsed = _json(server.memory_route(
+                query="auth gateway expired session tokens", top_k=5, deduplicate=False))
+        self.assertNotIn("error", parsed)
+        self.assertEqual(
+            [r["finding_id"] for r in parsed["routed"]],
+            [ids[self._DUP_A], ids[self._DUP_B], ids[self._CACHE], ids[self._BILLING]],
+        )
+        self.assertEqual(
+            [r["investigation_title"] for r in parsed["routed"]],
+            ["Auth outage", "Billing", "Auth outage", "Billing"],
+        )
+        self.assertEqual(parsed["count"], 4)
+        self.assertEqual(parsed["total_before_dedup"], 4)
+        scores = [r["score"] for r in parsed["routed"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
     def test_memory_route_qdrant_unavailable_returns_error_json(self):
         """When Qdrant is unavailable, memory_route returns an error dict with 'routed' key."""
@@ -2162,16 +2474,29 @@ class TestMemoryRoute(unittest.TestCase):
         self.assertEqual(parsed.get("routed"), [])
 
     def test_memory_route_response_shape_on_success_or_unavailable(self):
-        """Response always has 'routed', 'query', 'count' or 'error' keys."""
-        result = server.memory_route(query="cross-investigation routing test", top_k=5)
-        parsed = json.loads(result)
-        self.assertIsInstance(parsed, dict)
-        # Either a successful result or a graceful error — never a bare exception
-        if "error" not in parsed:
-            self.assertIn("routed", parsed)
-            self.assertIn("query", parsed)
-            self.assertIn("count", parsed)
-            self.assertIsInstance(parsed["routed"], list)
+        """Success shape with dedup and top_k: the near-duplicate is dropped,
+        the cap applies, and the trace carries every candidate."""
+        from loci_fakes import in_memory_qdrant
+
+        with in_memory_qdrant():
+            ids = self._seed()
+            parsed = _json(server.memory_route(
+                query="auth gateway expired session tokens", top_k=2, include_trace=True))
+        self.assertNotIn("error", parsed)
+        self.assertEqual(parsed["query"], "auth gateway expired session tokens")
+        self.assertIsNone(parsed["agent_id"])
+        self.assertEqual([r["finding_id"] for r in parsed["routed"]],
+                         [ids[self._DUP_A], ids[self._CACHE]])
+        self.assertEqual(parsed["count"], 2)
+        self.assertEqual(parsed["total_before_dedup"], 4)
+        self.assertEqual(parsed["total_after_dedup"], 2)
+        self.assertEqual(parsed["excluded_retracted"], 0)
+        self.assertEqual(parsed["excluded_acl"], 0)
+        trace = parsed["routing_trace"]
+        self.assertEqual(trace["metrics"]["after_dedup"], 3)
+        self.assertEqual({h["finding_id"] for h in trace["candidate_hits"]}, set(ids.values()))
+        self.assertEqual(trace["policy"]["top_k"], 2)
+        self.assertTrue(trace["policy"]["deduplicate"])
 
 
 if __name__ == "__main__":
@@ -2190,17 +2515,59 @@ class TestMemoryConsolidateCausalInference(unittest.TestCase):
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
 
+    # B restates A's opening (>10 chars) with a causal keyword -> one caused_by edge A->B.
+    _A = "The cache was full and stopped accepting writes"
+    _B = "Writes were rejected because the cache was full and stopped accepting writes"
+    _C = "Service latency spiked"
+
+    class _FakeMnemosyne:
+        """Stands in for mnemosyne's Mnemosyne (a dependency); records sleep calls."""
+        calls: list = []
+
+        def sleep_all_sessions(self, dry_run=False):
+            type(self).calls.append(dry_run)
+            return {"status": "nothing_to_consolidate", "items_consolidated": 0}
+
+    def _consolidate(self, dry_run):
+        self._FakeMnemosyne.calls = []
+        with mock.patch.object(server, "_load_mnemosyne_class", lambda: self._FakeMnemosyne), \
+             mock.patch("memcheck.llm.llm_available", lambda: False):
+            return _json(server.memory_consolidate(dry_run=dry_run))
+
+    def _seed_causal_investigation(self):
+        inv_id = _new_id("consolidate")
+        server.investigation_start(investigation_id=inv_id, title="Consolidate causal")
+        ids = []
+        for text in (self._A, self._B, self._C):
+            stored = _json(server.investigation_store(
+                investigation_id=inv_id, finding_type="observed", text=text,
+                source="test:causal", confidence="high",
+            ))
+            ids.append(stored["finding_id"])
+        return inv_id, ids
+
     def test_memory_consolidate_returns_valid_json(self):
-        """memory_consolidate must always return valid JSON with causal_edges_inferred >= 0."""
-        result = server.memory_consolidate(dry_run=True)
-        try:
-            parsed = json.loads(result)
-        except json.JSONDecodeError:
-            self.fail(f"memory_consolidate returned non-JSON: {result!r}")
-        self.assertIsInstance(parsed, dict)
-        # causal_edges_inferred must be present and non-negative
-        self.assertIn("causal_edges_inferred", parsed)
-        self.assertGreaterEqual(parsed["causal_edges_inferred"], 0)
+        """A real consolidation runs causal inference on the most recent
+        investigation and reports the exact number of edges it wrote."""
+        inv_id, (id_a, id_b, _id_c) = self._seed_causal_investigation()
+        parsed = self._consolidate(dry_run=False)
+        self.assertEqual(parsed["status"], "ok")
+        self.assertEqual(self._FakeMnemosyne.calls, [False])
+        self.assertEqual(parsed["causal_edges_inferred"], 1)
+        replay = parsed["sleep_like_consolidation"]["phases"][1]
+        self.assertEqual(replay["status"], "ok")
+        self.assertEqual(replay["details"]["investigation_id"], inv_id)
+        self.assertEqual(replay["details"]["causal_edges_inferred"], 1)
+        edges = _json(server.causal_edges_list(investigation_id=inv_id))["edges"]
+        self.assertEqual([(e["source_id"], e["target_id"]) for e in edges], [(id_a, id_b)])
+
+    def test_memory_consolidate_dry_run_infers_nothing(self):
+        inv_id, _ids = self._seed_causal_investigation()
+        parsed = self._consolidate(dry_run=True)
+        self.assertEqual(parsed["status"], "ok")
+        self.assertEqual(self._FakeMnemosyne.calls, [True])
+        self.assertEqual(parsed["causal_edges_inferred"], 0)
+        self.assertEqual(_json(server.causal_edges_list(investigation_id=inv_id))["count"], 0)
 
     def test_causal_edges_list_empty_for_new_investigation(self):
         """causal_edges_list returns empty edges list for an investigation with no edges."""
@@ -2227,32 +2594,45 @@ class TestMemoryConsolidateCausalInference(unittest.TestCase):
         import uuid as _uuid
         inv_id = _new_id("heuristic")
         server.investigation_start(investigation_id=inv_id, title="Heuristic causal test")
-        # Create findings where B references A by keyword + snippet.
+        # B restates A's opening with a causal keyword; C is unrelated.
         id_a = str(_uuid.uuid4())
         id_b = str(_uuid.uuid4())
         id_c = str(_uuid.uuid4())
-        findings_path = Path(self._tmp.name) / inv_id / "findings.jsonl"
-        import json as _json_local
-        with open(findings_path, "a") as f:
-            f.write(_json_local.dumps({"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"}) + "\n")
-            f.write(_json_local.dumps({"id": id_b, "text": "Because the cache was full", "type": "inferred"}) + "\n")
-            f.write(_json_local.dumps({"id": id_c, "text": "Service latency spiked", "type": "observed"}) + "\n")
-        # Run causal inference directly.
-        n = server._run_causal_inference(inv_id, [
-            {"id": id_a, "text": "The cache was full and stopped accepting writes", "type": "observed"},
-            {"id": id_b, "text": "Because the cache was full", "type": "inferred"},
-            {"id": id_c, "text": "Service latency spiked", "type": "observed"},
-        ])
-        # causal_edges_list should now return edges.
+        findings = [
+            {"id": id_a, "text": self._A, "type": "observed"},
+            {"id": id_b, "text": self._B, "type": "inferred"},
+            {"id": id_c, "text": self._C, "type": "observed"},
+        ]
+        # The LLM slow path is a dependency; force the heuristic lane.
+        with mock.patch("memcheck.llm.llm_available", lambda: False):
+            n = server._run_causal_inference(inv_id, findings)
+        self.assertEqual(n, 1)
         result = _json(server.causal_edges_list(investigation_id=inv_id))
-        self.assertEqual(result["count"], n)
-        if n > 0:
-            edge = result["edges"][0]
-            self.assertIn("source_id", edge)
-            self.assertIn("target_id", edge)
-            self.assertIn("edge_type", edge)
-            self.assertIn("confidence", edge)
-            self.assertIn("inferred_at", edge)
+        self.assertEqual(result["count"], 1)
+        edge = result["edges"][0]
+        self.assertEqual(edge["source_id"], id_a)
+        self.assertEqual(edge["target_id"], id_b)
+        self.assertEqual(edge["edge_type"], "caused_by")
+        self.assertEqual(edge["confidence"], 0.5)
+        self.assertTrue(edge["inferred_at"])
+        on_disk = [json.loads(line) for line in
+                   (server.MEMORY_DIR / inv_id / "causal_edges.jsonl").read_text().splitlines()]
+        self.assertEqual([e["method"] for e in on_disk], ["heuristic"])
+
+    def test_heuristic_causal_inference_ignores_unrelated_findings(self):
+        """Negative twin (same shape): no restated snippet, no id reference -> no edge."""
+        import uuid as _uuid
+        inv_id = _new_id("heuristic-neg")
+        server.investigation_start(investigation_id=inv_id, title="Heuristic negative")
+        findings = [
+            {"id": str(_uuid.uuid4()), "text": self._A, "type": "observed"},
+            {"id": str(_uuid.uuid4()), "text": "Because the disk was slow", "type": "inferred"},
+            {"id": str(_uuid.uuid4()), "text": self._C, "type": "observed"},
+        ]
+        with mock.patch("memcheck.llm.llm_available", lambda: False):
+            n = server._run_causal_inference(inv_id, findings)
+        self.assertEqual(n, 0)
+        self.assertEqual(_json(server.causal_edges_list(investigation_id=inv_id))["count"], 0)
 
 
 if __name__ == "__main__":
@@ -2315,14 +2695,22 @@ class TestMemoryHints(unittest.TestCase):
     def test_memory_hints_respects_limit(self):
         inv_id = _new_id("hints-limit")
         n = 5
-        self._create_and_store(inv_id, n_findings=n)
+        ids = self._create_and_store(inv_id, n_findings=n)
 
-        limit = 2
-        result = _json(server.memory_hints(investigation_id=inv_id, limit=limit))
+        result = _json(server.memory_hints(investigation_id=inv_id, limit=2))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertLessEqual(len(result["hints"]), limit,
-                             f"Got {len(result['hints'])} hints; expected ≤ {limit}")
-        self.assertEqual(result["count"], len(result["hints"]))
+        # Exactly the two most recent, newest first.
+        self.assertEqual([h["finding_id"] for h in result["hints"]], [ids[4], ids[3]])
+        self.assertEqual(result["count"], 2)
+
+        # Cold path (JSONL tail) applies the same limit and order.
+        server._session_hints.pop(inv_id, None)
+        cold = _json(server.memory_hints(investigation_id=inv_id, limit=2))
+        self.assertEqual([h["finding_id"] for h in cold["hints"]], [ids[4], ids[3]])
+
+        # A limit above the population returns everything, newest first.
+        everything = _json(server.memory_hints(investigation_id=inv_id, limit=10))
+        self.assertEqual([h["finding_id"] for h in everything["hints"]], ids[::-1])
 
     def test_memory_hints_missing_investigation_returns_error(self):
         result = _json(server.memory_hints(investigation_id="no-such-inv-xyz"))
@@ -2346,33 +2734,37 @@ class TestMemoryHints(unittest.TestCase):
         from datetime import datetime, timezone as tz
         cutoff = datetime.now(tz.utc).isoformat()
         _time.sleep(0.01)
-        server.investigation_store(
+        second = _json(server.investigation_store(
             investigation_id=inv_id,
             finding_type="inferred",
             text="Second finding — should pass the since_ts filter.",
             source="test",
             confidence="high",
-        )
+        ))
         result = _json(server.memory_hints(
             investigation_id=inv_id,
             limit=10,
             since_ts=cutoff,
         ))
         self.assertNotIn("error", result)
-        for hint in result["hints"]:
-            self.assertGreater(hint["ts"], cutoff,
-                               f"Hint ts {hint['ts']!r} should be > cutoff {cutoff!r}")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual([h["finding_id"] for h in result["hints"]], [second["finding_id"]])
+        self.assertGreater(result["hints"][0]["ts"], cutoff)
+        # Positive twin: without since_ts both findings come back.
+        unfiltered = _json(server.memory_hints(investigation_id=inv_id, limit=10))
+        self.assertEqual(unfiltered["count"], 2)
 
     def test_memory_hints_cold_path_from_jsonl(self):
         """Hints should still work when the session ring buffer is empty (JSONL cold path)."""
         inv_id = _new_id("hints-cold")
-        self._create_and_store(inv_id, n_findings=2)
+        ids = self._create_and_store(inv_id, n_findings=2)
         # Clear the ring buffer to force the JSONL cold path.
         server._session_hints.pop(inv_id, None)
         result = _json(server.memory_hints(investigation_id=inv_id, limit=5))
         self.assertNotIn("error", result)
-        self.assertGreater(result["count"], 0,
-                           "Cold-path JSONL read returned no hints for an investigation with stored findings")
+        self.assertEqual([h["finding_id"] for h in result["hints"]], ids[::-1])
+        self.assertEqual(_unwrap(result["hints"][0]["text"]),
+                         "Finding number 1: something interesting happened here.")
 
 
 if __name__ == "__main__":
@@ -2413,11 +2805,19 @@ class TestEntityNodes(unittest.TestCase):
         ])
         result = _json(server.entity_list(investigation_id=inv_id))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entities", result)
-        self.assertIn("count", result)
-        self.assertIsInstance(result["entities"], list)
-        self.assertIsInstance(result["count"], int)
-        self.assertGreaterEqual(result["count"], 0)
+        by_name = {e["name"]: e for e in result["entities"]}
+        self.assertEqual(
+            {n: (e["type"], e["finding_count"]) for n, e in by_name.items()},
+            {
+                "Windows Server": ("system", 1),
+                "Azure AD": ("system", 1),
+                "192.168.1.1": ("location", 1),
+                "John Smith": ("person", 1),
+                "10.0.0.5": ("location", 1),
+            },
+        )
+        self.assertEqual(result["count"], 5)
+        self.assertTrue(all(e["entity_id"] for e in result["entities"]))
 
     def test_entity_list_missing_investigation_returns_error(self):
         result = _json(server.entity_list(investigation_id="does-not-exist-xyz"))
@@ -2430,41 +2830,37 @@ class TestEntityNodes(unittest.TestCase):
         ])
         result = _json(server.entity_list(investigation_id=inv_id, entity_type="system"))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entities", result)
-        # All returned entities should have type == "system"
-        for ent in result["entities"]:
-            self.assertEqual(ent.get("type"), "system")
+        self.assertEqual(sorted(e["name"] for e in result["entities"]),
+                         ["Azure AD", "Windows Server"])
+        self.assertEqual(result["count"], 2)
+        # Positive twin: the other type is there too, and the filter excludes it.
+        loc = _json(server.entity_list(investigation_id=inv_id, entity_type="location"))
+        self.assertEqual([e["name"] for e in loc["entities"]], ["192.168.1.1"])
 
     def test_entity_timeline_returns_valid_json(self):
         inv_id = _new_id("etimeline")
-        self._start_and_store(inv_id, [
+        ids = self._start_and_store(inv_id, [
             'Windows Server was observed sending traffic.',
             'Windows Server escalated privileges.',
         ])
-        # Get entity list first to find an entity_id
         list_result = _json(server.entity_list(investigation_id=inv_id))
-        entities = list_result.get("entities", [])
+        self.assertEqual([e["name"] for e in list_result["entities"]], ["Windows Server"])
+        entity_id = list_result["entities"][0]["entity_id"]
 
-        if not entities:
-            # No entities extracted — still must return valid JSON when called with bad id
-            result = _json(server.entity_timeline(
-                investigation_id=inv_id,
-                entity_id="nonexistent-id",
-            ))
-            self.assertIn("error", result)
-            return
-
-        entity_id = entities[0]["entity_id"]
         result = _json(server.entity_timeline(
             investigation_id=inv_id,
             entity_id=entity_id,
         ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
-        self.assertIn("entity", result)
-        self.assertIn("timeline", result)
-        self.assertIn("count", result)
-        self.assertIsInstance(result["timeline"], list)
-        self.assertIsInstance(result["count"], int)
+        self.assertEqual(result["entity"]["name"], "Windows Server")
+        self.assertEqual(result["count"], 2)
+        # Chronological: first stored first.
+        self.assertEqual([t["finding_id"] for t in result["timeline"]], ids)
+        self.assertEqual(
+            [t["text"] for t in result["timeline"]],
+            ['Windows Server was observed sending traffic.',
+             'Windows Server escalated privileges.'],
+        )
 
     def test_entity_timeline_missing_entity_returns_error(self):
         inv_id = _new_id("etimeline-miss")
@@ -2491,12 +2887,10 @@ class TestEntityNodes(unittest.TestCase):
             'Windows Server crashed.',
         ])
         list_result = _json(server.entity_list(investigation_id=inv_id))
-        entities = list_result.get("entities", [])
-        # Find "Windows Server" entity (if extracted)
-        ws_entities = [e for e in entities if "windows" in e.get("name", "").lower()]
-        if ws_entities:
-            # Should appear in multiple findings
-            self.assertGreaterEqual(ws_entities[0]["finding_count"], 1)
+        entities = list_result["entities"]
+        # One entity, referenced by all three findings (appended, not replaced).
+        self.assertEqual([(e["name"], e["finding_count"]) for e in entities],
+                         [("Windows Server", 3)])
 
 
 class TestContractDeclarationStore(unittest.TestCase):
@@ -2947,17 +3341,36 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertIn("claim_results", result)
         self.assertGreater(len(result["claim_results"]), 0)
 
+    def _setup_tool_verified(self, text):
+        inv_id = _new_id("pac")
+        server.investigation_start(investigation_id=inv_id, title="Pre-answer tool evidence")
+        stored = _json(server.investigation_store(
+            investigation_id=inv_id, finding_type="observed", text=text,
+            source="psql --version", confidence="high",
+            metadata={"evidence_provenance_tier": "tool_verified"},
+        ))
+        return inv_id, stored["finding_id"]
+
     def test_claim_supported_is_bool_or_numeric(self):
-        inv_id = self._setup_investigation("The database uses PostgreSQL 15.")
+        """Pin the verdict: tool-verified evidence supports the matching claim and
+        not an unrelated one (same investigation, positive and negative twin)."""
+        inv_id, fid = self._setup_tool_verified("The database uses PostgreSQL 15.")
         result = _json(server.investigation_pre_answer_check(
             investigation_id=inv_id,
-            claims="The database uses PostgreSQL.",
+            claims=["The database uses PostgreSQL 15.",
+                    "The cache layer is Memcached on port 11211."],
+            record=False,
         ))
-        self.assertIn("claim_results", result)
-        first = result["claim_results"][0]
-        # Each result has 'supported' (bool) and 'contradicted' (bool)
-        self.assertIn("supported", first)
-        self.assertIn(type(first["supported"]), (bool, int))
+        supported, unrelated = result["claim_results"]
+        self.assertIs(supported["supported"], True)
+        self.assertIs(supported["contradicted"], False)
+        self.assertEqual(supported["support_basis"], "lexical")
+        self.assertIn(fid, [r["evidence_id"] for r in supported["support_refs"]])
+        self.assertIs(unrelated["supported"], False)
+        self.assertEqual(unrelated["support_refs"], [])
+        self.assertEqual(result["support_count"], 1)
+        self.assertEqual(result["unsupported_claims"],
+                         ["The cache layer is Memcached on port 11211."])
 
     def test_missing_investigation_returns_error(self):
         result = _json(server.investigation_pre_answer_check(
@@ -2985,13 +3398,51 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertEqual(len(result["claim_results"]), 2)
 
     def test_record_false_skips_persistence(self):
-        inv_id = self._setup_investigation("Fact about the system.")
-        result = _json(server.investigation_pre_answer_check(
-            investigation_id=inv_id,
-            claims="Fact about the system.",
-            record=False,
-        ))
-        self.assertIn("claim_results", result)
+        """A working verdict backend is installed and record=False must not use it."""
+        from loci_fakes import fake_verdict_backend
+
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with fake_verdict_backend() as backend:
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims="The service listens on port 8443.",
+                record=False,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 0, "qdrant": "disabled"})
+        self.assertEqual(backend.recorded, [])
+        first = result["claim_results"][0]
+        self.assertIsNone(first["verdict_type"])
+        self.assertEqual(first["prior_occurrences"], 0)
+
+    def test_record_true_persists_one_verdict_per_claim(self):
+        """Positive twin of record=False on the same fixture."""
+        from loci_fakes import fake_verdict_backend
+
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with fake_verdict_backend() as backend:
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims=["The service listens on port 8443.", "The service is written in Rust."],
+                record=True,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 2, "qdrant": "ok"})
+        self.assertEqual([v.verdict_type for v in backend.recorded],
+                         ["claim_supported", "claim_unsupported"])
+        self.assertEqual([cr["verdict_type"] for cr in result["claim_results"]],
+                         ["claim_supported", "claim_unsupported"])
+        self.assertEqual(backend.recorded[0].subject_excerpt,
+                         f"{inv_id}: The service listens on port 8443.")
+
+    def test_record_true_without_backend_is_reported_unavailable(self):
+        """Degraded branch (hermetic, no Qdrant): reported, not silently 'ok'."""
+        inv_id, _fid = self._setup_tool_verified("The service listens on port 8443.")
+        with mock.patch("verdict_ops._get_verdict_backend", lambda: None):
+            result = _json(server.investigation_pre_answer_check(
+                investigation_id=inv_id,
+                claims="The service listens on port 8443.",
+                record=True,
+            ))
+        self.assertEqual(result["verdict_recording"], {"recorded": 0, "qdrant": "unavailable"})
 
     def test_model_asserted_support_only_reports_unsupported(self):
         inv_id = _new_id("pac")

@@ -91,15 +91,36 @@ def test_model_error_fails_open():
     assert "generate() raised" in result["error"]
 
 
-def test_scan_has_no_wiring_store_side_effects():
+_TOGGLE_CANDIDATES = json.dumps({"candidates": [{
+    "description": "Toggle.enable() sets a flag that callers must later disable().",
+    "evidence_excerpt": "# caller must later disable() this flag",
+    "confidence": "high",
+    "suggested_declare_args": {
+        "class_name": "Toggle",
+        "method_name": "enable",
+        "expected_effect": "call disable() to clear the enabled flag",
+    },
+}]})
+
+
+def test_scan_has_no_wiring_store_side_effects(monkeypatch):
+    """The scan returns a real candidate (scripted model) and still writes nothing.
+
+    Without an injected model the hermetic env yields 0 candidates, so an
+    auto-declare of every candidate could not be observed; here there is one.
+    """
+    from loci_fakes import fake_lazy_generate
+
+    gen = fake_lazy_generate(lambda _prompt: {"text": _TOGGLE_CANDIDATES, "ok": True, "model": "fake"})
+    monkeypatch.setattr(W, "_lazy_generate", gen)
     tmp = tempfile.TemporaryDirectory()
     orig = server.MEMORY_DIR
     try:
         server.MEMORY_DIR = Path(tmp.name)
         inv_id = "wiring-scan-no-side-effects"
         server.investigation_start(investigation_id=inv_id, title="scan side effects")
-        findings_path = server.MEMORY_DIR / inv_id / "findings.jsonl"
-        before = findings_path.read_text() if findings_path.exists() else ""
+        inv_dir = server.MEMORY_DIR / inv_id
+        before = {p.name: p.read_bytes() for p in inv_dir.iterdir() if p.is_file()}
 
         result = _json(server.wiring_obligation_scan(
             content="""
@@ -111,13 +132,32 @@ class Toggle:
             path="toggle.py",
         ))
 
-        after = findings_path.read_text() if findings_path.exists() else ""
+        after = {p.name: p.read_bytes() for p in inv_dir.iterdir() if p.is_file()}
         listed = _json(server.wiring_obligation_list(investigation_id=inv_id))
 
-        assert "candidates" in result
+        assert len(gen.prompts) == 1
+        assert "Code to inspect:" in gen.prompts[0]
+        assert result["degraded"] is False
+        assert [c["suggested_declare_args"]["class_name"] for c in result["candidates"]] == ["Toggle"]
+        # Advisory only: no file in the investigation changed, nothing declared.
         assert before == after
         assert listed["unresolved_count"] == 0
         assert listed["obligations"] == []
     finally:
         server.MEMORY_DIR = orig
         tmp.cleanup()
+
+
+def test_declare_is_visible_to_the_list_used_above(tmp_path, monkeypatch):
+    """Positive twin: the same list call does see a declared obligation, so the
+    empty list above means "not declared", not "the list is blind"."""
+    monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
+    inv_id = "wiring-scan-twin"
+    server.investigation_start(investigation_id=inv_id, title="declare twin")
+    declared = _json(server.wiring_obligation_declare(
+        investigation_id=inv_id, class_name="Toggle", method_name="enable",
+        expected_effect="call disable() to clear the enabled flag",
+    ))
+    listed = _json(server.wiring_obligation_list(investigation_id=inv_id))
+    assert listed["unresolved_count"] == 1
+    assert [o["id"] for o in listed["obligations"]] == [declared["finding_id"]]

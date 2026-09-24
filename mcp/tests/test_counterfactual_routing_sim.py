@@ -185,7 +185,65 @@ class TestCounterfactualRoutingSimulation(unittest.TestCase):
         self.assertEqual(first["counterfactual"]["policy"]["slow_modulation"]["provenance"], "deterministic_derived")
         self.assertIn("aggregation", first["counterfactual"])
         self.assertEqual(len(first["counterfactual"]["aggregation"]["selected_refs"]), 1)
-        self.assertTrue(first["counterfactual"]["removed_finding_ids"])
+        # hunger=1.0, top_k=1: no priority slot, the single exploration slot takes
+        # the tail of the candidate pool.
+        self.assertEqual(first["counterfactual"]["removed_finding_ids"], ["f-1", "f-2"])
+        self.assertEqual(first["counterfactual"]["added_finding_ids"], ["f-3"])
+        self.assertEqual(first["counterfactual"]["overlap_count"], 0)
+
+    def _replay(self, *, hunger, top_k, candidates, baseline_ids, **kw):
+        audit_entry = {
+            "ts": "2026-09-22T16:00:00Z",
+            "tool": "memory_route",
+            "inputs": json.dumps({"query": "auth failure", "top_k": 2, "deduplicate": False}),
+            "output": json.dumps({
+                "query": "auth failure",
+                "routed": [{"finding_id": fid, "text": fid} for fid in baseline_ids],
+                "count": len(baseline_ids),
+                "routing_trace": {
+                    "version": 1,
+                    "policy": {
+                        "top_k": 2,
+                        "deduplicate": False,
+                        "dedup_threshold": 0.8,
+                        "drive_state": {"hunger": hunger, "fatigue": 0.0, "urgency": 0.0},
+                    },
+                    "candidate_hits": candidates,
+                },
+            }),
+        }
+        server._collect_recent_global_audit = lambda limit=200, days=3: [audit_entry]  # noqa: ARG005
+        server._load_manifest = lambda _inv_id: {"title": "Sim Test"}
+        payload = json.loads(server.memory_route_counterfactual_simulate(
+            limit=5, top_k=top_k, deduplicate=False, **kw))
+        self.assertEqual(payload["simulated"], 1)
+        return payload
+
+    @staticmethod
+    def _candidates(n):
+        # Distinct texts (no dedup), strictly decreasing score: rank == id order.
+        return [{"finding_id": f"f-{i}", "id": f"f-{i}", "text": f"hit number {i} word{i}",
+                 "score": round(1.0 - i * 0.05, 2)} for i in range(1, n + 1)]
+
+    def test_counterfactual_simulate_priority_keeps_the_top_hit(self):
+        """No hunger: every slot is a priority slot, so top_k=1 keeps the best-
+        scored baseline hit and removes exactly the other one."""
+        payload = self._replay(hunger=0.0, top_k=1, candidates=self._candidates(3),
+                               baseline_ids=["f-1", "f-2"])
+        cf = payload["results"][0]["counterfactual"]
+        self.assertEqual([r["finding_id"] for r in cf["aggregation"]["selected_refs"]], ["f-1"])
+        self.assertEqual(cf["removed_finding_ids"], ["f-2"])
+        self.assertEqual(cf["added_finding_ids"], [])
+        self.assertEqual(cf["overlap_count"], 1)
+        self.assertEqual(payload["changed"], 1)
+
+    def test_counterfactual_simulate_unchanged_policy_reports_no_change(self):
+        payload = self._replay(hunger=0.0, top_k=2, candidates=self._candidates(3),
+                               baseline_ids=["f-1", "f-2"])
+        cf = payload["results"][0]["counterfactual"]
+        self.assertEqual((cf["removed_finding_ids"], cf["added_finding_ids"]), ([], []))
+        self.assertEqual(cf["overlap_count"], 2)
+        self.assertEqual(payload["changed"], 0)
 
     def test_counterfactual_simulate_accepts_routing_tone_override(self):
         audit_entry = {
@@ -227,6 +285,22 @@ class TestCounterfactualRoutingSimulation(unittest.TestCase):
         first = payload["results"][0]
         self.assertEqual(first["counterfactual"]["policy"]["slow_modulation"]["routing_tone"], -0.4)
 
+    def test_counterfactual_routing_tone_changes_the_replayed_selection(self):
+        """The tone must drive the replay, not just be echoed. hunger=1.0, top_k=2:
+        candidate_limit 9; tone 0 keeps all 9 candidates so the exploration slot
+        takes f-9, tone -0.4 scales the Qdrant limit to round(9*0.8)=7 -> f-7."""
+        neutral = self._replay(hunger=1.0, top_k=2, candidates=self._candidates(9),
+                               baseline_ids=["f-1", "f-9"], routing_tone_override=0.0)
+        damped = self._replay(hunger=1.0, top_k=2, candidates=self._candidates(9),
+                              baseline_ids=["f-1", "f-9"], routing_tone_override=-0.4)
+        n_cf = neutral["results"][0]["counterfactual"]
+        d_cf = damped["results"][0]["counterfactual"]
+        self.assertEqual(n_cf["policy"]["slow_modulation"]["qdrant_limit"], 9)
+        self.assertEqual(d_cf["policy"]["slow_modulation"]["qdrant_limit"], 7)
+        self.assertEqual([r["finding_id"] for r in n_cf["aggregation"]["selected_refs"]], ["f-1", "f-9"])
+        self.assertEqual([r["finding_id"] for r in d_cf["aggregation"]["selected_refs"]], ["f-1", "f-7"])
+        self.assertEqual((d_cf["removed_finding_ids"], d_cf["added_finding_ids"]), (["f-9"], ["f-7"]))
+
     def test_counterfactual_simulate_reports_missing_trace(self):
         audit_entry = {
             "ts": "2026-09-22T16:00:00Z",
@@ -241,7 +315,7 @@ class TestCounterfactualRoutingSimulation(unittest.TestCase):
         server._collect_recent_global_audit = lambda limit=200, days=3: [audit_entry]  # noqa: ARG005
         payload = json.loads(server.memory_route_counterfactual_simulate(limit=5))
         self.assertEqual(payload["simulated"], 0)
-        self.assertGreaterEqual(payload["skipped_missing_trace"], 1)
+        self.assertEqual(payload["skipped_missing_trace"], 1)
 
 
 if __name__ == "__main__":

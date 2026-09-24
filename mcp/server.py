@@ -5516,12 +5516,12 @@ def audit_log(
     # Qdrant (best-effort secondary index)
     qdrant_indexed = False
     if _get_qdrant()[0] is not None:
-        _qdrant_upsert(
+        # _qdrant_upsert returns False when nothing was written (embed or upsert failed).
+        qdrant_indexed = _qdrant_upsert(
             str(uuid.uuid4()),
             embed_text,
             {**entry, "record_type": "audit"},
         )
-        qdrant_indexed = True
 
     return json.dumps({
         "logged": True,
