@@ -388,10 +388,11 @@ class FindingLifecycleTest(unittest.TestCase):
     def test_verify_all_confirms_model_asserted_finding_with_tool_verified_support(self):
         # The same model_asserted claim, but this time backed by an independent
         # tool_verified finding in the same investigation, passes the firewall
-        # and reaches (and is confirmed by) the stubbed model verifier.
+        # and reaches (and is confirmed by) the stubbed model verifier. The support
+        # must be about this claim: an unrelated tool row is not evidence for it.
         inv_id = self._start()
         self._store(
-            inv_id, "python3 -m json.tool confirms the schema parses.",
+            inv_id, "Reflection loop replay run: loop fixed, model agreement 5/5.",
             metadata={"evidence_provenance_tier": "tool_verified"},
         )
         fid = self._store(

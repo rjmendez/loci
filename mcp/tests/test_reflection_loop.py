@@ -461,6 +461,8 @@ class ReflectionLoopTests(unittest.TestCase):
                 "source": "reflection_loop_tick",
                 "confidence": "low",
                 "tags": "self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+                # Unreceipted heuristic output: stamped, never the tool_verified default.
+                "evidence_provenance_tier": "model_asserted",
             },
         )
         self.assertEqual(result["stats"], expected_stats)

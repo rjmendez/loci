@@ -216,9 +216,15 @@ New findings may set `metadata.evidence_provenance_tier` (or the
 a `model_asserted` claim is **UNVERIFIED** when its support is only other
 `model_asserted` findings. It needs at least one human-authored, tool-verified,
 or deterministically-derived residual (for example a matching file/quote/hash,
-passing test, parseable schema, or audit receipt). Legacy untagged findings
-default to `tool_verified` when used as evidence so old investigations and
-callers continue to work; refs surface `provenance_defaulted: true` for audit.
+passing test, parseable schema, or audit receipt for a non-model tool). The
+evidence must be linked to the claim (a `derived_from` parent or a lexical
+support match), not merely another finding in the investigation. Legacy
+untagged findings still display as `tool_verified`, but carry
+`provenance_defaulted: true` and never count as independent evidence.
+Loci's own writers (`investigation_reason`, `reflection_loop_tick`,
+`contract_declare`, `wiring_obligation_declare`) and untagged `assumed`/`gap`
+findings are stamped `model_asserted`; an audit receipt for a model tool
+(`llm_local`, `swarm_reason`, ...) is `model_asserted` too.
 
 **MCP tools provided by loci-mcp** — full registration composition and current
 count are canonical in [docs/CALLGRAPH.md](./CALLGRAPH.md).
