@@ -1539,7 +1539,8 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
             "Primary DB host 10.0.0.9 returns timeout errors during failover.",
             reflect_result["summary_l1"][0],
         )
-        self.assertIn("Latest [gap source=test:gap confidence=low provenance=tool_verified]:", reflect_result["summary_l2"])
+        # An untagged gap is not observed evidence: it is stamped model_asserted.
+        self.assertIn("Latest [gap source=test:gap confidence=low provenance=model_asserted]:", reflect_result["summary_l2"])
         self.assertIn("Replica routing logs have not yet been collected.", reflect_result["summary_l2"])
 
     def test_investigation_reflect_core_fields_are_unchanged_with_or_without_self_critique(self):
@@ -3056,7 +3057,9 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertEqual(first["support_basis"], "lexical")
         self.assertTrue(first["provenance_firewall"]["allowed"])
 
-    def test_legacy_untagged_support_defaults_to_tool_verified(self):
+    def test_legacy_untagged_support_is_displayed_but_not_independent(self):
+        # An untagged row still displays the legacy tool_verified tier, but nobody
+        # asserted it, so it cannot support a (model_asserted) answer claim.
         inv_id = self._setup_investigation("Legacy findings remain usable.")
         result = _json(server.investigation_pre_answer_check(
             investigation_id=inv_id,
@@ -3065,9 +3068,12 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         ))
 
         first = result["claim_results"][0]
-        self.assertTrue(first["supported"])
-        self.assertEqual(first["support_refs"][0]["evidence_provenance_tier"], "tool_verified")
-        self.assertTrue(first["support_refs"][0]["provenance_defaulted"])
+        self.assertFalse(first["supported"])
+        self.assertEqual(first["support_basis"], "provenance_blocked")
+        firewall = first["provenance_firewall"]
+        self.assertEqual(firewall["evidence_tiers"], ["tool_verified"])
+        self.assertEqual(firewall["independent_evidence_tiers"], [])
+        self.assertEqual(firewall["defaulted_evidence_count"], 1)
 
     def test_stale_audit_lane_is_reported_and_not_used_as_evidence(self):
         inv_id = self._setup_investigation("A recent finding unrelated to the stale receipt.")

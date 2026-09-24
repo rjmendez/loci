@@ -132,14 +132,19 @@ def test_tool_verified_evidence_passes_provenance_firewall():
     assert r["degraded"] is False
 
 
-def test_legacy_untagged_evidence_defaults_to_tool_verified_for_compatibility():
+def test_legacy_untagged_evidence_is_not_independent_support():
+    # Untagged rows still display the legacy tool_verified tier, but nobody
+    # asserted it, so they cannot verify a model_asserted claim.
     r = V.verify_finding(
         "Legacy finding remains usable.",
         candidate_provenance_tier="model_asserted",
         evidence_rows=[{"text": "Legacy finding remains usable."}],
         gen_fn=_ok(_CONFIRMED),
     )
-    assert r["verdict"] == "confirmed"
+    assert r["verdict"] == "uncertain"
+    assert r["provenance_firewall"]["allowed"] is False
+    assert r["provenance_firewall"]["evidence_tiers"] == ["tool_verified"]
+    assert r["provenance_firewall"]["defaulted_evidence_count"] == 1
 
 
 def test_provenance_firewall_fails_open(monkeypatch):

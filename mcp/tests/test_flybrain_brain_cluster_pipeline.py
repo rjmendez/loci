@@ -102,9 +102,12 @@ def test_p0_dry_run_is_deterministic_for_same_seed(tmp_path):
 
 
 def test_p0_dry_run_failure_injection_missing_replay_fingerprint_triggers_fail_closed(tmp_path):
+    # Under "seed-failure" the grounding expert measures 0.0 validation accuracy, so
+    # the baseline already fails closed everywhere and an injected fault adds no
+    # delta; that seed only "worked" while a fabricated 0.82 replaced the 0.0.
     report = _run(
         tmp_path,
-        split_seed="seed-failure",
+        split_seed="seed-failure-calibrated",
         candidate_shadow_overrides={
             "grounding_expert": {"replay_fingerprint_mode": "missing"},
             "provenance_expert": {"replay_fingerprint_mode": "missing"},

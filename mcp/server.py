@@ -246,8 +246,8 @@ from inv_store import (  # noqa: E402,F401
 from recall_filter import build_recall_filter  # noqa: E402
 from provenance_firewall import (  # noqa: E402
     MODEL_ASSERTED,
-    TOOL_VERIFIED,
     assert_evidence_firewall,
+    audit_provenance_fields,
     normalize_provenance_tier,
     provenance_fields,
 )
@@ -1717,8 +1717,8 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "audit_jsonl",
-                "evidence_provenance_tier": TOOL_VERIFIED,
-                "provenance_defaulted": False,
+                # Caller-written receipt: tool_verified only for a non-model tool.
+                **audit_provenance_fields(entry.get("tool")),
             })
 
         for idx, entry in enumerate(global_recent_audit):
@@ -1733,8 +1733,7 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "global_audit_jsonl",
-                "evidence_provenance_tier": TOOL_VERIFIED,
-                "provenance_defaulted": False,
+                **audit_provenance_fields(entry.get("tool")),
             })
     return evidence, {"audit": audit_lane}
 
@@ -2019,7 +2018,9 @@ def _hallucination_candidates(
     if not unsupported_ids or not contradictions:
         return []
 
-    # Approximates "has a receipt" as "not in unsupported_ids"; provenance only flags observed findings.
+    # Receipted = an observed finding the provenance check did not flag. Inferred/gap
+    # rows are never checked for receipts, so they are not receipted counter-evidence.
+    receipted_ids = _observed_ids - unsupported_ids
     findings_by_id = {str(f.get("id", "")): f for f in findings}
 
     candidates: list[dict] = []
@@ -2033,8 +2034,9 @@ def _hallucination_candidates(
         for unsup, other in pairs:
             if unsup not in unsupported_ids:
                 continue
-            if other in unsupported_ids and not _blanket:
-                continue  # other also unsupported — no receipted counter
+            counter_receipted = other in receipted_ids
+            if not counter_receipted and not _blanket:
+                continue  # no receipted counter
             if other not in findings_by_id:
                 continue
             if unsup in seen:
@@ -2044,12 +2046,20 @@ def _hallucination_candidates(
             candidates.append({
                 "finding_id": unsup,
                 "contradicted_by": other,
+                "counter_receipted": counter_receipted,
                 "excerpt": redact_excerpt(str(f.get("text", "") or "")),
                 "rationale": (
                     "unsupported observed finding (no receipt) contradicted by a "
                     "receipted finding — likely a self-generated hallucination"
+                    if counter_receipted else
+                    "unsupported observed finding contradicted by another finding; no "
+                    "audit receipt backs either side, so this cannot tell which is wrong"
                 ),
-                "hint": "review and run memory_retract(target=<finding_id>) to clean the lineage",
+                "hint": (
+                    "review and run memory_retract(target=<finding_id>) to clean the lineage"
+                    if counter_receipted else
+                    "verify both findings before retracting either; neither has a receipt"
+                ),
             })
     return candidates
 
@@ -3074,6 +3084,11 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
                 tool_name="flybrain_claim_scope_validator",
                 tier=str(flybrain_prov["audit_hook"].get("tier") or flybrain_prov.get("tier") or "T1"),
             )
+    # An assumption or a gap is by definition not observed evidence; unless the
+    # caller asserted a tier, it must not inherit the legacy tool_verified default.
+    if (not evidence_provenance_tier and finding_type in ("assumed", "gap")
+            and provenance_fields({"metadata": normalized_metadata})["provenance_defaulted"]):
+        evidence_provenance_tier = MODEL_ASSERTED
     if evidence_provenance_tier:
         normalized_metadata = normalized_metadata or {}
         normalized_metadata["evidence_provenance_tier"] = normalize_provenance_tier(
@@ -3823,6 +3838,8 @@ def _reflection_store_finding(
         "source": "reflection_loop_tick",
         "confidence": confidence,
         "tags": tags,
+        # Heuristic self-reflection, no receipt: never the legacy tool_verified default.
+        "evidence_provenance_tier": MODEL_ASSERTED,
     }
     if metadata is not None:
         payload["metadata"] = metadata
@@ -4513,6 +4530,23 @@ def _pre_answer_lexical_refs(
             ref = _make_ref(evid, "support", score=score)
             claim_support_refs.append(ref)
     return claim_support_refs, claim_contradiction_refs
+
+
+def _firewall_linked_evidence(investigation_id: str, finding: dict) -> list[dict]:
+    """Evidence rows actually linked to ``finding``'s claim, for the provenance firewall.
+
+    Its ``derived_from`` parents plus the rows the pre_answer_check lexical lane
+    counts as support (findings and audit receipts). Never "every other finding":
+    an unrelated row says nothing about this claim. No link -> [] (fails closed).
+    """
+    pool, _ = build_validation_evidence(investigation_id, min_confidence="low")
+    fid = str(finding.get("id") or "")
+    parents = set(_normalize_derived_from(finding.get("derived_from")))
+    others = [e for e in pool if str(e.get("evidence_id") or "") != fid]
+    claim = str(finding.get("text") or "")
+    support, _ = _pre_answer_lexical_refs(tokenize(claim), bool(_NEGATION_RE.search(claim)), others)
+    linked_ids = parents | {str(ref.get("evidence_id") or "") for ref in support}
+    return [e for e in others if str(e.get("evidence_id") or "") in linked_ids]
 
 
 def _pre_answer_chain_confidence(
@@ -5279,6 +5313,8 @@ def audit_log(
         "investigation_id": investigation_id,
         "inputs": inputs_json,
         "output": output,
+        # The caller wrote this receipt; a model tool's output is model_asserted.
+        **audit_provenance_fields(tool_name),
     }
     fb_audit_fp = flybrain_audit_fingerprint(tool_name, inputs_json, output)
     if isinstance(fb_audit_fp, dict):
@@ -5313,6 +5349,7 @@ def audit_log(
             "tool": tool_name,
             "investigation_id": investigation_id,
             "source": "audit_log",
+            **audit_provenance_fields(tool_name),
             **({"flybrain_provenance": entry.get("flybrain_provenance")}
                if isinstance(entry.get("flybrain_provenance"), dict) else {}),
         },
@@ -6979,6 +7016,7 @@ def contract_declare(
         "source": "contract_declare",
         "confidence": "medium",
         "numeric_confidence": _store_numeric_confidence("medium", None),
+        "evidence_provenance_tier": MODEL_ASSERTED,  # a declaration, not evidence
         "tags": tags,
         "derived_from": [],
         "entities": {},
@@ -7221,6 +7259,7 @@ def wiring_obligation_declare(
         "source": "wiring_obligation_declare",
         "confidence": "medium",
         "numeric_confidence": _store_numeric_confidence("medium", None),
+        "evidence_provenance_tier": MODEL_ASSERTED,  # UNVERIFIED obligation, not evidence
         "tags": tags,
         "derived_from": [],
         "entities": {},
@@ -7437,8 +7476,8 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     results = []
     for f in open_findings:
         fid = str(f.get("id", ""))
-        # Thread this finding's own stored provenance tier plus its investigation's
-        # other findings as candidate evidence, so a model_asserted finding with no
+        # Thread this finding's own stored provenance tier plus the evidence actually
+        # linked to it (parents, lexical support), so a model_asserted finding with no
         # independent (human/tool/deterministic) support is gated 'uncertain' by the
         # provenance firewall instead of reaching the model verifier unchecked.
         res = _v.verify_finding(
@@ -7450,10 +7489,7 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             # over prose while the file sits on disk.
             code_refs=f.get("code_refs"),
             candidate_provenance_tier=normalize_provenance_tier(f),
-            evidence_rows=[
-                g for g in findings
-                if isinstance(g, dict) and str(g.get("id") or "") != fid
-            ],
+            evidence_rows=_firewall_linked_evidence(investigation_id, f),
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
@@ -9655,29 +9691,32 @@ def loci_validated_knowledge_promotion(
         return json.dumps({"status": "blocked", "reason": "retracted_finding", "finding_id": finding_id})
 
     text = str(finding.get("text") or "")
-    evidence_tier = str(finding.get("evidence_provenance_tier") or "tool_verified")
+    # Same reader as verify_all: honours metadata.provenance_tier / evidence_kind aliases.
+    evidence_tier = normalize_provenance_tier(finding)
     import verify as _v
     verify_result = _v.verify_finding(
         text,
         investigation_id=investigation_id,
         finding_id=finding_id,
         candidate_provenance_tier=evidence_tier,
+        evidence_rows=_firewall_linked_evidence(investigation_id, finding),
     )
 
-    if verify_result.get("verdict") != "confirmed":
+    # verify_finding attaches provenance_firewall only when it blocked; absent means it passed.
+    firewall = verify_result.get("provenance_firewall")
+    if isinstance(firewall, dict) and not firewall.get("allowed", True):
         return json.dumps({
             "status": "blocked",
-            "reason": "verification_gate_failed",
+            "reason": "provenance_firewall",
             "finding_id": finding_id,
             "verification": verify_result,
             "promotion": None,
         })
 
-    firewall = verify_result.get("provenance_firewall") or {}
-    if not firewall.get("allowed", False):
+    if verify_result.get("verdict") != "confirmed":
         return json.dumps({
             "status": "blocked",
-            "reason": "provenance_firewall",
+            "reason": "verification_gate_failed",
             "finding_id": finding_id,
             "verification": verify_result,
             "promotion": None,
@@ -9711,7 +9750,8 @@ def loci_validated_knowledge_promotion(
     promotion = json.loads(memory_promote(investigation_id, finding_id, promoted_tier))
     return json.dumps({
         "status": "promoted" if promotion.get("ok") else "blocked",
-        "reason": "verified_repeat_promoted" if repeat_count > 0 else "verified_promoted",
+        "reason": ("promotion_failed" if not promotion.get("ok")
+                   else "verified_repeat_promoted" if repeat_count > 0 else "verified_promoted"),
         "finding_id": finding_id,
         "target_tier": promoted_tier,
         "repeat_count": repeat_count,
@@ -9926,6 +9966,7 @@ def investigation_reason(
                     source="investigation_reason",
                     confidence="medium",
                     tags="reasoned,investigation_reason",
+                    evidence_provenance_tier=MODEL_ASSERTED,
                 ))
                 if res.get("finding_id"):
                     persisted.append(res["finding_id"])
@@ -11343,6 +11384,7 @@ from graph_tools import (  # noqa: E402,F401
 # Local-model / embedding passthrough tools live in llm_tools.py (P2a of the split).
 import llm_tools  # noqa: E402
 llm_tools.register(mcp)
+llm_tools.linked_evidence_fn = _firewall_linked_evidence
 # Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from llm_tools import (  # noqa: E402,F401
     llm_local, generate_batch, query_expand, verify_finding, adversarial_review,

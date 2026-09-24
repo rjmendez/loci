@@ -198,13 +198,20 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
     return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
 
 
+# Set by server.py after register(): (investigation_id, finding) -> evidence rows
+# linked to that finding's claim (server._firewall_linked_evidence). Unset -> no
+# linked evidence, so a model_asserted finding fails closed.
+linked_evidence_fn = None
+
+
 def _finding_provenance_context(investigation_id: Optional[str], finding_id: Optional[str]):
-    """Look up a stored finding's own provenance tier plus its investigation's
-    other findings, to thread into ``verify.verify_finding``'s provenance
-    firewall. Fail-open: any lookup problem (missing investigation/finding,
-    corrupt storage) returns ``(None, None)`` so the caller falls back to
-    verify_finding's own legacy-default behavior instead of raising or wrongly
-    gating a claim it could not resolve.
+    """Look up a stored finding's own provenance tier plus the evidence linked to
+    its claim (derived_from parents, lexical support), to thread into
+    ``verify.verify_finding``'s provenance firewall. Unrelated findings are not
+    evidence. Fail-open: a missing investigation/finding or corrupt storage
+    returns ``(None, None)`` so the caller falls back to verify_finding's own
+    legacy-default behavior instead of raising or wrongly gating a claim it
+    could not resolve.
     """
     if not investigation_id or not finding_id:
         return None, None
@@ -212,21 +219,19 @@ def _finding_provenance_context(investigation_id: Optional[str], finding_id: Opt
         from inv_store import _inv_dir, _read_jsonl
         from provenance_firewall import normalize_provenance_tier
         findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-        target = None
-        evidence_rows = []
-        for f in findings:
-            if not isinstance(f, dict):
-                continue
-            if target is None and str(f.get("id") or "") == str(finding_id):
-                target = f
-            else:
-                evidence_rows.append(f)
+        target = next((f for f in findings if isinstance(f, dict)
+                       and str(f.get("id") or "") == str(finding_id)), None)
         if target is None:
             return None, None
-        return normalize_provenance_tier(target), evidence_rows
     except Exception as exc:
         logger.debug("verify_finding: provenance lookup failed (fail-open): %r", exc)
         return None, None
+    try:
+        evidence_rows = list(linked_evidence_fn(investigation_id, target)) if linked_evidence_fn else []
+    except Exception as exc:
+        logger.debug("verify_finding: linked-evidence lookup failed (no linked evidence): %r", exc)
+        evidence_rows = []
+    return normalize_provenance_tier(target), evidence_rows
 
 
 def verify_finding(claim: str,
