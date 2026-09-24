@@ -6,6 +6,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import grounding as G  # noqa: E402 — must follow the path setup above
 
+# degraded_lanes names each failed lane; see test_grounding_degraded.py.
+_RESULT_KEYS = {"block", "sources", "chars", "degraded", "degraded_lanes"}
+
 
 def test_ground_fail_open_on_raising_source(monkeypatch):
     # A raising server tool or malformed finding must never propagate out of ground().
@@ -22,7 +25,7 @@ def test_ground_fail_open_on_raising_source(monkeypatch):
     monkeypatch.setitem(sys.modules, "server", fake)
     r = G.ground({"title": "x", "focus": "y", "caseIds": ["c1"], "entities": ["1.2.3.4"]},
                  {"budgetChars": 500, "memoryDir": "/nonexistent", "allowKeyword": True})
-    assert set(r) == {"block", "sources", "chars", "degraded"}   # well-formed, never raised
+    assert set(r) == _RESULT_KEYS   # well-formed, never raised
 
 
 def test_ground_skips_malformed_findings(monkeypatch):
@@ -33,7 +36,7 @@ def test_ground_skips_malformed_findings(monkeypatch):
         "manifest": {"hypothesis": "h"}, "recent_findings": ["not-a-dict", {"text": "ok"}]}
     monkeypatch.setitem(sys.modules, "server", fake)
     r = G.ground({"title": "x", "caseIds": ["c1"]}, {"budgetChars": 500, "memoryDir": "/nonexistent"})
-    assert "ok" in r["block"] and set(r) == {"block", "sources", "chars", "degraded"}
+    assert "ok" in r["block"] and set(r) == _RESULT_KEYS
 
 
 def test_ground_frames_loaded_memory_as_untrusted(monkeypatch):
@@ -116,7 +119,7 @@ def test_select_memory_files_missing_index(tmp_path):
 def test_ground_fail_open_no_server(monkeypatch):
     # No caseIds/entities and unreachable server -> well-formed, non-crashing result.
     r = G.ground({"title": "nothing", "focus": "nothing"}, {"budgetChars": 500, "memoryDir": "/nonexistent"})
-    assert set(r) == {"block", "sources", "chars", "degraded"}
+    assert set(r) == _RESULT_KEYS
     assert r["chars"] <= 500 + 400  # header/footer overhead bounded
     assert isinstance(r["sources"], list)
 
@@ -161,7 +164,7 @@ def test_ground_omits_exclusion_block_when_nothing_resolved(monkeypatch):
     r = G.ground({"title": "re-audit", "caseIds": ["c1"]},
                  {"budgetChars": 4000, "memoryDir": "/nonexistent"})
     assert "known — do NOT re-report" not in r["block"]
-    assert set(r) == {"block", "sources", "chars", "degraded"}
+    assert set(r) == _RESULT_KEYS
 
 
 def test_ground_budget_respected(tmp_path, monkeypatch):
@@ -251,7 +254,7 @@ def test_ground_fail_open_on_non_string_memory_dir(monkeypatch):
     monkeypatch.setitem(sys.modules, "server", _fake_healthy_server())
     for bad in (5, b"/tmp"):
         r = G.ground({"title": "x"}, {"budgetChars": 500, "memoryDir": bad})
-        assert set(r) == {"block", "sources", "chars", "degraded"}
+        assert set(r) == _RESULT_KEYS
         assert r["degraded"] is True
 
 

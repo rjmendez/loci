@@ -372,7 +372,8 @@ def ground(
         mode: "normal" (default) for the legacy block, or "compact" for terse tagged lines.
 
     Returns:
-        JSON ``{block, sources, chars, degraded}``.
+        JSON ``{block, sources, chars, degraded, degraded_lanes}``; ``degraded_lanes``
+        names each lane that raised, errored or hit the deadline (LOCI_GROUND_DEADLINE_S).
     """
     if not title or not title.strip():
         return json.dumps({"error": "title must not be empty",
