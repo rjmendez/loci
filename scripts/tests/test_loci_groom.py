@@ -483,13 +483,37 @@ class TestKnnTags(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
             self._corpus_and_search(tmp, [])
-            search = lambda _q: {"ok": True, "results": [  # noqa: E731
-                {"id": "other", "score": 0.9, "tags": ["build"]}]}
-            rows = [_f(f"b{i}", tags=["build"]) for i in range(6)]
+            # Pure-miss corpus: every held-out finding gets its neighbours' tag
+            # from the OTHER group, so no pick overlaps the author's truth.
+            rows = [_f(f"b{i}", text="the build broke on the runner", tags=["build"])
+                    for i in range(6)]
             _corpus(tmp, {"inv2": rows})
+
+            def search(query):
+                wrong = "mqtt" if "build" in query else "build"
+                return {"ok": True, "results": [{"id": "other", "score": 0.9, "tags": [wrong]}]}
+
             report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=tmp / "_groom",
                                          search_fn=search, calibrate=True, min_weight=0.5)
-        self.assertGreater(report["checked"], 0)
+        self.assertEqual(report["checked"], 12)
+        self.assertEqual(report["mean_precision"], 0.0)
+        self.assertEqual(report["exact_or_partial_hit_rate"], 0.0)
+
+    def test_calibrate_averages_hits_and_misses(self):
+        # 6 hits (the "build" group gets "build") and 6 misses (mqtt+acoustic
+        # findings also get "build"): precision is the mean of 1.0 and 0.0.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            self._corpus_and_search(tmp, [])
+            _corpus(tmp, {"inv2": [_f(f"b{i}", tags=["build"]) for i in range(6)]})
+            search = lambda _q: {"ok": True, "results": [  # noqa: E731
+                {"id": "other", "score": 0.9, "tags": ["build"]}]}
+            report = groom.pass_knn_tags(memory_dir=tmp, groom_dir=tmp / "_groom",
+                                         search_fn=search, calibrate=True, min_weight=0.5)
+        self.assertEqual(report["checked"], 12)
+        self.assertEqual(report["mean_precision"], 0.5)
+        self.assertEqual(report["exact_or_partial_hit_rate"], 0.5)
 
     def test_calibrate_writes_no_proposals(self):
         import tempfile
