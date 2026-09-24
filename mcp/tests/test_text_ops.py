@@ -57,6 +57,26 @@ def test_compress_falls_back_to_shared_generate_when_backends_unresolvable(monke
     assert calls["model"] == ""
 
 
+def test_classify_routes_through_classify_model_when_no_gen_fn_given(monkeypatch):
+    """classify() should resolve backends.ollama_classify_model() for model selection
+    when no explicit gen_fn is provided."""
+    calls = {}
+
+    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
+        calls["model"] = model
+        return {"text": "bug", "ok": True}
+
+    import llm_local
+    monkeypatch.setattr(llm_local, "generate", fake_generate)
+    import backends
+    monkeypatch.setattr(backends, "ollama_classify_model", lambda: "tiny-classifier:1b")
+
+    result = T.classify("App crashes on launch after update.", ["bug", "feature"])
+    assert result["label"] == "bug"
+    assert result["degraded"] is False
+    assert calls["model"] == "tiny-classifier:1b"
+
+
 def test_classify_does_not_consult_compress_model(monkeypatch):
     """classify() must stay on the shared gen_model -- it must not call
     ollama_compress_model at all, confirming the two ops route independently."""
@@ -77,6 +97,16 @@ def test_classify_does_not_consult_compress_model(monkeypatch):
     result = T.classify("some bug report", ["bug", "feature"])
     assert result["label"] == "bug"
     assert calls["compress_model_called"] is False
+
+
+def test_classify_explicit_single_label_mention_skips_generation():
+    def _boom(*a, **k):
+        raise AssertionError("gen_fn must not be called when exactly one label is explicit")
+
+    # Explicit mention of exactly one candidate label should route through the
+    # deterministic code path instead of invoking local generation.
+    result = T.classify("This is clearly a bug, not a crash fix request.", ["bug", "feature"], gen_fn=_boom)
+    assert result == {"label": "bug", "degraded": False}
 
 
 # --- classify -------------------------------------------------------------

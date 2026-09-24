@@ -28,6 +28,7 @@ ok=False signals the caller (here: classify/compress) to fall back to the degrad
 """
 from __future__ import annotations
 
+import re
 from typing import Callable, Optional
 
 GenFn = Callable[..., dict]
@@ -82,15 +83,23 @@ def classify(text: str, labels: list, gen_fn: Optional[GenFn] = None) -> dict:
 
     Returns {'label': str|None, 'degraded': bool}. The prompt asks for the label
     only; the returned string is validated to be one of `labels` (case-insensitive,
-    mapped back to the canonical spelling). If generation is unavailable / not-ok /
-    returns an out-of-set label, -> {'label': None, 'degraded': True}. Never raises.
+    mapped back to the canonical spelling). Fast path: if exactly one label is
+    explicitly present in the input text, return it directly (no model call). This
+    keeps short semantic routing tasks off the general generation path. Otherwise,
+    classify uses a dedicated classify model override when configured. If generation
+    is unavailable / not-ok / returns an out-of-set label, ->
+    {'label': None, 'degraded': True}. Never raises.
     """
     text = text if isinstance(text, str) else ("" if text is None else str(text))
     labels = [str(l) for l in (labels or [])]
     if not text.strip() or not labels:
         return {"label": None, "degraded": True}
 
-    gf = _resolve_gen_fn(gen_fn)
+    mentioned = _single_explicit_label_mention(text, labels)
+    if mentioned is not None:
+        return {"label": mentioned, "degraded": False}
+
+    gf = _resolve_gen_fn(gen_fn, model=_classify_model())
     if gf is None:
         return {"label": None, "degraded": True}
 
@@ -175,3 +184,37 @@ def _compress_model() -> str:
         return backends.ollama_compress_model()
     except Exception:
         return ""
+
+
+def _classify_model() -> str:
+    """Best-effort model override for classify; "" means "use the shared gen_model".
+
+    Classify is intentionally cheap/high-volume, but this knob allows operators to pin
+    short semantic-routing tasks to a tiny specialist model without changing the shared
+    generation tier used by unrelated call sites.
+    """
+    try:
+        import backends
+        return backends.ollama_classify_model()
+    except Exception:
+        return ""
+
+
+def _single_explicit_label_mention(text: str, labels: list[str]) -> Optional[str]:
+    """Return label when exactly one candidate is explicitly mentioned in text.
+
+    Word-boundary matching is case-insensitive and supports multi-word labels.
+    If none or multiple labels are present, returns None so the model classifier
+    handles ambiguity.
+    """
+    low = text.lower()
+    hits: list[str] = []
+    for label in labels:
+        item = str(label or "").strip()
+        if not item:
+            continue
+        if re.search(r"(?<!\w)" + re.escape(item.lower()) + r"(?!\w)", low):
+            hits.append(item)
+    if len(hits) == 1:
+        return hits[0]
+    return None

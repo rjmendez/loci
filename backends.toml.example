@@ -20,6 +20,10 @@
                                             # reasoning specifically. If unset, code now routes to
                                             # qwen3.8:latest by default (hardening), not gen_model.
                                             # Set explicitly if you want a different tier.
+# classify_model = "your-pulled-model:tag" # optional: model for classify_text's short semantic
+                                            # routing. Leave unset to use gen_model; set this when
+                                            # you want tiny high-throughput classification isolated
+                                            # from other generation tasks.
 # compress_model = "your-pulled-model:tag" # optional: model for compress_text's summarization
                                             # specifically. If unset, code now routes to
                                             # qwen3.8:latest by default (hardening), not gen_model.

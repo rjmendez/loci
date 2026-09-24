@@ -165,6 +165,21 @@ neighbours rather than being one of a uniformly-close crowd, took that to 1.7% w
 confirming 80% of genuinely supported claims. Matches that fail the stricter test are still
 shown — labelled as candidates, not as support.
 
+### Why there are three reasoning lanes
+Loci has `llm_local`, swarm reasoning, and deep-think workflows because they solve
+different user problems, not because one is "newer" than the others:
+
+- **`llm_local`** exists for fast, cheap single-shot work (rewrite, classify, extract).
+- **Swarm (`swarm_reason` / `swarm_escalate.py`)** exists for broad tasks where the best
+  answer comes from exploring many subtasks in parallel, then escalating only the uncertain
+  parts.
+- **Deep-think (`local_deep_think.py`)** exists for investigation-heavy work where you
+  need a longer evidence chain: ideation, verification, optional red-team critique, and
+  explicit memory updates.
+
+In practice: start with the cheapest lane that fits the question shape, then escalate only
+when confidence or disagreement says you should.
+
 ### Multi-agent memory sharing
 The A2A (Agent-to-Agent) server lets multiple AI agents share a common memory pool. One
 agent can store a finding; another can retrieve it without any message-passing between

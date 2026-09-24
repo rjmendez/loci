@@ -13,12 +13,14 @@ residue. The triage heuristics here are deliberately bounded and testable rather
 magical: self-reported confidence, parse failures, and simple similarity/contradiction
 checks on near-duplicate subtasks.
 
-Every lane is fail-open: dead decomposition, cheap, escalation, or synthesis tiers
-return a degraded but well-formed result and NEVER raise. A broken tier lowers answer
-quality and marks more findings low-confidence; it does not abort the run. Limitations
-are explicit too: the contradiction detector is lexical, confidence is self-reported,
-and synthesis falls back to a mechanical summary when the strong tier cannot produce
-valid JSON.
+Generation lanes are fail-open: dead decomposition, cheap, escalation, or synthesis
+tiers return a degraded but well-formed result rather than raising. A broken tier lowers
+answer quality and marks more findings low-confidence; it does not abort the run.
+Separately, stage contracts (routing, consolidation, escalation, publication) are fail-
+closed: invariant violations raise ``SwarmContractError`` so malformed orchestration
+state is surfaced explicitly instead of being published. Limitations are explicit too:
+the contradiction detector is lexical, confidence is self-reported, and synthesis falls
+back to a mechanical summary when the strong tier cannot produce valid JSON.
 
 Usage:
   python3 scripts/swarm_escalate.py "topic here"
@@ -38,6 +40,8 @@ import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+from parallel_deliberation_controller import ParallelDeliberationController
 
 
 _CONFIDENCE_LEVELS = ("low", "medium", "high")
@@ -201,6 +205,15 @@ class SwarmFinding:
     why: str = ""
     escalation_attempted: bool = False
     escalation_reasons: list[str] = field(default_factory=list)
+
+
+class SwarmContractError(RuntimeError):
+    """Raised when a stage-level swarm contract invariant is violated."""
+
+
+def _ensure(condition: bool, message: str) -> None:
+    if not condition:
+        raise SwarmContractError(message)
 
 
 def _repo_root() -> Path:
@@ -607,6 +620,28 @@ def triage_findings(findings: list[SwarmFinding], config: SwarmConfig) -> dict:
     }
 
 
+def _assert_routing_contract(triage: dict, *, findings_count: int) -> None:
+    flagged = triage.get("flagged_indices")
+    _ensure(isinstance(flagged, list), "routing_contract: triage.flagged_indices must be a list")
+    seen: set[int] = set()
+    for raw in flagged:
+        _ensure(isinstance(raw, int), "routing_contract: triage.flagged_indices entries must be integers")
+        _ensure(0 <= raw < findings_count, "routing_contract: triage.flagged_indices entry out of range")
+        _ensure(raw not in seen, "routing_contract: triage.flagged_indices contains duplicates")
+        seen.add(raw)
+    _ensure(int(triage.get("flagged_count") or 0) == len(flagged),
+            "routing_contract: triage.flagged_count inconsistent with flagged_indices")
+    reasons = triage.get("escalation_reasons") or {}
+    _ensure(isinstance(reasons, dict), "routing_contract: triage.escalation_reasons must be a dict")
+    for idx_key, reason_list in reasons.items():
+        _ensure(str(idx_key).isdigit(), "routing_contract: escalation_reasons key must be numeric")
+        idx = int(str(idx_key))
+        _ensure(idx in seen, "routing_contract: escalation_reasons key not present in flagged_indices")
+        _ensure(isinstance(reason_list, list), "routing_contract: escalation_reasons values must be lists")
+        _ensure(any(str(item).strip() for item in reason_list),
+                "routing_contract: escalation_reasons entry must include at least one reason")
+
+
 def self_consistency_findings(findings: list[SwarmFinding], triage: dict, *, config: SwarmConfig,
                               batch_fn: Callable[..., list[dict]]) -> tuple[list[SwarmFinding], dict, dict]:
     samples = max(1, int(config.self_consistency_samples or 1))
@@ -765,6 +800,20 @@ def escalate_findings(findings: list[SwarmFinding], triage: dict, *, config: Swa
         "failed_open": failed_open,
         "model": config.escalate_model,
     }
+
+
+def _assert_escalation_contract(updated: list[SwarmFinding], report: dict, triage: dict) -> None:
+    flagged = [int(idx) for idx in (triage or {}).get("flagged_indices") or []]
+    attempted = int(report.get("attempted") or 0)
+    succeeded = int(report.get("succeeded") or 0)
+    failed_open = int(report.get("failed_open") or 0)
+    _ensure(attempted == len(flagged), "escalation_contract: attempted count must match flagged_indices")
+    _ensure(attempted == succeeded + failed_open,
+            "escalation_contract: attempted must equal succeeded + failed_open")
+    for idx in flagged:
+        _ensure(0 <= idx < len(updated), "escalation_contract: flagged index out of range")
+        _ensure(bool(updated[idx].escalation_attempted),
+                "escalation_contract: flagged finding missing escalation_attempted marker")
 
 
 def apply_consensus_gate(findings: list[SwarmFinding], triage: dict, config: SwarmConfig) -> tuple[dict, dict]:
@@ -967,6 +1016,19 @@ def _merge_findings(findings: list[SwarmFinding]) -> tuple[list[SwarmFinding], d
     }
 
 
+def _assert_consolidation_contract(merged: list[SwarmFinding], report: dict, *, input_count: int) -> None:
+    _ensure(all(isinstance(item, SwarmFinding) for item in merged),
+            "consolidation_contract: merged findings must be SwarmFinding entries")
+    merged_count = int(report.get("merged_count") or 0)
+    deduped_count = int(report.get("deduped_count") or 0)
+    _ensure(int(report.get("input_count") or 0) == input_count,
+            "consolidation_contract: input_count inconsistent with source findings")
+    _ensure(merged_count == len(merged),
+            "consolidation_contract: merged_count inconsistent with merged findings length")
+    _ensure(deduped_count == max(0, input_count - merged_count),
+            "consolidation_contract: deduped_count inconsistent with merged/input counts")
+
+
 def _bound_findings_for_synthesis(config: SwarmConfig, findings: list[SwarmFinding]) -> tuple[list[SwarmFinding], dict]:
     bounded: list[SwarmFinding] = []
     total_chars = 2  # opening/closing brackets for the JSON list
@@ -993,6 +1055,17 @@ def _bound_findings_for_synthesis(config: SwarmConfig, findings: list[SwarmFindi
     }
 
 
+def _assert_bounded_consolidation_contract(bounded: list[SwarmFinding], report: dict, *, input_count: int) -> None:
+    kept = int(report.get("kept_count") or 0)
+    dropped = int(report.get("dropped_count") or 0)
+    _ensure(int(report.get("input_count") or 0) == input_count,
+            "consolidation_contract: synthesis bound input_count inconsistent with merged findings")
+    _ensure(kept == len(bounded),
+            "consolidation_contract: synthesis bound kept_count inconsistent with kept findings")
+    _ensure(kept + dropped == input_count,
+            "consolidation_contract: kept_count + dropped_count must equal input_count")
+
+
 def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *, seed_index: int = 0,
                      seed_count: int = 1) -> dict:
     subtasks, decomposition = decompose_subtasks(config, batch_fn, seed_index=seed_index, seed_count=seed_count)
@@ -1005,14 +1078,18 @@ def _run_single_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]], *
         tier="cheap",
     )
     triage = triage_findings(cheap_findings, config)
+    _assert_routing_contract(triage, findings_count=len(cheap_findings))
     triage, consensus_report = apply_consensus_gate(cheap_findings, triage, config)
+    _assert_routing_contract(triage, findings_count=len(cheap_findings))
     consistent_findings, triage, self_consistency_report = self_consistency_findings(
         cheap_findings,
         triage,
         config=config,
         batch_fn=batch_fn,
     )
+    _assert_routing_contract(triage, findings_count=len(consistent_findings))
     final_findings, escalate_report = escalate_findings(consistent_findings, triage, config=config, batch_fn=batch_fn)
+    _assert_escalation_contract(final_findings, escalate_report, triage)
     return {
         "seed": seed_index,
         "subtasks": subtasks,
@@ -1053,7 +1130,17 @@ def _run_multi_seed(config: SwarmConfig, batch_fn: Callable[..., list[dict]],
         for entry in completed
         for finding in entry["final_findings"]
     ])
+    _assert_consolidation_contract(
+        merged_findings,
+        merge_report,
+        input_count=sum(len(entry["final_findings"]) for entry in completed),
+    )
     synthesis_findings, synthesis_bound = _bound_findings_for_synthesis(config, merged_findings)
+    _assert_bounded_consolidation_contract(
+        synthesis_findings,
+        synthesis_bound,
+        input_count=len(merged_findings),
+    )
     escalated_count = sum(1 for item in merged_findings if item.escalation_attempted)
     stats = {
         "fanout_count": len(merged_findings),
@@ -1294,6 +1381,51 @@ def validate_swarm_result(result: dict) -> list[str]:
     return errors
 
 
+def _build_parallel_deliberation_opinions(topic: str, findings: list[dict] | list[object]) -> list[dict]:
+    opinions: list[dict] = []
+    for item in findings or []:
+        if not isinstance(item, dict):
+            continue
+        answer = str(item.get("answer") or item.get("claim") or "").strip()
+        if not answer:
+            continue
+        opinions.append({
+            "agent_id": str(item.get("model") or item.get("agent_id") or "swarm-agent"),
+            "subtask": str(item.get("subtask") or topic or "unknown_subtask"),
+            "claim": answer,
+            "confidence": str(item.get("confidence") or "low"),
+            "evidence": str(item.get("evidence") or item.get("source") or item.get("model") or ""),
+            "provenance": {
+                "source": "swarm_escalate",
+                "model": str(item.get("model") or "swarm-agent"),
+                "tier": str(item.get("tier_reached") or "cheap"),
+            },
+        })
+    return opinions
+
+
+def _attach_parallel_deliberation(result: dict, topic: str, findings: list[dict] | list[object]) -> None:
+    try:
+        controller = ParallelDeliberationController()
+        result["parallel_deliberation"] = controller.deliberate(topic, _build_parallel_deliberation_opinions(topic, findings))
+    except Exception as exc:  # pragma: no cover - fail-open by contract
+        result["parallel_deliberation"] = {
+            "topic": topic,
+            "degraded": True,
+            "decision": "no_reliable_opinion",
+            "summary": f"Parallel deliberation failed open: {exc}",
+            "participants": 0,
+            "conflicts": [],
+            "subtasks": [],
+            "provenance": [],
+        }
+
+
+def _assert_publication_contract(result: dict) -> None:
+    errors = validate_swarm_result(result)
+    _ensure(not errors, f"publication_contract: invalid result shape: {'; '.join(errors)}")
+
+
 def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
     deps = deps or {"generate_batch": _batched_generate}
     batch_fn = deps["generate_batch"]
@@ -1301,11 +1433,19 @@ def run_swarm(config: SwarmConfig, deps: Optional[dict] = None) -> dict:
     effective_seeds = _effective_seed_count(config)
     if effective_seeds > 1:
         try:
-            return _run_multi_seed(config, batch_fn, guardian_fn, effective_seeds=effective_seeds)
+            result = _run_multi_seed(config, batch_fn, guardian_fn, effective_seeds=effective_seeds)
+        except SwarmContractError:
+            raise
         except Exception:
-            return _run_single_seed_result(config, batch_fn, guardian_fn)
+            result = _run_single_seed_result(config, batch_fn, guardian_fn)
+        _assert_publication_contract(result)
+        _attach_parallel_deliberation(result, config.topic, result.get("findings") or [])
+        return result
 
-    return _run_single_seed_result(config, batch_fn, guardian_fn)
+    result = _run_single_seed_result(config, batch_fn, guardian_fn)
+    _assert_publication_contract(result)
+    _attach_parallel_deliberation(result, config.topic, result.get("findings") or [])
+    return result
 
 
 def _run_single_seed_result(config: SwarmConfig, batch_fn: Callable[..., list[dict]],

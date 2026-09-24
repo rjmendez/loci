@@ -1,0 +1,57 @@
+{
+  "artifact": "fbh_f_drive_layout_inventory",
+  "date": "2026-09-22",
+  "drive": "CONFIGURED_STORAGE_ROOT",
+  "assumed_free_space_gb": 300.0,
+  "shared_drive_note": "The storage root is shared with user photo/media trees and other unbacked data; the harness must not assume the full free-space pool is available for FlyBrain work.",
+  "reserve_headroom_gb": 100.0,
+  "effective_harness_budget_gb": 200.0,
+  "hard_cap_gb": 200.0,
+  "soft_cap_gb": 160.0,
+  "warning_thresholds_gb": [
+    {
+      "level": "watch",
+      "threshold": 150.0,
+      "action": "Trigger retention review and pause large downloads."
+    },
+    {
+      "level": "soft_cap",
+      "threshold": 160.0,
+      "action": "Stop creating new datasets and keep only active run artifacts."
+    },
+    {
+      "level": "critical",
+      "threshold": 180.0,
+      "action": "Freeze nonessential writes and prune ephemeral caches."
+    },
+    {
+      "level": "hard_stop",
+      "threshold": 200.0,
+      "action": "Block all nonessential FlyBrain writes until storage falls below the soft cap."
+    }
+  ],
+  "safety_policy": {
+    "allowlisted_root": "$HARNESS_DATA_ROOT",
+    "never_exceed_hard_cap": true,
+    "reserve_headroom_for_unbacked_photo_growth": true,
+    "delete_only_ephemeral_data": true,
+    "keep_active_datasets_and_run_metadata": true,
+    "storage_root_env": "HARNESS_DATA_ROOT",
+    "config_keys": [
+      "HARNESS_DATA_ROOT",
+      "HARNESS_STORAGE_ROOT"
+    ]
+  },
+  "lifecycle_pressure_response": [
+    "At 75% of the hard cap (150 GB), run a retention review and archive old checkpoints, caches, and completed downloads that are no longer active.",
+    "At the soft cap (160 GB), stop creating new long-lived datasets, switch to read-only mode for noncritical analyses, and keep only the current active run plus the latest validated outputs.",
+    "At 90% of the hard cap (180 GB), freeze nonessential writes, purge tmp/staging/scratch directories, compress or remove duplicate artifacts, and require explicit override to continue.",
+    "At or above the hard cap (200 GB), block new writes immediately, drop ephemeral scratch, and only retain what is required to continue the current job safely."
+  ],
+  "documentation_link": "docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md",
+  "config_keys": [
+    "HARNESS_DATA_ROOT",
+    "HARNESS_STORAGE_ROOT"
+  ],
+  "storage_root_env": "HARNESS_DATA_ROOT"
+}

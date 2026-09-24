@@ -25,6 +25,68 @@ Collections:
 - `loci_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
 - `loci_verdicts` — pre-answer claim check verdicts; 384-dim hash vectors, schema owned by `memcheck/vectors.py`, created lazily on the first verdict write
 
+## Brain-cluster artifact promotion state
+
+`flybrain_brain_cluster.py` includes a durable promotion-state contract for
+artifact manifests. State is persisted as JSON with
+`schema_version=braincluster-promotion-state/v1`, timestamps, and candidate /
+promoted / previous_promoted pointers. Promotion and rollback are fail-closed:
+the target manifest must pass full `load_brain_cluster_artifacts(...)`
+validation before pointers are switched. Invalid transitions (for example,
+promoting an already-active manifest) and missing transition prerequisites
+return explicit error codes.
+
+## Brain-cluster P0 dry-run pipeline
+
+`flybrain_brain_cluster_pipeline.py` provides a deterministic train/evaluate
+pipeline for first-pass trainability checks:
+
+`train -> artifact manifest -> golden-set gate -> shadow replay -> promote/rollback`
+
+The training stage now includes a **swarm consensus student** distilled from
+multi-expert agreement, so swarm behavior is represented in both runtime policy
+and trained artifacts.
+
+CLI entrypoint:
+
+`braincluster-p0-dry-run --samples <samples.json> --output-dir <dir> --state-path <promotion-state.json> --split-seed <seed>`
+
+FlyWire raw-snapshot sample builder:
+
+`braincluster-build-fw-samples --storage-root F:\.flybrain --output <samples.json>`
+
+Additional objective for richer labels:
+
+`braincluster-build-fw-samples --storage-root F:\.flybrain --objective neurotransmitter_dominance --output <samples.json>`
+
+Objectives currently supported:
+- `connectivity_tier` (default): labels `high_connectivity` vs `baseline_connectivity`
+- `neurotransmitter_dominance`: labels dominant transmitter class from FlyWire proofread connection probabilities
+
+Production guardrails on sample build:
+- label diversity floor (`--min-distinct-labels`, default `2`)
+- label concentration ceiling (`--max-label-share`, default `0.9`)
+- deterministic fingerprinted metadata for audit/replay
+
+Objective-specific threshold bundle generation from real run history:
+
+`braincluster-release-prep --runs-root F:\.flybrain\cache\braincluster-runs --output-dir F:\.flybrain\cache\braincluster-thresholds --min-reports-per-objective 2`
+
+The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
+including dataset split fingerprints, expert/router artifact fingerprints,
+gate/shadow metrics, and final promotion-state pointers.
+Router runtime payloads now include a deterministic `swarm_policy`
+(`parallel_fanout`, bounded `fanout_k`, consensus mode) so parallel
+multi-expert execution is a first-class deployment contract.
+
+Threshold calibration entrypoint:
+
+`braincluster-threshold-calibrate --reports <reports.json> --output <thresholds.json>`
+
+Calibration emits `schema_version=braincluster-threshold-calibration/v1` with
+versioned gate + shadow threshold candidates derived from held-out run metrics
+and a reproducible input fingerprint.
+
 ## Requirements
 
 - Python 3.11+
@@ -137,6 +199,7 @@ with links back here for full signatures.
 **Finding storage:**
 - `investigation_store(investigation_id, finding_type, text, source, confidence?, tags?, derived_from?)` — store a finding
   - `finding_type`: one of `observed | inferred | assumed | gap`
+  - FlyBrain guardrail: when `metadata.claim_scope`/`metadata.flybrain_provenance.claim_scope` is present, the scope tuple is required and development/plasticity cross-stage or cross-sex generalizations must include explicit `metadata.flybrain_provenance.generalization_support` validation flags.
   - Returns: `{"stored": true, "finding_id": "<uuid>", "type": "<finding_type>", "mnemo_stored": true}`
 - `memory_retract(investigation_id, target, reason?, dry_run?, scope_semantic?)` — soft-delete findings matching `target`; `dry_run=True` by default, pass `dry_run=False` to actually retract
 - `memory_restore(investigation_id, finding_id?, retraction_id?, reason?)` — undo a retraction
@@ -149,13 +212,16 @@ with links back here for full signatures.
 - `investigation_related_cases(entities, entity_type?, limit_per_entity?)` — find past investigations sharing the given entities
 - `rag_context_search(query, ...)` — cross-collection RAG search
 - `memory_surface(context, investigation_id?, top_k?)` — proactively surface prior findings for the current working context
-- `memory_route(query, agent_id?, top_k?, deduplicate?)` — agent-mesh search across all investigations
+- `memory_route(query, agent_id?, top_k?, deduplicate?, include_trace?, drive_state?)` — agent-mesh search across all investigations (`include_trace=true` captures replayable route traces); optional `drive_state={hunger,fatigue,urgency}` (0..1, fail-closed validation) steers priority vs exploration; includes `routing_aggregation` with provenance-preserving selected-hit refs
+- `memory_route_counterfactual_simulate(investigation_id?, limit?, deduplicate?, dedup_threshold?, top_k?, agent_id_override?)` — replay audited memory-route traces under alternate policies without changing production behavior
+- `memory_route_policy_optimize(investigation_id?, limit?, days?, min_decisions?, persist?)` — conservative policy-optimization loop over audited route + consolidation outcomes with a fail-closed invariant gate and provenance-only aggregation (advisory only; never auto-applies routing changes)
 - `memory_hints(investigation_id, limit?, since_ts?)` — recent findings as lightweight hints
 - `memory_confidence(query, top_k?)` — metamemory: how reliably memory knows a topic
 - `ground(title, focus?, case_ids?, entities?, code_refs?, budget_chars?, allow_keyword?, graph_available?)` — assemble a char-budgeted, provenance-tagged grounding block
 
 **Claim validation:**
 - `investigation_pre_answer_check(investigation_id, claims, ...)` — validate claims against evidence before answering
+  - Includes a deterministic reflex-arc fast path in the advisory entailment lane: obvious high-overlap support/contradiction and explicitly prevalidated evidence short-circuit model calls; everything else fail-safely falls back to normal local-model verification.
 - `investigation_evidence_precheck(investigation_id, proposed_query, min_similarity?)` — lightweight duplicate/evidence check
 - `verify_finding(claim, context?, investigation_id?)` — adversarially verify a claim with the local model
 - `investigation_verify_all(investigation_id, limit?)` — batch adversarial-verify the open findings

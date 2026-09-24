@@ -1,0 +1,35 @@
+{
+  "artifact": "fbh_write_path_safety_policy",
+  "date": "2026-09-22",
+  "policy_doc": "docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md",
+  "allowlisted_root": "F:\\loci-data\\flybrain",
+  "override_env": "LOCI_FLYBRAIN_ALLOWED_ROOT",
+  "denylist_paths": [
+    "F:\\photos",
+    "F:\\photo",
+    "F:\\pictures",
+    "F:\\dcim",
+    "F:\\camera",
+    "F:\\",
+    "F:"
+  ],
+  "denylist_patterns": [
+    "*\\photo*",
+    "*\\picture*",
+    "*\\dcim*",
+    "*\\camera*"
+  ],
+  "required_controls": [
+    "normalize_and_canonicalize",
+    "containment_under_allowlisted_root",
+    "symlink_junction_reparse_escape_block",
+    "destructive_ops_guard",
+    "preflight_validation",
+    "allow_deny_audit_logging"
+  ],
+  "destructive_ops_never_targets": [
+    "F:\\",
+    "F:",
+    "F:\\loci-data\\flybrain"
+  ]
+}

@@ -33,6 +33,11 @@ test = [
 
 [project.scripts]
 loci-mcp = "server:main"
+braincluster-goldenset-gate-runner = "flybrain_brain_cluster_training:main"
+braincluster-p0-dry-run = "flybrain_brain_cluster_pipeline:main"
+braincluster-threshold-calibrate = "flybrain_brain_cluster_thresholds:main"
+braincluster-build-fw-samples = "flybrain_brain_cluster_fw_samples:main"
+braincluster-release-prep = "flybrain_brain_cluster_release_prep:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -46,6 +51,15 @@ py-modules = [
     "batched_gen",
     "embed_ops",
     "graph_tools",
+    "flybrain_harness_storage",
+    "flybrain_brain_cluster",
+    "flybrain_brain_cluster_training",
+    "flybrain_brain_cluster_pipeline",
+    "flybrain_brain_cluster_thresholds",
+    "flybrain_brain_cluster_fw_samples",
+    "flybrain_brain_cluster_release_prep",
+    "flybrain_hb_adapter",
+    "replay_fingerprint",
     "grounding",
     "inv_store",
     "investigation_tools",

@@ -5,17 +5,39 @@ this package can do ``import server`` and resolve the MCP server module —
 regardless of which directory pytest is invoked from or whether a2a_server
 tests are collected in the same session.
 """
+
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-_MCP_DIR = str(Path(__file__).resolve().parent.parent)
+_MCP_DIR = Path(__file__).resolve().parent.parent
+
+
+def _configure_pytest_temp_root() -> None:
+    """Pin pytest temp roots inside the repository when unset.
+
+    Some machines deny access to the default OS temp root used by pytest's
+    tmp_path fixture (for example, when `%TEMP%\\pytest-of-<user>` is blocked).
+    PYTEST_DEBUG_TEMPROOT is the official override and keeps tmp_path behavior
+    unchanged while avoiding machine-specific absolute paths.
+    """
+
+    if os.environ.get("PYTEST_DEBUG_TEMPROOT"):
+        return
+    temp_root = (_MCP_DIR / ".tmp").resolve(strict=False)
+    temp_root.mkdir(parents=True, exist_ok=True)
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(temp_root)
+
+
+_configure_pytest_temp_root()
 
 
 def pytest_configure(config):  # noqa: ARG001
-    if _MCP_DIR not in sys.path:
-        sys.path.insert(0, _MCP_DIR)
+    mcp_dir = str(_MCP_DIR)
+    if mcp_dir not in sys.path:
+        sys.path.insert(0, mcp_dir)
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +67,4 @@ def _isolate_offload_audit(tmp_path, monkeypatch):
     Same rationale as _isolate_the_audit_log: no test may write into the operator's home.
     """
     monkeypatch.setenv("LOCI_OFFLOAD_AUDIT_DIR", str(tmp_path / "offload-audit"))
+

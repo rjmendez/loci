@@ -139,3 +139,40 @@ def test_memory_consolidate_dry_run_shape_and_behavior_are_unchanged(monkeypatch
         },
         "causal_edges_inferred": 0,
     }
+
+
+def test_consolidation_quality_flags_include_provenance_and_are_deduped(monkeypatch):
+    sample = {
+        "session_id": "sess-1",
+        "merged_summary": "The incident was handled.",
+        "source_entries": [
+            {"id": "wm-1", "content": "Alice rotated the AWS key."},
+            {"id": "wm-2", "content": "Bob disabled the compromised CI runner."},
+        ],
+    }
+    monkeypatch.setattr(server, "_fetch_consolidation_quality_samples", lambda *_a, **_k: ([sample, dict(sample)], False))
+    monkeypatch.setattr(
+        "consolidation_quality_audit.audit_merge_quality",
+        lambda *_a, **_k: {
+            "available": True,
+            "verdict": "lost_or_conflated",
+            "concern": "The merged result omits distinct remediation actions.",
+            "confidence": 0.91,
+            "degraded": False,
+            "error": "",
+        },
+    )
+
+    parsed = server._run_consolidation_quality_audit(
+        m=object(),
+        result={"items_consolidated": 2, "session_results": [{"session_id": "sess-1"}]},
+        baseline_rowid=None,
+    )
+
+    assert parsed is not None
+    assert parsed["sampled"] == 2
+    assert len(parsed["flagged"]) == 1
+    flagged = parsed["flagged"][0]
+    assert flagged["session_id"] == "sess-1"
+    assert flagged["source_entry_ids"] == ["wm-1", "wm-2"]
+    assert flagged["source_entry_count"] == 2

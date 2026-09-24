@@ -5,6 +5,21 @@ This reference covers the local reasoning MCP tools plus the two related CLI ent
 - MCP tools: `swarm_reason`, `llm_local`, `reflection_loop_seed`, `reflection_loop_status`, `reflection_loop_tick`, `memory_confidence`
 - CLI scripts: `scripts/swarm_escalate.py`, `scripts/local_deep_think.py`
 
+For the operational policy envelope around escalation, budgets, human review, and
+fallback behavior, see [docs/REASONING_POLICY_SPEC.md](./REASONING_POLICY_SPEC.md).
+
+## Runtime operation-layer specs
+
+Implementation-ready swarm runtime specs that match the current codebase live here:
+
+- [docs/swarm-supervisor-role-spec.md](./swarm-supervisor-role-spec.md)
+- [docs/swarm-agent-ensemble-spec.md](./swarm-agent-ensemble-spec.md)
+- [docs/prompt-template-spec.md](./prompt-template-spec.md)
+- [docs/observability-dashboard-spec.md](./observability-dashboard-spec.md)
+
+These documents reuse the live contracts and policy already defined by `scripts/swarm_supervisor.py`,
+`scripts/swarm_escalate.py`, and `docs/REASONING_POLICY_SPEC.md` instead of inventing a parallel
+orchestration layer.
 The two most-misunderstood ideas are:
 
 1. A **seed** is a full independent swarm pipeline run, not sampling noise on one prompt.
@@ -862,6 +877,12 @@ typically using the same configured model tiers.
 
 ## When to use which
 
+Use **`llm_local`** when you want:
+
+- one fast local generation (classification, rewrite, extraction, short draft)
+- deterministic shape constraints (`fmt='json'`) without a multi-stage pipeline
+- the cheapest lane that still gives you a useful answer
+
 Use **`local_deep_think.py`** when you want:
 
 - multiple model perspectives on an open-ended question
@@ -876,10 +897,15 @@ Use **`swarm_escalate.py`** when you want:
 - robustness from multiple independent decompositions (`--seeds`)
 - one structured synthesized result without the investigation-writing chain
 
-Short version:
+Practical chooser:
 
-- **deep-think = cross-model idea diversity**
-- **swarm = cross-seed pipeline diversity**
+| If your question looks like... | Start with | Why this lane exists |
+|---|---|---|
+| "Rewrite/classify/summarize this one thing quickly." | `llm_local` | Lowest-latency local offload for single-shot work. |
+| "What is most likely true, and can we justify it in investigation memory?" | `local_deep_think.py` | It is built to generate ideas, verify claims, and persist evidence in one chain. |
+| "Break this broad problem into parts, explore many paths, then escalate only uncertain slices." | `swarm_escalate.py` | It spends cheap tokens broadly first, then pays escalation cost only where disagreement remains. |
+
+Short version: **llm_local = one-shot local generation; deep-think = cross-model idea diversity + verification; swarm = cross-seed pipeline diversity + selective escalation.**
 
 ---
 
@@ -972,3 +998,4 @@ If you remember only three things:
    is omitted; it is not the MCP tool default.
 3. `local_deep_think.py` gets diversity from multiple models; `swarm_escalate.py` gets
    diversity from multiple independent decompositions and seeds.
+

@@ -1,0 +1,22 @@
+{
+  "artifact": "fbh_index_query_adapters_20260922",
+  "kind": "plan",
+  "storage_root_env": "LOCI_FLYBRAIN_STORAGE_ROOT",
+  "adapters": [
+    "HbGraphLocalAdapter",
+    "FwMetadataLocalAdapter",
+    "RemoteFallbackAdapter"
+  ],
+  "routing_priority": [
+    "local-dataset-match",
+    "local-capability-check",
+    "remote-fallback-with-provenance"
+  ],
+  "provenance_required": true,
+  "hard_fail_on": [
+    "path_validation_failure",
+    "unsupported_version",
+    "manifest_mismatch",
+    "dataset_scope_violation"
+  ]
+}

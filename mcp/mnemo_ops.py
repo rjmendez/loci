@@ -126,7 +126,7 @@ def _mnemo_recall(query: str, *, top_k: int = 10, investigation_id: Optional[str
         if not text:
             continue
         score = _safe_float(item.get("score", item.get("similarity", 0.0)), default=0.0)
-        rows.append({
+        row = {
             "score": round(score, 4),
             "investigation_id": str(inv_from_meta or investigation_id or metadata.get("investigation_id") or ""),
             "record_type": str(metadata.get("record_type") or metadata.get("type") or "memory"),
@@ -141,5 +141,12 @@ def _mnemo_recall(query: str, *, top_k: int = 10, investigation_id: Optional[str
             # apart. provenance_fields() still applies that default for truly
             # untagged (pre-fix) rows, but flags it via provenance_defaulted.
             **provenance_fields(metadata),
-        })
+        }
+        claim_scope = metadata.get("claim_scope")
+        if isinstance(claim_scope, dict):
+            row["claim_scope"] = dict(claim_scope)
+        flybrain_provenance = metadata.get("flybrain_provenance")
+        if isinstance(flybrain_provenance, dict):
+            row["flybrain_provenance"] = dict(flybrain_provenance)
+        rows.append(row)
     return rows
