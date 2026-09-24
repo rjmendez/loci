@@ -106,21 +106,43 @@ class TestTOTPAuth(unittest.TestCase):
         with patch.object(a2a_server, "TOTP_SEED", ""):
             client = self._client_with_totp()
             resp = client.post("/a2a", json=_rpc("tasks/list"), headers=_HEADERS)
-        # 200 OK or a JSON-RPC result (not 401/429)
-        self.assertNotIn(resp.status_code, (401, 429))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["result"], {"tasks": []})
+
+    def _post_with_code(self, code):
+        with patch.object(a2a_server, "TOTP_SEED", _TEST_SEED):
+            client = self._client_with_totp()
+            return client.post("/a2a", json=_rpc("tasks/list"),
+                               headers={**_HEADERS, "X-TOTP": code})
 
     def test_valid_totp_code_passes(self):
-        """A TOTP code accepted by pyotp.TOTP.verify allows the request through."""
-        with patch.object(a2a_server, "TOTP_SEED", _TEST_SEED), \
-             patch.object(a2a_server, "pyotp") as mock_pyotp_mod:
-            mock_pyotp_mod.TOTP.return_value.verify.return_value = True
-            client = self._client_with_totp()
-            resp = client.post(
-                "/a2a",
-                json=_rpc("tasks/list"),
-                headers={**_HEADERS, "X-TOTP": "123456"},
-            )
-        self.assertNotIn(resp.status_code, (401, 429))
+        """A real RFC 6238 code for the configured seed lets the request through.
+
+        Uses real pyotp (no mock) so a verifier bound to the wrong seed, or one
+        that ignores the presented code, is caught.
+        """
+        import pyotp
+        resp = self._post_with_code(pyotp.TOTP(_TEST_SEED).now())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["result"], {"tasks": []})
+
+    def test_code_for_another_seed_is_rejected(self):
+        import pyotp
+        other = pyotp.TOTP("KRSXG5CTMVRXEZLUKN2XAZLSNFXGSZLF")   # a different valid seed
+        mine = pyotp.TOTP(_TEST_SEED)
+        # The other seed's current code, or (on a 1-in-10^5 collision) its next one.
+        code = next(c for c in (other.now(), other.at(time.time() + 30), other.at(time.time() + 60))
+                    if not mine.verify(c, valid_window=1))
+        resp = self._post_with_code(code)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["detail"], "Invalid TOTP code")
+
+    def test_expired_code_is_rejected(self):
+        import pyotp
+        stale = pyotp.TOTP(_TEST_SEED).at(time.time() - 10 * 60)   # well outside valid_window=1
+        resp = self._post_with_code(stale)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["detail"], "Invalid TOTP code")
 
 
 if __name__ == "__main__":
