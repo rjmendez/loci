@@ -137,7 +137,14 @@ class RecallFilter:
         return str(row.get("finding_id") or row.get("id") or "")
 
     def is_retracted(self, row: dict) -> bool:
-        """True when a row names, or repeats the text of, a retracted finding."""
+        """True when a row names, or repeats the text of, a retracted finding.
+
+        A row whose index payload carries ``retracted: true`` (set on the Qdrant
+        point by memory_retract, cleared by memory_restore) is retracted even
+        when that investigation's log could not be read or is not in scope.
+        """
+        if row.get("retracted") is True:
+            return True
         if not self.retracted:
             return False
         inv = str(row.get("investigation_id") or "")

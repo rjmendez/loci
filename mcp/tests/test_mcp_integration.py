@@ -2016,11 +2016,14 @@ class TestMemoryTiers(unittest.TestCase):
         finding_id = stored.get("finding_id")
         self.assertIsNotNone(finding_id)
 
-        result = _json(server.memory_promote(
-            investigation_id=inv_id,
-            finding_id=finding_id,
-            tier="warm",
-        ))
+        # ok means the point reached Qdrant; stub a landed upsert (the failure
+        # path is covered by test_promote_and_docs_recall_honesty.py).
+        with mock.patch.object(server, "_qdrant_upsert", lambda *a, **k: True):
+            result = _json(server.memory_promote(
+                investigation_id=inv_id,
+                finding_id=finding_id,
+                tier="warm",
+            ))
         self.assertNotIn("error", result, f"Unexpected error: {result}")
         self.assertEqual(result.get("finding_id"), finding_id)
         self.assertEqual(result.get("old_tier"), "cold")

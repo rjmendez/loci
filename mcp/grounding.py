@@ -244,6 +244,10 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     budget = int(opts.get("budgetChars", 4000))
     compact_mode = opts.get("mode") == "compact"
     memory_dir = opts.get("memoryDir", _MEMORY_DIR_DEFAULT)
+    # ACL: the case and RAG lanes check the transport-bound (or local) caller;
+    # a requesting agent id can only narrow that.
+    acl_kwargs = ({"requesting_agent_id": str(opts["requestingAgentId"])}
+                  if opts.get("requestingAgentId") else {})
     parts: list[str] = []
     sources: list[str] = []
     degraded_lanes: list[dict] = []
@@ -296,7 +300,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if not S:
             break
         try:
-            data = _jload(call(S.investigation_load, cid, last_n_findings=6))
+            data = _jload(call(S.investigation_load, cid, last_n_findings=6, **acl_kwargs))
             if isinstance(data, dict) and data.get("error"):
                 # A case that does not exist is an honest empty; any other error is a failed lookup.
                 if "not found" not in str(data.get("error")).lower():
@@ -350,7 +354,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if not S:
             break
         try:
-            data = _jload(call(S.investigation_load, cid, last_n_findings=200))
+            data = _jload(call(S.investigation_load, cid, last_n_findings=200, **acl_kwargs))
             if not isinstance(data, dict) or data.get("error"):
                 if isinstance(data, dict) and "not found" not in str(data.get("error")).lower():
                     mark("resolved", f"{cid}: {data.get('error')}")
@@ -424,7 +428,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         try:
             q = f"{task.get('title','')} {task.get('focus','')}".strip()
             rag_cap = max(_RAG_BUDGET_FLOOR, int(budget * _RAG_BUDGET_FRACTION))
-            rag_kwargs = {"budget_chars": min(remaining[0], rag_cap), "limit": 6}
+            rag_kwargs = {"budget_chars": min(remaining[0], rag_cap), "limit": 6, **acl_kwargs}
             if compact_mode:
                 rag_kwargs["mode"] = "compact"
             res = _jload(call(S.rag_context_search, q, **rag_kwargs))

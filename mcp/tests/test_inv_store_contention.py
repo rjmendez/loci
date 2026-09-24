@@ -230,6 +230,8 @@ def test_wiring_obligation_declare_reloads_manifest_under_lock(isolated_store, m
 def test_memory_promote_preserves_concurrent_append_during_rewrite(isolated_store, monkeypatch):
     inv_id = _start_investigation("rewrite-race")
     finding_id = _store_finding(inv_id, tier="cold")
+    # promote reports ok only once the point is indexed; stub a landed upsert.
+    monkeypatch.setattr(server, "_qdrant_upsert", lambda *a, **k: True)
     findings_path = server._inv_dir(inv_id) / "findings.jsonl"
     original_timeout = inv_store._STORE_LOCK_TIMEOUT_S
     inv_store._STORE_LOCK_TIMEOUT_S = 15.0

@@ -26,12 +26,12 @@ investigation_start(
 ```
 
 ### `investigation_load(investigation_id: str, last_n_findings: int = 20, include_retracted: bool = False, requesting_agent_id: Optional[str] = None, fidelity: str = "full") -> str`
-Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and enforces the ACL: when the case has a non-empty ACL, a requester that is neither the owner nor an ACL member gets `{"error":"permission_denied"}` (an omitted `requesting_agent_id` means the local agent, `HERMES_AGENT_ID`).
+Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and enforces the ACL: when the case has a non-empty ACL, a caller that is neither the owner nor an ACL member gets `{"error":"permission_denied"}`. The caller is the identity the transport vouches for: a per-agent bearer token (`LOCI_MCP_AGENT_TOKENS`) on the HTTP transports, or a `/bootstrap` session on A2A. Where nothing can be bound (stdio, a shared `LOCI_MCP_TOKEN`, unauthenticated loopback), the caller is the local agent, `HERMES_AGENT_ID`. `requesting_agent_id` is self-declared, so it can only narrow: the named agent must be allowed *as well*. The same rule gates `investigation_as_of`, `investigation_export`, `investigation_search`, `rag_context_search`, `memory_surface`, `memory_route` and `ground`.
 
 - **Key parameters**
   - `last_n_findings`: Recent window size. Older `gap` and `assumed` findings may be promoted into the window so open obligations do not age out silently.
   - `include_retracted`: Surfaces retracted findings instead of filtering them.
-  - `requesting_agent_id`: The caller. Non-members of a non-empty ACL are refused; members see findings authored by ACL members or themselves.
+  - `requesting_agent_id`: Narrows the transport-bound (or local) caller; it never admits a caller who is not a member. Members see findings authored by ACL members or themselves.
   - `fidelity`: `full`, `summary`, or `brief`.
 - **Returns**
   - `full`: `{"manifest":...,"fidelity":"full","total_findings":N,"recent_findings":[...],"field_invariants":...,"excluded_retracted":N,...}`
