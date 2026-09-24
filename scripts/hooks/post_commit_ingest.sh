@@ -5,6 +5,15 @@
 
 set -euo pipefail
 
+# Only ingest commits on main (or LOCI_HOOK_INGEST_BRANCH) in the primary
+# worktree; linked worktrees, feature branches and detached HEADs are skipped so
+# unmerged code is never ingested. LOCI_HOOK_INGEST=0 disables it entirely.
+[ "${LOCI_HOOK_INGEST:-1}" != "0" ] || exit 0
+_git_dir="$(cd "$(git rev-parse --git-dir 2>/dev/null)" 2>/dev/null && pwd -P)" || exit 0
+_common_dir="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" || exit 0
+[ -n "$_git_dir" ] && [ "$_git_dir" = "$_common_dir" ] || exit 0
+[ "$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)" = "${LOCI_HOOK_INGEST_BRANCH:-main}" ] || exit 0
+
 # Check if any Python files changed in this commit
 if ! git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -q '\.py$'; then
   exit 0

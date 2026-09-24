@@ -1,31 +1,83 @@
 #!/usr/bin/env bash
-# post-commit: re-ingest loci-codebase when Python files change.
-# Hook failures never block commits — all exit paths end with || true.
+# post-commit: re-ingest loci-codebase when Python files change and refresh
+# contract extraction for changed source files.
+#
+# Both steps spawn a background `claude -p` that writes into shared Loci stores,
+# so they run ONLY for commits on the ingest branch (default: main) in the
+# primary worktree. Commits in linked worktrees (git worktree add ...), on
+# feature branches, or on a detached HEAD are skipped, so unmerged code is never
+# ingested. Override the branch with LOCI_HOOK_INGEST_BRANCH; disable entirely
+# with LOCI_HOOK_INGEST=0.
+#
+# Hook failures must never block commits. Keep this script fail-open: wrap work
+# in main, ignore main's status at the end, and use background jobs for Claude.
 
 set -uo pipefail
 
-# Check whether any .py files were touched in the most recent commit.
-if ! git diff-tree --no-commit-id -r --name-only HEAD 2>/dev/null \
-     | grep -q '\.py$'; then
-  exit 0
-fi
+# Absolute path of a git-dir style value (older git lacks --path-format).
+_abs_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
 
-echo "[post-commit] Python files changed — triggering loci-codebase re-ingest..."
+# Returns 0 only for a commit on the ingest branch in the primary worktree.
+ingest_allowed() {
+  local git_dir common_dir branch want
+  [[ "${LOCI_HOOK_INGEST:-1}" != "0" ]] || { echo "[post-commit] LOCI_HOOK_INGEST=0; skipping ingest."; return 1; }
 
-# Locate the repo root so the workflow path is always absolute.
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+  git_dir="$(_abs_dir "$(git rev-parse --git-dir 2>/dev/null)")" || return 1
+  common_dir="$(_abs_dir "$(git rev-parse --git-common-dir 2>/dev/null)")" || return 1
+  if [[ -z "$git_dir" || "$git_dir" != "$common_dir" ]]; then
+    echo "[post-commit] linked worktree; skipping ingest (runs on main in the primary worktree only)."
+    return 1
+  fi
 
-# Bail gracefully if the claude CLI is not available.
-if ! command -v claude >/dev/null 2>&1; then
-  echo "[post-commit] Warning: 'claude' CLI not found; skipping ingest." >&2
-  exit 0
-fi
+  want="${LOCI_HOOK_INGEST_BRANCH:-main}"
+  branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || branch=""
+  if [[ "$branch" != "$want" ]]; then
+    echo "[post-commit] branch '${branch:-(detached)}' is not '$want'; skipping ingest."
+    return 1
+  fi
+  return 0
+}
 
-env -u ANTHROPIC_API_KEY \
-  claude -p --dangerously-skip-permissions "/loci-codebase-ingest" \
-  >> /tmp/loci-post-commit-ingest.log 2>&1 &
+main() {
+  local repo_root changed log_dir common_dir
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  changed="$(git diff-tree --root --no-commit-id -r --name-only HEAD 2>/dev/null || true)"
 
-# Run contract extraction for any .py/.ts/.go/.rs/.java change (non-blocking)
-"$REPO_ROOT/scripts/hooks/post-commit-contract-extract.sh" || true
+  if [[ -z "$changed" ]]; then
+    return 0
+  fi
 
+  if ! grep -qE '\.(py|ts|go|rs|java)$' <<<"$changed"; then
+    return 0
+  fi
+
+  ingest_allowed || return 0
+
+  # In a linked worktree "$repo_root/.git" is a file, not a directory, so logs
+  # live under the common git dir instead.
+  common_dir="$(_abs_dir "$(git rev-parse --git-common-dir 2>/dev/null)")" || common_dir=""
+  log_dir="${common_dir:-${TMPDIR:-/tmp}}/loci-hook-logs"
+  mkdir -p "$log_dir" 2>/dev/null || log_dir="${TMPDIR:-/tmp}"
+
+  if grep -qE '\.py$' <<<"$changed"; then
+    echo "[post-commit] Python files changed — triggering loci-codebase re-ingest..."
+    if command -v claude >/dev/null 2>&1; then
+      (
+        cd "$repo_root" || exit 0
+        env -u ANTHROPIC_API_KEY \
+          claude -p --dangerously-skip-permissions "/loci-codebase-ingest"
+      ) >> "$log_dir/loci-post-commit-ingest.log" 2>&1 &
+    else
+      echo "[post-commit] Warning: 'claude' CLI not found; skipping ingest." >&2
+    fi
+  fi
+
+  if [[ -x "$repo_root/scripts/hooks/post-commit-contract-extract.sh" ]]; then
+    "$repo_root/scripts/hooks/post-commit-contract-extract.sh" || true
+  fi
+}
+
+main "$@" || true
 exit 0
