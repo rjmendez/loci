@@ -766,6 +766,77 @@ commit to this repo can falsify a label. The headline number is FALSE REFUTATION
 not accuracy: "uncertain" leaves a finding unverified and is harmless, "refuted"
 on a true claim is the damage.
 
+### Offload tool loop
+
+`offload_tool_loop` lets the local Ollama model work a multi-step, read-only tool
+workflow so the calling cloud model does not pay for the intermediate steps
+(issue #376, MVP). The local model emits one JSON intent per turn; every intent is
+validated against a closed registry in `mcp/offload_loop.py` (`TOOL_SPECS`), executed
+under budgets, and fed back as untrusted data. The registry is code: env vars and
+arguments can only remove tools, never add them. No cloud model is called inside the
+loop; a run that cannot finish returns `status="fallback"` plus a compact `handoff`
+and the caller continues from that.
+
+Read-only tools: `investigation_search`, `investigation_entity_lookup`,
+`investigation_list`, `investigation_load`, `memory_health`, `code_graph_query`
+(stricter Cypher guard: MATCH/WITH/UNWIND/RETURN only, no `;`, no CALL/LOAD/etc.).
+Model-supplied `investigation_id`s must already exist. `investigation_id=` on the tool
+pins the run to one investigation: it overwrites the `investigation_id` argument of every
+tool that has one, and removes the tools that cannot be scoped (`investigation_list`,
+`code_graph_query`) from the allowlist for that run (they are also denied as
+`pinned_unscoped`).
+
+| Env var | Effect |
+|---|---|
+| `LOCI_OFFLOAD_DISABLE=1` | tool returns fallback `disabled` |
+| `LOCI_OFFLOAD_TOOLS=a,b` | narrows the allowlist (never widens) |
+| `LOCI_OFFLOAD_AUDIT_DIR` | audit directory (default `<memory dir>/../audit/offload`) |
+| `LOCI_OFFLOAD_AUDIT_FULL_PROMPTS=1` | also store every full prompt (default: sha256 + length) |
+
+Budgets default to 8 steps / 8 tool calls / 120 s / 32 KiB fed back, and are clamped
+to hard ceilings of 20 / 20 / 300 s / 256 KiB. Per-tool output is capped (4 KiB) and
+marked `[truncated N bytes]`; a prompt over 16 KB stops the run rather than being
+silently truncated by Ollama.
+
+Stop reasons (`reason`; only `finished` is `status="done"`): `finished`, `gave_up`,
+`max_steps`, `max_tool_calls`, `timeout`, `output_budget`, `prompt_budget`, `bad_turns`
+(3 consecutive unparseable replies), `denied_streak` (3), `repeat_call`, `no_progress`
+(3 identical results), `tool_error_streak` (2), `tool_timeout` (2 abandoned calls),
+`model_unavailable` (transport failure or empty reply; a reply cut off mid-JSON counts as a bad turn instead), `approval_required` (a non-read-only
+spec was requested; never executed), `audit_unavailable`, `no_tools_allowed`,
+`disabled`, `tools_unbound`, `unknown_investigation`, `bad_task`, `wrapper_exception`.
+
+Audit: one file per run, `offload-<YYYY-MM-DD>-<run_id>.jsonl`, one JSON record per
+event (`run_start`, `model_call`, `model_call_result`, `intent`, `decision`,
+`tool_result`, `run_end`) with `v`, `run_id`, `seq`, `ts`. The `decision` record is
+written before the tool executes; if it cannot be written the tool is not run. Purge
+by deleting old files. `offload_loop.aggregate_metrics(dir, days=7)` summarises
+`run_end` records (no MCP tool for it yet).
+
+Warm the model first (`scripts/gpu_warm.py`): a ~70 s cold load otherwise consumes the
+elapsed budget. `python scripts/offload_demo.py` runs the loop offline with a scripted model (mechanics only).
+
+Token figures in `metrics` are ESTIMATES, not billed tokens: `est_tokens_local =
+(prompt + completion bytes) // 4` is the local model's traffic and `est_tokens_returned =
+returned_bytes // 4` is what the caller pays to read the result. No cloud saving or
+baseline is reported: a number derived from the local model's own traffic says nothing
+about what a cloud loop would have cost, and a fallback run may cost the cloud more.
+Measuring that needs a real cloud-driven run of the same task.
+
+Status of the acceptance criteria: the loop mechanics are tested offline with a scripted
+model and fake tools (`mcp/tests/test_offload_loop.py`, `scripts/offload_demo.py`).
+Criterion 1 (a real local lane completing a multi-step workflow) and criterion 5 (a
+demonstrated reduction in cloud token spend) are NOT demonstrated: no warmed-lane run
+against a real investigation is recorded yet.
+
+Residual risks: the `answer` is the local model's unverified claim
+(`answer_provenance: local_model_unverified`); Mnemosyne recall inside
+`investigation_search` is an external package and may bump access counters; a tool that
+times out leaves an abandoned worker thread (capped at 2 per run); the audit has no
+secret redaction or hash chain; small local models may fall back often (safe, but less
+saving). Out of scope for this MVP: planner/executor split, swarm intent voting, write
+tools, approval tokens, cloud-vs-offload dashboards. Issue #376 is only partly done.
+
 ### Braincluster trainlog privacy scrub (contract + usage)
 
 `scripts/braincluster_trainlog_privacy_scrub.py` is the required fail-closed

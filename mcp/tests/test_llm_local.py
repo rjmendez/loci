@@ -280,3 +280,14 @@ def test_tmux_offload_strict_mode_fails_closed_when_session_missing(monkeypatch)
     assert r["ok"] is False
     assert r["tier"] == "tmux-offload-refused"
     assert r["tmux_session"] == "loci-synth"
+
+
+def test_timeout_kwarg_default_and_override(monkeypatch):
+    """generate() posts with _TIMEOUT unless the caller passes its own deadline."""
+    _ensure_base(monkeypatch)
+    cap = {}
+    _install_post(monkeypatch, resp=_FakeResp({"response": "hi"}), capture=cap)
+    L.generate("say hi")
+    assert cap["timeout"] == L._TIMEOUT
+    L.generate("say hi", timeout=7)
+    assert cap["timeout"] == 7.0
