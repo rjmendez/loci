@@ -7,8 +7,6 @@ tracked config files, and never prints secret values.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import subprocess
 import sys
 from pathlib import Path

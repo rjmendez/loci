@@ -23,7 +23,7 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -34,13 +34,10 @@ DEFAULT_MEMORY_DIR = Path(
 )
 SELF_MODEL_DIR = DEFAULT_MEMORY_DIR / "_self-model"
 STATE_FILE = SELF_MODEL_DIR / "state.json"
-INTROSPECTION_FILE = SELF_MODEL_DIR / "introspection_report.json"
-ALERTS_FILE = SELF_MODEL_DIR / "alerts.jsonl"
 REFLECTION_STATE_FILE = DEFAULT_MEMORY_DIR / "_reflection-loop" / "state.json"
 EVENT_LOG_FILE = Path(
     os.path.expanduser(os.environ.get("LOCI_EVENT_LOG", "~/.hermes/event_log.jsonl"))
 )
-TODOS_FILE = SELF_MODEL_DIR / "todos.json"
 STALE_HOURS = float(os.environ.get("LOCI_STALE_INVESTIGATION_HOURS", "72"))
 QUEUE_FLOOD_THRESHOLD = int(os.environ.get("LOCI_REFLECTION_QUEUE_THRESHOLD", "200"))
 BLOCKED_TODO_THRESHOLD = int(os.environ.get("LOCI_BLOCKED_TODO_THRESHOLD", "3"))
