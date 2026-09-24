@@ -16,7 +16,7 @@ Design contract: **fail-open everywhere.** If ``import ladybug`` fails, the db
 cannot be opened, or any query raises, public methods return ``False`` / ``[]``
 / ``{}`` and :meth:`available` stays ``False`` — nothing propagates out. The
 sole intentional exception is :meth:`code_query`, which raises ``ValueError`` on
-a write-shaped query before touching the database.
+any query outside its read-only allowlist before touching the database.
 """
 
 from __future__ import annotations
@@ -82,9 +82,117 @@ except Exception:  # pragma: no cover - environment without ladybug
 __all__ = ["LadybugStore"]
 
 # Query shapes that mutate the graph — rejected by code_query's read-only guard.
+# Kept as a fast first check; the allowlist below (_read_only_violation) is the
+# actual boundary.
 _WRITE_GUARD_RE = re.compile(
     r"\b(CREATE|DELETE|SET|DROP|COPY|ALTER|MERGE)\b", re.IGNORECASE
 )
+
+# code_query's read-only guard is an ALLOWLIST over the engine's clause grammar.
+# A keyword denylist let LOAD FROM (host file read), EXPORT DATABASE (host file
+# write), INSTALL / LOAD EXTENSION (native code download) and httpfs (outbound
+# HTTP) through, because the read-only database handle blocks graph mutation but
+# not statements that act on the host.
+_READ_START_KEYWORDS = frozenset({"MATCH", "OPTIONAL", "WITH", "UNWIND", "RETURN", "CALL"})
+# The reading clauses (MATCH / OPTIONAL MATCH / WHERE / WITH / UNWIND / RETURN /
+# ORDER BY / SKIP / LIMIT / UNION, and CALL of an allowlisted procedure) are the
+# only ones accepted. Every other clause/statement keyword of the Cypher /
+# LadybugDB grammar is listed here; a query naming any of them (outside a string
+# literal) is not read-only.
+_NON_READ_CLAUSE_KEYWORDS = frozenset({
+    "CREATE", "MERGE", "SET", "DELETE", "DETACH", "REMOVE", "DROP", "ALTER", "COPY",
+    "LOAD", "EXPORT", "IMPORT", "INSTALL", "UNINSTALL", "ATTACH", "USE", "CHECKPOINT",
+    "BEGIN", "COMMIT", "ROLLBACK", "FOREACH", "PROJECT", "EXTENSION", "DATABASE",
+    "TRANSACTION", "COMMENT", "MACRO", "SEQUENCE",
+})
+# Read-only introspection procedures CALL may name. Every other table function
+# (READ_CSV_*, READ_PARQUET, READ_NPY, FILE_INFO, COPY_*, PROJECT_GRAPH, ...)
+# reads the host filesystem or changes engine state.
+_READ_ONLY_CALL_PROCEDURES = frozenset({
+    "SHOW_TABLES", "TABLE_INFO", "SHOW_CONNECTION", "DB_VERSION", "CURRENT_SETTING",
+    "SHOW_FUNCTIONS", "SHOW_INDEXES", "CATALOG_VERSION", "STORAGE_VERSION",
+})
+# Functions that are not read-only in any position: host-file table functions
+# and the scalar functions that advance engine state.
+_NON_READ_FUNCTIONS = frozenset({
+    "READ_CSV_PARALLEL", "READ_CSV_SERIAL", "READ_NPY", "READ_PANDAS", "READ_PARQUET",
+    "READ_JSON", "FILE_INFO", "DISK_INFO", "DISK_SIZE_INFO", "COPY_CSV", "COPY_PARQUET",
+    "PROJECT_GRAPH", "PROJECT_GRAPH_CYPHER", "DROP_PROJECTED_GRAPH", "CLEAR_WARNINGS",
+    "_CACHE_ARRAY_COLUMN_LOCALLY", "NEXTVAL", "SETSEED",
+})
+
+
+def _cypher_tokens(cypher: str) -> list[tuple[str, str]]:
+    """Lex ``cypher`` into (kind, value) tokens, skipping string literals and
+    backtick identifiers the way the engine does (backslash escapes, doubled
+    backticks). Raises ValueError on comments or unterminated literals, since a
+    lexer that disagrees with the engine is how keywords get hidden."""
+    toks: list[tuple[str, str]] = []
+    i, n = 0, len(cypher)
+    while i < n:
+        ch = cypher[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n and cypher[j] != ch:
+                j += 2 if cypher[j] == "\\" else 1
+            if j >= n:
+                raise ValueError("unterminated string literal")
+            toks.append(("str", ""))
+            i = j + 1
+            continue
+        if ch == "`":
+            j = i + 1
+            while True:
+                j = cypher.find("`", j)
+                if j == -1:
+                    raise ValueError("unterminated backtick identifier")
+                if j + 1 < n and cypher[j + 1] == "`":
+                    j += 2
+                    continue
+                break
+            toks.append(("ident", ""))
+            i = j + 1
+            continue
+        if cypher.startswith("//", i) or cypher.startswith("/*", i):
+            raise ValueError("comments are not accepted")
+        if ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (cypher[j].isalnum() or cypher[j] == "_"):
+                j += 1
+            toks.append(("word", cypher[i:j].upper()))
+            i = j
+            continue
+        if not ch.isspace():
+            toks.append(("punct", ch))
+        i += 1
+    return toks
+
+
+def _read_only_violation(cypher: str) -> Optional[str]:
+    """Return why ``cypher`` is not an allowlisted read-only query, or None."""
+    try:
+        toks = _cypher_tokens(cypher)
+    except ValueError as exc:
+        return str(exc)
+    while toks and toks[-1] == ("punct", ";"):
+        toks.pop()
+    if ("punct", ";") in toks:
+        return "multiple statements are not accepted"
+    if not toks or toks[0][0] != "word" or toks[0][1] not in _READ_START_KEYWORDS:
+        return "query must start with MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN or CALL"
+    for idx, (kind, val) in enumerate(toks):
+        if kind != "word" or (idx and toks[idx - 1] == ("punct", "$")):
+            continue  # $params are names, not keywords
+        if val in _NON_READ_CLAUSE_KEYWORDS:
+            return f"{val} is not a read-only clause"
+        if val in _NON_READ_FUNCTIONS:
+            return f"{val} is not a read-only function"
+        if val == "CALL":
+            nxt = toks[idx + 1] if idx + 1 < len(toks) else ("", "")
+            after = toks[idx + 2] if idx + 2 < len(toks) else ("", "")
+            if nxt[0] != "word" or nxt[1] not in _READ_ONLY_CALL_PROCEDURES or after != ("punct", "("):
+                return "CALL may only name a read-only introspection procedure"
+    return None
 
 # The duck-typing call fallback must NOT fire on these: a shared name is a stdlib call.
 _DUCK_STOPWORDS = frozenset({
@@ -1099,6 +1207,9 @@ class LadybugStore:
                 "code_query is read-only; write keywords "
                 "(CREATE/DELETE/SET/DROP/COPY/ALTER/MERGE) are rejected"
             )
+        violation = _read_only_violation(cypher)
+        if violation:
+            raise ValueError(f"code_query is read-only; {violation}")
         if not self.ok:
             return []
         try:

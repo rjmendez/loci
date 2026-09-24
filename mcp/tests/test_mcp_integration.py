@@ -1293,15 +1293,14 @@ class TestInvestigationACL(unittest.TestCase):
         all_loaded = _json(server.investigation_load(investigation_id=inv_id))
         self.assertEqual(all_loaded["total_findings"], 3)
 
-        # bob sees his own findings and ACL members'; authored_by="" is filtered out.
+        # bob is not in the ACL, so he is refused outright. (This used to hand him
+        # every ACL member's finding: the filter never checked the requester.)
         bob_loaded = _json(server.investigation_load(
             investigation_id=inv_id,
             requesting_agent_id="agent-bob",
         ))
-        texts = [_unwrap(f.get("text", "")) for f in bob_loaded.get("recent_findings", [])]
-        self.assertIn("Finding by bob", texts)
-        self.assertIn("Finding by alice", texts)   # alice is in ACL
-        self.assertNotIn("Finding by nobody", texts)  # no author, not in ACL
+        self.assertEqual(bob_loaded.get("error"), "permission_denied", bob_loaded)
+        self.assertNotIn("Finding by alice", json.dumps(bob_loaded))
 
         # Requesting as agent-alice: sees own findings + bob (not in ACL → filtered)
         alice_loaded = _json(server.investigation_load(
@@ -1845,7 +1844,9 @@ class TestInvestigationExportImport(unittest.TestCase):
         self.assertGreater(result.get("size_bytes", 0), 0)
 
         bundle = result.get("bundle", {})
-        self.assertEqual(bundle.get("schema_version"), "1.0")
+        self.assertEqual(bundle.get("schema_version"), "1.1")
+        for key in ("retractions", "finding_updates", "finding_verifications"):
+            self.assertIsInstance(bundle.get(key), list)
         self.assertIn("exported_at", bundle)
         self.assertIn("manifest", bundle)
         self.assertIn("findings", bundle)

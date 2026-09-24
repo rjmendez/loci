@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from typing import Optional
 
 from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
+    _acl_access_denied,
     _append_jsonl,
     _inv_dir,
     _load_manifest,
@@ -747,9 +749,11 @@ def investigation_load(
             out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
-                             provided and the investigation has a non-empty ACL,
-                             findings are filtered to those authored by agents
-                             in the ACL or by the requesting agent itself.
+                             the investigation has a non-empty ACL, a requester
+                             that is neither the owner nor in the ACL gets
+                             permission_denied; a member sees findings
+                             authored by ACL members or by itself. Omitted, the
+                             caller is the local agent (HERMES_AGENT_ID).
         fidelity: Controls how much detail is returned. One of:
                   "full"    — manifest plus recent findings.
                   "summary" — manifest plus ``summary_l1`` and ``summary_l2``
@@ -770,6 +774,9 @@ def investigation_load(
             "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
         })
     manifest = _coordination_migrate_manifest(manifest)
+    denied = _acl_access_denied(manifest, requesting_agent_id)
+    if denied:
+        return json.dumps({"error": "permission_denied", "detail": denied})
 
     # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
     summary_l1 = manifest.get("summary_l1") or []
@@ -1514,16 +1521,19 @@ def investigation_list(
 def investigation_share(
     investigation_id: str,
     agent_ids: list,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Grant investigation access to one or more agents.
 
     Adds ``agent_ids`` to the investigation ACL. Idempotent: already-present
-    agents are left as-is.
+    agents are left as-is. Only the owner or an existing ACL member may change
+    the ACL (an unnamed caller is the local agent, ``HERMES_AGENT_ID``).
 
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to add to the ACL.
+        requesting_agent_id: Optional agent_id of the caller.
 
     Returns:
         JSON: {"shared_with": [...], "total_acl": N}
@@ -1533,6 +1543,9 @@ def investigation_share(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         current_acl = list(manifest.get("acl") or [])
         current_set = set(current_acl)
@@ -1557,15 +1570,18 @@ def investigation_share(
 def investigation_unshare(
     investigation_id: str,
     agent_ids: list,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Revoke investigation access from one or more agents.
 
     Removes ``agent_ids`` from the ACL. Idempotent: missing agents are ignored.
+    Only the owner or an existing ACL member may change the ACL.
 
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to remove from the ACL.
+        requesting_agent_id: Optional agent_id of the caller.
 
     Returns:
         JSON: {"removed": [...], "total_acl": N}
@@ -1575,6 +1591,9 @@ def investigation_unshare(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         current_acl = list(manifest.get("acl") or [])
         remove_set = set(agent_ids or [])
@@ -1592,14 +1611,35 @@ def investigation_unshare(
         return json.dumps({"error": str(exc)})
 
 
+# Bundle 1.1 adds the lifecycle logs; 1.0 bundles (no logs) still import.
+_BUNDLE_SCHEMA_VERSION = "1.1"
+_IMPORTABLE_SCHEMA_VERSIONS = ("1.0", "1.1")
+_BUNDLE_LIFECYCLE_LOGS = {
+    "retractions": "retractions.jsonl",
+    "finding_updates": "finding_updates.jsonl",
+    "finding_verifications": "finding_verifications.jsonl",
+}
+# Manifest fields an import takes from the bundle. Everything else — owner, acl,
+# coordination leases, finding_counts, ids and timestamps — is the importer's own
+# or is recomputed, never trusted from an untrusted bundle.
+_IMPORTED_MANIFEST_FIELDS = (
+    "title", "context", "status", "hypothesis", "open_questions", "next_step",
+    "checked_sources", "closed_at", "closed_summary", "summary_l1", "summary_l2",
+)
+
+
 def investigation_export(
     investigation_id: str,
     include_embeddings: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Export an investigation as a portable JSON bundle.
 
-    The bundle includes the manifest, findings, conflicts, and entities.
+    The bundle (schema 1.1) includes the manifest, findings, conflicts,
+    entities, and the lifecycle logs that decide how those findings read:
+    retractions, resolution updates and verification verdicts. Without them an
+    import would bring retracted findings back live and reset every resolution.
     ``include_embeddings`` is accepted for forward compatibility, but embeddings
     are not yet exported.
 
@@ -1607,6 +1647,9 @@ def investigation_export(
         investigation_id: Investigation identifier to export.
         include_embeddings: Reserved for future use — embeddings are not yet
                             included.  Pass ``True`` to opt-in once supported.
+        requesting_agent_id: Optional agent_id of the caller. An investigation
+                             with a non-empty ACL is exported only to its owner
+                             or an ACL member.
 
     Returns:
         JSON: {"exported": true, "investigation_id": str, "bundle": {...},
@@ -1617,6 +1660,9 @@ def investigation_export(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         inv_dir = _inv_dir(investigation_id)
 
@@ -1641,13 +1687,15 @@ def investigation_export(
         entities = _read_jsonl(inv_dir / "entities.jsonl")
 
         bundle = {
-            "schema_version": "1.0",
+            "schema_version": _BUNDLE_SCHEMA_VERSION,
             "exported_at": _now(),
             "manifest": manifest,
             "findings": findings,
             "conflicts": conflicts,
             "entities": entities,
         }
+        for key, filename in _BUNDLE_LIFECYCLE_LOGS.items():
+            bundle[key] = _read_jsonl(inv_dir / filename)
 
         bundle_str = json.dumps(bundle)
         size_bytes = len(bundle_str.encode("utf-8"))
@@ -1664,6 +1712,16 @@ def investigation_export(
         return json.dumps({"error": f"Export failed: {exc}"})
 
 
+def _remap_ref(value, id_map: dict):
+    """Map a finding-id reference (a str or a list of them) through ``id_map``;
+    anything not in the map (e.g. a free-text claim) is left as it was."""
+    if isinstance(value, str):
+        return id_map.get(value, value)
+    if isinstance(value, list):
+        return [id_map.get(v, v) if isinstance(v, str) else v for v in value]
+    return value
+
+
 def investigation_import(
     bundle_json: str,
     new_title: Optional[str] = None,
@@ -1672,8 +1730,14 @@ def investigation_import(
     Import an ``investigation_export`` bundle under a new investigation ID.
 
     A fresh UUID is always assigned; the original ID is preserved as
-    ``imported_from``. Findings are re-indexed into Qdrant on a best-effort,
-    fail-open basis.
+    ``imported_from``. Every finding also gets a fresh id (the bundle's id is
+    kept as ``imported_finding_id``) so the import can never overwrite another
+    investigation's Qdrant points. The importer owns the copy: owner is the local
+    agent, the ACL is empty, coordination leases are dropped and finding counts
+    are recomputed. Retractions, resolutions and verifications carried by a 1.1
+    bundle are replayed onto the new ids; 1.0 bundles, which have none, still
+    import. Findings are re-indexed into Qdrant on a best-effort, fail-open
+    basis, and ``qdrant_indexed`` counts only confirmed upserts.
 
     Args:
         bundle_json: The JSON string produced by ``investigation_export`` (the
@@ -1683,8 +1747,11 @@ def investigation_import(
 
     Returns:
         JSON: {"imported": true, "new_investigation_id": str,
-               "original_investigation_id": str, "findings_imported": int,
-               "qdrant_indexed": int}
+               "original_investigation_id": str, "schema_version": str,
+               "findings_imported": int, "skipped_invalid": int,
+               "retractions_imported": int, "resolutions_imported": int,
+               "verifications_imported": int, "qdrant_indexed": int,
+               "qdrant_failed": int}
         On error: {"error": str}
     """
     _MAX_BUNDLE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -1703,8 +1770,11 @@ def investigation_import(
             data = data["bundle"]
 
         schema_version = data.get("schema_version")
-        if schema_version != "1.0":
-            return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
+        if schema_version not in _IMPORTABLE_SCHEMA_VERSIONS:
+            return json.dumps({
+                "error": f"Unsupported schema_version: {schema_version!r}. "
+                         f"Expected one of {list(_IMPORTABLE_SCHEMA_VERSIONS)}."
+            })
 
         required_keys = {"manifest", "findings"}
         missing = required_keys - set(data.keys())
@@ -1719,11 +1789,61 @@ def investigation_import(
 
         new_id = str(uuid.uuid4())
 
+        findings = data.get("findings") or []
+        if not isinstance(findings, list):
+            findings = []
+
+        # Fresh ids for every row: the bundle is untrusted, and its ids are the
+        # source investigation's Qdrant point ids.
+        id_map: dict[str, str] = {}
+        new_findings: list[dict] = []
+        skipped_invalid = 0
+        for finding in findings:
+            if not isinstance(finding, dict):
+                skipped_invalid += 1
+                continue
+            f = dict(finding)
+            old_fid = str(f.get("id") or "")
+            f["id"] = id_map.get(old_fid) or str(uuid.uuid4())
+            if old_fid:
+                f["imported_finding_id"] = old_fid
+                id_map[old_fid] = f["id"]
+            f["investigation_id"] = new_id
+            new_findings.append(f)
+        for f in new_findings:
+            for ref_key in ("derived_from", "finding_id"):
+                if ref_key in f:
+                    f[ref_key] = _remap_ref(f[ref_key], id_map)
+
         now = _now()
-        new_manifest = dict(src_manifest)
-        new_manifest["id"] = new_id
-        new_manifest["created_at"] = now
-        new_manifest["updated_at"] = now
+        finding_counts = {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0}
+        for f in new_findings:
+            ftype = str(f.get("type") or "")
+            if ftype in finding_counts:
+                finding_counts[ftype] += 1
+        new_manifest = {
+            "id": new_id,
+            "title": "",
+            "context": "",
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "hypothesis": None,
+            "open_questions": [],
+            "next_step": None,
+            "checked_sources": {},
+            "finding_counts": finding_counts,
+            "closed_at": None,
+            "closed_summary": None,
+            "owner": os.environ.get("HERMES_AGENT_ID", ""),
+            "acl": [],
+            "summary_l1": [],
+            "summary_l2": "",
+            "coordination": {"version": 1, "items": []},
+        }
+        for key in _IMPORTED_MANIFEST_FIELDS:
+            if key in src_manifest:
+                new_manifest[key] = src_manifest[key]
         new_manifest["imported_from"] = original_id
         if new_title:
             new_manifest["title"] = new_title
@@ -1731,16 +1851,8 @@ def investigation_import(
         inv_dir = _inv_dir(new_id)
         _save_manifest(new_manifest)
 
-        findings = data.get("findings") or []
-        if not isinstance(findings, list):
-            findings = []
-
         findings_path = inv_dir / "findings.jsonl"
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-            f = dict(finding)
-            f["investigation_id"] = new_id
+        for f in new_findings:
             _append_jsonl(findings_path, f)
 
         conflicts = data.get("conflicts")
@@ -1748,6 +1860,11 @@ def investigation_import(
             conflicts_path = inv_dir / "conflicts.jsonl"
             for entry in conflicts:
                 if isinstance(entry, dict):
+                    entry = dict(entry)
+                    entry["investigation_id"] = new_id
+                    for ref_key in ("finding_id_a", "finding_id_b"):
+                        if ref_key in entry:
+                            entry[ref_key] = _remap_ref(entry[ref_key], id_map)
                     _append_jsonl(conflicts_path, entry)
 
         entities = data.get("entities")
@@ -1755,17 +1872,43 @@ def investigation_import(
             entities_path = inv_dir / "entities.jsonl"
             for entry in entities:
                 if isinstance(entry, dict):
+                    entry = dict(entry)
+                    if "finding_refs" in entry:
+                        entry["finding_refs"] = _remap_ref(entry["finding_refs"], id_map)
                     _append_jsonl(entities_path, entry)
+
+        # Replay the lifecycle logs onto the new ids. Rows naming a finding the
+        # bundle does not carry are dropped: they cannot refer to anything here.
+        replayed = {}
+        for key, filename in _BUNDLE_LIFECYCLE_LOGS.items():
+            rows = data.get(key)
+            replayed[key] = 0
+            if not isinstance(rows, list):
+                continue
+            log_path = inv_dir / filename
+            for entry in rows:
+                if not isinstance(entry, dict):
+                    continue
+                fid = str(entry.get("finding_id") or "")
+                if fid not in id_map:
+                    continue
+                entry = dict(entry)
+                entry["finding_id"] = id_map[fid]
+                if "investigation_id" in entry:
+                    entry["investigation_id"] = new_id
+                if "seed_id" in entry:
+                    entry["seed_id"] = _remap_ref(entry["seed_id"], id_map)
+                _append_jsonl(log_path, entry)
+                replayed[key] += 1
 
         # Re-index findings into Qdrant (fail-open).
         qdrant_indexed = 0
+        qdrant_failed = 0
         import_ts = int(datetime.now(timezone.utc).timestamp())
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
+        for finding in new_findings:
             text = str(finding.get("text") or "").strip()
-            finding_id = str(finding.get("id") or "")
-            if not text or not finding_id:
+            finding_id = finding["id"]
+            if not text:
                 continue
             try:
                 # Index the whole finding, as the native store path does
@@ -1786,17 +1929,27 @@ def investigation_import(
                     # so a reader can tell a real age from a stand-in.
                     payload["created_at_ts"] = import_ts
                     payload["age_source"] = "imported"
-                _qdrant_upsert(finding_id, text, payload)
-                qdrant_indexed += 1
+                # _qdrant_upsert swallows its own failures; only True means written.
+                if _qdrant_upsert(finding_id, text, payload) is True:
+                    qdrant_indexed += 1
+                else:
+                    qdrant_failed += 1
             except Exception as exc:
+                qdrant_failed += 1
                 logger.debug("investigation_import: qdrant upsert skipped for %s: %s", finding_id, exc)
 
         return json.dumps({
             "imported": True,
             "new_investigation_id": new_id,
             "original_investigation_id": original_id,
-            "findings_imported": len(findings),
+            "schema_version": schema_version,
+            "findings_imported": len(new_findings),
+            "skipped_invalid": skipped_invalid,
+            "retractions_imported": replayed["retractions"],
+            "resolutions_imported": replayed["finding_updates"],
+            "verifications_imported": replayed["finding_verifications"],
             "qdrant_indexed": qdrant_indexed,
+            "qdrant_failed": qdrant_failed,
         })
     except Exception as exc:
         logger.warning("investigation_import failed: %s", exc)

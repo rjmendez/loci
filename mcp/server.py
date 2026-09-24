@@ -2763,19 +2763,61 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
     return "new"
 
 
+_DOCS_INGEST_MAX_FILES = 500
+_DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
+
+
+def _docs_ingest_roots() -> list[Path]:
+    """Roots docs_ingest_indexer may read under: ``LOCI_DOCS_ROOTS``
+    (``os.pathsep``-separated), else the code root. Re-read each call."""
+    raw = os.environ.get("LOCI_DOCS_ROOTS", "")
+    roots = []
+    for part in raw.split(os.pathsep):
+        if part.strip():
+            try:
+                roots.append(Path(part.strip()).expanduser().resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return roots or [_code_root()]
+
+
+def _docs_ingest_confined(p: Path, roots: list[Path]) -> Optional[Path]:
+    """``p`` resolved (symlinks included) if it stays under a docs root, else None."""
+    try:
+        resolved = p.resolve(strict=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return resolved if any(resolved.is_relative_to(r) for r in roots) else None
+
+
 def _docs_ingest_targets(document_path: str) -> list[Path]:
-    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid."""
+    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid.
+
+    Only paths under a docs root (``_docs_ingest_roots``) are read, and each file
+    is checked after symlink resolution: a ``notes.md`` link to a secret outside
+    the roots, or to a non-doc file, is skipped. At most _DOCS_INGEST_MAX_FILES."""
+    roots = _docs_ingest_roots()
     p = Path(document_path).expanduser()
-    if not p.exists():
+    if not p.is_absolute():
+        p = _code_root() / p
+    if _docs_ingest_confined(p, roots) is None:
         return []
-    doc_exts = {".md", ".markdown", ".txt"}
+
+    def _ok(x: Path) -> bool:
+        target = _docs_ingest_confined(x, roots)
+        return (
+            target is not None and target.is_file()
+            and x.suffix.lower() in _DOCS_INGEST_EXTS
+            and target.suffix.lower() in _DOCS_INGEST_EXTS
+        )
+
     if p.is_file():
-        return [p] if p.suffix.lower() in doc_exts else []
+        return [p] if _ok(p) else []
     if p.is_dir():
         return sorted(
-            {x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in doc_exts},
+            {x for x in p.rglob("*") if x.is_file() and _ok(x)},
             key=lambda item: str(item),
-        )
+        )[:_DOCS_INGEST_MAX_FILES]
     return []
 
 
@@ -2787,11 +2829,21 @@ def docs_ingest_indexer(
     source: str = "docs_ingest_indexer",
     confidence: str = "medium",
 ) -> str:
-    """Index markdown or text docs into the standard Loci investigation store with provenance."""
+    """Index markdown or text docs into the standard Loci investigation store with provenance.
+
+    Only documents under the docs roots (``LOCI_DOCS_ROOTS``, ``os.pathsep``-separated;
+    default: the code root) are read, symlink targets included. Indexed findings are
+    tagged ``model_asserted``: the tool verifies which bytes it read (sha256), not
+    what the document claims, so its content is not independent evidence.
+    """
     targets = _docs_ingest_targets(document_path)
     if not targets:
         return json.dumps({
-            "error": f"No readable markdown/text documents found under: {document_path}",
+            "error": (
+                f"No readable markdown/text documents found under: {document_path} "
+                f"(only paths under the docs roots {[str(r) for r in _docs_ingest_roots()]} are read; "
+                "set LOCI_DOCS_ROOTS to widen them)"
+            ),
             "stored": 0,
             "investigation_id": investigation_id,
         })
@@ -2826,8 +2878,12 @@ def docs_ingest_indexer(
                 "document_sha256": content_hash,
                 "content_length": len(raw),
                 "ingested_at": _now(),
+                # The hash proves which bytes were read, not that their claims hold.
+                "content_verified": False,
             },
-            "evidence_provenance_tier": "tool_verified",
+            # Document text is an unverified claim of unknown authorship, so it takes
+            # the non-independent tier rather than tool_verified.
+            "evidence_provenance_tier": MODEL_ASSERTED,
         }
         if not summary_only:
             metadata["content_excerpt"] = raw[:1200]
@@ -2852,7 +2908,7 @@ def docs_ingest_indexer(
             confidence=confidence,
             tags=["docs", "markdown", "loci-index"],
             metadata=metadata,
-            evidence_provenance_tier="tool_verified",
+            evidence_provenance_tier=MODEL_ASSERTED,
         ))
         records.append({
             "path": str(doc_path),
@@ -4360,6 +4416,7 @@ def investigation_search(
     include_retracted: bool = False,
     min_confidence: str = "low",
     resolution: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Search findings by similarity.
@@ -4382,11 +4439,32 @@ def investigation_search(
                     open/fixed/intentional/wontfix/superseded, only findings in that
                     resolution state are returned. Omit (default) to return all.
                     Each result row surfaces its ``resolution`` (absent -> "open").
+        requesting_agent_id: Optional agent_id of the caller. Rows from an
+                    investigation with a non-empty ACL that the caller is neither
+                    owner nor member of are dropped and counted under
+                    ``excluded_acl``.
 
     Returns:
         JSON list of matching findings with investigation context.
     """
     min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
+
+    _acl_denied_by_inv: dict[str, Optional[str]] = {}
+
+    def _acl_denied(inv_id: str) -> Optional[str]:
+        if inv_id not in _acl_denied_by_inv:
+            try:
+                manifest = _load_manifest(inv_id) if inv_id else None
+            except Exception:  # noqa: BLE001 — a malformed row id has no manifest, hence no ACL
+                manifest = None
+            _acl_denied_by_inv[inv_id] = (
+                inv_store._acl_access_denied(manifest, requesting_agent_id) if manifest else None
+            )
+        return _acl_denied_by_inv[inv_id]
+
+    if investigation_id and _acl_denied(str(investigation_id)):
+        return json.dumps({"error": "permission_denied", "detail": _acl_denied(str(investigation_id))})
+    _excluded_acl = {"n": 0}
 
     # Per-dir fail-safe: a malformed dir is reported, never disables filtering.
     _rfilter = (
@@ -4429,6 +4507,9 @@ def investigation_search(
     def _add_row(row: dict) -> None:
         if _rfilter is not None and _rfilter.is_retracted(row):
             _excluded_retracted.add(_rfilter.finding_key(row))
+            return
+        if _acl_denied(str(row.get("investigation_id") or "")):
+            _excluded_acl["n"] += 1
             return
         key = "|".join([
             str(row.get("investigation_id", "")),
@@ -4481,9 +4562,13 @@ def investigation_search(
 
     _rfilter_status = _rfilter.status() if _rfilter is not None else {"status": "ok"}
     if not deduped:
-        return _search_empty_response(
+        empty = _search_empty_response(
             qdrant, mnemo_enabled, len(_excluded_retracted), include_retracted, _rfilter_status
         )
+        if _excluded_acl["n"]:
+            # Everything matched was withheld by an ACL; say so rather than "no matches".
+            empty = json.dumps({**json.loads(empty), "excluded_acl": _excluded_acl["n"]}, indent=2)
+        return empty
 
     mode = "mnemo_primary"
     if qdrant.get("ok"):
@@ -4503,6 +4588,7 @@ def investigation_search(
         "mode": mode,
         "results": deduped[: max(1, min(limit, 200))],
         "excluded_retracted": len(_excluded_retracted),
+        **({"excluded_acl": _excluded_acl["n"]} if _excluded_acl["n"] else {}),
         "include_retracted": include_retracted,
         "retraction_filter": _rfilter_status,
         "resolution_filter": resolution,

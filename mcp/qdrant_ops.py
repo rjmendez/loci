@@ -567,14 +567,18 @@ def _embed_uncached(text: str) -> list[float] | None:
     return _embed(text, use_cache=False)
 
 
-def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
-    """Store a point with dense + sparse vectors. Fails silently."""
+def _qdrant_upsert(point_id: str, text: str, payload: dict) -> bool:
+    """Store a point with dense + sparse vectors. Fails silently.
+
+    Returns True only once the upsert call succeeded, so a caller that counts
+    indexed points can tell a written point from a swallowed failure.
+    """
     client, col = _get_qdrant()
     if client is None:
-        return
+        return False
     dense_vec = _embed(text)
     if dense_vec is None:
-        return
+        return False
     sparse_vec = _embed_sparse(text)
     # Stamp multi-tenancy fields if not already set by the caller.
     _agent_id  = os.environ.get("HERMES_AGENT_ID", "")
@@ -594,6 +598,8 @@ def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
         )
     except Exception as exc:
         logger.warning("Qdrant upsert failed — finding stored in JSONL but not indexed: %s", exc)
+        return False
+    return True
 
 
 def _qdrant_degraded_mode(enabled: bool, available: bool, errors, query_success: bool) -> tuple[bool, str | None]:
