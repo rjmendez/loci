@@ -1,9 +1,9 @@
-"""Characterization tests for mlops/loop.py — the unattended nightly MLOps loop.
+"""Contract tests for mlops/loop.py — the unattended nightly MLOps loop.
 
-These tests pin the CURRENT behaviour of the module, bugs included. They are a
-safety net for a later refactor, not a specification of what the loop *should*
-do. Where a test pins something that is arguably wrong, the docstring says so
-and the finding is reported separately.
+These specify what the loop must do. They used to be characterization tests
+that pinned the behaviour of the day, bugs included (a HOLD counted as a
+promotion, dry runs that wrote files, failures that never reached FAILED_STEPS
+or ALERTS); those pins were replaced by the contract the code now meets.
 
 No external services are used: every subprocess call, every HTTP probe and
 every dynamic import performed by the loop is replaced with an in-process fake.
@@ -11,6 +11,7 @@ every dynamic import performed by the loop is replaced with an in-process fake.
 
 import json
 import os
+import shutil
 import subprocess
 import stat
 import time
@@ -25,6 +26,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import mlops.loop as loop  # noqa: E402
+
+# The real step functions, captured before the mainenv fixture stubs them, for
+# tests that drive a step through main() rather than a hand-written return.
+REAL_RUN_MONITOR = loop._run_monitor
+REAL_STEPS = {name: getattr(loop, name) for name in (
+    "_rebuild_dataset", "_retrain", "_run_canary", "_run_decay", "_run_monitor",
+    "_run_embedding_drift", "_run_sft_bake", "_run_active_learn",
+    "_emit_embedding_trigger")}
+
+# Explicit, not whatever the importing shell exported: comparing against the
+# import-time loop.DEFAULT_OLLAMA made these tests depend on the environment
+# pytest was launched from.
+OLLAMA_URL = "http://ollama.test:11434"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -56,11 +70,20 @@ class Runner:
     def on_call(self, script_basename, fn):
         self.side_effects[script_basename] = fn
 
+    def on_call_cmd(self, script_basename, fn):
+        """Like on_call, but the side effect receives the argv — for a fake child
+        that writes where its --out flag points, as the real one does."""
+        self.side_effects[script_basename] = ("cmd", fn)
+
     def __call__(self, cmd, *a, **kw):
         self.calls.append(list(cmd))
         key = os.path.basename(cmd[1]) if len(cmd) > 1 else ""
         if key in self.side_effects:
-            self.side_effects[key]()
+            fx = self.side_effects[key]
+            if isinstance(fx, tuple):
+                fx[1](list(cmd))
+            else:
+                fx()
         res = self.results.get(key, FakeResult(0))
         if isinstance(res, list):
             res = res.pop(0) if res else FakeResult(0)
@@ -164,16 +187,17 @@ def test_load_state_empty_file_falls_back_to_default(env):
     assert loop._load_state() == DEFAULT_STATE
 
 
-def test_load_state_returns_partial_dict_verbatim_without_backfill(env):
-    """Any dict that parses is returned as-is — missing keys are NOT filled in."""
-    (env.mlops / "loop_state.json").write_text('{"total_promotions": 5}')
-    assert loop._load_state() == {"total_promotions": 5}
+def test_load_state_backfills_missing_keys_and_keeps_stored_ones(env):
+    """main() indexes the default keys directly; a file from an older schema used
+    to come back verbatim and KeyError out of the nightly's first line."""
+    (env.mlops / "loop_state.json").write_text('{"total_promotions": 5, "extra": 1}')
+    assert loop._load_state() == {**DEFAULT_STATE, "total_promotions": 5, "extra": 1}
 
 
-def test_load_state_does_not_type_check_returns_list(env):
-    """A JSON document that is not an object is returned unchanged."""
+def test_load_state_non_object_json_falls_back_to_default(env, capsys):
     (env.mlops / "loop_state.json").write_text("[1, 2, 3]")
-    assert loop._load_state() == [1, 2, 3]
+    assert loop._load_state() == DEFAULT_STATE
+    assert "is not a JSON object" in capsys.readouterr().out
 
 
 def test_save_state_writes_indent_2_json(env):
@@ -195,7 +219,7 @@ def test_save_state_keeps_the_old_state_when_the_write_dies(env):
     committed = {"last_dataset_size": 4200, "runs_seen": ["r1", "r2"],
                  "total_promotions": 3}
     loop._save_state(committed)
-    assert loop._load_state() == committed
+    assert loop._load_state() == {**DEFAULT_STATE, **committed}
 
     def half_write_text(self, data, *args, **kwargs):
         with open(self, "w") as fh:
@@ -211,7 +235,7 @@ def test_save_state_keeps_the_old_state_when_the_write_dies(env):
                               "runs_seen": ["r1", "r2", "r3"],
                               "total_promotions": 4})
 
-    assert loop._load_state() == committed
+    assert loop._load_state() == {**DEFAULT_STATE, **committed}
     assert (env.mlops / "loop_state.json").read_text() == json.dumps(committed, indent=2)
 
 
@@ -228,12 +252,12 @@ def test_append_history_creates_file_and_appends_one_line_per_call(env):
     assert [json.loads(l)["n"] for l in lines] == [1, 2]
 
 
-def test_append_history_raises_when_parent_dir_missing(env, monkeypatch):
-    """History is opened in append mode with no mkdir — a missing mlops/ dir
-    takes down the very last step of the nightly run."""
+def test_append_history_creates_a_missing_parent_dir(env, monkeypatch):
+    """A missing directory used to raise FileNotFoundError out of the very last
+    step of the nightly run."""
     monkeypatch.setattr(loop, "HISTORY_FILE", env.tmp / "nope" / "h.jsonl")
-    with pytest.raises(FileNotFoundError):
-        loop._append_history({"n": 1})
+    loop._append_history({"n": 1})
+    assert json.loads((env.tmp / "nope" / "h.jsonl").read_text()) == {"n": 1}
 
 
 def test_append_history_propagates_non_serialisable_record(env):
@@ -272,14 +296,14 @@ def test_ollama_ok_false_on_any_exception(env, monkeypatch, exc):
     assert loop._ollama_ok("http://h") is False
 
 
-def test_ollama_ok_does_not_strip_trailing_slash(env, monkeypatch):
-    """Only the DEFAULT_OLLAMA constant is rstrip()'d; a caller-supplied base
-    with a trailing slash produces a double slash in the probe URL."""
+def test_ollama_ok_normalises_a_trailing_slash(env, monkeypatch):
+    """A caller-supplied --ollama with a trailing slash used to probe
+    http://h//api/tags."""
     seen = {}
     monkeypatch.setattr(loop.urllib.request, "urlopen",
                         lambda url, timeout=None: seen.setdefault("url", url))
-    loop._ollama_ok("http://h/")
-    assert seen["url"] == "http://h//api/tags"
+    assert loop._ollama_ok("http://h/") is True
+    assert seen["url"] == "http://h/api/tags"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,16 +325,19 @@ def test_discover_runs_no_matches_returns_empty_list(env):
     assert loop._discover_runs(str(env.tmp / "nothing" / "*" / "f.jsonl"), []) == []
 
 
-def test_discover_runs_does_not_dedupe_within_a_batch(env):
-    """Run identity is only the parent directory *basename*, and the result list
-    is not de-duplicated, so two same-named session dirs under different roots
-    are reported twice (and both get appended to runs_seen)."""
+def test_discover_runs_reports_a_run_id_once(env):
+    """Run identity is the parent directory basename, so two same-named session
+    dirs under different roots are ONE run. Reporting it twice counted double
+    toward --min-new-runs and appended it twice to runs_seen."""
     for root in ("a", "b"):
         d = env.tmp / root / "dt-loci-1"
         d.mkdir(parents=True)
         (d / "findings.jsonl").write_text("{}\n")
-    g = str(env.tmp / "*" / "dt-loci-1" / "findings.jsonl")
-    assert loop._discover_runs(g, []) == ["dt-loci-1", "dt-loci-1"]
+    d = env.tmp / "a" / "dt-loci-2"
+    d.mkdir(parents=True)
+    (d / "findings.jsonl").write_text("{}\n")
+    g = str(env.tmp / "*" / "dt-loci-*" / "findings.jsonl")
+    assert loop._discover_runs(g, []) == ["dt-loci-1", "dt-loci-2"]
 
 
 def test_discover_runs_seen_may_be_any_iterable_of_ids(env):
@@ -441,18 +468,26 @@ def test_retrain_returns_parsed_metrics(env):
     assert loop._retrain("g", "o", False) == {"decision": "PROMOTE", "cv_f1_mean": 0.9}
 
 
-def test_retrain_returns_stale_metrics_when_train_writes_nothing(env):
-    """train.py exiting 0 without writing train_metrics.json makes the loop
-    re-read *last* night's metrics and act on them again."""
+def test_retrain_ignores_last_nights_metrics_when_train_writes_nothing(env):
+    """train.py exiting 0 without writing train_metrics.json used to make the
+    loop re-read LAST night's file and act on its PROMOTE again."""
     _metrics_path(env).write_text('{"decision": "PROMOTE", "stale": true}')
-    assert loop._retrain("g", "o", False) == {"decision": "PROMOTE", "stale": True}
+    assert loop._retrain("g", "o", False) is None
+    assert loop.FAILED_STEPS == ["train.py"]
 
 
-def test_retrain_propagates_malformed_metrics_json(env):
-    """Unlike _load_state, a corrupt metrics file is not tolerated."""
-    _metrics_path(env).write_text("{oops")
-    with pytest.raises(json.JSONDecodeError):
-        loop._retrain("g", "o", False)
+def test_retrain_dry_run_writing_no_metrics_is_not_a_failure(env):
+    """train.py --dry-run writes no metrics by design."""
+    _metrics_path(env).write_text('{"decision": "PROMOTE", "stale": true}')
+    assert loop._retrain("g", "o", True) is None
+    assert loop.FAILED_STEPS == []
+
+
+def test_retrain_malformed_metrics_is_a_failed_step_not_a_crash(env):
+    """A corrupt metrics file raised JSONDecodeError out of main()."""
+    env.run.on_call("train.py", lambda: _metrics_path(env).write_text("{oops"))
+    assert loop._retrain("g", "o", False) is None
+    assert loop.FAILED_STEPS == ["train.py"]
 
 
 def test_retrain_does_not_re_print_stdout_after_the_fact(env, capsys):
@@ -513,9 +548,28 @@ def test_run_canary_exit_2_is_a_rollback_recommendation_not_silence(env, capsys)
 
 def test_run_canary_an_unexpected_exit_is_a_failed_step(env):
     (env.mlops / "grounding" / "candidate.joblib").write_text("m")
-    env.run.set("canary.py", FakeResult(3, stderr="Traceback\nValueError: x"))
+    env.run.set("canary.py", FakeResult(4, stderr="Traceback\nValueError: x"))
     loop._run_canary("g", "o", False)
     assert "canary" in loop.FAILED_STEPS
+
+
+def test_run_canary_hold_exit_is_neither_an_alert_nor_a_failure(env, capsys):
+    """HOLD is canary's ordinary 'no' (exit 3). It used to share exit 0 with
+    PROMOTE; now it has its own code and is reported as what it is."""
+    (env.mlops / "grounding" / "candidate.joblib").write_text("m")
+    env.run.set("canary.py", FakeResult(loop.CANARY_HOLD, stdout="hold"))
+    assert loop._run_canary("g", "o", False) == {"exit_code": 3, "stdout": "hold"}
+    assert "canary HOLD" in capsys.readouterr().out
+    assert loop.ALERTS == [] and loop.FAILED_STEPS == []
+
+
+def test_loop_and_canary_agree_on_the_exit_contract():
+    from mlops.grounding import canary as canary_mod
+    assert (loop.CANARY_OK, loop.CANARY_DRIFT, loop.CANARY_ROLLBACK, loop.CANARY_HOLD) == (
+        canary_mod.EXIT_PROMOTE, canary_mod.EXIT_DRIFT, canary_mod.EXIT_ROLLBACK,
+        canary_mod.EXIT_HOLD)
+    assert len({0, 1, 2, 3}) == len({canary_mod.EXIT_PROMOTE, canary_mod.EXIT_DRIFT,
+                                     canary_mod.EXIT_ROLLBACK, canary_mod.EXIT_HOLD})
 
 
 def test_run_canary_truncates_stored_stdout_to_500(env):
@@ -533,11 +587,12 @@ def _good_sft(env, nbytes=200):
     (env.mlops / "finetune" / "data" / "sft_pairs.jsonl").write_text("x" * nbytes)
 
 
-def test_sft_bake_creates_data_dir_and_runs_collect_then_format(env):
+def test_sft_bake_creates_data_dir_and_runs_collect_format_then_bake(env):
     env.run.on_call("format_sft.py", lambda: _good_sft(env))
-    assert loop._run_sft_bake("http://o", dry_run=True) is True
+    assert loop._run_sft_bake("http://o", dry_run=False) is True
     assert (env.mlops / "finetune" / "data").is_dir()
-    assert env.run.scripts() == ["collect.py", "format_sft.py"]
+    assert env.run.scripts() == ["collect.py", "format_sft.py", "train_lora.py"]
+    assert loop.FAILED_STEPS == []
 
 
 def test_sft_bake_collect_failure_short_circuits(env, capsys):
@@ -570,10 +625,14 @@ def test_sft_bake_size_exactly_100_bytes_passes_threshold(env):
     assert env.run.scripts()[-1] == "train_lora.py"
 
 
-def test_sft_bake_dry_run_returns_true_without_baking(env):
-    env.run.on_call("format_sft.py", lambda: _good_sft(env))
-    assert loop._run_sft_bake("o", dry_run=True) is True
-    assert "train_lora.py" not in env.run.scripts()
+def test_sft_bake_dry_run_runs_and_writes_nothing(env):
+    """collect.py and format_sft.py write into mlops/finetune/data; a dry run
+    used to run both and report the step as a success."""
+    shutil.rmtree(env.mlops / "finetune")
+    assert loop._run_sft_bake("o", dry_run=True) is False
+    assert env.run.calls == []
+    assert not (env.mlops / "finetune").exists()
+    assert loop.FAILED_STEPS == []
 
 
 def test_sft_bake_argv_of_real_bake(env):
@@ -588,10 +647,14 @@ def test_sft_bake_argv_of_real_bake(env):
                                     "--backend", "ollama-modelfile"]
 
 
-def test_sft_bake_returns_false_when_bake_fails(env):
+def test_sft_bake_failure_is_a_failed_step(env, capsys):
+    """A failed bake returned False and nothing else: it never reached
+    FAILED_STEPS, so the run exited 0 and said 'done'."""
     env.run.on_call("format_sft.py", lambda: _good_sft(env))
-    env.run.set("train_lora.py", FakeResult(1))
+    env.run.set("train_lora.py", FakeResult(1, stderr="Error: model not found"))
     assert loop._run_sft_bake("o", False) is False
+    assert loop.FAILED_STEPS == ["SFT bake"]
+    assert "train_lora.py bake failed (exit 1): Error: model not found" in capsys.readouterr().out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -648,27 +711,49 @@ def test_run_decay_import_failure_returns_empty_dict(env, monkeypatch):
     assert loop._run_decay("/db", False) == {}
 
 
-def test_run_decay_missing_mean_retention_key_uses_zero_default(env, monkeypatch, capsys):
+def test_run_decay_missing_mean_retention_key_is_reported_as_unknown(env, monkeypatch, capsys):
+    """It printed 0.000 -- total loss -- for a value that was simply absent."""
     install_fake(monkeypatch, "memory.decay",
                  apply_decay=lambda **k: {"n_rows": 1, "n_decayed": 0})
     assert loop._run_decay("/db", False) == {"n_rows": 1, "n_decayed": 0}
-    assert "mean_retention=0.000" in capsys.readouterr().out
+    assert "mean_retention=n/a" in capsys.readouterr().out
 
 
-def test_run_decay_null_mean_retention_discards_successful_result(env, monkeypatch, capsys):
-    """BUG pinned: the log line formats mean_retention with ``:.3f`` *inside* the
-    try block. A None value (a real possibility for an empty table) raises
-    TypeError, is swallowed by the bare ``except Exception``, and a decay that
-    actually ran is reported to the caller as ``{}``."""
-    install_fake(monkeypatch, "memory.decay",
-                 apply_decay=lambda **k: {"n_rows": 0, "n_decayed": 0, "mean_retention": None})
-    assert loop._run_decay("/db", False) == {}
-    assert "decay step failed" in capsys.readouterr().out
+def test_run_decay_null_mean_retention_keeps_the_successful_result(env, monkeypatch, capsys):
+    """Formatting a None mean_retention with :.3f used to raise inside the try,
+    so a decay that had run was reported as a failure returning {}."""
+    stats = {"n_rows": 0, "n_decayed": 0, "mean_retention": None}
+    install_fake(monkeypatch, "memory.decay", apply_decay=lambda **k: dict(stats))
+    assert loop._run_decay("/db", False) == stats
+    assert "mean_retention=n/a" in capsys.readouterr().out
+    assert loop.FAILED_STEPS == []
 
 
-def test_run_decay_non_dict_return_is_swallowed(env, monkeypatch):
+def test_run_decay_error_stub_is_a_failed_step(env, monkeypatch, capsys):
+    """apply_decay reports a missing DB as {'error': ...}. That printed
+    'n_rows=0 n_decayed=0' and counted as a green step."""
+    stub = {"error": "db not found: /nope.db", "n_rows": 0, "n_decayed": 0}
+    install_fake(monkeypatch, "memory.decay", apply_decay=lambda **k: dict(stub))
+    assert loop._run_decay("/nope.db", True) == stub
+    assert loop.FAILED_STEPS == ["decay"]
+    assert "decay step failed: db not found: /nope.db" in capsys.readouterr().out
+
+
+def test_run_decay_on_a_missing_db_is_a_failed_step_with_the_real_decay(env, tmp_path,
+                                                                        monkeypatch):
+    """Same, through the real apply_decay rather than a stub of it."""
+    monkeypatch.setattr(loop, "MLOPS", Path(loop.__file__).resolve().parent)
+    monkeypatch.delitem(sys.modules, "memory", raising=False)
+    monkeypatch.delitem(sys.modules, "memory.decay", raising=False)
+    out = loop._run_decay(str(tmp_path / "absent.db"), True)
+    assert out["error"] == f"db not found: {tmp_path / 'absent.db'}"
+    assert loop.FAILED_STEPS == ["decay"]
+
+
+def test_run_decay_non_dict_return_is_a_failed_step(env, monkeypatch):
     install_fake(monkeypatch, "memory.decay", apply_decay=lambda **k: None)
     assert loop._run_decay("/db", False) == {}
+    assert loop.FAILED_STEPS == ["decay"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -697,13 +782,37 @@ def test_run_monitor_returns_result_and_forwards_kwargs(env, monkeypatch, capsys
     assert "monitor: drift=0.02 rollback_recommended=False" in capsys.readouterr().out
 
 
-def test_run_monitor_alerts_on_rollback_recommendation(env, monkeypatch, capsys):
+def test_run_monitor_rollback_recommendation_reaches_alerts(env, monkeypatch, capsys):
+    """It used to be a bare print: ALERTS stayed empty, so the summary line and
+    loop_history said nothing needed a human."""
     (env.grounding / "grounding_bleed_clf.joblib").write_text("m")
     install_fake(monkeypatch, "mlops.grounding.canary",
                  monitor_live=lambda **k: {"drift": 9, "rollback_recommended": True})
     out = loop._run_monitor("g", "o", False)
     assert out["rollback_recommended"] is True
+    assert loop.ALERTS == ["monitor"]
+    assert loop.FAILED_STEPS == []
     assert "ALERT: rollback recommended" in capsys.readouterr().out
+
+
+def test_run_monitor_without_a_rollback_raises_no_alert(env, monkeypatch):
+    (env.grounding / "grounding_bleed_clf.joblib").write_text("m")
+    install_fake(monkeypatch, "mlops.grounding.canary",
+                 monitor_live=lambda **k: {"drift": True, "rollback_recommended": False})
+    loop._run_monitor("g", "o", False)
+    assert loop.ALERTS == [] and loop.FAILED_STEPS == []
+
+
+def test_main_monitor_rollback_is_in_the_history_alerts(mainenv, monkeypatch):
+    e = mainenv
+    (e.grounding / "grounding_bleed_clf.joblib").write_text("m")
+    monkeypatch.setattr(loop, "_run_monitor", REAL_RUN_MONITOR)
+    install_fake(monkeypatch, "mlops.grounding.canary",
+                 monitor_live=lambda **k: {"drift": True, "rollback_recommended": True})
+    assert e.main() == 0
+    rec = read_history(e)[0]
+    assert rec["alerts"] == ["monitor"]
+    assert rec["failed_steps"] == []
 
 
 def test_run_monitor_swallows_exception(env, monkeypatch, capsys):
@@ -723,14 +832,14 @@ def test_run_monitor_import_error_degrades_to_empty(env, monkeypatch):
     assert loop._run_monitor("g", "o", False) == {}
 
 
-def test_run_monitor_sys_path_insert_is_a_no_op_for_the_import_it_guards(env, monkeypatch):
-    """BUG pinned: it prepends MLOPS/grounding to sys.path but then imports the
-    absolute path ``mlops.grounding.canary``, which needs REPO on sys.path
-    instead. The inserted entry can never satisfy that import."""
+def test_run_monitor_does_not_grow_sys_path(env, monkeypatch):
+    """It prepended MLOPS/grounding on every call, which could never satisfy the
+    absolute ``mlops.grounding.canary`` import it guarded."""
     install_fake(monkeypatch, "mlops.grounding.canary", monitor_live=lambda **k: {})
     (env.grounding / "grounding_bleed_clf.joblib").write_text("m")
+    before = list(sys.path)
     loop._run_monitor("g", "o", False)
-    assert sys.path[0] == str(env.mlops / "grounding")
+    assert sys.path == before
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -802,8 +911,10 @@ def test_embedding_drift_malformed_result_json_falls_back_to_exit_code(env):
 
 def _measured_drift(env, exceeded=True):
     """drift.py writes --out only on the path where it actually measured."""
-    env.run.on_call("drift.py", lambda: (env.mlops / "embedding" / "drift_result.json")
-                    .write_text('{"exceeded": %s}' % ("true" if exceeded else "false")))
+    def write(cmd):
+        Path(cmd[cmd.index("--out") + 1]).write_text(
+            '{"exceeded": %s}' % ("true" if exceeded else "false"))
+    env.run.on_call_cmd("drift.py", write)
 
 
 def test_embedding_drift_exit_1_with_a_measurement_emits_contrastive_script(env, capsys):
@@ -830,14 +941,37 @@ def test_embedding_drift_exit_1_without_a_measurement_is_a_failure_not_drift(env
     assert "drift detected" not in out
 
 
-def test_embedding_drift_dry_run_alerts_but_emits_nothing(env, capsys):
+def test_embedding_drift_dry_run_measures_alerts_and_writes_nothing(env, capsys):
+    """A dry run still measures, into a scratch file, and reads the result back.
+    It used to write drift_result.json into the repo."""
     _drift_script(env)
     (env.mlops / "embedding" / "anchor.npz").write_text("a")
     env.run.set("drift.py", FakeResult(1))
     _measured_drift(env)
-    loop._run_embedding_drift("o", dry_run=True)
-    assert not (env.mlops / "run_contrastive.sh").exists()
+    before = sorted(p.name for p in env.mlops.rglob("*"))
+    assert loop._run_embedding_drift("o", dry_run=True) == {"exceeded": True}
+    out_arg = Path(env.run.calls[0][env.run.calls[0].index("--out") + 1])
+    assert not out_arg.is_relative_to(env.tmp), "the dry run pointed --out into the repo"
+    assert not out_arg.exists(), "the scratch result was left behind"
+    assert sorted(p.name for p in env.mlops.rglob("*")) == before
+    assert loop.ALERTS == ["embedding drift"]
     assert "embedding drift detected" in capsys.readouterr().out
+
+
+def test_embedding_drift_live_run_writes_its_result_into_the_repo(env):
+    _drift_script(env)
+    (env.mlops / "embedding" / "anchor.npz").write_text("a")
+    _measured_drift(env, exceeded=False)
+    assert loop._run_embedding_drift("o", dry_run=False) == {"exceeded": False}
+    assert json.loads((env.mlops / "embedding" / "drift_result.json").read_text()) == {
+        "exceeded": False}
+
+
+def test_embedding_drift_dry_run_does_not_build_an_anchor(env, capsys):
+    _drift_script(env)
+    assert loop._run_embedding_drift("o", dry_run=True) == {}
+    assert env.run.calls == []
+    assert "not built" in capsys.readouterr().out
 
 
 def test_embedding_drift_exit_2_does_not_emit(env):
@@ -982,7 +1116,7 @@ def mainenv(env, monkeypatch):
     # Hermetic: without this the suite reads the developer's ~/.loci/backends.toml
     # and the asserted Ollama default becomes whatever that machine has configured.
     monkeypatch.setattr(loop, "_resolve_backends", lambda: {})
-    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("OLLAMA_BASE_URL", OLLAMA_URL + "/")
     monkeypatch.setattr(loop, "_ollama_ok", lambda base: rv["ollama_ok"])
     monkeypatch.setattr(loop, "_discover_runs", lambda g, seen: list(rv["new_runs"]))
     monkeypatch.setattr(loop, "_rebuild_dataset", lambda g, o: (
@@ -1139,27 +1273,42 @@ def test_main_missing_decision_key_defaults_to_hold(mainenv):
     assert e.calls["canary"] == []
 
 
-def test_main_promotion_counter_increments_in_dry_run_but_is_not_persisted(mainenv, capsys):
+def test_main_canary_hold_is_not_a_promotion(mainenv, capsys):
+    """canary.py exited 0 for HOLD as well as PROMOTE, and main() counts a 0 as a
+    promotion — so every HOLD was recorded as promoted=True. HOLD now exits 3."""
+    e = mainenv
+    e.rv["retrain"] = {"decision": "PROMOTE"}
+    e.rv["canary"] = {"exit_code": loop.CANARY_HOLD}
+    assert e.main("--force") == 0
+    assert read_history(e)[0]["promoted"] is False
+    assert state_of(e)["total_promotions"] == 0
+    assert "PROMOTED" not in capsys.readouterr().out
+
+
+def test_main_dry_run_never_records_a_promotion(mainenv, capsys):
+    """A dry-run canary copies nothing, so nothing was promoted. It used to bump
+    the counter, print PROMOTED and write promoted=true to history."""
     e = mainenv
     e.rv["retrain"] = {"decision": "PROMOTE"}
     e.rv["canary"] = {"exit_code": 0}
     e.main("--force", "--dry-run")
+    out = capsys.readouterr().out
+    assert "PROMOTED" not in out
+    assert "would promote; nothing promoted" in out
     assert not (e.mlops / "loop_state.json").exists()
-    assert "total promotions: 1" in capsys.readouterr().out
-    assert read_history(e)[0]["promoted"] is True
+    assert not (e.mlops / "loop_history.jsonl").exists()
 
 
-def test_main_null_cv_f1_mean_in_metrics_crashes_the_loop(mainenv):
-    """BUG pinned: the train-decision log line formats cv_f1_mean with ``:.3f``
-    with only a *missing-key* default. A JSON null (which train.py can emit when
-    CV is skipped) raises TypeError out of main() — the nightly dies before the
-    decay / monitor / state-persist steps."""
+def test_main_null_cv_f1_mean_does_not_crash_the_loop(mainenv, capsys):
+    """train.py can write a JSON null for cv_f1_mean; formatting it with :.3f
+    raised TypeError out of main() before decay, monitor and the state save."""
     e = mainenv
     e.rv["retrain"] = {"decision": "HOLD", "cv_f1_mean": None}
-    with pytest.raises(TypeError):
-        e.main("--force")
-    assert not (e.mlops / "loop_state.json").exists()
-    assert read_history(e) == []
+    assert e.main("--force") == 0
+    assert "cv_f1=n/a" in capsys.readouterr().out
+    assert state_of(e)["total_loop_runs"] == 1
+    assert read_history(e)[0]["train_metrics"] == {"decision": "HOLD", "cv_f1_mean": None}
+    assert len(e.calls["decay"]) == 1 and len(e.calls["monitor"]) == 1
 
 
 # --- state bookkeeping --------------------------------------------------------
@@ -1187,25 +1336,30 @@ def test_main_runs_seen_untouched_when_not_retraining(mainenv):
     assert s["last_dataset_size"] == 0
 
 
-def test_main_runs_seen_is_appended_without_dedupe(mainenv):
+def test_main_runs_seen_records_each_run_once(mainenv):
     e = mainenv
-    seed_state(e, runs_seen=["dup"])
-    e.rv["new_runs"] = ["dup", "dup"]
+    seed_state(e, runs_seen=["old", "dup"])
+    e.rv["new_runs"] = ["dup", "new", "new"]
     e.main("--force")
-    assert state_of(e)["runs_seen"] == ["dup", "dup", "dup"]
+    assert state_of(e)["runs_seen"] == ["old", "dup", "new"]
 
 
-def test_main_consumes_new_data_signal_even_when_training_failed(mainenv):
-    """BUG pinned: last_dataset_size is advanced unconditionally inside the
-    retrain branch. When train.py fails (metrics None) the accumulated
-    new-pair delta is thrown away, so the next tick sees +0 pairs and will not
-    retry until another --min-new-pairs arrive."""
+@pytest.mark.xfail(strict=True, reason=(
+    "follow-up: a failed retrain must be retried. The rebuild marks the runs seen "
+    "and advances last_dataset_size before train.py's result is known, so the "
+    "next tick has neither new runs nor new pairs and never retrains."))
+def test_a_failed_retrain_is_retried_on_the_next_tick(mainenv):
     e = mainenv
     seed_state(e, last_dataset_size=0)
-    e.rv["retrain"] = None
+    e.rv["new_runs"] = ["n1", "n2"]
     e.rv["rebuild"] = 900
-    e.main("--force")
-    assert state_of(e)["last_dataset_size"] == 900
+    e.rv["retrain"] = None                 # train.py failed
+    e.main()
+    assert len(e.calls["retrain"]) == 1
+    e.rv["new_runs"] = []                  # nothing new since
+    e.rv["retrain"] = {"decision": "HOLD"}
+    e.main()
+    assert len(e.calls["retrain"]) == 2
 
 
 # Captured at import, before the mainenv fixture stubs it out: the two tests below
@@ -1268,22 +1422,17 @@ def test_main_dry_run_never_writes_state(mainenv):
     assert not (e.mlops / "loop_state.json").exists()
 
 
-def test_main_partial_state_file_raises_key_error(mainenv):
-    """BUG pinned: _load_state tolerates any JSON that parses, but main()
-    immediately indexes state['last_run'] / ['last_dataset_size'] /
-    ['runs_seen'] / ['total_promotions'] with []. A state file truncated to
-    ``{}`` (or written by an older schema) kills the nightly on line one."""
+@pytest.mark.parametrize("content", ["{}", "[]", '{"total_promotions": 4}'])
+def test_main_survives_a_partial_or_non_object_state_file(mainenv, content):
+    """A state file truncated to {} or written by an older schema raised
+    KeyError (a list: TypeError) on main()'s first line."""
     e = mainenv
-    (e.mlops / "loop_state.json").write_text("{}")
-    with pytest.raises(KeyError):
-        e.main()
-
-
-def test_main_list_state_file_raises_type_error(mainenv):
-    e = mainenv
-    (e.mlops / "loop_state.json").write_text("[]")
-    with pytest.raises(TypeError):
-        e.main()
+    (e.mlops / "loop_state.json").write_text(content)
+    assert e.main() == 0
+    s = state_of(e)
+    assert s["total_loop_runs"] == 1
+    assert s["total_promotions"] == (4 if "4" in content else 0)
+    assert len(read_history(e)) == 1
 
 
 # --- history ------------------------------------------------------------------
@@ -1307,21 +1456,21 @@ def test_main_history_record_shape(mainenv):
     assert rec["dry_run"] is False
 
 
-def test_main_history_is_written_even_in_dry_run(mainenv):
+def test_main_dry_run_appends_no_history(mainenv, capsys):
     e = mainenv
-    e.main("--dry-run")
-    assert read_history(e)[0]["dry_run"] is True
+    assert e.main("--dry-run") == 0
+    assert not (e.mlops / "loop_history.jsonl").exists()
+    assert "dry run: loop_history.jsonl not appended" in capsys.readouterr().out
 
 
-def test_main_history_dataset_size_is_the_pre_rebuild_count(mainenv):
-    """BUG pinned: history records ``current_size`` (measured before the
-    rebuild) while state records the post-rebuild size. loop_history.jsonl
-    therefore under-reports the dataset on exactly the nights that grew it."""
+def test_main_history_dataset_size_is_what_the_run_leaves_behind(mainenv):
+    """History used to record the pre-rebuild count while state recorded the
+    post-rebuild one, under-reporting the dataset on the nights that grew it."""
     e = mainenv
     write_dataset(e, 10)
     e.rv["rebuild"] = 999
     e.main("--force")
-    assert read_history(e)[0]["dataset_size"] == 10
+    assert read_history(e)[0]["dataset_size"] == 999
     assert state_of(e)["last_dataset_size"] == 999
 
 
@@ -1442,20 +1591,31 @@ def test_main_decay_cadence_uses_loop_count_modulo(mainenv, capsys):
     assert len(e.calls["decay"]) == 1
 
 
-def test_main_decay_every_zero_crashes_with_zero_division(mainenv):
-    """BUG pinned: --decay-every 0 is accepted by argparse and reaches
-    ``loop_count % 0``. An unattended run dies before decay, live-evo, monitor,
-    drift, SFT, state persist and history append."""
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_main_rejects_a_non_positive_decay_cadence_at_parse_time(mainenv, capsys, value):
+    """--decay-every 0 used to reach ``loop_count % 0`` mid-run and raise
+    ZeroDivisionError after the retrain, losing the night's state."""
     e = mainenv
-    with pytest.raises(ZeroDivisionError):
-        e.main("--decay-every", "0")
+    with pytest.raises(SystemExit) as exc:
+        e.main("--decay-every", value)
+    assert exc.value.code == 2
+    assert "must be a positive integer" in capsys.readouterr().err
+    assert e.calls["decay"] == [] and e.calls["rebuild"] == []
     assert read_history(e) == []
 
 
-def test_main_decay_receives_db_and_dry_run(mainenv):
+@pytest.mark.parametrize("flags,writes", [
+    ((), False),                             # the nightly default: report only
+    (("--decay-apply",), True),              # the one way to write
+    (("--decay-apply", "--dry-run"), False), # dry run beats apply
+    (("--dry-run",), False),
+])
+def test_main_decay_writes_only_with_decay_apply_and_no_dry_run(mainenv, flags, writes):
+    """The live Mnemosyne DB is written only when asked. The old test passed
+    --dry-run alone, so a loop that wrote unasked passed it too."""
     e = mainenv
-    e.main("--db", "/tmp/x.db", "--dry-run")
-    assert e.calls["decay"][0][0] == ("/tmp/x.db", True)
+    e.main("--db", "/tmp/x.db", *flags)
+    assert e.calls["decay"] == [(("/tmp/x.db", not writes), {})]
 
 
 # --- always-on steps ----------------------------------------------------------
@@ -1528,12 +1688,21 @@ def test_main_sft_state_not_advanced_on_failure(mainenv):
     assert state_of(e)["last_sft_bake"] is None
 
 
-def test_main_sft_bake_is_still_attempted_in_dry_run(mainenv):
-    """--dry-run is passed *down* into _run_sft_bake rather than gating it; the
-    step runs, only the state write is suppressed (by not saving state at all)."""
+def test_main_sft_bake_gets_the_run_time_ollama_url(mainenv):
+    """The URL is resolved when main() runs (env, trailing slash stripped), not
+    frozen at import. The old test compared against the import-time
+    loop.DEFAULT_OLLAMA and failed whenever the shell's env differed."""
+    e = mainenv
+    e.main()
+    assert e.calls["sft"] == [((OLLAMA_URL, False), {})]
+
+
+def test_main_sft_bake_is_not_run_in_dry_run(mainenv, capsys):
+    """collect/format write mlops/finetune/data; a dry run writes nothing."""
     e = mainenv
     e.main("--dry-run")
-    assert e.calls["sft"][0][0] == (loop.DEFAULT_OLLAMA, True)
+    assert e.calls["sft"] == []
+    assert "SFT bake skipped — dry run" in capsys.readouterr().out
     assert not (e.mlops / "loop_state.json").exists()
 
 
@@ -1619,12 +1788,13 @@ def test_main_embedding_trigger_skipped_within_cadence(mainenv):
     assert e.calls["emit"] == []
 
 
-def test_main_embedding_trigger_is_emitted_even_in_dry_run(mainenv):
-    """Unlike every other write, _emit_embedding_trigger is called before the
-    dry-run check; only the last_embedding_tune bookkeeping is suppressed."""
+def test_main_embedding_trigger_is_not_written_in_dry_run(mainenv, capsys):
+    """_emit_embedding_trigger used to run before the dry-run check and write
+    run_contrastive.sh on a dry run."""
     e = mainenv
     e.main("--dry-run")
-    assert len(e.calls["emit"]) == 1
+    assert e.calls["emit"] == []
+    assert "run_contrastive.sh not written" in capsys.readouterr().out
     assert not (e.mlops / "loop_state.json").exists()
 
 
@@ -1661,13 +1831,21 @@ def test_main_active_learn_skipped_when_ollama_down(mainenv):
     assert e.calls["active_learn"] == []
 
 
-def test_main_active_learn_runs_in_dry_run_without_dry_run_flag(mainenv):
-    """_run_active_learn takes no dry_run parameter at all — active_learn.py is
-    invoked for real (writing active_candidates.jsonl) on a --dry-run night."""
+def test_main_active_learn_is_not_run_in_dry_run(mainenv, capsys):
+    """active_learn.py rewrites active_candidates.jsonl; it used to be invoked
+    for real on a --dry-run night."""
     e = mainenv
     e.rv["active_learn"] = {"exit_code": 0}
     e.main("--dry-run")
-    assert e.calls["active_learn"][0][0] == (loop.DEFAULT_OLLAMA,)
+    assert e.calls["active_learn"] == []
+    assert "active_learn skipped — dry run" in capsys.readouterr().out
+
+
+def test_main_active_learn_gets_the_run_time_ollama_url(mainenv):
+    e = mainenv
+    e.rv["active_learn"] = {"exit_code": 0}
+    e.main()
+    assert e.calls["active_learn"] == [((OLLAMA_URL,), {})]
 
 
 # --- argparse defaults --------------------------------------------------------
@@ -1955,7 +2133,7 @@ def test_summary_honesty_alert_does_not_clear_an_existing_failure(mainenv):
     loop._fail("train.py", "boom")
     rc = loop._finish(
         state=dict(DEFAULT_STATE),
-        args=types.SimpleNamespace(dry_run=True),
+        args=types.SimpleNamespace(dry_run=False),
         now_iso="2026-09-16T00:00:00+00:00",
         loop_count=1,
         new_runs=[],
@@ -1969,3 +2147,73 @@ def test_summary_honesty_alert_does_not_clear_an_existing_failure(mainenv):
     assert rc == 1, "summary corroboration must not mask pre-existing FAILED_STEPS"
     assert rec["failed_steps"] == ["train.py"]
     assert "summary honesty" in rec["alerts"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# a whole dry run, through the real steps
+#
+# The per-step tests above stub the steps; this drives every real step function
+# through main() with fake children that write wherever they are pointed, as the
+# real scripts do. The contract of --dry-run ("plan only") is that the tree is
+# byte-for-byte unchanged afterwards and no promotion is recorded anywhere.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _snapshot(root):
+    return {str(p.relative_to(root)): (p.read_bytes() if p.is_file() else None)
+            for p in sorted(root.rglob("*"))}
+
+
+def test_a_full_dry_run_writes_nothing(env, monkeypatch, capsys):
+    e = env
+    monkeypatch.setattr(loop, "_resolve_backends", lambda: {})
+    monkeypatch.setenv("OLLAMA_BASE_URL", OLLAMA_URL)
+    monkeypatch.setattr(loop, "_ollama_ok", lambda base: True)
+    monkeypatch.setattr(loop, "check_summary_consistency",
+                        lambda *a, **k: {"consistent": None, "unsupported_claims": [],
+                                         "ok": False, "error": "stubbed"})
+    decay_calls = []
+    install_fake(monkeypatch, "memory.decay",
+                 apply_decay=lambda **k: decay_calls.append(k) or {
+                     "n_rows": 3, "n_decayed": 1, "mean_retention": 0.9})
+    install_fake(monkeypatch, "mlops.grounding.canary",
+                 monitor_live=lambda **k: {"drift": False, "rollback_recommended": False})
+
+    # Everything a real nightly finds on disk, so every step has work to do.
+    (e.grounding / "build_grounding_dataset.py").write_text("")
+    (e.grounding / "grounding_bleed_clf.joblib").write_text("live")
+    (e.mlops / "grounding" / "candidate.joblib").write_text("candidate")
+    (e.mlops / "grounding" / "active_learn.py").write_text("")
+    (e.mlops / "embedding" / "drift.py").write_text("")
+    (e.mlops / "embedding" / "anchor.npz").write_text("anchor")
+    write_dataset(e, 500)
+    sessions = e.tmp / "sessions"
+    for run in ("dt-loci-a", "dt-loci-b", "dt-loci-c"):
+        (sessions / run).mkdir(parents=True)
+        (sessions / run / "findings.jsonl").write_text("{}\n")
+
+    def writes_out(cmd):
+        Path(cmd[cmd.index("--out") + 1]).write_text("{}")
+
+    e.run.on_call_cmd("build_grounding_dataset.py", lambda cmd: write_dataset(e, 900))
+    e.run.on_call_cmd("train.py", lambda cmd: None if "--dry-run" in cmd else writes_out(cmd))
+    e.run.on_call_cmd("drift.py", writes_out)
+    e.run.on_call_cmd("active_learn.py", writes_out)
+    e.run.on_call_cmd("collect.py", lambda cmd: (Path(cmd[cmd.index("--out") + 1])
+                                                 / "raw_traces.jsonl").write_text("x"))
+
+    before = _snapshot(e.repo)
+    monkeypatch.setattr(sys, "argv", ["loop.py", "--dry-run", "--force",
+                                      "--findings", str(sessions / "*" / "findings.jsonl"),
+                                      "--db", str(e.tmp / "mnemosyne.db"), "--decay-apply"])
+    rc = loop.main()
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert _snapshot(e.repo) == before, "a dry run changed the tree"
+    assert "PROMOTED" not in out
+    assert decay_calls == [{"db_path": str(e.tmp / "mnemosyne.db"), "dry_run": True}]
+    # The read-only steps still ran; only the writers were held back.
+    assert "train.py" in e.run.scripts() and "drift.py" in e.run.scripts()
+    for writer in ("build_grounding_dataset.py", "active_learn.py", "collect.py",
+                   "format_sft.py", "train_lora.py"):
+        assert writer not in e.run.scripts(), f"{writer} ran on a dry run"
