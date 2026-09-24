@@ -275,6 +275,8 @@ class LadybugStore:
         # sample it around a call to tell "the graph held no rows" from "the query
         # never ran" — an empty list on its own says both.
         self.code_query_failures = 0
+        self.code_query_last_error = ""  # repr of the most recent swallowed read error
+        self._read_miss = threading.local()  # per-thread "_rows found no session" flag
         if not _HAS_LADYBUG:
             logger.info("ladybug not importable; LadybugStore unavailable")
 
@@ -394,13 +396,29 @@ class LadybugStore:
             return False
 
     def lock_holder_pid(self) -> Optional[int]:
-        """Best-effort PID of whoever holds the lease writer stamp (diagnostics)."""
+        """Best-effort PID of whoever holds the lease writer stamp (diagnostics).
+
+        The stamp is written on acquire and never cleared on release, so it outlives
+        its writer; a PID that is no longer running is reported as None rather than
+        as the current holder.
+        """
         try:
             with open(self._lease_path, "r") as f:
                 tok = f.read().split()
-            return int(tok[0]) if tok else None
+            pid = int(tok[0]) if tok else None
         except Exception:
             return None
+        if pid is None or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)  # signal 0: existence check only, nothing is delivered
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass  # alive, owned by another user
+        except Exception:
+            return None
+        return pid
 
     # ------------------------------------------------------------------ #
     # Schema
@@ -468,9 +486,16 @@ class LadybugStore:
 
     def _rows(self, cypher: str, params: Optional[dict] = None) -> list[list]:
         """Read rows in a leased READ-ONLY session (many readers share). Drains AND closes
-        the result INSIDE the session — the QueryResult is invalid once the conn closes."""
+        the result INSIDE the session — the QueryResult is invalid once the conn closes.
+
+        Returns [] when no session could be opened (read lease timed out, or an existing
+        store could not be opened) and records that on this thread (``_read_missed``), so
+        code_query can tell a query that never ran from one that matched nothing. A graph
+        that was never created is not a miss: there is nothing to match."""
         with self._session(write=False) as conn:
             if conn is None:
+                if os.path.exists(self.db_path):
+                    self._read_miss.flag = True
                 return []
             res = conn.execute(cypher) if params is None else conn.execute(cypher, params)
             out: list[list] = []
@@ -1077,9 +1102,15 @@ class LadybugStore:
         if not self.ok:
             return []
         try:
-            return self._rows(cypher, params)
+            self._read_miss.flag = False
+            rows = self._rows(cypher, params)
+            if self._read_miss.flag:
+                raise RuntimeError("graph read session unavailable "
+                                   "(read-lease timeout or store not openable)")
+            return rows
         except Exception as exc:
             logger.debug("code_query failed: %s", exc)
+            self.code_query_last_error = repr(exc)[:500]
             self.code_query_failures += 1
             return []
 

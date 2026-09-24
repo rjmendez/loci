@@ -50,8 +50,8 @@ def _run(client, vec=_UNSET):
     """
     embedding = [0.1] * DIM if vec is _UNSET else vec
     names = sorted(c.name for c in client.get_collections().collections)
-    with mock.patch.object(server, "_get_qdrant", lambda: (client, "loci_memory")), \
-         mock.patch.object(server, "_embed", lambda _q: embedding):
+    with mock.patch.object(server, "_qdrant_client_readonly", lambda: (client, "loci_memory")), \
+         mock.patch.object(server, "_embed_uncached", lambda _q: embedding):
         return json.loads(server.retrieval_selftest("anything", collections=names))
 
 
@@ -112,7 +112,7 @@ class TestRetrievalSelftest(unittest.TestCase):
         self.assertTrue(any("OLLAMA_BASE_URL" in r for r in out["remediations"]))
 
     def test_qdrant_down_is_unhealthy_not_ok(self):
-        with mock.patch.object(server, "_get_qdrant", lambda: (None, None)):
+        with mock.patch.object(server, "_qdrant_client_readonly", lambda: (None, None)):
             out = json.loads(server.retrieval_selftest("anything"))
         self.assertEqual(out["status"], "unhealthy")
         self.assertEqual(out["collections"], [])
@@ -195,8 +195,8 @@ class TestProbeUsesTheResolvedName(unittest.TestCase):
             "fast-nomic-embed-text-v1.5": VectorParams(size=DIM, distance=Distance.COSINE)})
         c.upsert("odd", points=[PointStruct(
             id=1, vector={"fast-nomic-embed-text-v1.5": [0.1] * DIM})])
-        with mock.patch.object(server, "_get_qdrant", lambda: (c, "odd")), \
-             mock.patch.object(server, "_embed", lambda _q: [0.1] * DIM):
+        with mock.patch.object(server, "_qdrant_client_readonly", lambda: (c, "odd")), \
+             mock.patch.object(server, "_embed_uncached", lambda _q: [0.1] * DIM):
             out = json.loads(server.retrieval_selftest("anything", collections=["odd"]))
         row = {r["collection"]: r for r in out["collections"]}["odd"]
         self.assertEqual(row["status"], "ok", row.get("detail"))
@@ -225,8 +225,8 @@ class TestScope(unittest.TestCase):
         import qdrant_ops
         qdrant_ops._dense_name_cache.clear()
         c = self._store()
-        with mock.patch.object(server, "_get_qdrant", lambda: (c, "loci_memory")), \
-             mock.patch.object(server, "_embed", lambda _q: [0.1] * DIM), \
+        with mock.patch.object(server, "_qdrant_client_readonly", lambda: (c, "loci_memory")), \
+             mock.patch.object(server, "_embed_uncached", lambda _q: [0.1] * DIM), \
              mock.patch.object(server, "QDRANT_COLLECTION_PREFIX", "loci_memory"), \
              mock.patch.object(server, "_CODE_CHUNKS_COLLECTION", ""):
             return json.loads(server.retrieval_selftest("anything", **kw))

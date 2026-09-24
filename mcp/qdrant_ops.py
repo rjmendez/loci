@@ -458,6 +458,27 @@ def _get_qdrant():
     return _qdrant_client
 
 
+def _qdrant_client_readonly():
+    """(client, main_collection) for health probes, or (None, None) if QDRANT_URL is unset.
+
+    Unlike ``_get_qdrant`` this never creates or reconfigures a collection, builds
+    payload indexes or purges old records: a health check that recreates a lost
+    collection empty hides the loss. It reuses the cached client when there is one;
+    it makes no request itself, so callers must issue their own live call (e.g.
+    ``get_collections``) to learn whether Qdrant is actually answering.
+    """
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    if not qdrant_url:
+        return None, None
+    cached = _qdrant_client
+    if isinstance(cached, tuple) and cached[0] is not None:
+        return cached
+    from qdrant_client import QdrantClient
+    client = QdrantClient(url=qdrant_url, api_key=os.environ.get("QDRANT_API_KEY", "") or None,
+                          timeout=_QDRANT_TIMEOUT)
+    return client, QDRANT_COLLECTION_PREFIX
+
+
 _OLLAMA_BASE          = os.environ.get("OLLAMA_BASE_URL")
 _EMBED_MODEL          = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 _EMBED_API_KEY        = os.environ.get("EMBED_API_KEY", "")
@@ -491,10 +512,13 @@ def _embed_auth_headers() -> dict:
     return h
 
 
-def _embed(text: str) -> list[float] | None:
+def _embed(text: str, use_cache: bool = True) -> list[float] | None:
     """Single-text embed via OpenAI-compat /v1/embeddings.
-    Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY)."""
-    cached = _embed_cache.get(text)
+    Works with Ollama (EMBED_API_KEY unset) and cloud providers (set EMBED_API_KEY).
+
+    ``use_cache=False`` neither reads nor fills the in-process cache, so the result
+    reflects the embedder right now (health probes; see ``_embed_uncached``)."""
+    cached = _embed_cache.get(text) if use_cache else None
     if cached is not None:
         return cached
     if not _OLLAMA_BASE:
@@ -528,12 +552,19 @@ def _embed(text: str) -> list[float] | None:
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
         return None
-    if result is not None:
+    if result is not None and use_cache:
         with _embed_cache_lock:
             if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
                 _embed_cache.pop(next(iter(_embed_cache)))
             _embed_cache[text] = result
     return result
+
+
+def _embed_uncached(text: str) -> list[float] | None:
+    """Live embed for health probes. A probe that embeds a fixed string through the
+    cache contacts the embedder once per process and then reports 'ok' from memory
+    for the rest of an outage."""
+    return _embed(text, use_cache=False)
 
 
 def _qdrant_upsert(point_id: str, text: str, payload: dict) -> None:
@@ -777,7 +808,10 @@ def _dense_vector_name(client, collection: str) -> Optional[str]:
                               if getattr(v, "size", None) == VECTOR_DIM]
                 name = same_width[0] if same_width else sorted(vectors)[0]
     except Exception as exc:
+        # Do not cache a failed lookup: a cached None made one transient timeout
+        # break every later query on a named-vector collection until restart.
         logger.debug("_dense_vector_name(%s): %r", collection, exc)
+        return None
     _dense_name_cache[collection] = name
     return name
 
@@ -841,7 +875,13 @@ def probe_collection(query_vec, client, name: str, limit: int = 3) -> dict:
     if our_dim is None:
         out["status"] = "error"
         out["detail"] = "no embedder — dense vector unavailable"
-        out["remediation"] = "Set OLLAMA_BASE_URL or EMBED_API_KEY so the server can embed."
+        if _OLLAMA_BASE or _EMBED_API_KEY:
+            out["remediation"] = (
+                "The embedder (OLLAMA_BASE_URL / EMBED_API_KEY) is configured but returned "
+                "no vector: it is down, timing out, or the embed brownout breaker is open. "
+                "Check the embed endpoint and the server log.")
+        else:
+            out["remediation"] = "Set OLLAMA_BASE_URL or EMBED_API_KEY so the server can embed."
         return out
 
     if shape["dense_dims"] and our_dim not in shape["dense_dims"]:
@@ -884,7 +924,8 @@ def _qdrant_search_collection(
     query_filter=None,
 ) -> list[dict]:
     """
-    Dense + sparse (RRF) search against any named Qdrant collection.
+    Hybrid search against any named Qdrant collection: dense + sparse prefetch,
+    re-scored by dense cosine so ``score`` keeps one scale across collections.
     Falls back to dense-only when sparse vectors are unavailable.
     Returns a flat list of payload dicts with an added 'score' key.
     Raises on Qdrant errors so callers can catch per-collection failures.
@@ -903,14 +944,17 @@ def _qdrant_search_collection(
     fetch_limit = limit * 5
     sparse_vec = _embed_sparse(query)
 
-    from qdrant_client.models import Prefetch, FusionQuery, Fusion
+    from qdrant_client.models import Prefetch
 
     # Detect whether this collection uses named vectors (dense/sparse) or a flat vector.
     try:
         col_info = client.get_collection(collection_name)
         vectors_config = col_info.config.params.vectors
         has_named_vectors = isinstance(vectors_config, dict)
-        has_sparse_index = has_named_vectors and "sparse" in (vectors_config or {})
+        # Sparse vectors are declared in params.sparse_vectors, never in the dense map
+        # (params.vectors) -- reading the latter made the hybrid branch unreachable.
+        sparse_config = getattr(col_info.config.params, "sparse_vectors", None) or {}
+        has_sparse_index = has_named_vectors and "sparse" in sparse_config
     except Exception:
         has_named_vectors = False
         has_sparse_index = False
@@ -923,14 +967,21 @@ def _qdrant_search_collection(
     _qsp = _quant_search_params()
 
     if has_named_vectors and has_sparse_index and sparse_vec is not None:
+        # Hybrid candidate pool (dense + sparse prefetch), scored by dense cosine.
+        # Callers compare ``score`` against cosine-scale thresholds (memory_surface's
+        # 0.25 floor) and merge it with dense-only collections, so an RRF rank score
+        # (~0.03) here would silently drop every hit; sparse contributes recall only.
         result = _query_points_with_retry(
             lambda: client.query_points(
                 collection_name=collection_name,
                 prefetch=[
-                    Prefetch(query=dense_vec, using=dense_name, limit=fetch_limit * 2),
-                    Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2),
+                    Prefetch(query=dense_vec, using=dense_name, limit=fetch_limit * 2,
+                             filter=query_filter),
+                    Prefetch(query=sparse_vec, using="sparse", limit=fetch_limit * 2,
+                             filter=query_filter),
                 ],
-                query=FusionQuery(fusion=Fusion.RRF),
+                query=dense_vec,
+                using=dense_name,
                 limit=fetch_limit,
                 with_payload=True,
                 query_filter=query_filter,
