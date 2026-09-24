@@ -246,8 +246,11 @@ def test_label_concentration_gate(tmp_path):
 
 
 def test_invalid_config_values(tmp_path):
+    # Every validation message starts with the parameter it rejects, so a
+    # deleted check cannot pass on some later, unrelated ValueError.
     for bad in (dict(max_samples=0), dict(high_connectivity_quantile=1.0), dict(partner_tier_edges=(100, 10))):
-        with pytest.raises(ValueError):
+        (key,) = bad
+        with pytest.raises(ValueError, match=rf"^{key} must "):
             samples.build_training_samples("banc", CONN, _explicit_config(tmp_path, **bad), allow_planned=True)
 
 
