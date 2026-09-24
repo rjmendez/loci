@@ -16,8 +16,11 @@ Safety:
   * All other lines, including ones that do not parse, are kept byte-for-byte.
   * Rerunning is safe. A file with no access rows is left alone, and a line
     already copied into access.jsonl by an interrupted run is not copied twice.
-  * Stop loci-mcp before --apply. A writer that is appending while the file is
-    replaced could lose its line.
+  * Stop loci-mcp before --apply anyway. As a guard for a server left running,
+    --apply holds the same per-file flocks the server's appends take
+    (findings.jsonl, then access.jsonl) across the read and the replace, refuses
+    to replace a file whose inode changed underneath it, and afterwards copies
+    any line a blocked writer appended to the old inode into the new file.
 
 Usage:
     migrate_access_rows.py                       # dry run over $LOCI_MEMORY_DIR
@@ -40,6 +43,9 @@ from pathlib import Path
 FINDINGS = "findings.jsonl"
 ACCESS = "access.jsonl"
 ACCESS_TYPES = frozenset({"access"})
+# After the replace, how long to watch the old inodes for appends from writers
+# that were waiting on our flock (the server polls its lock every <=0.1s).
+LATE_APPEND_WINDOW_S = 1.0
 
 
 def default_memory_dir() -> Path:
@@ -81,6 +87,52 @@ def _atomic_write(path: Path, lines: list[str]) -> None:
         raise
 
 
+class MigrationError(RuntimeError):
+    """The file changed underneath the migration; nothing was replaced."""
+
+
+def _same_inode(fh, path: Path) -> bool:
+    try:
+        a, b = os.fstat(fh.fileno()), os.stat(path)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _read_fh(fh) -> str:
+    fh.seek(0)
+    return fh.read()
+
+
+def _salvage_late_appends(watched: list) -> int:
+    """Copy bytes appended to replaced inodes into the files that replaced them.
+
+    ``watched`` is ``[(old_fh, size_at_read, path), ...]``. A writer that opened
+    a file before the replace and was waiting on our flock appends to the old
+    inode once we release it. Returns the number of lines copied.
+    """
+    sizes = [size for _, size, _ in watched]
+    deadline = time.monotonic() + LATE_APPEND_WINDOW_S
+    copied = 0
+    while True:
+        for i, (old_fh, _, path) in enumerate(watched):
+            size = os.fstat(old_fh.fileno()).st_size
+            if size <= sizes[i]:
+                continue
+            old_fh.seek(sizes[i])
+            extra = old_fh.read()
+            sizes[i] = size
+            with open(path, "a", encoding="utf-8", newline="") as out:
+                fcntl.flock(out.fileno(), fcntl.LOCK_EX)
+                out.write(extra if extra.endswith("\n") else extra + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            copied += sum(1 for ln in extra.splitlines() if ln.strip())
+        if time.monotonic() >= deadline:
+            return copied
+        time.sleep(0.05)
+
+
 def migrate_investigation(inv_dir: Path, apply: bool, stamp: str) -> dict:
     findings = inv_dir / FINDINGS
     report = {"investigation_id": inv_dir.name, "access_rows": 0, "kept_lines": 0}
@@ -89,10 +141,22 @@ def migrate_investigation(inv_dir: Path, apply: bool, stamp: str) -> dict:
         kept, access = split_lines(findings.read_text())
         report.update(access_rows=len(access), kept_lines=len(kept))
         return report
-    # The server's rewrite paths serialise on <inv>/.lock, so take it as well.
-    with open(inv_dir / ".lock", "a+") as lock_fh:
+    # The server's rewrite paths serialise on <inv>/.lock and its appends flock
+    # the target file itself, so take all three (same order as the server).
+    access_path = inv_dir / ACCESS
+    if not split_lines(findings.read_text())[1]:
+        return report  # nothing to move: take no locks, create no files
+    with open(inv_dir / ".lock", "a+") as lock_fh, \
+            open(findings, "r+", encoding="utf-8", newline="") as f_fh, \
+            open(access_path, "a+", encoding="utf-8", newline="") as a_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        kept, access = split_lines(findings.read_text())
+        fcntl.flock(f_fh.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(a_fh.fileno(), fcntl.LOCK_EX)
+        if not (_same_inode(f_fh, findings) and _same_inode(a_fh, access_path)):
+            raise MigrationError(f"{inv_dir.name}: file replaced while taking locks; rerun")
+        text = _read_fh(f_fh)
+        f_size = len(text.encode())
+        kept, access = split_lines(text)
         report.update(access_rows=len(access), kept_lines=len(kept))
         if not access:
             return report
@@ -105,8 +169,9 @@ def migrate_investigation(inv_dir: Path, apply: bool, stamp: str) -> dict:
         shutil.copy2(findings, backup)
         report["backup"] = str(backup)
 
-        access_path = inv_dir / ACCESS
-        existing = access_path.read_text().splitlines() if access_path.exists() else []
+        a_text = _read_fh(a_fh)
+        a_size = len(a_text.encode())
+        existing = a_text.splitlines()
         # An interrupted earlier run may already have copied some of these lines.
         already = collections.Counter(line.strip() for line in existing)
         to_add = []
@@ -123,6 +188,15 @@ def migrate_investigation(inv_dir: Path, apply: bool, stamp: str) -> dict:
         _atomic_write(findings, kept)
         report["moved"] = len(to_add)
         report["already_in_access_log"] = len(access) - len(to_add)
+        # Release the file locks (the with-block keeps the fds) before salvaging.
+        fcntl.flock(a_fh.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(f_fh.fileno(), fcntl.LOCK_UN)
+        watched = [(f_fh, f_size, findings)]
+        if to_add:  # access.jsonl was replaced only when there was something to add
+            watched.append((a_fh, a_size, access_path))
+        late = _salvage_late_appends(watched)
+        if late:
+            report["late_appends_recovered"] = late
     return report
 
 

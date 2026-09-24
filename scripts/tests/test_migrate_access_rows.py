@@ -92,6 +92,44 @@ class MigrateAccessRowsTest(unittest.TestCase):
         mig.run(self.root, apply=True)
         self.assertEqual((self.inv / "access.jsonl").read_text().splitlines(), [newer, A1, A2])
 
+    def test_append_racing_the_replace_is_not_lost(self):
+        # Review follow-up: --apply only locked <inv>/.lock, while the server's appends
+        # flock findings.jsonl itself, so a line appended to the old inode between the
+        # read and os.replace was silently dropped.
+        import fcntl
+        import threading
+        late = json.dumps({"id": "f3", "record_type": "observed", "text": "appended mid-migration"})
+        opened = threading.Event()
+
+        def server_append():  # same shape as inv_store._append_jsonl
+            with open(self.findings, "a") as fh:
+                opened.set()
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                fh.write(late + "\n")
+                fh.flush()
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+        real_write = mig._atomic_write
+        started = []
+
+        def racing_write(path, lines):
+            if not started:
+                t = threading.Thread(target=server_append)
+                t.start()
+                started.append(t)
+                opened.wait(2)
+            return real_write(path, lines)
+
+        mig._atomic_write = racing_write
+        try:
+            report = mig.run(self.root, apply=True)
+        finally:
+            mig._atomic_write = real_write
+            for t in started:
+                t.join(5)
+        self.assertIn(late, self.findings.read_text().splitlines())
+        self.assertEqual(report["per_investigation"][0].get("late_appends_recovered"), 1)
+
     def test_single_investigation_and_bad_id(self):
         report = mig.run(self.root, apply=True, investigation="clean")
         self.assertEqual(report["access_rows"], 0)
