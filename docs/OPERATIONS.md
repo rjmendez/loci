@@ -821,7 +821,7 @@ Use this sequence when promoting brain-cluster artifacts. Do not bypass any gate
   - `status=ok`
   - `missing_count=0`
 - [ ] Confirm `release-prep-report.json` gate output:
-  - `schema_version=braincluster-release-prep/v1`
+  - `schema_version=braincluster-release-prep/v2`
   - `status=ok`
 
 #### 2) Deploy checklist
@@ -980,10 +980,10 @@ Use these when alerts fire; execute top-to-bottom and do not skip evidence captu
 **Triage**
 1. Inspect threshold metadata:
    - `schema_version=braincluster-threshold-calibration/v1`
-   - `objective`, `generated_at`, `calibration_id`, `input_fingerprint`.
+   - `dataset_symbol`, `objective`, `generated_at`, `calibration_id`, `input_fingerprint`, `trivial_baseline`.
 2. Verify fingerprint continuity:
    - `calibration_id == braincluster-thresholds-<input_fingerprint[:16]>`.
-3. Confirm release-prep points to the expected `threshold_file` per objective.
+3. Confirm release-prep points to the expected `threshold_file` per (dataset, objective) group.
 
 **Mitigation**
 - Regenerate thresholds from latest holdout runs (`mcp\flybrain_brain_cluster_thresholds.py`) and update release-prep outputs.
@@ -996,7 +996,7 @@ Use these when alerts fire; execute top-to-bottom and do not skip evidence captu
 
 **Evidence to retain**
 - Old and replacement threshold bundles.
-- `release-prep-report.json` (`objectives_calibrated[*].threshold_file`).
+- `release-prep-report.json` (`groups_calibrated[*].threshold_file`).
 - `promotion-readiness.json` before/after recalibration.
 
 #### D) Promotion alert playbook (readiness/canary/audit failures)

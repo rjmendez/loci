@@ -5,9 +5,11 @@ adult *Drosophila* connectome that spans brain + ventral nerve cord. This
 module is the only place the harness touches the on-disk BANC snapshot:
 
 * ``open_banc_snapshot`` validates the storage root, the manifest
-  (``fbh-manifest/v1`` self-hash, verification status, refresh window, license)
-  and the per-file sha256/size of every required product before returning
-  resolved paths.
+  (``fbh-manifest/v1`` self-hash + sidecar, verification status, refresh
+  window, license), the size of every listed file and the sha256 of every
+  required product before returning resolved paths. Content hashes are cached
+  as write-once stamps keyed by (size, mtime_ns) (``flybrain_hash_stamps``),
+  so a 29 GB snapshot is not rehashed on every open.
 * ``load_banc_*`` readers check required columns and return pandas frames with
   18-19 digit root ids kept as strings (never float-promoted).
 * ``map_banc_region`` is the explicit brain-vs-nerve-cord region vocabulary map.
@@ -30,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from flybrain_dataset_registry import get_dataset, normalize_symbol, snapshot_version_root
+from flybrain_hash_stamps import METHOD_SIZE_ONLY, HashStampCache, verify_file_sha256
 from flybrain_harness_storage import build_flybrain_harness_layout
 
 BANC_DATASET_SYMBOL = "banc"
@@ -414,6 +417,8 @@ class BancSnapshot:
     product_sha256: Mapping[str, str]
     license_spdx: str
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # relative_path -> "hashed" | "stamp" | "size_only" (see flybrain_hash_stamps).
+    hash_verification: Mapping[str, str] = field(default_factory=dict)
 
     def path(self, role: str) -> Path:
         if role not in self.product_paths:
@@ -442,10 +447,25 @@ def validate_banc_manifest(
     snapshot_root: Path,
     *,
     required_roles: Sequence[str] = tuple(BANC_PRODUCT_PATHS),
-    verify_hashes: bool = True,
+    verify_hashes: bool | None = None,
     now: datetime | None = None,
+    stamp_cache: HashStampCache | None = None,
+    hash_report: dict[str, str] | None = None,
+    warnings: list[str] | None = None,
 ) -> dict[str, str]:
-    """Fail-closed manifest check. Returns ``{relative_path: sha256}`` for listed files."""
+    """Fail-closed manifest check. Returns ``{relative_path: sha256}`` for listed files.
+
+    Every listed file is always checked for presence, path safety and exact
+    ``size_bytes``. Content hashing depends on ``verify_hashes``:
+
+    * ``True`` (explicit verify): sha256 of every listed file, always.
+    * ``None`` (default): sha256 of the files backing ``required_roles`` only,
+      skipped when ``stamp_cache`` holds a write-once stamp for the file's
+      current ``(size, mtime_ns)``. Other listed files are size-checked only.
+    * ``False``: size checks only (smoke runs).
+
+    ``hash_report`` (if given) receives ``relative_path -> method``.
+    """
     if manifest.get("schema_version") != BANC_MANIFEST_SCHEMA_VERSION:
         _fail(BancAdapterErrorCode.MANIFEST_INVALID, "manifest schema_version mismatch",
               schema_version=manifest.get("schema_version"))
@@ -511,6 +531,7 @@ def validate_banc_manifest(
     root = Path(snapshot_root).resolve(strict=False)
     seen: set[str] = set()
     hashes: dict[str, str] = {}
+    listed: list[tuple[str, Path, str]] = []
     for entry in files:
         if not isinstance(entry, dict):
             _fail(BancAdapterErrorCode.MANIFEST_INVALID, "integrity.files entries must be objects")
@@ -537,17 +558,37 @@ def validate_banc_manifest(
         if path.stat().st_size != size:
             _fail(BancAdapterErrorCode.INTEGRITY_MISMATCH, "file size mismatch", relative_path=rel,
                   expected=size, actual=path.stat().st_size)
-        if verify_hashes:
-            actual_sha = sha256_file(path)
-            if actual_sha != sha:
-                _fail(BancAdapterErrorCode.INTEGRITY_MISMATCH, "file sha256 mismatch", relative_path=rel,
-                      expected=sha, actual=actual_sha)
-        hashes[rel.replace("\\", "/")] = sha
+        normalized_rel = rel.replace("\\", "/")
+        hashes[normalized_rel] = sha
+        listed.append((normalized_rel, path, sha))
     for role in required_roles:
         rel = BANC_PRODUCT_PATHS[role]
         if rel not in hashes:
             _fail(BancAdapterErrorCode.PRODUCT_MISSING, f"manifest does not list required product {role!r}",
                   role=role, relative_path=rel)
+
+    # Content hashing runs only after every metadata, path and size check passed.
+    required_paths = {BANC_PRODUCT_PATHS[role] for role in required_roles}
+    for rel, path, sha in listed:
+        if verify_hashes is False or (verify_hashes is None and rel not in required_paths):
+            if hash_report is not None:
+                hash_report[rel] = METHOD_SIZE_ONLY
+            continue
+        check = verify_file_sha256(
+            path,
+            relative_path=rel,
+            expected_sha256=sha,
+            cache=stamp_cache,
+            force=verify_hashes is True,
+            hasher=sha256_file,
+        )
+        if not check.matched:
+            _fail(BancAdapterErrorCode.INTEGRITY_MISMATCH, "file sha256 mismatch", relative_path=rel,
+                  expected=sha, actual=check.actual_sha256)
+        if hash_report is not None:
+            hash_report[rel] = check.method
+        if check.warning and warnings is not None:
+            warnings.append(check.warning)
     return hashes
 
 
@@ -555,10 +596,18 @@ def open_banc_snapshot(
     storage_root: str | Path | None = None,
     *,
     required_roles: Sequence[str] = tuple(BANC_PRODUCT_PATHS),
-    verify_hashes: bool = True,
+    verify_hashes: bool | None = None,
     now: datetime | None = None,
 ) -> BancSnapshot:
-    """Resolve + verify the pinned BANC snapshot. Raises ``BancAdapterError`` on any gap."""
+    """Resolve + verify the pinned BANC snapshot. Raises ``BancAdapterError`` on any gap.
+
+    The manifest self-hash and the ``manifest.sha256`` sidecar are checked on
+    every open, before any file content is hashed. File contents are then
+    hashed as described in ``validate_banc_manifest``: by default only the
+    required products, and only when no stamp under ``manifest/hash-stamps/``
+    matches the file's current (size, mtime_ns). ``verify_hashes=True`` forces a
+    full rehash of every listed file.
+    """
     for role in required_roles:
         if role not in BANC_PRODUCT_PATHS:
             _fail(BancAdapterErrorCode.PRODUCT_MISSING, f"unknown product role {role!r}", role=role)
@@ -574,17 +623,27 @@ def open_banc_snapshot(
         raise BancAdapterError(BancAdapterErrorCode.MANIFEST_INVALID, f"manifest unreadable: {exc}") from exc
     if not isinstance(manifest, dict):
         _fail(BancAdapterErrorCode.MANIFEST_INVALID, "manifest must be a JSON object")
-    hashes = validate_banc_manifest(
-        manifest, snapshot_root, required_roles=required_roles, verify_hashes=verify_hashes, now=now
-    )
     sidecar = snapshot_root / BANC_MANIFEST_SIDECAR_RELATIVE_PATH
     warnings: list[str] = []
     # Fail closed: the sidecar is written with the manifest (write_banc_manifest)
-    # and is the only integrity anchor outside manifest.json itself.
+    # and is the only integrity anchor outside manifest.json itself. It is
+    # checked before any file content is hashed.
     if not sidecar.is_file():
         _fail(BancAdapterErrorCode.MANIFEST_MISSING, "manifest.sha256 sidecar is missing", sidecar=str(sidecar))
-    if sidecar.read_text(encoding="utf-8").strip() != manifest["integrity"]["manifest_sha256"]:
+    integrity = manifest.get("integrity") if isinstance(manifest.get("integrity"), dict) else {}
+    if sidecar.read_text(encoding="utf-8").strip() != str(integrity.get("manifest_sha256") or ""):
         _fail(BancAdapterErrorCode.INTEGRITY_MISMATCH, "manifest.sha256 sidecar does not match manifest")
+    hash_report: dict[str, str] = {}
+    hashes = validate_banc_manifest(
+        manifest,
+        snapshot_root,
+        required_roles=required_roles,
+        verify_hashes=verify_hashes,
+        now=now,
+        stamp_cache=HashStampCache.for_snapshot(snapshot_root),
+        hash_report=hash_report,
+        warnings=warnings,
+    )
     product_paths = {role: (snapshot_root / BANC_PRODUCT_PATHS[role]).resolve(strict=False) for role in required_roles}
     product_sha = {role: hashes[BANC_PRODUCT_PATHS[role]] for role in required_roles}
     return BancSnapshot(
@@ -597,6 +656,7 @@ def open_banc_snapshot(
         product_sha256=product_sha,
         license_spdx=str(manifest["dataset"]["source"]["license"]["spdx_id"]),
         warnings=tuple(warnings),
+        hash_verification=dict(sorted(hash_report.items())),
     )
 
 
@@ -634,8 +694,12 @@ def _check_columns(available: Iterable[str], required: Sequence[str], role: str,
               role=role, path=str(path), missing=missing)
 
 
-def load_banc_meta(path: Path, *, columns: Sequence[str] = META_REQUIRED_COLUMNS):
-    """Per-neuron metadata (feather or parquet) with ``banc_888_id`` as string."""
+def load_banc_meta(path: Path, *, columns: Sequence[str] = META_REQUIRED_COLUMNS,
+                   optional_columns: Sequence[str] = ()):
+    """Per-neuron metadata (feather or parquet) with ``banc_888_id`` as string.
+
+    ``optional_columns`` are read when the file has them and otherwise skipped.
+    """
     import pyarrow as pa
     import pyarrow.feather as feather
     import pyarrow.parquet as pq
@@ -645,10 +709,12 @@ def load_banc_meta(path: Path, *, columns: Sequence[str] = META_REQUIRED_COLUMNS
     if source.suffix.lower() == ".parquet":
         names = pq.read_schema(str(source)).names
         _check_columns(names, wanted, "meta", source)
+        wanted += [col for col in optional_columns if col in names and col not in wanted]
         table = pq.read_table(str(source), columns=wanted)
     else:
         names = _feather_columns(source)
         _check_columns(names, wanted, "meta", source)
+        wanted += [col for col in optional_columns if col in names and col not in wanted]
         table = feather.read_table(str(source), columns=wanted)
     table = table.set_column(
         table.schema.get_field_index("banc_888_id"), "banc_888_id", table.column("banc_888_id").cast(pa.string())

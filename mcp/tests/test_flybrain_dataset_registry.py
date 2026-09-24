@@ -59,10 +59,75 @@ def test_require_active_gates_planned():
     assert reg.require_active("banc", allow_planned=True).symbol == "banc"
 
 
-def test_unpinned_snapshot_root_fails_closed(tmp_path):
+def test_unpinned_snapshot_root_fails_closed(tmp_path, monkeypatch):
+    unpinned = dataclasses.replace(reg.DATASET_REGISTRY["ol"], pinned_version=None)
+    monkeypatch.setitem(reg.DATASET_REGISTRY, "ol", unpinned)
     with pytest.raises(reg.DatasetRegistryError) as exc:
-        reg.snapshot_version_root("mc", storage_root=tmp_path)
+        reg.snapshot_version_root("ol", storage_root=tmp_path)
     assert exc.value.code is reg.DatasetErrorCode.VERSION_UNPINNED
+
+
+@pytest.mark.parametrize(
+    "symbol,version,vocabulary,anatomy_words,citation_words",
+    [
+        # mc = full male CNS (brain + VNC), mv = MANC (male VNC only): matches the pulled snapshots.
+        ("mc", "male-cns_v1.0", reg.RegionVocabulary.MALE_CNS_ROI, ("brain", "ventral nerve cord", "male-cns:v1.0"),
+         ("Berg S", "10.1101/2025.10.09.680999", "gs://flyem-male-cns/v1.0")),
+        ("mv", "manc_v1.0", reg.RegionVocabulary.MANC_NEUROPIL, ("Nerve Cord (MANC) v1.0", "ventral nerve cord only"),
+         ("eLife 13:RP97769", "eLife 13:RP97766", "eLife 13:RP96084", "gs://flyem-manc-exports/v1.0")),
+        ("ol", "optic_lobe_v1.1", reg.RegionVocabulary.OPTIC_LOBE_NEUROPIL, ("optic lobe", "optic-lobe:v1.1"),
+         ("Nern A", "10.1038/s41586-025-08746-0")),
+    ],
+)
+def test_flyem_snapshots_are_pinned_licensed_and_cited(tmp_path, symbol, version, vocabulary, anatomy_words,
+                                                       citation_words):
+    spec = reg.get_dataset(symbol)
+    assert spec.pinned_version == version
+    assert spec.snapshot_dir_name == symbol
+    assert spec.region_vocabulary is vocabulary
+    assert spec.license == reg.LICENSE_CC_BY_4_0
+    assert spec.status is reg.DatasetStatus.PLANNED
+    for word in anatomy_words:
+        assert word in spec.description
+    for word in citation_words:
+        assert word in spec.citation
+    root = reg.snapshot_version_root(symbol, storage_root=tmp_path)
+    assert root.relative_to(tmp_path).as_posix() == f"snapshots/{symbol}/{version}"
+    assert "MANC" not in reg.get_dataset("mc").description
+
+
+def test_split_group_keys_per_dataset():
+    assert reg.split_group_keys("banc") == ("cell_type", "hemilineage")
+    assert reg.split_group_keys("l1em") == ("split_group",)
+    assert reg.split_group_keys("ol") == ("cell_type",)
+    assert reg.split_group_keys("fafb") == ()
+    assert reg.get_dataset("mc").as_dict()["split_group_keys"] == ["cell_type", "hemilineage"]
+
+
+def test_registry_validation_requires_pin_for_reviewed_licence(monkeypatch):
+    broken = dataclasses.replace(reg.DATASET_REGISTRY["mv"], pinned_version=None)
+    monkeypatch.setitem(reg.DATASET_REGISTRY, "mv", broken)
+    with pytest.raises(AssertionError, match="pinned snapshot version"):
+        reg._validate_registry()
+
+
+_REAL_ROOT = os.environ.get("LOCI_FLYBRAIN_STORAGE_ROOT", "")
+
+
+@pytest.mark.skipif(not _REAL_ROOT or not os.path.isdir(os.path.join(_REAL_ROOT, "snapshots")),
+                    reason="real FlyBrain storage root not configured")
+@pytest.mark.parametrize("symbol", ["mc", "mv", "ol"])
+def test_real_snapshot_manifests_match_registry(symbol):
+    import json
+
+    spec = reg.get_dataset(symbol)
+    manifest_path = reg.snapshot_version_root(symbol, _REAL_ROOT) / "manifest" / "manifest.json"
+    if not manifest_path.is_file():
+        pytest.skip(f"{symbol} snapshot not present")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["dataset"]["symbol"] == symbol
+    assert manifest["dataset"]["version_id"] == spec.pinned_version
+    assert manifest["dataset"]["source"]["license"]["spdx_id"] == spec.license
 
 
 def test_as_dict_is_json_ready():

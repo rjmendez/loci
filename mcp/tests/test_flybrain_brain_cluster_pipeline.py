@@ -9,16 +9,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import flybrain_brain_cluster_pipeline as fbcp  # noqa: E402
 
 
-def _sample_payload() -> dict[str, list[dict[str, object]]]:
+def _sample_payload(*, with_cue: bool = True) -> dict[str, list[dict[str, object]]]:
+    # The categorical cue gives the model real signal, so it can beat the
+    # majority-class trivial baseline; without it the AC6 gate must fail.
     samples = []
     for i in range(1, 41):
         region = "grounding" if i % 2 == 0 else "provenance"
         label = "accept" if i % 4 else "reject"
+        cue = (" cue open" if label == "accept" else " cue closed") if with_cue else ""
         samples.append(
             {
                 "sample_id": f"s{i:03d}",
                 "region_id": region,
-                "input_text": f"sample text {i} for {region}",
+                "input_text": f"sample text {i} for {region}{cue}",
                 "expected_label": label,
                 "expected_confidence": 0.82 if label == "accept" else 0.68,
                 "provenance_refs": [f"finding-{i}"],

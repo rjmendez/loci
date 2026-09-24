@@ -314,3 +314,20 @@ def test_unknown_proofread_token_fails_closed():
         banc_samples._proofread_mask(["TRUE", "maybe"])
     assert exc.value.code is BancAdapterErrorCode.SCHEMA_MISMATCH
     assert banc_samples._proofread_mask([True, False, "FALSE", "true", None]) == [True, False, False, True, False]
+
+
+@pytest.mark.parametrize("objective", [CONN, NT])
+def test_samples_carry_split_group_keys_outside_input(tmp_path, objective):
+    payload = samples.build_training_samples("banc", objective, _explicit_config(tmp_path, objective=objective),
+                                             allow_planned=True)
+    for sample in payload["samples"]:
+        assert sample["metadata"]["cell_type"] == "ct"  # synthetic meta fixture
+        assert "hemilineage" in sample["metadata"]
+        assert "cell_type" not in _kv(sample)
+    by_id = {s["metadata"]["root_id"]: s for s in payload["samples"]}
+    if rid(5) in by_id:
+        assert by_id[rid(5)]["metadata"]["hemilineage"] == "all1"
+
+
+def test_default_config_uses_stamp_cached_verification():
+    assert banc_samples.BancSampleBuildConfig().verify_hashes is None

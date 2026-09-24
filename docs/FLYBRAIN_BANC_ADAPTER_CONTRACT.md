@@ -63,7 +63,17 @@ The git clone at `source/BANC-project` came from an earlier pull and is not list
 
 ## 3. Adapter guarantees (`flybrain_banc_adapter`)
 
-`open_banc_snapshot(storage_root=None, *, required_roles=..., verify_hashes=True)` returns a `BancSnapshot` (resolved product paths, manifest id/sha, license, `provenance()`), or raises `BancAdapterError`. The error has `.code` set to a `BancAdapterErrorCode`, and its message is prefixed `[CODE] `.
+`open_banc_snapshot(storage_root=None, *, required_roles=..., verify_hashes=None)` returns a `BancSnapshot` (resolved product paths, manifest id/sha, license, `provenance()`), or raises `BancAdapterError`. The error has `.code` set to a `BancAdapterErrorCode`, and its message is prefixed `[CODE] `.
+
+Every open checks, in order: manifest schema and pins, the manifest self-hash, the `manifest.sha256` sidecar, then path safety and the exact `size_bytes` of every listed file. File contents are hashed only after all of those pass:
+
+| `verify_hashes` | Content hashing |
+|---|---|
+| `None` (default) | sha256 of the files behind `required_roles` only. Skipped when a stamp under `manifest/hash-stamps/` matches the file's current `(size, mtime_ns)`. Other listed files, such as the 19.7 GB enriched synapse table, get the size check only. |
+| `True` (explicit verify) | sha256 of every listed file, always. Use it for the quarterly integrity recheck and after any suspected tampering. |
+| `False` | Size checks only (smoke runs). |
+
+Stamps come from `flybrain_hash_stamps` (schema `fbh-hash-stamp/v1`). One is written per verified file state, and only after the recomputed sha256 matched the manifest and the file did not change while it was hashed. A valid stamp is never rewritten. The stamp name is derived from the relative path, the expected sha256, the size and the mtime_ns, so a size or mtime change, or a new expected hash, forces a rehash. A byte change that keeps both the size and the nanosecond mtime is not caught by a stamped open; `verify_hashes=True` catches it. A stamp caches an earlier verification. It is not a signature, and it is only as trustworthy as the snapshot directory. If the stamp directory is not writable, the open still succeeds and `BancSnapshot.warnings` says so. `BancSnapshot.hash_verification` records `hashed`, `stamp` or `size_only` for each listed file.
 
 | Code | Raised when |
 |---|---|
@@ -195,7 +205,7 @@ Explicit paths must be given for every required product or for none; a partial s
 
 ## 8. Operational notes
 
-- A real build takes about 10 s (connectivity) or about 25 s (NT) on the F: snapshot, plus about 3 s of sha256 verification. Pass `verify_hashes=False` only for smoke runs.
+- A real build takes about 10 s (connectivity) or about 25 s (NT) on the F: snapshot, plus sha256 verification of the required products the first time each file state is opened (stamped after that). Pass `verify_hashes=True` for a full rehash of every listed file, and `verify_hashes=False` only for smoke runs.
 - CLI: `python flybrain_brain_cluster_banc_samples.py --objective <obj> --output <json> --allow-planned [--storage-root F:\.flybrain]`
 - Tests re-register the builder per test and unregister it at module import, so the dispatcher's stub-`banc` tests keep an empty slot in the same pytest session.
-- Before promotion (registry `planned` to `active`, license `UNREVIEWED` to `CC-BY-4.0`): SC3 (thresholds from at least 2 eligible reports per objective) and the AB plan AC1-AC5 still apply. `region_specialization_tier` is on BANC's registry allow-list but has no builder yet (`BUILDER_NOT_REGISTERED`).
+- Before promotion (registry `planned` to `active`, license `UNREVIEWED` to `CC-BY-4.0`): SC3 (thresholds from at least 2 eligible reports per (dataset, objective)), the grouped-split trivial-baseline gate (AC6) and the AB plan AC1-AC5 still apply. `region_specialization_tier` is on BANC's registry allow-list but has no builder yet (`BUILDER_NOT_REGISTERED`).

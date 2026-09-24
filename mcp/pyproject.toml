@@ -68,6 +68,8 @@ py-modules = [
     "flybrain_brain_cluster_banc_samples",
     "flybrain_l1em_adapter",
     "flybrain_brain_cluster_l1em_samples",
+    "flybrain_brain_cluster_baselines",
+    "flybrain_hash_stamps",
     "replay_fingerprint",
     "grounding",
     "inv_store",

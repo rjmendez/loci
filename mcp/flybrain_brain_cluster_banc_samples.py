@@ -122,6 +122,15 @@ FORBIDDEN_INPUT_FEATURES: Mapping[str, frozenset[str]] = {
 }
 
 
+# Meta columns carried into sample metadata (never into input_text) so the
+# training split can keep related neurons together (registry split_group_keys).
+SPLIT_GROUP_META_COLUMNS: tuple[str, ...] = ("cell_type",)
+
+
+def _split_group_fields(row: Any) -> dict[str, str]:
+    return {"cell_type": _clean(getattr(row, "cell_type", None)), "hemilineage": _clean(row.hemilineage)}
+
+
 @dataclass(frozen=True)
 class BancSampleBuildConfig:
     objective: str = OBJECTIVE_CONNECTIVITY_TIER
@@ -130,7 +139,9 @@ class BancSampleBuildConfig:
     edgelist_path: str | Path | None = None
     nt_path: str | Path | None = None
     meta_path: str | Path | None = None
-    verify_hashes: bool = True
+    # None: stamp-cached verification of the required products (see
+    # flybrain_hash_stamps); True: full rehash; False: size checks only.
+    verify_hashes: bool | None = None
     max_samples: int = 5000
     min_total_count: int = 10
     min_region_samples: int = 25
@@ -356,7 +367,7 @@ def _division_counts(samples: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 def _build_connectivity(config: BancSampleBuildConfig, paths: Mapping[str, Path], source_label: str):
     totals, edge_rows = load_banc_outgoing_totals(paths[ROLE_EDGELIST_V3])
-    meta = load_banc_meta(paths[ROLE_META])
+    meta = load_banc_meta(paths[ROLE_META], optional_columns=SPLIT_GROUP_META_COLUMNS)
     frame = totals[totals["total_out_synapses"] >= int(config.min_total_count)]
     if frame.empty:
         raise ValueError("No rows remain after min_total_count filtering.")
@@ -388,6 +399,7 @@ def _build_connectivity(config: BancSampleBuildConfig, paths: Mapping[str, Path]
                     "dataset_version": BANC_VERSION_ID,
                     "root_id": root_id,
                     "cns_division": feats["cns_division"],
+                    **_split_group_fields(row),
                     "root_region": str(row.root_region),
                     "task_type": "connectivity",
                     "risk_tier": "high" if label == "high_connectivity" else "medium",
@@ -408,7 +420,7 @@ def _build_connectivity(config: BancSampleBuildConfig, paths: Mapping[str, Path]
 
 def _build_neurotransmitter(config: BancSampleBuildConfig, paths: Mapping[str, Path], source_label: str):
     nt = load_banc_nt_predictions(paths[ROLE_NT_PREDICTION])
-    meta = load_banc_meta(paths[ROLE_META])
+    meta = load_banc_meta(paths[ROLE_META], optional_columns=SPLIT_GROUP_META_COLUMNS)
     totals, _edge_rows = load_banc_outgoing_totals(paths[ROLE_EDGELIST_V3])
     source_rows = int(len(nt))
     multi_anchor = nt["nt_row_multiplicity"] > 1
@@ -450,6 +462,7 @@ def _build_neurotransmitter(config: BancSampleBuildConfig, paths: Mapping[str, P
                     "dataset_version": BANC_VERSION_ID,
                     "root_id": root_id,
                     "cns_division": feats["cns_division"],
+                    **_split_group_fields(row),
                     "root_region": str(row.root_region),
                     "dominant_neurotransmitter": label,
                     "task_type": "neurotransmitter",
