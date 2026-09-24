@@ -8,10 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from flybrain_dataset_registry import supported_objectives
 from flybrain_harness_storage import build_flybrain_harness_layout
 
 _REGION_SANITIZE_RE = re.compile(r"[^a-z0-9]+")
 _NT_COLUMNS = ("ach_avg", "gaba_avg", "glut_avg", "da_avg", "ser_avg", "oct_avg")
+# Per-dataset objective allow-list lives in flybrain_dataset_registry.
+FW_SUPPORTED_OBJECTIVES: tuple[str, ...] = supported_objectives("fw")
 
 
 @dataclass(frozen=True)
@@ -78,8 +81,8 @@ def _validate_config(config: FwSampleBuildConfig) -> None:
         raise ValueError("min_distinct_labels must be >= 1")
     if not (0.0 < config.max_label_share <= 1.0):
         raise ValueError("max_label_share must be in (0, 1]")
-    if config.objective not in {"connectivity_tier", "neurotransmitter_dominance"}:
-        raise ValueError("objective must be one of: connectivity_tier, neurotransmitter_dominance")
+    if config.objective not in FW_SUPPORTED_OBJECTIVES:
+        raise ValueError(f"objective must be one of: {', '.join(FW_SUPPORTED_OBJECTIVES)}")
 
 
 def _row_to_connectivity_sample(
@@ -400,7 +403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--storage-root", help="FlyBrain storage root (for example F:\\.flybrain)")
     parser.add_argument(
         "--objective",
-        choices=("connectivity_tier", "neurotransmitter_dominance"),
+        choices=FW_SUPPORTED_OBJECTIVES,
         default="connectivity_tier",
         help="Training objective to materialize from FlyWire data.",
     )
