@@ -38,9 +38,13 @@ def _config(*, red_team: bool = False, self_reflect: bool = True,
 
 
 def _search_collection(*, query, collection_name, limit):  # noqa: ARG001
+    # Explicitly tagged: an untagged row is provenance_defaulted and never counts
+    # as independent evidence for a model-asserted claim.
     return [
-        {"id": "seed-1", "origin": collection_name, "score": 0.91, "text": "Loci prefers fail-open returns."},
-        {"id": "seed-2", "origin": collection_name, "score": 0.87, "text": "verify_finding is adversarial."},
+        {"id": "seed-1", "origin": collection_name, "score": 0.91, "text": "Loci prefers fail-open returns.",
+         "evidence_provenance_tier": "tool_verified"},
+        {"id": "seed-2", "origin": collection_name, "score": 0.87, "text": "verify_finding is adversarial.",
+         "evidence_provenance_tier": "tool_verified"},
     ]
 
 
@@ -587,6 +591,36 @@ def test_verify_findings_blocks_model_only_provenance_support():
     assert reports[0]["verdict"] == "uncertain"
     assert reports[0]["provenance_firewall"]["allowed"] is False
 
+
+
+def test_verify_findings_does_not_count_untagged_hits_as_independent():
+    """Untagged retrieval hits default to tool_verified for display only; they
+    must not satisfy the firewall for a model-asserted idea."""
+    verify_calls = []
+
+    def _search(*, query, collection_name, limit):  # noqa: ARG001
+        return [{"id": "untagged-1", "origin": collection_name, "score": 0.95,
+                 "text": "Loci prefers fail-open returns."}]
+
+    def _verify(claim, context="", gen_fn=None, investigation_id=None):  # noqa: ARG001
+        verify_calls.append(claim)
+        return {"verdict": "confirmed", "refutation": "", "confidence": 0.9, "degraded": False}
+
+    survivors, reports = L.verify_findings(
+        [L.StoredFinding("idea-1", "Loci prefers fail-open returns.", "ideate", "m")],
+        topic="fail-open",
+        config=_config(self_reflect=False),
+        search_fn=_search,
+        gate_fn=_gate,
+        verify_fn=_verify,
+        gen_fn=lambda *args, **kwargs: {"ok": True, "text": "{}"},
+        store_fn=lambda **kwargs: '{"stored": true, "finding_id": "vf1"}',
+    )
+
+    assert survivors == []
+    assert verify_calls == []
+    assert reports[0]["provenance_firewall"]["allowed"] is False
+    assert reports[0]["provenance_firewall"]["defaulted_evidence_count"] == 1
 
 def _ungrounded_deps():
     """generate/verify/store stack shared by the strict-grounding tests below.

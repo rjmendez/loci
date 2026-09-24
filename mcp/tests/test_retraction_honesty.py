@@ -269,7 +269,8 @@ def test_rag_context_search_drops_retracted_hits(store, monkeypatch):
     assert "/api/v9/debug" not in r["context"]
     assert "/api/v1/health" in r["context"]
     assert r["result_count"] == 1 and r["excluded_retracted"] == 1
-    access_ids = [x.get("id") for x in server._read_jsonl(server._inv_dir(inv) / "findings.jsonl")
+    # Access markers live in their own log (inv_store.ACCESS_LOG_NAME), never in findings.jsonl.
+    access_ids = [x.get("id") for x in server._read_jsonl(server._inv_dir(inv) / inv_store.ACCESS_LOG_NAME)
                   if x.get("record_type") == "access"]
     assert bad not in access_ids and good in access_ids
 
