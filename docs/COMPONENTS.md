@@ -645,6 +645,12 @@ ship alongside it: `post_commit_ingest.sh` (re-ingests changed `.py` files into 
 contracts from changed `.py/.ts/.go/.rs/.java` files into the active investigation;
 non-blocking, every path ends in `|| true`).
 
+Both spawn a background `claude -p`, so they run only for commits on `main` in the
+primary worktree: commits in linked worktrees, on feature branches or on a detached
+HEAD are skipped so unmerged code is never ingested. `LOCI_HOOK_INGEST_BRANCH`
+changes the branch and `LOCI_HOOK_INGEST=0` disables ingest. Logs go to
+`$(git rev-parse --git-common-dir)/loci-hook-logs/`.
+
 ---
 
 ## Deep-think-loci reasoning engine
