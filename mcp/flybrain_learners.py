@@ -1089,6 +1089,12 @@ def save_learner(learner: Learner, directory: str | Path, *, metrics: Mapping[st
     target.mkdir(parents=True)
     _write_learner_files(learner, target)
     _write_json(target / "metrics.json", _jsonable(dict(metrics or {})))
+    declared_model_paths = [target / name for name in learner.model_files]
+    missing = [str(path) for path in declared_model_paths if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            f"save_learner: manifest declares {len(missing)} file(s) that were not written: {missing}"
+        )
     files = {name: sha256_file(target / name) for name in _listed_files(target)}
     manifest = {
         "schema_version": LEARNER_ARTIFACT_SCHEMA_VERSION,

@@ -283,6 +283,23 @@ def test_promotion_happy_path_stage_promote_and_read(tmp_path):
     assert read_back.promoted.manifest_path == promoted.promoted.manifest_path
 
 
+def test_promotion_state_rejects_previous_promoted_without_promoted():
+    with pytest.raises(fbc.BrainClusterPromotionStateError) as exc:
+        fbc.BrainClusterPromotionState(
+            schema_version=fbc.BRAIN_CLUSTER_PROMOTION_STATE_SCHEMA_VERSION,
+            updated_at="2026-09-24T00:00:00Z",
+            previous_promoted=fbc.BrainClusterPromotionPointer(
+                manifest_path="/home/rjmendez/development/loci/mcp/tests/fixtures/manifest.json",
+                manifest_sha256="a" * 64,
+                artifact_id="braincluster-expert-router",
+                artifact_version="2026.09.23",
+                recorded_at="2026-09-24T00:00:00Z",
+            ),
+        )
+    assert exc.value.code == fbc.BrainClusterPromotionStateErrorCode.STATE_INVALID.value
+    assert exc.value.message == "previous_promoted cannot be set without promoted."
+
+
 def test_promotion_invalid_transition_when_candidate_matches_current_promoted(tmp_path):
     state_path = tmp_path / "promotion-state.json"
     manifest_path = _write_artifact_bundle(tmp_path / "v1", artifact_version="2026.09.23")

@@ -59,6 +59,19 @@ _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
 # attempted only when at least _MIN_ATTEMPT_S of budget is left.
 _DEFAULT_DEADLINE_S = 150.0
 _MIN_ATTEMPT_S = 5.0
+# When GPU is loaded, cap Ollama per-attempt timeout so vLLM/cloud can be reached within budget.
+_GPU_LOADED_OLLAMA_TIMEOUT_S = float(os.environ.get("LOCI_GPU_LOADED_OLLAMA_TIMEOUT_S", "30"))
+# Roles that skip Ollama entirely and try vLLM first when the GPU is saturated.
+_EXPENSIVE_ROLES = frozenset({"reasoning", "synthesis", "redteam", "reflection"})
+
+
+def _read_gpu_load():
+    """Read the shared GPU load signal without raising."""
+    try:
+        from gpu_load import read_gpu_load as _rgl
+        return _rgl()
+    except Exception:
+        return None
 
 
 def _deadline_s() -> float:
@@ -384,6 +397,34 @@ def generate(prompt: str,
                    f"{time.monotonic() - started:.1f}s; last error: {last_error}"[:300])
         out["deadline_exceeded"] = True
         return out
+
+    # GPU load-aware routing: read shared load signal (written by loci-gpu-load sidecar).
+    # Expensive roles skip Ollama when GPU is saturated and go to vLLM first.
+    # All roles get a capped Ollama timeout so downstream tiers can be reached within budget.
+    _gpu_load = _read_gpu_load()
+    _effective_role = normalized_role or _heuristic_route(prompt).get("role")
+    if _gpu_load is not None and _gpu_load.is_loaded():
+        if _effective_role in _EXPENSIVE_ROLES:
+            _fast = _try_vllm(
+                prompt, fmt=fmt, max_tokens=max_tokens,
+                temperature=temperature, endpoint_role=_effective_role,
+            )
+            if _fast is not None:
+                _fast["gpu_routed"] = True
+                _LOG.info(
+                    "llm_local gpu_route tier=vllm util=%.0f%% vram=%.0f%% role=%s",
+                    _gpu_load.max_util_pct, _gpu_load.max_vram_pct, _effective_role,
+                )
+                return _fast
+            _LOG.info(
+                "llm_local gpu_route vllm_unavailable util=%.0f%% falling_to_ollama_capped",
+                _gpu_load.max_util_pct,
+            )
+        per_request = min(per_request, _GPU_LOADED_OLLAMA_TIMEOUT_S)
+        _LOG.info(
+            "llm_local gpu_route ollama_timeout_capped=%.0fs util=%.0f%% vram=%.0f%%",
+            per_request, _gpu_load.max_util_pct, _gpu_load.max_vram_pct,
+        )
 
     if _looks_embedding_model(model):
         discovered = _discover_generation_model(base, exclude=model, timeout=attempt_timeout())
