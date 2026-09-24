@@ -247,6 +247,7 @@ def test_queue_release_returns_item_to_queue_and_status_filter(tmp_path, monkeyp
 
     released = _json(server.investigation_queue_release(investigation_id=inv_id, item_id="release-task", owner_session="session-z", notes="giving this up"))
     assert released["released"] is True
+    assert released["updated"] is True  # kept for callers of the old release response
     assert released["item"]["state"] == "queued"
     assert released["item"]["owner_session"] is None
     assert released["item"]["lease_expires_at"] is None
@@ -499,6 +500,9 @@ def test_queue_claim_enforces_dependencies(tmp_path, monkeypatch):
     blocked = _json(server.investigation_queue_claim(investigation_id=inv_id, item_id="child", owner_session="B", lease_seconds=60))
     assert "unmet dependencies" in blocked["error"]
     assert "parent" in blocked["error"] and "does-not-exist" in blocked["error"]
+    # Missing ids are reported apart from existing-but-not-done ones.
+    assert blocked["unmet_dependencies"] == ["parent"]
+    assert blocked["unknown_dependencies"] == ["does-not-exist"]
     status = _json(server.investigation_queue_status(investigation_id=inv_id, item_id="child"))
     assert status["queue"][0]["state"] == "queued"
     assert status["queue"][0]["available"] is False

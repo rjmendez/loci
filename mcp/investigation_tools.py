@@ -443,9 +443,22 @@ def investigation_queue_claim(
         )
     unmet = _coordination_unmet_dependencies(manifest, item)
     if unmet:
-        return _coordination_error(
-            f"Queue item '{item_id}' has unmet dependencies (must exist and be done): {', '.join(unmet)}"
+        # Report ids missing from this queue (legacy or cross-investigation strings)
+        # separately from ones that exist but are not done, so they can be diagnosed.
+        known = {dep.get('id') for dep in (manifest.get('coordination') or {}).get('items', [])}
+        not_done = [dep for dep in unmet if dep in known]
+        unknown = [dep for dep in unmet if dep not in known]
+        detail = "; ".join(
+            part for part in (
+                f"not done: {', '.join(not_done)}" if not_done else "",
+                f"not in this investigation's queue: {', '.join(unknown)}" if unknown else "",
+            ) if part
         )
+        return json.dumps({
+            "error": f"Queue item '{item_id}' has unmet dependencies (must exist and be done). {detail}",
+            "unmet_dependencies": not_done,
+            "unknown_dependencies": unknown,
+        }, indent=2)
     item['owner_session'] = owner_session
     item['state'] = 'claimed'
     item['lease_expires_at'] = _coordination_now_plus(ttl)
@@ -536,7 +549,8 @@ def investigation_queue_release(
     item['lease_expires_at'] = None
     item['updated_at'] = _now()
     _save_manifest(manifest)
-    return json.dumps({"released": True, "item": item}, indent=2)
+    # "updated" kept for callers of the old release (an alias of complete(state='blocked')).
+    return json.dumps({"released": True, "updated": True, "item": item}, indent=2)
 
 
 def investigation_queue_status(
