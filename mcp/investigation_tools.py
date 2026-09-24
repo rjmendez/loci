@@ -23,6 +23,7 @@ from inv_store import (
     _load_retracted_ids,
     _now,
     _read_jsonl,
+    _retraction_events,
     _save_manifest,
     _validated_investigation_id,
     _node_numeric_confidence,
@@ -900,6 +901,21 @@ def _verification_summary(investigation_id: str) -> Optional[dict]:
     return out
 
 
+def _retracted_as_of(events: list[tuple[str, bool]], as_of_dt: datetime) -> bool:
+    """True when the last retraction-log entry at or before ``as_of_dt`` is active."""
+    state = False
+    for ts, active in events:
+        try:
+            ev_dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if ev_dt.tzinfo is None:
+            ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+        if ev_dt <= as_of_dt:
+            state = active
+    return state
+
+
 def investigation_as_of(
     investigation_id: str,
     as_of_timestamp: str,
@@ -909,7 +925,8 @@ def investigation_as_of(
 
     A finding is included only if it already existed
     (``created_at_ts <= as_of_epoch``) and either has no ``valid_until`` or
-    stays valid through ``as_of_timestamp``. This enables bi-temporal
+    stays valid through ``as_of_timestamp``, and was not retracted at that
+    moment per ``retractions.jsonl``. This enables bi-temporal
     reconstruction even after later supersession or retraction.
 
     Args:
@@ -939,6 +956,10 @@ def investigation_as_of(
 
         findings_path = _inv_dir(investigation_id) / "findings.jsonl"
         all_findings = _read_jsonl(findings_path)
+        # Retraction intervals come from the append-only log, so memory_restore
+        # is an exact inverse. Older retracts also stamped valid_until with the
+        # retraction ts; that stamp defers to the log instead of hiding for good.
+        retraction_events = _retraction_events(_inv_dir(investigation_id) / "retractions.jsonl")
 
         result_findings = []
         for f in all_findings:
@@ -949,7 +970,15 @@ def investigation_as_of(
             elif int(created_at_ts) > as_of_epoch:
                 continue
 
+            fid_events = retraction_events.get(str(f.get("id") or ""), [])
+            if _retracted_as_of(fid_events, as_of_dt):
+                continue
+
             valid_until = f.get("valid_until")
+            if valid_until is not None and any(
+                active and ts == str(valid_until) for ts, active in fid_events
+            ):
+                valid_until = None
             if valid_until is not None:
                 try:
                     vu_dt = datetime.fromisoformat(str(valid_until))
