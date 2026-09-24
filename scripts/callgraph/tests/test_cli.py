@@ -1,10 +1,12 @@
 """cli.py: argument parsing and that each subcommand actually prints the
 data it claims to, not just that it exits 0."""
 import json
+import re
 
 import pytest
 
 from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+from .helpers import mcp_tool_functions, source_at
 
 from ..cli import main
 
@@ -117,11 +119,15 @@ def test_reach_from_get_ladybug(capsys):
 # -- registry -----------------------------------------------------------------
 
 
-def test_registry_lists_known_surfaces(capsys):
+def test_registry_lists_known_surfaces(capsys, head_sources):
     code, out = _run(capsys, ["registry", "--rev", "HEAD"])
     assert code == 0
-    assert "reg:mcp/server.py::mcp.tool" in out
-    assert "members= 43" in out or "members=43" in out
+    tool_row = next((row for row in out.splitlines() if "reg:mcp/server.py::mcp.tool " in row), None)
+    assert tool_row is not None, out
+    # Member count must equal the @mcp.tool decorators actually in server.py
+    # (a plain-ast count), not a literal that every new tool invalidates.
+    members = int(re.search(r"members=\s*(\d+)", tool_row).group(1))
+    assert members == len(mcp_tool_functions(source_at(head_sources, "mcp/server.py").source))
     assert "reg:a2a_server/server.py::_SKILL_MAP" in out
 
 

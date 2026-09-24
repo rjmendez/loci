@@ -5,7 +5,8 @@ bar for steps 1-3, not just the synthetic fixtures.
 Most of these share the `head_build` session fixture (see conftest.py) so
 the corpus is only parsed once per test run; a few need a different
 `--rev` or `--scope` and build independently."""
-from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+from .conftest import VALIDATED_REV, needs_corpus_deps, needs_git_history  # noqa: F401
+from .helpers import called_bare_name_count, global_write_lines, mcp_tool_functions, source_at
 from .. import config
 from ..analyze.deadcode import registered_but_dead
 from ..analyze.reach import (
@@ -25,53 +26,90 @@ def test_build_is_clean_and_fast(head_build):
     )
 
 
-def test_module_level_function_count_matches_census_within_tolerance(head_build):
-    module_level = [
-        n for n in head_build.store.nodes_of_kind("FUNCTION")
+# ---------------------------------------------------------------------------
+# Census counts. Each is asserted twice:
+#
+# * on VALIDATED_REV (a fixed commit, see conftest.py) against the number the
+#   current tool measures there, +-3%. Code landing on HEAD cannot move these,
+#   so they are deterministic; only a change to the tool can.
+# * on HEAD as a per-file DENSITY band. These used to be absolute bands that
+#   were widened by hand every few PRs (954-1060 -> ... -> 1800; 8,000-20,000)
+#   and went red for adding code, not for miscounting. Density tracks repo
+#   size, so a band only fails when the pipeline counts nothing or everything.
+# ---------------------------------------------------------------------------
+
+
+def _module_level(store, mcp_top_level_only=False):
+    return [
+        n for n in store.nodes_of_kind("FUNCTION")
         if not n.attrs["is_nested"] and not n.attrs["is_method"]
+        and (not mcp_top_level_only
+             or (n.path is not None and n.path.startswith("mcp/") and n.path.count("/") == 1))
     ]
-    # Band is the 1060 measured count +-10%; helper scripts add a handful of
-    # module-level functions, but large swings still catch corpus regressions.
-    # Raised ceiling: the local-model fleet batch (verify/guardian follow-ons —
-    # conflict/reflection/pre-answer/procedure-learning/mnemosyne/wiring-obligation
-    # corroboration modules) adds several small new modules at once.
-    # 1320 -> 1360: scripts/issue_proposer.py (guarded reflection-loop issue
-    # proposer) and scripts/stigmergic_consensus.py (19 module-level functions)
-    # both add their module-level helpers to the census.
-    # 1360 -> 1390: scripts/model_catalog.py (specialist model catalog),
-    # scripts/swarm_supervisor.py, and scripts/demo_swarm_supervisor.py
-    # (advisory swarm supervisor + demo) add their module-level helpers.
-    # 1390 -> 1410: scripts/bench_local_models.py (honest local model
-    # benchmark harness) adds its module-level helpers.
-    # 1410 -> 1450: swarm-reasoning-tiers explicit-override fix
-    # (local_deep_think.py, swarm_escalate.py) adds per-field *_explicit
-    # tracking + regression tests; CI-measured at 1424, margin kept.
-    assert 954 <= len(module_level) <= 1800, len(module_level)
+
+
+def _mcp_top_level_file_count(build):
+    return sum(1 for n in build.store.nodes_of_kind("MODULE")
+               if n.path is not None and n.path.startswith("mcp/") and n.path.count("/") == 1)
+
+
+def _within(actual, expected, tol=0.03):
+    return abs(actual - expected) <= expected * tol
+
+
+@needs_git_history
+def test_census_counts_at_validated_rev_are_stable(validated_build):
+    store = validated_build.store
+    measured = {
+        "files": validated_build.meta.file_count,
+        "module_level_functions": len(_module_level(store)),
+        "mcp_top_level_module_level_functions": len(_module_level(store, mcp_top_level_only=True)),
+        "callsites": sum(1 for _ in store.nodes_of_kind("CALLSITE")),
+    }
+    # docs/census.txt estimated ~950 module-level functions and ~11,600
+    # call sites at this revision.
+    expected = {
+        "files": 114,
+        "module_level_functions": 915,
+        "mcp_top_level_module_level_functions": 322,
+        "callsites": 11667,
+    }
+    assert measured["files"] == expected["files"], measured
+    assert validated_build.meta.error_count == 0, validated_build.meta.errors
+    off = {k: (measured[k], v) for k, v in expected.items() if not _within(measured[k], v)}
+    assert off == {}, f"census drifted at {VALIDATED_REV} (measured, expected): {off}"
+
+
+def test_module_level_function_count_matches_census_within_tolerance(head_build):
+    n = len(_module_level(head_build.store))
+    per_file = n / head_build.meta.file_count
+    # 8.0/file at VALIDATED_REV, 10.5/file at HEAD when this band was set.
+    assert 4 <= per_file <= 25, (n, head_build.meta.file_count)
 
 
 def test_mcp_top_level_module_level_function_count(head_build):
-    module_level = [
-        n for n in head_build.store.nodes_of_kind("FUNCTION")
-        if n.path is not None and n.path.startswith("mcp/") and n.path.count("/") == 1
-        and not n.attrs["is_nested"] and not n.attrs["is_method"]
-    ]
-    # docs/census.txt estimate was 297; mcp/openrouter.py moved it to ~334.
-    # PR #295 (ladybug lease bounded-wait/backoff helpers) moved it to ~371.
-    # 380 -> 390: mcp/compact.py adds 10 module-level compact-mode helpers.
-    # 390 -> 400: mcp/guardian.py (Granite Guardian) adds check_injection_risk +
-    # backends.py adds ollama_guardian_model.
-    # 400 -> 420: mcp/procedure_learning.py adds the auto-promotion/execution-
-    # outcome feedback loop helpers.
-    assert 300 <= len(module_level) <= 650, len(module_level)
+    n = len(_module_level(head_build.store, mcp_top_level_only=True))
+    files = _mcp_top_level_file_count(head_build)
+    assert files > 0
+    # 16.1/file at VALIDATED_REV, 14.6/file at HEAD when this band was set.
+    assert 5 <= n / files <= 40, (n, files)
 
 
-def test_every_mcp_tool_decorator_is_classified_registering(head_build):
-    registering = [
-        e for e in head_build.store.edges_of_kind("DECORATED_BY")
+def test_every_mcp_tool_decorator_is_classified_registering(head_build, head_sources):
+    """Every `@mcp.tool` in mcp/server.py, found by a plain-ast scan that
+    shares no code with the pipeline, must come out as a registering
+    decorator. Compared by NAME, so adding a tool never breaks this and a
+    tool the pipeline misses is named in the failure."""
+    expected = mcp_tool_functions(source_at(head_sources, "mcp/server.py").source)
+    assert len(expected) >= 43  # the surface at #332; a collapse here means the oracle broke
+    registering = {
+        e.src.split("::", 1)[1] for e in head_build.store.edges_of_kind("DECORATED_BY")
         if e.attrs["classification"] == "registering" and e.attrs["raw"].startswith("mcp.tool")
         and e.src.startswith("fn:mcp/server.py::")
-    ]
-    assert len(registering) == 43
+    }
+    assert registering == expected, {
+        "missed": sorted(expected - registering), "extra": sorted(registering - expected),
+    }
 
 
 def test_no_unknown_decorators_in_real_corpus(head_build):
@@ -149,7 +187,12 @@ def test_callsite_count_is_in_the_expected_ballpark(head_build):
     every feature branch moves. Re-widen it rather than trimming code to fit.
     """
     count = sum(1 for _ in head_build.store.nodes_of_kind("CALLSITE"))
-    assert 8000 <= count <= 20000, count
+    # The absolute 8,000-20,000 band was outgrown too (24,515 at 175 files).
+    # 102/file at VALIDATED_REV, 140/file at HEAD when this band was set; the
+    # exact count at the pinned revision is gated in
+    # test_census_counts_at_validated_rev_are_stable.
+    per_file = count / head_build.meta.file_count
+    assert 40 <= per_file <= 400, (count, head_build.meta.file_count)
 
 
 def test_every_callsite_has_exactly_one_calls_edge(head_build):
@@ -240,14 +283,18 @@ def test_root_cli_entrypoints_cover_most_main_guard_modules(head_build):
 # ---------------------------------------------------------------------------
 
 
-def test_name_get_ladybug_write_and_injection_and_reads(head_build):
+def test_name_get_ladybug_write_and_injection_and_reads(head_build, head_sources):
     store = head_build.store
+    graph_tools_src = source_at(head_sources, "mcp/graph_tools.py").source
     nid = "name:mcp/graph_tools.py::_get_ladybug"
     writes = store.in_edges(nid, "WRITES_NAME")
     global_stmt_writes = [w for w in writes if w.attrs["via"] == "global-stmt"]
     assert len(global_stmt_writes) == 1
     assert global_stmt_writes[0].src == "fn:mcp/graph_tools.py::register"
-    assert global_stmt_writes[0].attrs["line"] == 386  # shifted by docstring/comment trim in mcp/graph_tools.py
+    # The line register() assigns the global _get_ladybug, located by ast rather
+    # than pinned: a literal line number moved with every docstring edit.
+    assert [global_stmt_writes[0].attrs["line"]] == global_write_lines(
+        graph_tools_src, "register", "_get_ladybug")
 
     injects = store.in_edges(nid, "INJECTS")
     assert len(injects) == 1
@@ -255,7 +302,8 @@ def test_name_get_ladybug_write_and_injection_and_reads(head_build):
     assert injects[0].confidence == Confidence.PROBABLE
 
     reads = store.in_edges(nid, "READS_NAME")
-    assert len(reads) == 11
+    assert reads, "graph_tools.py calls the injected _get_ladybug; READS_NAME must see it"
+    assert len(reads) == called_bare_name_count(graph_tools_src, "_get_ladybug")
     assert all(r.attrs["in_call_position"] for r in reads)
 
 

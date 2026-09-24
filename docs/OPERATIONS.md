@@ -30,6 +30,26 @@ not live in the repo.
 | `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
 | `LOCI_TMUX_ROLE_SESSION_MAP` | _(empty)_ | optional `role=session` mappings for offload telemetry attribution (example: `triage=copilot,code=claude`) |
 | `LOCI_TMUX_STALE_SECONDS` | `300` | deterministic stale threshold for tmux workers. A mapped session with latest live-pane activity older than this is marked `stale_worker` |
+| `LOCI_CLOUD_TIER_ENABLED` | `0` (off) | enables third-tier cloud fallback orchestration in `mcp/llm_local.py` after local tiers fail. When enabled, unspecified-model calls can be role-routed to OpenRouter or Abliteration |
+| `LOCI_CLOUD_TIER_SUPERVISOR_MODEL` | `backends.ollama_verify_model()` (the verify-tier model) | local supervisor model used to triage/dispatch unspecified-model calls by role (`triage`, `coding`, `reasoning`, `synthesis`, `redteam`) before cloud escalation |
+| `LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT` | `0` (off) | hard gate for third-party prompt egress. Cloud fallback will not send prompts to OpenRouter/Abliteration unless this is explicitly set to `1/true/on` |
+| `LOCI_CLOUD_TIER_MAX_TOKENS_PER_CALL` | `0` (disabled) | hard cloud-fallback per-call cap. When set, cloud routing refuses requests with larger `max_tokens` and returns `tier=cloud-refused` with reason |
+| `LOCI_CLOUD_TIER_DAILY_CALL_BUDGET` | `0` (disabled) | max cloud fallback calls per UTC day. Exceeding it causes explicit refusal (no silent fallback) |
+| `LOCI_CLOUD_TIER_DAILY_TOKEN_BUDGET` | `0` (disabled) | max requested cloud fallback tokens per UTC day. Exceeding it causes explicit refusal |
+| `LOCI_CLOUD_TIER_DENY_PROVIDERS` | _(none)_ | comma-list deny gate (`openrouter`, `abliteration`) applied before provider attempts |
+| `LOCI_CLOUD_TIER_DENY_ROLES` | _(none)_ | comma-list deny gate for routed roles (`triage`, `coding`, `reasoning`, `synthesis`, `redteam`) |
+| `LOCI_CLOUD_TIER_ALLOWED_ROLES` | _(none)_ | optional allow-list for routed roles. If set, non-listed roles are explicitly refused |
+| `LOCI_CLOUD_TIER_BUDGET_STATE_PATH` | `~/.loci/cloud_tier_budget.json` | JSON ledger path for daily cloud call/token accounting |
+| `LOCI_TMUX_OFFLOAD_ENABLED` | `0` (off) | enables tmux-based offload lane policy reads from `mcp/backends.py`; off by default to preserve current behavior |
+| `LOCI_TMUX_OFFLOAD_ROLE_SESSIONS` | _(none)_ | role→session map for tmux lanes. Accepts comma pairs (`triage=loci-fast,reasoning=loci-deep`) or JSON object |
+| `LOCI_TMUX_OFFLOAD_EXPENSIVE_ROLES` | _(none)_ | comma-list roles treated as expensive lanes (for priority/routing policy), e.g. `reasoning,synthesis,redteam` |
+| `LOCI_TMUX_OFFLOAD_REQUIRE_MAPPED_SESSION` | `0` (off) | strict mode: if `1/true/on`, callers should fail closed when a mapped tmux session is unavailable |
+| `OPENROUTER_BASE_URL` / `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` / _(none)_ | OpenRouter cloud offload tier (`mcp/openrouter.py`) |
+| `OPENROUTER_MODEL` / `OPENROUTER_MODEL_<ROLE>` | `qwen/qwen3.8-27b:free` / _(none)_ | shared and per-role OpenRouter model mapping used by cloud-tier fallback; role keys include `TRIAGE`, `CODING`, `REASONING`, `SYNTHESIS`, `REDTEAM` |
+| `LOCI_OPENROUTER_MAX_TOKENS_PER_CALL` | `0` (disabled) | provider-level hard cap in `mcp/openrouter.py`; requests above this max are explicitly rejected before HTTP calls |
+| `ABLITERATION_BASE_URL` / `ABLITERATION_API_KEY` | `https://api.abliteration.ai/v1` / _(none)_ | Abliteration cloud escalation tier (`mcp/abliteration.py`) |
+| `ABLITERATION_MODEL` / `ABLITERATION_MODEL_<ROLE>` | `abliterated-model` / _(none)_ | shared and per-role Abliteration model mapping; red-team/offensive escalation should usually set `ABLITERATION_MODEL_REDTEAM` explicitly |
+| `LOCI_ABLITERATION_MAX_TOKENS_PER_CALL` | `0` (disabled) | provider-level hard cap in `mcp/abliteration.py`; requests above this max are explicitly rejected before HTTP calls |
 
 **Diagnosed 2026-09-15, corrected in `~/.loci/backends.toml` (machine-specific,
 gitignored — not shown here):** this box's `[ollama].gen_url` had been pointed at a
@@ -72,6 +92,44 @@ Remediation flow:
 3. For `no_live_worker`, restart the worker pane/process in that session.
 4. For `stale_worker`, inspect pane activity and restart the stalled worker.
 5. Re-run `loci_health` and verify all required sessions are `healthy`.
+
+### Cloud tier routing policy (OpenRouter + Abliteration)
+
+The cloud tier is intentionally **opt-in** and only activates when local generation
+fails and `LOCI_CLOUD_TIER_ENABLED=1`.
+
+- **OpenRouter role**: low-cost/free offload and burst absorption.
+- **Abliteration role**: heavy uncensored red-team escalation.
+- **Supervisor role**: a stronger local model (default: the verify-tier model, `backends.ollama_verify_model()`) triages
+  unspecified-model calls into role buckets so provider choice is explicit and auditable.
+- **Egress guard**: set `LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT=1` or cloud fallback will refuse external prompt export by default.
+- **Budget guardrails**: optional per-call and daily budgets now fail closed with explicit
+  refusal reasons (`tier=cloud-refused`) instead of silently trying more expensive routes.
+
+Recommended starting assignments (cost-aware defaults from 2026-09 research):
+
+| Role | OpenRouter default | Abliteration default |
+|---|---|---|
+| `triage` | `qwen/qwen3.8-27b:free` | `abliterated-model` |
+| `coding` | `prism-ml/ternary-bonsai-2-27b` | `abliterated-model` |
+| `reasoning` | `z-ai/glm-5.3-flash` | `abliterated-model` |
+| `synthesis` | `deepseek/deepseek-pro-latest` | `abliterated-model-large-v2` |
+| `redteam` | `qwen/qwen3.8-flash` | `abliterated-model-large-v2` |
+
+Benchmark gate before promoting defaults:
+1. Run role benchmarks across local/openrouter/abliteration lanes.
+2. Promote only after threshold pass and zero critical misroutes.
+3. Record the decision + model map in ops notes so assignment is reproducible.
+
+### tmux offload lane policy
+
+`mcp/backends.py` now exposes tmux lane policy readers under `[tmux_offload]` in
+`~/.loci/backends.toml` (or matching env vars). Safe defaults keep the feature disabled:
+
+- `enabled=false`
+- `role_sessions={...}` optional role→session map
+- `expensive_roles=[]` optional expensive-role set
+- `require_mapped_session=false` (strict fail-closed toggle)
 
 ### Opt-in heavier Ollama generation tags
 
@@ -311,6 +369,10 @@ Reference crontab line for the live profile copy:
 | `c857cd706f67` | mnemosyne-qdrant-sync | 30m | `mnemosyne_qdrant_sync.py` |
 | `a9fc1ea0886a` | state-db-qdrant-sync | 5m | `state_db_qdrant_sync.py` |
 | `f3a4d7c9b8e1` | proactive-self-model-loop | 5m | `self_model_trigger_eval.py` |
+
+`scripts/hermes_cron_runner.py` now rejects absolute script paths, parent-traversal
+segments, and any resolved script outside `<root>/scripts`; invalid job entries are
+persisted as `last_status=error` with reason instead of being executed.
 
 **mnemosyne-consolidation** and **mnemosyne-session-summarizer** both use
 `mnemosyne_activity_check.py` as the pre-flight gate script. They differ in the
@@ -1090,6 +1152,27 @@ No infra address or path is hardcoded. To stand up on a new machine:
    This is the durable channel: it needs no third-party import and no launcher
    that remembers to export anything. Leave a section blank on a laptop that
    runs its own Ollama; the local probe finds it.
+   For cloud/offload setup, use `scripts/loci_setup_verify.py`:
+
+   ```bash
+   # Apply values from local key files into ~/.loci/backends.toml then verify.
+   python scripts/loci_setup_verify.py \
+     --apply \
+     --cloud-tier on \
+     --openrouter-key-file ~/.openrouter \
+     --abliteration-key-file ~/.abliteration \
+     --openrouter-url https://openrouter.ai/api/v1 \
+     --abliteration-url https://api.abliteration.ai/v1
+
+   # Verify only (no writes).
+   python scripts/loci_setup_verify.py --config ~/.loci/backends.toml --check-tmux-sessions
+   ```
+
+   Safety notes:
+   - API keys are read from local key files and written to local user config only
+     (`~/.loci/backends.toml` by default).
+   - The tool refuses `--apply` to repo-tracked paths.
+   - The tool reports key presence/missing status only; it does not print key values.
 2. `scripts/hooks/install.sh` to place the three hooks in `~/.claude/hooks`.
 3. Register them in `~/.claude/settings.json`. Hook paths there are absolute —
    JSON does no `$HOME` expansion.

@@ -94,15 +94,35 @@ def _validate_root(root: Path, *, env_name: str = ENV_FLYBRAIN_STORAGE_ROOT) -> 
             )
 
 
+def _reject_link_components(path: Path, *, env_name: str) -> None:
+    """Fail closed if any existing prefix of the unresolved path is a link.
+
+    Walks the components exactly as given (no lexical ``..`` collapsing), so
+    ``<root>/link/..`` is caught at ``<root>/link`` rather than normalised away.
+    """
+    probe = Path(path.anchor) if path.anchor else Path()
+    for part in path.parts[len(probe.parts):]:
+        probe = probe / part
+        if part in (".", ".."):
+            continue
+        if probe.is_symlink() or _is_windows_reparse_point(probe):
+            raise ValueError(
+                f"{env_name} may not traverse symlink/reparse path: {probe}"
+            )
+
+
 def _resolve_valid_root_value(raw: str, *, env_name: str) -> Path:
     expanded = os.path.expandvars(os.path.expanduser(raw.strip()))
     if not expanded:
         raise ValueError(f"{env_name} is empty")
-    candidate = Path(expanded)
-    if not candidate.is_absolute():
+    if not Path(expanded).is_absolute():
         raise ValueError(f"{env_name} must resolve to an absolute path")
-    _validate_root(candidate, env_name=env_name)
+    # Check the path as written, BEFORE resolving it: Path.resolve() follows
+    # symlinks, so validating only the resolved path can never see a symlinked
+    # component and the symlink/reparse guard would be a no-op.
+    _reject_link_components(Path(expanded), env_name=env_name)
     root = _expand_path(expanded)
+    _validate_root(root, env_name=env_name)
     return root
 
 

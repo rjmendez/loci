@@ -24,20 +24,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-try:
-    from mcp.route_audit import record_route_event
-except Exception:
-    try:
-        from route_audit import record_route_event
-    except Exception:
-        record_route_event = None
 
 _LOG = logging.getLogger("loci-mcp.llm_local")
 
@@ -99,25 +88,178 @@ def _discover_generation_model(base: str, exclude: str = "") -> str:
         return ""
     return ""
 
+def _flag_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _log_route_event(*, tier: str, route: str, reason: str, prompt: str, model: str, degraded: bool = False, ok: bool | None = None, fallback: str | None = None, status_code: int | None = None) -> None:
-    """Write a structured local-route audit event, but never block generation."""
+def _sanitize_for_cloud(prompt: str, max_len: int = 12000) -> str:
+    # Conservative redaction for obvious credential patterns before third-party egress.
+    import re
+    text = (prompt or "")[:max_len]
+    patterns = [
+        r"sk-or-v1-[A-Za-z0-9\-_]+",
+        r"sk-[A-Za-z0-9\-_]{16,}",
+        r"ghp_[A-Za-z0-9]{20,}",
+        r"Bearer\s+[A-Za-z0-9\-_\.=]{16,}",
+        r"(?i)(api[_-]?key\s*[:=]\s*)([^\s\"']+)",
+    ]
+    redacted = text
+    for pat in patterns:
+        redacted = re.sub(pat, lambda m: (m.group(1) if m.lastindex and m.lastindex >= 1 else "") + "[REDACTED]",
+                          redacted)
+    return redacted
+
+
+def _cloud_refusal(why: str, *, provider: str = "", role: str = "", model: str = "") -> dict:
+    out = {"text": "", "ok": False, "tier": "cloud-refused", "why": why[:300], "model": model}
+    if provider:
+        out["provider"] = provider
+    if role:
+        out["route_role"] = role
+    return out
+
+
+def _read_json_file(path: Path) -> dict:
     try:
-        record_route_event(
-            tier=tier,
-            route=route,
-            reason=reason,
-            prompt=prompt,
-            model=model,
-            degraded=degraded,
-            ok=ok,
-            fallback=fallback,
-            status_code=status_code,
-            source="llm_local",
-        )
+        if path.exists():
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                return parsed
     except Exception:
         pass
+    return {}
+
+
+def _write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _consume_cloud_daily_budget(*, max_tokens: int) -> Optional[str]:
+    try:
+        import backends
+        call_budget = backends.cloud_daily_call_budget()
+        token_budget = backends.cloud_daily_token_budget()
+        state_path = Path(backends.cloud_budget_state_path())
+    except Exception as exc:
+        return f"cloud guardrail unavailable: {type(exc).__name__}: {exc}"[:220]
+
+    if call_budget <= 0 and token_budget <= 0:
+        return None
+
+    day = datetime.now(timezone.utc).date().isoformat()
+    try:
+        state = _read_json_file(state_path)
+        if state.get("day") != day:
+            state = {"day": day, "calls": 0, "tokens": 0}
+        calls = int(state.get("calls", 0))
+        tokens = int(state.get("tokens", 0))
+    except Exception as exc:
+        return f"cloud guardrail state unreadable: {type(exc).__name__}: {exc}"[:220]
+
+    if call_budget > 0 and (calls + 1) > call_budget:
+        return f"cloud daily call budget exhausted ({calls}/{call_budget})"
+    if token_budget > 0 and (tokens + max_tokens) > token_budget:
+        return ("cloud daily token budget exhausted "
+                f"({tokens}+{max_tokens}>{token_budget})")
+
+    state["calls"] = calls + 1
+    state["tokens"] = tokens + max_tokens
+    try:
+        _write_json_file(state_path, state)
+    except Exception as exc:
+        return f"cloud guardrail state unwritable: {type(exc).__name__}: {exc}"[:220]
+    return None
+
+
+def _normalize_role(role: Optional[str]) -> str:
+    if role is None:
+        return ""
+    return str(role).strip().lower().replace("_", "-")
+
+
+def _tmux_session_available(session_name: str) -> bool:
+    """Check whether a configured tmux session is currently live."""
+    session_name = (session_name or "").strip()
+    if not session_name:
+        return False
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _tmux_offload_policy(role: Optional[str]) -> dict:
+    """Resolve tmux offload policy for a generation role.
+
+    The policy is advisory: if a mapped tmux lane exists and is live, we surface it as a
+    higher-priority actor for expensive roles without disturbing the standard local/vLLM/cloud
+    fallback flow when the feature is disabled or no tmux lane is available. In strict mode
+    (require_mapped_session=True), a missing mapped lane becomes a hard fail instead of
+    silently falling back.
+    """
+    try:
+        import backends
+    except Exception:
+        return {
+            "enabled": False,
+            "role": _normalize_role(role),
+            "priority": "normal",
+            "session": None,
+            "available": False,
+            "require_mapped_session": False,
+            "reason": "tmux backend unavailable",
+        }
+
+    normalized = _normalize_role(role)
+    enabled = bool(backends.tmux_offload_enabled())
+    if not enabled:
+        return {
+            "enabled": False,
+            "role": normalized,
+            "priority": "normal",
+            "session": None,
+            "available": False,
+            "require_mapped_session": False,
+            "reason": "feature disabled",
+        }
+
+    mappings = {str(k).lower(): str(v) for k, v in (backends.tmux_offload_role_sessions() or {}).items()}
+    expensive = {str(v).strip().lower() for v in (backends.tmux_offload_expensive_roles() or set())}
+    session_name = mappings.get(normalized, "") or ""
+    is_expensive = normalized in expensive
+    if session_name:
+        available = _tmux_session_available(session_name)
+        return {
+            "enabled": True,
+            "role": normalized,
+            "priority": "expensive" if is_expensive else "normal",
+            "session": session_name,
+            "available": available,
+            "require_mapped_session": bool(backends.tmux_offload_require_mapped_session()),
+            "reason": "session available" if available else "session missing",
+        }
+
+    return {
+        "enabled": True,
+        "role": normalized,
+        "priority": "expensive" if is_expensive else "normal",
+        "session": None,
+        "available": False,
+        "require_mapped_session": bool(backends.tmux_offload_require_mapped_session()),
+        "reason": "no mapped session for role",
+    }
+
 
 def generate(prompt: str,
              model: str = "",
@@ -125,7 +267,8 @@ def generate(prompt: str,
              max_tokens: int = 256,
              temperature: float = 0.2,
              keep_alive: str = "30m",
-             think: bool = False) -> dict:
+             think: bool = False,
+             role: Optional[str] = None) -> dict:
     """Generate text from the local Ollama model. Fail-open, never raises.
 
     Args:
@@ -151,6 +294,26 @@ def generate(prompt: str,
     Returns:
         {'text': str, 'ok': bool, 'model': str}. On any failure text='' and ok=False.
     """
+    normalized_role = _normalize_role(role)
+    tmux_policy = _tmux_offload_policy(normalized_role or _heuristic_route(prompt).get("role"))
+    if tmux_policy.get("enabled") and tmux_policy.get("require_mapped_session") and tmux_policy.get("session") and not tmux_policy.get("available"):
+        return {
+            "text": "",
+            "ok": False,
+            "model": model or "",
+            "tier": "tmux-offload-refused",
+            "route_role": tmux_policy.get("role"),
+            "tmux_session": tmux_policy.get("session"),
+            "why": f"tmux offload required for role '{tmux_policy.get('role')}' but session '{tmux_policy.get('session')}' is unavailable",
+        }
+    if tmux_policy.get("enabled") and tmux_policy.get("available"):
+        _LOG.info(
+            "llm_local.tmux_offload role=%s session=%s priority=%s",
+            tmux_policy.get("role"),
+            tmux_policy.get("session"),
+            tmux_policy.get("priority"),
+        )
+    model_was_unspecified = not bool(model)
     if not model:
         try:
             import backends
@@ -208,7 +371,6 @@ def generate(prompt: str,
         import requests
         _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
                   model, fmt or "", max_tokens)
-        _log_route_event(tier="local", route="ollama", reason="generate_request", prompt=prompt, model=model, degraded=False, ok=None)
         r = requests.post(f"{base}/api/generate", json=body, timeout=_TIMEOUT)
         r.raise_for_status()
         payload = r.json()
@@ -244,14 +406,19 @@ def generate(prompt: str,
             payload = None
             text = ""
         if not text:
+            route = _supervisor_route(prompt, fmt=fmt, max_tokens=max_tokens) if model_was_unspecified else None
             fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
-                                 temperature=temperature)
+                                 temperature=temperature, endpoint_role=(route or {}).get("role"))
             if fallback is not None:
                 _LOG.info("llm_local fallback tier=%s model=%s",
                           fallback.get("tier", "unknown"), fallback.get("model", ""))
-                _log_route_event(tier="local", route="vllm_fallback", reason="ollama_failure", prompt=prompt, model=model, degraded=True, ok=True, fallback=fallback.get("tier", "vllm"), status_code=0)
                 return fallback
-            _log_route_event(tier="local", route="ollama", reason=f"ollama {type(exc).__name__}", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
+            cloud = _try_cloud_tier(prompt, fmt=fmt, max_tokens=max_tokens,
+                                    temperature=temperature, route=route, model=model)
+            if cloud is not None:
+                _LOG.info("llm_local fallback tier=%s model=%s",
+                          cloud.get("tier", "unknown"), cloud.get("model", ""))
+                return cloud
             return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
 
     if fmt == "json":
@@ -259,16 +426,20 @@ def generate(prompt: str,
         try:
             json.loads(text)
         except Exception as exc:
-            _log_route_event(tier="local", route="ollama", reason="json_invalid", prompt=prompt, model=model, degraded=True, ok=False, status_code=0)
             return {"text": text, "ok": False, "model": model,
                     "why": f"response was not valid JSON: {exc}"[:200]}
 
-    _log_route_event(tier="local", route="ollama", reason="generate_success", prompt=prompt, model=model, degraded=False, ok=True, status_code=0)
-    return {"text": text, "ok": True, "model": model}
+    out = {"text": text, "ok": True, "model": model}
+    tmux_policy = _tmux_offload_policy(_normalize_role(role) or _heuristic_route(prompt).get("role"))
+    if tmux_policy.get("enabled") and tmux_policy.get("session"):
+        out["tmux_session"] = tmux_policy["session"]
+        out["route_role"] = tmux_policy.get("role")
+        out["tmux_priority"] = tmux_policy.get("priority")
+    return out
 
 
 def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
-              temperature: float) -> Optional[dict]:
+              temperature: float, endpoint_role: Optional[str] = None) -> Optional[dict]:
     """Second tier. Returns a result dict, or None if vLLM is not usable either.
 
     batched_gen already resolves the vLLM endpoint AND the model name the server
@@ -284,7 +455,7 @@ def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
         return None
     try:
         out = batched_gen.generate_batch([prompt], max_tokens=max_tokens, fmt=fmt,
-                                         temperature=temperature)
+                                         think=False, endpoint_role=endpoint_role)
     except TypeError:
         # older signature without temperature
         try:
@@ -301,7 +472,151 @@ def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
     served = first.get("model")
     if not served:
         try:
-            served = batched_gen._resolve_vllm_model()
+            served = batched_gen._resolve_vllm_model(endpoint_role)
         except Exception:
             served = "vllm"
     return {"text": first.get("text", ""), "ok": True, "model": served, "tier": "vllm"}
+
+
+def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int) -> Optional[dict]:
+    """Use a stronger local supervisor to route unspecified calls across cloud tier options."""
+    try:
+        import backends
+        if not backends.cloud_tier_enabled():
+            return None
+        supervisor_model = backends.cloud_supervisor_model()
+    except Exception:
+        return None
+
+    base = _gen_env() or _resolve_ollama()
+    if not base:
+        return _heuristic_route(prompt)
+
+    instruction = (
+        "Return strict JSON only: {\"provider\":\"openrouter|abliteration|vllm|ollama\","
+        "\"role\":\"triage|coding|reasoning|synthesis|redteam\","
+        "\"reason\":\"short\"}. Pick cloud provider only when local first-tier would"
+        " likely degrade for this prompt."
+    )
+    body = {
+        "model": supervisor_model,
+        "prompt": f"{instruction}\n\nPrompt:\n{prompt[:5000]}",
+        "stream": False,
+        "keep_alive": "30m",
+        "think": False,
+        "format": "json",
+        "options": {"num_predict": min(max_tokens, 220), "temperature": 0.0},
+    }
+    try:
+        import requests
+        r = requests.post(f"{base}/api/generate", json=body, timeout=min(_TIMEOUT, 45))
+        r.raise_for_status()
+        text = (r.json() or {}).get("response") or ""
+        parsed = json.loads(text)
+        provider = str(parsed.get("provider", "")).strip().lower()
+        role = str(parsed.get("role", "")).strip().lower()
+        if provider not in {"openrouter", "abliteration", "vllm", "ollama"}:
+            return _heuristic_route(prompt)
+        if role not in {"triage", "coding", "reasoning", "synthesis", "redteam"}:
+            role = "reasoning"
+        route = {"provider": provider, "role": role}
+        _LOG.info("llm_local.supervisor_route provider=%s role=%s", provider, role)
+        return route
+    except Exception:
+        return _heuristic_route(prompt)
+
+
+def _heuristic_route(prompt: str) -> dict:
+    p = (prompt or "").lower()
+    if any(k in p for k in ("red team", "redteam", "adversarial", "jailbreak", "exploit")):
+        return {"provider": "abliteration", "role": "redteam"}
+    if any(k in p for k in ("refactor", "code", "python", "typescript", "compile", "test")):
+        return {"provider": "openrouter", "role": "coding"}
+    if len(p) > 3500 or any(k in p for k in ("synthesize", "long context", "compare", "summarize")):
+        return {"provider": "openrouter", "role": "synthesis"}
+    return {"provider": "openrouter", "role": "triage"}
+
+
+def _try_cloud_tier(prompt: str, *, fmt: Optional[str], max_tokens: int,
+                    temperature: float, route: Optional[dict], model: str = "") -> Optional[dict]:
+    """Third tier: provider-selected cloud fallback (OpenRouter + Abliteration)."""
+    try:
+        import backends
+        if not backends.cloud_tier_enabled():
+            return None
+        if not _flag_on("LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT"):
+            why = ("cloud fallback refused: prompt export is disabled; "
+                   "set LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT=1")
+            _LOG.warning("llm_local: %s", why)
+            return _cloud_refusal(why, role=(route or {}).get("role", ""))
+        role = (route or {}).get("role") or "triage"
+        preferred = (route or {}).get("provider", "openrouter")
+        openrouter_model = backends.openrouter_model(role)
+        abliteration_model = backends.abliteration_model(role)
+        max_per_call = backends.cloud_max_tokens_per_call()
+        deny_roles = backends.cloud_deny_roles()
+        allowed_roles = backends.cloud_allowed_roles()
+        deny_providers = backends.cloud_deny_providers()
+    except Exception:
+        return None
+
+    if max_per_call > 0 and max_tokens > max_per_call:
+        return _cloud_refusal(
+            f"cloud fallback refused: max_tokens={max_tokens} exceeds per-call cap={max_per_call}",
+            role=role,
+            model=model,
+        )
+    if role in deny_roles:
+        return _cloud_refusal(
+            f"cloud fallback refused: role '{role}' is denied by policy",
+            role=role,
+            model=model,
+        )
+    if allowed_roles and role not in allowed_roles:
+        return _cloud_refusal(
+            f"cloud fallback refused: role '{role}' is not in allowed set",
+            role=role,
+            model=model,
+        )
+
+    providers = ["openrouter", "abliteration"] if preferred != "abliteration" else ["abliteration", "openrouter"]
+    providers = [p for p in providers if p not in deny_providers]
+    if not providers:
+        return _cloud_refusal(
+            f"cloud fallback refused: provider deny-list removed all candidates ({sorted(deny_providers)})",
+            role=role,
+            model=model,
+        )
+    budget_refusal = _consume_cloud_daily_budget(max_tokens=max_tokens)
+    if budget_refusal:
+        return _cloud_refusal(f"cloud fallback refused: {budget_refusal}", role=role, model=model)
+
+    prompt_for_cloud = _sanitize_for_cloud(prompt)
+    for provider in providers:
+        if provider == "openrouter":
+            try:
+                import openrouter
+                out = openrouter.generate_batch([prompt_for_cloud], model=openrouter_model,
+                                                max_tokens=max_tokens, fmt=fmt,
+                                                temperature=temperature)
+                first = (out or [{}])[0]
+                if first.get("ok"):
+                    return {"text": first.get("text", ""), "ok": True,
+                            "model": first.get("model", openrouter_model),
+                            "tier": "cloud-openrouter", "route_role": role}
+            except Exception:
+                continue
+        else:
+            try:
+                import abliteration
+                out = abliteration.generate_batch([prompt_for_cloud], model=abliteration_model,
+                                                  max_tokens=max_tokens, fmt=fmt,
+                                                  temperature=temperature)
+                first = (out or [{}])[0]
+                if first.get("ok"):
+                    return {"text": first.get("text", ""), "ok": True,
+                            "model": first.get("model", abliteration_model),
+                            "tier": "cloud-abliteration", "route_role": role}
+            except Exception:
+                continue
+    return None

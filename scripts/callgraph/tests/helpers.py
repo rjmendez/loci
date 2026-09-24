@@ -78,3 +78,62 @@ def build_fixture_store(rel_paths: list[str]):
         flush()
     extract_probable_calls(store, scopes, top_level_index)
     return store, table, scopes
+
+
+# ---------------------------------------------------------------------------
+# Independent oracles for real-corpus tests.
+#
+# A real-corpus test that pins a literal count ("43 tools", "line 386") fails
+# every time someone adds a tool or a comment, which teaches people to bump the
+# number without looking. These helpers compute the expected answer straight
+# from the source with plain `ast`, sharing no code with the pipeline under
+# test, so the test compares the tool against the code as it is now.
+# ---------------------------------------------------------------------------
+
+
+def source_at(sources, rel_path: str):
+    """The SourceFile for `rel_path` from a load_corpus() result."""
+    return next(sf for sf in sources if sf.rel_path == rel_path)
+
+
+def _decorator_target(dec: ast.expr) -> ast.expr:
+    return dec.func if isinstance(dec, ast.Call) else dec
+
+
+def mcp_tool_functions(source: str) -> set[str]:
+    """Names of functions decorated `@mcp.tool` / `@mcp.tool(...)`."""
+    out: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            target = _decorator_target(dec)
+            if (isinstance(target, ast.Attribute) and target.attr == "tool"
+                    and isinstance(target.value, ast.Name) and target.value.id == "mcp"):
+                out.add(node.name)
+    return out
+
+
+def global_write_lines(source: str, enclosing_fn: str, name: str) -> list[int]:
+    """Lines where top-level `enclosing_fn` assigns `name` after declaring it
+    `global` -- the writes the pipeline records as WRITES_NAME via=global-stmt."""
+    tree = ast.parse(source)
+    lines: list[int] = []
+    for fn in tree.body:
+        if not (isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name == enclosing_fn):
+            continue
+        if not any(isinstance(n, ast.Global) and name in n.names for n in ast.walk(fn)):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Name) and node.id == name
+                    and isinstance(node.ctx, ast.Store)):
+                lines.append(node.lineno)
+    return sorted(lines)
+
+
+def called_bare_name_count(source: str, name: str) -> int:
+    """How many times `name(...)` is called by bare name anywhere in the module."""
+    return sum(
+        1 for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    )
