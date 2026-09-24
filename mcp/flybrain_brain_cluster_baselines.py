@@ -9,6 +9,12 @@ samples than the obvious rule a person would write without any training:
   connectivity_tier label is thresholded from).
 * ``argmax``: pick the label whose score feature is largest in ``input_text``
   (e.g. fw ``ach_avg`` / ``gaba_avg`` / ... for neurotransmitter_dominance).
+* ``lookup``: a one-feature lookup table (feature value -> majority train
+  label; unseen values fall back to the train majority). This is the trivial
+  rule for categorical inputs (banc / mc / mv / ol put only category tokens in
+  ``input_text``, where ``threshold`` and ``argmax`` never apply). Every input
+  feature gets its own table and the rule reports the feature with the best
+  held-out accuracy, so it is deliberately a strict bar.
 
 Rules only see what the model sees (``input_text``). Each rule is fitted on
 the train split and scored on the held-out split. The gate fails unless the
@@ -30,6 +36,7 @@ TRIVIAL_BASELINE_SCHEMA_VERSION = "braincluster-trivial-baseline/v1"
 RULE_MAJORITY = "majority"
 RULE_THRESHOLD = "threshold"
 RULE_ARGMAX = "argmax"
+RULE_LOOKUP = "lookup"
 
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LABEL_PREFIXES = ("dominant_",)
@@ -218,6 +225,40 @@ def apply_argmax_rule(rule: Mapping[str, Any], text: str) -> str | None:
     return sorted(label for value, label in scored if value == best_value)[0]
 
 
+def fit_lookup_rules(rows: Sequence[tuple[str, str]]) -> dict[str, dict[str, Any]]:
+    """One lookup table per input feature (train rows only).
+
+    Each table maps a feature value to its majority train label; ``fallback``
+    (the overall train majority) covers rows where the value was never seen or
+    the feature is absent. Features with a single value in train are skipped
+    (their table equals the majority rule).
+    """
+    if not rows:
+        return {}
+    fallback = _majority_label([label for _, label in rows])
+    per_feature: dict[str, dict[str, dict[str, int]]] = {}
+    for text, label in rows:
+        for key, value in parse_input_features(text).items():
+            bucket = per_feature.setdefault(key, {}).setdefault(value, {})
+            bucket[label] = bucket.get(label, 0) + 1
+    tables: dict[str, dict[str, Any]] = {}
+    for key in sorted(per_feature):
+        values = per_feature[key]
+        if len(values) < 2:
+            continue
+        tables[key] = {
+            "fallback": fallback,
+            "table": {value: _best_label(counts)[0] for value, counts in sorted(values.items())},
+        }
+    return tables
+
+
+def apply_lookup_rule(rule: Mapping[str, Any], feature: str, text: str) -> str:
+    value = parse_input_features(text).get(feature)
+    table = rule["table"]
+    return str(table[value]) if value is not None and value in table else str(rule["fallback"])
+
+
 def evaluate_trivial_baselines(
     train_rows: Sequence[tuple[str, str]],
     heldout_rows: Sequence[tuple[str, str]],
@@ -259,6 +300,26 @@ def evaluate_trivial_baselines(
             "applicable": True,
             "params": argmax,
             "heldout_accuracy": _accuracy(predicted, actual),
+        }
+
+    lookups = fit_lookup_rules(train_rows)
+    if not lookups:
+        rules[RULE_LOOKUP] = {"applicable": False, "params": None, "heldout_accuracy": None}
+    else:
+        per_feature: dict[str, float] = {}
+        for feature, rule in lookups.items():
+            predicted = [apply_lookup_rule(rule, feature, text) for text, _ in heldout_rows]
+            per_feature[feature] = _accuracy(predicted, actual)
+        best_feature = sorted(per_feature.items(), key=lambda item: (-item[1], item[0]))[0][0]
+        rules[RULE_LOOKUP] = {
+            "applicable": True,
+            "params": {
+                "feature": best_feature,
+                "distinct_values": len(lookups[best_feature]["table"]),
+                "fallback": lookups[best_feature]["fallback"],
+                "per_feature_heldout_accuracy": {k: round(v, 6) for k, v in sorted(per_feature.items())},
+            },
+            "heldout_accuracy": per_feature[best_feature],
         }
 
     applicable = [(name, row["heldout_accuracy"]) for name, row in rules.items() if row["applicable"]]
@@ -314,13 +375,16 @@ def trivial_baseline_gate(
 __all__ = [
     "BaselineGateConfig",
     "RULE_ARGMAX",
+    "RULE_LOOKUP",
     "RULE_MAJORITY",
     "RULE_THRESHOLD",
     "TRIVIAL_BASELINE_SCHEMA_VERSION",
     "apply_argmax_rule",
+    "apply_lookup_rule",
     "apply_threshold_rule",
     "evaluate_trivial_baselines",
     "fit_argmax_rule",
+    "fit_lookup_rules",
     "fit_threshold_rule",
     "parse_input_features",
     "trivial_baseline_gate",

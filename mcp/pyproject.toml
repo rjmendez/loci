@@ -38,6 +38,9 @@ braincluster-p0-dry-run = "flybrain_brain_cluster_pipeline:main"
 braincluster-threshold-calibrate = "flybrain_brain_cluster_thresholds:main"
 braincluster-build-fw-samples = "flybrain_brain_cluster_fw_samples:main"
 braincluster-build-banc-samples = "flybrain_brain_cluster_banc_samples:main"
+braincluster-build-mc-samples = "flybrain_brain_cluster_mc_samples:main"
+braincluster-build-mv-samples = "flybrain_brain_cluster_mv_samples:main"
+braincluster-build-ol-samples = "flybrain_brain_cluster_ol_samples:main"
 braincluster-release-prep = "flybrain_brain_cluster_release_prep:main"
 
 [tool.setuptools.packages.find]
@@ -68,6 +71,12 @@ py-modules = [
     "flybrain_brain_cluster_banc_samples",
     "flybrain_l1em_adapter",
     "flybrain_brain_cluster_l1em_samples",
+    "flybrain_mc_adapter",
+    "flybrain_brain_cluster_mc_samples",
+    "flybrain_mv_adapter",
+    "flybrain_brain_cluster_mv_samples",
+    "flybrain_ol_adapter",
+    "flybrain_brain_cluster_ol_samples",
     "flybrain_brain_cluster_baselines",
     "flybrain_hash_stamps",
     "replay_fingerprint",

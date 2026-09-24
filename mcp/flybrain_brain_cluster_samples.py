@@ -22,7 +22,7 @@ import importlib.util
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 import flybrain_brain_cluster_fw_samples as fw_samples
 from flybrain_dataset_registry import (
@@ -252,6 +252,54 @@ def sanitize_region(raw: str) -> str:
 def balance_and_cap_samples(samples: Sequence[dict[str, Any]], *, max_samples: int) -> list[dict[str, Any]]:
     """Deterministic round-robin across regions (sorted), identical to fw."""
     return fw_samples._balance_and_cap_samples(samples, max_samples=max_samples)
+
+
+def hash_ordered_preselect(
+    samples: Sequence[dict[str, Any]],
+    *,
+    max_samples: int,
+    salt: str,
+    id_of: Callable[[Mapping[str, Any]], str] | None = None,
+) -> list[dict[str, Any]]:
+    """Pick the cap-sized subset in sha256(salt:id) order per region, round-robin over sorted regions.
+
+    ``balance_and_cap_samples`` takes each region's samples in ``sample_id``
+    order. When sample ids embed a body id that tracks neuron size or
+    proofreading order (FlyEM MaleCNS, MANC and optic-lobe body ids all do),
+    a capped build keeps the lowest ids and skews the label balance (for
+    example far more high_connectivity than the 25% a 0.75 quantile defines).
+    This pre-selection chooses an id-order-independent subset of exactly the
+    size the cap allows; passing the result through ``balance_and_cap_samples``
+    then only reorders it. Deterministic and independent of input order.
+    ``id_of`` defaults to ``sample_id``.
+    """
+    key_of = id_of or (lambda sample: str(sample["sample_id"]))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        grouped.setdefault(str(sample["region_id"]), []).append(sample)
+
+    def _order(sample: Mapping[str, Any]) -> tuple[str, str]:
+        digest = hashlib.sha256(f"{salt}:{key_of(sample)}".encode("utf-8")).hexdigest()
+        return digest, str(sample["sample_id"])
+
+    for bucket in grouped.values():
+        bucket.sort(key=_order)
+    limit = int(max_samples)
+    selected: list[dict[str, Any]] = []
+    cursors = {region: 0 for region in grouped}
+    regions = sorted(grouped)
+    while len(selected) < limit:
+        progressed = False
+        for region in regions:
+            if len(selected) >= limit:
+                break
+            if cursors[region] < len(grouped[region]):
+                selected.append(grouped[region][cursors[region]])
+                cursors[region] += 1
+                progressed = True
+        if not progressed:
+            break
+    return selected
 
 
 def assemble_training_payload(

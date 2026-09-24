@@ -175,7 +175,8 @@ _SPECS: tuple[DatasetSpec, ...] = (
     DatasetSpec("mc", "mc", "male-cns_v1.0", OrganismStage.ADULT, RegionVocabulary.MALE_CNS_ROI,
                 LICENSE_CC_BY_4_0, (_C, _N, _R), DatasetStatus.PLANNED,
                 "Janelia FlyEM male adult CNS (MaleCNS, neuPrint male-cns:v1.0, released 2026-06-08): "
-                "brain + ventral nerve cord of one male. No adapter or sample builder yet.",
+                "brain + ventral nerve cord of one male. Builders: connectivity_tier, neurotransmitter_dominance, "
+                "region_specialization_tier (docs/FLYBRAIN_MC_ADAPTER_CONTRACT.md).",
                 split_group_keys=("cell_type", "hemilineage"),
                 citation="Berg S, Beckett IR, Costa M, Schlegel P, et al. (2026). Sexual dimorphism in the "
                          "complete connectome of the Drosophila male central nervous system. Cell "
@@ -184,7 +185,8 @@ _SPECS: tuple[DatasetSpec, ...] = (
     DatasetSpec("mv", "mv", "manc_v1.0", OrganismStage.ADULT, RegionVocabulary.MANC_NEUROPIL,
                 LICENSE_CC_BY_4_0, (_C, _N, _R), DatasetStatus.PLANNED,
                 "Janelia FlyEM Male Adult Nerve Cord (MANC) v1.0 flat exports: male ventral nerve cord "
-                "only (v1.2.x is neuPrint-API only and was not pulled). No adapter or sample builder yet.",
+                "only (v1.2.x is neuPrint-API only and was not pulled). Builders: connectivity_tier, "
+                "neurotransmitter_dominance, region_specialization_tier (docs/FLYBRAIN_MV_ADAPTER_CONTRACT.md).",
                 split_group_keys=("cell_type", "hemilineage"),
                 citation="Takemura S, Hayworth KJ, Huang GB, et al. (2024). A connectome of the male "
                          "Drosophila ventral nerve cord. eLife 13:RP97769. doi:10.7554/eLife.97769; "
@@ -193,9 +195,11 @@ _SPECS: tuple[DatasetSpec, ...] = (
                          "eLife 13:RP96084. doi:10.7554/eLife.96084. Data: FlyEM MANC v1.0, "
                          "gs://flyem-manc-exports/v1.0 (CC BY 4.0)."),
     DatasetSpec("ol", "ol", "optic_lobe_v1.1", OrganismStage.ADULT, RegionVocabulary.OPTIC_LOBE_NEUROPIL,
-                LICENSE_CC_BY_4_0, (_C, _N, _R), DatasetStatus.PLANNED,
+                LICENSE_CC_BY_4_0, (_C, _N), DatasetStatus.PLANNED,
                 "Janelia FlyEM male right optic lobe (neuPrint optic-lobe:v1.1; flat export "
-                "2024-09-11-a7d912, minconf 0.5). No adapter or sample builder yet.",
+                "2024-09-11-a7d912, minconf 0.5). Builders: connectivity_tier, neurotransmitter_dominance "
+                "(docs/FLYBRAIN_OL_ADAPTER_CONTRACT.md). No region_specialization_tier: roiInfo is the only "
+                "region signal and already defines region_id and the inputs, so any such label is circular.",
                 split_group_keys=("cell_type",),
                 citation="Nern A, Loesche F, Takemura S, Burnett LE, Dreher M, et al. (2025). "
                          "Connectome-driven neural inventory of a complete visual system. Nature "

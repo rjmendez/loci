@@ -55,12 +55,39 @@ def test_argmax_rule_for_neurotransmitter_scores():
     assert report["rules"][fbb.RULE_ARGMAX]["heldout_accuracy"] == pytest.approx(1.0)
 
 
-def test_majority_only_when_no_numeric_or_score_features():
-    train = [("color red", "a")] * 6 + [("color blue", "b")] * 2
-    held = [("color red", "a"), ("color blue", "b")]
+def test_categorical_lookup_rule_catches_label_proxy():
+    # Categorical-only input: threshold/argmax never apply, but a one-feature
+    # lookup table recovers the label, so the gate bar is 1.0, not majority.
+    train = [("dataset x color red shape sq", "a")] * 6 + [("dataset x color blue shape sq", "b")] * 2
+    held = [("dataset x color red shape sq", "a"), ("dataset x color blue shape sq", "b")]
     report = fbb.evaluate_trivial_baselines(train, held)
     assert report["rules"][fbb.RULE_THRESHOLD]["applicable"] is False
     assert report["rules"][fbb.RULE_ARGMAX]["applicable"] is False
+    assert report["rules"][fbb.RULE_MAJORITY]["heldout_accuracy"] == pytest.approx(0.5)
+    lookup = report["rules"][fbb.RULE_LOOKUP]
+    assert lookup["applicable"] is True
+    assert lookup["params"]["feature"] == "color"
+    # Constant features (dataset, shape) get no table of their own.
+    assert set(lookup["params"]["per_feature_heldout_accuracy"]) == {"color"}
+    assert report["best_rule"] == fbb.RULE_LOOKUP
+    assert report["best_accuracy"] == pytest.approx(1.0)
+
+
+def test_lookup_unseen_value_falls_back_to_train_majority():
+    train = [("color red", "a")] * 6 + [("color blue", "b")] * 2
+    held = [("color green", "a"), ("color green", "b")]
+    report = fbb.evaluate_trivial_baselines(train, held)
+    assert report["rules"][fbb.RULE_LOOKUP]["heldout_accuracy"] == pytest.approx(0.5)
+    assert report["best_accuracy"] == pytest.approx(0.5)
+
+
+def test_majority_only_when_every_feature_is_constant():
+    train = [("color red", "a")] * 6 + [("color red", "b")] * 2
+    held = [("color red", "a"), ("color red", "b")]
+    report = fbb.evaluate_trivial_baselines(train, held)
+    assert report["rules"][fbb.RULE_THRESHOLD]["applicable"] is False
+    assert report["rules"][fbb.RULE_ARGMAX]["applicable"] is False
+    assert report["rules"][fbb.RULE_LOOKUP]["applicable"] is False
     assert report["best_rule"] == fbb.RULE_MAJORITY
     assert report["best_accuracy"] == pytest.approx(0.5)
 

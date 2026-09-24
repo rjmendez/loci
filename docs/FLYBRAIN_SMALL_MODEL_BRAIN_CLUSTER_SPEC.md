@@ -194,9 +194,13 @@ hemilineage, or a left/right pair via `split_group`) land in the same split.
 would have straddled.
 
 The promotion gate also runs the trivial-baseline check (AC6,
-`flybrain_brain_cluster_baselines`). Three rules are fitted on the train split and scored on
+`flybrain_brain_cluster_baselines`). Four rules are fitted on the train split and scored on
 the held-out split (test, else val): majority class, a one-feature threshold on a numeric
-`input_text` feature, and argmax over score features in `input_text`. The gate fails unless
+`input_text` feature, argmax over score features in `input_text`, and a one-feature lookup
+table (feature value to majority train label, unseen values fall back to the train
+majority). The lookup rule is the trivial rule for categorical inputs (banc, mc, mv and ol
+put only category tokens in `input_text`); each feature gets its own table and the best
+held-out feature is reported, so it is a deliberately strict bar. The gate fails unless
 the model's held-out accuracy is at least the best trivial accuracy plus `min_margin`
 (default 0.01, CLI `--baseline-margin`). Both numbers are recorded in
 `gate_report.trivial_baseline`, in `trivial-baseline-report.json`, and in the

@@ -237,3 +237,36 @@ def test_payload_stamped_for_another_dataset_rejected(stub_banc):
     with pytest.raises(DatasetRegistryError) as exc:
         samples.build_training_samples("mc", "connectivity_tier", _StubConfig(symbol="banc"), allow_planned=True)
     assert exc.value.code is DatasetErrorCode.PAYLOAD_INVALID
+
+
+def _id_ordered_samples(n_per_region: int = 200) -> list[dict]:
+    # Low ids are "big" neurons (label hi), as in FlyEM body ids.
+    out = []
+    for region in ("r_a", "r_b"):
+        for index in range(n_per_region):
+            body = 10_000 + index
+            out.append({
+                "sample_id": f"t-{region}-{body}",
+                "region_id": region,
+                "expected_label": "hi" if index < n_per_region // 4 else "lo",
+                "metadata": {"root_id": str(body)},
+            })
+    return out
+
+
+def test_hash_ordered_preselect_removes_id_order_bias():
+    pool = _id_ordered_samples()
+    by_id_order = samples.balance_and_cap_samples(pool, max_samples=100)
+    assert all(s["expected_label"] == "hi" for s in by_id_order)  # the bias being fixed
+    picked = samples.hash_ordered_preselect(pool, max_samples=100, salt="t",
+                                            id_of=lambda s: s["metadata"]["root_id"])
+    assert len(picked) == 100
+    assert {s["region_id"] for s in picked} == {"r_a", "r_b"}
+    hi_share = sum(s["expected_label"] == "hi" for s in picked) / 100.0
+    assert 0.1 < hi_share < 0.45
+    again = samples.hash_ordered_preselect(list(reversed(pool)), max_samples=100, salt="t",
+                                           id_of=lambda s: s["metadata"]["root_id"])
+    assert [s["sample_id"] for s in again] == [s["sample_id"] for s in picked]
+    capped = samples.balance_and_cap_samples(picked, max_samples=100)
+    assert {s["sample_id"] for s in capped} == {s["sample_id"] for s in picked}
+    assert len(samples.hash_ordered_preselect(pool, max_samples=10_000, salt="t")) == len(pool)
