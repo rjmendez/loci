@@ -190,10 +190,24 @@ FORBIDDEN_INPUT_FEATURES: Mapping[str, frozenset[str]] = {
     )
     | _IDENTITY_FEATURES,
 }
+# Structured (tabular) categorical features per objective for the feature
+# learners in ``flybrain_learners`` (``sample["features"]``, attached when
+# ``MvSampleBuildConfig.attach_features`` is set). A subset of the legacy
+# input keys: ``out_partner_tier`` is dropped (the wiring degree family is the
+# numeric version of it) and ``primary_neuropil`` is dropped for region
+# specialization (``flybrain_wiring_features`` excludes region columns there).
+STRUCTURED_FEATURES: Mapping[str, tuple[str, ...]] = {
+    OBJECTIVE_CONNECTIVITY_TIER: ("primary_neuropil", "soma_neuromere", "soma_side", "class", "birthtime",
+                                  "hemilineage"),
+    OBJECTIVE_NEUROTRANSMITTER_DOMINANCE: ("primary_neuropil", "soma_neuromere", "soma_side", "class", "birthtime"),
+    OBJECTIVE_REGION_SPECIALIZATION_TIER: ("soma_neuromere", "soma_side", "class", "birthtime"),
+}
 for _objective, _features in INPUT_FEATURES.items():
     _overlap = set(_features) & FORBIDDEN_INPUT_FEATURES[_objective]
     if _overlap:  # pragma: no cover - module invariant
         raise AssertionError(f"{_objective}: input features overlap forbidden set: {sorted(_overlap)}")
+    if not set(STRUCTURED_FEATURES[_objective]) <= set(_features):  # pragma: no cover - module invariant
+        raise AssertionError(f"{_objective}: structured features must be a subset of the input features")
 
 # neuPrint soma/root side tokens -> side vocabulary.
 _SIDE_MAP: Mapping[str, str] = {
@@ -234,6 +248,10 @@ class MvSampleBuildConfig:
     partner_tier_edges: tuple[int, ...] = (10, 100)
     # Fail the build if one input feature alone predicts the label this well (in-sample).
     max_single_feature_accuracy: float = 0.9
+    # Attach ``sample["features"]`` (STRUCTURED_FEATURES[objective], categorical
+    # strings) for the feature learners. Off by default: legacy payloads and
+    # their fingerprints are unchanged.
+    attach_features: bool = False
 
 
 def _validate_config(config: MvSampleBuildConfig) -> None:
@@ -592,24 +610,47 @@ def _sample(objective: str, body: str, row: Any, feats: Mapping[str, str], label
         "expected_confidence": round(float(confidence), 6),
         "provenance_refs": [f"{_DATASET_TAG}:body_id:{body}", "source:manc-v1.0-neuron-properties.feather"],
         "metadata": dict(metadata),
+        # Stripped by build_mv_training_samples unless config.attach_features is set.
+        "features": {key: feats[key] for key in STRUCTURED_FEATURES[objective]},
     }
 
 
-def build_mv_training_samples(objective: str, config: MvSampleBuildConfig) -> dict[str, Any]:
-    if config.objective != objective:
-        raise ValueError(f"config.objective {config.objective!r} != requested objective {objective!r}")
+def load_mv_candidates(config: MvSampleBuildConfig) -> dict[str, Any]:
+    """Resolve (manifest-verified) inputs and load the candidate neurons shared by every mv objective.
+
+    Returns ``{"frame", "paths", "provenance", "source_rows", "stats"}``. The
+    frame has one row per candidate (Traced, typed unless ``require_type`` is
+    off, class not excluded, >= 1 neuropil synapse) with the neuPrint columns
+    (``class`` renamed ``class_``) plus ``neuropil_synweight``,
+    ``top_neuropil_roi``, ``top_neuropil_share``, ``n_neuropils`` and
+    ``region_id``.
+    """
     _validate_config(config)
     try:
         import pyarrow  # noqa: F401
     except Exception as exc:  # pragma: no cover - environment dependent
         raise RuntimeError("pyarrow is required to build mv training samples") from exc
-
     paths, provenance = _resolve_inputs(config)
-    meta_path = paths[ROLE_META]
-    frame, source_rows, stats = _load_candidates(config, meta_path)
+    frame, source_rows, stats = _load_candidates(config, paths[ROLE_META])
     frame = frame.rename(columns={"class": "class_"})
     if frame.empty:
         raise ValueError("No mv neurons remain after status / type / class / neuropil filtering.")
+    return {"frame": frame, "paths": paths, "provenance": provenance, "source_rows": int(source_rows),
+            "stats": stats}
+
+
+def collect_mv_samples(objective: str, config: MvSampleBuildConfig) -> dict[str, Any]:
+    """Every labelled candidate for ``objective`` (leakage-checked; NOT capped or balanced).
+
+    Each sample carries ``features`` (``STRUCTURED_FEATURES[objective]``).
+    ``build_mv_training_samples`` caps and balances these for the legacy
+    pipeline; the real-model harness (``flybrain_mv_targets``) evaluates all
+    of them, so the majority rate is the true class prior.
+    """
+    if config.objective != objective:
+        raise ValueError(f"config.objective {config.objective!r} != requested objective {objective!r}")
+    loaded = load_mv_candidates(config)
+    frame, paths = loaded["frame"], loaded["paths"]
     extra_stats: dict[str, Any]
     if objective == OBJECTIVE_NEUROTRANSMITTER_DOMINANCE:
         all_samples, extra_stats = _build_neurotransmitter(config, frame, paths[ROLE_EDGELIST])
@@ -618,6 +659,18 @@ def build_mv_training_samples(objective: str, config: MvSampleBuildConfig) -> di
     else:
         all_samples, extra_stats = _build_connectivity(config, frame)
     assert_no_label_leakage(all_samples, objective)
+    return {**loaded, "samples": all_samples, "extra_stats": extra_stats}
+
+
+def build_mv_training_samples(objective: str, config: MvSampleBuildConfig) -> dict[str, Any]:
+    collected = collect_mv_samples(objective, config)
+    paths, provenance = collected["paths"], collected["provenance"]
+    source_rows, stats, extra_stats = collected["source_rows"], collected["stats"], collected["extra_stats"]
+    all_samples = collected["samples"]
+    meta_path = paths[ROLE_META]
+    if not config.attach_features:
+        for sample in all_samples:
+            sample.pop("features", None)
     # MANC bodyIds track size/proofreading order, so pick the capped subset in
     # sha256(bodyId) order instead of sample_id order (see hash_ordered_preselect).
     preselected = hash_ordered_preselect(all_samples, max_samples=int(config.max_samples), salt=_DATASET_TAG,
@@ -645,6 +698,8 @@ def build_mv_training_samples(objective: str, config: MvSampleBuildConfig) -> di
         "input_features": list(INPUT_FEATURES[objective]),
         "input_text_format": INPUT_TEXT_FORMAT,
     }
+    if config.attach_features:
+        fingerprint_inputs["structured_features"] = list(STRUCTURED_FEATURES[objective])
     filter_stats = {
         "dropped_untyped": int(stats["dropped_untyped"]),
         "dropped_excluded_class": int(stats["dropped_excluded_class"]),
