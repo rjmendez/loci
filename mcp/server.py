@@ -52,6 +52,7 @@ import hmac
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -245,6 +246,7 @@ from inv_store import (  # noqa: E402,F401
 )
 from recall_filter import build_recall_filter  # noqa: E402
 from provenance_firewall import (  # noqa: E402
+    DETERMINISTIC_DERIVED,
     MODEL_ASSERTED,
     assert_evidence_firewall,
     audit_provenance_fields,
@@ -10673,27 +10675,43 @@ def _route_filter_by_agent(hits: list[dict], agent_id: str) -> list[dict]:
     return filtered
 
 
-def _route_dedup_by_overlap(hits: list[dict], threshold: float = 0.80) -> list[dict]:
+def _route_word_overlap(hit_a: dict, hit_b: dict) -> Optional[float]:
+    """Word-set Jaccard of two hits' text; None when both texts are empty."""
+    words_a = set(str(hit_a.get("text", "")).lower().split())
+    words_b = set(str(hit_b.get("text", "")).lower().split())
+    union = words_a | words_b
+    if not union:
+        return None
+    return len(words_a & words_b) / max(len(union), 1)
+
+
+def _route_dedup_by_overlap(
+    hits: list[dict],
+    threshold: float = 0.80,
+    overlap_fn: Optional[Callable[[dict, dict], Optional[float]]] = None,
+) -> list[dict]:
     """
     Deduplicate memory_route hits by word-overlap (>threshold overlap → keep
     the highest-scoring hit). Assumes `hits` is already sorted by score
     (descending), so among an overlapping pair the later one in iteration
     order is always the lower-scoring one to suppress.
+
+    ``overlap_fn`` replaces the text comparison. Replay of an audited trace that
+    carries precomputed overlaps instead of text uses it (see
+    ``_route_trace_overlap_fn``).
     """
+    overlap_of = overlap_fn or _route_word_overlap
     kept = []
     suppressed = set()
     for i, hit_a in enumerate(hits):
         if i in suppressed:
             continue
-        words_a = set(str(hit_a.get("text", "")).lower().split())
         for j, hit_b in enumerate(hits):
             if j <= i or j in suppressed:
                 continue
-            words_b = set(str(hit_b.get("text", "")).lower().split())
-            union = words_a | words_b
-            if not union:
+            overlap = overlap_of(hit_a, hit_b)
+            if overlap is None:
                 continue
-            overlap = len(words_a & words_b) / max(len(union), 1)
             if overlap > threshold:
                 # Suppress the lower-scoring one (raw_hits already sorted by score)
                 suppressed.add(j)
@@ -10889,6 +10907,7 @@ def _route_apply_policy(
     dedup_threshold: float = 0.80,
     agent_id: Optional[str] = None,
     priority_slots: Optional[int] = None,
+    overlap_fn: Optional[Callable[[dict, dict], Optional[float]]] = None,
 ) -> dict:
     """Apply a routing policy deterministically over a captured candidate set."""
     hits = list(candidate_hits or [])
@@ -10897,7 +10916,7 @@ def _route_apply_policy(
     if deduplicate and len(filtered) > 1:
         threshold = _safe_float(dedup_threshold, 0.80)
         threshold = max(0.0, min(1.0, threshold))
-        deduped = _route_dedup_by_overlap(filtered, threshold=threshold)
+        deduped = _route_dedup_by_overlap(filtered, threshold=threshold, overlap_fn=overlap_fn)
     cap = max(0, int(top_k))
     if priority_slots is None:
         trimmed = deduped[:cap]
@@ -11088,28 +11107,29 @@ def memory_route(
                 "provenance": "deterministic_derived",
             },
         }
+        trace_policy = _route_trace_policy(agent_id, top_k, deduplicate, homeostasis, slow_mod)
         if include_trace:
             payload["routing_trace"] = {
                 "version": 1,
                 "captured_at": _now(),
-                "policy": {
-                    "agent_id": agent_id,
-                    "top_k": int(top_k),
-                    "deduplicate": bool(deduplicate),
-                    "dedup_threshold": 0.80,
-                    "drive_state": homeostasis["drives"],
-                    "candidate_multiplier": homeostasis["candidate_multiplier"],
-                    "priority_ratio": homeostasis["priority_ratio"],
-                    "slow_modulation": {
-                        "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
-                        "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
-                        "provenance": "deterministic_derived",
-                    },
-                },
+                "policy": trace_policy,
                 "candidate_hits": [_route_policy_trace_hit(hit) for hit in raw_hits],
                 "metrics": metrics,
                 "aggregation": aggregation,
             }
+        _audit_route_trace_sample(
+            query=query,
+            agent_id=agent_id,
+            top_k=top_k,
+            deduplicate=deduplicate,
+            drive_state_given=drive_state is not None,
+            policy=trace_policy,
+            candidate_hits=raw_hits,
+            routed_hits=final_hits,
+            metrics=metrics,
+            excluded_retracted=len(_route_retracted),
+            excluded_acl=_route_acl_excluded,
+        )
         try:
             route_signal = 0.0
             if int(metrics.get("after_top_k", 0)) > 0:
@@ -11133,6 +11153,177 @@ def memory_route(
             "error": f"memory_route failed: {exc}",
             "routed": [],
         })
+
+
+def _route_trace_policy(agent_id, top_k, deduplicate, homeostasis: dict, slow_mod: dict) -> dict:
+    """The policy block of a routing trace: everything replay needs besides the candidates."""
+    return {
+        "agent_id": agent_id,
+        "top_k": int(top_k),
+        "deduplicate": bool(deduplicate),
+        "dedup_threshold": 0.80,
+        "drive_state": homeostasis["drives"],
+        "candidate_multiplier": homeostasis["candidate_multiplier"],
+        "priority_ratio": homeostasis["priority_ratio"],
+        "slow_modulation": {
+            "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
+            "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
+            "provenance": "deterministic_derived",
+        },
+    }
+
+
+# Sampled routing traces in the global audit log, so the counterfactual replay
+# and policy-optimize tools have decisions to read without anyone remembering to
+# call memory_route(include_trace=True) and audit_log by hand.
+#
+# LOCI_ROUTE_TRACE_AUDIT_RATE is the fraction of memory_route calls traced, 0..1.
+# Default 0 (off): the audit-lane readers take the newest global receipts, so
+# traces written at a high rate can push other receipts out of that window.
+#
+# A sampled trace holds ids, scores, tiers and counts only. The query is reduced
+# to its length; the candidate texts are replaced by their pairwise word-overlap
+# at or above ROUTE_TRACE_OVERLAP_FLOOR, which is all dedup replay needs for any
+# threshold at or above that floor.
+ROUTE_TRACE_AUDIT_SOURCE = "route_trace_sampler"
+ROUTE_TRACE_VERSION = 2
+ROUTE_TRACE_OVERLAP_FLOOR = 0.5
+_route_trace_rng = random.Random()
+
+
+def _route_trace_audit_rate() -> float:
+    raw = os.environ.get("LOCI_ROUTE_TRACE_AUDIT_RATE", "")
+    try:
+        rate = float(raw) if raw.strip() else 0.0
+    except ValueError:
+        return 0.0
+    if not math.isfinite(rate):
+        return 0.0
+    return max(0.0, min(1.0, rate))
+
+
+def _route_overlap_edges(hits: list[dict], floor: float = ROUTE_TRACE_OVERLAP_FLOOR) -> list[list]:
+    """``[i, j, overlap]`` for every candidate pair i < j whose word overlap is >= floor."""
+    edges: list[list] = []
+    for i in range(len(hits)):
+        for j in range(i + 1, len(hits)):
+            overlap = _route_word_overlap(hits[i], hits[j])
+            if overlap is not None and overlap >= floor:
+                edges.append([i, j, overlap])
+    return edges
+
+
+def _route_compact_trace_hit(idx: int, hit: dict) -> dict:
+    """A candidate as a sampled trace stores it: ids, score and tier, no text or source."""
+    return {
+        "trace_idx": idx,
+        "finding_id": hit.get("finding_id") or hit.get("id", ""),
+        "id": hit.get("id") or hit.get("finding_id", ""),
+        "investigation_id": hit.get("investigation_id", ""),
+        "authored_by": hit.get("authored_by", ""),
+        "score": _safe_float(hit.get("score"), 0.0),
+        "tier": hit.get("tier") or hit.get("record_type", "finding"),
+    }
+
+
+def _audit_route_trace_sample(
+    *,
+    query: str,
+    agent_id: Optional[str],
+    top_k: int,
+    deduplicate: bool,
+    drive_state_given: bool,
+    policy: dict,
+    candidate_hits: list[dict],
+    routed_hits: list[dict],
+    metrics: dict,
+    excluded_retracted: int,
+    excluded_acl: int,
+) -> bool:
+    """Write a sampled memory_route decision to the global audit log. Fail-open."""
+    try:
+        rate = _route_trace_audit_rate()
+        if rate <= 0.0 or _route_trace_rng.random() >= rate:
+            return False
+        routed_ids = [
+            {
+                "finding_id": h.get("finding_id") or h.get("id", ""),
+                "investigation_id": h.get("investigation_id", ""),
+                "score": _safe_float(h.get("score"), 0.0),
+                "tier": h.get("tier") or h.get("record_type", "finding"),
+            }
+            for h in routed_hits
+        ]
+        output = {
+            # Never the query text. Replay derives the drives from policy.drive_state,
+            # which already includes the keyword-derived values.
+            "query": "",
+            "query_features": {"chars": len(query or ""), "tokens": len(str(query or "").split())},
+            "routed": routed_ids,
+            "count": len(routed_ids),
+            "excluded_retracted": int(excluded_retracted),
+            "excluded_acl": int(excluded_acl),
+            "routing_trace": {
+                "version": ROUTE_TRACE_VERSION,
+                "captured_at": _now(),
+                "policy": policy,
+                "candidate_hits": [_route_compact_trace_hit(i, h) for i, h in enumerate(candidate_hits)],
+                "overlap_floor": ROUTE_TRACE_OVERLAP_FLOOR,
+                "overlap_edges": _route_overlap_edges(candidate_hits),
+                "metrics": metrics,
+            },
+        }
+        entry = {
+            "ts": _now(),
+            "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
+            "tool": "memory_route",
+            "source": ROUTE_TRACE_AUDIT_SOURCE,
+            "investigation_id": None,
+            "inputs": json.dumps({
+                "top_k": int(top_k),
+                "deduplicate": bool(deduplicate),
+                "agent_id": agent_id,
+                "drive_state_given": bool(drive_state_given),
+                "sample_rate": rate,
+            }),
+            "output": json.dumps(output),
+            "evidence_provenance_tier": DETERMINISTIC_DERIVED,
+            "provenance_defaulted": False,
+        }
+        audit_dir = MEMORY_DIR.parent / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _append_jsonl(audit_dir / f"{date_str}.jsonl", entry)
+        return True
+    except Exception as exc:
+        logger.debug("memory_route trace sampling failed (fail-open): %r", exc)
+        return False
+
+
+def _route_trace_overlap_fn(decision: dict) -> Optional[Callable[[dict, dict], Optional[float]]]:
+    """Overlap lookup for a replayed decision whose trace stored overlap edges instead of text.
+
+    None for a trace that carries candidate text (include_trace, version 1): replay
+    then compares the text, exactly as before.
+    """
+    edges = decision.get("overlap_edges")
+    if not isinstance(edges, list):
+        return None
+    table: dict[tuple[int, int], float] = {}
+    for edge in edges:
+        try:
+            a, b, value = int(edge[0]), int(edge[1]), float(edge[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        table[(min(a, b), max(a, b))] = value
+
+    def _lookup(hit_a: dict, hit_b: dict) -> Optional[float]:
+        ia, ib = hit_a.get("trace_idx"), hit_b.get("trace_idx")
+        if not isinstance(ia, int) or not isinstance(ib, int):
+            return None
+        return table.get((min(ia, ib), max(ia, ib)), 0.0)
+
+    return _lookup
 
 
 def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) -> tuple[list[dict], int]:
@@ -11176,6 +11367,8 @@ def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) 
             "baseline_policy": baseline_policy,
             "baseline_routed": baseline_routed,
             "candidate_hits": candidates,
+            "overlap_edges": trace.get("overlap_edges"),
+            "overlap_floor": trace.get("overlap_floor"),
         })
     return decisions, skipped_missing_trace
 
@@ -11265,6 +11458,7 @@ def memory_route_counterfactual_simulate(
             candidates_for_policy = list(decision.get("candidate_hits") or [])[
                 : max(1, int(counter_slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])))
             ]
+            overlap_fn = _route_trace_overlap_fn(decision)
             counter = _route_apply_policy(
                 candidates_for_policy,
                 top_k=use_top_k,
@@ -11272,6 +11466,7 @@ def memory_route_counterfactual_simulate(
                 dedup_threshold=dedup_threshold,
                 agent_id=use_agent_id,
                 priority_slots=homeostasis["priority_slots"],
+                overlap_fn=overlap_fn,
             )
             counter_rows = _route_rows(counter["hits"])
             counter_aggregation = _route_aggregation_with_provenance(counter["hits"], candidates_for_policy)
@@ -11284,11 +11479,20 @@ def memory_route_counterfactual_simulate(
             removed = sorted(baseline_set - counter_set)
             if added or removed:
                 changed += 1
+            floor = _safe_float(decision.get("overlap_floor"), 0.0)
             comparisons.append({
                 "decision_id": decision.get("decision_id"),
                 "ts": decision.get("ts"),
                 "query": decision.get("query", ""),
                 "baseline_count": len(baseline_rows),
+                # "overlap_edges": the trace stored overlaps >= its floor, not text.
+                # Dedup replay is then exact only for thresholds at or above that floor.
+                "dedup_basis": "overlap_edges" if overlap_fn is not None else "text",
+                "dedup_exact": (
+                    overlap_fn is None
+                    or not use_deduplicate
+                    or _safe_float(dedup_threshold, 0.80) >= floor
+                ),
                 "counterfactual": {
                     "policy": {
                         "agent_id": use_agent_id,
@@ -11546,6 +11750,7 @@ def _route_eval_candidate(
             deduplicate=deduplicate,
             dedup_threshold=dedup_threshold,
             agent_id=decision.get("baseline_policy", {}).get("agent_id"),
+            overlap_fn=_route_trace_overlap_fn(decision),
         )
         baseline_rows = decision.get("baseline_routed") or []
         counter_rows = _route_rows(counter["hits"])
