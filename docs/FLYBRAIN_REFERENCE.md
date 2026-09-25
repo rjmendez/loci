@@ -30,7 +30,7 @@ Pull reports with the file-by-file sha256, licence evidence and what was skipped
 
 | What | Location | Status | Use it as |
 |---|---|---|---|
-| Real-model results, 4 finished datasets plus location-free super_class | `docs/FLYBRAIN_REAL_MODELS_INTERIM.md` (PR #393) | **interim, unaudited** | Working numbers only. Do not quote as final |
+| Real-model results, 5 finished datasets plus location-free super_class | `docs/FLYBRAIN_REAL_MODELS_INTERIM.md` (PR #393) | **interim, unaudited** | Working numbers only. Do not quote as final |
 | Per-lane reports (JSON + markdown: baselines, CIs, ablations, calibration, controls) | `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/<dataset>/<target>/<run>/report.{json,md}` | interim | Primary evidence for each lane |
 | Model artifacts (manifested, fail-closed load) | `/mnt/f/.flybrain/cache/models/…`, created at the integrate step | pending | Only lanes that pass the gates get artifacts, at canary level |
 | Wiring-feature caches (fingerprinted parquet) | `/mnt/f/.flybrain/cache/wiring-features/<dataset>/<fingerprint>.parquet` | interim | Reproducible inputs; the fingerprint is recorded in each report |
@@ -73,14 +73,17 @@ Example:
 
 > BANC `banc_888`, super_class (curated), wiring-only HGB 0.893 [0.851–0.936] on a grouped split. Source: `real-models-20260924T174122Z/banc/…/quick_super_class_wiring_only.log`. Status: interim.
 
-## 6. Ingesting into Loci
+## 6. Querying this reference
 
-Planned; see the roadmap. Run it after each workflow ships, and only for audited material, except where it is explicitly marked interim. Steps:
+**Primary: the FlyBrain Research MCP** (roadmap step 2, Phase A). A standalone read-only server over this catalog, the snapshot manifests, the lanes summary and `docs/flybrain-research/research.json`. Tools: `datasets()`, `provenance()`, `literature()`, `results()`, `findings()` and `errata()`. Every response carries a `claim` line with its caveats built in. Predictions (Phase B) come after the benchmark.
 
-1. Ingest this reference, the roadmap and the final results doc through the docs indexer. Loci's docs root must include the repo's `docs/` (`LOCI_DOCS_ROOTS`).
-2. Store headline lane results as findings in a `flybrain-reference` investigation. Each finding carries its provenance tier (table above), dataset version, report path and status.
-3. Store literature claims with their citation and verification status.
-4. When a later run replaces a result, resolve the old finding as `superseded`, pointing to the new one. Do not retract it; retraction is for results that were wrong.
+**Loci: minimal, optional.** Loci does not hold copies of this reference. If headline, **audited** findings are useful for cross-project recall, keep a handful in a `flybrain-reference` investigation:
+
+- tag results `tool_verified`, with report path, dataset version and status;
+- literature claims carry their citation;
+- model predictions are `model_asserted`;
+- resolve replaced results as `superseded`, not retracted;
+- never ingest interim numbers or withdrawn material.
 
 ## 7. Open errata
 

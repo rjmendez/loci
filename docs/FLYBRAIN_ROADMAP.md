@@ -1,6 +1,6 @@
 # FlyBrain roadmap
 
-Canonical roadmap for FlyBrain models, the benchmark and serving, as of 2026-09-24. `FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md` covers the data-harness rollout (M0–M3). This file covers everything built on top of it.
+Canonical roadmap for FlyBrain models, the benchmark and the FlyBrain Research MCP, as of 2026-09-24. `FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md` covers the data-harness rollout (M0–M3). This file covers everything built on top of it.
 
 Local research reference (what is where, how trustworthy it is, how to cite it): [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md).
 
@@ -44,10 +44,36 @@ The literature synthesis and the interim results back all of these.
 - **Cross-animal transfer** (male-cns ↔ BANC, and → FlyWire): reviewed matches only, dimorphic and sex-specific types excluded, a left→right ceiling and a graph-matching baseline.
 - **Integration:** candidate artifacts at canary level only. The swarm consensus-student is deprecated; the per-region router is deferred.
 
-### 2. Benchmark: queued; starts when the test-honesty workflow finishes
+### 2. FlyBrain Research MCP, Phase A: the reference layer (queued; starts when the real-model workflow ships)
 
-1. **Stereotypy map and sexual dimorphism,** first, because they change features and pooling.
-   - Per-class edge reproducibility, which sets thresholds and weights.
+A standalone, read-only MCP server that is **not** inside Loci. It serves evidence, not predictions, and is the main way agents query FlyBrain. The data is small and static: the reference catalog, snapshot manifests, the lanes summary, and `docs/flybrain-research/research.json`.
+
+Tools:
+
+- **`datasets()`**
+  - versions, licences, citations and manifest paths;
+  - which annotation columns are connectivity-defined or model-predicted.
+- **`provenance(dataset, column)`**
+  - where a label comes from;
+  - what that means for using it (for example, "recovery, not discovery").
+- **`literature(query)`**
+  - search over the 150 checked sources;
+  - each hit has its verification status, key result and linked findings (F1–F10).
+- **`results(dataset?, target?)`**
+  - lane results with CI, gate, label provenance and **status** (interim, audited or superseded).
+- **`findings()` and `errata()`**
+  - current conclusions and open questions E1–E10.
+
+Rules:
+
+- **Tamper-resistant claims.** Every response pairs its raw numbers with a one-line `claim` field that has the caveats built in (split type, provenance, status), so agents cannot quote a number without its context.
+- **Honest status.** Only audited results are reported as audited; interim ones say so.
+- **Server standards:** async tools with time limits (the #390 lesson), bearer-token auth, and a `0.0.0.0` bind with a token so Windows clients work. It shares no stores with Loci.
+
+### 3. Benchmark (queued; starts when the test-honesty workflow finishes)
+
+1. **Stereotypy map and sexual dimorphism.** These run first because they change features and pooling.
+   - Per-class edge reproducibility sets the thresholds and weights.
    - The published dimorphic and sex-specific type lists decide pooling exclusions. "Is this type dimorphic?" becomes a measured target.
 2. **A grouped-split fly-connectome benchmark:** fixed splits across fw, BANC, mc and mv; provenance tags; baselines; a dataset card; a leaderboard script.
 3. **NTAC re-test on grouped hold-outs,** with no seeds from test types or left/right pairs.
@@ -64,34 +90,36 @@ The literature synthesis and the interim results back all of these.
    - a sparse "AND of ~5 partner types" baseline;
    - a homophily check.
 
-### 3. Serving: queued after the benchmark
+As the benchmark ships, its results, splits and dataset card are added to the Research MCP's `results()` and `datasets()`.
 
-- **A standalone FlyBrain MCP server** (not inside Loci) and an HTTP API, sharing a `flybrain_serving` core.
+### 4. FlyBrain Research MCP, Phase B: predictions (queued after the benchmark)
+
+This extends the same server. Predictions wait for the audits, calibration and conformal abstention so that agents can rely on them.
+
+- **Shared core:** a `flybrain_serving` library used by both the MCP and an HTTP API (FastAPI).
 - **Core behaviour:**
-  - serves only gated lanes, with manifest-verified artifacts;
+  - serves only gated lanes, from manifest-verified artifacts;
   - reads per-dataset feature stores;
-  - every response carries label provenance, gate status, calibrated probability, abstention, model fingerprint, dataset version and CC-BY attribution.
-- **Tools:** `lanes`, `predict`, `explain`, `compare`, `similar`.
+  - every response carries label provenance, gate status, calibrated probability, abstention/back-off to the parent class, model fingerprint, dataset version, CC-BY attribution and the `claim` field.
+- **Tools:** `predict`, `explain`, `compare` (cross-animal, via reviewed matches) and `similar`.
 - **Candidate tools, not yet confirmed:**
-  - `anomalies`/`typicality` (QA queue);
+  - `anomalies`/`typicality` (a QA queue);
   - `match_candidates`;
   - `nt_uncertainty`;
   - `score_submission` (benchmark scoring).
 - **Edge exports:**
-  - ONNX, checked against the original models, plus a Raspberry Pi runner.
-  - ESP32 via an emlearn/m2cgen C export of logistic regression or small distilled trees. The ESP32 receives feature vectors and does no feature computation.
+  - ONNX (checked against the original models) plus a Raspberry Pi runner;
+  - ESP32 via emlearn/m2cgen C export of logistic regression or small distilled trees. The ESP32 receives feature vectors and does no feature computation.
 
-### 4. Reference upkeep and Loci ingestion (after each workflow ships)
+### 5. Reference upkeep (after each workflow ships)
 
-- Refresh [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md): statuses (interim → audited, superseded), new reports and artifacts, pins, resolved errata.
-- Ingest audited material into Loci with provenance tiers. Details are in the reference, section 6:
-  - docs go through the docs indexer;
-  - headline lane results become findings in a `flybrain-reference` investigation (`tool_verified` plus report path, dataset version and status);
-  - literature claims carry their citation and verification status;
-  - model predictions are `model_asserted`.
-- Replaced results are resolved as `superseded`, not retracted.
-- Do not ingest interim numbers unless they are explicitly marked interim.
-- Do not ingest withdrawn material (the Phase 6 roadmap).
+- Refresh [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md): statuses (interim → audited, superseded), new reports and artifacts, pins, and resolved errata. The Research MCP reads from these same sources, so updating them updates the MCP.
+- **Loci ingestion is minimal.** The Research MCP is the primary way to query FlyBrain; Loci does not hold copies. Optionally, keep a handful of headline, **audited** findings in a `flybrain-reference` investigation for cross-project recall:
+  - tag them `tool_verified`, with the report path, dataset version and status;
+  - literature claims carry their citation;
+  - model predictions are `model_asserted`;
+  - resolve replaced results as `superseded`, not retracted;
+  - never ingest interim numbers or withdrawn material (the Phase 6 roadmap).
 - Resolve the registry licence gaps for `fw` and `hb`, and add the missing `l1em` citation.
 
 ## Backlog
