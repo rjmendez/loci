@@ -111,11 +111,28 @@ def test_share_cannot_be_used_to_widen(acl_case):
     assert "mallory" not in server._load_manifest(CASE)["acl"]
 
 
+def test_share_by_the_bound_owner_widens(acl_case):
+    # Positive twin: the same call from the transport-bound owner succeeds.
+    with caller_identity.bound("alice"):
+        out = json.loads(server.investigation_share(CASE, ["carol"], requesting_agent_id="alice"))
+    assert "error" not in out, out
+    assert "carol" in server._load_manifest(CASE)["acl"]
+
+
 def test_retract_owner_check_uses_the_bound_identity(acl_case, monkeypatch):
     monkeypatch.setattr(server, "AGENT_ID", "alice")
     with caller_identity.bound("mallory"):
         out = json.loads(server.memory_retract(CASE, acl_case, dry_run=True))
     assert out.get("error") == "permission_denied", out
+
+
+def test_retract_by_the_bound_owner_is_allowed(acl_case, monkeypatch):
+    # Positive twin: server AGENT_ID is someone else, the bound caller is the owner.
+    monkeypatch.setattr(server, "AGENT_ID", "mallory")
+    with caller_identity.bound("alice"):
+        out = json.loads(server.memory_retract(CASE, acl_case, dry_run=True))
+    assert "error" not in out, out
+    assert (out["seed_ids"], out["count"], out["applied"]) == ([acl_case], 1, False)
 
 
 # --- previously ungated paths --------------------------------------------------

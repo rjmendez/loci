@@ -122,29 +122,50 @@ class TestBearerMiddleware(unittest.IsolatedAsyncioTestCase):
         self.mw = server._BearerAuthMiddleware(self.inner, "s3cret")
 
     async def _call(self, headers, path="/mcp"):
+        # Real ASGI servers pass headers as a LIST of (name, value) byte pairs, with
+        # other headers around the one that matters -- never a dict.
         sent = []
-        scope = {"type": "http", "path": path, "headers": headers}
+        scope = {"type": "http", "path": path,
+                 "headers": [(b"host", b"loci.local"), *headers, (b"accept", b"*/*")]}
         await self.mw(scope, mock.AsyncMock(), lambda m: sent.append(m) or _noop())
         return sent
 
+    _UNAUTHORIZED = [
+        {"type": "http.response.start", "status": 401,
+         "headers": [(b"content-type", b"application/json"), (b"content-length", b"24"),
+                     (b"www-authenticate", b"Bearer")]},
+        {"type": "http.response.body", "body": b'{"error":"unauthorized"}'},
+    ]
+
     async def test_correct_token_passes_through(self):
-        sent = await self._call({b"authorization": b"Bearer s3cret"})
+        sent = await self._call([(b"authorization", b"Bearer s3cret")])
+        self.inner.assert_awaited_once()
+        self.assertEqual(sent, [])
+
+    async def test_scheme_is_case_insensitive(self):
+        sent = await self._call([(b"authorization", b"bearer s3cret")])
         self.inner.assert_awaited_once()
         self.assertEqual(sent, [])
 
     async def test_wrong_token_is_401(self):
-        sent = await self._call({b"authorization": b"Bearer wrong"})
+        sent = await self._call([(b"authorization", b"Bearer wrong")])
         self.inner.assert_not_awaited()
-        self.assertEqual(sent[0]["status"], 401)
+        self.assertEqual(sent, self._UNAUTHORIZED)
+
+    async def test_token_prefix_or_other_scheme_is_401(self):
+        for value in (b"Bearer s3cre", b"Bearer s3cret-and-more", b"Basic s3cret", b"s3cret"):
+            sent = await self._call([(b"authorization", value)])
+            self.assertEqual(sent, self._UNAUTHORIZED, value)
+        self.inner.assert_not_awaited()
 
     async def test_missing_header_is_401(self):
-        sent = await self._call({})
+        sent = await self._call([])
         self.inner.assert_not_awaited()
-        self.assertEqual(sent[0]["status"], 401)
+        self.assertEqual(sent, self._UNAUTHORIZED)
 
     async def test_health_is_exempt(self):
         """Liveness probes must work without the secret; /health discloses nothing."""
-        await self._call({}, path="/health")
+        await self._call([], path="/health")
         self.inner.assert_awaited_once()
 
     async def test_non_http_scope_passes_through(self):
