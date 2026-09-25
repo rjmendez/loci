@@ -14,7 +14,7 @@ import numpy as np
 # Find the optimizer
 FLYBRAIN_MCP = Path("/home/rjmendez/development/flybrain-worktrees/copilot-review/flybrain")
 LOCI_MCP = Path("/home/rjmendez/development/loci/mcp")
-for p in [FLYBRAIN_MCP, LOCI_MCP]:
+for p in [LOCI_MCP, FLYBRAIN_MCP]:
     if p.exists():
         sys.path.insert(0, str(p))
 
