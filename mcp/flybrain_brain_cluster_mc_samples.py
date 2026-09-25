@@ -767,6 +767,47 @@ def trivial_baseline_report(payload: Mapping[str, Any], *, split_seed: str = "mc
     }
 
 
+# ---------------------------------------------------------------------------
+# Structured features (opt-in; the payload builders above are unchanged)
+# ---------------------------------------------------------------------------
+
+
+def attach_structured_features(samples: Sequence[Mapping[str, Any]], feature_frame, *, objective: str,
+                               id_column: str = "node_id") -> list[dict[str, Any]]:
+    """Return copies of ``samples`` with a ``features`` dict from ``feature_frame`` (joined on the body id).
+
+    ``feature_frame`` is e.g. ``flybrain_wiring_features.build_wiring_features(...).frame``
+    or ``flybrain_mc_targets.roi_feature_frame(...)``. Columns the objective's
+    registered exclusions (``flybrain_wiring_features``) forbid are dropped
+    first, and the survivors are re-checked with ``assert_features_allowed``
+    (fail closed). ``input_text`` is left untouched, so existing callers that
+    read only ``input_text`` see the same samples. A sample whose body is
+    missing from the frame fails closed. See ``flybrain_mc_targets`` for the
+    full real-model path (new targets, masking, harness runs).
+    """
+    import flybrain_wiring_features as fwf
+
+    columns = [c for c in feature_frame.columns if c != id_column]
+    dropped = set(fwf.excluded_feature_names(columns, objective))
+    kept = [c for c in columns if c not in dropped]
+    fwf.assert_features_allowed(kept, objective)
+    lookup = feature_frame.set_index(feature_frame[id_column].astype(str))[kept]
+    if lookup.index.duplicated().any():
+        raise ValueError("feature_frame has duplicate body ids")
+    out = []
+    for sample in samples:
+        root_id = str(sample["metadata"]["root_id"])
+        if root_id not in lookup.index:
+            raise ValueError(f"no structured features for body {root_id}")
+        features = {}
+        for name, value in lookup.loc[root_id].items():
+            if hasattr(value, "item"):
+                value = value.item()
+            features[name] = None if isinstance(value, float) and value != value else value
+        out.append({**dict(sample), "features": features})
+    return out
+
+
 def register_mc_sample_builders(*, replace: bool = False) -> None:
     register_sample_builder(
         MC_SYMBOL,
