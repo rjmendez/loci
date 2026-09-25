@@ -27,6 +27,20 @@ Features (column ``<family>__<name>``; the family is what ablations drop)
 * ``out2_comp`` / ``in2_comp`` (``two_hop=True``): partner composition of the
   partners (row-normalized W @ composition).
 
+R5 robust features (research synthesis item 6; [Schlegel 2024; Scheffer 2025;
+Stürner 2025]), opt-in so every v1 fingerprint and cache entry is unchanged:
+
+* ``two_hop_min_weight`` (R5 default 5, sensitivity 10): both 2-hop hops use
+  only annotated pairs whose pair-aggregated weight reaches the threshold.
+* ``degree_transform='rank'``: extensive degree / weight / neuropil-count
+  columns become within-dataset percentile ranks (``*_rank``); log1p copies go.
+* ``robust_wiring_params()`` builds the R5 params; ``FLYBRAIN_WIRING_PROFILE``
+  (``v1`` | ``r5`` | ``r5:10``) or ``with wiring_profile('r5'):`` upgrades the
+  params of any unchanged caller.
+* Partner-NT hard block: an NT objective (``is_nt_objective``) refuses an
+  NT-derived partner category (builder and cache loader), and every
+  ``*__gaba`` / ``*_pnt__*`` / ``*inhibit*``-style column is excluded for it.
+
 Partner counts, reciprocity and 2-hop use only edges whose two endpoints are
 in the node table (deduplicated per pair), so they mean the same thing on a
 per-pair table (mc/BANC simple) and on a per-neuropil table (fw).
@@ -97,6 +111,78 @@ _NT_PATTERNS = (
     "serotonin*", "oct", "oct_*", "octopamine*", "his", "his_*", "histamine*", "tyr*", "*nt_prob*",
     "*nt_score*", "predicted_nt*", "*neuropeptide*",
 )
+# R5 hard block: partner-NT-derived features (e.g. the "fraction of inhibitory
+# inputs" of [SYNTHESIS F3], or a composition family built on partner
+# predicted NT such as MANC ``*_comp_pnt__*``) never reach an NT model. These
+# name patterns catch such columns however they were built and merged in;
+# ``build_wiring_features`` / ``load_wiring_features`` additionally refuse an
+# NT objective whose partner category itself is an NT column (see
+# ``assert_partner_category_allowed``).
+NT_VALUE_VOCAB: frozenset[str] = frozenset({
+    "ach", "acetylcholine", "cholinergic", "gaba", "gabaergic", "glu", "glut", "glutamate", "glutamatergic",
+    "da", "dopamine", "dopaminergic", "ser", "5ht", "5_ht", "serotonin", "serotonergic", "oct", "octopamine",
+    "octopaminergic", "his", "histamine", "histaminergic", "tyr", "tyramine", "tyraminergic",
+    "inhibitory", "excitatory", "inhib", "excit",
+})
+_PARTNER_NT_PATTERNS = tuple(f"*__{v}" for v in sorted(NT_VALUE_VOCAB)) + tuple(
+    f"*__{v}_*" for v in sorted(NT_VALUE_VOCAB)) + (
+    "*_pnt__*", "*_pnt_*", "*comp_pnt*", "*comp_nt*", "*_nt__*", "pnt", "pnt_*", "*_pnt",
+    "*predictednt*", "*consensusnt*", "*topnt*", "*top_nt*", "*known_nt*", "*synister*",
+    "*inhibit*", "*excitat*", "*inhib_*", "*excit_*", "*_sign__*", "*dale*",
+)
+_NT_PATTERNS = _NT_PATTERNS + _PARTNER_NT_PATTERNS
+_NT_NAME_RE = re.compile(r"(^|[^a-z])(p?nt|neurotransmitter|transmitter)([^a-z]|$)")
+NT_OBJECTIVES: set[str] = {"neurotransmitter_dominance", "nt_ground_truth"}
+
+
+def register_nt_objective(objective: str) -> None:
+    """Mark ``objective`` as an NT target: the partner-NT hard block then applies to it."""
+    name = str(objective).strip()
+    if not name:
+        raise ValueError("objective is required")
+    NT_OBJECTIVES.add(name)
+
+
+def is_nt_objective(objective: str) -> bool:
+    """True for registered NT objectives and (fail closed) any objective whose name says NT."""
+    name = str(objective).strip().lower()
+    return name in NT_OBJECTIVES or bool(_NT_NAME_RE.search(name))
+
+
+def _nt_like_name(name: str) -> bool:
+    lowered = slug(name)
+    return bool(_NT_NAME_RE.search(lowered)) or lowered in NT_VALUE_VOCAB or any(
+        fnmatch.fnmatchcase(lowered, p) for p in _NT_PATTERNS)
+
+
+def partner_category_is_nt(category_column: str, categories: Iterable[Any], *, category_tag: str = "",
+                           min_fraction: float = 0.5) -> bool:
+    """Heuristic, fail-closed: is this partner category an NT (or E/I sign) annotation?
+
+    True when the column name or tag looks like an NT field, or when at least
+    ``min_fraction`` of the labelled nodes carry an NT-vocabulary value (so a
+    renamed NT column is still caught).
+    """
+    if _nt_like_name(category_column) or (category_tag and _nt_like_name(category_tag)):
+        return True
+    labelled = [slug(v) for v in categories
+                if not (v is None or (isinstance(v, float) and math.isnan(v)))
+                and slug(v) not in {UNKNOWN, UNANNOTATED, "other"}]
+    if not labelled:
+        return False
+    hits = sum(1 for v in labelled if v in NT_VALUE_VOCAB)
+    return hits / len(labelled) >= float(min_fraction)
+
+
+def assert_partner_category_allowed(objective: str, category_column: str, categories: Iterable[Any], *,
+                                    category_tag: str = "") -> None:
+    """Hard R5 block: an NT objective may not use partner-NT-derived features (raises ``LabelLeakageError``)."""
+    if is_nt_objective(objective) and partner_category_is_nt(category_column, categories, category_tag=category_tag):
+        raise LabelLeakageError(
+            f"objective {objective!r} is an NT target and partner category {category_column!r}"
+            f"{' (tag ' + repr(category_tag) + ')' if category_tag else ''} is NT-derived; partner-NT features "
+            "(e.g. fraction of inhibitory inputs) are banned from every NT model [SYNTHESIS F3; R5]"
+        )
 _REGION_PATTERNS = (
     "*_np__*", "np__*", "*neuropil*", "*roi*", "region*", "*_region", "cns_division", "subdivision",
     "*position*", "neuromere", "*_side_index",
@@ -282,9 +368,109 @@ class WiringFeatureParams:
     category_tag: str = ""
     max_pair_rows: int = 120_000_000
     batch_rows: int = 1 << 20
+    # --- R5 robust features (defaults reproduce the v1 features bit for bit) ---
+    # 2-hop composition is built only from annotated pairs whose (pair-aggregated)
+    # weight is >= this many synapses, on BOTH hops (i -> j and j -> partners of j).
+    # Edges > 10 synapses reproduce > 90% of the time across animals [Schlegel 2024];
+    # FIB-SEM detects > 40% more synapses than TEM [Scheffer 2025]. R5: 5, sensitivity 10.
+    two_hop_min_weight: float = 0.0
+    # 'raw' (v1) keeps raw degree counts/weight sums; 'rank' replaces every
+    # extensive degree / neuropil-count column with its within-dataset percentile
+    # rank in (0, 1] (scale-free, so FIB-SEM vs TEM weight scaling cancels
+    # [Stürner 2025: normalized DNa02 slope 0.69 vs raw 0.42]).
+    degree_transform: str = "raw"
+
+    def __post_init__(self) -> None:
+        if self.degree_transform not in DEGREE_TRANSFORMS:
+            raise ValueError(f"degree_transform must be one of {DEGREE_TRANSFORMS}")
+        if float(self.two_hop_min_weight) < 0 or not math.isfinite(float(self.two_hop_min_weight)):
+            raise ValueError("two_hop_min_weight must be a finite number >= 0")
+        if float(self.two_hop_min_weight) > 0 and not self.two_hop:
+            raise ValueError("two_hop_min_weight > 0 requires two_hop=True")
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """Fingerprint payload. R5 fields are recorded only when they differ from the
+        v1 defaults, so every v1 fingerprint (and cache entry) is unchanged."""
+        out = asdict(self)
+        for key, legacy in _R5_LEGACY_DEFAULTS.items():
+            if out[key] == legacy:
+                del out[key]
+        return out
+
+    def is_robust(self) -> bool:
+        return any(getattr(self, k) != v for k, v in _R5_LEGACY_DEFAULTS.items())
+
+
+DEGREE_TRANSFORMS = ("raw", "rank")
+_R5_LEGACY_DEFAULTS: dict[str, Any] = {"two_hop_min_weight": 0.0, "degree_transform": "raw"}
+R5_TWO_HOP_MIN_WEIGHT = 5.0
+R5_SENSITIVITY_TWO_HOP_MIN_WEIGHT = 10.0
+
+
+def robust_wiring_params(base: WiringFeatureParams | None = None, *,
+                         two_hop_min_weight: float = R5_TWO_HOP_MIN_WEIGHT, degree_transform: str = "rank",
+                         **overrides: Any) -> WiringFeatureParams:
+    """The R5 configuration: 2-hop on edges >= 5 synapses (10 for the sensitivity run) and
+    rank-normalized degree features. ``base`` supplies every other field (top-K, tag, ...)."""
+    from dataclasses import replace
+
+    base = base or WiringFeatureParams()
+    return replace(base, two_hop=True, two_hop_min_weight=float(two_hop_min_weight),
+                   degree_transform=degree_transform, **overrides)
+
+
+# ---- feature profiles: let every dataset track request R5 features without code changes.
+# ``FLYBRAIN_WIRING_PROFILE`` = "v1" (default) | "r5" (2-hop >= 5, rank) | "r5:<min_weight>"
+# (e.g. "r5:10" for the sensitivity run). ``wiring_profile(...)`` does the same in-process.
+# The profile rewrites the params BEFORE fingerprinting, so it is recorded in the
+# fingerprint and in the cache sidecar; the v1 profile leaves params untouched.
+WIRING_PROFILE_ENV = "FLYBRAIN_WIRING_PROFILE"
+_PROFILE_OVERRIDE: list[str] = []
+
+
+def parse_wiring_profile(text: str | None) -> dict[str, Any] | None:
+    """``None`` for v1, else ``{'two_hop_min_weight': w, 'degree_transform': 'rank', 'name': ...}``."""
+    raw = (text or "").strip().lower()
+    if raw in ("", "v1", "legacy", "raw"):
+        return None
+    name, _, arg = raw.partition(":")
+    if name != "r5":
+        raise ValueError(f"unknown wiring profile {text!r}; use v1, r5 or r5:<min_weight>")
+    weight = float(arg) if arg else R5_TWO_HOP_MIN_WEIGHT
+    if not math.isfinite(weight) or weight <= 0:
+        raise ValueError(f"wiring profile {text!r}: min weight must be > 0")
+    return {"name": f"r5:{weight:g}", "two_hop_min_weight": weight, "degree_transform": "rank"}
+
+
+def active_wiring_profile() -> dict[str, Any] | None:
+    return parse_wiring_profile(_PROFILE_OVERRIDE[-1] if _PROFILE_OVERRIDE else os.environ.get(WIRING_PROFILE_ENV))
+
+
+def apply_wiring_profile(params: WiringFeatureParams, profile: dict[str, Any] | None = None) -> WiringFeatureParams:
+    """Upgrade ``params`` to the active profile. Params that are already non-v1 are kept as given;
+    the 2-hop threshold is only set when the caller asked for 2-hop features."""
+    from dataclasses import replace
+
+    profile = active_wiring_profile() if profile is None else profile
+    if not profile or params.is_robust():
+        return params
+    return replace(params, degree_transform=profile["degree_transform"],
+                   two_hop_min_weight=profile["two_hop_min_weight"] if params.two_hop else 0.0)
+
+
+class wiring_profile:  # noqa: N801 - context manager used like a function
+    """``with wiring_profile('r5:10'): ...`` -- scoped override of ``FLYBRAIN_WIRING_PROFILE``."""
+
+    def __init__(self, profile: str) -> None:
+        parse_wiring_profile(profile)
+        self.profile = profile
+
+    def __enter__(self) -> "wiring_profile":
+        _PROFILE_OVERRIDE.append(self.profile)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        _PROFILE_OVERRIDE.pop()
 
 
 @dataclass(frozen=True)
@@ -407,6 +593,91 @@ def _entropy_bits(matrix: np.ndarray) -> np.ndarray:
 def _fractions(matrix: np.ndarray, totals: np.ndarray) -> np.ndarray:
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(totals[:, None] > 0, matrix / totals[:, None], np.nan)
+
+
+def _category_mass(rows: np.ndarray, cats: np.ndarray, w: np.ndarray, n: int, n_cat: int) -> np.ndarray:
+    """(n, n_cat) matrix: summed weight of the edges of each ``rows`` node per partner category."""
+    return np.bincount(rows * n_cat + cats, weights=w, minlength=n * n_cat).reshape(n, n_cat)
+
+
+def _two_hop_composition(n: int, node_cat: np.ndarray, keys: np.ndarray, src: np.ndarray, dst: np.ndarray,
+                         pw: np.ndarray, comp_out_j: np.ndarray, comp_in_j: np.ndarray,
+                         out_den_j: np.ndarray, in_den_j: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Row-normalized W @ (partner composition), minus each node's i -> j -> i return path.
+
+    ``keys``/``src``/``dst``/``pw`` are the (sorted, unique) pairs that define W;
+    ``comp_*_j`` are the per-node compositions reached on the second hop and
+    ``*_den_j`` the totals they were normalized by (so the return-path share of
+    node i inside j's composition is ``w_ji / den_j``).
+    """
+    from scipy import sparse
+
+    W = sparse.csr_matrix((pw, (src, dst)), shape=(n, n))
+    row = np.asarray(W.sum(axis=1)).ravel()
+    col = np.asarray(W.sum(axis=0)).ravel()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out2 = np.asarray(sparse.diags(np.where(row > 0, 1.0 / row, 0.0)) @ W @ comp_out_j)
+        in2 = np.asarray(sparse.diags(np.where(col > 0, 1.0 / col, 0.0)) @ W.T.tocsr() @ comp_in_j)
+    if len(keys):
+        # Remove the i -> j -> i return path: j's composition counts i's own
+        # category, which would put the node's own label into its features.
+        reverse = dst * n + src
+        pos = np.minimum(np.searchsorted(keys, reverse), len(keys) - 1)
+        w_rev = np.where(keys[pos] == reverse, pw[pos], 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            self_out = np.bincount(src, weights=np.where(
+                (row[src] > 0) & (out_den_j[dst] > 0), (pw / row[src]) * (w_rev / out_den_j[dst]), 0.0), minlength=n)
+            self_in = np.bincount(dst, weights=np.where(
+                (col[dst] > 0) & (in_den_j[src] > 0), (pw / col[dst]) * (w_rev / in_den_j[src]), 0.0), minlength=n)
+        del reverse, pos, w_rev
+        out2[np.arange(n), node_cat] = np.maximum(out2[np.arange(n), node_cat] - self_out, 0.0)
+        in2[np.arange(n), node_cat] = np.maximum(in2[np.arange(n), node_cat] - self_in, 0.0)
+    out2 = np.where(row[:, None] > 0, out2, np.nan)
+    in2 = np.where(col[:, None] > 0, in2, np.nan)
+    return out2, in2
+
+
+# Extensive (size-scaled) columns that ``degree_transform='rank'`` turns into
+# within-dataset percentile ranks; their log1p copies are dropped (rank-identical).
+_RANKED_EXTENSIVE = (
+    "degree__out_weight_total", "degree__in_weight_total", "degree__out_n_annotated_partners",
+    "degree__in_n_annotated_partners", "degree__out_mean_pair_weight", "degree__in_mean_pair_weight",
+    "degree__out_max_pair_weight", "degree__in_max_pair_weight", "out_np__n_neuropils", "in_np__n_neuropils",
+)
+_DROPPED_UNDER_RANK = (
+    "degree__log1p_out_weight_total", "degree__log1p_in_weight_total",
+    "degree__log1p_out_n_annotated_partners", "degree__log1p_in_n_annotated_partners",
+)
+
+
+def percentile_rank(values: np.ndarray) -> np.ndarray:
+    """Average-tie percentile rank in (0, 1] over the finite entries; NaN stays NaN.
+
+    Exact zeros (no edges at all) map to 0.0, so ``rank > 0`` iff ``raw > 0``: the
+    absence of inputs/outputs stays visible and callers can still test for it.
+    """
+    from scipy.stats import rankdata
+
+    values = np.asarray(values, dtype=np.float64)
+    out = np.full(values.shape, np.nan)
+    finite = np.isfinite(values)
+    m = int(finite.sum())
+    if m:
+        out[finite] = rankdata(values[finite], method="average") / m
+    out[finite & (values == 0)] = 0.0
+    return out
+
+
+def _rank_transform(features: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for name, values in features.items():
+        if name in _DROPPED_UNDER_RANK:
+            continue
+        if name in _RANKED_EXTENSIVE:
+            out[f"{name}_rank"] = percentile_rank(values)
+        else:
+            out[name] = values
+    return out
 
 
 def compute_wiring_features(
@@ -566,35 +837,31 @@ def compute_wiring_features(
             features["recip__partner_frac"] = np.where(out_partners > 0, r_out_n / out_partners, np.nan)
         del reverse, pos, recip
 
+    two_hop_stats: dict[str, Any] = {}
     if params.two_hop and len(keys):
-        from scipy import sparse
-
-        W = sparse.csr_matrix((pw, (src, dst)), shape=(n, n))
-        out_frac0 = np.nan_to_num(out_frac)
-        in_frac0 = np.nan_to_num(in_frac)
-        row = np.asarray(W.sum(axis=1)).ravel()
-        col = np.asarray(W.sum(axis=0)).ravel()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out2 = np.asarray(sparse.diags(np.where(row > 0, 1.0 / row, 0.0)) @ W @ out_frac0)
-            in2 = np.asarray(sparse.diags(np.where(col > 0, 1.0 / col, 0.0)) @ W.T.tocsr() @ in_frac0)
-        # Remove the i -> j -> i return path: j's composition counts i's own
-        # category, which would put the node's own label into its features.
-        reverse = dst * n + src
-        pos = np.minimum(np.searchsorted(keys, reverse), len(keys) - 1)
-        w_rev = np.where(keys[pos] == reverse, pw[pos], 0.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            self_out = np.bincount(src, weights=np.where(
-                (row[src] > 0) & (out_total[dst] > 0), (pw / row[src]) * (w_rev / out_total[dst]), 0.0), minlength=n)
-            self_in = np.bincount(dst, weights=np.where(
-                (col[dst] > 0) & (in_total[src] > 0), (pw / col[dst]) * (w_rev / in_total[src]), 0.0), minlength=n)
-        del reverse, pos, w_rev
-        out2[np.arange(n), node_cat] = np.maximum(out2[np.arange(n), node_cat] - self_out, 0.0)
-        in2[np.arange(n), node_cat] = np.maximum(in2[np.arange(n), node_cat] - self_in, 0.0)
-        out2 = np.where(row[:, None] > 0, out2, np.nan)
-        in2 = np.where(col[:, None] > 0, in2, np.nan)
+        thr = float(params.two_hop_min_weight)
+        if thr > 0:
+            # R5: both hops use strong pairs only; j's composition is the composition
+            # of j's own strong (annotated-table) partners, not of all its edges.
+            strong = pw >= thr
+            s_keys, s_pw = keys[strong], pw[strong]
+            s_src, s_dst = src[strong], dst[strong]
+            s_row = np.bincount(s_src, weights=s_pw, minlength=n)
+            s_col = np.bincount(s_dst, weights=s_pw, minlength=n)
+            comp_out_j = _fractions(_category_mass(s_src, node_cat[s_dst], s_pw, n, n_cat), s_row)
+            comp_in_j = _fractions(_category_mass(s_dst, node_cat[s_src], s_pw, n, n_cat), s_col)
+            out2, in2 = _two_hop_composition(n, node_cat, s_keys, s_src, s_dst, s_pw,
+                                             np.nan_to_num(comp_out_j), np.nan_to_num(comp_in_j), s_row, s_col)
+            two_hop_stats = {"two_hop_min_weight": thr, "two_hop_pairs": int(strong.sum()),
+                             "two_hop_weight_fraction": float(s_pw.sum() / pw.sum()) if pw.sum() > 0 else 0.0}
+            del s_keys, s_pw, s_src, s_dst, strong, comp_out_j, comp_in_j
+        else:
+            out2, in2 = _two_hop_composition(n, node_cat, keys, src, dst, pw, np.nan_to_num(out_frac),
+                                             np.nan_to_num(in_frac), out_total, in_total)
         for k, name in enumerate(categories):
             features[f"out2_comp{tag}__{name}"] = out2[:, k]
             features[f"in2_comp{tag}__{name}"] = in2[:, k]
+        del out2, in2
 
     # -- neuropil
     np_names, np_out, np_in = np_acc.matrices()
@@ -614,6 +881,8 @@ def compute_wiring_features(
             features[f"{prefix}__entropy"] = _entropy_bits(mat)
             features[f"{prefix}__n_neuropils"] = np.where(row_total > 0, (mat > 0).sum(axis=1).astype(float), np.nan)
 
+    if params.degree_transform == "rank":
+        features = _rank_transform(features)
     frame = pd.DataFrame(features)
     frame = frame.reindex(sorted(frame.columns), axis=1)
     stats = {
@@ -627,6 +896,8 @@ def compute_wiring_features(
         "nodes": int(n),
         "nodes_with_outputs": int((out_total > 0).sum()),
         "nodes_with_inputs": int((in_total > 0).sum()),
+        "degree_transform": params.degree_transform,
+        **two_hop_stats,
     }
     return frame, stats
 
@@ -689,8 +960,15 @@ def build_wiring_features(
     any node's features (transductive leakage through same-type partners).
     ``two_hop`` also removes each node's i->j->i return path, so a node's own
     category never enters its own features.
+
+    R5: ``params.two_hop_min_weight`` / ``params.degree_transform`` (or the
+    ``FLYBRAIN_WIRING_PROFILE`` env var / ``wiring_profile`` context, applied
+    here before fingerprinting) select strong-edge 2-hop and rank-normalized
+    degree features. NT objectives raise ``LabelLeakageError`` when the
+    partner category is NT-derived.
     """
     rule = objective_exclusions(objective)  # unknown objective -> fail closed before any work
+    params = apply_wiring_profile(params)
     if not re.match(r"^[a-z0-9_]+$", dataset or ""):
         raise ValueError("dataset must be a lowercase symbol")
     if id_column not in nodes.columns or category_column not in nodes.columns:
@@ -701,7 +979,13 @@ def build_wiring_features(
     if len(set(ids)) != len(ids):
         raise ValueError("node table ids are not unique")
     harmonize = _harmonizer(vocab_map)
-    cats = [harmonize(v) for v in nodes[category_column].tolist()]
+    raw_cats = nodes[category_column].tolist()
+    cats = [harmonize(v) for v in raw_cats]
+    # R5 hard block, before any work: NT objectives never see partner-NT features.
+    category_is_nt = (partner_category_is_nt(category_column, raw_cats, category_tag=params.category_tag)
+                      or partner_category_is_nt(category_column, cats, category_tag=params.category_tag))
+    if category_is_nt and is_nt_objective(objective):
+        assert_partner_category_allowed(objective, category_column, cats + raw_cats, category_tag=params.category_tag)
     masked = {str(v) for v in (mask_category_ids or ())}
     unknown_masks = masked - set(ids)
     if unknown_masks:
@@ -741,6 +1025,9 @@ def build_wiring_features(
             "neuropil_edges": None if neuropil_edges is None else neuropil_edges.identity(),
             "stats": stats,
             "masked_category_nodes": len(masked),
+            "partner_category_nt": bool(category_is_nt),
+            "r5": {"two_hop_min_weight": float(params.two_hop_min_weight),
+                   "degree_transform": params.degree_transform},
             "columns": list(frame.columns),
         }
         if cache_path is not None:
@@ -750,6 +1037,7 @@ def build_wiring_features(
             os.replace(tmp, cache_path)
             meta["parquet_sha256"] = _sha256_file(cache_path)
             cache_path.with_suffix(".json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    meta = {**meta, "partner_category_nt": bool(category_is_nt)}
     kept, dropped = apply_objective_exclusions(full, objective)
     return WiringFeatureResult(
         frame=kept.reset_index(drop=True),
@@ -768,10 +1056,20 @@ def load_wiring_features(path: str | Path, *, objective: str) -> WiringFeatureRe
     meta = json.loads(parquet.with_suffix(".json").read_text(encoding="utf-8"))
     if meta.get("parquet_sha256") and meta["parquet_sha256"] != _sha256_file(parquet):
         raise ValueError(f"cached wiring features hash mismatch: {parquet}")
+    if is_nt_objective(objective):
+        tag = str((meta.get("params") or {}).get("category_tag") or "")
+        if meta.get("partner_category_nt") or partner_category_is_nt(
+                str(meta.get("category_column") or ""), (meta.get("stats") or {}).get("categories") or (),
+                category_tag=tag):
+            raise LabelLeakageError(
+                f"objective {objective!r} is an NT target and cached features {parquet.name} were built on an "
+                f"NT-derived partner category ({meta.get('category_column')!r}); partner-NT features are banned "
+                "from every NT model [SYNTHESIS F3; R5]")
     kept, dropped = apply_objective_exclusions(pd.read_parquet(parquet), objective)
     return WiringFeatureResult(frame=kept, fingerprint=str(meta["fingerprint"]), cache_path=str(parquet),
                                objective=objective, excluded_features=tuple(dropped),
                                meta={**meta, "exclusion_rule": rule.as_dict()})
+
 
 
 def _sha256_file(path: Path) -> str:
@@ -795,8 +1093,24 @@ __all__ = [
     "WIRING_FEATURES_SCHEMA_VERSION",
     "WiringFeatureParams",
     "WiringFeatureResult",
+    "DEGREE_TRANSFORMS",
+    "WIRING_PROFILE_ENV",
+    "active_wiring_profile",
+    "apply_wiring_profile",
+    "parse_wiring_profile",
+    "wiring_profile",
+    "NT_OBJECTIVES",
+    "NT_VALUE_VOCAB",
+    "R5_SENSITIVITY_TWO_HOP_MIN_WEIGHT",
+    "R5_TWO_HOP_MIN_WEIGHT",
     "apply_objective_exclusions",
     "assert_features_allowed",
+    "assert_partner_category_allowed",
+    "is_nt_objective",
+    "partner_category_is_nt",
+    "percentile_rank",
+    "register_nt_objective",
+    "robust_wiring_params",
     "build_wiring_features",
     "compute_wiring_features",
     "excluded_feature_names",
