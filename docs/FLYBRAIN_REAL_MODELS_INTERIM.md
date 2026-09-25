@@ -92,6 +92,71 @@ The S2 cell types, `level_7_cluster` and ascending modality were rejected as tar
 3. **NT from wiring does not hold up against ground truth.** "Passes" appear only on classifier-predicted labels (distillation). Literature ground-truth sets are small, so CIs are wide. The next stage uses the `drosophila_neurotransmitters` repository (>900 types).
 4. **Naive Bayes over text tokens fails nearly everywhere.** Logistic regression and gradient-boosted trees pass. Boosted trees memorise lineage on random splits, which is why grouped splits are required.
 
+## Findings so far and how they compare with prior work
+
+### What we have learned
+
+**Biology**
+
+1. **Wiring encodes cell identity.** super_class from wiring alone reaches 0.89–0.98 across FlyWire, BANC, optic lobe and male-cns. Other identity results:
+   - cell_class: MANC 0.89; BANC 0.63 against a 0.05 trivial rule.
+   - cell families of never-seen optic-lobe types: 0.76.
+   - larval io_class: 0.95.
+
+   Location or morphology matters only where the class is defined by location (optic-lobe projection and centrifugal classes; BANC about +7 points).
+2. **Lineage leaves a partial trace in wiring.** MANC hemilineage reaches 0.49 across 34 classes, against a 0.10 trivial rule. That label is partly connectivity-defined, so the check is being repeated on FlyWire hemilineages.
+3. **NT is not recoverable from wiring against ground truth.** Every apparent pass was on classifier-predicted labels (distillation) or leaked through lineage: BANC boosted trees score 0.79 on a random split and 0.44 grouped.
+4. **Some targets are proxies:**
+   - BANC `flow` is solved by one missing morphology field.
+   - `connectivity_tier` mostly tracks neuron size.
+   - Optic-lobe super_class with location features is partly the curation rule.
+
+**Method**
+
+5. **Label provenance matters most.** Many published labels are connectivity-defined or model output. Tagging provenance changed how about half of the results should be read.
+6. **Grouped splits change the answers.** Random splits inflate results by 10–40 points: optic-lobe family 0.96 vs 0.76, MANC hemilineage 0.84 vs 0.49. They also hid real leaks.
+7. **Honest learners on real features win.** Logistic regression and gradient-boosted trees pass. Naive Bayes over text tokens and the swarm consensus-student did not.
+8. **Gates are only as good as the tests behind them.** A parallel audit found about 180 hollow tests in the Loci repo.
+
+### Improve next (in the running workflow)
+
+- **Labels:** gates that enforce provenance, and literature NT ground truth.
+- **Baselines and statistics:** a size/degree-only baseline, group bootstrap and permutation, and a graded split curve.
+- **Features and calibration:** edge-thresholded, normalized features; debiased calibration; a hierarchical super_class → cell_class model.
+- **Compute:** 3 concurrent heavy-job slots instead of a single lock, and both GPUs, keeping 1 GB free for Loci's embedder.
+
+### Expand next (queued benchmark workflow)
+
+- **Cross-animal:** transfer with measured ceilings, and a pooled per-task model across animals.
+- **Specialists:** a super_class-routed hierarchy, and an NT specialist with its own inputs.
+- **Studies:** stereotypy and sexual-dimorphism analyses that decide what can safely be pooled.
+- **The benchmark:** a public grouped-split benchmark with provenance tags, and an NTAC re-test on grouped hold-outs.
+
+### Has anyone released a similar model?
+
+Parts of this exist; we did not find this combination. Sources were verified in `/mnt/f/.flybrain/logs/research-20260924T2245Z/SYNTHESIS.md`.
+
+| Work | What it is | How it differs from ours |
+|---|---|---|
+| NTAC (Schwartzman 2025) | Connectivity-based cell typing on FlyWire: >95% with 2% seed labels, about 52–70% unseeded | Seeded protocol leaks members of the same type; no grouped hold-out |
+| Matsliah 2024; Nern 2025 | Optic-lobe typing; about 5 partner types / top-5 connections define a type | These define the types from connectivity (label source, not a predictive model) |
+| flywire-gnn (Dhakane, unreviewed) | FlyWire super_class with MLP/GraphSAGE, about 0.98 | Random split, with neuropil and predicted-NT features (the leaks our gates block) |
+| NeuNet (2024) | Hemibrain classification from skeleton + connectome, 0.917 (connectome branch alone 0.587) | Morphology-led; not a grouped evaluation |
+| Elabbady 2025 (MICrONS, mouse) | Cell typing from perisomatic features: 91% cross-validated, 82% on expert validation | Mouse and non-wiring, but shows the same drop under stricter validation |
+| Eckstein 2024 (synister) | NT from EM synapse images, 94% per neuron | The source of the datasets' NT columns; images, not wiring |
+| ACDC (Lee / Matsliah 2026) | Topology-only graph alignment across datasets | Matching, not classification; our transfer baseline |
+| Lappalainen 2024 (flyvis); Shiu 2024 | Connectome-constrained dynamical models | Consume predicted NT, so NT provenance matters to them |
+| Lu 2026 (C. elegans) | Graph vs non-graph neuron-classification benchmark | Worm, 3 classes; a candidate cross-organism check |
+
+**What appears new:**
+
+- a wiring-only classifier evaluated with grouped hold-outs plus trivial and size baselines;
+- label-provenance gating;
+- evidence that NT is not recoverable from wiring against ground truth;
+- once the transfer stage runs, wiring-only transfer across animals with measured ceilings.
+
+This is based on one literature pass. Repeat the search before publishing.
+
 ## Next (in the running workflow)
 
 - Finish the mc, fw and graph-model tracks.
