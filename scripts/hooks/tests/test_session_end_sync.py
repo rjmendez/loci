@@ -572,7 +572,7 @@ def test_embed_posts_openai_shape_and_returns_first_embedding(hook):
 def test_embed_propagates_transport_errors(hook):
     _, p = patch_urlopen(hook, OSError("connection refused"))
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="connection refused"):
             hook.embed("hi")
     finally:
         p.stop()
@@ -581,7 +581,7 @@ def test_embed_propagates_transport_errors(hook):
 def test_embed_propagates_malformed_response(hook):
     _, p = patch_urlopen(hook, Resp({"data": []}))
     try:
-        with pytest.raises(IndexError):
+        with pytest.raises(IndexError, match="list index out of range"):
             hook.embed("hi")
     finally:
         p.stop()

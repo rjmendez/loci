@@ -230,7 +230,7 @@ def test_save_state_keeps_the_old_state_when_the_write_dies(env):
     # so undoing that one would put STATE_FILE back to the real repo path.
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Path, "write_text", half_write_text)
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="simulated crash mid-write"):
             loop._save_state({"last_dataset_size": 5300,
                               "runs_seen": ["r1", "r2", "r3"],
                               "total_promotions": 4})

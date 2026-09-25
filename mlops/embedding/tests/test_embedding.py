@@ -310,7 +310,7 @@ def test_embed_propagates_transport_errors(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr("urllib.request.urlopen", boom)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match="connection refused"):
         D._embed("t", "http://h", "m")
 
 

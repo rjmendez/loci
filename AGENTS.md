@@ -33,10 +33,12 @@ exist because of that. They apply to every test you add or edit.
    verdict backend, the RAG layer, `_lazy_generate`, ...) so the success branch runs
    and its values are asserted. Test the degraded branch separately and assert it is
    *reported* as degraded.
-6. **`pytest.raises(SpecificError, match=...)`.** Bare `raises(Exception)`, or
-   `raises(ValueError|TypeError|KeyError)` without `match=`, is rejected by CI:
-   an unrelated error on the way in satisfies it. Same for `assertRaises` -- use
-   `assertRaisesRegex`.
+6. **`pytest.raises(SpecificError, match=...)`.** Bare `raises(Exception)`, or a
+   broad built-in (`ValueError`, `TypeError`, `KeyError`, `RuntimeError`,
+   `OSError`, `AttributeError`, `IndexError`, ...) without a real `match=`, is
+   rejected by CI: an unrelated error on the way in satisfies it. A pattern that
+   matches anything (`match=""`, `".*"`) does not count. Same for `assertRaises`
+   -- use `assertRaisesRegex` with a real pattern.
 7. **The fixture must be able to tell right from wrong:** distinct embeddings,
    learnable labels, sizes past the caps, boundary values, duplicates where dedup
    matters, and winners that are not also first in input or alphabetical order.
@@ -65,13 +67,13 @@ exist because of that. They apply to every test you add or edit.
 `scripts/check_test_honesty.py` (CI `lint` job) rejects rules 6, 8 and 14 and
 env-gated skips mechanically:
 
-    python3 scripts/check_test_honesty.py            # whole repo
-    python3 scripts/check_test_honesty.py path.py    # one file
+    python3 scripts/check_test_honesty.py --fail-stale   # whole repo, as CI runs it
+    python3 scripts/check_test_honesty.py path.py        # one file
 
 Pre-existing violations are listed, with reasons, in
 `scripts/test_honesty_allowlist.toml`. That list only shrinks: when you fix a listed
-test, delete its entry in the same commit. Do not add an entry to get a new test
-through -- fix the test.
+test, delete its entry in the same commit (CI fails on a stale entry). Do not add an
+entry to get a new test through -- fix the test.
 
 `scripts/check_test_weakening.py` (CI, pull requests, warning only) flags a commit
 that changes source and, in the same commit, removes assertions or adds violations

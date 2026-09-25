@@ -8,8 +8,11 @@ in the syntax tree, so this script rejects them mechanically:
 
   or-true            ``assert x or True`` -- the assertion cannot fail.
   assert-true        ``assert True`` / ``assertTrue(True)`` -- ditto.
-  broad-raises       ``pytest.raises(Exception)`` or ``raises(ValueError|TypeError|
-                     KeyError)`` (and unittest ``assertRaises``) without ``match=``.
+  broad-raises       ``pytest.raises(Exception)`` or another broad built-in class
+                     (ValueError, TypeError, KeyError, RuntimeError, OSError, ...;
+                     see BROAD_EXC) without a real ``match=`` (and unittest
+                     ``assertRaises`` / an empty ``assertRaisesRegex`` pattern). A
+                     match that matches anything (``""``, ``".*"``) does not count.
                      Any unrelated error on the way in satisfies it.
   swallowed-assert   an assert inside ``try`` whose handler catches AssertionError
                      (or Exception / bare except) and does not re-raise.
@@ -61,7 +64,11 @@ RULES = (
 )
 
 # Exception classes so broad that, without match=, "it raised" says nothing about why.
-BROAD_EXC = {"Exception", "BaseException", "ValueError", "TypeError", "KeyError"}
+BROAD_EXC = {"Exception", "BaseException", "ValueError", "TypeError", "KeyError",
+             "RuntimeError", "OSError", "IOError", "EnvironmentError", "AttributeError",
+             "LookupError", "IndexError", "ArithmeticError", "AssertionError"}
+# match= / assertRaisesRegex patterns that match any message, so they pin nothing.
+TRIVIAL_PATTERNS = {"", ".", ".*", ".+", "(?s).*", "(?s).+", "^", "$", "^.*$", "\\w", "\\S"}
 # Handlers that catch a failed assert.
 SWALLOWING_EXC = {"AssertionError", "Exception", "BaseException"}
 # Calls that are assertions in their own right (besides assert* / *.assert_*).
@@ -127,6 +134,15 @@ def _exc_names(node: ast.AST | None) -> set[str]:
         return out
     name = _dotted(node)
     return {name.rsplit(".", 1)[-1]} if name else set()
+
+
+def _real_pattern(node: ast.AST | None) -> bool:
+    """False for a missing pattern or a literal one that matches any message."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str) and node.value.strip() not in TRIVIAL_PATTERNS
+    return True  # a computed pattern: give it the benefit of the doubt
 
 
 def _truthy_constant(node: ast.AST) -> bool:
@@ -349,16 +365,25 @@ class _Checker(ast.NodeVisitor):
             self._check_or_true(node, node.args[0])
         if name == "raises" and dotted.endswith("raises") and node.args:
             broad = _exc_names(node.args[0]) & BROAD_EXC
-            if broad and not any(k.arg == "match" for k in node.keywords):
+            match = next((k.value for k in node.keywords if k.arg == "match"), None)
+            if broad and not _real_pattern(match):
                 self._add(node, "broad-raises",
-                          f"raises({', '.join(sorted(broad))}) without match=: any unrelated "
-                          "error satisfies it")
+                          f"raises({', '.join(sorted(broad))}) without a real match=: any "
+                          "unrelated error satisfies it")
         if name == "assertRaises" and node.args:
             broad = _exc_names(node.args[0]) & BROAD_EXC
             if broad:
                 self._add(node, "broad-raises",
                           f"assertRaises({', '.join(sorted(broad))}): use assertRaisesRegex or a "
                           "specific exception")
+        if name == "assertRaisesRegex" and node.args:
+            broad = _exc_names(node.args[0]) & BROAD_EXC
+            pattern = node.args[1] if len(node.args) > 1 else next(
+                (k.value for k in node.keywords if k.arg in {"expected_regex", "expected_regexp"}), None)
+            if broad and not _real_pattern(pattern):
+                self._add(node, "broad-raises",
+                          f"assertRaisesRegex({', '.join(sorted(broad))}) with a pattern that "
+                          "matches any message")
         if dotted in {"pytest.xfail"}:
             self._add(node, "xfail-not-strict",
                       "imperative pytest.xfail() cannot be strict; use mark.xfail(strict=True)")

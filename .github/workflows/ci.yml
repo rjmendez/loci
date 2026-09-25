@@ -241,9 +241,10 @@ jobs:
       # name removed. This rejects the mechanical shapes (bare raises(Exception),
       # 'or True', swallowed asserts, assertion-free tests, non-strict xfail, skips
       # gated on undocumented env vars). Known debt is in the allowlist, which only
-      # shrinks; stale entries warn. See AGENTS.md "Test-writing rules for agents".
+      # shrinks: a stale entry (the test was fixed) fails too, so the fix and the
+      # entry's deletion land together. See AGENTS.md "Test-writing rules for agents".
       - name: Test honesty
-        run: python3 scripts/check_test_honesty.py
+        run: python3 scripts/check_test_honesty.py --fail-stale
 
       # Heuristic, so it warns rather than fails: a commit that changes source and,
       # in the same commit, drops assertions / loosens == to >= / adds skips in a
@@ -327,8 +328,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pytest
-        run: pip install pytest
+      # mnemosyne-memory has no dependencies. Without it the checks against its real
+      # DDL (TestEmbeddedSchemaMatchesMnemosyne, the "mnemosyne" subtests) skip and
+      # the file only compares the scripts with its own embedded copy of the schema.
+      # Pinned to the version the service runs; bump both together.
+      - name: Install pytest and mnemosyne
+        run: pip install pytest mnemosyne-memory==3.4.0
 
       - name: Run schema consistency tests
         run: pytest tests/test_schema_consistency.py -v --tb=short

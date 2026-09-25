@@ -138,12 +138,6 @@ entries = [
 ]
 
 [[allow]]
-file = "mcp/tests/test_health_warm.py"
-entries = [
-  { test = "test_loci_health_probes_are_bounded_short_timeout", rule = "no-assertions", reason = "pre-existing at 3a1ad78: test asserts nothing (audit C1); audit mcp-4 hollow_confirmed C1; owner: mcp owners" },
-]
-
-[[allow]]
 file = "mcp/tests/test_ladybug_store.py"
 entries = [
   { test = "test_code_query_write_guard", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },

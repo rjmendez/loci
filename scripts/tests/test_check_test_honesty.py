@@ -59,6 +59,17 @@ def test_top_level_or_with_truthy_literal_is_flagged(tmp_path):
     assert _found(tmp_path, src) == [("or-true", "test_a", 2)]
 
 
+def test_or_true_nested_inside_a_larger_assert_is_flagged(tmp_path):
+    # `a and (b or True)` cannot fail on b: the nested literal True is found anywhere.
+    src = """
+    def test_a():
+        assert compute() == 3 and (other() or True)
+    def test_b():
+        assert compute() == 3 and (other() or fallback())
+    """
+    assert _found(tmp_path, src) == [("or-true", "test_a", 2)]
+
+
 def test_assert_true_constant_is_flagged_but_assert_false_is_a_failure_not_a_tautology(tmp_path):
     src = """
     import unittest
@@ -116,6 +127,49 @@ def test_unittest_assert_raises_broad_is_flagged_regex_form_is_not(tmp_path):
                 f()
     """
     assert _found(tmp_path, src) == [("broad-raises", "T::test_broad", 4)]
+
+
+def test_a_match_that_matches_anything_is_not_a_match(tmp_path):
+    src = """
+    import pytest
+    import unittest
+    def test_empty():
+        with pytest.raises(Exception, match=""):
+            f()
+    def test_dotstar():
+        with pytest.raises(ValueError, match=".*"):
+            f()
+    def test_real():
+        with pytest.raises(ValueError, match="bad port"):
+            f()
+    class T(unittest.TestCase):
+        def test_empty_regex(self):
+            with self.assertRaisesRegex(TypeError, ""):
+                f()
+        def test_regex(self):
+            with self.assertRaisesRegex(TypeError, "int"):
+                f()
+    """
+    assert _found(tmp_path, src) == [
+        ("broad-raises", "T::test_empty_regex", 14),
+        ("broad-raises", "test_dotstar", 7),
+        ("broad-raises", "test_empty", 4),
+    ]
+
+
+@pytest.mark.parametrize("exc", ["RuntimeError", "OSError", "AttributeError", "IndexError",
+                                 "LookupError", "AssertionError"])
+def test_other_broad_builtins_need_a_match_too(tmp_path, exc):
+    src = f"""
+    import pytest
+    def test_bare():
+        with pytest.raises({exc}):
+            f()
+    def test_matched():
+        with pytest.raises({exc}, match="the reason"):
+            f()
+    """
+    assert _found(tmp_path, src) == [("broad-raises", "test_bare", 3)]
 
 
 # --------------------------------------------------------------------- swallowed-assert
