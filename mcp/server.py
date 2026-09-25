@@ -2139,22 +2139,64 @@ def _judge_conflict_pair(new_finding: dict, neighbor_finding: dict, *, gen_fn=No
     after the cheap gate has produced a candidate pair, and it stays fail-open:
     any import/backend/model issue returns ``verdict=None`` so the caller preserves the
     prior heuristic-only behaviour exactly.
-    """
-    try:
-        from conflict_verify import judge_conflict
 
-        return judge_conflict(
+    The result also carries ``model`` and ``tier``: what the generation call reported
+    it ran on. ``tier`` is None on the primary local path, which does not tag itself;
+    both are None when no generation happened.
+    """
+    served: dict = {"model": None, "tier": None}
+    try:
+        import conflict_verify
+
+        base_fn = gen_fn or conflict_verify._lazy_generate
+
+        def _recording_gen_fn(prompt, **kwargs):
+            out = base_fn(prompt, **kwargs)
+            if isinstance(out, dict):
+                served["model"] = out.get("model") or None
+                served["tier"] = out.get("tier") or None
+            return out
+
+        result = conflict_verify.judge_conflict(
             str((new_finding or {}).get("text", "") or ""),
             str((neighbor_finding or {}).get("text", "") or ""),
             type_a=str((new_finding or {}).get("record_type")
                        or (new_finding or {}).get("type", "") or ""),
             type_b=str((neighbor_finding or {}).get("record_type")
                        or (neighbor_finding or {}).get("type", "") or ""),
-            gen_fn=gen_fn,
+            gen_fn=_recording_gen_fn,
         )
+        return {**result, **served}
     except Exception as exc:
         logger.debug("_judge_conflict_pair: fail-open on exception: %r", exc)
-        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200]}
+        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200], **served}
+
+
+# Every contradiction-judge decision is appended to <investigation>/judge_verdicts.jsonl
+# with ids, scores and enums only (no finding text, no judge reason), so the judge can
+# be audited and a pre-filter trained on real labels. It is on by default because it
+# changes no tool output. Set LOCI_JUDGE_VERDICT_LOG=0 to turn it off.
+JUDGE_VERDICT_LOG_NAME = "judge_verdicts.jsonl"
+JUDGE_VERDICT_SCHEMA = 1
+
+
+def _judge_verdict_log_enabled() -> bool:
+    from instrumentation_log import env_enabled
+
+    return env_enabled("LOCI_JUDGE_VERDICT_LOG", True)
+
+
+def _record_judge_verdicts(investigation_id: str, rows: list[dict]) -> bool:
+    """Append judged-pair rows to the investigation's verdict log. Fail-open."""
+    if not rows or not _judge_verdict_log_enabled():
+        return False
+    try:
+        from instrumentation_log import append_rows
+
+        return append_rows(_inv_dir(investigation_id) / JUDGE_VERDICT_LOG_NAME, rows)
+    except Exception as exc:
+        logger.debug("_record_judge_verdicts: fail-open on exception: %r", exc)
+        return False
 
 
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
@@ -2207,7 +2249,8 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
         new_neg = _has_negation(new_text)
 
         conflicts = []
-        for hit in result:
+        judged: list[dict] = []
+        for rank, hit in enumerate(result):
             payload = dict(hit.payload or {})
             neighbor_id = str(payload.get("id", hit.id))
             if neighbor_id == new_id:
@@ -2218,32 +2261,56 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             neighbor_neg = _has_negation(neighbor_text)
 
             heuristic_conflict = False
+            heuristic_rule = None
 
             # Heuristic 1: gap now filled by an observed finding
             if neighbor_type == "gap" and new_type == "observed":
                 heuristic_conflict = True
+                heuristic_rule = "gap_filled"
 
             # Heuristic 2: assumption overridden by a non-assumed finding
             elif neighbor_type == "assumed" and new_type != "assumed":
                 heuristic_conflict = True
+                heuristic_rule = "assumption_overridden"
 
             # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
             elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
                 heuristic_conflict = True
+                heuristic_rule = "negation_mismatch"
 
             llm = _judge_conflict_pair(new_finding, payload)
             llm_contradict = llm.get("verdict") == "contradict"
+            similarity = round(float(hit.score), 4)
+
+            judged.append({
+                "schema": JUDGE_VERDICT_SCHEMA,
+                "event": "conflict_judge",
+                "ts": _now(),
+                "new_finding_id": str(new_id),
+                "neighbor_id": neighbor_id,
+                "neighbor_rank": rank,
+                "similarity": similarity,
+                "new_type": str(new_type or ""),
+                "neighbor_type": str(neighbor_type or ""),
+                "heuristic_rule": heuristic_rule,
+                "verdict": llm.get("verdict"),
+                "judge_ok": bool(llm.get("ok")),
+                "model": llm.get("model"),
+                "tier": llm.get("tier"),
+                "conflict_candidate": bool(heuristic_conflict or llm_contradict),
+            })
 
             if heuristic_conflict or llm_contradict:
                 conflicts.append({
                     "neighbor_id": neighbor_id,
                     "neighbor_type": neighbor_type,
-                    "score": round(float(hit.score), 4),
+                    "score": similarity,
                     "heuristic_conflict": heuristic_conflict,
                     "llm_verdict": llm.get("verdict"),
                     "llm_reason": llm.get("reason", ""),
                 })
 
+        _record_judge_verdicts(investigation_id, judged)
         return conflicts
     except Exception as exc:
         logger.debug("_detect_conflicts: fail-open on exception: %s", exc)
