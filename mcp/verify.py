@@ -544,8 +544,9 @@ def verify_finding(claim: str,
             ``model_asserted``, at least one evidence row must be human-authored,
             tool-verified, or deterministically-derived before a model verdict may
             verify the claim.
-        evidence_rows: optional structured support evidence with provenance tiers.
-            Untagged legacy evidence defaults to ``tool_verified`` for compatibility.
+        evidence_rows: optional structured support evidence with provenance tiers,
+            linked to this claim. Untagged legacy evidence is displayed as
+            ``tool_verified`` but, being defaulted, never counts as independent.
         gen_fn: injectable generation fn (shared contract). None -> lazy llm_local.generate.
         rag_fn: injectable grounding fn. None -> lazy rag_context_search.
         code_refs: optional list of ``file:line`` / ``file:start-end`` strings, or stored

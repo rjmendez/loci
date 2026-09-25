@@ -102,3 +102,6 @@ mlops/grounding/candidate.joblib
 mlops/grounding/train_metrics.json
 mlops/grounding/active_candidates.jsonl
 mlops/grounding/monitor_history.jsonl
+
+# pytest temp root created by mcp/tests/conftest.py (PYTEST_DEBUG_TEMPROOT)
+mcp/.tmp/

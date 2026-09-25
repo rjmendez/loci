@@ -109,6 +109,18 @@ def test_classify_explicit_single_label_mention_skips_generation():
     assert result == {"label": "bug", "degraded": False}
 
 
+
+def test_classify_explicit_mention_returns_the_canonical_label_spelling():
+    # Regression (hypothesis: text="0", labels=["0 "]): the fast path matched on
+    # the stripped label and returned "0", which is not one of the caller's labels.
+    def _boom(*a, **k):
+        raise AssertionError("gen_fn must not be called when exactly one label is explicit")
+
+    assert T.classify("0", ["0 "], gen_fn=_boom) == {"label": "0 ", "degraded": False}
+    result = T.classify("route this to Billing Team now", [" Billing Team", "support"], gen_fn=_boom)
+    assert result == {"label": " Billing Team", "degraded": False}
+
+
 # --- classify -------------------------------------------------------------
 
 def test_classify_valid_label():

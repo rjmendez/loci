@@ -25,7 +25,12 @@ from __future__ import annotations
 
 
 from ..analyze.deadcode import dead_functions, registered_but_dead
+from .conftest import VALIDATED_REV, needs_git_history
 from .helpers import build_fixture_store
+
+# Measured: 66/1144 = 5.8% at VALIDATED_REV, 186/2294 = 8.1% at HEAD when this
+# band was introduced. A resolution collapse drives this far past 15%.
+DEAD_SHARE_CEILING = 0.15
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +71,41 @@ def test_mcp_tool_and_manifest_surfaces_specifically(head_build):
     assert manifest & dead_ids == set()
 
 
-def test_dead_row_count_does_not_regress(head_build):
-    """A ceiling, not a target. 66 rows at the HEAD this was validated against
-    (down from 165 before the five resolution fixes + the dunder filter). If this climbs sharply,
-    a resolution path has broken and the query is filling up with noise again.
+@needs_git_history
+def test_dead_row_count_does_not_regress(validated_build):
+    """A ceiling, not a target, measured on the FIXED revision the 66 was
+    hand-validated against (down from 165 before the five resolution fixes +
+    the dunder filter). Pinning the revision makes this deterministic: new
+    code landing on HEAD cannot move it, only a change to the tool can. If it
+    climbs, a resolution path has broken and the query is filling up with
+    noise again.
+
+    It used to run on HEAD with the same ceiling and went red for the wrong
+    reason: HEAD grew from 114 to 175 files (FlyBrain adapters, memcheck) and
+    the count reached 186 while the tool, re-run on this revision, still
+    reported exactly 66.
     """
-    n = len(dead_functions(head_build.store))
-    assert n <= 85, (
-        f"`cg dead` reports {n} unreachable functions (was 66 when validated). "
-        "A jump means a dispatch shape stopped resolving — find it before "
-        "raising this number."
+    n = len(dead_functions(validated_build.store))
+    assert n <= 66, (
+        f"`cg dead` reports {n} unreachable functions at {VALIDATED_REV} (was 66 "
+        "when validated). A jump means a dispatch shape stopped resolving — find "
+        "it before raising this number."
+    )
+
+
+def test_dead_row_share_at_head_is_sane(head_build):
+    """HEAD-side companion to the pinned gate: a loose DENSITY band that
+    tracks repo size rather than a count every feature branch moves. It is
+    here to catch the query flooding (a resolution collapse marks most of the
+    corpus dead), not to measure noise precisely -- the pinned test does that.
+    """
+    store = head_build.store
+    total = sum(1 for _ in store.nodes_of_kind("FUNCTION"))
+    n = len(dead_functions(store))
+    assert total > 0
+    assert n / total <= DEAD_SHARE_CEILING, (
+        f"`cg dead` reports {n} of {total} functions ({n / total:.1%}) at HEAD; "
+        f"ceiling is {DEAD_SHARE_CEILING:.0%}"
     )
 
 

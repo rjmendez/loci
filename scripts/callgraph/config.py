@@ -147,35 +147,61 @@ def stdlib_module_names() -> frozenset[str]:
 _THIRD_PARTY_NAMES: frozenset[str] | None = None
 
 
+def _site_packages_dirs() -> list[Path]:
+    """Every site-packages directory that could satisfy an import in the corpus.
+
+    The project venvs (mcp/.venv, a2a_server/.venv) come first, but a git
+    worktree or a CI checkout has no venv of its own; the interpreter running
+    `cg` is then the only environment with anything installed. When only the
+    venvs were consulted, a worktree run reported every installed dependency
+    (fastapi, numpy, aiohttp, ...) as "unresolved".
+    """
+    dirs: list[Path] = []
+    for lib_dir in (REPO_ROOT / "mcp" / ".venv" / "lib", REPO_ROOT / "a2a_server" / ".venv" / "lib"):
+        if lib_dir.is_dir():
+            dirs.extend(py_dir / "site-packages" for py_dir in sorted(lib_dir.glob("python3.*")))
+    for entry in sys.path:
+        if entry and Path(entry).name in ("site-packages", "dist-packages"):
+            dirs.append(Path(entry))
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for d in dirs:
+        try:
+            key = d.resolve()
+        except OSError:
+            continue
+        if key in seen or not d.is_dir():
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
 def third_party_top_level_names() -> frozenset[str]:
-    """Top-level importable names available in the project's venv, used only
-    to classify an external import as 'third-party' (installed) vs 'unknown'
-    (nothing on disk answers to that name) for reporting purposes."""
+    """Top-level importable names installed in the project's venvs or in the
+    running interpreter, used only to classify an external import as
+    'third-party' (installed) vs 'unresolved' (nothing on disk answers to that
+    name) for reporting purposes."""
     global _THIRD_PARTY_NAMES
     if _THIRD_PARTY_NAMES is not None:
         return _THIRD_PARTY_NAMES
     names: set[str] = set()
-    candidates = [
-        REPO_ROOT / "mcp" / ".venv" / "lib",
-        REPO_ROOT / "a2a_server" / ".venv" / "lib",
-    ]
-    for lib_dir in candidates:
-        if not lib_dir.is_dir():
+    for site in _site_packages_dirs():
+        try:
+            entries = list(site.iterdir())
+        except OSError:
             continue
-        for py_dir in lib_dir.glob("python3.*"):
-            site = py_dir / "site-packages"
-            if not site.is_dir():
+        for entry in entries:
+            name = entry.name
+            if name.endswith(".pth"):
                 continue
-            for entry in site.iterdir():
-                name = entry.name
-                if name.endswith(".dist-info") or name.endswith(".egg-info"):
-                    name = name.split("-")[0]
-                elif name.endswith(".py"):
-                    name = name[:-3]
-                elif name.endswith(".so"):
-                    name = name.split(".")[0]
-                if not name or name.startswith("_") and name not in {"_distutils_hack"}:
-                    pass
+            if name.endswith(".dist-info") or name.endswith(".egg-info"):
+                name = name.split("-")[0]
+            elif name.endswith(".py"):
+                name = name[:-3]
+            elif name.endswith((".so", ".pyd")):
+                name = name.split(".")[0]
+            if name:
                 names.add(name)
     _THIRD_PARTY_NAMES = frozenset(names)
     return _THIRD_PARTY_NAMES

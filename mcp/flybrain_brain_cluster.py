@@ -104,6 +104,13 @@ class BrainClusterPromotionState:
     promoted: BrainClusterPromotionPointer | None = None
     previous_promoted: BrainClusterPromotionPointer | None = None
 
+    def __post_init__(self) -> None:
+        if self.previous_promoted is not None and self.promoted is None:
+            raise BrainClusterPromotionStateError(
+                BrainClusterPromotionStateErrorCode.STATE_INVALID,
+                "previous_promoted cannot be set without promoted.",
+            )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -332,6 +339,12 @@ def _validate_brain_cluster_manifest(
                 BrainClusterArtifactErrorCode.PATH_ESCAPE,
                 "Manifest integrity file escapes artifact root.",
                 details={"logical_name": logical_name, "relative_path": relative_path},
+            )
+        if artifact_path.is_symlink():
+            raise BrainClusterArtifactError(
+                BrainClusterArtifactErrorCode.PATH_ESCAPE,
+                "Manifest integrity file is a symlink.",
+                details={"logical_name": logical_name, "path": str(artifact_path)},
             )
         if not artifact_path.exists() or not artifact_path.is_file():
             raise BrainClusterArtifactError(
@@ -843,6 +856,11 @@ class DeterministicRegionRouter:
         )
 
 
+# Marker for an expert confidence nothing measured (no validation samples, no
+# declared value). It is never a number that can clear the ConfidenceGate.
+UNCALIBRATED_CONFIDENCE = "uncalibrated"
+
+
 class ConfidenceGate:
     def __init__(self, *, min_confidence: float = 0.65):
         self.min_confidence = float(min_confidence)
@@ -854,6 +872,12 @@ class ConfidenceGate:
         route: RoutePlan,
         output: ExpertOutput,
     ) -> GateResult:
+        artifacts = output.artifacts if isinstance(output.artifacts, Mapping) else {}
+        if artifacts.get("confidence_calibration") == UNCALIBRATED_CONFIDENCE:
+            return GateResult(
+                decision=ClusterDecision.FAIL_CLOSED,
+                reason="expert confidence uncalibrated (no validation measurement)",
+            )
         if output.confidence < self.min_confidence:
             return GateResult(
                 decision=ClusterDecision.FAIL_CLOSED,
@@ -1196,10 +1220,15 @@ class _ArtifactReplayExpert:
 
     def infer(self, task: ClusterTaskEnvelope, provenance: ReplayProvenanceEnvelope) -> ExpertOutput:
         per_task_conf = self._behavior.get("confidence_by_task_type", {})
+        calibration = self._behavior.get("confidence_calibration")
         if isinstance(per_task_conf, Mapping) and task.task_type in per_task_conf:
             confidence = float(per_task_conf[task.task_type])
+            calibration = "declared_per_task"
+        elif "confidence" in self._behavior:
+            confidence = float(self._behavior["confidence"])
         else:
-            confidence = float(self._behavior.get("confidence", 0.82))
+            # No measured or declared confidence: never invent one.
+            confidence, calibration = 0.0, UNCALIBRATED_CONFIDENCE
         confidence = max(0.0, min(1.0, confidence))
 
         mode = str(self._behavior.get("replay_fingerprint_mode", "match")).strip().lower()
@@ -1224,7 +1253,11 @@ class _ArtifactReplayExpert:
             expert_id=self.expert_id,
             confidence=confidence,
             claims=[f"{self.expert_id} handled {task.task_type}"],
-            artifacts={"replay_fingerprint": replay_fp},
+            artifacts={
+                "replay_fingerprint": replay_fp,
+                **({"confidence_calibration": UNCALIBRATED_CONFIDENCE}
+                   if calibration == UNCALIBRATED_CONFIDENCE else {}),
+            },
             provenance_refs=provenance_refs,
         )
 

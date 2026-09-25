@@ -74,6 +74,16 @@ class TestIterFindings(unittest.TestCase):
             ids = sorted(f["id"] for f in groom.iter_findings(tmp))
             self.assertEqual(ids, ["1", "2", "3"])
 
+    def test_it_skips_legacy_access_rows(self):
+        # rag_context_search once wrote {id: <finding id>, record_type: access}
+        # rows into findings.jsonl. They are bookkeeping, not findings.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv-a": [_f("1"), {"id": "1", "record_type": "access", "query": "q"}]})
+            rows = list(groom.iter_findings(tmp))
+            self.assertEqual([r.get("text") for r in rows], ["a finding about the reranker"])
+
 
 class TestIndexPass(unittest.TestCase):
     def _run(self, disk_ids, indexed_ids, apply=False, limit=None):

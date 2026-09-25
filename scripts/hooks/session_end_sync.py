@@ -377,6 +377,9 @@ def _check_wiring_obligations(investigation_id: str, payload: dict) -> "str | No
                 rec = json.loads(line.strip())
             except Exception:
                 continue
+            # A legacy access row reuses the finding's id; it must not shadow it.
+            if (rec.get("record_type") or rec.get("type") or "") == "access":
+                continue
             fid = rec.get("id", "")
             if fid in seen_ids:
                 continue

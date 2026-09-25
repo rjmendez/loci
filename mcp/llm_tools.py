@@ -198,35 +198,42 @@ def query_expand(query: str, n_queries: int = 3, n_keywords: int = 6) -> str:
     return json.dumps(_qe.expand(query, n_queries=n_queries, n_keywords=n_keywords), indent=2)
 
 
+# Set by server.py after register(): (investigation_id, finding) -> evidence rows
+# linked to that finding's claim (server._firewall_linked_evidence). Unset -> no
+# linked evidence, so a model_asserted finding fails closed.
+linked_evidence_fn = None
+
+
 def _finding_provenance_context(investigation_id: Optional[str], finding_id: Optional[str]):
-    """Look up a stored finding's own provenance tier plus its investigation's
-    other findings, to thread into ``verify.verify_finding``'s provenance
-    firewall. Fail-open: any lookup problem (missing investigation/finding,
-    corrupt storage) returns ``(None, None)`` so the caller falls back to
-    verify_finding's own legacy-default behavior instead of raising or wrongly
-    gating a claim it could not resolve.
+    """Look up a stored finding's own provenance tier plus the evidence linked to
+    its claim (derived_from parents, lexical support), to thread into
+    ``verify.verify_finding``'s provenance firewall. Unrelated findings are not
+    evidence. Fail-open: a missing investigation/finding or corrupt storage
+    returns ``(None, None)`` so the caller falls back to verify_finding's own
+    legacy-default behavior instead of raising or wrongly gating a claim it
+    could not resolve.
     """
     if not investigation_id or not finding_id:
         return None, None
     try:
-        from inv_store import _inv_dir, _read_jsonl
-        from provenance_firewall import normalize_provenance_tier
-        findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
-        target = None
-        evidence_rows = []
-        for f in findings:
-            if not isinstance(f, dict):
-                continue
-            if target is None and str(f.get("id") or "") == str(finding_id):
-                target = f
-            else:
-                evidence_rows.append(f)
+        from inv_store import _fold_provenance_overrides, _inv_dir, _read_jsonl
+        from provenance_firewall import firewall_candidate_tier
+        findings = _fold_provenance_overrides(
+            _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
+        target = next((f for f in findings if isinstance(f, dict)
+                       and str(f.get("id") or "") == str(finding_id)), None)
         if target is None:
             return None, None
-        return normalize_provenance_tier(target), evidence_rows
     except Exception as exc:
         logger.debug("verify_finding: provenance lookup failed (fail-open): %r", exc)
         return None, None
+    try:
+        evidence_rows = list(linked_evidence_fn(investigation_id, target)) if linked_evidence_fn else []
+    except Exception as exc:
+        logger.debug("verify_finding: linked-evidence lookup failed (no linked evidence): %r", exc)
+        evidence_rows = []
+    # An untagged (defaulted) finding is gated like model_asserted.
+    return firewall_candidate_tier(target), evidence_rows
 
 
 def verify_finding(claim: str,
@@ -342,6 +349,7 @@ def ground(
     allow_keyword: bool = False,
     graph_available: bool = False,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Build a compact, provenance-tagged grounding block for a task. Call it once
@@ -370,9 +378,13 @@ def ground(
         graph_available: Enable the code-graph lane (default off; requires the
             LadybugDB graph).
         mode: "normal" (default) for the legacy block, or "compact" for terse tagged lines.
+        requesting_agent_id: Optional agent_id for the case and RAG lanes' ACL
+            checks. It can only narrow the transport-bound (or local) identity;
+            findings from investigations the caller cannot read are left out.
 
     Returns:
-        JSON ``{block, sources, chars, degraded}``.
+        JSON ``{block, sources, chars, degraded, degraded_lanes}``; ``degraded_lanes``
+        names each lane that raised, errored or hit the deadline (LOCI_GROUND_DEADLINE_S).
     """
     if not title or not title.strip():
         return json.dumps({"error": "title must not be empty",
@@ -390,6 +402,8 @@ def ground(
     }
     if mode == "compact":
         opts["mode"] = "compact"
+    if requesting_agent_id:
+        opts["requestingAgentId"] = str(requesting_agent_id)
     return json.dumps(grounding.ground(task, opts), indent=2)
 
 
@@ -602,6 +616,37 @@ def adversarial_review(findings: list,
                                               domain=domain), indent=2)
 
 
+def offload_tool_loop(task: str, allowed_tools: Optional[list] = None,
+                      max_steps: int = 8, max_tool_calls: int = 8,
+                      max_elapsed_s: float = 120.0, max_output_bytes: int = 32768,
+                      model: str = "", investigation_id: Optional[str] = None,
+                      dry_run: bool = False) -> str:
+    """
+    Let the LOCAL model work a multi-step, read-only tool loop so the calling cloud model
+    does not spend tokens on the intermediate steps. The local model emits one JSON intent
+    per turn; each is validated against a deny-by-default registry of read-only tools
+    (investigation_search, investigation_entity_lookup, investigation_list,
+    investigation_load, memory_health, code_graph_query), executed under budgets, and
+    fed back as untrusted data. ``allowed_tools`` can only NARROW that set (as can the
+    LOCI_OFFLOAD_TOOLS env var); ``investigation_id`` pins the run to one investigation (tools that cannot be scoped, investigation_list and code_graph_query, are removed for that run).
+
+    Budgets are clamped to hard ceilings (20 steps, 20 tool calls, 300 s, 256 KiB). No
+    cloud model is ever called from inside the loop: a run that cannot finish returns
+    ``status="fallback"`` with a compact ``handoff`` for the caller to continue from.
+    Every run writes a JSONL audit trail (path in ``audit.path``). Fail-open: never raises.
+
+    Returns JSON ``{status: done|fallback, reason, answer (done), handoff (fallback),
+    steps, budget, metrics, audit, model, lane}``. ``answer`` is the local model's own
+    unverified claim. ``metrics.est_tokens_*`` are bytes/4 ESTIMATES, not billed tokens.
+    """
+    import offload_loop as _ol
+    return json.dumps(_ol.offload_entry(
+        task, allowed_tools=allowed_tools, max_steps=max_steps,
+        max_tool_calls=max_tool_calls, max_elapsed_s=max_elapsed_s,
+        max_output_bytes=max_output_bytes, model=model, investigation_id=investigation_id,
+        dry_run=dry_run), indent=2, default=str)
+
+
 def register(mcp):
     """Register every local-model passthrough tool on the shared FastMCP instance."""
     for fn in (
@@ -616,5 +661,6 @@ def register(mcp):
         semantic_relevance,
         ground,
         swarm_reason,
+        offload_tool_loop,
     ):
         mcp.tool()(fn)

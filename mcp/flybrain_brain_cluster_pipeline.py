@@ -216,10 +216,21 @@ def _build_experts_runtime_payload(
         expert_id = f"{region_id}_expert"
         result = expert_results[region_id]
         val_metrics = result.metrics.get("val_metrics", {}) if isinstance(result.metrics, Mapping) else {}
-        confidence = float(val_metrics.get("accuracy", 0.82))
-        confidence = max(0.0, min(1.0, confidence if confidence > 0.0 else 0.82))
+        # Confidence is the measured validation accuracy, 0.0 included. With no
+        # validation samples there is no measurement: say so, and fail the gate.
+        try:
+            sample_count = int(val_metrics.get("sample_count", 1))
+        except (TypeError, ValueError):
+            sample_count = 0
+        if "accuracy" in val_metrics and sample_count > 0:
+            confidence = max(0.0, min(1.0, float(val_metrics["accuracy"])))
+            calibration = "validation_accuracy"
+        else:
+            confidence = 0.0
+            calibration = fbc.UNCALIBRATED_CONFIDENCE
         shadow_behavior = {
             "confidence": confidence,
+            "confidence_calibration": calibration,
             "provenance_refs": [f"dataset:{manifest.manifest_id}:{region_id}"],
             "replay_fingerprint_mode": "match",
         }

@@ -4,8 +4,16 @@ Inserts the mcp/ directory at the front of sys.path so that every test in
 this package can do ``import server`` and resolve the MCP server module —
 regardless of which directory pytest is invoked from or whether a2a_server
 tests are collected in the same session.
+
+Also isolates the whole session from the live Loci stores before anything
+imports ``server``: temp HOME / LOCI_MEMORY_DIR / MNEMOSYNE_DATA_DIR, no
+backends.toml, unreachable Qdrant/Ollama/vLLM, the repo .env files not loaded,
+and any access under the real ~/.loci or ~/.hermes refused and failed. See
+testsupport/loci_hermetic.py. Opt out only for a deliberate live smoke test:
+LOCI_TESTS_LIVE=1.
 """
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -13,6 +21,28 @@ from pathlib import Path
 import pytest
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_hermetic():
+    """Import testsupport/loci_hermetic.py by path (it is not on sys.path)."""
+    if "loci_hermetic" in sys.modules:
+        return sys.modules["loci_hermetic"]
+    path = _MCP_DIR.parent / "testsupport" / "loci_hermetic.py"
+    spec = importlib.util.spec_from_file_location("loci_hermetic", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["loci_hermetic"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Must run at conftest import: pytest imports this file before any test module,
+# and server/backends/qdrant_ops read the environment at import time. A fixture,
+# even a session-scoped one, runs after collection has already imported them.
+loci_hermetic = _load_hermetic()
+loci_hermetic.install()
+# Autouse fixture failing any test that reached ~/.loci or ~/.hermes, plus the
+# report header and the session-level check. Opt-out: LOCI_TESTS_LIVE=1.
+globals().update(loci_hermetic.pytest_hooks())
 
 
 def _configure_pytest_temp_root() -> None:
@@ -58,4 +88,13 @@ def _isolate_the_audit_log(tmp_path, monkeypatch):
     autouse and unconditional: an opt-in fixture is one a new test file forgets.
     """
     monkeypatch.setenv("MEMCHECK_AUDIT_LOG", str(tmp_path / "memcheck-audit.jsonl"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_offload_audit(tmp_path, monkeypatch):
+    """offload_tool_loop writes per-run JSONL under MEMORY_DIR/../audit/offload by default.
+
+    Same rationale as _isolate_the_audit_log: no test may write into the operator's home.
+    """
+    monkeypatch.setenv("LOCI_OFFLOAD_AUDIT_DIR", str(tmp_path / "offload-audit"))
 

@@ -73,7 +73,7 @@ def validate_sample_features(features: Mapping[str, Any]) -> None:
     if not isinstance(features, Mapping):
         raise ValueError("features must be a mapping")
     for key, value in features.items():
-        if not isinstance(key, str) or not _FEATURE_NAME_RE.match(key):
+        if not isinstance(key, str) or not _FEATURE_NAME_RE.fullmatch(key):
             raise ValueError(f"invalid feature name: {key!r}")
         if value is None or isinstance(value, (str, bool)):
             continue

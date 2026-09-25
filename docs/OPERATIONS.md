@@ -30,6 +30,26 @@ not live in the repo.
 | `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
 | `LOCI_TMUX_ROLE_SESSION_MAP` | _(empty)_ | optional `role=session` mappings for offload telemetry attribution (example: `triage=copilot,code=claude`) |
 | `LOCI_TMUX_STALE_SECONDS` | `300` | deterministic stale threshold for tmux workers. A mapped session with latest live-pane activity older than this is marked `stale_worker` |
+| `LOCI_CLOUD_TIER_ENABLED` | `0` (off) | enables third-tier cloud fallback orchestration in `mcp/llm_local.py` after local tiers fail. When enabled, unspecified-model calls can be role-routed to OpenRouter or Abliteration |
+| `LOCI_CLOUD_TIER_SUPERVISOR_MODEL` | `backends.ollama_verify_model()` (the verify-tier model) | local supervisor model used to triage/dispatch unspecified-model calls by role (`triage`, `coding`, `reasoning`, `synthesis`, `redteam`) before cloud escalation |
+| `LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT` | `0` (off) | hard gate for third-party prompt egress. Cloud fallback will not send prompts to OpenRouter/Abliteration unless this is explicitly set to `1/true/on` |
+| `LOCI_CLOUD_TIER_MAX_TOKENS_PER_CALL` | `0` (disabled) | hard cloud-fallback per-call cap. When set, cloud routing refuses requests with larger `max_tokens` and returns `tier=cloud-refused` with reason |
+| `LOCI_CLOUD_TIER_DAILY_CALL_BUDGET` | `0` (disabled) | max cloud fallback calls per UTC day. Exceeding it causes explicit refusal (no silent fallback) |
+| `LOCI_CLOUD_TIER_DAILY_TOKEN_BUDGET` | `0` (disabled) | max requested cloud fallback tokens per UTC day. Exceeding it causes explicit refusal |
+| `LOCI_CLOUD_TIER_DENY_PROVIDERS` | _(none)_ | comma-list deny gate (`openrouter`, `abliteration`) applied before provider attempts |
+| `LOCI_CLOUD_TIER_DENY_ROLES` | _(none)_ | comma-list deny gate for routed roles (`triage`, `coding`, `reasoning`, `synthesis`, `redteam`) |
+| `LOCI_CLOUD_TIER_ALLOWED_ROLES` | _(none)_ | optional allow-list for routed roles. If set, non-listed roles are explicitly refused |
+| `LOCI_CLOUD_TIER_BUDGET_STATE_PATH` | `~/.loci/cloud_tier_budget.json` | JSON ledger path for daily cloud call/token accounting |
+| `LOCI_TMUX_OFFLOAD_ENABLED` | `0` (off) | enables tmux-based offload lane policy reads from `mcp/backends.py`; off by default to preserve current behavior |
+| `LOCI_TMUX_OFFLOAD_ROLE_SESSIONS` | _(none)_ | role→session map for tmux lanes. Accepts comma pairs (`triage=loci-fast,reasoning=loci-deep`) or JSON object |
+| `LOCI_TMUX_OFFLOAD_EXPENSIVE_ROLES` | _(none)_ | comma-list roles treated as expensive lanes (for priority/routing policy), e.g. `reasoning,synthesis,redteam` |
+| `LOCI_TMUX_OFFLOAD_REQUIRE_MAPPED_SESSION` | `0` (off) | strict mode: if `1/true/on`, callers should fail closed when a mapped tmux session is unavailable |
+| `OPENROUTER_BASE_URL` / `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` / _(none)_ | OpenRouter cloud offload tier (`mcp/openrouter.py`) |
+| `OPENROUTER_MODEL` / `OPENROUTER_MODEL_<ROLE>` | `qwen/qwen3.8-27b:free` / _(none)_ | shared and per-role OpenRouter model mapping used by cloud-tier fallback; role keys include `TRIAGE`, `CODING`, `REASONING`, `SYNTHESIS`, `REDTEAM` |
+| `LOCI_OPENROUTER_MAX_TOKENS_PER_CALL` | `0` (disabled) | provider-level hard cap in `mcp/openrouter.py`; requests above this max are explicitly rejected before HTTP calls |
+| `ABLITERATION_BASE_URL` / `ABLITERATION_API_KEY` | `https://api.abliteration.ai/v1` / _(none)_ | Abliteration cloud escalation tier (`mcp/abliteration.py`) |
+| `ABLITERATION_MODEL` / `ABLITERATION_MODEL_<ROLE>` | `abliterated-model` / _(none)_ | shared and per-role Abliteration model mapping; red-team/offensive escalation should usually set `ABLITERATION_MODEL_REDTEAM` explicitly |
+| `LOCI_ABLITERATION_MAX_TOKENS_PER_CALL` | `0` (disabled) | provider-level hard cap in `mcp/abliteration.py`; requests above this max are explicitly rejected before HTTP calls |
 
 **Diagnosed 2026-09-15, corrected in `~/.loci/backends.toml` (machine-specific,
 gitignored — not shown here):** this box's `[ollama].gen_url` had been pointed at a
@@ -72,6 +92,44 @@ Remediation flow:
 3. For `no_live_worker`, restart the worker pane/process in that session.
 4. For `stale_worker`, inspect pane activity and restart the stalled worker.
 5. Re-run `loci_health` and verify all required sessions are `healthy`.
+
+### Cloud tier routing policy (OpenRouter + Abliteration)
+
+The cloud tier is intentionally **opt-in** and only activates when local generation
+fails and `LOCI_CLOUD_TIER_ENABLED=1`.
+
+- **OpenRouter role**: low-cost/free offload and burst absorption.
+- **Abliteration role**: heavy uncensored red-team escalation.
+- **Supervisor role**: a stronger local model (default: the verify-tier model, `backends.ollama_verify_model()`) triages
+  unspecified-model calls into role buckets so provider choice is explicit and auditable.
+- **Egress guard**: set `LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT=1` or cloud fallback will refuse external prompt export by default.
+- **Budget guardrails**: optional per-call and daily budgets now fail closed with explicit
+  refusal reasons (`tier=cloud-refused`) instead of silently trying more expensive routes.
+
+Recommended starting assignments (cost-aware defaults from 2026-09 research):
+
+| Role | OpenRouter default | Abliteration default |
+|---|---|---|
+| `triage` | `qwen/qwen3.8-27b:free` | `abliterated-model` |
+| `coding` | `prism-ml/ternary-bonsai-2-27b` | `abliterated-model` |
+| `reasoning` | `z-ai/glm-5.3-flash` | `abliterated-model` |
+| `synthesis` | `deepseek/deepseek-pro-latest` | `abliterated-model-large-v2` |
+| `redteam` | `qwen/qwen3.8-flash` | `abliterated-model-large-v2` |
+
+Benchmark gate before promoting defaults:
+1. Run role benchmarks across local/openrouter/abliteration lanes.
+2. Promote only after threshold pass and zero critical misroutes.
+3. Record the decision + model map in ops notes so assignment is reproducible.
+
+### tmux offload lane policy
+
+`mcp/backends.py` now exposes tmux lane policy readers under `[tmux_offload]` in
+`~/.loci/backends.toml` (or matching env vars). Safe defaults keep the feature disabled:
+
+- `enabled=false`
+- `role_sessions={...}` optional role→session map
+- `expensive_roles=[]` optional expensive-role set
+- `require_mapped_session=false` (strict fail-closed toggle)
 
 ### Opt-in heavier Ollama generation tags
 
@@ -190,6 +248,7 @@ This is the implementation-ready path for the `benchmark-harness-spec`, `rollout
 | `STATE_DIR` | `~/.claude/hook-state` | all hooks, skill_annotation_updater, score_trace, exif |
 | `SKILLS_DIR` | `~/.claude/skills` | skill_annotation_updater, skillops_maintenance, exif |
 | `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
+| `LOCI_DOCS_ROOTS` | `LOCI_CODE_ROOT`, else the service's cwd | docs_ingest_indexer: `os.pathsep`-separated roots it may read under (symlink targets must stay inside). Set it to ingest docs from any other repo; relative paths resolve against the code root. A directory ingest reads at most 500 files and reports `truncated: true` with `files_found` when it hits that cap. |
 
 ### FlyBrain harness write-path safety
 
@@ -218,6 +277,8 @@ Operationally:
 | `AGENTHER_GEN_MODEL` | `llama3.2:latest` | Ollama model for failure relabeling |
 | `EXIF_GEN_MODEL` | `llama3.2:latest` | Ollama model for skill gap analysis |
 | `TOP_K_PER_LEVEL` | `3` | Results per level in MemGAS search; used by memgas_hierarchy.py |
+| `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
+| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route, vLLM and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 
 ---
 
@@ -235,13 +296,14 @@ Loci now supports a durable investigation-scoped coordination queue so parallel 
 2. Enqueue: `investigation_queue_enqueue(...)` with a stable item id, scope, and targets.
 3. Claim lease: `investigation_queue_claim(...)` with `owner_session` and bounded `lease_seconds`.
 4. Heartbeat/renew: re-run `investigation_queue_claim(...)` with the same owner before expiry.
-5. Complete/release: `investigation_queue_complete(...)` with `state=done|blocked|cancelled` (or `investigation_queue_release(...)` alias).
+5. Complete: `investigation_queue_complete(...)` with `state=done|blocked|cancelled`. To hand work back instead, `investigation_queue_release(...)` returns the item to `queued` for any session to claim.
 
 **Conflict-avoidance rules**
 - One owner per item while lease is active.
 - Claims from other sessions fail unless the lease is expired.
 - Completion by non-owners is rejected while another owner’s lease is still valid.
-- Use explicit `dependencies` to serialize truly dependent work only.
+- Use explicit `dependencies` to serialize truly dependent work only: a claim is refused until every dependency exists and is `done`.
+- A claim always carries a lease. A lease-less claim (legacy or imported) counts as expired; `investigation_queue_status` flags expired leases with `lease_expired: true` and claimable items with `available: true`.
 
 **Example MCP calls**
 
@@ -311,6 +373,10 @@ Reference crontab line for the live profile copy:
 | `c857cd706f67` | mnemosyne-qdrant-sync | 30m | `mnemosyne_qdrant_sync.py` |
 | `a9fc1ea0886a` | state-db-qdrant-sync | 5m | `state_db_qdrant_sync.py` |
 | `f3a4d7c9b8e1` | proactive-self-model-loop | 5m | `self_model_trigger_eval.py` |
+
+`scripts/hermes_cron_runner.py` now rejects absolute script paths, parent-traversal
+segments, and any resolved script outside `<root>/scripts`; invalid job entries are
+persisted as `last_status=error` with reason instead of being executed.
 
 **mnemosyne-consolidation** and **mnemosyne-session-summarizer** both use
 `mnemosyne_activity_check.py` as the pre-flight gate script. They differ in the
@@ -683,6 +749,10 @@ QDRANT_API_KEY=$QDRANT_API_KEY \
 $LOCI_PY $LOCI/scripts/mnemosyne_qdrant_sync.py
 ```
 
+This only adds and re-embeds. To also delete points whose memory is gone from SQLite, pass
+`--prune`; it requires `HERMES_AGENT_ID` and `HERMES_PROFILE` to be set and refuses to delete
+more than half of this host's points in one run unless `--force-prune` is also given.
+
 ### Run a groom pass by hand
 
 ```bash
@@ -703,6 +773,77 @@ A fixed, self-contained case set — every case carries its own context, so no
 commit to this repo can falsify a label. The headline number is FALSE REFUTATION,
 not accuracy: "uncertain" leaves a finding unverified and is harmless, "refuted"
 on a true claim is the damage.
+
+### Offload tool loop
+
+`offload_tool_loop` lets the local Ollama model work a multi-step, read-only tool
+workflow so the calling cloud model does not pay for the intermediate steps
+(issue #376, MVP). The local model emits one JSON intent per turn; every intent is
+validated against a closed registry in `mcp/offload_loop.py` (`TOOL_SPECS`), executed
+under budgets, and fed back as untrusted data. The registry is code: env vars and
+arguments can only remove tools, never add them. No cloud model is called inside the
+loop; a run that cannot finish returns `status="fallback"` plus a compact `handoff`
+and the caller continues from that.
+
+Read-only tools: `investigation_search`, `investigation_entity_lookup`,
+`investigation_list`, `investigation_load`, `memory_health`, `code_graph_query`
+(stricter Cypher guard: MATCH/WITH/UNWIND/RETURN only, no `;`, no CALL/LOAD/etc.).
+Model-supplied `investigation_id`s must already exist. `investigation_id=` on the tool
+pins the run to one investigation: it overwrites the `investigation_id` argument of every
+tool that has one, and removes the tools that cannot be scoped (`investigation_list`,
+`code_graph_query`) from the allowlist for that run (they are also denied as
+`pinned_unscoped`).
+
+| Env var | Effect |
+|---|---|
+| `LOCI_OFFLOAD_DISABLE=1` | tool returns fallback `disabled` |
+| `LOCI_OFFLOAD_TOOLS=a,b` | narrows the allowlist (never widens) |
+| `LOCI_OFFLOAD_AUDIT_DIR` | audit directory (default `<memory dir>/../audit/offload`) |
+| `LOCI_OFFLOAD_AUDIT_FULL_PROMPTS=1` | also store every full prompt (default: sha256 + length) |
+
+Budgets default to 8 steps / 8 tool calls / 120 s / 32 KiB fed back, and are clamped
+to hard ceilings of 20 / 20 / 300 s / 256 KiB. Per-tool output is capped (4 KiB) and
+marked `[truncated N bytes]`; a prompt over 16 KB stops the run rather than being
+silently truncated by Ollama.
+
+Stop reasons (`reason`; only `finished` is `status="done"`): `finished`, `gave_up`,
+`max_steps`, `max_tool_calls`, `timeout`, `output_budget`, `prompt_budget`, `bad_turns`
+(3 consecutive unparseable replies), `denied_streak` (3), `repeat_call`, `no_progress`
+(3 identical results), `tool_error_streak` (2), `tool_timeout` (2 abandoned calls),
+`model_unavailable` (transport failure or empty reply; a reply cut off mid-JSON counts as a bad turn instead), `approval_required` (a non-read-only
+spec was requested; never executed), `audit_unavailable`, `no_tools_allowed`,
+`disabled`, `tools_unbound`, `unknown_investigation`, `bad_task`, `wrapper_exception`.
+
+Audit: one file per run, `offload-<YYYY-MM-DD>-<run_id>.jsonl`, one JSON record per
+event (`run_start`, `model_call`, `model_call_result`, `intent`, `decision`,
+`tool_result`, `run_end`) with `v`, `run_id`, `seq`, `ts`. The `decision` record is
+written before the tool executes; if it cannot be written the tool is not run. Purge
+by deleting old files. `offload_loop.aggregate_metrics(dir, days=7)` summarises
+`run_end` records (no MCP tool for it yet).
+
+Warm the model first (`scripts/gpu_warm.py`): a ~70 s cold load otherwise consumes the
+elapsed budget. `python scripts/offload_demo.py` runs the loop offline with a scripted model (mechanics only).
+
+Token figures in `metrics` are ESTIMATES, not billed tokens: `est_tokens_local =
+(prompt + completion bytes) // 4` is the local model's traffic and `est_tokens_returned =
+returned_bytes // 4` is what the caller pays to read the result. No cloud saving or
+baseline is reported: a number derived from the local model's own traffic says nothing
+about what a cloud loop would have cost, and a fallback run may cost the cloud more.
+Measuring that needs a real cloud-driven run of the same task.
+
+Status of the acceptance criteria: the loop mechanics are tested offline with a scripted
+model and fake tools (`mcp/tests/test_offload_loop.py`, `scripts/offload_demo.py`).
+Criterion 1 (a real local lane completing a multi-step workflow) and criterion 5 (a
+demonstrated reduction in cloud token spend) are NOT demonstrated: no warmed-lane run
+against a real investigation is recorded yet.
+
+Residual risks: the `answer` is the local model's unverified claim
+(`answer_provenance: local_model_unverified`); Mnemosyne recall inside
+`investigation_search` is an external package and may bump access counters; a tool that
+times out leaves an abandoned worker thread (capped at 2 per run); the audit has no
+secret redaction or hash chain; small local models may fall back often (safe, but less
+saving). Out of scope for this MVP: planner/executor split, swarm intent voting, write
+tools, approval tokens, cloud-vs-offload dashboards. Issue #376 is only partly done.
 
 ### Braincluster trainlog privacy scrub (contract + usage)
 
@@ -1090,6 +1231,27 @@ No infra address or path is hardcoded. To stand up on a new machine:
    This is the durable channel: it needs no third-party import and no launcher
    that remembers to export anything. Leave a section blank on a laptop that
    runs its own Ollama; the local probe finds it.
+   For cloud/offload setup, use `scripts/loci_setup_verify.py`:
+
+   ```bash
+   # Apply values from local key files into ~/.loci/backends.toml then verify.
+   python scripts/loci_setup_verify.py \
+     --apply \
+     --cloud-tier on \
+     --openrouter-key-file ~/.openrouter \
+     --abliteration-key-file ~/.abliteration \
+     --openrouter-url https://openrouter.ai/api/v1 \
+     --abliteration-url https://api.abliteration.ai/v1
+
+   # Verify only (no writes).
+   python scripts/loci_setup_verify.py --config ~/.loci/backends.toml --check-tmux-sessions
+   ```
+
+   Safety notes:
+   - API keys are read from local key files and written to local user config only
+     (`~/.loci/backends.toml` by default).
+   - The tool refuses `--apply` to repo-tracked paths.
+   - The tool reports key presence/missing status only; it does not print key values.
 2. `scripts/hooks/install.sh` to place the three hooks in `~/.claude/hooks`.
 3. Register them in `~/.claude/settings.json`. Hook paths there are absolute —
    JSON does no `$HOME` expansion.
@@ -1101,6 +1263,191 @@ The one setting worth checking by hand on a new machine is
 `LOCI_QDRANT_RETENTION_DAYS`. The code default is 0, and 0 is safe, so a fresh
 install needs nothing — but a stray non-zero value anywhere in the chain makes
 the first Qdrant call of every process delete findings.
+
+---
+
+## #383 deploy runbook
+
+Deploys the honesty-audit fixes (#383) and their follow-ups together. Run it
+top to bottom on the host that runs `loci-mcp`. Paths below are the defaults:
+`LOCI_MEMORY_DIR=~/.loci/memory-sessions`, the user unit
+`~/.config/systemd/user/loci-mcp.service`. Substitute yours.
+
+What changes behaviour on deploy (read before starting):
+
+- **ACL identity.** `requesting_agent_id` (and `memory_route`'s `agent_id`) can
+  only *narrow* access now. The identity the ACL checks is the transport-bound
+  one: a per-agent bearer token from `LOCI_MCP_AGENT_TOKENS` on the HTTP
+  transports, or a `/bootstrap` session token on A2A. With stdio, a shared
+  `LOCI_MCP_TOKEN`, or unauthenticated loopback, there is nothing to bind, and
+  the caller is the process identity `HERMES_AGENT_ID`. **Limitation:** on
+  those transports every client is the same agent, so ACLs separate
+  investigations between *deployments* (processes), not between clients of one
+  process. To separate clients, give each one its own token (see step 6).
+  `grounding`, `memory_route`, `investigation_as_of`, `rag_context_search` and
+  `memory_surface` are gated now, and each reports `excluded_acl`.
+- **Retraction propagation.** `memory_retract` (applied) sets `retracted: true`
+  on the finding's own Qdrant point payload and stamps `valid_until` on
+  matching Mnemosyne `working_memory` / `episodic_memory` rows. `memory_restore`
+  clears exactly what retract wrote. Nothing is deleted. The legacy Mnemosyne
+  `memories` table has no lifecycle column: its rows are counted in the reply
+  (`legacy_unflagged`) and left alone, so `mnemosyne_qdrant_sync.py` can still
+  copy those texts into the `mnemosyne` collection. `LOCI_RETRACT_PROPAGATE=0`
+  turns propagation off. The reply's `propagation` block reports per-store
+  status. `failed` means the tombstone applied but that store was not updated.
+- **memory_promote** returns `ok:false, retryable:true` when the Qdrant upsert
+  did not land. Re-running it with the same tier retries the index write.
+- **docs_recall / docs_search** return the real lexical score (1.0 for a phrase
+  match, else the fraction of query tokens matched) with `score_kind:
+  "lexical"`. The fixed 0.95 is gone, and hits are ranked by that score.
+- **Coordination queue** writes hold `<investigation>/.lock`. A contended call
+  returns `{"error": "busy", "retryable": true}` instead of silently losing the
+  write.
+
+### 1. Stop the service
+
+```bash
+systemctl --user stop loci-mcp
+systemctl --user is-active loci-mcp   # expect: inactive
+```
+
+Stop anything else that writes the store too: the A2A server, cron grooming
+(`loci_groom_cron.sh`), `mnemosyne_qdrant_sync.py` and reflection-loop ticks.
+
+### 2. Back up `~/.loci`
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+tar -C ~ -czf ~/loci-backup-$TS.tgz .loci
+tar -tzf ~/loci-backup-$TS.tgz | head      # sanity check it is readable
+```
+
+If the Mnemosyne database will take retraction stamps (it will, whenever
+`MNEMOSYNE_DATA_DIR` holds a `mnemosyne.db`), back it up as well:
+`cp "$MNEMOSYNE_DATA_DIR/mnemosyne.db" ~/mnemosyne-backup-$TS.db`.
+
+### 3. Migrate legacy access rows (dry run, then apply)
+
+```bash
+PY=~/development/loci/mcp/.venv/bin/python
+$PY scripts/migrate_access_rows.py --memory-dir ~/.loci/memory-sessions          # dry run
+$PY scripts/migrate_access_rows.py --memory-dir ~/.loci/memory-sessions --apply  # writes findings.jsonl.bak-<ts> first
+```
+
+Check that the dry-run counts match what `--apply` reports.
+
+### 4. Inspect, then move aside, the legacy `undefined` investigation dir
+
+Older builds wrote findings for callers that passed the literal string
+`undefined` as an investigation id. That directory fails id validation, is
+listed as `malformed` by the recall filter, and keeps `memory_health`'s
+`retraction_integrity` at `warn`.
+
+```bash
+D=~/.loci/memory-sessions/undefined
+ls -la "$D"; wc -l "$D"/*.jsonl
+head -c 2000 "$D/findings.jsonl"      # decide whether anything in it is worth re-filing
+mkdir -p ~/.loci/quarantine
+mv "$D" ~/.loci/quarantine/undefined-$TS
+```
+
+Move it outside `memory-sessions`: global scans walk every directory under
+that root. Do not delete it. Re-file anything worth keeping through
+`investigation_store` under a real id once the service is back.
+
+### 5. Set `LOCI_DOCS_ROOTS` if docs ingest reads outside the code root
+
+`docs_ingest_indexer` only reads under `LOCI_DOCS_ROOTS` (`:`-separated), or under
+the code root when that is unset. If you ingest docs from anywhere else, add
+the variable to the unit:
+
+```bash
+systemctl --user edit loci-mcp
+# [Service]
+# Environment=LOCI_DOCS_ROOTS=/home/<you>/development/loci/docs:/home/<you>/notes
+```
+
+### 6. (Optional) Bind MCP client identity
+
+If more than one agent talks to this server and ACLs should tell them apart,
+give each agent its own bearer token. Keep the tokens out of the unit file:
+
+```bash
+install -m 600 /dev/null ~/.loci/agent-tokens.json
+# {"agent-a": "<python3 -c 'import secrets;print(secrets.token_hex(32))'>", "agent-b": "..."}
+systemctl --user edit loci-mcp
+# [Service]
+# Environment=LOCI_MCP_AGENT_TOKENS_FILE=%h/.loci/agent-tokens.json
+```
+
+Each client then sends `Authorization: Bearer <its token>`. The server refuses
+to start if the file does not parse, or if `LOCI_MCP_TOKEN` is also used as an
+agent token.
+
+### 7. Backfill provenance tiers (dry run, then apply)
+
+```bash
+$PY scripts/backfill_provenance_tiers.py --memory-dir ~/.loci/memory-sessions          # per-rule counts, writes nothing
+$PY scripts/backfill_provenance_tiers.py --memory-dir ~/.loci/memory-sessions --apply  # backs up, then appends
+```
+
+The dry run prints how many findings each rule would tag and how many stay
+untagged (`no_unambiguous_rule`, `conflict`, `explicit_tier`). `--apply` writes
+only `<inv>/provenance_updates.jsonl` (append-only). It first copies every log
+it will append to, plus the planned records and a `ROLLBACK.txt`, into
+`~/.loci/backups/provenance-backfill-<ts>/`. A second run tags nothing
+(`already_backfilled`).
+
+### 8. Restart
+
+```bash
+systemctl --user daemon-reload     # only if you edited the unit
+systemctl --user start loci-mcp
+systemctl --user is-active loci-mcp
+journalctl --user -u loci-mcp -n 50 --no-pager   # no tracebacks; note the token log line if step 6 ran
+```
+
+Restart the A2A server and re-enable any cron jobs you stopped in step 1.
+
+### 9. Post-deploy checks
+
+Run these through an MCP client connected to the service:
+
+1. `loci_health` returns `status: ok` (or `degraded` only for a backend you
+   know is down). `code_version` matches the deployed commit.
+2. `memory_health` returns `retraction_integrity: ok`. `warn` here usually means
+   the `undefined` dir is still under `memory-sessions` (step 4).
+3. A `pre_answer_check` sanity probe. Use `record=false` so the probe leaves no
+   trace. Pick an investigation with a known tool-verified finding:
+   `investigation_pre_answer_check(investigation_id=<id>, claims=[<that finding's text>], record=false)`
+   should support the claim. A made-up claim should come back in
+   `unsupported_claims`, and a claim that only a `[reasoned]` finding supports
+   should come back `provenance_blocked`.
+4. `docs_recall("<a phrase you know is indexed>")` returns `score: 1.0` and
+   `score_kind: "lexical"`.
+5. If step 6 ran: from agent-a's token, `investigation_load` on an investigation
+   whose ACL excludes agent-a returns `permission_denied`, even with
+   `requesting_agent_id` set to a member.
+
+### 10. Rollback
+
+1. `systemctl --user stop loci-mcp`
+2. Check out the previous release in the service's checkout, or `git revert`
+   the merge.
+3. Restore the store: `rm -rf ~/.loci && tar -C ~ -xzf ~/loci-backup-$TS.tgz`.
+   This undoes steps 3, 4 and 7 together. To undo only the backfill, follow
+   `ROLLBACK.txt` in the backfill backup dir. The appended log is the only file
+   it touched.
+4. Qdrant points flagged by retractions made *after* the deploy keep
+   `retracted: true` in their payload. The previous release ignores that key,
+   so no action is needed. To clear it anyway, `memory_restore` each finding
+   before rolling back.
+5. If you restored the Mnemosyne backup, stop Mnemosyne writers first. The
+   stamps are plain `valid_until` values, so the previous release reads them as
+   Mnemosyne's own expiry.
+6. Remove any `LOCI_MCP_AGENT_TOKENS*`, `LOCI_DOCS_ROOTS` or
+   `LOCI_RETRACT_PROPAGATE` lines you added to the unit, then run
+   `systemctl --user daemon-reload && systemctl --user start loci-mcp`.
 
 ---
 

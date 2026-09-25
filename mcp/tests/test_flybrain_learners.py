@@ -238,6 +238,14 @@ def test_artifact_manifest_edit_is_detected(tmp_path):
         fl.load_learner(directory, trusted_root=tmp_path)
 
 
+def test_save_rejects_missing_declared_model_files(tmp_path):
+    frame, y, groups = _synthetic(n=100)
+    learner = fl.make_learner("logreg").fit(frame, y, groups=groups)
+    learner._save_model = lambda directory: None
+    with pytest.raises(RuntimeError, match="were not written"):
+        fl.save_learner(learner, tmp_path / "broken")
+
+
 def test_save_refuses_existing_non_artifact_dir(tmp_path):
     frame, y, _ = _synthetic(n=100)
     learner = fl.make_learner("logreg").fit(frame, y)

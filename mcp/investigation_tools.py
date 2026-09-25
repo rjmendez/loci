@@ -10,19 +10,26 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import caller_identity
 from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
+    _acl_access_denied,
     _append_jsonl,
     _inv_dir,
     _load_manifest,
+    _load_manifest_fresh,
     _load_retracted_ids,
+    _locked_file,
+    StoreBusyError,
     _now,
     _read_jsonl,
+    _retraction_events,
     _save_manifest,
     _validated_investigation_id,
     _node_numeric_confidence,
@@ -193,10 +200,24 @@ def _coordination_now_plus(seconds: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
 
+_COORDINATION_DEFAULT_LEASE_SECONDS = 300  # same default as investigation_queue_claim
+
+
+def _coordination_unmet_dependencies(manifest: dict, item: dict) -> list[str]:
+    """Dependency ids that are missing or not yet ``done`` (all-of gating)."""
+    states = {
+        dep.get('id'): dep.get('state')
+        for dep in (manifest.get('coordination') or {}).get('items', [])
+    }
+    return [dep for dep in item.get('dependencies') or [] if states.get(dep) != 'done']
+
+
 def _coordination_lease_expired(item: dict) -> bool:
+    # A claim without a lease is not a live claim: treating it as held would let an
+    # enqueue/import with owner_session but no lease lock the item forever.
     expires = (item.get("lease_expires_at") or "").strip()
     if not expires:
-        return False
+        return True
     try:
         expires_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
         if expires_dt.tzinfo is None:
@@ -336,6 +357,38 @@ def _coordination_require_item(manifest: dict, item_id: str) -> dict:
     return match[1]
 
 
+def _queue_locked(investigation_id: str, fn) -> str:
+    """Run one queue read-modify-write under the investigation's file lock.
+
+    The queue lives in manifest.json. Without the lock, two processes (or two
+    server workers) that claim the same item both read "queued", both write
+    "claimed", and the second write silently wins, so two sessions believe they
+    own the item. This takes the same per-investigation ``.lock`` that retract,
+    restore and tier changes use, re-reads the manifest from disk (the
+    in-process cache can be stale when another process wrote), and saves inside
+    the lock. A lock held past the bounded wait returns a retryable ``busy``.
+    """
+    try:
+        if not _load_manifest(investigation_id):
+            return _coordination_error(f"Investigation '{investigation_id}' not found.")
+        inv_dir = _inv_dir(investigation_id)
+    except ValueError as exc:
+        return _coordination_error(str(exc))
+    try:
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
+            manifest = _load_manifest_fresh(investigation_id)
+            if not manifest:
+                return _coordination_error(f"Investigation '{investigation_id}' not found.")
+            return fn(_coordination_manifest(manifest))
+    except StoreBusyError as exc:
+        return json.dumps({
+            "error": "busy",
+            "detail": str(exc),
+            "retryable": True,
+            "investigation_id": investigation_id,
+        })
+
+
 def investigation_queue_enqueue(
     investigation_id: str,
     item_id: Optional[str] = None,
@@ -348,10 +401,36 @@ def investigation_queue_enqueue(
     owner_session: Optional[str] = None,
 ) -> str:
     """Enqueue a deterministic work item into an investigation's coordination queue."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_enqueue_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            item_json=item_json,
+            scope_kind=scope_kind,
+            scope_targets=scope_targets,
+            notes=notes,
+            dependencies=dependencies,
+            state=state,
+            owner_session=owner_session,
+        ),
+    )
+
+
+def _queue_enqueue_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: Optional[str] = None,
+    item_json: Optional[str | dict] = None,
+    scope_kind: Optional[str] = None,
+    scope_targets: Optional[list | str] = None,
+    notes: Optional[str] = None,
+    dependencies: Optional[list | str] = None,
+    state: Optional[str] = None,
+    owner_session: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     try:
         payload = _coordination_payload_from_json(item_json, field_name='item_json') if item_json is not None else {}
     except ValueError as exc:
@@ -381,6 +460,15 @@ def investigation_queue_enqueue(
     item['updated_at'] = _now()
     if item['state'] not in {'queued', 'claimed'}:
         item['state'] = 'queued'
+    if item['state'] == 'claimed':
+        # Every claim carries a lease, so a crashed owner cannot hold the item forever.
+        if not item['owner_session']:
+            return _coordination_error("state='claimed' requires owner_session.")
+        if not item['lease_expires_at']:
+            item['lease_expires_at'] = _coordination_now_plus(_COORDINATION_DEFAULT_LEASE_SECONDS)
+    else:
+        item['owner_session'] = None
+        item['lease_expires_at'] = None
     coordination['items'].append(item)
     _save_manifest(manifest)
     return json.dumps({"queued": True, "item": item}, indent=2)
@@ -393,10 +481,26 @@ def investigation_queue_claim(
     lease_seconds: float | int = 300,
 ) -> str:
     """Claim / renew a queue item for a specific session with a lease TTL."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_claim_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            lease_seconds=lease_seconds,
+        ),
+    )
+
+
+def _queue_claim_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: str,
+    lease_seconds: float | int = 300,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     try:
         ttl = float(lease_seconds)
     except (TypeError, ValueError):
@@ -415,6 +519,24 @@ def investigation_queue_claim(
         return _coordination_error(
             f"Queue item '{item_id}' is already claimed by session '{current_owner}'."
         )
+    unmet = _coordination_unmet_dependencies(manifest, item)
+    if unmet:
+        # Report ids missing from this queue (legacy or cross-investigation strings)
+        # separately from ones that exist but are not done, so they can be diagnosed.
+        known = {dep.get('id') for dep in (manifest.get('coordination') or {}).get('items', [])}
+        not_done = [dep for dep in unmet if dep in known]
+        unknown = [dep for dep in unmet if dep not in known]
+        detail = "; ".join(
+            part for part in (
+                f"not done: {', '.join(not_done)}" if not_done else "",
+                f"not in this investigation's queue: {', '.join(unknown)}" if unknown else "",
+            ) if part
+        )
+        return json.dumps({
+            "error": f"Queue item '{item_id}' has unmet dependencies (must exist and be done). {detail}",
+            "unmet_dependencies": not_done,
+            "unknown_dependencies": unknown,
+        }, indent=2)
     item['owner_session'] = owner_session
     item['state'] = 'claimed'
     item['lease_expires_at'] = _coordination_now_plus(ttl)
@@ -431,10 +553,28 @@ def investigation_queue_complete(
     notes: Optional[str] = None,
 ) -> str:
     """Finalize a queue item as done, blocked, or cancelled."""
-    manifest = _load_manifest(investigation_id)
-    if not manifest:
-        return _coordination_error(f"Investigation '{investigation_id}' not found.")
-    manifest = _coordination_manifest(manifest)
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_complete_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            state=state,
+            notes=notes,
+        ),
+    )
+
+
+def _queue_complete_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    state: str = 'done',
+    notes: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
     item_id = str(item_id).strip()
     if not item_id:
         return _coordination_error('item_id is required.')
@@ -475,14 +615,54 @@ def investigation_queue_release(
     owner_session: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> str:
-    """Alias for completing a queue item as blocked or cancelled."""
-    return investigation_queue_complete(
-        investigation_id=investigation_id,
-        item_id=item_id,
-        owner_session=owner_session,
-        state='blocked',
-        notes=notes,
+    """Give up a claim: return the item to ``queued`` with no owner or lease.
+
+    Release is not terminal; any session may claim the item again. To stop the line use
+    ``investigation_queue_complete(state='blocked')``.
+    """
+    return _queue_locked(
+        investigation_id,
+        lambda manifest: _queue_release_locked(
+            manifest,
+            investigation_id,
+            item_id=item_id,
+            owner_session=owner_session,
+            notes=notes,
+        ),
     )
+
+
+def _queue_release_locked(
+    manifest: dict,
+    investigation_id: str,
+    item_id: str,
+    owner_session: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> str:
+    # Runs under the investigation .lock with a fresh manifest (see _queue_locked).
+    item_id = str(item_id).strip()
+    if not item_id:
+        return _coordination_error('item_id is required.')
+    owner_session = str(owner_session).strip() if owner_session is not None else None
+    item = _coordination_require_item(manifest, item_id)
+    if item['state'] in {'done', 'blocked', 'cancelled'}:
+        return _coordination_error(f"Queue item '{item_id}' is already final: {item['state']}")
+    current_owner = item.get('owner_session')
+    if current_owner and current_owner != owner_session:
+        return _coordination_error(
+            f"Queue item '{item_id}' is owned by session '{current_owner}' and cannot be released by '{owner_session}'."
+        )
+    if notes is not None:
+        notes = str(notes).strip()
+        if notes:
+            item['notes'] = notes
+    item['state'] = 'queued'
+    item['owner_session'] = None
+    item['lease_expires_at'] = None
+    item['updated_at'] = _now()
+    _save_manifest(manifest)
+    # "updated" kept for callers of the old release (an alias of complete(state='blocked')).
+    return json.dumps({"released": True, "updated": True, "item": item}, indent=2)
 
 
 def investigation_queue_status(
@@ -508,6 +688,18 @@ def investigation_queue_status(
                 'state filter must be one of queued, claimed, done, blocked, cancelled.'
             )
         items = [item for item in items if item.get('state') == value]
+    # Derived, read-only fields: the stored state stays 'claimed' after a lease lapses,
+    # so say explicitly whether the lease is live and whether the item can be claimed now.
+    view = []
+    for item in items:
+        lease_expired = item.get('state') == 'claimed' and _coordination_lease_expired(item)
+        open_state = item.get('state') == 'queued' or lease_expired
+        view.append(dict(
+            item,
+            lease_expired=lease_expired,
+            available=open_state and not _coordination_unmet_dependencies(manifest, item),
+        ))
+    items = view
     payload = {
         "investigation_id": investigation_id,
         "queue": items,
@@ -746,9 +938,15 @@ def investigation_load(
             out is reported as ``findings_omitted``.
         include_retracted: Include soft-retracted findings (default False).
         requesting_agent_id: Optional agent_id of the requesting agent. When
-                             provided and the investigation has a non-empty ACL,
-                             findings are filtered to those authored by agents
-                             in the ACL or by the requesting agent itself.
+                             the investigation has a non-empty ACL, the caller
+                             must be the owner or in the ACL, else
+                             permission_denied; a member sees findings
+                             authored by ACL members or by itself. The caller
+                             is the transport-bound identity (a per-agent MCP
+                             token or an A2A session), else the local agent
+                             (HERMES_AGENT_ID). This argument is self-declared,
+                             so it can only narrow: naming a member does not
+                             admit a caller that is not one.
         fidelity: Controls how much detail is returned. One of:
                   "full"    — manifest plus recent findings.
                   "summary" — manifest plus ``summary_l1`` and ``summary_l2``
@@ -769,6 +967,9 @@ def investigation_load(
             "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
         })
     manifest = _coordination_migrate_manifest(manifest)
+    denied = _acl_access_denied(manifest, requesting_agent_id)
+    if denied:
+        return json.dumps({"error": "permission_denied", "detail": denied})
 
     # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
     summary_l1 = manifest.get("summary_l1") or []
@@ -817,11 +1018,12 @@ def investigation_load(
         findings = kept
 
     acl = manifest.get("acl") or []
-    if requesting_agent_id and acl:
+    viewer = requesting_agent_id or caller_identity.bound_agent_id()
+    if viewer and acl:
         acl_set = set(acl)
         findings = [
             f for f in findings
-            if f.get("authored_by", "") == requesting_agent_id
+            if f.get("authored_by", "") == viewer
             or f.get("authored_by", "") in acl_set
         ]
 
@@ -892,7 +1094,9 @@ def _verification_summary(investigation_id: str) -> Optional[dict]:
             refuted.append({"finding_id": fid, "confidence": conf, "ts": r.get("ts")})
 
     refuted.sort(key=lambda x: -x["confidence"])
-    out = {"counts": counts, "verified_findings": len(latest)}
+    # A degraded row means no verifier was reached: it is an attempt, not a verification.
+    out = {"counts": counts, "verified_findings": len(latest) - counts["degraded"],
+           "verification_attempts": len(latest)}
     if refuted:
         out["refuted"] = refuted
         out["hint"] = ("adversarial verdicts, advisory only — they do NOT change a "
@@ -900,16 +1104,33 @@ def _verification_summary(investigation_id: str) -> Optional[dict]:
     return out
 
 
+def _retracted_as_of(events: list[tuple[str, bool]], as_of_dt: datetime) -> bool:
+    """True when the last retraction-log entry at or before ``as_of_dt`` is active."""
+    state = False
+    for ts, active in events:
+        try:
+            ev_dt = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if ev_dt.tzinfo is None:
+            ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+        if ev_dt <= as_of_dt:
+            state = active
+    return state
+
+
 def investigation_as_of(
     investigation_id: str,
     as_of_timestamp: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Return findings as they were believed at a specific time.
 
     A finding is included only if it already existed
     (``created_at_ts <= as_of_epoch``) and either has no ``valid_until`` or
-    stays valid through ``as_of_timestamp``. This enables bi-temporal
+    stays valid through ``as_of_timestamp``, and was not retracted at that
+    moment per ``retractions.jsonl``. This enables bi-temporal
     reconstruction even after later supersession or retraction.
 
     Args:
@@ -918,6 +1139,10 @@ def investigation_as_of(
                          Findings created after this moment are excluded, and
                          findings whose valid_until is before this moment are
                          also excluded.
+        requesting_agent_id: Optional agent_id. Same ACL rule as
+                             investigation_load: the transport-bound (or local)
+                             caller must be allowed, and a named agent can only
+                             narrow that.
 
     Returns:
         JSON ``{"investigation_id","as_of","findings","count"}``, or
@@ -927,6 +1152,9 @@ def investigation_as_of(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         try:
             as_of_dt = datetime.fromisoformat(as_of_timestamp)
@@ -939,6 +1167,10 @@ def investigation_as_of(
 
         findings_path = _inv_dir(investigation_id) / "findings.jsonl"
         all_findings = _read_jsonl(findings_path)
+        # Retraction intervals come from the append-only log, so memory_restore
+        # is an exact inverse. Older retracts also stamped valid_until with the
+        # retraction ts; that stamp defers to the log instead of hiding for good.
+        retraction_events = _retraction_events(_inv_dir(investigation_id) / "retractions.jsonl")
 
         result_findings = []
         for f in all_findings:
@@ -949,7 +1181,15 @@ def investigation_as_of(
             elif int(created_at_ts) > as_of_epoch:
                 continue
 
+            fid_events = retraction_events.get(str(f.get("id") or ""), [])
+            if _retracted_as_of(fid_events, as_of_dt):
+                continue
+
             valid_until = f.get("valid_until")
+            if valid_until is not None and any(
+                active and ts == str(valid_until) for ts, active in fid_events
+            ):
+                valid_until = None
             if valid_until is not None:
                 try:
                     vu_dt = datetime.fromisoformat(str(valid_until))
@@ -1483,16 +1723,19 @@ def investigation_list(
 def investigation_share(
     investigation_id: str,
     agent_ids: list,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Grant investigation access to one or more agents.
 
     Adds ``agent_ids`` to the investigation ACL. Idempotent: already-present
-    agents are left as-is.
+    agents are left as-is. Only the owner or an existing ACL member may change
+    the ACL (an unnamed caller is the local agent, ``HERMES_AGENT_ID``).
 
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to add to the ACL.
+        requesting_agent_id: Optional agent_id of the caller.
 
     Returns:
         JSON: {"shared_with": [...], "total_acl": N}
@@ -1502,6 +1745,9 @@ def investigation_share(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         current_acl = list(manifest.get("acl") or [])
         current_set = set(current_acl)
@@ -1526,15 +1772,18 @@ def investigation_share(
 def investigation_unshare(
     investigation_id: str,
     agent_ids: list,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Revoke investigation access from one or more agents.
 
     Removes ``agent_ids`` from the ACL. Idempotent: missing agents are ignored.
+    Only the owner or an existing ACL member may change the ACL.
 
     Args:
         investigation_id: Investigation identifier.
         agent_ids: List of agent_id strings to remove from the ACL.
+        requesting_agent_id: Optional agent_id of the caller.
 
     Returns:
         JSON: {"removed": [...], "total_acl": N}
@@ -1544,6 +1793,9 @@ def investigation_unshare(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=False)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         current_acl = list(manifest.get("acl") or [])
         remove_set = set(agent_ids or [])
@@ -1561,14 +1813,35 @@ def investigation_unshare(
         return json.dumps({"error": str(exc)})
 
 
+# Bundle 1.1 adds the lifecycle logs; 1.0 bundles (no logs) still import.
+_BUNDLE_SCHEMA_VERSION = "1.1"
+_IMPORTABLE_SCHEMA_VERSIONS = ("1.0", "1.1")
+_BUNDLE_LIFECYCLE_LOGS = {
+    "retractions": "retractions.jsonl",
+    "finding_updates": "finding_updates.jsonl",
+    "finding_verifications": "finding_verifications.jsonl",
+}
+# Manifest fields an import takes from the bundle. Everything else — owner, acl,
+# coordination leases, finding_counts, ids and timestamps — is the importer's own
+# or is recomputed, never trusted from an untrusted bundle.
+_IMPORTED_MANIFEST_FIELDS = (
+    "title", "context", "status", "hypothesis", "open_questions", "next_step",
+    "checked_sources", "closed_at", "closed_summary", "summary_l1", "summary_l2",
+)
+
+
 def investigation_export(
     investigation_id: str,
     include_embeddings: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Export an investigation as a portable JSON bundle.
 
-    The bundle includes the manifest, findings, conflicts, and entities.
+    The bundle (schema 1.1) includes the manifest, findings, conflicts,
+    entities, and the lifecycle logs that decide how those findings read:
+    retractions, resolution updates and verification verdicts. Without them an
+    import would bring retracted findings back live and reset every resolution.
     ``include_embeddings`` is accepted for forward compatibility, but embeddings
     are not yet exported.
 
@@ -1576,6 +1849,9 @@ def investigation_export(
         investigation_id: Investigation identifier to export.
         include_embeddings: Reserved for future use — embeddings are not yet
                             included.  Pass ``True`` to opt-in once supported.
+        requesting_agent_id: Optional agent_id of the caller. An investigation
+                             with a non-empty ACL is exported only to its owner
+                             or an ACL member.
 
     Returns:
         JSON: {"exported": true, "investigation_id": str, "bundle": {...},
@@ -1586,6 +1862,9 @@ def investigation_export(
         manifest = _load_manifest(investigation_id)
         if not manifest:
             return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+        denied = _acl_access_denied(manifest, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
 
         inv_dir = _inv_dir(investigation_id)
 
@@ -1610,13 +1889,15 @@ def investigation_export(
         entities = _read_jsonl(inv_dir / "entities.jsonl")
 
         bundle = {
-            "schema_version": "1.0",
+            "schema_version": _BUNDLE_SCHEMA_VERSION,
             "exported_at": _now(),
             "manifest": manifest,
             "findings": findings,
             "conflicts": conflicts,
             "entities": entities,
         }
+        for key, filename in _BUNDLE_LIFECYCLE_LOGS.items():
+            bundle[key] = _read_jsonl(inv_dir / filename)
 
         bundle_str = json.dumps(bundle)
         size_bytes = len(bundle_str.encode("utf-8"))
@@ -1633,6 +1914,16 @@ def investigation_export(
         return json.dumps({"error": f"Export failed: {exc}"})
 
 
+def _remap_ref(value, id_map: dict):
+    """Map a finding-id reference (a str or a list of them) through ``id_map``;
+    anything not in the map (e.g. a free-text claim) is left as it was."""
+    if isinstance(value, str):
+        return id_map.get(value, value)
+    if isinstance(value, list):
+        return [id_map.get(v, v) if isinstance(v, str) else v for v in value]
+    return value
+
+
 def investigation_import(
     bundle_json: str,
     new_title: Optional[str] = None,
@@ -1641,8 +1932,14 @@ def investigation_import(
     Import an ``investigation_export`` bundle under a new investigation ID.
 
     A fresh UUID is always assigned; the original ID is preserved as
-    ``imported_from``. Findings are re-indexed into Qdrant on a best-effort,
-    fail-open basis.
+    ``imported_from``. Every finding also gets a fresh id (the bundle's id is
+    kept as ``imported_finding_id``) so the import can never overwrite another
+    investigation's Qdrant points. The importer owns the copy: owner is the local
+    agent, the ACL is empty, coordination leases are dropped and finding counts
+    are recomputed. Retractions, resolutions and verifications carried by a 1.1
+    bundle are replayed onto the new ids; 1.0 bundles, which have none, still
+    import. Findings are re-indexed into Qdrant on a best-effort, fail-open
+    basis, and ``qdrant_indexed`` counts only confirmed upserts.
 
     Args:
         bundle_json: The JSON string produced by ``investigation_export`` (the
@@ -1652,8 +1949,11 @@ def investigation_import(
 
     Returns:
         JSON: {"imported": true, "new_investigation_id": str,
-               "original_investigation_id": str, "findings_imported": int,
-               "qdrant_indexed": int}
+               "original_investigation_id": str, "schema_version": str,
+               "findings_imported": int, "skipped_invalid": int,
+               "retractions_imported": int, "resolutions_imported": int,
+               "verifications_imported": int, "qdrant_indexed": int,
+               "qdrant_failed": int}
         On error: {"error": str}
     """
     _MAX_BUNDLE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -1672,8 +1972,11 @@ def investigation_import(
             data = data["bundle"]
 
         schema_version = data.get("schema_version")
-        if schema_version != "1.0":
-            return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
+        if schema_version not in _IMPORTABLE_SCHEMA_VERSIONS:
+            return json.dumps({
+                "error": f"Unsupported schema_version: {schema_version!r}. "
+                         f"Expected one of {list(_IMPORTABLE_SCHEMA_VERSIONS)}."
+            })
 
         required_keys = {"manifest", "findings"}
         missing = required_keys - set(data.keys())
@@ -1688,11 +1991,61 @@ def investigation_import(
 
         new_id = str(uuid.uuid4())
 
+        findings = data.get("findings") or []
+        if not isinstance(findings, list):
+            findings = []
+
+        # Fresh ids for every row: the bundle is untrusted, and its ids are the
+        # source investigation's Qdrant point ids.
+        id_map: dict[str, str] = {}
+        new_findings: list[dict] = []
+        skipped_invalid = 0
+        for finding in findings:
+            if not isinstance(finding, dict):
+                skipped_invalid += 1
+                continue
+            f = dict(finding)
+            old_fid = str(f.get("id") or "")
+            f["id"] = id_map.get(old_fid) or str(uuid.uuid4())
+            if old_fid:
+                f["imported_finding_id"] = old_fid
+                id_map[old_fid] = f["id"]
+            f["investigation_id"] = new_id
+            new_findings.append(f)
+        for f in new_findings:
+            for ref_key in ("derived_from", "finding_id"):
+                if ref_key in f:
+                    f[ref_key] = _remap_ref(f[ref_key], id_map)
+
         now = _now()
-        new_manifest = dict(src_manifest)
-        new_manifest["id"] = new_id
-        new_manifest["created_at"] = now
-        new_manifest["updated_at"] = now
+        finding_counts = {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0}
+        for f in new_findings:
+            ftype = str(f.get("type") or "")
+            if ftype in finding_counts:
+                finding_counts[ftype] += 1
+        new_manifest = {
+            "id": new_id,
+            "title": "",
+            "context": "",
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "hypothesis": None,
+            "open_questions": [],
+            "next_step": None,
+            "checked_sources": {},
+            "finding_counts": finding_counts,
+            "closed_at": None,
+            "closed_summary": None,
+            "owner": os.environ.get("HERMES_AGENT_ID", ""),
+            "acl": [],
+            "summary_l1": [],
+            "summary_l2": "",
+            "coordination": {"version": 1, "items": []},
+        }
+        for key in _IMPORTED_MANIFEST_FIELDS:
+            if key in src_manifest:
+                new_manifest[key] = src_manifest[key]
         new_manifest["imported_from"] = original_id
         if new_title:
             new_manifest["title"] = new_title
@@ -1700,16 +2053,8 @@ def investigation_import(
         inv_dir = _inv_dir(new_id)
         _save_manifest(new_manifest)
 
-        findings = data.get("findings") or []
-        if not isinstance(findings, list):
-            findings = []
-
         findings_path = inv_dir / "findings.jsonl"
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
-            f = dict(finding)
-            f["investigation_id"] = new_id
+        for f in new_findings:
             _append_jsonl(findings_path, f)
 
         conflicts = data.get("conflicts")
@@ -1717,6 +2062,11 @@ def investigation_import(
             conflicts_path = inv_dir / "conflicts.jsonl"
             for entry in conflicts:
                 if isinstance(entry, dict):
+                    entry = dict(entry)
+                    entry["investigation_id"] = new_id
+                    for ref_key in ("finding_id_a", "finding_id_b"):
+                        if ref_key in entry:
+                            entry[ref_key] = _remap_ref(entry[ref_key], id_map)
                     _append_jsonl(conflicts_path, entry)
 
         entities = data.get("entities")
@@ -1724,17 +2074,43 @@ def investigation_import(
             entities_path = inv_dir / "entities.jsonl"
             for entry in entities:
                 if isinstance(entry, dict):
+                    entry = dict(entry)
+                    if "finding_refs" in entry:
+                        entry["finding_refs"] = _remap_ref(entry["finding_refs"], id_map)
                     _append_jsonl(entities_path, entry)
+
+        # Replay the lifecycle logs onto the new ids. Rows naming a finding the
+        # bundle does not carry are dropped: they cannot refer to anything here.
+        replayed = {}
+        for key, filename in _BUNDLE_LIFECYCLE_LOGS.items():
+            rows = data.get(key)
+            replayed[key] = 0
+            if not isinstance(rows, list):
+                continue
+            log_path = inv_dir / filename
+            for entry in rows:
+                if not isinstance(entry, dict):
+                    continue
+                fid = str(entry.get("finding_id") or "")
+                if fid not in id_map:
+                    continue
+                entry = dict(entry)
+                entry["finding_id"] = id_map[fid]
+                if "investigation_id" in entry:
+                    entry["investigation_id"] = new_id
+                if "seed_id" in entry:
+                    entry["seed_id"] = _remap_ref(entry["seed_id"], id_map)
+                _append_jsonl(log_path, entry)
+                replayed[key] += 1
 
         # Re-index findings into Qdrant (fail-open).
         qdrant_indexed = 0
+        qdrant_failed = 0
         import_ts = int(datetime.now(timezone.utc).timestamp())
-        for finding in findings:
-            if not isinstance(finding, dict):
-                continue
+        for finding in new_findings:
             text = str(finding.get("text") or "").strip()
-            finding_id = str(finding.get("id") or "")
-            if not text or not finding_id:
+            finding_id = finding["id"]
+            if not text:
                 continue
             try:
                 # Index the whole finding, as the native store path does
@@ -1755,17 +2131,27 @@ def investigation_import(
                     # so a reader can tell a real age from a stand-in.
                     payload["created_at_ts"] = import_ts
                     payload["age_source"] = "imported"
-                _qdrant_upsert(finding_id, text, payload)
-                qdrant_indexed += 1
+                # _qdrant_upsert swallows its own failures; only True means written.
+                if _qdrant_upsert(finding_id, text, payload) is True:
+                    qdrant_indexed += 1
+                else:
+                    qdrant_failed += 1
             except Exception as exc:
+                qdrant_failed += 1
                 logger.debug("investigation_import: qdrant upsert skipped for %s: %s", finding_id, exc)
 
         return json.dumps({
             "imported": True,
             "new_investigation_id": new_id,
             "original_investigation_id": original_id,
-            "findings_imported": len(findings),
+            "schema_version": schema_version,
+            "findings_imported": len(new_findings),
+            "skipped_invalid": skipped_invalid,
+            "retractions_imported": replayed["retractions"],
+            "resolutions_imported": replayed["finding_updates"],
+            "verifications_imported": replayed["finding_verifications"],
             "qdrant_indexed": qdrant_indexed,
+            "qdrant_failed": qdrant_failed,
         })
     except Exception as exc:
         logger.warning("investigation_import failed: %s", exc)

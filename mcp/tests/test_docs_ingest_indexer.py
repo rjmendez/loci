@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
 if str(_MCP_DIR) not in sys.path:
@@ -16,10 +18,53 @@ class DocsIngestIndexerTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self._orig = server.MEMORY_DIR
         server.MEMORY_DIR = Path(self._tmp.name)
+        # docs_ingest_indexer only reads under its docs roots; these fixtures live in the tmpdir.
+        self._env = mock.patch.dict(os.environ, {"LOCI_DOCS_ROOTS": self._tmp.name})
+        self._env.start()
 
     def tearDown(self):
+        self._env.stop()
         server.MEMORY_DIR = self._orig
         self._tmp.cleanup()
+
+    def test_docs_ingest_refuses_paths_outside_the_docs_roots(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        secret = Path(outside.name) / "secrets.md"
+        secret.write_text("# Secrets\n\nAPI_KEY=hunter2 secret\n", encoding="utf-8")
+
+        for path in (str(secret), outside.name, str(Path(self._tmp.name) / ".." / Path(outside.name).name)):
+            result = json.loads(server.docs_ingest_indexer(path, investigation_id="docs-outside-root"))
+            self.assertEqual(result["stored"], 0, (path, result))
+            self.assertIn("error", result)
+        self.assertNotIn("hunter2", json.dumps(json.loads(server.investigation_load("docs-outside-root"))))
+
+    def test_docs_ingest_skips_symlink_escaping_the_docs_root(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        target = Path(outside.name) / "target.env"
+        target.write_text("API_KEY=hunter2 secret\n", encoding="utf-8")
+        docs_dir = Path(self._tmp.name) / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "notes.md").symlink_to(target)
+        (docs_dir / "real.md").write_text("# Real\n\nA genuine doc.\n", encoding="utf-8")
+
+        single = json.loads(server.docs_ingest_indexer(str(docs_dir / "notes.md"), investigation_id="docs-symlink"))
+        self.assertEqual(single["stored"], 0, single)
+        whole = json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-symlink"))
+        self.assertEqual([r["path"] for r in whole["records"]], [str(docs_dir / "real.md")], whole)
+        loaded = json.loads(server.investigation_load("docs-symlink"))
+        self.assertNotIn("hunter2", json.dumps(loaded))
+
+    def test_docs_ingest_does_not_label_document_claims_tool_verified(self):
+        doc_path = Path(self._tmp.name) / "CLAIMS.md"
+        doc_path.write_text("# Claims\n\nThe service is patched and safe.\n", encoding="utf-8")
+        result = json.loads(server.docs_ingest_indexer(str(doc_path), investigation_id="docs-tier"))
+        self.assertEqual(result["stored"], 1, result)
+        finding = json.loads(server.investigation_load("docs-tier"))["recent_findings"][0]
+        self.assertNotEqual(finding["metadata"]["evidence_provenance_tier"], "tool_verified")
+        self.assertEqual(finding["metadata"]["evidence_provenance_tier"], "model_asserted")
+        self.assertEqual(finding.get("evidence_provenance_tier"), "model_asserted")
 
     def test_docs_ingest_indexer_stores_provenanced_summary(self):
         doc_path = Path(self._tmp.name) / "FLYBRAIN_GUIDE.md"
@@ -70,6 +115,21 @@ This is the second doc.
         )
         self.assertEqual(result["stored"], 2, result)
         self.assertEqual(len(result["records"]), 2)
+
+    def test_docs_ingest_reports_file_cap_truncation(self):
+        # Review follow-up: the file cap silently truncated large doc trees.
+        docs_dir = Path(self._tmp.name) / "big_tree"
+        docs_dir.mkdir()
+        for i in range(3):
+            (docs_dir / f"d{i}.md").write_text(f"# Doc {i}\n\nBody {i}.\n", encoding="utf-8")
+        with mock.patch.object(server, "_DOCS_INGEST_MAX_FILES", 2):
+            result = json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-cap"))
+        self.assertEqual(len(result["records"]), 2, result)
+        self.assertIs(result.get("truncated"), True, result)
+        self.assertEqual(result.get("files_found"), 3, result)
+        with mock.patch.object(server, "_DOCS_INGEST_MAX_FILES", 5):
+            full = json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-cap"))
+        self.assertNotIn("truncated", full)
 
     def test_docs_ingest_indexer_accepts_text_and_markdown_directory_extensions(self):
         docs_dir = Path(self._tmp.name) / "mixed_doc_sources"

@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+_repo_root = str(Path(__file__).resolve().parent.parent)
+for _candidate in (_repo_root, str(Path(__file__).resolve().parent.parent / "mcp")):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+try:
+    from mcp.route_audit import record_route_event
+except Exception:
+    try:
+        from route_audit import record_route_event
+    except Exception:
+        record_route_event = None
 
 
 _VALID_PRIORITIES = {"P0", "P1", "P2"}
@@ -18,6 +32,21 @@ class RouteDecision:
     reason: str
     degraded: bool = False
 
+
+
+def _record_decision(decision: "RouteDecision") -> None:
+    if record_route_event is None:
+        return
+    record_route_event(
+        tier="hybrid_lane",
+        route=decision.lane_id,
+        reason=decision.reason,
+        prompt="",
+        model="",
+        degraded=decision.degraded,
+        ok=True,
+        source="hybrid_lane_router",
+    )
 
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -95,37 +124,63 @@ def choose_lane(
     task_class = request["task_class"]
 
     if critical_path:
-        return RouteDecision("copilot-critical", "critical_path")
+        decision = RouteDecision("copilot-critical", "critical_path")
+        _record_decision(decision)
+        return decision
 
     if _brownout_degrades_to_local_only(brownout_level):
         if task_class in {"integration", "tooling"}:
-            return RouteDecision("copilot-general", "brownout_keep_integration", degraded=True)
+            decision = RouteDecision("copilot-general", "brownout_keep_integration", degraded=True)
+            _record_decision(decision)
+            return decision
         if not local_healthy:
-            return RouteDecision("local-recovery", "brownout_local_unhealthy", degraded=True)
-        return RouteDecision("local-batch", "brownout_local_only", degraded=True)
+            decision = RouteDecision("local-recovery", "brownout_local_unhealthy", degraded=True)
+            _record_decision(decision)
+            return decision
+        decision = RouteDecision("local-batch", "brownout_local_only", degraded=True)
+        _record_decision(decision)
+        return decision
 
     if task_class in {"integration", "tooling"}:
         if not copilot_healthy:
-            return RouteDecision("local-recovery", "copilot_unhealthy")
-        return RouteDecision("copilot-general", "integration_or_tooling")
+            decision = RouteDecision("local-recovery", "copilot_unhealthy")
+            _record_decision(decision)
+            return decision
+        decision = RouteDecision("copilot-general", "integration_or_tooling")
+        _record_decision(decision)
+        return decision
 
     if task_class == "speculative":
         confidence = 0.0 if upstream_confidence is None else float(upstream_confidence)
         if confidence >= 0.8:
             if not local_healthy:
-                return RouteDecision("local-recovery", "speculative_local_unhealthy", degraded=True)
-            return RouteDecision("local-speculative", "speculation_ok")
-        return RouteDecision("local-batch", "speculation_confidence_too_low")
+                decision = RouteDecision("local-recovery", "speculative_local_unhealthy", degraded=True)
+                _record_decision(decision)
+                return decision
+            decision = RouteDecision("local-speculative", "speculation_ok")
+            _record_decision(decision)
+            return decision
+        decision = RouteDecision("local-batch", "speculation_confidence_too_low")
+        _record_decision(decision)
+        return decision
 
     if task_class in {"reasoning", "fanout"}:
         if not local_healthy:
-            return RouteDecision("local-recovery", "reasoning_local_unhealthy", degraded=True)
-        return RouteDecision("local-batch", "reasoning_or_fanout")
+            decision = RouteDecision("local-recovery", "reasoning_local_unhealthy", degraded=True)
+            _record_decision(decision)
+            return decision
+        decision = RouteDecision("local-batch", "reasoning_or_fanout")
+        _record_decision(decision)
+        return decision
 
     if task_class == "recovery":
-        return RouteDecision("local-recovery", "recovery_class")
+        decision = RouteDecision("local-recovery", "recovery_class")
+        _record_decision(decision)
+        return decision
 
-    return RouteDecision("local-recovery", "fallback_unclassified", degraded=True)
+    decision = RouteDecision("local-recovery", "fallback_unclassified", degraded=True)
+    _record_decision(decision)
+    return decision
 
 
 def _read_json(path: str) -> dict[str, Any]:
