@@ -174,6 +174,18 @@ def test_extract_json_object_fuzz_never_raises(text, depth):
 
 
 @settings(max_examples=200, deadline=None)
+@given(text=st.text(st.characters(blacklist_categories=("Cs",), blacklist_characters="`"),
+                    max_size=512),
+       depth=st.integers(min_value=1, max_value=50))
+def test_extract_json_object_fuzz_recovers_the_fenced_object(text, depth):
+    # Success-path twin: whatever prose surrounds it, a fenced object is returned intact
+    # (a parser that always returns None passes the never-raises property above).
+    nested = ("{\"a\":" * depth) + "0" + ("}" * depth)
+    result = model_json.extract_json_object(f"{text} ```json\n{nested}\n``` {text}")
+    assert result == json.loads(nested)
+
+
+@settings(max_examples=200, deadline=None)
 @given(
     text=_MALFORMED_UNICODE_TEXT,
     labels=st.lists(_MALFORMED_UNICODE_TEXT, min_size=0, max_size=5),
@@ -270,12 +282,32 @@ def test_investigation_note_tool_fuzz_never_raises(tmp_path, monkeypatch, field,
         server.investigation_note("case-note-fuzz", field, note_value)
     )
     assert isinstance(parsed, dict)
+    raw = note_value if isinstance(note_value, str) else ("" if note_value is None else str(note_value))
+    if field == "checked_source":
+        tool, _, summary = raw.rpartition(":")
+        valid = bool(tool.strip()) and bool(summary.strip())
+    else:
+        valid = bool(raw.strip())
+    # Exactly the empty / whitespace-only / malformed values are rejected, and nothing else.
+    assert ("error" in parsed) is (not valid), (field, note_value, parsed)
     if "error" in parsed:
         assert isinstance(parsed["error"], str)
         return
 
     manifest = parsed["manifest"]
     assert parsed["updated"] == field
+    stripped = raw.strip()
+    if field in ("context", "hypothesis", "next_step"):
+        assert manifest[field] == stripped
+    elif field == "open_question_add":
+        assert stripped in manifest["open_questions"]
+    elif field == "open_question_remove":
+        assert stripped not in manifest["open_questions"]
+    elif field == "closed_summary":
+        assert (manifest["closed_summary"], manifest["status"]) == (stripped, "closed")
+    else:
+        tool, _, summary = raw.rpartition(":")
+        assert manifest["checked_sources"][tool.strip()][-1]["summary"] == summary.strip()
     assert all(isinstance(item, str) and item.strip() for item in manifest["open_questions"])
     assert manifest["closed_summary"] is None or (
         isinstance(manifest["closed_summary"], str) and manifest["closed_summary"].strip()
@@ -288,8 +320,24 @@ def test_investigation_note_tool_fuzz_never_raises(tmp_path, monkeypatch, field,
 
 def test_inv_dir_rejects_overlong_ids_with_value_error(tmp_path, monkeypatch):
     monkeypatch.setattr(inv_store, "_get_memory_dir", lambda: tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="exceeds"):
         inv_store._inv_dir("a" * 256)
+
+
+@settings(
+    max_examples=200,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(investigation_id=st.text(st.sampled_from(tuple(_VALID_ID_CHARS)), min_size=1, max_size=200)
+       .filter(lambda s: s.lower() not in inv_store._INVALID_INVESTIGATION_ID_SENTINELS))
+def test_inv_dir_fuzz_accepts_every_valid_id(tmp_path, monkeypatch, investigation_id):
+    # Success-path twin of the escape fuzz: rejecting everything must not pass.
+    root = tmp_path / f"valid-root-{len(list(tmp_path.iterdir()))}"
+    root.mkdir()
+    monkeypatch.setattr(inv_store, "_get_memory_dir", lambda: root)
+    assert inv_store._inv_dir(investigation_id) == root.resolve() / investigation_id
+    assert (root / investigation_id).is_dir()
 
 
 def test_classify_text_scalar_labels_degrade_instead_of_raising(monkeypatch):
@@ -306,4 +354,4 @@ def test_investigation_note_rejects_none_checked_source_instead_of_crashing(tmp_
     monkeypatch.setattr(server, "MEMORY_DIR", tmp_path)
     server.investigation_start("case-note-regression", "fuzz note", "ctx")
     parsed = json.loads(server.investigation_note("case-note-regression", "checked_source", None))
-    assert "error" in parsed
+    assert parsed == {"error": "checked_source tool name must not be empty"}

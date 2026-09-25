@@ -1163,6 +1163,25 @@ def seed_state(env, **kw):
 
 # --- gating -------------------------------------------------------------------
 
+@pytest.mark.parametrize("argv, env_url, cfg_url, expected", [
+    ([], None, "http://gpu-host:11434", "http://gpu-host:11434"),               # config file
+    ([], "http://from-env:11434/", "http://gpu-host:11434", "http://from-env:11434"),  # env wins
+    ([], None, None, "http://localhost:11434"),                                  # last resort
+    (["--ollama", "http://cli:11434"], "http://from-env:11434", None, "http://cli:11434"),
+])
+def test_main_resolves_ollama_at_run_time(mainenv, monkeypatch, argv, env_url, cfg_url, expected):
+    probed = []
+    monkeypatch.setattr(loop, "_ollama_ok", lambda base: probed.append(base) or False)
+    monkeypatch.setattr(loop, "_resolve_backends",
+                        lambda: {"OLLAMA_BASE_URL": cfg_url} if cfg_url else {})
+    if env_url is None:
+        monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OLLAMA_BASE_URL", env_url)
+    mainenv.main(*argv)
+    assert probed == [expected]
+
+
 def test_main_first_run_no_ollama_does_not_retrain(mainenv):
     e = mainenv
     e.rv["ollama_ok"] = False

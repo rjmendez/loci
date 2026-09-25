@@ -9,6 +9,7 @@ item could both be told they own it. These tests race real OS processes
 import json
 import multiprocessing
 import sys
+import time
 
 import pytest
 
@@ -18,15 +19,22 @@ pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="needs fork + fl
 
 _N_PROCS = 6
 _PER_PROC = 8
+_MAX_ATTEMPTS = 50
 
 
 def _enqueue_worker(inv_id, proc_idx, barrier, out):
+    """Enqueue _PER_PROC items; a 'busy' answer is retried, as a client is told to."""
     barrier.wait()
     results = []
     for i in range(_PER_PROC):
-        results.append(json.loads(server.investigation_queue_enqueue(
-            investigation_id=inv_id, item_id=f"p{proc_idx}-i{i}",
-        )))
+        for _attempt in range(_MAX_ATTEMPTS):
+            r = json.loads(server.investigation_queue_enqueue(
+                investigation_id=inv_id, item_id=f"p{proc_idx}-i{i}",
+            ))
+            results.append(r)
+            if r.get("error") != "busy":
+                break
+            time.sleep(0.02)
     out.put(results)
 
 
@@ -66,14 +74,17 @@ def test_concurrent_enqueues_from_many_processes_lose_nothing(store):
     inv_id = "q-mp-enqueue"
     server.investigation_start(investigation_id=inv_id, title="multiprocess enqueue")
     batches = _run(_enqueue_worker, inv_id)
-    accepted = {r["item"]["id"] for batch in batches for r in batch if r.get("queued")}
-    busy = [r for batch in batches for r in batch if r.get("error") == "busy"]
-    # Every enqueue that reported success must be in the queue afterwards.
+    expected = {f"p{p}-i{i}" for p in range(_N_PROCS) for i in range(_PER_PROC)}
+    answers = [r for batch in batches for r in batch]
+    # Every answer is either an acceptance or a retryable busy -- nothing else.
+    assert all(r.get("queued") is True or (r.get("error") == "busy" and r.get("retryable"))
+               for r in answers), [r for r in answers if not r.get("queued")][:3]
+    accepted = [r["item"]["id"] for r in answers if r.get("queued")]
+    # With retries every item is accepted exactly once...
+    assert sorted(accepted) == sorted(expected)
+    # ...and every acknowledged enqueue is in the queue afterwards (none lost).
     server.inv_store._manifest_cache.clear()
-    on_disk = _queue_ids(inv_id)
-    assert accepted <= on_disk, f"lost {len(accepted - on_disk)} acknowledged enqueues"
-    # And with a bounded lock, a contended call is either accepted or told to retry.
-    assert len(accepted) + len(busy) == _N_PROCS * _PER_PROC
+    assert _queue_ids(inv_id) == expected
 
 
 def test_contested_claim_from_many_processes_has_one_winner(store):
