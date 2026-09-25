@@ -361,8 +361,9 @@ def test_ground_normal_mode_drops_whole_rag_rows_over_budget(monkeypatch):
     assert [s["attrs"]["finding_id"] for s in spans] == ["f-1", "f-2"]
     assert_payload_framed(block, bodies[0], finding_id="f-1")
     assert_payload_framed(block, bodies[1], finding_id="f-2")
-    assert "f-3" not in block and "payload-3" not in block   # the overflow row is dropped whole
-    assert "…[truncated]" in block
+    # too little room is left to clip row 3 inside a frame, so its frame is not opened at all:
+    # only Loci's own row header survives, followed by the truncation marker
+    assert "[3 id=f-3] …[truncated]\n" in block and "payload-3" not in block
     assert _FOOTER in block and all(_FOOTER not in s["body"] for s in spans)
 
 

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Optional
 from untrusted_memory import wrap_untrusted_memory_text
 
-from compact import _CLEAN_FRAME_RE, compact_text
+from compact import compact_text
 
 logger = logging.getLogger("loci-mcp.grounding")
 _wrap_untrusted_memory_text = wrap_untrusted_memory_text
@@ -109,32 +109,6 @@ def _truncate(text: str, limit: int) -> str:
             cut = cut[: i + 1]
             break
     return cut.rstrip() + " …[truncated]"
-
-
-def _truncate_framed(text: str, limit: int) -> str:
-    """_truncate for text composed of untrusted-memory frames: never cut inside a frame.
-
-    A row is a frame plus the plain text before it. Whole rows are kept while they fit
-    and the first row that does not fit is dropped with everything after it, so the
-    result never ends inside an open frame (which would put the rest of the prompt in
-    the frame and lose the frame's closing tag).
-    """
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    rows: list[str] = []
-    pos = 0
-    for fm in _CLEAN_FRAME_RE.finditer(text):
-        rows.append(text[pos:fm.end()])
-        pos = fm.end()
-    if pos < len(text):
-        rows.append(text[pos:])
-    out = ""
-    for row in rows:
-        if len(out) + len(row) > limit:
-            break
-        out += row
-    return (out.rstrip() + " …[truncated]").strip()
 
 
 # Common tokens that inflate overlap without indicating relevance.
@@ -298,8 +272,10 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if remaining[0] <= 0 or not text:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
+        # Framed text is clipped by compact_text in both modes: a frame that does not fit
+        # is cut INSIDE its tags, so it always closes and keeps as much text as fits.
         chunk = (compact_text(text, cap, preserve_sentence_boundary=not compact_mode, keep_frames=framed)
-                 if compact_mode else (_truncate_framed if framed else _truncate)(text, cap))
+                 if compact_mode or framed else _truncate(text, cap))
         if compact_mode:
             chunk = re.sub(r"\s+", " ", chunk).strip()
         block = f"[{tag}] {chunk}"

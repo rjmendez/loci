@@ -281,12 +281,13 @@ def test_ground_compact_reuses_rag_compact_and_reduces_chars(monkeypatch):
                               investigation_id="c1", kind="manifest_summary")
         assert not any("[rag]" in s["body"] or "Do not present facts" in s["body"] for s in spans)
         assert "token cache is invalidated" not in outside_frames(block)
-    # Normal mode: the 430-char finding cannot fit its 200-char slice as a whole frame, so the
-    # row is dropped and marked rather than cut open (its closing tag was lost before).
-    assert "[case:c1:finding] …[truncated]\n" in normal["block"]
-    assert 'finding_id="f-case"' not in normal["block"]
-    # Compact mode clips the finding inside a closed frame.
-    assert_payload_framed(compact["block"], "The token cache is invalidated too early.", finding_id="f-case")
+    # Both modes: the 430-char finding cannot fit its 200-char slice whole, so it is clipped
+    # INSIDE a closed frame: its text survives and the frame still closes. (At 3a1ad78 normal
+    # mode lost the closing tag; an interim fix dropped the whole row and its content.)
+    for block in (normal["block"], compact["block"]):
+        span = assert_payload_framed(block, "The token cache is invalidated too early", finding_id="f-case")
+        assert span["body"].rstrip().endswith("…[truncated]"), span["body"]
+        assert "[case:c1:finding] …[truncated]" not in block
 
 
 def test_memory_hints_compact_clips_text_and_keeps_fields(monkeypatch):
