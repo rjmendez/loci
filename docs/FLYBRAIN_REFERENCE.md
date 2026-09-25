@@ -40,8 +40,8 @@ Pull reports with the file-by-file sha256, licence evidence and what was skipped
 
 ## 3. Literature
 
-- **Synthesis:** `/mnt/f/.flybrain/logs/research-20260924T2245Z/SYNTHESIS.md`. It covers the findings compared with prior work, methods to adopt, parallel efforts, roadmap implications, errata (6b) and references (7).
-- **Structured data:** `research.json` in the same directory, with every source, its key result, which findings it links to, and its verification status. Per-topic notes are in `*.md` there too.
+- **Synthesis (in git):** [flybrain-research/SYNTHESIS.md](flybrain-research/SYNTHESIS.md). It covers the findings compared with prior work, methods to adopt, parallel efforts, roadmap implications, errata (6b) and references (7). The original run directory is `/mnt/f/.flybrain/logs/research-20260924T2245Z/`.
+- **Structured data (in git):** [flybrain-research/research.json](flybrain-research/research.json), with every source, its key result, which findings it links to, and its verification status. Per-topic notes are in `docs/flybrain-research/*.md`.
 - **Verification:** 150 citations were re-fetched by an independent checker. 137 verified, 4 misattributed (corrected in the synthesis), 9 unverifiable (paywalled), 0 fabricated.
 - **Cite from the reference list, not from memory.** Claims marked `[unverifiable]` are context only.
 

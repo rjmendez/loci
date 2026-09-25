@@ -7,7 +7,7 @@ Local research reference (what is where, how trustworthy it is, how to cite it):
 Evidence:
 
 - Interim results: `FLYBRAIN_REAL_MODELS_INTERIM.md`.
-- Literature synthesis: `/mnt/f/.flybrain/logs/research-20260924T2245Z/SYNTHESIS.md` (150 citations checked: 137 verified, 4 corrected, 9 unverifiable, 0 fabricated).
+- Literature synthesis: [flybrain-research/SYNTHESIS.md](flybrain-research/SYNTHESIS.md) (150 citations checked: 137 verified, 4 corrected, 9 unverifiable, 0 fabricated).
 
 ## Scope
 
@@ -30,7 +30,7 @@ The literature synthesis and the interim results back all of these.
 
 ### 1. Real models: workflow `flybrain-real-models` (running; draft PR #393)
 
-- **Datasets:** l1em, BANC, optic lobe and MANC are done. male-cns, FlyWire and the graph model are still running.
+- **Datasets:** l1em, BANC, optic lobe, MANC and male-cns are done. FlyWire and the graph model are still running.
 - **Rigor stage:**
   - provenance gates;
   - literature NT ground truth (`drosophila_neurotransmitters`, confidence ≥ 4, CNN training types removed);
@@ -136,6 +136,7 @@ Open provenance questions for dataset teams, and published numbers we could not 
 
 ## Operations
 
-- **Heavy jobs:** `~/.local/bin/flybrain-slot`, which runs 3 at a time. The old global lock serialised jobs for hours.
+- **Heavy jobs:** `flybrain-slot`, which runs 3 at a time. The old global lock serialised jobs for hours. The source is `scripts/flybrain-slot`; install it with `install -m 755 scripts/flybrain-slot ~/.local/bin/flybrain-slot`.
+- **Loci MCP secrets:** `scripts/ops/loci-mcp-envfile.sh` moves secret `Environment=` lines from the user unit into a mode-600 `EnvironmentFile`. Run it with `--dry-run` first.
 - **GPUs:** both are used (index 0 = RTX 2080 Ti, index 1 = RTX 4070 Ti with `CUDA_DEVICE_ORDER=PCI_BUS_ID`). Pin one card per job and keep at least 1 GB free on each so Loci's embedder can load. Ollama's large models degrade to Loci fallbacks (#390/#391) during training.
 - **Storage:** writes go only to `/mnt/f/.flybrain/cache` and run logs. Snapshots are read-only.
