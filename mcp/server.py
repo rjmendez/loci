@@ -11944,6 +11944,260 @@ class _BearerAuthMiddleware:
         await self._app(scope, receive, send)
 
 
+# ---------------------------------------------------------------------------
+# Brain cluster inference tools
+# ---------------------------------------------------------------------------
+
+def _cluster_state_path() -> str:
+    path = os.environ.get("FLYBRAIN_CLUSTER_STATE_PATH", "").strip()
+    if not path:
+        raise ValueError(
+            "FLYBRAIN_CLUSTER_STATE_PATH is not set. "
+            "Point it at the brain_cluster_promotion_state.json written by run_brain_cluster_p0_dry_run."
+        )
+    return path
+
+
+def _load_promoted_bundle():
+    import flybrain_brain_cluster as fbc
+    state = fbc.read_brain_cluster_promotion_state(_cluster_state_path())
+    if state.promoted is None:
+        raise ValueError("No promoted brain cluster artifact. Run and promote the training pipeline first.")
+    return fbc.load_brain_cluster_artifacts(state.promoted.manifest_path)
+
+
+@mcp.tool()
+def flybrain_cluster_describe() -> str:
+    """Describe the currently promoted brain cluster -- experts, regions, labels, and validation metrics.
+
+    Reads the active promotion state from FLYBRAIN_CLUSTER_STATE_PATH and returns a
+    summary of every regional expert: which brain region it covers, the neuron-type labels
+    it can predict, its validation accuracy and sample counts, and the promotion timestamp.
+
+    Returns:
+        JSON with promoted artifact metadata, per-expert summaries, and routing table.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"error": str(exc), "ok": False})
+
+    router = bundle.router
+    experts_payload = bundle.experts
+    manifest = bundle.manifest
+
+    experts_out = []
+    for expert in experts_payload.get("experts", []):
+        expert_id = expert.get("expert_id", "")
+        region = expert.get("region", "")
+        shadow = expert.get("shadow_replay", {})
+        experts_out.append({
+            "expert_id": expert_id,
+            "region": region,
+            "confidence": shadow.get("confidence"),
+            "confidence_calibration": shadow.get("confidence_calibration"),
+            "provenance_refs": shadow.get("provenance_refs", []),
+        })
+
+    return json.dumps({
+        "ok": True,
+        "artifact_id": manifest.artifact_id,
+        "artifact_version": manifest.artifact_version,
+        "expert_count": len(experts_out),
+        "experts": experts_out,
+        "routing_table": router.get("routes_by_task_type", router.get("routes", {})),
+        "router_schema_version": router.get("schema_version"),
+        "experts_schema_version": experts_payload.get("schema_version"),
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_cluster_classify(
+    samples: str,
+    expert_id: str = "",
+) -> str:
+    """Classify one or more neurons using the promoted brain cluster models.
+
+    Each sample is routed to the appropriate regional expert (Naive-Bayes classifier)
+    and scored. The expert is selected by matching region_id to the trained experts;
+    pass expert_id to override and force a specific expert for all samples.
+
+    Args:
+        samples: JSON list of objects, each with sample_id (str), region_id (str),
+            and input_text (str -- the wiring description text for the neuron).
+        expert_id: Optional expert ID override (e.g. 'MB_expert'). When set, all
+            samples are scored against this expert regardless of region_id.
+
+    Returns:
+        JSON with predicted_label, confidence, expert_id, abstained per sample.
+    """
+    try:
+        raw_samples = json.loads(samples)
+        if not isinstance(raw_samples, list):
+            return json.dumps({"ok": False, "error": "samples must be a JSON array"})
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    import flybrain_brain_cluster_training as fbct
+
+    experts_payload = bundle.experts
+    region_to_expert: dict[str, str] = {}
+    for exp in experts_payload.get("experts", []):
+        eid = exp.get("expert_id", "")
+        rid = exp.get("region", "")
+        if eid and rid:
+            region_to_expert[rid] = eid
+
+    try:
+        manifest_dict = bundle.manifest.as_dict()
+        artifact_root_rel = manifest_dict.get("artifact", {}).get("root", "artifacts")
+        manifest_dir = Path(manifest_dict.get("manifest_path", "")).parent
+        artifact_root = (manifest_dir / artifact_root_rel).resolve() if manifest_dir != Path("") else None
+    except Exception:
+        artifact_root = None
+
+    model_cache: dict[str, Any] = {}
+
+    def _load_model(eid: str, rid: str):
+        if eid in model_cache:
+            return model_cache[eid]
+        if not artifact_root or not artifact_root.is_dir():
+            return None
+        for candidate in sorted(artifact_root.glob(f"*{rid}*.json")) + sorted(artifact_root.glob(f"*{eid}*.json")):
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                m = payload.get("model")
+                if isinstance(m, dict) and "labels" in m and "log_probs" in m:
+                    model_cache[eid] = m
+                    return m
+            except Exception:
+                continue
+        return None
+
+    predictions = []
+    for row in raw_samples:
+        sid = str(row.get("sample_id", "")).strip()
+        rid = str(row.get("region_id", "")).strip()
+        text = str(row.get("input_text", "")).strip()
+        if not sid:
+            predictions.append({"sample_id": sid, "error": "sample_id required", "abstained": True})
+            continue
+        if not text:
+            predictions.append({"sample_id": sid, "error": "input_text required", "abstained": True})
+            continue
+        eid = expert_id.strip() if expert_id.strip() else region_to_expert.get(rid, "")
+        if not eid:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": None, "abstained": True,
+                                 "reason": f"no expert for region_id={rid!r}"})
+            continue
+        resolved_rid = rid or next((r for r, e in region_to_expert.items() if e == eid), "")
+        model = _load_model(eid, resolved_rid)
+        if model is None:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": eid, "abstained": True, "reason": "model artifact not found"})
+            continue
+        try:
+            label, confidence = fbct._predict_multinomial_nb(model, text)
+            predictions.append({"sample_id": sid, "predicted_label": label,
+                                 "confidence": round(confidence, 6), "expert_id": eid, "abstained": False})
+        except Exception as exc:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": eid, "abstained": True, "reason": str(exc)[:200]})
+
+    return json.dumps({
+        "ok": True,
+        "prediction_count": len(predictions),
+        "abstained_count": sum(1 for p in predictions if p.get("abstained")),
+        "predictions": predictions,
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_cluster_route(
+    task_type: str,
+) -> str:
+    """Return which expert(s) the router assigns for a given task type.
+
+    The brain cluster router maps task types (e.g. 'verification', 'analysis')
+    to regional expert IDs in priority order. Pass 'default' to see fallback routing.
+
+    Args:
+        task_type: Task type string to route (e.g. 'verification', 'analysis', 'default').
+
+    Returns:
+        JSON with experts list, fallback_used flag, and full routing table.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    routes = bundle.router.get("routes_by_task_type") or bundle.router.get("routes") or {}
+    matched = routes.get(task_type) or routes.get("default") or []
+    return json.dumps({
+        "ok": True,
+        "task_type": task_type,
+        "experts": matched,
+        "fallback_used": task_type not in routes and "default" in routes,
+        "all_routes": routes,
+        "router_schema_version": bundle.router.get("schema_version"),
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_expert_inspect(
+    expert_id: str = "",
+    region_id: str = "",
+) -> str:
+    """Inspect a specific regional expert from the promoted brain cluster.
+
+    Returns the expert's validation confidence, calibration method, provenance
+    references, and training artifact fingerprints. Either expert_id (e.g. 'MB_expert')
+    or region_id (e.g. 'MB') is required.
+
+    Args:
+        expert_id: Expert identifier (e.g. 'MB_expert').
+        region_id: Brain region identifier (e.g. 'MB'); resolved to expert_id automatically.
+
+    Returns:
+        JSON with expert metadata, validation stats, and shadow-replay configuration.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    eid = expert_id.strip()
+    rid = region_id.strip()
+    experts = bundle.experts.get("experts", [])
+    match = next(
+        (e for e in experts if (eid and e.get("expert_id") == eid) or (rid and e.get("region") == rid)),
+        None,
+    )
+    if match is None:
+        return json.dumps({
+            "ok": False,
+            "error": f"Expert not found. expert_id={eid!r} region_id={rid!r}",
+            "available_experts": [e.get("expert_id") for e in experts],
+        })
+
+    shadow = match.get("shadow_replay", {})
+    training = match.get("training_artifact", {})
+    return json.dumps({
+        "ok": True,
+        "expert_id": match.get("expert_id"),
+        "region": match.get("region"),
+        "confidence": shadow.get("confidence"),
+        "confidence_calibration": shadow.get("confidence_calibration"),
+        "provenance_refs": shadow.get("provenance_refs", []),
+        "replay_fingerprint_mode": shadow.get("replay_fingerprint_mode"),
+        "model_fingerprint": training.get("model_fingerprint"),
+        "metrics_fingerprint": training.get("metrics_fingerprint"),
+        "shadow_replay_config": shadow,
+    }, indent=2)
+
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:
