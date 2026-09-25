@@ -145,6 +145,26 @@ def test_unreadable_manifest_withholds_the_hit(mem):
     assert out["excluded_acl"] == 1
 
 
+def test_hits_from_an_investigation_this_node_does_not_govern_stay_visible(mem, monkeypatch):
+    # No manifest here means no ACL here: the hit is not withheld (fail-closed applies
+    # to an ACL that exists but cannot be read, not to one that does not exist).
+    # Positive twin of the withholding tests, with the same non-member caller.
+    extra = [
+        {"id": "f-elsewhere", "score": 0.95,
+         "payload": {"text": "finding from another node", "investigation_id": "other-node-case"}},
+        {"id": "f-secret", "score": 0.9,
+         "payload": {"text": SECRET, "investigation_id": "private-case"}},
+    ]
+
+    async def fake_search(col, vec, top_k=5):
+        return [dict(h, payload=dict(h["payload"])) for h in extra] if col == "loci_memory" else []
+
+    monkeypatch.setattr(a2a, "_qdrant_search", fake_search)
+    out = _run("mallory", bound="mallory")
+    assert _contents(out) == ["finding from another node"]
+    assert out["excluded_acl"] == 1
+
+
 def test_acl_helpers_unavailable_withholds_investigation_hits(mem, monkeypatch):
     monkeypatch.setattr(a2a, "_inv_store_acl", None)
     out = _run("bob", bound="bob")
