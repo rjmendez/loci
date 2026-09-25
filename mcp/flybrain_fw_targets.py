@@ -1,25 +1,65 @@
-"""FlyWire 783 real-model targets: annotation-derived labels + structured wiring features.
+"""FlyWire 783 (``fw``) real-model targets: labels, groups, wiring features, eval datasets.
 
-This module builds ``flybrain_model_eval.EvalDataset`` objects for three
-FlyWire 783 targets and runs the shared evaluation harness:
+The legacy fw objectives in ``flybrain_brain_cluster_fw_samples`` were circular
+(the label was a threshold on / argmax of numbers written into the model's own
+``input_text``). This module builds non-circular targets instead:
 
-* ``super_class``: annotation ``super_class`` harmonized onto the shared coarse
-  vocabulary with ``flybrain_wiring_features.harmonize_super_class``.
-* ``nt_type``: annotation neurotransmitter type, normalized to ``ach`` /
-  ``gaba`` / ``glut`` / ``da`` / ``ser`` / ``oct``.
-* ``connectivity_tier``: ``high_connectivity`` for the top quartile of the
-  neuron's outgoing weighted synapse mass, else ``baseline_connectivity``.
+========================================  ===========================================  ===============
+target (= label-exclusion objective)      label                                        partner category
+========================================  ===========================================  ===============
+``super_class``                           Schlegel 2024 ``super_class``                super_class (masked)
+``super_class_no_neuropil``               same, neuropil features removed as well      super_class (masked)
+``flow``                                  Schlegel 2024 ``flow``                       super_class (masked)
+``cell_class``                            Schlegel 2024 ``cell_class`` (>= N neurons)  cell_class (masked)
+``cell_class_no_neuropil``                same, neuropil features removed as well      cell_class (masked)
+``neurotransmitter_dominance``            Schlegel ``top_nt`` = per-neuron argmax of   super_class
+                                          Eckstein 2024 synapse NT *predictions*
+                                          (NOT ground truth)
+``nt_ground_truth``                       Schlegel ``known_nt`` (literature), single   super_class
+                                          classical transmitter only
+``connectivity_tier``                     top quartile of the neuron's total           super_class
+                                          presynapse count (per-neuron neuropil counts)
+``hemilineage``                           Schlegel 2024 ``ito_lee_hemilineage``        hemilineage (masked)
+                                          (cell-body-fibre tracts; the headline
+                                          hemilineage target, curated_morphology)
+``nt_literature`` (+ ``_binary``,         drosophila_neurotransmitters, conf >= 4,     super_class
+``_all``, ``_all_binary``)                mapped by cell_type (R2;
+                                          ``flybrain_nt_ground_truth``)
+========================================  ===========================================  ===============
 
-Features are intentionally simple and dataset-local:
+Every target carries a ``label_provenance`` (R1, ``flybrain_target_registry``);
+evaluations go through ``ftr.run_gated_evaluation``, so the gate can only pass
+measured / curated-morphology targets. ``neurotransmitter_dominance`` is a
+distillation of the Eckstein 2024 classifier and ``connectivity_tier`` a
+connectivity-derived statistic: both are reported, never gated.
 
-* ``degree__out_degree`` / ``degree__in_degree`` from proofread connections.
-* ``nt_out__*``: per-neuron outgoing NT probabilities, weighted by
-  ``syn_count`` and averaged over outgoing edges.
-* ``pre_np__*`` / ``post_np__*``: top-K per-neuropil pre/post fractions,
-  plus ``other`` and entropy.
+Features are ``flybrain_wiring_features`` streamed over
+``proofread_connections_783.feather`` (pre, post, neuropil, syn_count; one row
+per (pre, post, neuropil), so ``unique_pairs=False``) with 2-hop composition.
+Label-defining columns are removed by the objective's registered exclusions.
+When the partner category is (or determines) the label, it is masked before
+the features are built (``plan_grouped_split`` -> ``mask_category_ids`` ->
+``masked_split_ids_sha256``) for every node that shares a held-out sample's
+cell type, hemibrain type, type family or (except for the hemilineage target)
+hemilineage, not only for the sampled val/test neurons: an unsampled neuron of
+a held-out type would otherwise reveal the label through same-type partners.
 
-Splits are grouped by ``cell_type`` so every test neuron comes from a held-out
-cell type, matching the other FlyBrain real-model datasets.
+Groups: ``cell_type``, ``hemilineage`` (ito_lee; the catch-all
+``putative_primary`` and ambiguous ``*_or_*`` values are not group keys),
+``hemibrain_type`` and ``type_family`` (union-find), so no cell type,
+hemilineage, hemibrain type or sister-type family straddles train/val/test.
+``type_family`` closes the sister-type leak behind the first
+``nt_ground_truth`` run (val accuracy 0.98 vs test 0.10): optic-lobe neurons
+have no ito_lee hemilineage and no hemibrain type, so ``T5c`` and ``C3`` sat in
+val while ``T4a-d`` / ``T5a,b,d`` and ``C2`` were in train, and one Kenyon-cell
+component (1,979 of 2,825 test rows) was the whole test set. The per-component
+cap (``max_per_component``) removes the second problem. The ``hemilineage``
+target cannot group by its own label and uses the other three keys.
+
+Snapshot access is read-only and fail-closed: ``open_fw_snapshot`` checks the
+manifest sidecar, the manifest self-hash, the verification status and refresh
+decision, every listed path/size, then content-hashes the products it needs,
+keeping hash stamps OUTSIDE the snapshot (default ``<root>/cache/hash-stamps/fw``).
 """
 
 from __future__ import annotations
@@ -27,554 +67,748 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
+import os
+import re
+import resource
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-import flybrain_model_eval as fme
-import flybrain_learners as fl
+import flybrain_nt_ground_truth as ntgt
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
+from flybrain_hash_stamps import HashStampCache, sha256_file, verify_file_sha256
 
-DATASET = "fw"
-VERSION_ID = "flywire783"
-TARGET_SUPER_CLASS = "super_class"
-TARGET_NT_TYPE = "nt_type"
-TARGET_CONNECTIVITY = "connectivity_tier"
-FW_TARGETS: tuple[str, ...] = (TARGET_SUPER_CLASS, TARGET_NT_TYPE, TARGET_CONNECTIVITY)
-GROUP_KEYS: tuple[str, ...] = ("cell_type",)
-DEFAULT_REPORT_ROOT = "/home/rjmendez/.loci/flybrain-real-models/reports"
-DEFAULT_ANNOTATIONS = "/mnt/f/.flybrain/snapshots/fw/flywire783/metadata/files/annotations/flywire_annotations_v783.csv"
-DEFAULT_CONNECTIONS = "/mnt/f/.flybrain/snapshots/fw/flywire783/metadata/files/proofread_connections_783.feather"
-DEFAULT_PRE_NEUROPIL = "/mnt/f/.flybrain/snapshots/fw/flywire783/metadata/files/per_neuron_neuropil_count_pre_783.feather"
-DEFAULT_POST_NEUROPIL = "/mnt/f/.flybrain/snapshots/fw/flywire783/metadata/files/per_neuron_neuropil_count_post_783.feather"
-NT_COLUMNS: tuple[str, ...] = ("ach_avg", "gaba_avg", "glut_avg", "da_avg", "ser_avg", "oct_avg")
-ANNOTATION_COLUMNS: tuple[str, ...] = ("root_id", "super_class", "cell_type", "hemilineage", "nt_type")
-NT_SHORT_CODES: Mapping[str, str] = {
-    "acetylcholine": "ach",
-    "gaba": "gaba",
-    "glutamate": "glut",
-    "dopamine": "da",
-    "serotonin": "ser",
-    "octopamine": "oct",
+FW_SNAPSHOT_RELATIVE_ROOT = "snapshots/fw/flywire783"
+FW_MANIFEST_RELATIVE_PATH = "manifest/manifest.json"
+FW_MANIFEST_SIDECAR_RELATIVE_PATH = "manifest/manifest.sha256"
+DEFAULT_STORAGE_ROOT = "/mnt/f/.flybrain"
+DEFAULT_REPORT_ROOT = "/mnt/f/.flybrain/logs/real-models-20260924T174122Z"
+
+ROLE_CONNECTIONS = "edgelist_per_neuropil"
+ROLE_ANNOTATIONS = "neuron_annotations_hierarchical"
+ROLE_PRE_COUNTS = "per_neuron_neuropil_count_pre"
+FW_PRODUCT_PATHS: dict[str, str] = {
+    ROLE_CONNECTIONS: "source/proofread_connections_783.feather",
+    ROLE_ANNOTATIONS: "source/nature_schlegel2024/Supplementary_Data_1_neuron_annotations.tsv",
+    ROLE_PRE_COUNTS: "source/per_neuron_neuropil_count_pre_783.feather",
 }
-NON_LABEL_SUPER_CLASSES = frozenset({fwf.UNKNOWN, "non_neuronal", "other"})
+
+GROUP_COLUMNS: tuple[str, ...] = ("cell_type", "hemilineage", "hemibrain_type", "type_family")
+HEMILINEAGE_GROUP_COLUMNS: tuple[str, ...] = ("cell_type", "hemibrain_type", "type_family")
+# Catch-all hemilineage values: never a label and never a split key.
+HEMILINEAGE_SENTINELS = frozenset({"putative_primary", "primary", "unknown", "na", "no_lineage", "tbd"})
+# Sister types from one developmental origin whose names do not share a stem.
+TYPE_FAMILY_MERGES: Mapping[str, str] = {"T4": "T4/T5", "T5": "T4/T5"}
+CLASSICAL_NT: tuple[str, ...] = ("acetylcholine", "glutamate", "gaba", "dopamine", "serotonin", "octopamine",
+                                 "histamine")
+_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+_BLOCKED_SUFFIXES = (".partial", ".tmp", ".inprogress")
 
 
-def _register_fw_targets() -> None:
-    if TARGET_NT_TYPE not in fwf.registered_objectives():
-        nt_rule = fwf.objective_exclusions("nt_ground_truth")
-        fwf.register_objective_exclusions(
-            TARGET_NT_TYPE,
-            nt_rule.patterns,
-            reason="label is the annotation neurotransmitter type; NT prediction scores and names near-copy it",
-        )
+class FwSnapshotError(RuntimeError):
+    """The fw snapshot failed a fail-closed integrity check."""
 
 
-_register_fw_targets()
+# =========================================================================== snapshot
 
 
 @dataclass(frozen=True)
-class FwTargetConfig:
-    annotations_path: str | Path = DEFAULT_ANNOTATIONS
-    connections_path: str | Path = DEFAULT_CONNECTIONS
-    pre_neuropil_path: str | Path = DEFAULT_PRE_NEUROPIL
-    post_neuropil_path: str | Path = DEFAULT_POST_NEUROPIL
-    top_k_neuropils: int = 16
-    min_label_neurons: int = 50
-    min_label_cell_types: int = 5
-    connectivity_quantile: float = 0.75
-    max_per_cell_type: int = 1
-    cap_salt: str = "fw-real-models/v1"
+class FwSnapshot:
+    snapshot_root: Path
+    manifest_sha256: str
+    product_paths: Mapping[str, Path]
+    product_sha256: Mapping[str, str]
+    hash_verification: Mapping[str, str]
+    warnings: tuple[str, ...] = ()
 
-    def as_dict(self) -> dict[str, Any]:
-        out = asdict(self)
-        return {k: (str(v) if isinstance(v, Path) else v) for k, v in out.items()}
+    def path(self, role: str) -> Path:
+        if role not in self.product_paths:
+            raise FwSnapshotError(f"role {role!r} was not opened (required_roles)")
+        return self.product_paths[role]
 
-
-@dataclass
-class FwContext:
-    annotations: pd.DataFrame
-    features: pd.DataFrame
-    feature_columns: tuple[str, ...]
-    proofread_root_ids: tuple[str, ...]
-    config: FwTargetConfig
-    neuropils_pre: tuple[str, ...]
-    neuropils_post: tuple[str, ...]
-    connectivity_threshold: float
-
-    @classmethod
-    def load(cls, config: FwTargetConfig, *, log=print) -> "FwContext":
-        started = time.time()
-        ann_path = Path(config.annotations_path)
-        conn_path = Path(config.connections_path)
-        pre_path = Path(config.pre_neuropil_path)
-        post_path = Path(config.post_neuropil_path)
-        annotations = pd.read_csv(ann_path, usecols=list(ANNOTATION_COLUMNS), low_memory=False)
-        annotations["root_id"] = pd.to_numeric(annotations["root_id"], errors="coerce").astype("Int64")
-        annotations = annotations.dropna(subset=["root_id"]).copy()
-        annotations["root_id"] = annotations["root_id"].astype("int64").astype(str)
-        annotations["cell_type"] = [_clean_group(v) for v in annotations["cell_type"].tolist()]
-        annotations["hemilineage"] = [_clean_opt(v) for v in annotations["hemilineage"].tolist()]
-        annotations["super_class_h"] = [fwf.harmonize_super_class(v) for v in annotations["super_class"].tolist()]
-        annotations["nt_type_h"] = [_normalize_nt(v) for v in annotations["nt_type"].tolist()]
-        log(f"[fw] annotations rows={len(annotations)} path={ann_path}")
-
-        conn = pd.read_feather(conn_path, columns=["pre_pt_root_id", "post_pt_root_id", "syn_count", *NT_COLUMNS])
-        conn["pre_pt_root_id"] = conn["pre_pt_root_id"].astype("int64").astype(str)
-        conn["post_pt_root_id"] = conn["post_pt_root_id"].astype("int64").astype(str)
-        conn["syn_count"] = pd.to_numeric(conn["syn_count"], errors="coerce").fillna(0).astype("float32")
-        for column in NT_COLUMNS:
-            conn[column] = pd.to_numeric(conn[column], errors="coerce").fillna(0).astype("float32")
-        proofread_ids = tuple(sorted(pd.unique(pd.concat([conn["pre_pt_root_id"], conn["post_pt_root_id"]]))))
-        annotations = annotations[annotations["root_id"].isin(proofread_ids)].copy()
-        annotations = annotations[annotations["cell_type"].notna()].copy()
-        log(f"[fw] proofread annotated neurons={len(annotations)} unique_cell_types={annotations['cell_type'].nunique()} "
-            f"({time.time() - started:.0f}s)")
-
-        features, threshold, top_pre, top_post = build_feature_frame(
-            annotations["root_id"].tolist(), conn, pre_path, post_path, top_k=config.top_k_neuropils,
-            quantile=config.connectivity_quantile, log=log
-        )
-        feature_columns = tuple(sorted(c for c in features.columns if c != "root_id"))
-        features = features[["root_id", *feature_columns]].copy()
-        log(f"[fw] feature frame={features.shape} q{config.connectivity_quantile:.2f}={threshold:.3f} "
-            f"({time.time() - started:.0f}s)")
-        return cls(annotations, features, feature_columns, proofread_ids, config, top_pre, top_post, threshold)
+    def provenance(self, role: str) -> dict[str, str]:
+        return {"manifest_sha256": self.manifest_sha256, "sha256": self.product_sha256[role],
+                "relative_path": FW_PRODUCT_PATHS[role]}
 
 
-def _clean_group(value: Any) -> str | None:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+def _manifest_digest(manifest: Mapping[str, Any]) -> str:
+    """Self-hash rule from FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md (same as the other adapters)."""
+    canonical = json.loads(json.dumps(manifest))
+    integrity = canonical.get("integrity")
+    if not isinstance(integrity, dict):
+        raise FwSnapshotError("manifest.integrity must be an object")
+    integrity["manifest_sha256"] = ""
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _inside_snapshots(path: Path) -> bool:
+    return "snapshots" in Path(path).resolve(strict=False).parts
+
+
+def open_fw_snapshot(
+    storage_root: str | Path = DEFAULT_STORAGE_ROOT,
+    *,
+    required_roles: Sequence[str] = tuple(FW_PRODUCT_PATHS),
+    stamp_dir: str | Path | None = None,
+    verify_hashes: bool | None = None,
+    now: datetime | None = None,
+) -> FwSnapshot:
+    """Verify the pinned flywire783 snapshot and return the required product paths.
+
+    ``verify_hashes``: None hashes the required products (stamp cache honoured),
+    True re-hashes them ignoring stamps, False checks sizes only. Stamps are
+    never written inside ``snapshots/`` (the default stamp dir is
+    ``<storage_root>/cache/hash-stamps/fw``).
+    """
+    unknown = [r for r in required_roles if r not in FW_PRODUCT_PATHS]
+    if unknown:
+        raise FwSnapshotError(f"unknown fw product roles: {unknown}")
+    root = Path(storage_root).resolve(strict=False)
+    snapshot_root = root / FW_SNAPSHOT_RELATIVE_ROOT
+    manifest_path = snapshot_root / FW_MANIFEST_RELATIVE_PATH
+    sidecar_path = snapshot_root / FW_MANIFEST_SIDECAR_RELATIVE_PATH
+    if not manifest_path.is_file():
+        raise FwSnapshotError(f"fw manifest not found: {manifest_path}")
+    if not sidecar_path.is_file():
+        raise FwSnapshotError(f"fw manifest.sha256 sidecar is missing: {sidecar_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FwSnapshotError(f"fw manifest unreadable: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise FwSnapshotError("fw manifest must be a JSON object")
+    integrity = manifest.get("integrity") if isinstance(manifest.get("integrity"), dict) else {}
+    expected = str(integrity.get("manifest_sha256") or "")
+    if not _SHA_RE.fullmatch(expected):
+        raise FwSnapshotError("integrity.manifest_sha256 must be lowercase 64-hex")
+    if sidecar_path.read_text(encoding="utf-8").strip() != expected:
+        raise FwSnapshotError("manifest.sha256 sidecar does not match manifest")
+    actual = _manifest_digest(manifest)
+    if actual != expected:
+        raise FwSnapshotError(f"manifest self-hash mismatch (expected {expected}, actual {actual})")
+    status = str((integrity.get("verification") or {}).get("status") or "")
+    if status != "verified":
+        raise FwSnapshotError(f"manifest verification status must be 'verified' (got {status!r})")
+    dataset = manifest.get("dataset") if isinstance(manifest.get("dataset"), dict) else {}
+    if dataset.get("symbol") != "fw" or dataset.get("version_id") != "flywire783":
+        raise FwSnapshotError("manifest is not pinned to fw/flywire783")
+    refresh = manifest.get("refresh") if isinstance(manifest.get("refresh"), dict) else {}
+    if str(refresh.get("decision") or "").lower() == "rollback":
+        raise FwSnapshotError("refresh.decision indicates rollback")
+    due = refresh.get("next_check_due")
+    if due:
+        due_dt = datetime.fromisoformat(str(due).replace("Z", "+00:00"))
+        if due_dt < (now or datetime.now(timezone.utc)):
+            raise FwSnapshotError(f"refresh.next_check_due has elapsed ({due})")
+
+    files = integrity.get("files")
+    if not isinstance(files, list) or not files:
+        raise FwSnapshotError("integrity.files must be a non-empty list")
+    listed: dict[str, tuple[Path, str]] = {}
+    for entry in files:
+        rel = str((entry or {}).get("relative_path") or "").replace("\\", "/").strip()
+        sha = str((entry or {}).get("sha256") or "").strip()
+        size = (entry or {}).get("size_bytes")
+        if not rel or rel.startswith("/") or ".." in rel.split("/") or ":" in rel:
+            raise FwSnapshotError(f"unsafe integrity path {rel!r}")
+        if rel.lower().endswith(_BLOCKED_SUFFIXES):
+            raise FwSnapshotError(f"partial/temporary artifact listed: {rel}")
+        if rel.casefold() in {k.casefold() for k in listed}:
+            raise FwSnapshotError(f"duplicate integrity path {rel}")
+        if not _SHA_RE.fullmatch(sha):
+            raise FwSnapshotError(f"file sha256 must be lowercase 64-hex: {rel}")
+        path = (snapshot_root / rel).resolve(strict=False)
+        if not path.is_relative_to(snapshot_root.resolve(strict=False)):
+            raise FwSnapshotError(f"integrity path escapes the snapshot: {rel}")
+        if not path.is_file():
+            raise FwSnapshotError(f"integrity file is missing: {rel}")
+        if isinstance(size, bool) or not isinstance(size, int) or path.stat().st_size != size:
+            raise FwSnapshotError(f"file size mismatch: {rel}")
+        listed[rel] = (path, sha)
+
+    stamp_root = Path(stamp_dir) if stamp_dir is not None else root / "cache" / "hash-stamps" / "fw"
+    if _inside_snapshots(stamp_root):
+        raise FwSnapshotError(f"refusing to keep hash stamps inside a snapshots directory: {stamp_root}")
+    cache = HashStampCache(stamp_root)
+    report: dict[str, str] = {}
+    warnings: list[str] = []
+    paths: dict[str, Path] = {}
+    shas: dict[str, str] = {}
+    for role in required_roles:
+        rel = FW_PRODUCT_PATHS[role]
+        if rel not in listed:
+            raise FwSnapshotError(f"manifest does not list required product {role!r} ({rel})")
+        path, sha = listed[rel]
+        if verify_hashes is False:
+            report[rel] = "size_only"
+        else:
+            check = verify_file_sha256(path, relative_path=rel, expected_sha256=sha, cache=cache,
+                                       force=verify_hashes is True, hasher=sha256_file)
+            if not check.matched:
+                raise FwSnapshotError(f"sha256 mismatch for {rel}: expected {sha}, got {check.actual_sha256}")
+            report[rel] = check.method
+            if check.warning:
+                warnings.append(check.warning)
+        paths[role] = path
+        shas[role] = sha
+    return FwSnapshot(snapshot_root, expected, paths, shas, dict(sorted(report.items())), tuple(warnings))
+
+
+# =========================================================================== annotations + labels
+
+_ANNOTATION_COLUMNS = ("root_id", "flow", "super_class", "cell_class", "cell_sub_class", "cell_type",
+                       "hemibrain_type", "ito_lee_hemilineage", "top_nt", "known_nt", "known_nt_source",
+                       "side", "status")
+
+
+def type_family(cell_type: Any) -> str | None:
+    """Sister-type family used as an extra split key (conservative: it only ever merges groups).
+
+    A hyphenated suffix is dropped (``KCapbp-ap2`` -> ``KCapbp``), then trailing
+    lower-case letters after a digit, capital or ``)`` (``T4a`` -> ``T4``,
+    ``KCab`` -> ``KC``, ``Dm3a`` -> ``Dm3``, ``(M_lPNm12,M_lPNm13)a`` -> ``(M_lPNm12,M_lPNm13)``),
+    then ``TYPE_FAMILY_MERGES`` (T4/T5 share their progenitors). ``LHPV2a1`` and
+    ``ORN_VC5`` are unchanged.
+    """
+    if cell_type is None or (isinstance(cell_type, float) and cell_type != cell_type):
+        return None
+    text = str(cell_type).strip()
+    if not text or text.lower() in {"na", "nan", "none", "unknown"}:
+        return None
+    stem = text.split("-", 1)[0] if not text.startswith("(") else text
+    stem = re.sub(r"_[a-z]$", "", stem)  # LHPV2a1_a / LHPV2a1_b
+    stem = re.sub(r"(?<=[0-9A-Z)])[a-z]+$", "", stem) or text
+    return "fam:" + TYPE_FAMILY_MERGES.get(stem, stem)
+
+
+def _lineage_group(value: Any) -> str | None:
+    """Hemilineage as a label / split key: sentinels and ambiguous ``A_or_B`` assignments -> None."""
+    if value is None or (isinstance(value, float) and value != value):
         return None
     text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "<na>"}:
+    if not text or text.lower() in HEMILINEAGE_SENTINELS or "_or_" in text.lower():
         return None
     return text
 
 
-def _clean_opt(value: Any) -> str | None:
-    return _clean_group(value)
+def load_fw_annotations(path: str | Path) -> pd.DataFrame:
+    """Schlegel 2024 neuron annotations (one row per proofread neuron), ids as int64.
+
+    ``hemilineage`` holds only real lineage assignments (label and split key);
+    the file's value is kept verbatim in ``hemilineage_raw``. ``type_family``
+    is the sister-type split key (``type_family``).
+    """
+    frame = pd.read_csv(path, sep="\t", usecols=list(_ANNOTATION_COLUMNS), dtype=str, keep_default_na=False,
+                        na_values=[""])
+    frame["root_id"] = frame["root_id"].astype("int64")
+    if not frame["root_id"].is_unique:
+        raise ValueError("annotation root_id is not unique")
+    frame = frame.rename(columns={"ito_lee_hemilineage": "hemilineage"})
+    for col in ("cell_type", "hemibrain_type", "hemilineage"):
+        frame[col] = frame[col].where(frame[col].notna() & ~frame[col].isin(["na", "NA", "unknown"]), None)
+    frame["hemilineage_raw"] = frame["hemilineage"]
+    frame["hemilineage"] = frame["hemilineage"].map(_lineage_group)
+    frame["type_family"] = frame["cell_type"].map(type_family)
+    return frame.sort_values("root_id", kind="mergesort").reset_index(drop=True)
 
 
-def _normalize_nt(value: Any) -> str | None:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+def parse_known_nt(value: Any) -> str | None:
+    """Single classical transmitter from a ``known_nt`` string; None when absent or ambiguous."""
+    if value is None or (isinstance(value, float) and value != value):
         return None
-    text = str(value).strip().lower()
-    return NT_SHORT_CODES.get(text)
+    tokens = [t.strip().lower() for t in str(value).split(",")]
+    classical = sorted({t for t in tokens if t in CLASSICAL_NT})
+    return classical[0] if len(classical) == 1 else None
 
 
-def _entropy_from_frame(frame: pd.DataFrame) -> pd.Series:
-    arr = frame.to_numpy(dtype=np.float64, copy=False)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        bits = -(arr * np.log2(np.clip(arr, 1e-12, None)))
-    return pd.Series(np.where(np.isfinite(bits).sum(axis=1) >= 0, bits.sum(axis=1), np.nan), index=frame.index)
+def total_presynapse_counts(pre_counts_path: str | Path) -> pd.Series:
+    """Total presynapse count per neuron (sum over neuropils) from per_neuron_neuropil_count_pre."""
+    import pyarrow.feather as feather
+
+    table = feather.read_table(str(pre_counts_path), columns=["pre_pt_root_id", "count"]).to_pandas()
+    return table.groupby("pre_pt_root_id", sort=True)["count"].sum().astype("int64")
 
 
-def _slug_neuropil(value: Any) -> str:
-    return fwf.slug(str(value).replace("(", "_").replace(")", "_"))
+def _label_super_class(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["super_class"].map(lambda v: None if pd.isna(v) else fwf.harmonize_super_class(v))
 
 
-def _neuropil_fraction_features(path: Path, *, id_column: str, prefix: str, root_ids: Sequence[str], top_k: int,
-                                log=print) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    table = pd.read_feather(path, columns=[id_column, "neuropil", "count"])
-    table[id_column] = table[id_column].astype("int64").astype(str)
-    table["count"] = pd.to_numeric(table["count"], errors="coerce").fillna(0).astype("float32")
-    table = table[table[id_column].isin(root_ids)].copy()
-    totals = table.groupby(id_column, sort=False)["count"].sum().rename("__total__")
-    top = (
-        table.groupby("neuropil", sort=False)["count"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(int(top_k))
-        .index.tolist()
+def _label_flow(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["flow"].map(lambda v: None if pd.isna(v) else fwf.slug(v))
+
+
+def _label_cell_class(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["cell_class"].map(lambda v: None if pd.isna(v) else fwf.slug(v))
+
+
+def _label_top_nt(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["top_nt"].map(lambda v: None if pd.isna(v) or str(v).lower() not in CLASSICAL_NT else str(v).lower())
+
+
+def _label_known_nt(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["known_nt"].map(parse_known_nt)
+
+
+def _label_hemilineage(ann: pd.DataFrame, _ctx: Mapping[str, Any]) -> pd.Series:
+    return ann["hemilineage"].map(lambda v: None if v is None or (isinstance(v, float) and v != v) else str(v))
+
+
+def _label_nt_literature(ann: pd.DataFrame, ctx: Mapping[str, Any]) -> pd.Series:
+    labels: Mapping[int, str] = ctx["nt_literature_labels"]
+    return ann["root_id"].map(lambda r: labels.get(int(r)))
+
+
+def connectivity_tier_labels(totals: pd.Series, quantile: float = 0.75) -> tuple[pd.Series, float]:
+    threshold = float(np.quantile(totals.to_numpy(dtype=float), quantile))
+    labels = np.where(totals.to_numpy(dtype=float) >= threshold, "high_connectivity", "baseline_connectivity")
+    return pd.Series(labels, index=totals.index, dtype=object), threshold
+
+
+def _label_connectivity(ann: pd.DataFrame, ctx: Mapping[str, Any]) -> pd.Series:
+    totals = ctx["presynapse_totals"].reindex(ann["root_id"]).fillna(0).astype("int64")
+    totals.index = ann.index
+    labels, threshold = connectivity_tier_labels(totals, float(ctx.get("quantile", 0.75)))
+    ctx["connectivity_threshold"] = threshold  # type: ignore[index]
+    return labels
+
+
+# =========================================================================== target specs
+
+
+def _register_strict_objectives() -> None:
+    region = fwf.objective_exclusions("region_specialization_tier").patterns
+    for name, base in (("super_class_no_neuropil", "super_class"), ("cell_class_no_neuropil", "cell_class")):
+        if name in fwf.registered_objectives():
+            continue
+        rule = fwf.objective_exclusions(base)
+        fwf.register_objective_exclusions(
+            name, tuple(rule.patterns) + tuple(region),
+            reason=(f"{rule.reason}; additionally every neuropil/region feature, because fw super_class and "
+                    "optic cell_class ('ME>LO', 'LA>ME', ...) are defined by where a neuron's arbors lie"))
+
+
+_register_strict_objectives()
+
+
+@dataclass(frozen=True)
+class FwTargetSpec:
+    target: str
+    label_fn: Callable[[pd.DataFrame, Mapping[str, Any]], pd.Series]
+    category_column: str
+    vocab: Any
+    mask_heldout: bool
+    label_provenance: str  # R1: measured / curated_morphology / connectivity_defined / model_predicted
+    description: str
+    min_class_count: int = 100
+    # classes with fewer distinct grouped components cannot be learned under a grouped split
+    min_class_components: int = 1
+    max_per_class: int = 10_000
+    needs_pre_counts: bool = False
+    needs_nt_literature: bool = False
+    # A few giant cell types (photoreceptors, T4/T5, Kenyon cells) would otherwise fill whole
+    # classes and whole test splits; cap each grouped component so many components are sampled.
+    max_per_component: int = 200
+    group_columns: tuple[str, ...] = GROUP_COLUMNS
+
+    @property
+    def ground_truth(self) -> bool:
+        """Back-compat flag: True only for measured labels."""
+        return self.label_provenance == ftr.LabelProvenance.MEASURED.value
+
+
+_P = ftr.LabelProvenance
+_NT_LIT_SPECS = tuple(
+    FwTargetSpec(target, _label_nt_literature, "super_class", fwf.harmonize_super_class, False, _P.MEASURED.value,
+                 spec.describe(), min_class_count=20, min_class_components=3, needs_nt_literature=True,
+                 max_per_component=50)
+    for target, spec in ntgt.NT_LITERATURE_SPECS.items())
+
+FW_TARGETS: dict[str, FwTargetSpec] = {
+    spec.target: spec
+    for spec in (
+        FwTargetSpec("super_class", _label_super_class, "super_class", fwf.harmonize_super_class, True,
+                     _P.CURATED_MORPHOLOGY.value,
+                     "Schlegel 2024 super_class (harmonized vocab) from wiring incl. neuropil fractions"),
+        FwTargetSpec("super_class_no_neuropil", _label_super_class, "super_class", fwf.harmonize_super_class, True,
+                     _P.CURATED_MORPHOLOGY.value,
+                     "super_class from partner composition / reciprocity / 2-hop / degree only"),
+        FwTargetSpec("flow", _label_flow, "super_class", fwf.harmonize_super_class, True, _P.CURATED_MORPHOLOGY.value,
+                     "Schlegel 2024 flow (afferent/intrinsic/efferent)"),
+        FwTargetSpec("cell_class", _label_cell_class, "cell_class", None, True, _P.CURATED_MORPHOLOGY.value,
+                     "Schlegel 2024 cell_class (classes with >= 100 neurons); optic classes are neuropil "
+                     "paths, so neuropil features are near-definitional here", max_per_class=4000),
+        FwTargetSpec("cell_class_no_neuropil", _label_cell_class, "cell_class", None, True,
+                     _P.CURATED_MORPHOLOGY.value, "cell_class without any neuropil feature", max_per_class=4000),
+        FwTargetSpec("hemilineage", _label_hemilineage, "hemilineage", None, True, _P.CURATED_MORPHOLOGY.value,
+                     "Schlegel 2024 ito_lee_hemilineage (cell-body-fibre tracts; putative_primary and 'A_or_B' "
+                     "assignments dropped); partner hemilineage composition masked for held-out groups",
+                     min_class_count=30, min_class_components=3, max_per_class=2000, max_per_component=100,
+                     group_columns=HEMILINEAGE_GROUP_COLUMNS),
+        FwTargetSpec("neurotransmitter_dominance", _label_top_nt, "super_class", fwf.harmonize_super_class, False,
+                     _P.MODEL_PREDICTED.value, "top_nt = per-neuron argmax of Eckstein 2024 synapse-level NT "
+                                               "PREDICTIONS (label is a model output, not ground truth)"),
+        FwTargetSpec("nt_ground_truth", _label_known_nt, "super_class", fwf.harmonize_super_class, False,
+                     _P.MEASURED.value, "known_nt (literature / Schlegel 2024), single classical transmitter only; "
+                                        "superseded by nt_literature", min_class_count=50, min_class_components=3,
+                     max_per_component=50),
+        FwTargetSpec("connectivity_tier", _label_connectivity, "super_class", fwf.harmonize_super_class, False,
+                     _P.CONNECTIVITY_DEFINED.value, "top quartile of total presynapse count "
+                     "(per_neuron_neuropil_count_pre); degree / count / n_neuropils features excluded",
+                     needs_pre_counts=True),
+        *_NT_LIT_SPECS,
     )
-    top_frame = table[table["neuropil"].isin(top)].pivot_table(
-        index=id_column, columns="neuropil", values="count", aggfunc="sum", fill_value=0
-    )
-    top_frame = top_frame.reindex(columns=top, fill_value=0)
-    fractions = top_frame.div(totals, axis=0).fillna(0)
-    fractions.columns = [f"{prefix}__{_slug_neuropil(c)}" for c in fractions.columns]
-    if not fractions.empty:
-        entropy = _entropy_from_frame(fractions)
-        fractions[f"{prefix}__other"] = np.maximum(0.0, 1.0 - fractions.sum(axis=1))
-        fractions[f"{prefix}__entropy_bits"] = entropy
-        fractions[f"{prefix}__n_neuropils"] = table.groupby(id_column, sort=False)["neuropil"].nunique().reindex(
-            fractions.index
-        ).astype("float32")
-        fractions[f"{prefix}__dominant_fraction"] = fractions[
-            [c for c in fractions.columns if c.startswith(f"{prefix}__") and c not in {
-                f"{prefix}__other", f"{prefix}__entropy_bits", f"{prefix}__n_neuropils", f"{prefix}__dominant_fraction",
-            }]
-        ].max(axis=1)
-    out = fractions.reset_index().rename(columns={id_column: "root_id"})
-    log(f"[fw] {prefix} neuropils rows={len(out)} top_k={len(top)} path={path}")
-    return out, tuple(_slug_neuropil(v) for v in top)
+}
 
 
-def build_feature_frame(root_ids: Sequence[str], conn: pd.DataFrame, pre_path: Path, post_path: Path, *, top_k: int,
-                        quantile: float = 0.75, log=print) -> tuple[pd.DataFrame, float, tuple[str, ...], tuple[str, ...]]:
-    out_degree = conn.groupby("pre_pt_root_id", sort=False)["syn_count"].sum().rename("degree__out_degree")
-    in_degree = conn.groupby("post_pt_root_id", sort=False)["syn_count"].sum().rename("degree__in_degree")
-    weighted = conn[["pre_pt_root_id", "syn_count", *NT_COLUMNS]].copy()
-    for column in NT_COLUMNS:
-        weighted[column] = weighted[column] * weighted["syn_count"]
-    nt = weighted.groupby("pre_pt_root_id", sort=False).sum()
-    nt_weighted_total = nt["syn_count"].rename("weighted_total_syn_count")
-    for column in NT_COLUMNS:
-        nt[column] = nt[column] / nt["syn_count"].clip(lower=1.0)
-    nt = nt.drop(columns=["syn_count"]).rename(columns={c: f"nt_out__{c.replace('_avg', '')}" for c in NT_COLUMNS})
-
-    base = pd.DataFrame({"root_id": pd.Index(root_ids, dtype=object)})
-    base = base.merge(out_degree.rename_axis("root_id").reset_index(), on="root_id", how="left")
-    base = base.merge(in_degree.rename_axis("root_id").reset_index(), on="root_id", how="left")
-    base = base.merge(nt.rename_axis("root_id").reset_index(), on="root_id", how="left")
-    base = base.merge(nt_weighted_total.rename_axis("root_id").reset_index(), on="root_id", how="left")
-    pre_frame, top_pre = _neuropil_fraction_features(pre_path, id_column="pre_pt_root_id", prefix="pre_np",
-                                                     root_ids=root_ids, top_k=top_k, log=log)
-    post_frame, top_post = _neuropil_fraction_features(post_path, id_column="post_pt_root_id", prefix="post_np",
-                                                       root_ids=root_ids, top_k=top_k, log=log)
-    base = base.merge(pre_frame, on="root_id", how="left").merge(post_frame, on="root_id", how="left")
-    for column in base.columns:
-        if column != "root_id":
-            base[column] = pd.to_numeric(base[column], errors="coerce").fillna(0.0).astype("float32")
-    threshold = float(base["weighted_total_syn_count"].quantile(float(quantile)))
-    return base, threshold, top_pre, top_post
+# Every fw target spec must agree with the central registry (fail closed at import).
+ftr.check_module_provenance("fw", {name: spec.label_provenance for name, spec in FW_TARGETS.items()})
 
 
-def default_models() -> tuple[fme.ModelSpec, ...]:
-    return (
-        fme.ModelSpec(
-            "logreg",
-            (
-                {"C": 1.0, "max_iter": 1000},
-            ),
-            None,
-            "logreg",
-        ),
-    )
+def _hash_key(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def binned_text(features: pd.DataFrame, train_rows: Sequence[int], *, n_bins: int = 5) -> list[str]:
-    columns = sorted(features.columns)
-    train_rows = np.asarray(list(train_rows), dtype=np.int64)
-    parts: list[list[str]] = []
-    for name in columns:
-        col = features[name]
-        if pd.api.types.is_numeric_dtype(col.dtype):
-            values = col.to_numpy(dtype=np.float64)
-            train = values[train_rows]
-            train = train[np.isfinite(train)]
-            if len(train) == 0:
-                edges = np.asarray([], dtype=np.float64)
-            else:
-                qs = np.linspace(0.0, 1.0, int(n_bins) + 1)[1:-1]
-                edges = np.unique(np.quantile(train, qs))
-            bucket = np.digitize(np.where(np.isfinite(values), values, -1e18), edges, right=False)
-            tokens = [f"{name} {name}_q{int(v)}" if np.isfinite(x) else f"{name} {name}_missing"
-                      for x, v in zip(values, bucket, strict=False)]
-        else:
-            vals = col.astype(object).where(col.notna(), fwf.UNKNOWN).astype(str).tolist()
-            tokens = [f"{name} {fwf.slug(v)}" for v in vals]
-        parts.append(tokens)
-    return [" ".join(row) for row in zip(*parts, strict=False)]
+def component_ids(frame: pd.DataFrame, group_columns: Sequence[str] = GROUP_COLUMNS) -> list[str]:
+    """Union-find component per row (same rule as the grouped split)."""
+    from flybrain_brain_cluster_training import split_group_components
+    import flybrain_model_eval as fme
+
+    ids = frame["root_id"].astype(str).tolist()
+    comp = split_group_components(fme._light(ids, frame[list(group_columns)].to_dict(orient="records")),
+                                  group_keys=tuple(group_columns))
+    return [comp[i] for i in ids]
 
 
-def eval_config(*, split_seed: str, report_root: str | None = DEFAULT_REPORT_ROOT, run_label: str = "",
-                models: Sequence[fme.ModelSpec] | None = None, full: bool = False,
-                n_bootstrap: int | None = None, n_threads: int = 8) -> fme.EvalConfig:
-    return fme.EvalConfig(
-        models=tuple(models or default_models()),
-        split_seed=split_seed,
-        cv_folds=0,
-        tune_metric="macro_f1",
-        seed=0,
-        n_bootstrap=5 if n_bootstrap is None and full else (3 if n_bootstrap is None else int(n_bootstrap)),
-        min_margin=0.01,
-        shuffle_control=True,
-        random_split_control=False,
-        ablation=False,
-        n_threads=n_threads,
-        report_root=report_root,
-        run_label=run_label,
-        save_models=False,
-        calibration_protocol="oof",
-        calibration_bootstrap=0,
-        size_baseline=False,
-        require_size_baseline=False,
-        n_permutations=0,
-        require_permutation_null=False,
-        split_curve=False,
-    )
-
-
-def _target_frame(target: str, ctx: FwContext) -> tuple[pd.DataFrame, dict[str, Any]]:
-    frame = ctx.annotations.merge(ctx.features, on="root_id", how="left", validate="one_to_one")
-    notes: dict[str, Any] = {
-        "dataset_version": VERSION_ID,
-        "config": ctx.config.as_dict(),
-        "feature_columns": list(ctx.feature_columns),
-        "n_features": len(ctx.feature_columns),
-        "top_pre_neuropils": list(ctx.neuropils_pre),
-        "top_post_neuropils": list(ctx.neuropils_post),
-        "proofread_annotated_neurons": int(len(ctx.annotations)),
-    }
-    if target == TARGET_SUPER_CLASS:
-        frame["label"] = frame["super_class_h"]
-        frame = frame[~frame["label"].isin(NON_LABEL_SUPER_CLASSES)].copy()
-        notes["label_definition"] = "annotation super_class harmonized via flybrain_wiring_features.harmonize_super_class"
-    elif target == TARGET_NT_TYPE:
-        frame["label"] = frame["nt_type_h"]
-        frame = frame[frame["label"].notna()].copy()
-        notes["label_definition"] = "annotation nt_type normalized to ach/gaba/glut/da/ser/oct"
-    elif target == TARGET_CONNECTIVITY:
-        frame["label"] = np.where(
-            frame["weighted_total_syn_count"] >= float(ctx.connectivity_threshold),
-            "high_connectivity",
-            "baseline_connectivity",
-        )
-        notes["label_definition"] = "top quartile of outgoing weighted synapse mass from proofread_connections_783.feather"
-        notes["high_connectivity_threshold"] = float(ctx.connectivity_threshold)
-    else:
-        raise ValueError(f"unknown fw target {target!r} (supported: {', '.join(FW_TARGETS)})")
-
-    before = len(frame)
-    if target != TARGET_CONNECTIVITY:
-        frame, kept_notes = _drop_small_label_groups(
-            frame,
-            min_neurons=ctx.config.min_label_neurons,
-            min_cell_types=ctx.config.min_label_cell_types,
-        )
-        notes.update(kept_notes)
-    before_cap = len(frame)
-    frame = _cap_per_cell_type(frame, max_per_cell_type=ctx.config.max_per_cell_type, salt=ctx.config.cap_salt)
-    frame = frame.sort_values("root_id", kind="stable").reset_index(drop=True)
-    notes.update({
-        "rows_before_label_filters": int(before),
-        "rows_before_cap": int(before_cap),
-        "n_samples": int(len(frame)),
-        "label_counts": {str(k): int(v) for k, v in frame["label"].value_counts().sort_index().items()},
-        "sampling": {"max_per_cell_type": int(ctx.config.max_per_cell_type),
-                     "order": f"sha256({ctx.config.cap_salt}:cell_type:root_id)"},
-    })
-    return frame, notes
-
-
-def _drop_small_label_groups(frame: pd.DataFrame, *, min_neurons: int, min_cell_types: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+def select_target_rows(ann: pd.DataFrame, spec: FwTargetSpec, ctx: Mapping[str, Any]) -> pd.DataFrame:
+    """Labelled rows for ``spec``: drop outliers / unlabeled / rare classes, cap big classes by whole components."""
+    frame = ann.copy()
+    frame["label"] = spec.label_fn(frame, ctx).to_numpy()
+    frame = frame[frame["status"].isna()]  # outlier_seg / outlier_bio neurons are not samples
+    frame = frame[frame["label"].notna() & ~frame["label"].isin([fwf.UNKNOWN, "unknown", "non_neuronal"])]
     counts = frame["label"].value_counts()
-    n_types = frame.groupby("label", sort=True)["cell_type"].nunique()
-    keep = sorted(
-        label for label in counts.index
-        if int(counts[label]) >= int(min_neurons) and int(n_types.get(label, 0)) >= int(min_cell_types)
-    )
-    out = frame[frame["label"].isin(keep)].copy()
-    dropped = sorted(set(frame["label"].astype(str)) - set(str(v) for v in keep))
-    notes = {
-        "min_label_neurons": int(min_neurons),
-        "min_label_cell_types": int(min_cell_types),
-        "dropped_small_labels": {
-            str(label): {"neurons": int(counts[label]), "cell_types": int(n_types.get(label, 0))}
-            for label in dropped
-        },
+    frame = frame[frame["label"].isin(counts[counts >= int(spec.min_class_count)].index)].copy()
+    frame["_component"] = component_ids(frame, spec.group_columns)
+    if int(spec.min_class_components) > 1:
+        comps = frame.groupby("label")["_component"].nunique()
+        frame = frame[frame["label"].isin(comps[comps >= int(spec.min_class_components)].index)].copy()
+    frame["_order"] = [(_hash_key(f"fw-cap:{c}"), _hash_key(f"fw-cap:{r}"))
+                       for c, r in zip(frame["_component"], frame["root_id"].astype(str))]
+    frame = frame.sort_values("_order", kind="mergesort")
+    frame = frame.groupby("_component", sort=False).head(int(spec.max_per_component))
+    kept = []
+    for label, part in frame.groupby("label", sort=True):
+        part = part.sort_values("_order", kind="mergesort")
+        kept.append(part.head(int(spec.max_per_class)))
+    if not kept:
+        raise ValueError(f"{spec.target}: no class survives the selection filters")
+    out = pd.concat(kept).sort_values("root_id", kind="mergesort").reset_index(drop=True)
+    return out.drop(columns=["_order"])
+
+
+def held_out_mask_ids(annotations: pd.DataFrame, rows: pd.DataFrame, held_out: Sequence[str],
+                      group_columns: Sequence[str]) -> list[str]:
+    """Held-out samples + every annotated node sharing any of their group values (cell type, lineage, ...)."""
+    held = rows[rows["root_id"].astype(str).isin(set(held_out))]
+    hit = np.zeros(len(annotations), dtype=bool)
+    for column in group_columns:
+        values = set(held[column].dropna())
+        if values:
+            hit |= annotations[column].isin(values).to_numpy()
+    ids = set(annotations.loc[hit, "root_id"].astype(str)) | set(held_out)
+    return sorted(ids)
+
+
+def nt_literature_labels(annotations: pd.DataFrame, target: str, *,
+                         nt_root: str | Path = ntgt.DEFAULT_NT_GT_ROOT) -> tuple[dict[int, str], dict[str, Any]]:
+    """root_id -> literature NT for an ``nt_literature*`` target + coverage statistics (R2)."""
+    source = ntgt.open_nt_ground_truth(nt_root)
+    labelled = ntgt.label_neurons(annotations[["root_id", "cell_type", "hemibrain_type"]], dataset="fw",
+                                  source=source, target=target, id_column="root_id",
+                                  secondary_type_column="hemibrain_type")
+    return {int(r): str(l) for r, l in zip(labelled.frame["root_id"], labelled.frame["label"])}, labelled.coverage
+
+
+# =========================================================================== text view (nb)
+
+
+def binned_text(features: pd.DataFrame, fit_rows: np.ndarray, n_bins: int = 10) -> list[str]:
+    """``name name__qK`` tokens with decile edges fitted on ``fit_rows`` (train) only.
+
+    The value token carries the feature name so the NB tokenizer (``[a-z0-9_]+``)
+    keeps it distinct per feature; missing values become ``name__na``.
+    """
+    cols = sorted(features.columns)
+    qs = np.linspace(0, 1, n_bins + 1)[1:-1]
+    parts: list[list[str]] = []
+    for name in cols:
+        values = features[name].to_numpy(dtype=float)
+        train = values[fit_rows]
+        train = train[np.isfinite(train)]
+        edges = np.unique(np.quantile(train, qs)) if len(train) else np.zeros(0)
+        bins = np.searchsorted(edges, values, side="right")
+        tokens = [f"{name} {name}__q{b}" if np.isfinite(v) else f"{name} {name}__na" for v, b in zip(values, bins)]
+        parts.append(tokens)
+    return [" ".join(row) for row in zip(*parts)] if parts else [""] * len(features)
+
+
+# =========================================================================== eval dataset
+
+
+@dataclass
+class FwBuild:
+    data: Any  # flybrain_model_eval.EvalDataset
+    plan: Mapping[str, Sequence[str]]
+    features: fwf.WiringFeatureResult
+    rows: pd.DataFrame
+    info: dict[str, Any] = field(default_factory=dict)
+
+
+def edge_source(snapshot: FwSnapshot) -> fwf.EdgeSource:
+    return fwf.EdgeSource(path=str(snapshot.path(ROLE_CONNECTIONS)), pre="pre_pt_root_id", post="post_pt_root_id",
+                          weight="syn_count", neuropil="neuropil", unique_pairs=False, format="ipc",
+                          provenance=snapshot.provenance(ROLE_CONNECTIONS))
+
+
+def build_fw_eval_dataset(
+    target: str,
+    *,
+    snapshot: FwSnapshot,
+    annotations: pd.DataFrame,
+    config: Any,
+    presynapse_totals: pd.Series | None = None,
+    cache_root: str | Path = fwf.DEFAULT_CACHE_ROOT,
+    params: fwf.WiringFeatureParams | None = None,
+    with_text: bool = True,
+    nt_root: str | Path = ntgt.DEFAULT_NT_GT_ROOT,
+) -> FwBuild:
+    """Samples + masked wiring features + grouped split for one fw target (the REQUIRED mask pattern)."""
+    import flybrain_model_eval as fme
+
+    spec = FW_TARGETS[target]
+    prov = ftr.target_provenance("fw", target)  # fail closed before any work
+    ctx: dict[str, Any] = {"presynapse_totals": presynapse_totals}
+    if spec.needs_pre_counts and presynapse_totals is None:
+        raise ValueError(f"{target} needs presynapse_totals")
+    coverage = None
+    if spec.needs_nt_literature:
+        ctx["nt_literature_labels"], coverage = nt_literature_labels(annotations, target, nt_root=nt_root)
+    rows = select_target_rows(annotations, spec, ctx)
+    ids = rows["root_id"].astype(str).tolist()
+    keys = tuple(spec.group_columns)
+    groups = rows[list(keys)].to_dict(orient="records")
+    plan = fme.plan_grouped_split(ids, groups, keys, config)
+    mask = held_out_mask_ids(annotations, rows, list(plan["val"]) + list(plan["test"]), keys) \
+        if spec.mask_heldout else None
+    feats = fwf.build_wiring_features(
+        dataset="fw", objective=target, edges=edge_source(snapshot), nodes=annotations[["root_id", spec.category_column]],
+        id_column="root_id", category_column=spec.category_column, vocab_map=spec.vocab,
+        params=params or fwf.WiringFeatureParams(two_hop=True), cache_root=cache_root, mask_category_ids=mask)
+    fcols = [c for c in feats.frame.columns if c != fwf.NODE_ID_COLUMN]
+    # constant columns carry no signal and confuse the trivial stumps' tie-breaks
+    feat = feats.frame.set_index(fwf.NODE_ID_COLUMN).reindex(ids)
+    fcols = [c for c in fcols if feat[c].nunique(dropna=False) > 1]
+    frame = rows.reset_index(drop=True).copy()
+    frame["root_id"] = frame["root_id"].astype(str)
+    frame = pd.concat([frame, feat[fcols].reset_index(drop=True)], axis=1)
+    notes: dict[str, Any] = {
+        "label_source": spec.description,
+        **prov.notes(),
+        "label_is_ground_truth": spec.ground_truth,
+        "group_keys": list(keys),
+        "partner_category": spec.category_column,
+        "partner_category_masked_for_val_test": spec.mask_heldout,
+        "masked_category_nodes": None if mask is None else len(mask),
+        "mask_rule": None if mask is None else ("held-out samples + every annotated node sharing their "
+                                                + ", ".join(keys)),
+        "components": {"selected": int(rows["_component"].nunique()),
+                       "per_label": {str(k): int(v) for k, v in
+                                     rows.groupby("label")["_component"].nunique().sort_index().items()}},
+        "features_fingerprint": feats.fingerprint,
+        "features_cache": feats.cache_path,
+        "excluded_features": list(feats.excluded_features),
+        "fw_manifest_sha256": snapshot.manifest_sha256,
+        "product_sha256": dict(snapshot.product_sha256),
+        "min_class_count": spec.min_class_count,
+        "max_per_class": spec.max_per_class,
+        "max_per_component": spec.max_per_component,
+        "cap_rule": ("<= max_per_component rows per grouped component (sha256 order), then per class whole "
+                     "(capped) components in sha256('fw-cap:'+component) order up to max_per_class"),
+        "label_counts_selected": rows["label"].value_counts().sort_index().to_dict(),
     }
-    return out, notes
+    if spec.mask_heldout:
+        notes["masked_split_ids_sha256"] = fme.split_ids_sha256(plan)
+    if "connectivity_threshold" in ctx:
+        notes["connectivity_threshold_presynapses"] = ctx["connectivity_threshold"]
+    if coverage is not None:
+        notes["nt_literature_coverage"] = coverage
+    text_col = None
+    if with_text:
+        position = {sid: i for i, sid in enumerate(ids)}
+        train_rows = np.asarray(sorted(position[s] for s in plan["train"]), dtype=np.int64)
+        frame["input_text"] = binned_text(frame[fcols], train_rows)
+        text_col = "input_text"
+        notes["text_view"] = "decile-binned feature tokens, edges fitted on train rows only"
+    data = fme.EvalDataset.from_frame(frame, dataset="fw", target=target, id_column="root_id", label_column="label",
+                                      feature_columns=fcols, group_columns=list(keys),
+                                      text_column=text_col, notes=notes)
+    data.aux = fme.size_side_aux(data.features, size_frame=feats.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                                 ids=frame["root_id"], side=frame["side"] if "side" in frame.columns else None)
+    data.__post_init__()  # re-validate aux against the features
+    return FwBuild(data=data, plan=plan, features=feats, rows=rows, info={"n_features": len(fcols)})
 
 
-def _stable_cap_order(cell_type: str, root_id: str, salt: str) -> str:
-    return hashlib.sha256(f"{salt}:{cell_type}:{root_id}".encode("utf-8")).hexdigest()
+# =========================================================================== transfer bridge
 
 
-def _cap_per_cell_type(frame: pd.DataFrame, *, max_per_cell_type: int, salt: str) -> pd.DataFrame:
-    if max_per_cell_type <= 0:
-        return frame
-    ranked = frame.copy()
-    ranked["__cap_order__"] = [
-        _stable_cap_order(str(cell_type), str(root_id), salt)
-        for cell_type, root_id in zip(ranked["cell_type"].tolist(), ranked["root_id"].tolist(), strict=False)
-    ]
-    ranked = ranked.sort_values(["cell_type", "__cap_order__"], kind="stable")
-    ranked["__cap_rank__"] = ranked.groupby("cell_type", sort=False).cumcount()
-    ranked = ranked[ranked["__cap_rank__"] < int(max_per_cell_type)].copy()
-    return ranked.drop(columns=["__cap_order__", "__cap_rank__"])
+def hemibrain_type_group(value: Any) -> str | None:
+    """Canonical hemibrain type group: sorted, de-duplicated comma tokens joined by '|'."""
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    tokens = sorted({t.strip() for t in re.split(r"[,;]", str(value).strip("()")) if t.strip()})
+    return "|".join(tokens) or None
 
 
-def build_eval_dataset(target: str, ctx: FwContext, config: fme.EvalConfig) -> fme.EvalDataset:
-    frame, notes = _target_frame(target, ctx)
-    feature_cols = [c for c in ctx.feature_columns if c in frame.columns and c != "weighted_total_syn_count"]
-    if target == TARGET_CONNECTIVITY:
-        # keep the raw label source out of the feature frame; the registered
-        # connectivity exclusions will also drop every degree__* proxy.
-        feature_cols = [c for c in feature_cols if c != "weighted_total_syn_count"]
-    data_frame = frame[["root_id", "label", *GROUP_KEYS, *feature_cols]].copy()
-    kept, dropped = fwf.apply_objective_exclusions(data_frame[feature_cols], target)
-    feature_cols = sorted(kept.columns.tolist())
-    group_values = frame[list(GROUP_KEYS)].to_dict(orient="records")
-    plan = fme.plan_grouped_split(frame["root_id"].tolist(), group_values, GROUP_KEYS, config)
-    pos = {sid: i for i, sid in enumerate(frame["root_id"].tolist())}
-    train_rows = np.asarray(sorted(pos[sid] for sid in plan["train"]), dtype=np.int64)
-    text = binned_text(kept, train_rows)
-    data_frame = pd.concat([data_frame[["root_id", "label", *GROUP_KEYS]].reset_index(drop=True),
-                            kept.reset_index(drop=True)], axis=1)
-    data_frame["__text__"] = text
-    fwf.assert_features_allowed(feature_cols, target)
-    notes["excluded_features"] = dropped
-    notes["text_mode"] = "binned"
-    return fme.EvalDataset.from_frame(
-        data_frame,
-        dataset=DATASET,
-        target=target,
-        id_column="root_id",
-        label_column="label",
-        feature_columns=feature_cols,
-        group_columns=list(GROUP_KEYS),
-        text_column="__text__",
-        notes=notes,
+def write_bridge_table(annotations: pd.DataFrame, *, snapshot: FwSnapshot, features_fingerprint: str,
+                       features_cache: str | None, cache_root: str | Path = fwf.DEFAULT_CACHE_ROOT) -> Path:
+    """hemibrain_type bridging columns keyed like the wiring-feature cache (``node_id``) for the transfer track.
+
+    Not a training input: these columns are identifiers of the curated type
+    hierarchy and are excluded as features for every type-level objective.
+    """
+    out_dir = Path(cache_root) / "wiring-features" / "fw" / "bridge"
+    if _inside_snapshots(out_dir):
+        raise ValueError(f"refusing to write under snapshots: {out_dir}")
+    frame = pd.DataFrame({
+        "node_id": annotations["root_id"].astype(str),
+        "hemibrain_type": annotations["hemibrain_type"],
+        "hemibrain_type_group": annotations["hemibrain_type"].map(hemibrain_type_group),
+        "cell_type": annotations["cell_type"],
+        "cell_class": annotations["cell_class"],
+        "super_class": annotations["super_class"].map(lambda v: None if pd.isna(v) else fwf.harmonize_super_class(v)),
+        "flow": annotations["flow"],
+        "hemilineage": annotations.get("hemilineage_raw", annotations["hemilineage"]),
+        "side": annotations["side"],
+    })
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{features_fingerprint[:32]}.bridge.parquet"
+    tmp = path.with_suffix(".tmp")
+    frame.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+    meta = {
+        "schema_version": "flybrain-fw-bridge/v1",
+        "features_fingerprint": features_fingerprint,
+        "features_cache": features_cache,
+        "fw_manifest_sha256": snapshot.manifest_sha256,
+        "annotations_sha256": snapshot.product_sha256.get(ROLE_ANNOTATIONS),
+        "rows": int(len(frame)),
+        "with_hemibrain_type": int(frame["hemibrain_type"].notna().sum()),
+        "parquet_sha256": sha256_file(path),
+        "use": "join key for hb<->fw transfer; never a training feature",
+    }
+    path.with_suffix(".json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+# =========================================================================== driver
+
+
+def default_eval_config(run_label: str = "v2", report_root: str = DEFAULT_REPORT_ROOT, **overrides: Any) -> Any:
+    import flybrain_model_eval as fme
+
+    models = (
+        fme.ModelSpec("nb", ({"alpha": 1.0},), "temperature"),
+        fme.ModelSpec("logreg", ({"C": 0.1}, {"C": 1.0}), "temperature"),
+        fme.ModelSpec("hgb", ({"max_iter": 300, "learning_rate": 0.1},
+                              {"max_iter": 300, "learning_rate": 0.1, "class_weight": "balanced"}), "temperature"),
     )
+    kwargs = dict(models=models, cv_folds=4, n_bootstrap=1000, run_label=run_label, n_threads=8,
+                  report_root=report_root)
+    kwargs.update(overrides)
+    return fme.EvalConfig(**kwargs)
 
 
-def _best_model_row(report: Mapping[str, Any]) -> Mapping[str, Any]:
-    best = str(report.get("best_on_val") or "")
+def run_target(target: str, *, storage_root: str = DEFAULT_STORAGE_ROOT, run_label: str = "v2",
+               report_root: str = DEFAULT_REPORT_ROOT, cache_root: str = fwf.DEFAULT_CACHE_ROOT,
+               write_bridge: bool = False, nt_root: str = ntgt.DEFAULT_NT_GT_ROOT,
+               **config_overrides: Any) -> dict[str, Any]:
+    t0 = time.time()
+    spec = FW_TARGETS[target]
+    roles = [ROLE_CONNECTIONS, ROLE_ANNOTATIONS] + ([ROLE_PRE_COUNTS] if spec.needs_pre_counts else [])
+    snap = open_fw_snapshot(storage_root, required_roles=roles,
+                            stamp_dir=Path(cache_root) / "hash-stamps" / "fw")
+    ann = load_fw_annotations(snap.path(ROLE_ANNOTATIONS))
+    totals = total_presynapse_counts(snap.path(ROLE_PRE_COUNTS)) if spec.needs_pre_counts else None
+    config = default_eval_config(run_label=run_label, report_root=report_root, **config_overrides)
+    build = build_fw_eval_dataset(target, snapshot=snap, annotations=ann, config=config,
+                                  presynapse_totals=totals, cache_root=cache_root, nt_root=nt_root)
+    print(f"[{target}] samples {len(build.rows)} features {build.info['n_features']} "
+          f"({round(time.time() - t0)} s)", flush=True)
+    if write_bridge:
+        bridge = write_bridge_table(ann, snapshot=snap, features_fingerprint=build.features.fingerprint,
+                                    features_cache=build.features.cache_path, cache_root=cache_root)
+        print(f"[{target}] bridge {bridge}", flush=True)
+    report = ftr.run_gated_evaluation(build.data, config)
     for row in report["summary"]:
-        if str(row["model"]) == best:
-            return row
-    return report["summary"][0]
-
-
-def run_target(target: str, ctx: FwContext, *, report_root: str = DEFAULT_REPORT_ROOT, seeds: int = 5,
-               base_seed: str = "flybrain-fw-real-models-v1", n_threads: int = 8, log=print) -> dict[str, Any]:
-    runs = []
-    for i in range(int(seeds)):
-        label = "" if i == 0 else f"repeat-{i}"
-        cfg = eval_config(
-            split_seed=base_seed if i == 0 else f"{base_seed}-seed{i}",
-            report_root=report_root,
-            run_label=label,
-            n_threads=n_threads,
-            full=False,
-        )
-        started = time.time()
-        report = fme.run_evaluation(build_eval_dataset(target, ctx, cfg), cfg)
-        best = dict(_best_model_row(report))
-        best["best_on_val"] = report.get("best_on_val")
-        best["elapsed_seconds"] = round(time.time() - started, 1)
-        runs.append({"seed_index": i, "split_seed": cfg.split_seed, "best": best, "summary": report["summary"]})
-        log(json.dumps({"target": target, "seed_index": i, "best": best}, sort_keys=True, default=str))
-    passes = sum(1 for run in runs if run["best"]["gate"] == "pass")
-    return {
-        "target": target,
-        "seeds": int(seeds),
-        "pass_count": int(passes),
-        "target_pass": bool(passes >= 3),
-        "primary": runs[0],
-        "runs": runs,
-    }
-
-
-def run_all(*, report_root: str = DEFAULT_REPORT_ROOT, targets: Sequence[str] = FW_TARGETS, seeds: int = 5,
-            top_k_neuropils: int = 16, min_label_neurons: int = 50, min_label_cell_types: int = 5,
-            max_per_cell_type: int = 1,
-            n_threads: int = 8) -> dict[str, Any]:
-    started = time.time()
-    config = FwTargetConfig(
-        top_k_neuropils=top_k_neuropils,
-        min_label_neurons=min_label_neurons,
-        min_label_cell_types=min_label_cell_types,
-        max_per_cell_type=max_per_cell_type,
-    )
-    ctx = FwContext.load(config)
-    results = {target: run_target(target, ctx, report_root=report_root, seeds=seeds, n_threads=n_threads)
-               for target in targets}
-    payload = {
-        "schema_version": "flybrain-fw-real-models/v1",
-        "dataset": DATASET,
-        "dataset_version": VERSION_ID,
-        "config": config.as_dict(),
-        "elapsed_seconds": round(time.time() - started, 1),
-        "results": results,
-    }
-    out = Path(report_root) / DATASET
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "fw_real_models.json").write_text(
-        json.dumps(fl._jsonable(payload), indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    (out / "SUMMARY.md").write_text(render_summary(payload), encoding="utf-8")
-    return payload
-
-
-def _f(value: Any) -> str:
-    return "-" if value is None or (isinstance(value, float) and not math.isfinite(value)) else f"{float(value):.3f}"
-
-
-def render_summary(payload: Mapping[str, Any]) -> str:
-    lines = [
-        "# FlyWire 783 real models",
-        "",
-        f"dataset `{payload['dataset']}` version `{payload['dataset_version']}`",
-        "",
-        "| target | primary model | acc | best trivial | macro-F1 | n_test | gate | passes |",
-        "|---|---|---|---|---|---|---|---|",
-    ]
-    for target, result in payload["results"].items():
-        best = result["primary"]["best"]
-        lines.append(
-            f"| {target} | {best['model']} | {_f(best['model_acc'])} | {_f(best['best_trivial'])} | "
-            f"{_f(best['macro_f1'])} | {best['n_test']} | {best['gate']} | {result['pass_count']}/{result['seeds']} |"
-        )
-    return "\n".join(lines) + "\n"
+        print(json.dumps(row), flush=True)
+    print(f"[{target}] elapsed {round(time.time() - t0)} s maxrss_MB "
+          f"{resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f}", flush=True)
+    return report
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate FlyWire 783 super_class / nt_type / connectivity_tier targets.")
-    parser.add_argument("--targets", nargs="*", choices=list(FW_TARGETS), default=list(FW_TARGETS))
+    parser = argparse.ArgumentParser(description="Train/evaluate fw real-model targets through the eval harness.")
+    parser.add_argument("targets", nargs="+", choices=sorted(FW_TARGETS))
+    parser.add_argument("--storage-root", default=DEFAULT_STORAGE_ROOT)
     parser.add_argument("--report-root", default=DEFAULT_REPORT_ROOT)
-    parser.add_argument("--seeds", type=int, default=5)
-    parser.add_argument("--top-k-neuropils", type=int, default=16)
-    parser.add_argument("--min-label-neurons", type=int, default=50)
-    parser.add_argument("--min-label-cell-types", type=int, default=5)
-    parser.add_argument("--max-per-cell-type", type=int, default=1)
-    parser.add_argument("--n-threads", type=int, default=8)
+    parser.add_argument("--cache-root", default=fwf.DEFAULT_CACHE_ROOT)
+    parser.add_argument("--run-label", default="v2")
+    parser.add_argument("--write-bridge", action="store_true")
     args = parser.parse_args(argv)
-    payload = run_all(
-        report_root=args.report_root,
-        targets=args.targets,
-        seeds=args.seeds,
-        top_k_neuropils=args.top_k_neuropils,
-        min_label_neurons=args.min_label_neurons,
-        min_label_cell_types=args.min_label_cell_types,
-        max_per_cell_type=args.max_per_cell_type,
-        n_threads=args.n_threads,
-    )
-    for target, result in payload["results"].items():
-        print(json.dumps({"target": target, "primary": result["primary"]["best"], "pass_count": result["pass_count"],
-                          "seeds": result["seeds"], "target_pass": result["target_pass"]}, default=str, sort_keys=True))
+    for target in args.targets:
+        run_target(target, storage_root=args.storage_root, run_label=args.run_label, report_root=args.report_root,
+                   cache_root=args.cache_root, write_bridge=args.write_bridge)
     return 0
 
 
 __all__ = [
-    "DATASET",
-    "DEFAULT_ANNOTATIONS",
-    "DEFAULT_CONNECTIONS",
-    "DEFAULT_POST_NEUROPIL",
-    "DEFAULT_PRE_NEUROPIL",
-    "DEFAULT_REPORT_ROOT",
+    "CLASSICAL_NT",
+    "FW_PRODUCT_PATHS",
     "FW_TARGETS",
-    "FwContext",
-    "FwTargetConfig",
-    "GROUP_KEYS",
-    "TARGET_CONNECTIVITY",
-    "TARGET_NT_TYPE",
-    "TARGET_SUPER_CLASS",
-    "build_eval_dataset",
-    "build_feature_frame",
-    "default_models",
-    "eval_config",
-    "render_summary",
-    "run_all",
+    "FwBuild",
+    "FwSnapshot",
+    "FwSnapshotError",
+    "FwTargetSpec",
+    "GROUP_COLUMNS",
+    "HEMILINEAGE_GROUP_COLUMNS",
+    "HEMILINEAGE_SENTINELS",
+    "TYPE_FAMILY_MERGES",
+    "held_out_mask_ids",
+    "nt_literature_labels",
+    "type_family",
+    "ROLE_ANNOTATIONS",
+    "ROLE_CONNECTIONS",
+    "ROLE_PRE_COUNTS",
+    "binned_text",
+    "build_fw_eval_dataset",
+    "component_ids",
+    "connectivity_tier_labels",
+    "default_eval_config",
+    "edge_source",
+    "hemibrain_type_group",
+    "load_fw_annotations",
+    "open_fw_snapshot",
+    "parse_known_nt",
     "run_target",
+    "select_target_rows",
+    "total_presynapse_counts",
+    "write_bridge_table",
 ]
 
 
