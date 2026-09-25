@@ -39,6 +39,14 @@ N_BOOT = 2000
 NOVELTY_TOPICS = ("mcp-core", "mcp-tests", "mcp-flybrain", "scripts", "docs", "mlops", "nfcorpus")
 
 
+def _dist_version(name):
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 # ---------------------------------------------------------------- data
 
 
@@ -373,7 +381,7 @@ def main(argv=None) -> int:
         "operating_point": base,
         "specs": {k: {"n_glomeruli": s.n_glomeruli, "mean_claws_nonzero": round(s.mean_claws, 3),
                       "n_kc_with_claws": int((s.matrix.sum(axis=0) > 0).sum()), "provenance": s.provenance} for k, s in specs.items()},
-        "env": {"python": platform.python_version(), "numpy": np.__version__, "hnswlib": getattr(hnswlib, "__version__", None) if hnswlib else None},
+        "env": {"python": platform.python_version(), "numpy": np.__version__, "hnswlib": _dist_version("hnswlib") if hnswlib else None},
         "datasets": {k: {"n_index": int(v["x"].shape[0]), "n_queries": int(v["q"].shape[0])} for k, v in data.items() if k != "pool"},
     }
     with tempfile.TemporaryDirectory(dir=str(Path(args.cache) / "private")) as tmpdir:

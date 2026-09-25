@@ -1,0 +1,1342 @@
+{
+  "preregistration": "eval/fly_sparse_index/PREREGISTRATION.md",
+  "operating_point": {
+    "G": 55,
+    "K": 1100,
+    "wta": 0.05,
+    "claws": 4,
+    "D": 768,
+    "matrix": "fw_right"
+  },
+  "specs": {
+    "fw_right": {
+      "n_glomeruli": 55,
+      "mean_claws_nonzero": 4.189,
+      "n_kc_with_claws": 2338,
+      "provenance": {
+        "kind": "measured",
+        "matrix_key": "fw_right",
+        "spec_sha256": "d4b6e64cad4085ef94b44305e203ae5a8e4bf016a3e13ec8c8fd81254b61d205",
+        "params_sha256": "97c6df01309c85d9ef375fcc3df20b9710ce24d0cf3b8c12d43fde6c6f868ebf",
+        "threshold_synapses": 5,
+        "source": {
+          "fw": {
+            "dataset_symbol": "fw",
+            "version_id": "flywire783",
+            "citation": "Dorkenwald S, Matsliah A, et al. (2024). Neuronal wiring diagram of an adult brain. Nature 634:124-138. doi:10.1038/s41586-024-07558-y; Schlegel P, et al. (2024). Whole-brain annotation and multi-connectome cell typing of Drosophila. Nature 634:139-152. doi:10.1038/s41586-024-07686-5; data Zenodo doi:10.5281/zenodo.10676866",
+            "licence": {
+              "note": "Zenodo 10676866 and Nature Schlegel 2024 Supplementary Data 1 are CC-BY-4.0 (snapshot manifest license_evidence).",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          },
+          "hb": {
+            "dataset_symbol": "hb",
+            "version_id": "neuprint_JRC_Hemibrain_1point2point1",
+            "citation": "Scheffer LK, Xu CS, et al. (2020). A connectome and analysis of the adult Drosophila central brain. eLife 9:e57443. doi:10.7554/eLife.57443 (neuPrint hemibrain v1.2.1)",
+            "licence": {
+              "note": "Snapshot manifest records CC-BY-4.0 for the hemibrain data; the neo4j-inputs zip also bundles an HHMI BSD-3-Clause-style LICENSE.txt. Attribute Scheffer et al. 2020.",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          }
+        }
+      }
+    },
+    "fw_left": {
+      "n_glomeruli": 55,
+      "mean_claws_nonzero": 4.375,
+      "n_kc_with_claws": 2343,
+      "provenance": {
+        "kind": "measured",
+        "matrix_key": "fw_left",
+        "spec_sha256": "d4b6e64cad4085ef94b44305e203ae5a8e4bf016a3e13ec8c8fd81254b61d205",
+        "params_sha256": "97c6df01309c85d9ef375fcc3df20b9710ce24d0cf3b8c12d43fde6c6f868ebf",
+        "threshold_synapses": 5,
+        "source": {
+          "fw": {
+            "dataset_symbol": "fw",
+            "version_id": "flywire783",
+            "citation": "Dorkenwald S, Matsliah A, et al. (2024). Neuronal wiring diagram of an adult brain. Nature 634:124-138. doi:10.1038/s41586-024-07558-y; Schlegel P, et al. (2024). Whole-brain annotation and multi-connectome cell typing of Drosophila. Nature 634:139-152. doi:10.1038/s41586-024-07686-5; data Zenodo doi:10.5281/zenodo.10676866",
+            "licence": {
+              "note": "Zenodo 10676866 and Nature Schlegel 2024 Supplementary Data 1 are CC-BY-4.0 (snapshot manifest license_evidence).",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          },
+          "hb": {
+            "dataset_symbol": "hb",
+            "version_id": "neuprint_JRC_Hemibrain_1point2point1",
+            "citation": "Scheffer LK, Xu CS, et al. (2020). A connectome and analysis of the adult Drosophila central brain. eLife 9:e57443. doi:10.7554/eLife.57443 (neuPrint hemibrain v1.2.1)",
+            "licence": {
+              "note": "Snapshot manifest records CC-BY-4.0 for the hemibrain data; the neo4j-inputs zip also bundles an HHMI BSD-3-Clause-style LICENSE.txt. Attribute Scheffer et al. 2020.",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          }
+        }
+      }
+    },
+    "hb": {
+      "n_glomeruli": 56,
+      "mean_claws_nonzero": 5.285,
+      "n_kc_with_claws": 1747,
+      "provenance": {
+        "kind": "measured",
+        "matrix_key": "hb",
+        "spec_sha256": "d4b6e64cad4085ef94b44305e203ae5a8e4bf016a3e13ec8c8fd81254b61d205",
+        "params_sha256": "97c6df01309c85d9ef375fcc3df20b9710ce24d0cf3b8c12d43fde6c6f868ebf",
+        "threshold_synapses": 5,
+        "source": {
+          "fw": {
+            "dataset_symbol": "fw",
+            "version_id": "flywire783",
+            "citation": "Dorkenwald S, Matsliah A, et al. (2024). Neuronal wiring diagram of an adult brain. Nature 634:124-138. doi:10.1038/s41586-024-07558-y; Schlegel P, et al. (2024). Whole-brain annotation and multi-connectome cell typing of Drosophila. Nature 634:139-152. doi:10.1038/s41586-024-07686-5; data Zenodo doi:10.5281/zenodo.10676866",
+            "licence": {
+              "note": "Zenodo 10676866 and Nature Schlegel 2024 Supplementary Data 1 are CC-BY-4.0 (snapshot manifest license_evidence).",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          },
+          "hb": {
+            "dataset_symbol": "hb",
+            "version_id": "neuprint_JRC_Hemibrain_1point2point1",
+            "citation": "Scheffer LK, Xu CS, et al. (2020). A connectome and analysis of the adult Drosophila central brain. eLife 9:e57443. doi:10.7554/eLife.57443 (neuPrint hemibrain v1.2.1)",
+            "licence": {
+              "note": "Snapshot manifest records CC-BY-4.0 for the hemibrain data; the neo4j-inputs zip also bundles an HHMI BSD-3-Clause-style LICENSE.txt. Attribute Scheffer et al. 2020.",
+              "spdx_id": "CC-BY-4.0",
+              "url": "https://creativecommons.org/licenses/by/4.0/"
+            }
+          }
+        }
+      }
+    }
+  },
+  "env": {
+    "python": "3.12.3",
+    "numpy": "2.5.3",
+    "hnswlib": null
+  },
+  "datasets": {
+    "loci": {
+      "n_index": 7259,
+      "n_queries": 300
+    },
+    "nfcorpus": {
+      "n_index": 3633,
+      "n_queries": 323
+    }
+  },
+  "decision": {
+    "D1_measured_vs_idealised": {
+      "diff": [
+        -0.004999999999999998,
+        -0.014001666666666667,
+        0.0041366666666666505
+      ],
+      "adopt": false
+    },
+    "D2_adopt_for_loci": {
+      "best_baseline": "simhash",
+      "diff": [
+        -0.38859999999999995,
+        -0.40346666666666664,
+        -0.37439666666666666
+      ],
+      "adopt": false
+    }
+  },
+  "primary": {
+    "loci": {
+      "rows": {
+        "simhash": {
+          "recall@10": [
+            0.6881999999999999,
+            0.6729333333333334,
+            0.7023366666666666
+          ],
+          "mrr@100": [
+            0.7857850124211792,
+            0.7575568792349737,
+            0.8123313972796677
+          ],
+          "recall@10_rerank100": [
+            0.9829333333333333,
+            0.9772666666666668,
+            0.9877333333333334
+          ],
+          "recall@10_seed_sd": 0.006448944788792075,
+          "latency_ms_per_query": 0.6617680766551832,
+          "build_s": 0.05634220499996445,
+          "memory_bytes": 4427568,
+          "code_bytes_per_item": 144
+        },
+        "flyhash_random": {
+          "recall@10": [
+            0.30460000000000004,
+            0.2866,
+            0.3238716666666666
+          ],
+          "mrr@100": [
+            0.3650295804169888,
+            0.33038200359952313,
+            0.40217730466264484
+          ],
+          "recall@10_rerank100": [
+            0.6833999999999999,
+            0.6595333333333334,
+            0.7056683333333333
+          ],
+          "recall@10_seed_sd": 0.0068572751309993445,
+          "latency_ms_per_query": 0.6218545499965936,
+          "build_s": 0.14621737499692244,
+          "memory_bytes": 1229200,
+          "code_bytes_per_item": 144
+        },
+        "flyhash_random_fullD": {
+          "recall@10": [
+            0.4205333333333333,
+            0.403,
+            0.43799999999999994
+          ],
+          "mrr@100": [
+            0.5457190239147565,
+            0.5135548814420561,
+            0.5776874229743157
+          ],
+          "recall@10_rerank100": [
+            0.7956666666666666,
+            0.7774650000000001,
+            0.8140683333333334
+          ],
+          "recall@10_seed_sd": 0.004086563348340538,
+          "latency_ms_per_query": 0.6332832133315,
+          "build_s": 0.21377941199898487,
+          "memory_bytes": 3419536,
+          "code_bytes_per_item": 144
+        },
+        "fly_measured_matrix": {
+          "recall@10": [
+            0.2996,
+            0.282395,
+            0.31679999999999997
+          ],
+          "mrr@100": [
+            0.36071184021043196,
+            0.3277084300075921,
+            0.3939271142552957
+          ],
+          "recall@10_rerank100": [
+            0.6843333333333333,
+            0.6621983333333333,
+            0.7055366666666667
+          ],
+          "recall@10_seed_sd": 0.010264285438137205,
+          "latency_ms_per_query": 0.5748354533231274,
+          "build_s": 0.08916954900269047,
+          "memory_bytes": 1229646,
+          "code_bytes_per_item": 144
+        },
+        "fly_measured_sample": {
+          "recall@10": [
+            0.30939999999999995,
+            0.292395,
+            0.3272
+          ],
+          "mrr@100": [
+            0.36860866533548936,
+            0.3343891688741844,
+            0.4023746663476347
+          ],
+          "recall@10_rerank100": [
+            0.6945333333333333,
+            0.6728649999999999,
+            0.7155350000000001
+          ],
+          "recall@10_seed_sd": 0.016572064848211693,
+          "latency_ms_per_query": 0.5938927500028512,
+          "build_s": 0.1338310930004809,
+          "memory_bytes": 1229702,
+          "code_bytes_per_item": 144
+        },
+        "ctrl_measured_claws_uniform_glom": {
+          "recall@10": [
+            0.33046666666666663,
+            0.3121333333333333,
+            0.34960166666666664
+          ],
+          "mrr@100": [
+            0.3769936886759879,
+            0.34196868452688073,
+            0.4114756717373051
+          ],
+          "recall@10_rerank100": [
+            0.7258666666666667,
+            0.7038666666666668,
+            0.7472683333333333
+          ],
+          "recall@10_seed_sd": 0.00895234295837933,
+          "latency_ms_per_query": 0.5713203233365979,
+          "build_s": 0.13580104599896003,
+          "memory_bytes": 1229702,
+          "code_bytes_per_item": 144
+        },
+        "ctrl_fixed_claws_measured_glom": {
+          "recall@10": [
+            0.2866,
+            0.2697299999999999,
+            0.30433333333333334
+          ],
+          "mrr@100": [
+            0.35435179873120176,
+            0.3203736776000957,
+            0.38771431335089523
+          ],
+          "recall@10_rerank100": [
+            0.6531333333333333,
+            0.6293316666666667,
+            0.6754
+          ],
+          "recall@10_seed_sd": 0.007657240582176666,
+          "latency_ms_per_query": 0.6146148533419667,
+          "build_s": 0.1584483660008118,
+          "memory_bytes": 1229200,
+          "code_bytes_per_item": 144
+        },
+        "exact": {
+          "recall@10": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "mrr@100": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "recall@10_rerank100": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "recall@10_seed_sd": 0.0,
+          "latency_ms_per_query": 0.43678766333565966,
+          "build_s": 0.0,
+          "memory_bytes": 22299648,
+          "code_bytes_per_item": 3072
+        },
+        "hnsw": {
+          "recall@10": [
+            0.9983333333333333,
+            0.9963333333333333,
+            0.9996666666666666
+          ],
+          "mrr@100": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "recall@10_rerank100": [
+            0.9983333333333333,
+            0.9963333333333333,
+            0.9996666666666666
+          ],
+          "recall@10_seed_sd": 0.0,
+          "latency_ms_per_query": 0.3220880733351805,
+          "build_s": 2.7131694660020003,
+          "memory_bytes": 23378428,
+          "code_bytes_per_item": 3220
+        }
+      },
+      "differences": {
+        "fly_measured_matrix - flyhash_random": [
+          -0.004999999999999998,
+          -0.014001666666666667,
+          0.0041366666666666505
+        ],
+        "fly_measured_sample - flyhash_random": [
+          0.004800000000000001,
+          -0.0042683333333333314,
+          0.014000000000000004
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.38859999999999995,
+          -0.40346666666666664,
+          -0.37439666666666666
+        ],
+        "fly_measured_matrix - flyhash_random_fullD": [
+          -0.12093333333333334,
+          -0.1348683333333333,
+          -0.10706666666666668
+        ],
+        "fly_measured_matrix - flyhash_random (rerank100)": [
+          0.0009333333333333256,
+          -0.009133333333333344,
+          0.011534999999999981
+        ],
+        "fly_measured_matrix - simhash (rerank100)": [
+          -0.29860000000000003,
+          -0.31906833333333334,
+          -0.278865
+        ],
+        "ctrl_measured_claws_uniform_glom - flyhash_random": [
+          0.025866666666666663,
+          0.018398333333333326,
+          0.033666666666666664
+        ],
+        "ctrl_fixed_claws_measured_glom - flyhash_random": [
+          -0.018000000000000002,
+          -0.02673333333333333,
+          -0.008928333333333363
+        ],
+        "fly_measured_matrix - hnsw": [
+          -0.6987333333333333,
+          -0.7160666666666666,
+          -0.6807983333333334
+        ],
+        "fly_measured_matrix - best_baseline(simhash)": [
+          -0.38859999999999995,
+          -0.40346666666666664,
+          -0.37439666666666666
+        ]
+      },
+      "best_memory_matched_baseline": "simhash",
+      "replicates": {
+        "fw_left": {
+          "recall@10": [
+            0.30733333333333335,
+            0.29053166666666663,
+            0.32393333333333335
+          ],
+          "minus_flyhash_random": [
+            0.0027333333333333268,
+            -0.006266666666666671,
+            0.011999999999999995
+          ]
+        },
+        "hb": {
+          "recall@10": [
+            0.3224666666666667,
+            0.30519833333333335,
+            0.33953500000000003
+          ],
+          "minus_flyhash_random": [
+            0.017866666666666666,
+            0.007531666666666663,
+            0.02826666666666667
+          ]
+        }
+      }
+    },
+    "nfcorpus": {
+      "rows": {
+        "simhash": {
+          "recall@10": [
+            0.5442105263157896,
+            0.5224133126934984,
+            0.565764705882353
+          ],
+          "mrr@100": [
+            0.6678801282430301,
+            0.6337934141277898,
+            0.7016880157877956
+          ],
+          "recall@10_rerank100": [
+            0.918328173374613,
+            0.9055092879256966,
+            0.9310216718266254
+          ],
+          "recall@10_seed_sd": 0.005310297005076741,
+          "latency_ms_per_query": 0.45884389783450025,
+          "build_s": 0.06233092999900691,
+          "memory_bytes": 3905424,
+          "code_bytes_per_item": 144
+        },
+        "flyhash_random": {
+          "recall@10": [
+            0.22458204334365323,
+            0.20365325077399382,
+            0.24532817337461302
+          ],
+          "mrr@100": [
+            0.25784401708392246,
+            0.220294697892816,
+            0.2922429225496244
+          ],
+          "recall@10_rerank100": [
+            0.544953560371517,
+            0.5157260061919505,
+            0.5728173374613004
+          ],
+          "recall@10_seed_sd": 0.008829230682113798,
+          "latency_ms_per_query": 0.32991782043344736,
+          "build_s": 0.12162663500203053,
+          "memory_bytes": 707056,
+          "code_bytes_per_item": 144
+        },
+        "flyhash_random_fullD": {
+          "recall@10": [
+            0.286811145510836,
+            0.26730650154798763,
+            0.30551393188854487
+          ],
+          "mrr@100": [
+            0.3878780314245827,
+            0.35281839675938065,
+            0.4217966352945974
+          ],
+          "recall@10_rerank100": [
+            0.6285448916408668,
+            0.6025913312693498,
+            0.6523885448916409
+          ],
+          "recall@10_seed_sd": 0.005118200483637244,
+          "latency_ms_per_query": 0.39814174613712106,
+          "build_s": 0.21223889799875906,
+          "memory_bytes": 2897392,
+          "code_bytes_per_item": 144
+        },
+        "fly_measured_matrix": {
+          "recall@10": [
+            0.23164086687306504,
+            0.21275386996904025,
+            0.2506501547987616
+          ],
+          "mrr@100": [
+            0.25519968994069764,
+            0.21918094550666786,
+            0.2854185307624728
+          ],
+          "recall@10_rerank100": [
+            0.5760990712074303,
+            0.5491021671826626,
+            0.6023529411764706
+          ],
+          "recall@10_seed_sd": 0.006289479589649046,
+          "latency_ms_per_query": 0.3541394458249667,
+          "build_s": 0.06931963599708979,
+          "memory_bytes": 707502,
+          "code_bytes_per_item": 144
+        },
+        "fly_measured_sample": {
+          "recall@10": [
+            0.2331888544891641,
+            0.21349535603715172,
+            0.2526950464396285
+          ],
+          "mrr@100": [
+            0.27148904167390336,
+            0.23657014831358888,
+            0.30369280797172127
+          ],
+          "recall@10_rerank100": [
+            0.58,
+            0.5526919504643963,
+            0.6059442724458204
+          ],
+          "recall@10_seed_sd": 0.010106829994477099,
+          "latency_ms_per_query": 0.3345720402485707,
+          "build_s": 0.12658395000107703,
+          "memory_bytes": 707558,
+          "code_bytes_per_item": 144
+        },
+        "ctrl_measured_claws_uniform_glom": {
+          "recall@10": [
+            0.24080495356037152,
+            0.22030185758513932,
+            0.2614256965944272
+          ],
+          "mrr@100": [
+            0.27019559227770057,
+            0.233287172753577,
+            0.30383615282910104
+          ],
+          "recall@10_rerank100": [
+            0.5779566563467492,
+            0.5498390092879258,
+            0.605201238390093
+          ],
+          "recall@10_seed_sd": 0.005332811720667277,
+          "latency_ms_per_query": 0.3448905665642797,
+          "build_s": 0.13186369100003503,
+          "memory_bytes": 707558,
+          "code_bytes_per_item": 144
+        },
+        "ctrl_fixed_claws_measured_glom": {
+          "recall@10": [
+            0.21739938080495355,
+            0.1985139318885449,
+            0.23665944272445819
+          ],
+          "mrr@100": [
+            0.23513070645436143,
+            0.20200199776257494,
+            0.264948740539547
+          ],
+          "recall@10_rerank100": [
+            0.5456965944272446,
+            0.5193188854489165,
+            0.5707755417956656
+          ],
+          "recall@10_seed_sd": 0.011793999703587979,
+          "latency_ms_per_query": 0.41833519504231476,
+          "build_s": 0.1532573449985648,
+          "memory_bytes": 707056,
+          "code_bytes_per_item": 144
+        },
+        "exact": {
+          "recall@10": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "mrr@100": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "recall@10_rerank100": [
+            1.0,
+            1.0,
+            1.0
+          ],
+          "recall@10_seed_sd": 0.0,
+          "latency_ms_per_query": 0.21671282043521964,
+          "build_s": 0.0,
+          "memory_bytes": 11160576,
+          "code_bytes_per_item": 3072
+        },
+        "hnsw": {
+          "recall@10": [
+            0.9926315789473684,
+            0.9893498452012384,
+            0.9954179566563467
+          ],
+          "mrr@100": [
+            0.9969040247678018,
+            0.9907120743034056,
+            1.0
+          ],
+          "recall@10_rerank100": [
+            0.9926315789473684,
+            0.9893498452012384,
+            0.9954179566563467
+          ],
+          "recall@10_seed_sd": 0.00013845622151695687,
+          "latency_ms_per_query": 0.19568371517211053,
+          "build_s": 0.8843268669988902,
+          "memory_bytes": 11699464,
+          "code_bytes_per_item": 3220
+        }
+      },
+      "differences": {
+        "fly_measured_matrix - flyhash_random": [
+          0.007058823529411766,
+          -0.0004969040247678048,
+          0.014428792569659435
+        ],
+        "fly_measured_sample - flyhash_random": [
+          0.008606811145510837,
+          0.0007430340557275592,
+          0.01628637770897832
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.3125696594427244,
+          -0.32922910216718265,
+          -0.2957879256965944
+        ],
+        "fly_measured_matrix - flyhash_random_fullD": [
+          -0.05517027863777089,
+          -0.06941640866873065,
+          -0.0418560371517028
+        ],
+        "fly_measured_matrix - flyhash_random (rerank100)": [
+          0.03114551083591331,
+          0.02012229102167182,
+          0.04266563467492258
+        ],
+        "fly_measured_matrix - simhash (rerank100)": [
+          -0.34222910216718266,
+          -0.3629117647058823,
+          -0.3219164086687306
+        ],
+        "ctrl_measured_claws_uniform_glom - flyhash_random": [
+          0.01622291021671827,
+          0.009781733746130028,
+          0.02222910216718266
+        ],
+        "ctrl_fixed_claws_measured_glom - flyhash_random": [
+          -0.007182662538699691,
+          -0.014366873065015481,
+          0.0006826625386996836
+        ],
+        "fly_measured_matrix - hnsw": [
+          -0.7609907120743035,
+          -0.7787647058823529,
+          -0.7419814241486069
+        ],
+        "fly_measured_matrix - best_baseline(simhash)": [
+          -0.3125696594427244,
+          -0.32922910216718265,
+          -0.2957879256965944
+        ]
+      },
+      "best_memory_matched_baseline": "simhash",
+      "replicates": {
+        "fw_left": {
+          "recall@10": [
+            0.2261919504643963,
+            0.2073684210526316,
+            0.24514086687306502
+          ],
+          "minus_flyhash_random": [
+            0.0016099071207430335,
+            -0.005944272445820437,
+            0.009597523219814238
+          ]
+        },
+        "hb": {
+          "recall@10": [
+            0.236656346749226,
+            0.21727554179566566,
+            0.25727554179566564
+          ],
+          "minus_flyhash_random": [
+            0.012074303405572756,
+            0.0044566563467492255,
+            0.019876160990712075
+          ]
+        }
+      }
+    }
+  },
+  "sweeps": {
+    "expansion": {
+      "2": {
+        "simhash": [
+          0.29366666666666663,
+          0.27655555555555555,
+          0.3108888888888888
+        ],
+        "flyhash_random": [
+          0.08655555555555557,
+          0.07777777777777778,
+          0.09589166666666665
+        ],
+        "fly_measured_matrix": [
+          0.08355555555555555,
+          0.07455555555555556,
+          0.09244444444444444
+        ],
+        "fly_measured_sample": [
+          0.08022222222222222,
+          0.07222222222222223,
+          0.08833333333333333
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.0029999999999999996,
+          -0.011999999999999999,
+          0.006000000000000001
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.2101111111111111,
+          -0.2247777777777778,
+          -0.19532500000000005
+        ]
+      },
+      "5": {
+        "simhash": [
+          0.5025555555555555,
+          0.4851083333333332,
+          0.5197805555555556
+        ],
+        "flyhash_random": [
+          0.17555555555555558,
+          0.16133333333333336,
+          0.1892222222222222
+        ],
+        "fly_measured_matrix": [
+          0.16222222222222224,
+          0.14922222222222223,
+          0.17578055555555555
+        ],
+        "fly_measured_sample": [
+          0.1678888888888889,
+          0.1547777777777778,
+          0.1808944444444444
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.013333333333333334,
+          -0.02411111111111111,
+          -0.002888888888888889
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.3403333333333333,
+          -0.35533611111111113,
+          -0.3254416666666667
+        ]
+      },
+      "10": {
+        "simhash": [
+          0.6091111111111112,
+          0.592775,
+          0.6255555555555555
+        ],
+        "flyhash_random": [
+          0.2478888888888889,
+          0.23044444444444448,
+          0.2643333333333333
+        ],
+        "fly_measured_matrix": [
+          0.24566666666666662,
+          0.22933333333333336,
+          0.262225
+        ],
+        "fly_measured_sample": [
+          0.25433333333333336,
+          0.23721944444444443,
+          0.2715583333333333
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.002222222222222225,
+          -0.013222222222222225,
+          0.00866666666666666
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.36344444444444446,
+          -0.37944722222222227,
+          -0.3482222222222222
+        ]
+      },
+      "20": {
+        "simhash": [
+          0.6864444444444444,
+          0.6713305555555555,
+          0.7014444444444444
+        ],
+        "flyhash_random": [
+          0.3045555555555555,
+          0.2859972222222222,
+          0.32388888888888884
+        ],
+        "fly_measured_matrix": [
+          0.3035555555555555,
+          0.28655277777777777,
+          0.3212222222222222
+        ],
+        "fly_measured_sample": [
+          0.31477777777777777,
+          0.2965527777777778,
+          0.33322222222222225
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.0010000000000000009,
+          -0.012558333333333331,
+          0.010555555555555556
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.3828888888888889,
+          -0.39866666666666667,
+          -0.3674416666666667
+        ]
+      },
+      "50": {
+        "simhash": [
+          0.7457777777777779,
+          0.731,
+          0.7595583333333333
+        ],
+        "flyhash_random": [
+          0.3551111111111111,
+          0.33432777777777783,
+          0.37611666666666665
+        ],
+        "fly_measured_matrix": [
+          0.3597777777777778,
+          0.3402194444444444,
+          0.37911944444444445
+        ],
+        "fly_measured_sample": [
+          0.3697777777777778,
+          0.35044444444444445,
+          0.38866944444444446
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          0.004666666666666668,
+          -0.005666666666666666,
+          0.014888888888888886
+        ],
+        "fly_measured_matrix - simhash": [
+          -0.38600000000000007,
+          -0.40345277777777777,
+          -0.3697777777777778
+        ]
+      }
+    },
+    "claws": {
+      "2": {
+        "flyhash_random": [
+          0.19,
+          0.17288611111111113,
+          0.20678055555555555
+        ],
+        "measured_glom_fixed_claws": [
+          0.1753333333333333,
+          0.1615527777777778,
+          0.1900027777777778
+        ],
+        "measured_glom - uniform_glom": [
+          -0.014666666666666665,
+          -0.025336111111111108,
+          -0.004997222222222238
+        ]
+      },
+      "4": {
+        "flyhash_random": [
+          0.3045555555555555,
+          0.2859972222222222,
+          0.32388888888888884
+        ],
+        "measured_glom_fixed_claws": [
+          0.28844444444444445,
+          0.27133333333333337,
+          0.3061138888888889
+        ],
+        "measured_glom - uniform_glom": [
+          -0.016111111111111114,
+          -0.027222222222222214,
+          -0.004886111111111123
+        ]
+      },
+      "6": {
+        "flyhash_random": [
+          0.3595555555555556,
+          0.3413305555555556,
+          0.37778055555555556
+        ],
+        "measured_glom_fixed_claws": [
+          0.33544444444444443,
+          0.3168888888888889,
+          0.3535583333333333
+        ],
+        "measured_glom - uniform_glom": [
+          -0.024111111111111114,
+          -0.035002777777777785,
+          -0.014111111111111114
+        ]
+      },
+      "7": {
+        "flyhash_random": [
+          0.37144444444444447,
+          0.35300000000000004,
+          0.3895638888888889
+        ],
+        "measured_glom_fixed_claws": [
+          0.3487777777777778,
+          0.3302222222222222,
+          0.3674444444444444
+        ],
+        "measured_glom - uniform_glom": [
+          -0.02266666666666667,
+          -0.03288888888888889,
+          -0.012333333333333337
+        ]
+      },
+      "10": {
+        "flyhash_random": [
+          0.39233333333333337,
+          0.3744416666666666,
+          0.4102222222222222
+        ],
+        "measured_glom_fixed_claws": [
+          0.3803333333333333,
+          0.3632222222222222,
+          0.39799999999999996
+        ],
+        "measured_glom - uniform_glom": [
+          -0.011999999999999999,
+          -0.02255555555555555,
+          -0.0012194444444444583
+        ]
+      },
+      "15": {
+        "flyhash_random": [
+          0.4194444444444445,
+          0.40077777777777773,
+          0.43799999999999994
+        ],
+        "measured_glom_fixed_claws": [
+          0.3978888888888889,
+          0.3794444444444445,
+          0.41633333333333333
+        ],
+        "measured_glom - uniform_glom": [
+          -0.021555555555555557,
+          -0.032447222222222225,
+          -0.010216666666666697
+        ]
+      }
+    },
+    "wta": {
+      "0.01": {
+        "flyhash_random": [
+          0.14744444444444446,
+          0.13444444444444445,
+          0.16077777777777777
+        ],
+        "fly_measured_matrix": [
+          0.16066666666666668,
+          0.14777777777777776,
+          0.1743361111111111
+        ],
+        "fly_measured_sample": [
+          0.1612222222222222,
+          0.1491111111111111,
+          0.17411388888888887
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          0.013222222222222225,
+          0.002333333333333336,
+          0.02455833333333332
+        ]
+      },
+      "0.02": {
+        "flyhash_random": [
+          0.21677777777777776,
+          0.20121944444444442,
+          0.23211944444444435
+        ],
+        "fly_measured_matrix": [
+          0.23077777777777783,
+          0.2154444444444444,
+          0.24666944444444444
+        ],
+        "fly_measured_sample": [
+          0.2338888888888889,
+          0.21800000000000003,
+          0.24933611111111115
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          0.014000000000000004,
+          0.003666666666666664,
+          0.024222222222222225
+        ]
+      },
+      "0.05": {
+        "flyhash_random": [
+          0.3045555555555555,
+          0.2859972222222222,
+          0.32388888888888884
+        ],
+        "fly_measured_matrix": [
+          0.3035555555555555,
+          0.28655277777777777,
+          0.3212222222222222
+        ],
+        "fly_measured_sample": [
+          0.31477777777777777,
+          0.2965527777777778,
+          0.33322222222222225
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.0010000000000000009,
+          -0.012558333333333331,
+          0.010555555555555556
+        ]
+      },
+      "0.1": {
+        "flyhash_random": [
+          0.374,
+          0.3528833333333334,
+          0.39444444444444443
+        ],
+        "fly_measured_matrix": [
+          0.349,
+          0.329775,
+          0.36778055555555556
+        ],
+        "fly_measured_sample": [
+          0.3612222222222222,
+          0.342325,
+          0.3802249999999999
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.025000000000000005,
+          -0.03666666666666667,
+          -0.013333333333333334
+        ]
+      },
+      "0.2": {
+        "flyhash_random": [
+          0.46611111111111114,
+          0.4452194444444444,
+          0.4846666666666666
+        ],
+        "fly_measured_matrix": [
+          0.41400000000000003,
+          0.3944444444444445,
+          0.4334472222222222
+        ],
+        "fly_measured_sample": [
+          0.4232222222222222,
+          0.4044444444444445,
+          0.4425555555555556
+        ],
+        "fly_measured_matrix - flyhash_random": [
+          -0.0521111111111111,
+          -0.06166666666666664,
+          -0.04222222222222222
+        ]
+      }
+    }
+  },
+  "novelty": {
+    "folds": [
+      "docs",
+      "mcp-core",
+      "mcp-flybrain",
+      "mcp-tests",
+      "mlops",
+      "nfcorpus",
+      "scripts"
+    ],
+    "fold_sizes": {
+      "docs": [
+        7988,
+        500,
+        500
+      ],
+      "mcp-core": [
+        7892,
+        500,
+        500
+      ],
+      "mcp-flybrain": [
+        8200,
+        500,
+        500
+      ],
+      "mcp-tests": [
+        7868,
+        500,
+        500
+      ],
+      "mlops": [
+        8621,
+        415,
+        500
+      ],
+      "nfcorpus": [
+        6047,
+        500,
+        500
+      ],
+      "scripts": [
+        7402,
+        500,
+        500
+      ]
+    },
+    "summary": {
+      "simhash": {
+        "auroc_mean_over_folds": 0.8632496592082616,
+        "ci95": [
+          0.8549058860585197,
+          0.8711768029259896
+        ]
+      },
+      "flyhash_random": {
+        "auroc_mean_over_folds": 0.7976510395869191,
+        "ci95": [
+          0.7866756994836489,
+          0.8081673320998279
+        ]
+      },
+      "fly_measured_matrix": {
+        "auroc_mean_over_folds": 0.8076477555938038,
+        "ci95": [
+          0.7974208135972463,
+          0.8168692765920826
+        ]
+      },
+      "fly_measured_sample": {
+        "auroc_mean_over_folds": 0.8089439380378659,
+        "ci95": [
+          0.7993004963855422,
+          0.8190885165232359
+        ]
+      },
+      "exact": {
+        "auroc_mean_over_folds": 0.827741122203098,
+        "ci95": [
+          0.8187340841652323,
+          0.8366705209982789
+        ]
+      },
+      "hnsw": {
+        "auroc_mean_over_folds": 0.8277456179001721,
+        "ci95": [
+          0.8187071333907058,
+          0.836623508605852
+        ]
+      }
+    },
+    "per_fold": {
+      "simhash": {
+        "docs": 0.7643,
+        "mcp-core": 0.8163,
+        "mcp-flybrain": 0.8327,
+        "mcp-tests": 0.829,
+        "mlops": 0.9153,
+        "nfcorpus": 0.9967,
+        "scripts": 0.8884
+      },
+      "flyhash_random": {
+        "docs": 0.6142,
+        "mcp-core": 0.797,
+        "mcp-flybrain": 0.8238,
+        "mcp-tests": 0.7734,
+        "mlops": 0.7884,
+        "nfcorpus": 0.9367,
+        "scripts": 0.8501
+      },
+      "fly_measured_matrix": {
+        "docs": 0.6358,
+        "mcp-core": 0.8035,
+        "mcp-flybrain": 0.834,
+        "mcp-tests": 0.7697,
+        "mlops": 0.8043,
+        "nfcorpus": 0.9564,
+        "scripts": 0.8499
+      },
+      "fly_measured_sample": {
+        "docs": 0.6441,
+        "mcp-core": 0.7964,
+        "mcp-flybrain": 0.8358,
+        "mcp-tests": 0.7831,
+        "mlops": 0.7965,
+        "nfcorpus": 0.9586,
+        "scripts": 0.8481
+      },
+      "exact": {
+        "docs": 0.7074,
+        "mcp-core": 0.7592,
+        "mcp-flybrain": 0.7791,
+        "mcp-tests": 0.7797,
+        "mlops": 0.8926,
+        "nfcorpus": 1.0,
+        "scripts": 0.8762
+      },
+      "hnsw": {
+        "docs": 0.7075,
+        "mcp-core": 0.7592,
+        "mcp-flybrain": 0.7789,
+        "mcp-tests": 0.7798,
+        "mlops": 0.8926,
+        "nfcorpus": 1.0,
+        "scripts": 0.8762
+      }
+    },
+    "differences": {
+      "simhash - exact": {
+        "mean": 0.03550853700516354,
+        "ci95": [
+          0.03131306333907042,
+          0.039870240103270276
+        ]
+      },
+      "simhash - hnsw": {
+        "mean": 0.035504041308089485,
+        "ci95": [
+          0.031284414285714435,
+          0.03992733820998284
+        ]
+      },
+      "simhash - flyhash_random": {
+        "mean": 0.0655986196213425,
+        "ci95": [
+          0.05466244638554208,
+          0.07380362676419974
+        ]
+      },
+      "flyhash_random - exact": {
+        "mean": -0.03009008261617896,
+        "ci95": [
+          -0.04098904492254741,
+          -0.017326455507745142
+        ]
+      },
+      "flyhash_random - hnsw": {
+        "mean": -0.030094578313253018,
+        "ci95": [
+          -0.041021997762478626,
+          -0.017269177366608997
+        ]
+      },
+      "flyhash_random - simhash": {
+        "mean": -0.0655986196213425,
+        "ci95": [
+          -0.07380362676419973,
+          -0.05466244638554208
+        ]
+      },
+      "fly_measured_matrix - exact": {
+        "mean": -0.020093366609294283,
+        "ci95": [
+          -0.03010738743545619,
+          -0.007758710154905213
+        ]
+      },
+      "fly_measured_matrix - hnsw": {
+        "mean": -0.02009786230636834,
+        "ci95": [
+          -0.0301104117900173,
+          -0.007701962822719153
+        ]
+      },
+      "fly_measured_matrix - simhash": {
+        "mean": -0.055601903614457826,
+        "ci95": [
+          -0.06384253115318414,
+          -0.04525102822719437
+        ]
+      },
+      "fly_measured_matrix - flyhash_random": {
+        "mean": 0.009996716006884676,
+        "ci95": [
+          0.005223958347676422,
+          0.01504704690189324
+        ]
+      },
+      "fly_measured_sample - exact": {
+        "mean": -0.018797184165232128,
+        "ci95": [
+          -0.028197976075731553,
+          -0.00724661566265049
+        ]
+      },
+      "fly_measured_sample - hnsw": {
+        "mean": -0.018801679862306186,
+        "ci95": [
+          -0.028236285542168664,
+          -0.007189868330464429
+        ]
+      },
+      "fly_measured_sample - simhash": {
+        "mean": -0.05430572117039567,
+        "ci95": [
+          -0.06292601643717718,
+          -0.04437383984509478
+        ]
+      },
+      "fly_measured_sample - flyhash_random": {
+        "mean": 0.011292898450946831,
+        "ci95": [
+          0.007084891566264917,
+          0.015942315748709076
+        ]
+      }
+    }
+  },
+  "wall_s": 276.5
+}
