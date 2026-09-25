@@ -32,13 +32,14 @@ The question is whether wiring alone recovers super_class. Super_class is curate
 | FlyWire (fw)† | 0.961 | 0.967 | **0.967** | 0.671 |
 | BANC | 0.961 | 0.921 | **0.893** [0.851–0.936], macro-F1 0.888 | 0.298 |
 | Optic lobe (ol) | 0.992 | — | **0.913**, macro-F1 0.711 | 0.705 |
-| male-cns (mc) | 0.979 | — | pending | — |
+| male-cns (mc) | 0.979 | — | **0.976** [0.966–0.984], macro-F1 0.798 | 0.654 |
 
 Best model shown (hgb); logreg also passes on every wiring-only run; ECE 0.02–0.05. †fw's neuropil-removed run is already wiring-only; the fw track is still running.
 
 Reading:
 
-- Wiring alone recovers super_class at **0.89–0.97** on held-out grouped splits in every finished dataset.
+- Wiring alone recovers super_class at **0.89–0.98** on held-out grouped splits in all four datasets tested (FlyWire, BANC, optic lobe, male-cns).
+- In male-cns, region features add nothing: 0.979 with them vs 0.976 without, and macro-F1 is unchanged (0.80).
 - In FlyWire, neuropil adds nothing.
 - In BANC, anatomy contributed about 7 points: roughly 4 from neuropil and 3 from morphology.
 - In the optic lobe, accuracy holds but macro-F1 drops from 0.985 to 0.711. The minority classes (visual projection and centrifugal types) depend on where synapses sit, which is part of how they are defined.
