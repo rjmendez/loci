@@ -85,14 +85,33 @@ class VllmFallbackTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("ollama", r["why"])
 
+    def _try(self, batch_result, opt_in="1"):
+        # The hermetic conftest deletes LOCI_VLLM_FALLBACK, and with it unset _try_vllm
+        # returns None before looking at the result -- set the opt-in so the result
+        # handling under test actually runs.
+        fake = mock.MagicMock()
+        fake.generate_batch.return_value = batch_result
+        fake._resolve_vllm_model.return_value = "served-model"
+        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": opt_in}), \
+                mock.patch.dict("sys.modules", {"batched_gen": fake}):
+            out = llm_local._try_vllm("hi", fmt="json", max_tokens=8, temperature=0.0)
+        return out, fake
+
     def test_a_vllm_result_that_is_not_ok_is_not_returned_as_success(self):
-        with mock.patch.object(llm_local, "batched_gen", create=True):
-            with mock.patch.dict("sys.modules"):
-                fake = mock.MagicMock()
-                fake.generate_batch.return_value = [{"text": "", "ok": False}]
-                with mock.patch.dict("sys.modules", {"batched_gen": fake}):
-                    self.assertIsNone(
-                        llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0))
+        out, fake = self._try([{"text": "junk", "ok": False}])
+        self.assertIsNone(out)
+        fake.generate_batch.assert_called_once_with(["hi"], max_tokens=8, fmt="json",
+                                                    think=False, endpoint_role=None)
+
+    def test_an_ok_vllm_result_is_returned_as_the_vllm_tier(self):
+        # Positive twin with the same opt-in: an ok result comes back, tagged.
+        out, _ = self._try([{"text": "answer", "ok": True}])
+        self.assertEqual(out, {"text": "answer", "ok": True, "model": "served-model", "tier": "vllm"})
+
+    def test_without_the_opt_in_vllm_is_never_called(self):
+        out, fake = self._try([{"text": "answer", "ok": True}], opt_in="0")
+        self.assertIsNone(out)
+        fake.generate_batch.assert_not_called()
 
 
 if __name__ == "__main__":

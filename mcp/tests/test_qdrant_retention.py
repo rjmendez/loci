@@ -48,12 +48,26 @@ class TestRetentionWindow(unittest.TestCase):
         index boundary was the purge window. Re-indexing fixed it until the next
         process start.
         """
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("LOCI_QDRANT_RETENTION_DAYS", None)
-            with mock.patch.object(qdrant_ops, "logger"):
-                # no backends.toml value in the test env -> the floor is 0
-                with mock.patch.dict("sys.modules", {"backends": None}):
+        # The REAL backends module reading a real (empty) backends.toml: no stubbed
+        # import, so a destructive default anywhere on the resolution path shows up.
+        import tempfile
+
+        import backends
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "backends.toml")
+            with open(cfg, "w") as fh:
+                fh.write("[qdrant]\nurl = \"http://qdrant.invalid:6333\"\n")
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(backends, "_CONFIG_PATH", cfg):
+                os.environ.pop("LOCI_QDRANT_RETENTION_DAYS", None)
+                backends._reset_cache()
+                try:
                     self.assertEqual(qdrant_ops._retention_days(), 0)
+                    client = _Client(count=5)
+                    qdrant_ops._purge_old_records(client, "loci_memory")
+                finally:
+                    backends._reset_cache()
+        self.assertEqual((client.counts, client.deletes), ([], []))
 
     def test_zero_disables_the_purge(self):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "0"})
@@ -71,9 +85,18 @@ class TestRetentionWindow(unittest.TestCase):
 
     def test_a_custom_window_is_honoured(self):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "90"})
-        self.assertEqual(len(client.deletes), 1)
-        rng = client.counts[0]["count_filter"].must[0].range
-        self.assertAlmostEqual(rng.lt, int(__import__("time").time()) - 90 * 86400, delta=5)
+        cutoff = int(__import__("time").time()) - 90 * 86400
+        # counted and deleted with the SAME filter: created_at_ts < now - 90 days, nothing else
+        (count,) = client.counts
+        (delete,) = client.deletes
+        stale = count["count_filter"]
+        self.assertEqual((count["collection_name"], count["exact"]), ("loci_memory", True))
+        self.assertEqual(delete["collection_name"], "loci_memory")
+        self.assertEqual(delete["points_selector"].filter, stale)
+        (cond,) = stale.must
+        self.assertEqual(cond.key, "created_at_ts")
+        self.assertEqual((cond.range.gt, cond.range.gte, cond.range.lte), (None, None, None))
+        self.assertAlmostEqual(cond.range.lt, cutoff, delta=5)
 
     def test_nothing_stale_means_no_delete_call(self):
         client = _purge({"LOCI_QDRANT_RETENTION_DAYS": "30"}, count=0)
@@ -87,11 +110,42 @@ class TestRetentionWindow(unittest.TestCase):
 
 
 class TestCallSiteDoesNotPinTheWindow(unittest.TestCase):
+    """The real _get_qdrant startup path: with no window configured it deletes nothing."""
+
+    class _StartupClient(_Client):
+        def get_collections(self):
+            import types
+            return types.SimpleNamespace(collections=[types.SimpleNamespace(name="loci_memory")])
+
+        def get_aliases(self):
+            import types
+            return types.SimpleNamespace(aliases=[])
+
+        def update_collection(self, *a, **k):
+            pass
+
+        def create_payload_index(self, **k):
+            pass
+
+    def _start(self, env):
+        import qdrant_client
+        client = self._StartupClient(count=5)
+        with mock.patch.dict(os.environ, {"QDRANT_URL": "http://qdrant.invalid:6333", **env}), \
+                mock.patch.object(qdrant_client, "QdrantClient", lambda *a, **k: client), \
+                mock.patch.object(qdrant_ops, "QDRANT_COLLECTION_PREFIX", "loci_memory"), \
+                mock.patch.object(qdrant_ops, "_qdrant_client", None), \
+                mock.patch.object(qdrant_ops, "_qdrant_failed_at", None):
+            self.assertEqual(qdrant_ops._get_qdrant(), (client, "loci_memory"))
+        return client
+
     def test_get_qdrant_passes_no_literal(self):
-        import inspect
-        src = inspect.getsource(qdrant_ops._get_qdrant)
-        self.assertIn("_purge_old_records(client, col)", src)
-        self.assertNotIn("retention_days=30", src)
+        client = self._start({"LOCI_QDRANT_RETENTION_DAYS": "0"})
+        self.assertEqual((client.counts, client.deletes), ([], []))
+
+    def test_get_qdrant_honours_a_configured_window(self):
+        # Positive twin: the startup path does purge when a window was chosen.
+        client = self._start({"LOCI_QDRANT_RETENTION_DAYS": "30"})
+        self.assertEqual((len(client.counts), len(client.deletes)), (1, 1))
 
 
 if __name__ == "__main__":
