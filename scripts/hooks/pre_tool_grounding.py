@@ -59,7 +59,7 @@ try:
 except Exception:
     pass
 
-BLOCK_MODE: bool = os.environ.get("HOOK_BLOCK_MODE", "0").strip() in ("1", "true", "yes")
+BLOCK_MODE: bool = os.environ.get("HOOK_BLOCK_MODE", "0").strip().lower() in ("1", "true", "yes")
 MAX_AUDIT_BYTES: int = 5 * 1024 * 1024  # 5 MB — matches Hermes logging.max_size_mb
 
 # ---- Granite Guardian semantic corroboration (opt-in, fail-open) --------------
@@ -201,7 +201,10 @@ MUTATION_TOOLS: frozenset[str] = frozenset({
 
 # ---- Dangerous terminal patterns — always audited, blocked in BLOCK_MODE ------
 DANGEROUS_TERMINAL_PATTERNS: list[tuple[str, str]] = [
-    (r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b", "rm -rf detected"),
+    # Recursive + force in any spelling: -rf, -fr, -rfv, -r -f, --recursive --force.
+    # Each lookahead scans rm's leading option words for one of the two flags.
+    (r"\brm(?=(?:\s+-\S+)*?\s+(?:-[a-z]*r|--recursive\b))"
+     r"(?=(?:\s+-\S+)*?\s+(?:-[a-z]*f|--force\b))", "rm -rf detected"),
     (r"\bDROP\s+(TABLE|DATABASE|SCHEMA)\b", "destructive SQL DDL"),
     (r"\bgit\s+push\s+.*--force(?!-with-lease)\b", "force push without --force-with-lease"),
     (r"\bgit\s+push\s+-f\b", "force push -f"),
@@ -245,9 +248,9 @@ SUPPLY_CHAIN_PATH_PATTERNS: list[tuple[str, str]] = [
      ".claude/setup.mjs (Hades IDE-open vector)"),
     (r"(^|[/\\])\.vscode[/\\]tasks\.json$",
      ".vscode/tasks.json (Hades IDE-open vector)"),
-    (r"[/\\]site-packages[/\\][^/\\]+\.pth$",
+    (r"(^|[/\\])site-packages[/\\][^/\\]+\.pth$",
      ".pth in site-packages (Python import hook)"),
-    (r"[/\\]dist-packages[/\\][^/\\]+\.pth$",
+    (r"(^|[/\\])dist-packages[/\\][^/\\]+\.pth$",
      ".pth in dist-packages (Python import hook)"),
     (r"(^|[/\\])binding\.gyp$",
      "binding.gyp (Phantom Gyp / Miasma install-hook)"),
@@ -288,7 +291,7 @@ INJECTION_HIGH: list[tuple[str, str]] = [
      "system prompt injection marker"),
     (r"(?i)\bI\s+AM\s+YOUR\s+(REAL\s+)?(USER|OPERATOR|DEVELOPER|OWNER|ADMIN)\b",
      "identity spoofing"),
-    (r"(?i)\bDO\s+NOT\s+(TELL|INFORM|REVEAL\s+(TO\s+)?)THE\s+(USER|HUMAN|OPERATOR)\b",
+    (r"(?i)\bDO\s+NOT\s+(TELL|INFORM|REVEAL(\s+TO)?)\s+THE\s+(USER|HUMAN|OPERATOR)\b",
      "hide-from-user instruction"),
     (r"(?i)(EXFILTRATE|EXFIL|SECRETLY\s+SEND|UPLOAD\s+WITHOUT\s+TELLING).{0,80}(KEY|TOKEN|SECRET|SSH|CREDENTIAL|\.ENV)",
      "credential exfiltration instruction"),
@@ -342,7 +345,10 @@ def _rotate_if_needed() -> None:
     try:
         if _audit_log.exists() and _audit_log.stat().st_size > MAX_AUDIT_BYTES:
             content = _audit_log.read_bytes()
-            _audit_log.write_bytes(content[-2 * 1024 * 1024:])
+            # Keep the tail: 2 MB, or half the threshold when that is smaller (a
+            # fixed 2 MB tail never shrank a log whose threshold is under 2 MB).
+            keep = min(2 * 1024 * 1024, max(1, MAX_AUDIT_BYTES // 2))
+            _audit_log.write_bytes(content[-keep:])
     except Exception:
         pass
 
@@ -363,7 +369,7 @@ def _is_subagent(payload: dict) -> bool:
     if os.environ.get("HERMES_SUBAGENT"):
         return True
     task_id = (payload.get("extra") or {}).get("task_id") or payload.get("session_id") or ""
-    return "subagent" in task_id.lower()
+    return "subagent" in str(task_id).lower()
 
 
 # ---- Helpers for mutation tool inspection ------------------------------------
@@ -405,6 +411,12 @@ def _extract_write_content(tool_name: str, tool_input: dict) -> str:
     body = tool_input.get("body")
     if body and isinstance(body, str):
         return body
+    # MultiEdit: every edits[*].new_string is written
+    edits = tool_input.get("edits")
+    if isinstance(edits, list):
+        return "\n".join(e["new_string"] for e in edits
+                         if isinstance(e, dict) and e.get("new_string")
+                         and isinstance(e["new_string"], str))
     return ""
 
 
@@ -432,7 +444,7 @@ def _check_injection_content(content: str) -> tuple[str | None, str | None]:
     Returns (high_match_description, suspicious_match_description).
     High tier is checked first; suspicious only checked if no high match.
     """
-    if not content or len(content) < 10:
+    if not content:
         return None, None
 
     for pattern, description in INJECTION_HIGH:
@@ -481,6 +493,8 @@ def main() -> None:
         raw = sys.stdin.read()
         payload = json.loads(raw)
     except (json.JSONDecodeError, OSError):
+        sys.exit(0)
+    if not isinstance(payload, dict):
         sys.exit(0)
 
     event = payload.get("hook_event_name", "")

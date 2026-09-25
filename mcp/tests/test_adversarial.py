@@ -10,10 +10,18 @@ import adversarial as A  # noqa: E402
 # --- stub gen_fn factories: match the shared contract gen_fn(prompt, *, fmt, max_tokens) ---
 
 def _ok(text):
+    """Stub that answers ``text`` and records every call in ``_fn.calls``.
+
+    It never raises: adversarial wraps gen_fn in ``except Exception`` and would turn
+    a raised assertion into a quiet degraded result. A call without fmt="json" is
+    answered as a failed generation instead, so the result comes back degraded.
+    """
     def _fn(prompt, *, fmt=None, max_tokens=256):
-        assert fmt == "json"                       # adversarial passes must request JSON
-        assert isinstance(prompt, str)
+        _fn.calls.append({"prompt": prompt, "fmt": fmt, "max_tokens": max_tokens})
+        if fmt != "json" or not isinstance(prompt, str):
+            return {"text": "", "ok": False}
         return {"text": text, "ok": True}
+    _fn.calls = []
     return _fn
 
 
@@ -124,15 +132,23 @@ def test_empty_findings_degraded_not_raised():
 
 
 def test_unknown_mode_falls_back_to_redteam():
-    out = A.adversarial_review(["x"], mode="bogus", gen_fn=_ok(_RT))
-    assert out["mode"] == "redteam"
+    fn = _ok(_RT)
+    out = A.adversarial_review(["x"], mode="bogus", gen_fn=fn)
+    assert (out["mode"], out["degraded"]) == ("redteam", False)
+    assert [(r["finding"], r["exploitable"], r["degraded"]) for r in out["results"]] == [("x", True, False)]
+    # one red-team prompt per finding, requesting JSON
+    assert [(c["fmt"], c["max_tokens"]) for c in fn.calls] == [("json", 400)]
 
 
 def test_findings_coercion():
     # dicts flatten to k=v text; a bare string is accepted; a huge list is capped
-    out = A.adversarial_review({"kind": "secret", "where": "persist"}, mode="redteam",
-                              gen_fn=_ok(_RT))
-    assert len(out["results"]) == 1
+    fn = _ok(_RT)
+    out = A.adversarial_review({"kind": "secret", "where": "persist", "n": 3, "skip": None},
+                               mode="redteam", gen_fn=fn)
+    assert [r["finding"] for r in out["results"]] == ["kind=secret; where=persist; n=3"]
+    assert out["degraded"] is False
+    assert "kind=secret; where=persist; n=3" in fn.calls[0]["prompt"]
+    assert [r["finding"] for r in A.adversarial_review("  bare  ", gen_fn=_ok(_RT))["results"]] == ["bare"]
     big = A.adversarial_review([f"f{i}" for i in range(A._MAX_FINDINGS + 20)],
-                             mode="redteam", gen_fn=_ok(_RT))
-    assert len(big["results"]) == A._MAX_FINDINGS
+                               mode="redteam", gen_fn=_ok(_RT))
+    assert [r["finding"] for r in big["results"]] == [f"f{i}" for i in range(A._MAX_FINDINGS)]

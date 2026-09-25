@@ -33,7 +33,11 @@ def test_tail_segment_last_path_component():
 def test_classify_flavour():
     assert classify_flavour("mcp/server.py") == "path"
     assert classify_flavour("LOCI_PORT") == "key"
-    assert classify_flavour("has a space and/slash") is None or classify_flavour("has a space and/slash") == "path"
+    assert classify_flavour("notes.jsonl") == "path"
+    assert classify_flavour("~/.hermes/x") == "path"
+    # Prose is neither a path nor a key (the old assert accepted either outcome
+    # for an ambiguous string, so "everything is a path" passed).
+    assert classify_flavour("hello world") is None
 
 
 def test_literal_node_id_stable_for_same_normalized_text():

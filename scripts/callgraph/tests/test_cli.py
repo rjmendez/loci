@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+from .conftest import VALIDATED_REV, needs_corpus_deps, needs_git_history  # noqa: F401
 from .helpers import mcp_tool_functions, source_at
 
 from ..cli import main
@@ -75,8 +75,10 @@ def test_aliases_symbol_impact(capsys):
 
 
 def test_bad_subcommand_exits_nonzero():
-    with pytest.raises(SystemExit):
+    # SystemExit(0) is also a SystemExit: pin argparse's usage-error status.
+    with pytest.raises(SystemExit) as excinfo:
         main(["not-a-real-command"])
+    assert excinfo.value.code == 2
 
 
 # -- callers / reach ---------------------------------------------------------
@@ -169,6 +171,25 @@ def test_holes_groups_by_reason(capsys):
     code, out = _run(capsys, ["holes", "--rev", "HEAD", "--scope", "mcp/graph_tools.py"])
     assert code == 0
     assert "callsite(s) total" in out
+    code, out = _run(capsys, ["holes", "--rev", "HEAD", "--scope", "mcp/graph_tools.py",
+                              "--format", "json"])
+    payload = json.loads(out)
+    # every unresolved callsite is attributed to a real reason, and the groups add up
+    assert sum(payload["by_reason"].values()) == payload["total"] > 0
+    assert "unknown" not in payload["by_reason"]
+
+
+@needs_git_history
+def test_holes_reason_breakdown_at_the_validated_rev(capsys):
+    # Exact at the fixed revision (HEAD moves as code lands; the tool must not).
+    code, out = _run(capsys, ["holes", "--rev", VALIDATED_REV, "--scope", "mcp/graph_tools.py",
+                              "--format", "json"])
+    assert code == 0
+    assert json.loads(out) == {
+        "by_reason": {"attribute-unknown-receiver": 26, "call-result-unresolved": 1,
+                      "name-not-bound-in-module-scope": 20},
+        "total": 47,
+    }
 
 
 # -- probable tier: dispatch / injected globals -------------------------------
@@ -252,7 +273,26 @@ def test_paths_dot_renders_the_hop_chain(capsys):
 
 
 def test_entrypoints_names_code_memory_relink_tool(capsys):
+    # The line of `def code_memory_relink` at HEAD, from plain ast (no pipeline
+    # code), so the test follows the function rather than a pinned line number.
+    import ast
+    import subprocess
+    from ..config import REPO_ROOT
+    source = subprocess.run(["git", "show", "HEAD:mcp/graph_tools.py"], cwd=REPO_ROOT,
+                            capture_output=True, text=True, check=True).stdout
+    line = next(n.lineno for n in ast.parse(source).body
+                if isinstance(n, ast.FunctionDef) and n.name == "code_memory_relink")
+
+    code, out = _run(capsys, ["entrypoints", f"mcp/graph_tools.py:{line + 1}", "--rev", "HEAD", "--scope", "mcp/"])
+    assert code == 0
+    assert f"mcp/graph_tools.py:{line + 1}  ->  code_memory_relink" in out
+    assert "reachable from 1 entry point(s):" in out
+    assert re.search(r"entry:mcp-tool:code_memory_relink\s+PROVEN", out), out
+
+
+def test_entrypoints_on_the_module_docstring_falls_back_to_the_module(capsys):
     code, out = _run(capsys, ["entrypoints", "mcp/graph_tools.py:1", "--rev", "HEAD", "--scope", "mcp/"])
     # Line 1 is the module docstring: falls back to the MODULE id, which has no ENTRYPOINT.
     assert code == 0
-    assert "mcp/graph_tools.py:1" in out
+    assert "mcp/graph_tools.py:1  ->  mod:mcp/graph_tools.py" in out
+    assert "reachable from 0 known entry points" in out

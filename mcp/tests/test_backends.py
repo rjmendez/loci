@@ -103,6 +103,15 @@ def test_cloud_tier_enabled_accepts_bool_and_string(monkeypatch, tmp_path):
     assert B.cloud_tier_enabled() is True
     monkeypatch.setenv("LOCI_CLOUD_TIER_ENABLED", "0")
     assert B.cloud_tier_enabled() is False
+    # the string branch, from env and from a quoted config value
+    for raw, want in (("1", True), ("true", True), (" YES ", True), ("on", True),
+                      ("off", False), ("no", False), ("false", False), ("2", False)):
+        monkeypatch.setenv("LOCI_CLOUD_TIER_ENABLED", raw)
+        assert B.cloud_tier_enabled() is want, raw
+    monkeypatch.delenv("LOCI_CLOUD_TIER_ENABLED")
+    cfg.write_text('[cloud]\nenabled="yes"\n')
+    B._reset_cache()
+    assert B.cloud_tier_enabled() is True
 
 
 def test_cloud_guardrail_settings_resolve_from_config_then_env(monkeypatch, tmp_path):
@@ -222,9 +231,15 @@ def test_verify_classify_and_compress_model_fall_back_to_gen_model_when_unset(mo
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
-    assert B.ollama_verify_model() == B.ollama_gen_model()
-    assert B.ollama_classify_model() == B.ollama_gen_model()
-    assert B.ollama_compress_model() == B.ollama_gen_model()
+    # no env, no config, nothing installed: the documented default, for all four
+    assert B.ollama_gen_model() == "qwen2.5:3b"
+    assert B.ollama_verify_model() == "qwen2.5:3b"
+    assert B.ollama_classify_model() == "qwen2.5:3b"
+    assert B.ollama_compress_model() == "qwen2.5:3b"
+    # and they follow gen_model when only that is set
+    monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "only-gen:7b")
+    assert (B.ollama_verify_model(), B.ollama_classify_model(), B.ollama_compress_model()) == \
+        ("only-gen:7b",) * 3
 
 
 def test_verify_model_config_key_overrides_gen_model(tmp_path, monkeypatch):

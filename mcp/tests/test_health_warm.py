@@ -77,11 +77,44 @@ def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
 
 def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
     # Every probe, the resolvers' own included, must be short-timeout so a first call cannot block.
+    # The spies record the timeout each probe is given (history: 589722f emptied this test).
     for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(backends, "_config", lambda: {})
-    backends.ollama_url.cache_clear()
-    backends.vllm_url.cache_clear()
+    seen = {"resolver": [], "alive": [], "http": []}
+
+    def _resolver(url):
+        def _fn(*a, **k):
+            seen["resolver"].append(k.get("probe_timeout", a[0] if a else None))
+            return url
+        return _fn
+
+    def _alive(url, timeout=None):
+        seen["alive"].append(timeout)
+        return True
+
+    def _http_probe(url, path, timeout=None, headers=None):
+        seen["http"].append(timeout)
+        return False, {}          # not ok -> the ollama lanes also take the status probe
+
+    def _http_status(url, path, timeout=None, headers=None):
+        seen["http"].append(timeout)
+        return 404
+
+    monkeypatch.setattr(backends, "ollama_url", _resolver("http://localhost:11434"))
+    monkeypatch.setattr(backends, "ollama_gen_url", _resolver("http://localhost:11434"))
+    monkeypatch.setattr(backends, "vllm_url", _resolver("http://localhost:8000"))
+    monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
+    monkeypatch.setattr(backends, "_alive", _alive)
+    monkeypatch.setattr(backends, "_http_probe", _http_probe)
+    monkeypatch.setattr(backends, "_http_status", _http_status)
+
+    out = json.loads(server.loci_health())
+
+    assert seen["resolver"] == [0.5, 0.5, 0.5]        # ollama, ollama_gen, vllm resolvers
+    assert seen["alive"] == [0.5] * 4                 # one TCP gate per endpoint
+    assert seen["http"] == [1.0] * 6                  # 4 GETs + 2 ollama status fallbacks
+    assert (out["ollama_reachable"], out["vllm_reachable"], out["qdrant_reachable"]) == (True, False, False)
 
 
 def test_loci_health_explicit_backend_down_is_unhealthy(monkeypatch):
@@ -192,11 +225,20 @@ def test_warm_fires_once_and_flips_warmed():
     _reset_warm()
     assert embed_ops.warmed() is False
     calls = []
-    started = embed_ops.warm(embed_fn=lambda t: calls.append(t) or [])
+    fired = threading.Event()
+
+    def _embed(texts):
+        calls.append(texts)
+        fired.set()
+        return []
+
+    started = embed_ops.warm(embed_fn=_embed)
     assert started is True
     assert embed_ops.warmed() is True
+    assert fired.wait(timeout=5) is True
     # idempotent: a second call does not re-fire
-    assert embed_ops.warm(embed_fn=lambda t: calls.append(t) or []) is False
+    assert embed_ops.warm(embed_fn=_embed) is False
+    assert calls == [["warm"]]
 
 
 def test_warm_is_best_effort_never_raises_when_endpoint_down():

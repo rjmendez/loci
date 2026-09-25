@@ -772,14 +772,18 @@ def test_escalate_with_prior_context_includes_cheap_answer_in_prompt():
             return [{"ok": True, "text": '{"summary":"Prior-aware escalation succeeded."}'}]
         raise AssertionError(f"unexpected model: {model}")
 
-    config = _config(subtasks=["critique this"], fanout_count=1)
+    # A neutral subtask: the old one was "critique this", so the word "critique"
+    # was in the prompt even with the critique instruction deleted.
+    config = _config(subtasks=["summarize the auth policy"], fanout_count=1)
     config.escalate_with_prior_context = True
     result = S.run_swarm(config, deps={"generate_batch": _generate_batch})
 
     _assert_valid(result)
     assert result["findings"][0]["answer"] == "improved strong answer"
+    assert len(captured) == 1
     assert "PRIOR_WEAK_ANSWER: cheap weaker draft" in captured[0]
-    assert "Critique" in captured[0] or "critique" in captured[0]
+    assert "PRIOR_CONFIDENCE: low" in captured[0]
+    assert "Critique it, correct any mistakes, and improve the answer" in captured[0]
 
 
 def test_hierarchical_reduce_groups_findings_and_fails_open_per_group():

@@ -30,33 +30,67 @@ class QdrantTimeoutTest(unittest.TestCase):
             "10.87s was measured on agent_core_chunks; a shorter timeout fails it")
 
     def test_timeout_is_configurable(self):
-        with mock.patch.dict(os.environ, {"LOCI_QDRANT_TIMEOUT": "42"}):
-            import qdrant_ops
-            importlib.reload(qdrant_ops)
-            try:
-                self.assertEqual(qdrant_ops._QDRANT_TIMEOUT, 42.0)
-            finally:
+        import qdrant_ops
+        before = qdrant_ops._QDRANT_TIMEOUT
+        try:
+            with mock.patch.dict(os.environ, {"LOCI_QDRANT_TIMEOUT": "42"}):
                 importlib.reload(qdrant_ops)
+                self.assertEqual(qdrant_ops._QDRANT_TIMEOUT, 42.0)
+        finally:
+            # Outside the env patch: reloading inside it re-read "42" and leaked
+            # 42.0 into every later test in the session.
+            importlib.reload(qdrant_ops)
+        self.assertEqual(qdrant_ops._QDRANT_TIMEOUT, before)
+
+
+_MCP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_SCRIPTS_DIR = os.path.join(os.path.dirname(_MCP_DIR), "scripts")
 
 
 class QueryExpandShadowTest(unittest.TestCase):
 
-    def test_the_cli_wrapper_reexports_expand(self):
-        """Whichever module wins the name, expand() must exist."""
-        import importlib.util
+    def _import_query_expand(self, path_front):
+        """Import `query_expand` in a fresh interpreter with ``path_front`` first
+        on sys.path, and report what the name resolved to and what expand() does
+        with a stub generator (so no model is needed)."""
+        import json
+        import subprocess
         import sys
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "..", "scripts", "query_expand.py")
-        spec = importlib.util.spec_from_file_location("scripts_query_expand", path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["scripts_query_expand"] = mod
-        try:
-            spec.loader.exec_module(mod)
-            self.assertTrue(hasattr(mod, "expand"),
-                            "the CLI wrapper must re-export expand() or it shadows it away")
-            self.assertIsNotNone(mod.expand)
-        finally:
-            sys.modules.pop("scripts_query_expand", None)
+        import textwrap
+        code = textwrap.dedent("""
+            import json, sys
+            sys.path[:0] = json.loads(sys.argv[1])
+            import query_expand
+            expand = getattr(query_expand, "expand", None)
+            out = {"callable": callable(expand)}
+            if callable(expand):
+                out["defined_in"] = expand.__code__.co_filename
+                gen = lambda prompt, **kw: {"ok": True, "text": json.dumps(
+                    {"queries": ["alpha rewrite"], "keywords": ["beta"]})}
+                out["result"] = expand("alpha", gen_fn=gen, n_queries=2, n_keywords=2)
+            print(json.dumps(out))
+        """)
+        proc = subprocess.run([sys.executable, "-c", code, json.dumps(path_front)],
+                              capture_output=True, text=True, timeout=60, cwd=_MCP_DIR)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_scripts_ahead_of_mcp_still_resolves_the_real_expand(self):
+        # scripts/judge_eval.py leaves scripts/ AHEAD of mcp/ on sys.path, and the
+        # server then does `import query_expand`. Reproduce that order exactly.
+        got = self._import_query_expand([_SCRIPTS_DIR, _MCP_DIR])
+        self.assertTrue(got["callable"], "scripts/query_expand.py shadowed expand() away")
+        self.assertEqual(os.path.realpath(got["defined_in"]),
+                         os.path.realpath(os.path.join(_MCP_DIR, "query_expand.py")))
+        self.assertEqual(got["result"]["degraded"], False)
+        self.assertEqual(got["result"]["queries"][0], "alpha")
+        self.assertIn("alpha rewrite", got["result"]["queries"])
+
+    def test_mcp_first_resolves_the_real_expand(self):
+        got = self._import_query_expand([_MCP_DIR, _SCRIPTS_DIR])
+        self.assertEqual(os.path.realpath(got["defined_in"]),
+                         os.path.realpath(os.path.join(_MCP_DIR, "query_expand.py")))
+        self.assertEqual(got["result"]["degraded"], False)
 
 
 class RagDocstringTest(unittest.TestCase):

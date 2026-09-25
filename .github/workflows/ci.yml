@@ -163,6 +163,12 @@ jobs:
         # trips a shorter per-test timeout as ~18 spurious errors.
         run: pytest mlops -v --tb=short --timeout=120
 
+      # The grounding gate and its feature contract (the layout mlops trains on) and
+      # the deep-think-loci argument guards, executed in node. Same deps as mlops;
+      # node is preinstalled on ubuntu-latest. Not run anywhere in CI before.
+      - name: Run deep_think_loci tests
+        run: pytest deep_think_loci -v --tb=short --timeout=60
+
   test-callgraph:
     name: Callgraph tool tests
     runs-on: ubuntu-latest
@@ -226,6 +232,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # check_test_weakening.py walks the PR's commits one at a time.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -233,6 +242,24 @@ jobs:
 
       - name: Install ruff
         run: pip install ruff
+
+      # The 2026-09 audit found 180 tests that stayed green with the behaviour they
+      # name removed. This rejects the mechanical shapes (bare raises(Exception),
+      # 'or True', swallowed asserts, assertion-free tests, non-strict xfail, skips
+      # gated on undocumented env vars). Known debt is in the allowlist, which only
+      # shrinks: a stale entry (the test was fixed) fails too, so the fix and the
+      # entry's deletion land together. See AGENTS.md "Test-writing rules for agents".
+      - name: Test honesty
+        run: python3 scripts/check_test_honesty.py --fail-stale
+
+      # Heuristic, so it warns rather than fails: a commit that changes source and,
+      # in the same commit, drops assertions / loosens == to >= / adds skips in a
+      # test file, without a 'Test-weakened-because:' trailer.
+      - name: Flag tests weakened alongside source changes
+        if: github.event_name == 'pull_request'
+        run: >-
+          python3 scripts/check_test_weakening.py
+          --range ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
       - name: Check syntax and imports
         run: |
@@ -307,8 +334,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pytest
-        run: pip install pytest
+      # mnemosyne-memory has no dependencies. Without it the checks against its real
+      # DDL (TestEmbeddedSchemaMatchesMnemosyne, the "mnemosyne" subtests) skip and
+      # the file only compares the scripts with its own embedded copy of the schema.
+      # Pinned to the version the service runs; bump both together.
+      - name: Install pytest and mnemosyne
+        run: pip install pytest mnemosyne-memory==3.4.0
 
       - name: Run schema consistency tests
         run: pytest tests/test_schema_consistency.py -v --tb=short

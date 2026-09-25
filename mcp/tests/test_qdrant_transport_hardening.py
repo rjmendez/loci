@@ -23,6 +23,15 @@ class _Resp:
         return self._payload
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _module_globals_are_restored():
+    # Direct assignment (Q._OLLAMA_BASE = ...) leaked embed.local into every
+    # later test in the session. Tests must set module globals via monkeypatch.
+    before = Q._OLLAMA_BASE
+    yield
+    assert Q._OLLAMA_BASE == before, "a test leaked qdrant_ops._OLLAMA_BASE"
+
+
 @pytest.fixture(autouse=True)
 def _reset_transport_state(monkeypatch):
     for op in ("embed", "qdrant_query"):
@@ -53,7 +62,7 @@ def _install_requests(monkeypatch, side_effects):
 
 
 def test_embed_retries_timeout_then_recovers(monkeypatch):
-    Q._OLLAMA_BASE = "http://embed.local:11434"
+    monkeypatch.setattr(Q, "_OLLAMA_BASE", "http://embed.local:11434")
     monkeypatch.setattr(Q, "_EMBED_RETRY_ATTEMPTS", 2)
     monkeypatch.setattr(Q, "_TRANSPORT_BACKOFF_BASE_S", 0.01)
     monkeypatch.setattr(Q, "_TRANSPORT_BACKOFF_CAP_S", 0.02)
@@ -73,7 +82,7 @@ def test_embed_retries_timeout_then_recovers(monkeypatch):
 
 
 def test_embed_brownout_opens_and_short_circuits(monkeypatch):
-    Q._OLLAMA_BASE = "http://embed.local:11434"
+    monkeypatch.setattr(Q, "_OLLAMA_BASE", "http://embed.local:11434")
     monkeypatch.setattr(Q, "_EMBED_RETRY_ATTEMPTS", 1)
     monkeypatch.setattr(Q, "_TRANSPORT_BROWNOUT_THRESHOLD", 2)
     monkeypatch.setattr(Q, "_TRANSPORT_BROWNOUT_SECONDS", 60.0)
@@ -100,7 +109,7 @@ def test_embed_brownout_opens_and_short_circuits(monkeypatch):
 
 
 def test_embed_readiness_gate_blocks_high_cost_call(monkeypatch):
-    Q._OLLAMA_BASE = "http://embed.local:11434"
+    monkeypatch.setattr(Q, "_OLLAMA_BASE", "http://embed.local:11434")
     monkeypatch.setattr(Q, "_endpoint_ready", lambda _url: False)
     requests_mock = types.SimpleNamespace(post=lambda *a, **k: _Resp({}))  # pragma: no cover - must not be called
     monkeypatch.setitem(sys.modules, "requests", requests_mock)

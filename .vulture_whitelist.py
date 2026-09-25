@@ -149,3 +149,8 @@ _ = independent_agents
 # through the base class, never called directly in this repo.
 _ = _send_prompt_to_target_async
 _ = cleanup_target_async
+
+# ── pytest autouse fixtures (requested by pytest by name, never called)
+# scripts/tests/test_issue_proposer.py: fails any test that writes the
+# operator's real queue/dashboard/ledger files instead of its tmp paths.
+_ = _production_files_untouched

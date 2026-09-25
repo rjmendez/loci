@@ -61,8 +61,68 @@ class TestStoreLocal(unittest.TestCase):
 
     def test_false_still_attempts_the_fan_out(self):
         # Suppressing the local write must not suppress the actual point of the skill.
-        out, _ = call(content="hello", store_local=False)
-        self.assertIn("broadcast", out)
+        # With a peer configured the POST must actually go out (with no peer the
+        # 'broadcast' key is present either way, which is what hid a skipped fan-out).
+        peer = "http://peer-a:8201/a2a"
+        posts = []
+
+        class _Resp:
+            status = 200
+
+            async def json(self):
+                return {"result": {"output": {"id": "peer-mem-1"}}}
+
+            async def text(self):
+                return ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Sess:
+            closed = False
+
+            def post(self, url, json=None, headers=None):
+                posts.append((url, json, headers))
+                return _Resp()
+
+        remembered = []
+
+        async def fake_remember(task):
+            remembered.append(task)
+            return {"id": "stored-id"}
+
+        saved = a2a._http_session
+        a2a._http_session = _Sess()
+        try:
+            with mock.patch.dict(os.environ, {"PEER_A2A_URLS": peer,
+                                              "PEER_A2A_TOKEN": "peer-tok",
+                                              "PEER_A2A_TOKENS_JSON": "{}",
+                                              "PEER_A2A_TOTP_SEED": "",
+                                              "PEER_A2A_TOTP_SEEDS_JSON": "{}"}), \
+                 mock.patch.object(a2a, "skill_memory_remember", fake_remember):
+                out = run(a2a.skill_context_broadcast(
+                    {"input": {"content": "hello", "store_local": False, "importance": 0.8},
+                     "sender": "test"}))
+        finally:
+            a2a._http_session = saved
+
+        self.assertEqual(remembered, [])
+        self.assertFalse(out["stored_locally"])
+        self.assertEqual(out["peers_count"], 1)
+        self.assertEqual(out["broadcast"],
+                         [{"peer": peer, "status": "ok", "output": {"id": "peer-mem-1"}}])
+        self.assertEqual(len(posts), 1)
+        url, body, headers = posts[0]
+        self.assertEqual(url, peer)
+        self.assertEqual(headers["Authorization"], "Bearer peer-tok")
+        self.assertEqual(body["method"], "tasks/send")
+        self.assertEqual(body["params"]["skill_id"], "memory_remember")
+        self.assertEqual(body["params"]["input"]["content"], "hello")
+        self.assertEqual(body["params"]["input"]["importance"], 0.8)
+        self.assertEqual(body["params"]["input"]["_boundary"]["lane"], "context_broadcast")
 
     def test_empty_content_still_rejected(self):
         out, calls = call(content="   ", store_local=False)

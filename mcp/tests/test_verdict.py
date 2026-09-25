@@ -3,6 +3,7 @@
 import sys
 import os
 import unittest
+from dataclasses import asdict
 
 # Resolves whether pytest is launched from mcp/ or from the repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -150,26 +151,30 @@ class TestVerdictSerialization(unittest.TestCase):
         )
 
     def test_to_payload_roundtrip(self):
+        # Every field off its default so a hard-coded/defaulted field in
+        # from_payload cannot survive a whole-object comparison.
         v = self._make_verdict()
+        v.occurrences = 4
+        v.first_seen = "2026-01-01T00:00:00.000000Z"
+        v.last_seen = "2026-01-02T00:00:00.000000Z"
+        v.provisional = True
         payload = v.to_payload()
+        self.assertEqual(payload, asdict(v))
         v2 = Verdict.from_payload(payload)
-        self.assertEqual(v.id, v2.id)
-        self.assertEqual(v.decision, v2.decision)
-        self.assertEqual(v.refs, v2.refs)
-        self.assertEqual(v.confidence, v2.confidence)
+        self.assertEqual(v2, v)
+        self.assertEqual(asdict(v2), payload)
 
     def test_to_payload_json_safe(self):
         import json
         v = self._make_verdict()
         payload = v.to_payload()
-        dumped = json.dumps(payload)  # should not raise
-        self.assertIsInstance(dumped, str)
+        self.assertEqual(Verdict.from_payload(json.loads(json.dumps(payload))), v)
 
     def test_from_payload_ignores_extra_keys(self):
-        payload = self._make_verdict().to_payload()
+        v = self._make_verdict()
+        payload = v.to_payload()
         payload["unknown_future_field"] = "some value"
-        v = Verdict.from_payload(payload)  # should not raise
-        self.assertEqual(v.decision, "warn")
+        self.assertEqual(Verdict.from_payload(payload), v)
 
     def test_from_payload_missing_refs_defaults_to_empty(self):
         payload = self._make_verdict().to_payload()

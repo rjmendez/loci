@@ -2,9 +2,9 @@
 
 This hook runs before *every* LLM call in a Claude Code session, so its
 contract is mostly about what it emits on stdout and when it silently
-gets out of the way. These tests pin the behaviour AS IT IS TODAY --
-including several things that are arguably wrong (see the module-level
-BUG comments) -- so that a refactor can be checked against them.
+gets out of the way. These tests pin that behaviour so a refactor can be
+checked against them. They once also pinned bugs as-is; those now assert
+the correct behaviour (AGENTS.md rule 8: never pin a known bug).
 
 No network, no Qdrant, no Ollama: every outbound call goes through
 urllib.request.urlopen, which is patched, or through a module-level
@@ -422,16 +422,30 @@ def test_search_collection_raises_on_http_error(hook):
         calls.stop()
 
 
-def test_search_collection_null_result_raises_typeerror(hook):
-    """BUG: Qdrant error envelopes carry {"result": null}; `.get("result", [])`
-    returns None and the for-loop raises. Swallowed in the fan-out (futures are
-    guarded) but fatal on the subagent path, which calls this directly."""
+def test_search_collection_null_result_is_an_empty_hit_list(hook):
+    """Qdrant error envelopes carry {"result": null}. That must read as "no hits",
+    not raise TypeError -- the subagent path calls this directly and only catches
+    _SearchFailed, so a TypeError there killed the hook."""
     calls = fake_urlopen(hook, Resp({"status": {"error": "boom"}, "result": None}))
     try:
-        with pytest.raises(TypeError):
-            hook._search_collection("c1", [1.0], "text", None, True)
+        assert hook._search_collection("c1", [1.0], "text", None, True) == []
     finally:
         calls.stop()
+    assert len(calls) == 1
+
+
+def test_subagent_survives_a_null_result_envelope(hook):
+    hook._embed = lambda t: [0.1]
+    hook._load_rules_summary = lambda: ""
+    calls = fake_urlopen(hook, Resp({"status": {"error": "boom"}, "result": None}))
+    try:
+        code, out = run_main(hook, _prompt(task_id="subagent-1"))
+    finally:
+        calls.stop()
+    assert code is None
+    assert context_of(out) == hook.GROUNDING_DIRECTIVE
+    assert [c["url"] for c in calls] == [
+        "http://qdrant.invalid:6333/collections/loci_memory/points/search"]
 
 
 def test_search_collection_missing_result_key_is_empty(hook):
@@ -669,12 +683,16 @@ def test_multi_signal_score_missing_payload_key_is_tolerated(hook):
     assert hook._multi_signal_score(hit, 1.0) == pytest.approx(0.495)
 
 
-def test_multi_signal_score_requires_score_key_even_when_fused_present(hook):
-    """BUG: the default expression `hit['score'] * ...` is evaluated eagerly,
-    so a hit carrying 'fused' but no 'score' raises KeyError instead of using
-    the fused value it already has."""
-    with pytest.raises(KeyError):
-        hook._multi_signal_score({"fused": 0.9, "importance": 0.5, "payload": {}}, 1.0)
+def test_multi_signal_score_uses_fused_without_needing_score(hook):
+    """A hit that already carries 'fused' is ranked on it; a missing 'score'
+    (never read in that case) must not raise KeyError."""
+    got = hook._multi_signal_score({"fused": 0.9, "importance": 0.5, "payload": {}}, 1.0)
+    assert got == pytest.approx(0.5 * 0.9 + 0.2 * 0.5 + 0.15 * 0.6 + 0.15 * 0.7)
+
+
+def test_multi_signal_score_derives_relevance_when_fused_is_absent(hook):
+    got = hook._multi_signal_score({"score": 0.8, "importance": 0.25, "payload": {}}, 1.0)
+    assert got == pytest.approx(0.5 * 0.2 + 0.2 * 0.5 + 0.15 * 0.6 + 0.15 * 0.7)
 
 
 def test_pheromone_boost_is_added_on_top(hook):
@@ -803,12 +821,16 @@ def test_clean_content_json_list_with_no_usable_turns_becomes_empty(hook):
     assert hook._clean_content(json.dumps([{"role": "user", "content": "   "}])) == ""
 
 
-def test_clean_content_drops_non_transcript_json_arrays(hook):
-    """BUG: any payload that happens to start with '[{' or '["' is assumed to be
-    a chat transcript. Structured non-transcript content is silently erased,
-    which in _format_results means the hit is dropped from the output entirely."""
-    assert hook._clean_content('[{"file": "a.py", "lines": 12}]') == ""
-    assert hook._clean_content('["alpha", "beta"]') == ""
+def test_clean_content_keeps_non_transcript_json_arrays(hook):
+    """Only a chat transcript (dicts with a "role") is condensed. Other structured
+    content that happens to start with '[{' or '["' is kept as-is; it used to be
+    erased, which in _format_results dropped the hit from the output entirely."""
+    for blob in ('[{"file": "a.py", "lines": 12}]', '["alpha", "beta"]',
+                 '["broken", "json",', '[{"file": "a.py", "lines":'):
+        assert hook._clean_content(blob) == blob, blob
+    # positive twin: a transcript is still condensed
+    assert hook._clean_content('[{"role": "user", "content": "the pipeline is failing"}]') == \
+        "user: the pipeline is failing"
 
 
 def test_clean_content_regex_fallback_for_broken_json(hook):
@@ -969,11 +991,12 @@ def test_main_exits_quietly_on_unparseable_stdin(hook):
     assert code == 0 and out == ""
 
 
-def test_main_raises_on_non_object_json(hook):
-    """BUG: the guard catches JSONDecodeError/OSError but not the AttributeError
-    from calling .get() on a non-dict payload (e.g. a bare JSON string)."""
-    with pytest.raises(AttributeError):
-        run_main(hook, '"just a string"')
+@pytest.mark.parametrize("raw", ['"just a string"', "[1, 2]", "42", "null"])
+def test_main_exits_quietly_on_non_object_json(hook, raw):
+    """Valid JSON that is not an object is not a hook event: fail open, like
+    unparseable stdin, instead of an AttributeError traceback."""
+    code, out = run_main(hook, raw)
+    assert code == 0 and out == ""
 
 
 @pytest.mark.parametrize("event", ["", "PostToolUse", "Stop", "pre_tool_use", None])
@@ -1328,21 +1351,40 @@ def test_sa_exception_is_swallowed(hook):
     assert "seeded" in context_of(out)
 
 
-def test_sa_hits_are_appended_after_selection_so_a_full_pool_hides_them(hook):
-    """BUG: SA results are appended after MMR has already chosen RECALL_TOP_K
-    hits, and _format_results stops at RECALL_TOP_K lines. Whenever the vector
-    search already returned K usable hits -- the normal case -- the spreading
-    activation work is executed and then never shown."""
+def test_sa_hits_compete_for_the_top_k_when_the_pool_is_full(hook):
+    """SA results join the candidate pool BEFORE the RECALL_TOP_K selection. When
+    the vector search already returned K usable hits -- the normal case -- a
+    strongly activated SA memory must still be able to take a slot, instead of
+    being appended after selection and cut off by _format_results."""
     pool = [_mn_hit("first finding", mid="m-1", score=0.9),
             _mn_hit("second finding", score=0.89),
             _mn_hit("third finding", score=0.88)]
     calls = _sa_setup(hook, pool,
-                      [{"content": "associatively linked memory", "activation": 0.99}])
+                      [{"content": "associatively linked memory", "activation": 0.99,
+                        "importance": 0.9}])
     with mock.patch("random.random", return_value=1.0):
         _, out = run_main(hook, _prompt())
     ctx = context_of(out)
-    assert calls, "SA ran"
-    assert "associatively linked memory" not in ctx
+    assert len(calls) == 1
+    assert calls[0]["seed_ids"] == ["m-1"]
+    lines = ctx.splitlines()
+    assert lines[0].startswith("MEMORY MATCH (3 results from ")
+    # highest multi-signal score (fused 0.891) is selected first
+    assert lines[1] == "[mnemosyne-sa|0.99] associatively linked memory"
+    assert ctx.count("[mnemosyne|") == 2
+
+
+def test_sa_hit_weaker_than_the_pool_loses_its_slot_on_merit(hook):
+    """Merging before selection is competition, not a reserved slot."""
+    pool = [_mn_hit("alpha one", mid="m-1", score=0.9),
+            _mn_hit("bravo two", score=0.89),
+            _mn_hit("charlie three", score=0.88)]
+    _sa_setup(hook, pool, [{"content": "faint echo", "activation": 0.05,
+                            "importance": 0.1}])
+    with mock.patch("random.random", return_value=1.0):
+        _, out = run_main(hook, _prompt())
+    ctx = context_of(out)
+    assert "faint echo" not in ctx
     assert ctx.count("[mnemosyne|") == 3
 
 
@@ -1370,7 +1412,8 @@ def test_subagent_detection_sources(hook, payload_extra, session_id, env):
     assert seen[0][0][0] == "loci_memory"
     assert seen[0][0][2:] == ("text", "numeric_confidence", True)
     assert seen[0][1] == {"top_k": 2}
-    assert "grounding unavailable in subagent context" in context_of(out)
+    # the search answered (with nothing): no outage is claimed
+    assert context_of(out) == hook.GROUNDING_DIRECTIVE
 
 
 def test_main_session_path_when_task_id_is_not_a_subagent(hook):
@@ -1398,14 +1441,55 @@ def test_subagent_warning_when_qdrant_url_unset_skips_embedding(hook):
     assert ctx.endswith(hook.GROUNDING_DIRECTIVE)
 
 
-def test_subagent_empty_results_report_qdrant_unreachable(hook):
-    """BUG: 'Qdrant unreachable' is emitted whenever the search returns nothing,
-    including a perfectly healthy search with no matches above MIN_SCORE."""
+def test_subagent_healthy_empty_search_is_a_bare_directive(hook):
+    """A search that answered with no match above MIN_SCORE is a genuine miss,
+    not an outage: 'Qdrant unreachable' there is a false alarm."""
     hook._embed = lambda t: [0.1]
     hook._search_collection = lambda *a, **k: []
+    hook._beam_fallback = lambda q: pytest.fail("beam fallback on a healthy search")
+    hook._load_rules_summary = lambda: ""
+    code, out = run_main(hook, _prompt(task_id="subagent-1"))
+    assert code is None
+    assert context_of(out) == hook.GROUNDING_DIRECTIVE
+
+
+def test_subagent_healthy_search_with_only_unimportant_hits_is_a_bare_directive(hook):
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = lambda *a, **k: [
+        {"collection": "loci_memory", "point_id": None, "score": 0.9,
+         "importance": 0.05, "fused": 0.045, "content": "noise", "payload": {}}]
     hook._load_rules_summary = lambda: ""
     _, out = run_main(hook, _prompt(task_id="subagent-1"))
-    assert "Qdrant unreachable" in context_of(out)
+    assert context_of(out) == hook.GROUNDING_DIRECTIVE
+
+
+def test_subagent_search_failure_with_empty_beam_reports_unreachable(hook):
+    """The degraded branch: the one search failed and the fallback has nothing."""
+    beam_calls = []
+
+    def _boom(*a, **k):
+        raise hook._SearchFailed("loci_memory")
+
+    hook._embed = lambda t: [0.1]
+    hook._search_collection = _boom
+    hook._beam_fallback = lambda q: beam_calls.append(q) or []
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt(task_id="subagent-1"))
+    ctx = context_of(out)
+    assert beam_calls == ["what happened to the loader"]
+    assert ctx.startswith("[WARNING: memory grounding unavailable in subagent context")
+    assert "Qdrant unreachable" in ctx
+    assert ctx.endswith(hook.GROUNDING_DIRECTIVE)
+
+
+def test_subagent_embed_failure_with_empty_beam_reports_unavailable(hook):
+    hook._embed = lambda t: None
+    hook._search_collection = lambda *a, **k: pytest.fail("searched without a vector")
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+    _, out = run_main(hook, _prompt(task_id="subagent-1"))
+    assert context_of(out).startswith(
+        "[WARNING: memory grounding unavailable in subagent context")
 
 
 def test_subagent_falls_back_to_beam_when_embedding_fails(hook):

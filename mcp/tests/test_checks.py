@@ -72,23 +72,72 @@ class TestRunContradiction(unittest.TestCase):
         f2 = {"id": "b", "text": "the server is not running on port 9000 http endpoint alive"}
         results = run_contradiction([f1, f2])
         self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].refs, ["a", "b"])
+
+    def test_duplicate_id_pair_is_deduped(self):
+        # The same finding id re-stored later (e.g. an edit) must not produce a
+        # second verdict for the same (a, b) pair: the pair key is id-based.
+        pos = {"id": "a", "text": "the server is running on port 9000 http endpoint alive"}
+        neg = {"id": "b", "text": "the server is not running on port 9000 http endpoint alive"}
+        pos_again = {"id": "a", "text": "the server is running on port 9000 http endpoint alive"}
+        results = run_contradiction([pos, neg, pos_again])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].refs, ["a", "b"])
 
     def test_malformed_finding_skipped(self):
         good = _f("the service is running on port 443 endpoint alive")
         not_negated = _f("the service is not available on port 443 endpoint alive")
-        # Non-dict entry should be skipped without raising
+        # Non-dict entry should be skipped without raising, and without
+        # dropping the valid pair around it (ids keep their input index).
         results = run_contradiction([good, "not a dict", not_negated])
-        self.assertIsInstance(results, list)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].refs, ["finding:0", "finding:2"])
+        self.assertEqual(results[0].decision, "flag")
+
+    def _cap_findings(self, with_ids=True):
+        texts = [
+            "alpha beta gamma delta",
+            "not alpha beta gamma delta",
+            "epsilon zeta theta iota",
+            "not epsilon zeta theta iota",
+        ]
+        ids = ["old-pos", "old-neg", "new-pos", "new-neg"]
+        return [
+            {"id": i, "text": t} if with_ids else {"text": t}
+            for i, t in zip(ids, texts)
+        ]
 
     def test_max_findings_cap(self):
-        # max_findings=2 should only compare the last 2 findings
-        findings = [
-            {"id": f"f{i}", "text": f"finding number {i} placeholder text token"}
-            for i in range(10)
-        ]
-        # Should not raise even with cap
+        # Both the oldest pair and the newest pair contradict; max_findings=2
+        # keeps only the most recent two.
+        findings = self._cap_findings()
+        self.assertEqual(len(run_contradiction(findings)), 2)  # uncapped control
         results = run_contradiction(findings, max_findings=2)
-        self.assertIsInstance(results, list)
+        self.assertEqual([v.refs for v in results], [["new-pos", "new-neg"]])
+
+    def test_max_findings_cap_keeps_original_index_for_derived_ids(self):
+        results = run_contradiction(self._cap_findings(with_ids=False), max_findings=2)
+        self.assertEqual([v.refs for v in results], [["finding:2", "finding:3"]])
+
+    def test_ordinary_findings_are_not_provisional(self):
+        # observed + no confidence -> protection 0.55 < 0.75: enforced verdict.
+        f1 = {"id": "a", "text": "the cache is populated with entries records rows"}
+        f2 = {"id": "b", "text": "the cache is not populated with entries records rows"}
+        (v,) = run_contradiction([f1, f2])
+        self.assertIs(v.provisional, False)
+        self.assertEqual(v.confidence, 0.55)
+        self.assertNotIn("PROVISIONAL", v.rationale)
+
+    def test_established_finding_makes_contradiction_provisional(self):
+        # high (0.9) * observed (1.1) -> protection 0.99 >= 0.75.
+        f1 = {"id": "a", "text": "the cache is populated with entries records rows",
+              "confidence": "high", "type": "observed"}
+        f2 = {"id": "b", "text": "the cache is not populated with entries records rows"}
+        (v,) = run_contradiction([f1, f2])
+        self.assertIs(v.provisional, True)
+        self.assertEqual(v.confidence, 0.40)
+        self.assertIn("PROVISIONAL", v.rationale)
+        self.assertIn("prot=0.99", v.rationale)
 
     def test_refs_contain_finding_ids(self):
         f1 = {"id": "alpha", "text": "the cache is populated with entries records rows"}
@@ -241,9 +290,21 @@ class TestFindContamination(unittest.TestCase):
             {"id": "a", "text": "first", "derived_from": "b"},
             {"id": "b", "text": "second", "derived_from": "a"},
         ]
-        # No seed overlap → just seeds returned, no infinite loop
+        # No seed overlap → just seeds returned, no infinite loop, and the
+        # cycle itself must not mark a or b contaminated.
         result = find_contamination(["seed"], findings, entities_of=self._no_entities)
-        self.assertIsInstance(result["contaminated_ids"], list)
+        self.assertEqual(result["contaminated_ids"], ["seed"])
+        self.assertEqual(result["reasons"], {"seed": ["seed"]})
+
+    def test_derivation_cycle_that_reaches_seed_is_contaminated(self):
+        findings = [
+            {"id": "a", "text": "first", "derived_from": ["b", "seed"]},
+            {"id": "b", "text": "second", "derived_from": "a"},
+        ]
+        result = find_contamination(["seed"], findings, entities_of=self._no_entities)
+        self.assertEqual(result["contaminated_ids"], ["seed", "a", "b"])
+        self.assertEqual(result["reasons"]["a"], ["derived_from:seed"])
+        self.assertEqual(result["reasons"]["b"], ["derived_from:a"])
 
     def test_derived_from_as_string(self):
         findings = [
@@ -271,10 +332,33 @@ class TestFindContamination(unittest.TestCase):
         def bad_extractor(text):
             raise RuntimeError("extractor failed")
 
-        findings = [{"id": "f1", "text": "some text"}]
-        # Should not raise
+        findings = [
+            {"id": "seed", "text": "seed text"},
+            {"id": "f1", "text": "some text", "derived_from": "seed"},
+            {"id": "f2", "text": "unrelated text"},
+        ]
+        # Should not raise; a finding whose extraction failed still takes part
+        # in derivation propagation, and the seed is kept.
         result = find_contamination(["seed"], findings, entities_of=bad_extractor)
-        self.assertIsInstance(result, dict)
+        self.assertEqual(result["contaminated_ids"], ["seed", "f1"])
+        self.assertEqual(
+            result["reasons"], {"seed": ["seed"], "f1": ["derived_from:seed"]}
+        )
+
+    def test_entities_of_raising_for_one_finding_keeps_the_others_anchored(self):
+        def flaky(text):
+            if "boom" in text:
+                raise RuntimeError("extractor failed")
+            return self._entities_from_urls(text)
+
+        findings = [
+            {"id": "seed", "text": "calls http://fake.internal/api endpoint"},
+            {"id": "bad", "text": "boom http://fake.internal/api endpoint"},
+            {"id": "child", "text": "built on http://fake.internal/api endpoint"},
+        ]
+        result = find_contamination(["seed"], findings, entities_of=flaky)
+        self.assertEqual(result["contaminated_ids"], ["seed", "child"])
+        self.assertEqual(result["reasons"]["child"], ["entity:http://fake.internal/api"])
 
     def test_seeds_appear_first_in_output(self):
         findings = [

@@ -34,16 +34,16 @@ def test_load_from_cannot_read_host_files(tmp_path):
     store = _store(tmp_path)
     secret = tmp_path / "secret.csv"
     secret.write_text("top,secret\nAKIA123,hunter2\n")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="read-only"):
         store.code_query(f'LOAD FROM "{secret}" RETURN *')
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="read-only"):
         store.code_query(f"load from '{secret}' (header=false) return * limit 3")
 
 
 def test_export_database_cannot_write_to_disk(tmp_path):
     store = _store(tmp_path)
     out = tmp_path / "exported"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="read-only"):
         store.code_query(f'EXPORT DATABASE "{out}"')
     assert not out.exists()
 
@@ -81,24 +81,36 @@ def test_non_read_statements_never_reach_the_engine(tmp_path, cypher):
     store = _store(tmp_path)
     executed = []
     store._rows = lambda q, p=None: executed.append(q) or []
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="read-only"):
         store.code_query(cypher)
     assert executed == []
 
 
-@pytest.mark.parametrize("cypher", [
-    "MATCH (s:CodeSymbol) RETURN s.id",
-    "OPTIONAL MATCH (s:CodeSymbol) WHERE s.name = $n RETURN s.id ORDER BY s.id SKIP 0 LIMIT 5",
-    "UNWIND [1, 2] AS x RETURN x",
-    "WITH 1 AS x RETURN x",
-    "MATCH (s:CodeSymbol) WHERE s.name CONTAINS 'load from export install' RETURN count(s)",
-    "MATCH (s:CodeSymbol) WHERE s.name = \"a\\\"b LOAD\" RETURN s.id",
-    "CALL show_tables() RETURN *",
-    "RETURN 1;",
+@pytest.mark.parametrize("cypher, expected", [
+    ("MATCH (s:CodeSymbol) RETURN s.id", [["x.py::f"]]),
+    ("OPTIONAL MATCH (s:CodeSymbol) WHERE s.name = $n RETURN s.id ORDER BY s.id SKIP 0 LIMIT 5",
+     [["x.py::f"]]),
+    ("UNWIND [1, 2] AS x RETURN x", [[1], [2]]),
+    ("WITH 1 AS x RETURN x", [[1]]),
+    ("MATCH (s:CodeSymbol) WHERE s.name CONTAINS 'load from export install' RETURN count(s)", [[0]]),
+    ("MATCH (s:CodeSymbol) WHERE s.name = \"a\\\"b LOAD\" RETURN s.id", []),
+    ("RETURN 1;", [[1]]),
 ])
-def test_read_queries_still_run(tmp_path, cypher):
+def test_read_queries_still_run(tmp_path, cypher, expected):
+    # code_query fails open to [] on an engine error, so "it returned" proves nothing:
+    # the rows must be the real answer and no failure may have been counted.
     store = _store(tmp_path)
-    store.code_query(cypher, {"n": "f"} if "$n" in cypher else None)
+    rows = store.code_query(cypher, {"n": "f"} if "$n" in cypher else None)
+    assert [list(r) for r in rows] == expected
+    assert store.code_query_failures == 0, store.code_query_last_error
+
+
+def test_show_tables_call_is_a_read_that_runs(tmp_path):
+    store = _store(tmp_path)
+    rows = store.code_query("CALL show_tables() RETURN *")
+    assert store.code_query_failures == 0, store.code_query_last_error
+    names = {str(cell) for row in rows for cell in row}
+    assert {"CodeSymbol", "CodeFile"} <= names
 
 
 def test_code_graph_query_tool_reports_the_rejection(tmp_path, monkeypatch):

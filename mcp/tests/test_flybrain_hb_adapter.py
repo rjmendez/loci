@@ -230,3 +230,145 @@ def test_disabled_promotion_pointer_blocks_execution(tmp_path):
         )
     assert excinfo.value.code == fha.HbAdapterErrorCode.PROMOTION_STATE_INVALID.value
     assert excinfo.value.rollback_required is True
+
+
+# ---------------------------------------------------------------------------
+# Manifest-integrity checks, one per guard. Each fixture differs from the
+# valid one in exactly the property the guard exists for, so removing that
+# guard lets the snapshot resolve and the test fails.
+# ---------------------------------------------------------------------------
+
+
+def _manifest_path(root: Path) -> Path:
+    return root / "snapshots" / "hb" / fha.HB_VERSION_ID / "manifest" / "manifest.json"
+
+
+def _rewrite_manifest(root: Path, mutate) -> None:
+    path = _manifest_path(root)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    manifest["integrity"]["manifest_sha256"] = _manifest_digest(manifest)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _resolve_error(root: Path) -> fha.HbAdapterError:
+    with pytest.raises(fha.HbAdapterError) as excinfo:
+        fha.build_hb_adapter(root_override=root).resolve_snapshot()
+    return excinfo.value
+
+
+def test_same_size_tamper_is_caught_by_the_sha256_check(tmp_path):
+    # The older tamper test changed the file length, so the size check caught
+    # it and the SHA256 compare could be deleted with every test still green.
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    nodes_file = root / "graph" / "hb" / fha.HB_VERSION_ID / "nodes.parquet"
+    original = nodes_file.read_bytes()
+    tampered = b"hb-nodez"
+    assert len(tampered) == len(original) and tampered != original
+    nodes_file.write_bytes(tampered)
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.INTEGRITY_MISMATCH.value
+    assert err.message == "SHA256 mismatch for integrity file: nodes.parquet"
+    assert err.rollback_required is True
+
+
+def test_resize_is_caught_by_the_size_check(tmp_path):
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    (root / "graph" / "hb" / fha.HB_VERSION_ID / "nodes.parquet").write_bytes(b"hb-nodes-longer")
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.INTEGRITY_MISMATCH.value
+    assert err.message == "size_bytes mismatch for integrity file: nodes.parquet"
+
+
+@pytest.mark.parametrize("field, value", [("sex", "male"), ("stage", "larva"), ("anatomy", "optic_lobe")])
+def test_manifest_scope_outside_phase1_is_rejected(tmp_path, field, value):
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    _rewrite_manifest(root, lambda m: m["scope"].__setitem__(field, value))
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.OUT_OF_SCOPE.value
+    assert err.message == "Pinned manifest scope does not match phase-1 hb scope"
+
+
+def test_integrity_file_symlinked_outside_the_artifact_root_is_rejected(tmp_path):
+    # A path that is lexically safe ("nodes.parquet") but resolves outside the
+    # artifact root through a symlink. The manifest carries the real SHA256 and
+    # size of the outside file, so only the resolved-path containment check
+    # stops it.
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    outside = tmp_path / "outside.parquet"
+    outside.write_bytes(b"not-hb-data")
+    nodes_file = root / "graph" / "hb" / fha.HB_VERSION_ID / "nodes.parquet"
+    nodes_file.unlink()
+    try:
+        nodes_file.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation requires OS privileges")
+
+    def point_at_outside(m):
+        m["integrity"]["files"][0]["sha256"] = hashlib.sha256(outside.read_bytes()).hexdigest()
+        m["integrity"]["files"][0]["size_bytes"] = outside.stat().st_size
+
+    _rewrite_manifest(root, point_at_outside)
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.ROOT_OUT_OF_BOUNDS.value
+    assert err.message == "Integrity file path escapes artifact root: nodes.parquet"
+
+
+@pytest.mark.parametrize("suffix", [".partial", ".tmp", ".inprogress"])
+def test_partial_artifacts_are_not_accepted_as_integrity_files(tmp_path, suffix):
+    # The partial file exists and its hash and size are right, so without the
+    # suffix guard the snapshot would resolve on a half-written artifact.
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    graph_root = root / "graph" / "hb" / fha.HB_VERSION_ID
+    partial = graph_root / f"edges.parquet{suffix}"
+    partial.write_bytes(b"half-written")
+
+    def add_partial(m):
+        m["integrity"]["files"].append({
+            "relative_path": partial.name,
+            "sha256": hashlib.sha256(partial.read_bytes()).hexdigest(),
+            "size_bytes": partial.stat().st_size,
+        })
+
+    _rewrite_manifest(root, add_partial)
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.MANIFEST_INVALID.value
+    assert err.message == f"Partial artifact path not permitted in integrity.files: {partial.name}"
+
+
+def test_rollback_refresh_decision_marks_the_snapshot_rollback_required(tmp_path):
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root, refresh_decision="rollback")
+
+    snapshot = fha.build_hb_adapter(root_override=root).resolve_snapshot()
+    assert snapshot.refresh_decision == "rollback"
+    assert snapshot.rollback_required is True
+
+
+def test_elapsed_next_check_due_requires_rollback(tmp_path):
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root, next_check_due="2000-01-01T00:00:00+00:00")
+
+    err = _resolve_error(root)
+    assert err.code == fha.HbAdapterErrorCode.ROLLBACK_REQUIRED.value
+    assert err.rollback_required is True
+
+
+def test_the_valid_fixture_resolves_cleanly(tmp_path):
+    # Positive twin for every negative test above: the unmodified fixture passes
+    # all of the same guards.
+    root = tmp_path / "flybrain-root"
+    _write_manifest(root)
+    snapshot = fha.build_hb_adapter(root_override=root).resolve_snapshot()
+    assert (snapshot.verification_status, snapshot.refresh_decision, snapshot.rollback_required) == (
+        "verified", "no_change", False)

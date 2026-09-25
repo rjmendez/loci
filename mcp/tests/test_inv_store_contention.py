@@ -235,10 +235,12 @@ def test_memory_promote_preserves_concurrent_append_during_rewrite(isolated_stor
     findings_path = server._inv_dir(inv_id) / "findings.jsonl"
     original_timeout = inv_store._STORE_LOCK_TIMEOUT_S
     inv_store._STORE_LOCK_TIMEOUT_S = 15.0
+    append_started = threading.Event()
     append_finished = threading.Event()
+    blocked_while_rewriting = []
 
     def _append_late() -> None:
-        time.sleep(0.05)
+        append_started.set()
         with server._locked_file(server._inv_dir(inv_id) / ".lock", "a+", exclusive=True):
             server._append_jsonl(findings_path, {
                 "id": "late-append",
@@ -251,11 +253,28 @@ def test_memory_promote_preserves_concurrent_append_during_rewrite(isolated_stor
         append_finished.set()
 
     append_thread = threading.Thread(target=_append_late)
-    append_thread.start()
+
+    # Deterministic interleave: the rewrite has read findings.jsonl and is about
+    # to write it back. Start the appender exactly there and give it the chance
+    # to append. Under the lock it cannot, and the rewrite must not wait on it;
+    # without the lock it appends at once and the rewrite then overwrites it.
+    # (The old version slept 50 ms before appending, after the rewrite had
+    # finished, so removing the lock passed 5/5.)
+    real_atomic_write = inv_store._atomic_write_text
+
+    def _write_after_interleave(path, data):
+        if Path(path) == findings_path and not append_thread.is_alive() and not append_finished.is_set():
+            append_thread.start()
+            assert append_started.wait(5.0)
+            blocked_while_rewriting.append(not append_finished.wait(1.0))
+        return real_atomic_write(path, data)
+
+    monkeypatch.setattr(inv_store, "_atomic_write_text", _write_after_interleave)
 
     try:
         result = _json(server.memory_promote(inv_id, finding_id, "hot"))
         assert result["ok"] is True, result
+        assert blocked_while_rewriting == [True], "the append ran inside the rewrite window"
 
         assert append_finished.wait(15.0), "concurrent append must complete"
         append_thread.join(15.0)

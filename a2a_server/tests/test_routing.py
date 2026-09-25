@@ -104,13 +104,25 @@ class TestA2ADispatch(unittest.TestCase):
         self.assertEqual(data["error"]["code"], -32601)
 
     def test_tasks_send_unknown_skill_returns_error(self):
-        data = self._post(rpc("tasks/send", {
-            "skill_id": "does_not_exist",
-            "message": "test",
-            "sender": "test",
-        }))
-        # Either an error code or a result with an error payload
-        self.assertIn("id", data)
+        calls = []
+
+        async def recording_dispatch(skill_id, task):
+            calls.append(skill_id)
+            return {}
+
+        with mock.patch.object(a2a_server, "_dispatch", recording_dispatch):
+            resp = client.post("/a2a", json=rpc("tasks/send", {
+                "skill_id": "does_not_exist",
+                "message": "test",
+                "sender": "test",
+            }), headers=HEADERS)
+        self.assertEqual(resp.status_code, 404)
+        data = resp.json()
+        self.assertEqual(data["id"], "req-1")
+        self.assertNotIn("result", data)
+        self.assertEqual(data["error"]["code"], -32601)
+        self.assertEqual(data["error"]["message"], "Unknown skill 'does_not_exist'.")
+        self.assertEqual(calls, [])
 
     def test_tasks_get_missing_task_returns_error(self):
         data = self._post(rpc("tasks/get", {"task_id": "00000000-0000-0000-0000-000000000000"}))

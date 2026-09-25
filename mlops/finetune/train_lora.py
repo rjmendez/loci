@@ -55,6 +55,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 
 def load_pairs(path: str, max_examples: int) -> list[dict]:
+    if max_examples < 0:
+        # A negative cap was used as a Python slice and dropped pairs from the end.
+        raise ValueError(f"max_examples must be >= 0, got {max_examples}")
     pairs = []
     try:
         with open(path) as f:
@@ -82,6 +85,26 @@ def _escape_modelfile_value(s: str) -> str:
     return s.replace('"""', "'''")
 
 
+def _modelfile_value(s: str) -> str:
+    """A MESSAGE value that cannot end its directive early.
+
+    Memory text is emitted into the Modelfile verbatim, and a newline in it
+    started a new line of the Modelfile: content holding "\\nFROM evil\\nSYSTEM
+    pwned" produced a second FROM and a second SYSTEM directive. A value that
+    spans lines (or starts with a quote, which the parser would read as one) is
+    wrapped in the Modelfile's triple-quote form, which runs to the next \"\"\"
+    whatever lines it crosses. _escape_modelfile_value has already removed every
+    \"\"\" from the content, so the only terminator is the one added here; a
+    trailing quote gets a space so it cannot merge into it.
+    """
+    value = _escape_modelfile_value(s)
+    if "\n" not in value and "\r" not in value and not value.startswith('"'):
+        return value
+    if value.endswith('"'):
+        value += " "
+    return f'"""{value}"""'
+
+
 def build_modelfile(base_model: str, pairs: list[dict]) -> str:
     lines = [f'FROM {base_model}', ""]
 
@@ -95,8 +118,8 @@ def build_modelfile(base_model: str, pairs: list[dict]) -> str:
         messages = pair.get("messages", [])
         if len(messages) < 2:
             continue
-        user_msg = _escape_modelfile_value(messages[0].get("content", ""))
-        asst_msg = _escape_modelfile_value(messages[1].get("content", ""))
+        user_msg = _modelfile_value(messages[0].get("content", ""))
+        asst_msg = _modelfile_value(messages[1].get("content", ""))
         lines.append(f'MESSAGE user {user_msg}')
         lines.append(f'MESSAGE assistant {asst_msg}')
         lines.append("")

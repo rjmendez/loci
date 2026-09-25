@@ -1,8 +1,8 @@
-"""Characterization tests for mlops/embedding/ — drift.py and contrastive.py.
+"""Contract tests for mlops/embedding/ — drift.py and contrastive.py.
 
-These pin CURRENT behaviour, warts included. Several assertions below deliberately
-lock in behaviour that is arguably wrong (see the `BUG:` comments); they exist so a
-refactor cannot change it silently.
+These used to pin the behaviour of the day, warts included -- among them the
+TypeError that killed every contrastive fine-tune. Those pins are replaced by the
+contract the code now meets.
 
 No external services are touched: Ollama HTTP is stubbed at ``urllib.request.urlopen``
 or by replacing ``drift._embed``, and no sentence-transformers model is ever downloaded.
@@ -209,18 +209,13 @@ def test_sample_texts_finds_rows_in_the_committed_dataset():
     assert len(D._sample_texts(str(ds), 20)) == 20
 
 
-def test_sample_texts_non_dict_json_line_raises_attributeerror(tmp_path):
-    """BUG: only JSONDecodeError is caught. A valid-but-non-object line crashes."""
-    ds = _write_jsonl(tmp_path / "d.jsonl", ["[1, 2, 3]"])
-    with pytest.raises(AttributeError):
-        D._sample_texts(str(ds), 10)
-
-
-def test_sample_texts_non_string_text_value_raises_typeerror(tmp_path):
-    """BUG: len() is applied without a type check."""
-    ds = _write_jsonl(tmp_path / "d.jsonl", [{"text": 1234567890}])
-    with pytest.raises(TypeError):
-        D._sample_texts(str(ds), 10)
+@pytest.mark.parametrize("bad", ["[1, 2, 3]", "42", '"just a string"',
+                                 {"text": 1234567890}, {"text": ["x" * 40]}])
+def test_sample_texts_skips_malformed_rows_instead_of_crashing(tmp_path, bad):
+    """Only JSONDecodeError was caught: a non-object line raised AttributeError
+    and a non-string text TypeError, and the anchor build died on one bad row."""
+    ds = _write_jsonl(tmp_path / "d.jsonl", [bad, {"text": _long("a")}])
+    assert D._sample_texts(str(ds), 10) == [_long("a")]
 
 
 def test_sample_texts_is_deterministic_and_shuffles(tmp_path):
@@ -315,7 +310,7 @@ def test_embed_propagates_transport_errors(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr("urllib.request.urlopen", boom)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError, match="connection refused"):
         D._embed("t", "http://h", "m")
 
 
@@ -634,19 +629,19 @@ def test_main_exits_1_when_drift_exceeded_and_writes_out_file(monkeypatch, tmp_p
     assert "exceeded=True" in stdout
 
 
-def test_main_exits_1_on_measure_error_same_code_as_drift(monkeypatch, capsys):
-    """BUG-ish: an operational failure and a genuine drift alarm both exit 1,
-    so a caller cannot tell 'ollama is down' from 'the model drifted'."""
+def test_main_measure_error_exits_2_not_the_drift_code(monkeypatch, capsys):
+    """An operational failure and a real drift alarm both exited 1, so a caller
+    could not tell 'Ollama is down' from 'the model drifted'."""
     monkeypatch.setattr(D, "measure_drift", lambda *a, **k: {"error": "anchor not found: /x"})
     code = _run_main(monkeypatch, ["--dataset", "x.jsonl"])
-    assert code == 1
+    assert code == 2
     assert "[drift] ERROR: anchor not found: /x" in capsys.readouterr().err
 
 
 def test_main_does_not_write_out_file_on_error(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "measure_drift", lambda *a, **k: {"error": "boom"})
     out_file = tmp_path / "drift.json"
-    assert _run_main(monkeypatch, ["--dataset", "x.jsonl", "--out", str(out_file)]) == 1
+    assert _run_main(monkeypatch, ["--dataset", "x.jsonl", "--out", str(out_file)]) == 2
     assert not out_file.exists()
 
 
@@ -800,11 +795,10 @@ def test_print_stats_omits_cosine_line_when_no_cos_key(C, capsys):
     assert "pos=1, neg=1" in out
 
 
-def test_print_stats_counts_by_summing_labels_not_by_counting_positives(C, capsys):
-    """BUG: `pos = sum(labels)` assumes labels are 0/1. A stray label of 2 produces a
-    negative count instead of an error."""
-    C.print_stats([{"label": 2}])
-    assert "pos=2, neg=-1" in capsys.readouterr().out
+def test_print_stats_counts_positives_rather_than_summing_labels(C, capsys):
+    """`pos = sum(labels)` printed pos=2, neg=-1 for one stray label of 2."""
+    C.print_stats([{"label": 2}, {"label": 1}, {"label": 0}])
+    assert "Dataset: 3 rows — pos=1, neg=2" in capsys.readouterr().out
 
 
 def test_print_stats_on_empty_rows(C, capsys):
@@ -856,22 +850,21 @@ class _StubModel:
         return torch.tensor(rows)
 
 
-def test_baseline_spearman_returns_a_dict_despite_its_float_annotation(C, tmp_path):
-    """BUG: annotated `-> float`, but sentence-transformers' evaluator returns a metrics
-    dict. main() formats the equivalent value with `:.4f`, so the training entrypoint
-    raises TypeError against the installed sentence-transformers.
-    """
+def test_baseline_spearman_returns_the_spearman_as_a_float(C, tmp_path):
+    """sentence-transformers' evaluator returns a metrics dict; this handed the
+    dict on, and main() formatting it with :.4f raised TypeError, so no
+    fine-tune ever finished. It must be the evaluator's spearman_cosine."""
     examples = [
         C.InputExample(texts=["short", "a longer piece of evidence"], label=1.0),
         C.InputExample(texts=["tiny", "x"], label=0.0),
         C.InputExample(texts=["medium text", "another evidence"], label=1.0),
     ]
     result = C.baseline_spearman(_StubModel(), examples, [1.0, 0.0, 1.0], tmp_path)
-
-    assert isinstance(result, dict)
-    assert "val-baseline_spearman_cosine" in result
-    with pytest.raises(TypeError):
-        format(result, ".4f")
+    raw = C.EmbeddingSimilarityEvaluator.from_input_examples(
+        examples, name="val-baseline", write_csv=False)(_StubModel(), output_path=str(tmp_path))
+    assert type(result) is float
+    assert result == raw["val-baseline_spearman_cosine"]
+    format(result, ".4f")
 
 
 def test_baseline_spearman_ignores_its_val_scores_argument(C, tmp_path):
@@ -939,3 +932,90 @@ def test_contrastive_argparse_defaults(C, monkeypatch, tmp_path):
     assert captured["msg"] == (
         "Dataset not found: deep_think_loci/grounding/grounding_dataset.jsonl"
     )
+
+
+# --------------------------------------------------------------------------------------
+# contrastive.main, end to end, with the model stubbed and the evaluator real
+# --------------------------------------------------------------------------------------
+
+class _AxisModel(_StubModel):
+    """Embeds by marker word, so the cosine of a pair is chosen by the test.
+
+    'pos-ev' texts -> e1 for the "good" model and e0 for the "bad" one; every
+    other text -> e0. With claims on e0, a good model scores positives 1 and
+    negatives 0 (Spearman +1), a bad one the reverse (Spearman -1).
+    """
+
+    def __init__(self, good):
+        super().__init__()
+        self.good = good
+        self.fit_calls = []
+
+    def encode(self, sentences, **kwargs):
+        import torch
+        rows = []
+        for s in sentences:
+            if "pos-ev" in s:
+                rows.append([1.0, 0.0] if self.good else [0.0, 1.0])
+            elif "neg-ev" in s:
+                rows.append([0.0, 1.0] if self.good else [1.0, 0.0])
+            else:
+                rows.append([1.0, 0.0])
+        return torch.tensor(rows)
+
+    def fit(self, **kwargs):
+        self.fit_calls.append(kwargs)
+
+
+def _contrastive_dataset(tmp_path):
+    ds = tmp_path / "d.jsonl"
+    rows = []
+    for i in range(10):
+        rows.append({"claim": f"claim {i}", "evidence": f"pos-ev {i}", "label": 1})
+        rows.append({"claim": f"claim {i}", "evidence": f"neg-ev {i}", "label": 0})
+    ds.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return ds
+
+
+@pytest.mark.parametrize("before_good,after_good,delta,loads", [
+    (False, True, 2.0, True),     # the fine-tune fixed an inverted model
+    (True, False, -2.0, False),   # the fine-tune broke a good one
+])
+def test_contrastive_main_trains_evaluates_and_records_the_real_delta(
+        C, monkeypatch, tmp_path, capsys, before_good, after_good, delta, loads):
+    """main() used to raise TypeError formatting the evaluator's dict before any
+    training ran. It must train, score base and fine-tuned models on the same
+    held-out pairs, and write a delta that decides the load advice -- a main()
+    that hard-coded delta=1.0 printed "load it" either way and passed before."""
+    models = []
+
+    def fake_st(name_or_path, trust_remote_code=False):
+        m = _AxisModel(good=before_good if not models else after_good)
+        m.loaded_from = name_or_path
+        models.append(m)
+        return m
+
+    losses_seen = []
+    monkeypatch.setattr(C, "SentenceTransformer", fake_st)
+    monkeypatch.setattr(C.losses, "CosineSimilarityLoss",
+                        lambda model: losses_seen.append(model) or "loss")
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["contrastive.py", "--dataset",
+                                      str(_contrastive_dataset(tmp_path)),
+                                      "--out", str(out), "--epochs", "1"])
+    C.main()
+
+    base, tuned = models
+    assert base.loaded_from == C.MODEL_CONFIGS["small"]["base"]
+    assert tuned.loaded_from == str(out / "loci-embed-small")
+    assert len(base.fit_calls) == 1 and base.fit_calls[0]["epochs"] == 1
+    assert losses_seen == [base]
+    record = json.loads((out / "eval.json").read_text())
+    assert record["baseline_spearman"] == pytest.approx(-delta / 2)
+    assert record["finetuned_spearman"] == pytest.approx(delta / 2)
+    assert record["delta"] == pytest.approx(delta)
+    assert (record["train_n"], record["val_n"]) == (16, 4)
+    printed = capsys.readouterr().out
+    assert f"Baseline Spearman (untrained): {-delta / 2:.4f}" in printed
+    assert ("ollama create loci-embed" in printed) is loads
+    assert ("do not load it" in printed) is not loads

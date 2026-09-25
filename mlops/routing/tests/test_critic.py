@@ -1,12 +1,12 @@
-"""Characterization tests for mlops/routing/ (mlops/routing/critic.py).
+"""Contract tests for mlops/routing/ (mlops/routing/critic.py).
 
 `mlops/routing/__init__.py` is empty, so `RetrievalCritic` in critic.py is the
 entire public surface of the package.
 
-These tests pin the CURRENT behaviour of the module, bugs included. They are a
-safety net for a later refactor, not a statement of what the critic *should*
-do. Where a test pins something that is arguably wrong the docstring says so,
-and the finding is reported separately.
+These used to pin the behaviour of the day, bugs included (a failed retrain
+that truncated the good model on disk, one malformed label line that poisoned
+the batch). Those pins are replaced by the contract the critic now meets; the
+bare-pickle load is a strict xfail naming its follow-up.
 
 No external services are used. scikit-learn is a real, local, CPU-only
 dependency and is exercised for real in a couple of end-to-end tests; every
@@ -386,15 +386,20 @@ def test_empty_model_file_is_swallowed(sandbox_paths):
     assert RetrievalCritic()._clf is None
 
 
-def test_model_file_is_loaded_with_bare_pickle_at_construction(sandbox_paths):
-    """Whatever the pickle contains is adopted as the classifier — no type check.
-
-    This is arbitrary-code-execution-by-file-drop; pinned because it is current behaviour.
-    """
+def test_a_pickled_classifier_is_loaded_at_construction_and_used(sandbox_paths):
     sandbox_paths["model"].write_bytes(pickle.dumps(StubClf(proba=0.8)))
     c = RetrievalCritic()
     assert isinstance(c._clf, StubClf)
     assert c.route("q", ["a"], [0.0])["reason"] == "classifier proba=0.800"
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "follow-up: load critic_model.pkl through a restricted unpickler (sklearn/numpy "
+    "globals only). A bare pickle.load adopts whatever the file holds, which is "
+    "code execution for anyone who can drop a file next to the package"))
+def test_a_model_file_that_is_not_an_sklearn_classifier_is_refused(sandbox_paths):
+    sandbox_paths["model"].write_bytes(pickle.dumps(StubClf(proba=0.8)))
+    assert RetrievalCritic()._clf is None
 
 
 def test_model_is_loaded_once_at_construction_not_per_call(sandbox_paths):
@@ -516,20 +521,17 @@ def test_train_skips_malformed_json_lines_and_does_not_count_them(sandbox_paths)
     }
 
 
-def test_train_crashes_on_valid_json_that_is_not_an_object(sandbox_paths):
-    """`null`/numbers/arrays parse fine, count toward the quota, then AttributeError
-    out of the whole training run — one bad line poisons the batch."""
-    write_labels(sandbox_paths, ["null", "null"])
-    assert RetrievalCritic().train(min_samples=2) == {
-        "trained": False,
-        "reason": "'NoneType' object has no attribute 'get'",
-    }
-
-    write_labels(sandbox_paths, ["123", "456"])
-    assert RetrievalCritic().train(min_samples=2) == {
-        "trained": False,
-        "reason": "'int' object has no attribute 'get'",
-    }
+def test_train_skips_valid_json_that_is_not_an_object(sandbox_paths, fake_lr):
+    """`null`/numbers/arrays parsed, counted toward the quota, then raised
+    AttributeError out of the whole run -- one bad line poisoned the batch."""
+    write_labels(sandbox_paths, [
+        "null", "123", "[1, 2]",
+        {"query": "q", "n_chunks": 1, "scores": [0.9], "label": 1},
+        {"query": "q", "n_chunks": 1, "scores": [0.1], "label": 0},
+    ])
+    assert RetrievalCritic().train(min_samples=3) == {
+        "trained": False, "reason": "need 3 samples, have 2"}
+    assert RetrievalCritic().train(min_samples=2) == {"trained": True, "n_samples": 2}
 
 
 def test_train_reports_missing_sklearn(sandbox_paths, monkeypatch):
@@ -581,10 +583,11 @@ def test_pickle_failure_is_reported_and_the_model_is_not_adopted(sandbox_paths, 
     assert c._clf is None  # self._clf is assigned only after a successful dump
 
 
-def test_pickle_failure_truncates_a_previously_good_model_file(sandbox_paths, monkeypatch):
-    """The output file is opened "wb" before dumping, so a failed retrain destroys
-    the model on disk: the next process starts with no classifier at all."""
-    sandbox_paths["model"].write_bytes(pickle.dumps(StubClf(proba=0.8)))
+def test_pickle_failure_leaves_a_previously_good_model_file_intact(sandbox_paths, monkeypatch):
+    """The output file was opened "wb" before dumping, so a failed retrain left a
+    0-byte model on disk and the next process started with no classifier."""
+    good = pickle.dumps(StubClf(proba=0.8))
+    sandbox_paths["model"].write_bytes(good)
     assert RetrievalCritic()._clf is not None
 
     write_labels(
@@ -597,8 +600,23 @@ def test_pickle_failure_truncates_a_previously_good_model_file(sandbox_paths, mo
     monkeypatch.setattr(sklearn.linear_model, "LogisticRegression", UnpicklableLR)
     assert RetrievalCritic().train(min_samples=2)["trained"] is False
 
-    assert sandbox_paths["model"].stat().st_size == 0
-    assert RetrievalCritic()._clf is None
+    assert sandbox_paths["model"].read_bytes() == good
+    assert list(sandbox_paths["model"].parent.glob("*.tmp")) == []
+    reloaded = RetrievalCritic()
+    assert isinstance(reloaded._clf, StubClf)
+    assert reloaded.route("q", ["a"], [0.0])["reason"] == "classifier proba=0.800"
+
+
+def test_a_successful_retrain_replaces_the_model_file(sandbox_paths):
+    sandbox_paths["model"].write_bytes(pickle.dumps(StubClf(proba=0.8)))
+    write_labels(sandbox_paths, [
+        {"query": "q", "n_chunks": 1, "scores": [0.9], "label": 1},
+        {"query": "q", "n_chunks": 1, "scores": [0.1], "label": 0},
+    ])
+    assert RetrievalCritic().train(min_samples=2) == {"trained": True, "n_samples": 2}
+    reloaded = RetrievalCritic()
+    assert type(reloaded._clf).__name__ == "LogisticRegression"
+    assert list(sandbox_paths["model"].parent.glob("*.tmp")) == []
 
 
 # ── train(): feature construction ─────────────────────────────────────────────

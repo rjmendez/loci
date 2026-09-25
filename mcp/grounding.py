@@ -272,8 +272,10 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if remaining[0] <= 0 or not text:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
+        # Framed text is clipped by compact_text in both modes: a frame that does not fit
+        # is cut INSIDE its tags, so it always closes and keeps as much text as fits.
         chunk = (compact_text(text, cap, preserve_sentence_boundary=not compact_mode, keep_frames=framed)
-                 if compact_mode else _truncate(text, cap))
+                 if compact_mode or framed else _truncate(text, cap))
         if compact_mode:
             chunk = re.sub(r"\s+", " ", chunk).strip()
         block = f"[{tag}] {chunk}"

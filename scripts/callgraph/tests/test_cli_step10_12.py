@@ -45,7 +45,12 @@ def test_writes_dead_include_tests_shrinks_weak_list(capsys):
     code, out_tests = _run(capsys, ["writes-dead", "--rev", "HEAD", "--include-tests", "--format", "json"])
     assert code == 0
     payload = json.loads(out_tests)
-    assert len(payload["write_no_read"]) <= default_count
+    # Strict: at HEAD the tests read hundreds of otherwise write-only slots
+    # (557 -> 95 when this was pinned), so "<=" only admitted a flag that
+    # filters nothing. The filtered list is a subset of the default one.
+    assert len(payload["write_no_read"]) < default_count
+    default_slots = {row["slot"] for row in json.loads(out_default)["write_no_read"]}
+    assert {row["slot"] for row in payload["write_no_read"]} <= default_slots
     assert payload["include_tests"] is True
 
 

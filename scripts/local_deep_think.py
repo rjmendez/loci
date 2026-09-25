@@ -1131,7 +1131,9 @@ def synthesize(topic: str, *, survivors: list[StoredFinding], critiques: list[St
     # confidently-worded answer with nothing behind it: lower confidence, tag it, and put
     # the caveat in the persisted text itself so it survives outside this JSON blob too.
     synthesis["grounding_status"] = "grounded" if grounded else "ungrounded"
-    confidence = "high"
+    # A synthesis with no verified survivor behind it rests on nothing the verify tier
+    # confirmed, whatever the grounding mode: never persist that at "high".
+    confidence = "high" if survivors else "low"
     if config.strict_grounding and not grounded:
         tags.append("ungrounded")
         confidence = "low"

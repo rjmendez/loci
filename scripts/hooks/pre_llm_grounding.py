@@ -247,7 +247,7 @@ def _search_collection(
         raise _SearchFailed(collection)
 
     hits = []
-    for pt in d.get("result", []):
+    for pt in d.get("result") or []:   # error envelopes carry "result": null
         score = pt.get("score", 0.0)
         if score < MIN_SCORE:
             continue
@@ -348,7 +348,8 @@ def _multi_signal_score(hit: dict, now_ts: float) -> float:
     """Score a hit on four axes plus stigmergic pheromone boost."""
     payload = hit.get("payload") or {}
 
-    relevance = hit.get("fused", hit["score"] * hit.get("importance", 0.5))
+    relevance = (hit["fused"] if "fused" in hit
+                 else hit["score"] * hit.get("importance", 0.5))
 
     created = payload.get("created_at_ts") or payload.get("ts_epoch")
     if created:
@@ -466,6 +467,8 @@ def _clean_content(content: str) -> str:
     try:
         obj = json.loads(stripped)
         if isinstance(obj, list):
+            if not any(isinstance(msg, dict) and "role" in msg for msg in obj):
+                return stripped     # structured content, not a chat transcript
             parts = []
             for msg in obj:
                 if not isinstance(msg, dict):
@@ -479,6 +482,8 @@ def _clean_content(content: str) -> str:
             return " | ".join(parts[:2]) if parts else ""
     except (json.JSONDecodeError, TypeError):
         pass
+    if '"role"' not in stripped:
+        return stripped             # broken JSON that is not a transcript either
     m = re.search(r'"role"\s*:\s*"user"[^}]*"content"\s*:\s*"([^"]{10,})"', stripped)
     return f"user: {m.group(1)[:200]}" if m else ""
 
@@ -538,6 +543,8 @@ def main() -> None:
         payload = json.loads(raw)
     except (json.JSONDecodeError, OSError):
         sys.exit(0)
+    if not isinstance(payload, dict):
+        sys.exit(0)
 
     if payload.get("hook_event_name", "") not in (
         "pre_llm_call", "PreLlmCall",       # legacy Hermes names
@@ -596,6 +603,9 @@ def main() -> None:
         if sub_hits:
             recall_block = _format_results(sub_hits, intent, sub_used_fallback,
                                            searched=1)
+        elif QDRANT_URL and not sub_used_fallback:
+            # The search answered and nothing matched: a genuine miss, not an outage.
+            recall_block = GROUNDING_DIRECTIVE
         else:
             recall_block = (
                 "[WARNING: memory grounding unavailable in subagent context — "
@@ -658,17 +668,12 @@ def main() -> None:
         for h in hits:
             h["_ms_score"] = _multi_signal_score(h, _now_ts)
         hits = sorted(hits, key=lambda h: h["_ms_score"], reverse=True)
-        hits = _mmr_select(hits, RECALL_TOP_K)
-
-        # Only loci_memory points have mutable payloads we own; fire-and-forget.
-        for _h in hits:
-            if _h.get("collection") in ("loci_memory",) and _h.get("point_id"):
-                _phero_now = _now_ts
-                _current   = _effective_pheromone(_h.get("payload") or {}, _phero_now)
-                _pheromone_deposit(_h["collection"], _h["point_id"], _current, _phero_now)
 
         # ── Optional spreading activation enrichment ──────────────────────
         # SA discovers associatively-linked memories that vector search missed.
+        # Its hits join the candidate pool BEFORE the top-K selection below;
+        # appended after it, _format_results cut them off whenever the vector
+        # search had already filled RECALL_TOP_K slots.
         if SA_ENABLED and _SA_MODULE is not None:
             try:
                 import time as _time
@@ -689,18 +694,33 @@ def main() -> None:
                     )
                     _sa_ms = (_time.monotonic() - _sa_t0) * 1000
                     if _sa_ms <= SA_TIMEOUT_MS:
+                        _sa_hits = []
                         for _r in _sa_results:
                             if _r.get("content"):
-                                hits.append({
+                                _sa_hit = {
                                     "collection": "mnemosyne_sa",
                                     "score": _r["activation"],
                                     "importance": _r.get("importance", 0.5),
                                     "fused": _r["activation"] * _r.get("importance", 0.5),
                                     "content": _r["content"],
                                     "payload": {},
-                                })
+                                }
+                                _sa_hit["_ms_score"] = _multi_signal_score(_sa_hit, _now_ts)
+                                _sa_hits.append(_sa_hit)
+                        if _sa_hits:
+                            hits = sorted(hits + _sa_hits,
+                                          key=lambda h: h["_ms_score"], reverse=True)
             except Exception:
                 pass
+
+        hits = _mmr_select(hits, RECALL_TOP_K)
+
+        # Only loci_memory points have mutable payloads we own; fire-and-forget.
+        for _h in hits:
+            if _h.get("collection") in ("loci_memory",) and _h.get("point_id"):
+                _phero_now = _now_ts
+                _current   = _effective_pheromone(_h.get("payload") or {}, _phero_now)
+                _pheromone_deposit(_h["collection"], _h["point_id"], _current, _phero_now)
 
     if hits:
         recall_block = _format_results(hits, intent, used_fallback, failed)

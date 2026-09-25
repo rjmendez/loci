@@ -25,6 +25,7 @@ Design mirrors guardian.py / verify.py:
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Callable, Optional
 
@@ -37,6 +38,19 @@ _MAX_EVIDENCE_ITEMS = 8
 _MAX_EVIDENCE_CHARS = 1200
 _FASTPATH_MIN_OVERLAP = 0.72
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+# Polarity cues. The reflex only compares tokens, so "No evidence that X" contains X
+# verbatim; a support row whose negation cues differ from the claim's is left to the model.
+# The list cannot be complete (a denial can be worded any way), so the exact-match path
+# also requires the evidence to *start* with the claim (see _reflex_arc_fastpath).
+_NEGATION_TOKENS = frozenset({
+    "no", "not", "never", "none", "nothing", "nobody", "neither", "nor", "without",
+    "false", "untrue", "cannot", "cant", "didn", "doesn", "don", "isn", "wasn", "weren",
+    "aren", "hasn", "haven", "hadn", "won", "wouldn", "couldn", "shouldn",
+    "refuted", "disproved", "disproven", "unconfirmed",
+    "deny", "denies", "denied", "ruled", "incorrect", "inaccurate", "wrong", "unfounded",
+    "baseless", "unsupported", "unproven", "unverified", "disputed", "retracted",
+    "debunked", "rejected", "dismissed", "failed", "alleged", "allegedly", "whether",
+})
 
 _PROMPT_TMPL = (
     "You are checking whether cited investigation evidence REALLY supports an EXACT claim.\n"
@@ -65,14 +79,24 @@ def _coerce_verdict(raw) -> str:
 
 
 def _coerce_confidence(raw) -> float:
-    """Coerce confidence to [0,1]; invalid values degrade to 0.0."""
+    """Coerce confidence to [0,1]; invalid or non-finite values degrade to 0.0."""
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    if value != value:
+    if not math.isfinite(value):
         return 0.0
     return max(0.0, min(1.0, value))
+
+
+def _is_nonfinite_confidence(raw) -> bool:
+    """True for a confidence that parses as a number but is NaN, +/-inf or overflows."""
+    try:
+        return not math.isfinite(float(raw))
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _unavailable(error: str = "", rationale: str = "") -> dict:
@@ -154,13 +178,19 @@ def _reflex_arc_fastpath(claim: str, evidence: list[dict]) -> dict | None:
 
     # Reflex acceptance: exact or near-exact support match with no contradiction.
     if not contradictions:
+        claim_negations = _tokenize(claim_text) & _NEGATION_TOKENS
         for row in supports:
             text = str(row.get("text") or row.get("snippet") or "").strip()
             if not text:
                 continue
+            if (_tokenize(text) & _NEGATION_TOKENS) != claim_negations:
+                continue  # polarity differs: lexical overlap cannot tell support from denial
             text_norm = _normalize_lexeme_text(text)
             overlap = _lexical_overlap_ratio(claim_text, text)
-            exactish = (claim_norm in text_norm) or (text_norm in claim_norm)
+            # The claim must lead the evidence ("X and ..."), not sit inside a
+            # wrapper that can deny it ("That X was ruled out", "Vendor denied that X").
+            exactish = (text_norm == claim_norm or text_norm.startswith(claim_norm + " ")
+                        or text_norm in claim_norm)
             if exactish and overlap >= 0.85:
                 return {
                     "available": True,
@@ -260,6 +290,9 @@ def check_claim_entailment(
     obj = extract_json_object(raw)
     if obj is None:
         return _unavailable(f"unparseable response: {str(raw)[:120]!r}")
+
+    if _is_nonfinite_confidence(obj.get("confidence")):
+        return _unavailable(f"non-finite confidence: {str(raw)[:120]!r}")
 
     rationale = obj.get("rationale")
     if not isinstance(rationale, str) or not rationale.strip():

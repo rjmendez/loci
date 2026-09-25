@@ -6,9 +6,9 @@ outbound dependency (sqlite state.db, Ollama, Qdrant, the Loci findings
 file) is allowed to be missing or broken, and the hook must still exit 0
 without a traceback.
 
-These tests pin the behaviour AS IT IS TODAY, including several things
-that are arguably wrong.  Those are called out with `BUG:` comments and
-are asserted *as-is* on purpose -- they are the safety net, not the spec.
+These tests pin the hook's behaviour. They once also pinned several bugs
+as-is (`BUG:` comments); those tests now assert the correct behaviour and the
+bugs are fixed. Do not pin a known bug here again: see AGENTS.md rule 8.
 
 Nothing here touches the network.  urllib.request.urlopen is patched, or
 the module-level helper that calls it is patched.  The module reads ~10
@@ -411,33 +411,43 @@ def test_content_window_keeps_the_tail_and_truncates_the_oldest_line(hook):
     ])
     got = hook.get_session_content("s1")
     l1, l2, l3 = ("USER: " + c * 24 for c in "ABC")
-    assert got["content"] == "\n\n".join([l1[:20], l2, l3])
+    # 80 - 30 - 30 - two 2-char separators = 16 chars left for the oldest line
+    assert got["content"] == "\n\n".join([l1[:16], l2, l3])
+    assert len(got["content"]) == 80
     # msg_count still counts every qualifying message, even the truncated one.
     assert got["msg_count"] == 3
 
 
-def test_content_window_can_exceed_max_chars_because_separators_are_uncounted(hook):
-    """BUG: the "\\n\\n" joiners are not charged against MAX_CHARS, so the
-    embedded text is up to 2*(n-1) chars longer than the stated budget."""
-    hook.MAX_CHARS = 80
-    make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
-        {"role": "user", "content": c * 24, "ts": i}
-        for i, c in enumerate("ABC")
-    ])
-    assert len(hook.get_session_content("s1")["content"]) == 84
-
-
-def test_content_window_emits_a_leading_empty_line_on_exact_fit(hook):
-    """BUG: when the budget is exactly consumed, the next line is sliced to
-    line[:0] == "" and still joined in, so content starts with "\\n\\n"."""
-    hook.MAX_CHARS = 60          # exactly two 30-char lines
+@pytest.mark.parametrize("budget, expected_len", [
+    (40, 40), (61, 61), (62, 62),
+    (63, 62), (64, 62),          # no room for a separator plus a char: nothing more is joined
+    (65, 65), (80, 80), (93, 93), (94, 94), (200, 94),
+])
+def test_content_window_never_exceeds_max_chars(hook, budget, expected_len):
+    """The "\\n\\n" joiners count against MAX_CHARS (they used to be free, so the
+    embedded text ran up to 2*(n-1) chars over the stated budget)."""
+    hook.MAX_CHARS = budget
     make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
         {"role": "user", "content": c * 24, "ts": i}
         for i, c in enumerate("ABC")
     ])
     content = hook.get_session_content("s1")["content"]
-    assert content.startswith("\n\n")
-    assert content == "\n\n" + "USER: " + "B" * 24 + "\n\n" + "USER: " + "C" * 24
+    full = "\n\n".join("USER: " + c * 24 for c in "ABC")    # 94 chars
+    assert len(content) == expected_len <= budget
+    assert full.endswith(content[-30:])                       # the newest line is always whole
+    assert not content.startswith("\n")
+
+
+def test_content_window_has_no_empty_line_on_an_exact_fit(hook):
+    """Exactly two lines plus their separator fit: the third is dropped, not joined
+    in as an empty line (which used to make the content start with "\\n\\n")."""
+    hook.MAX_CHARS = 62          # 30 + 2 + 30
+    make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
+        {"role": "user", "content": c * 24, "ts": i}
+        for i, c in enumerate("ABC")
+    ])
+    content = hook.get_session_content("s1")["content"]
+    assert content == "USER: " + "B" * 24 + "\n\n" + "USER: " + "C" * 24
 
 
 def test_single_oversized_message_is_head_truncated_to_max_chars(hook):
@@ -498,21 +508,19 @@ def test_write_cache_swallows_an_unusable_cache_dir(hook, tmp_path):
     assert blocker.read_text() == "i am a file"
 
 
-def test_cached_msg_count_raises_when_the_cache_dir_cannot_be_created(hook, tmp_path):
-    """BUG: cache_path() is called *outside* cached_msg_count()'s try block, so
-    an unusable LOCI_SYNC_CACHE turns the "return -1 on anything" contract
-    into an uncaught exception."""
+def test_cached_msg_count_is_minus_one_when_the_cache_dir_cannot_be_created(hook, tmp_path):
+    """The "return -1 on anything" contract covers an unusable LOCI_SYNC_CACHE
+    too: cache_path()'s makedirs error must not escape."""
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file")
     hook.CACHE_DIR = str(blocker)
-    with pytest.raises(FileExistsError):
-        hook.cached_msg_count("s1")
+    assert hook.cached_msg_count("s1") == -1
+    assert blocker.read_text() == "i am a file"
 
 
-def test_cached_msg_count_raises_on_a_missing_parent_directory(hook):
+def test_cached_msg_count_is_minus_one_on_a_missing_parent_directory(hook):
     hook.CACHE_DIR = "/proc/no-such-parent/cache"
-    with pytest.raises(OSError):
-        hook.cached_msg_count("s1")
+    assert hook.cached_msg_count("s1") == -1
 
 
 def test_cache_keys_are_per_session(hook):
@@ -574,7 +582,7 @@ def test_embed_posts_openai_shape_and_returns_first_embedding(hook):
 def test_embed_propagates_transport_errors(hook):
     _, p = patch_urlopen(hook, OSError("connection refused"))
     try:
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="connection refused"):
             hook.embed("hi")
     finally:
         p.stop()
@@ -583,17 +591,38 @@ def test_embed_propagates_transport_errors(hook):
 def test_embed_propagates_malformed_response(hook):
     _, p = patch_urlopen(hook, Resp({"data": []}))
     try:
-        with pytest.raises(IndexError):
+        with pytest.raises(IndexError, match="list index out of range"):
             hook.embed("hi")
     finally:
         p.stop()
 
 
-def test_embed_raises_when_ollama_base_url_is_unset(paths):
-    """With OLLAMA None the Request constructor blows up -- main() catches it."""
+def test_embed_raises_a_clear_error_when_no_endpoint_is_configured(paths):
+    """No endpoint configured: a RuntimeError naming the missing settings, with
+    no request attempted -- main() logs it and exits 0."""
     h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"]})
-    with pytest.raises(Exception):
-        h.embed("hi")
+    calls, p = patch_urlopen(h, AssertionError("must not be called"))
+    try:
+        with pytest.raises(RuntimeError,
+                           match="OLLAMA_BASE_URL or MNEMOSYNE_EMBEDDING_API_URL"):
+            h.embed("hi")
+    finally:
+        p.stop()
+    assert calls == []
+
+
+def test_main_without_an_embeddings_endpoint_logs_and_exits_zero(paths, capsys):
+    h = load_hook({"OLLAMA_BASE_URL": None, "LOCI_STATE_DB": paths["db"],
+                   "LOCI_SYNC_CACHE": paths["cache"]})
+    upserts = []
+    h.ensure_collection = lambda: None
+    h.qdrant_upsert = lambda *a: upserts.append(a) or True
+    seed_session(h)
+    assert run_main(h, {"session_id": "s1"}) == 0
+    assert capsys.readouterr().err.strip() == (
+        "[session_end_sync] embed error: no embeddings endpoint configured "
+        "(set OLLAMA_BASE_URL or MNEMOSYNE_EMBEDDING_API_URL)")
+    assert upserts == []
 
 
 # ---------------------------------------------------------------------------
@@ -819,18 +848,33 @@ def test_wiring_dedup_keeps_only_one_entry_per_id(inv_env):
     assert payload["unresolved_wiring_obligation_samples"] == ["new"]
 
 
-def test_wiring_records_without_an_id_collapse_into_one(inv_env):
-    """BUG: a missing id defaults to "", so the empty string is the dedup key
-    and every id-less finding after the first is silently dropped."""
+def test_wiring_records_without_an_id_are_each_counted(inv_env):
+    """An id-less finding has nothing to be deduplicated against: three of them
+    are three obligations, not one."""
     write_findings(inv_env, "inv1", [
         {"text": "no-id one", "tags": ["wiring_obligation"], "record_type": "gap"},
         {"text": "no-id two", "tags": ["wiring_obligation"], "record_type": "gap"},
-        {"text": "no-id three", "tags": ["wiring_obligation"], "record_type": "gap"},
+        {"id": "", "text": "empty-id three", "tags": ["wiring_obligation"],
+         "record_type": "gap"},
+    ])
+    payload = {}
+    note = inv_env._check_wiring_obligations("inv1", payload)
+    assert note == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 3"
+    assert payload["unresolved_wiring_obligations"] == 3
+    assert payload["unresolved_wiring_obligation_samples"] == [
+        "empty-id three", "no-id two", "no-id one"]
+
+
+def test_wiring_id_less_records_do_not_disturb_id_dedup(inv_env):
+    write_findings(inv_env, "inv1", [
+        gap("f1", "old"),
+        {"text": "anonymous", "tags": ["wiring_obligation"], "record_type": "gap"},
+        gap("f1", "new"),
     ])
     payload = {}
     inv_env._check_wiring_obligations("inv1", payload)
-    assert payload["unresolved_wiring_obligations"] == 1
-    assert payload["unresolved_wiring_obligation_samples"] == ["no-id three"]
+    assert payload["unresolved_wiring_obligations"] == 2
+    assert payload["unresolved_wiring_obligation_samples"] == ["new", "anonymous"]
 
 
 def test_wiring_skips_unparseable_lines(inv_env):
@@ -865,18 +909,30 @@ def test_wiring_samples_capped_at_three_but_count_is_total(inv_env):
     assert payload["unresolved_wiring_obligation_samples"] == ["t6", "t5", "t4"]
 
 
-def test_wiring_explicit_null_text_aborts_the_whole_scan(inv_env, capsys):
-    """BUG (still): `rec.get("text", fid)` returns None for `"text": null`, and the
-    resulting TypeError discards *every* obligation in the file, not just the bad
-    record. It now reports None ("could not check") rather than "" ("none open")."""
+def test_wiring_explicit_null_text_is_counted_and_sampled_by_id(inv_env, capsys):
+    """`"text": null` used to raise TypeError on slicing and discard *every*
+    obligation in the file. It is one obligation, sampled by its id."""
     write_findings(inv_env, "inv1", [
         gap("f1", "real obligation"),
         {"id": "f2", "text": None, "tags": ["wiring_obligation"], "record_type": "gap"},
     ])
     payload = {}
-    assert inv_env._check_wiring_obligations("inv1", payload) is None
-    assert payload == {}
-    assert "wiring-obligation check failed" in capsys.readouterr().err
+    assert inv_env._check_wiring_obligations("inv1", payload) == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 2"
+    assert payload["unresolved_wiring_obligation_samples"] == ["f2", "real obligation"]
+    assert capsys.readouterr().err == ""
+
+
+def test_wiring_a_legacy_access_row_does_not_shadow_its_finding(inv_env):
+    """Access rows reuse the finding's id and sit AFTER it in the file; reading
+    newest-first they must be skipped, not taken as the finding's latest state."""
+    write_findings(inv_env, "inv1", [
+        gap("f1", "still open"),
+        {"id": "f1", "record_type": "access", "ts": "2026-09-01T00:00:00Z"},
+        {"id": "f1", "type": "access", "ts": "2026-09-02T00:00:00Z"},
+    ])
+    payload = {}
+    assert inv_env._check_wiring_obligations("inv1", payload) == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 1"
+    assert payload["unresolved_wiring_obligation_samples"] == ["still open"]
 
 
 def test_wiring_unreadable_findings_file_is_reported_not_read_as_zero(inv_env, capsys):
@@ -1011,27 +1067,32 @@ def test_main_fast_path_skips_embed_when_msg_count_is_unchanged(wired, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_fast_path_still_calls_ensure_collection_first(wired):
-    """BUG (latency): the docstring promises an immediate exit when nothing
-    changed, but ensure_collection() -- one or two Qdrant round-trips -- runs
-    *before* the cache comparison."""
+def test_fast_path_exits_before_touching_qdrant(wired):
+    """Nothing changed: the hook exits without ensure_collection()'s one or two
+    Qdrant round-trips (they used to run before the cache comparison)."""
     seed_session(wired, n=2)
     wired.write_cache("s1", 2)
     run_main(wired, {"session_id": "s1"})
+    assert wired._rec["ensure"] == 0
+    # positive twin: a changed session still ensures the collection before upserting
+    wired.write_cache("s1", 1)
+    run_main(wired, {"session_id": "s1"})
     assert wired._rec["ensure"] == 1
+    assert len(wired._rec["upsert"]) == 1
 
 
-def test_main_crashes_if_the_cache_dir_is_unusable(wired, tmp_path):
-    """BUG (fail-open violated): every other degraded path exits 0, but an
-    unusable LOCI_SYNC_CACHE lets cache_path()'s makedirs error escape
-    main(), so the hook dies with a traceback and a non-zero status."""
+def test_main_still_syncs_when_the_cache_dir_is_unusable(wired, tmp_path, capsys):
+    """Fail-open: an unusable LOCI_SYNC_CACHE only costs the fast path. With no
+    readable count the session is treated as changed and synced as normal."""
     seed_session(wired)
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("x")
     wired.CACHE_DIR = str(blocker)
-    with pytest.raises(FileExistsError):
-        run_main(wired, {"session_id": "s1"})
-    assert wired._rec["embed"] == []       # it dies before embedding
+    assert run_main(wired, {"session_id": "s1"}) is None
+    assert len(wired._rec["embed"]) == 1
+    assert [u["payload"]["msg_count"] for u in wired._rec["upsert"]] == [2]
+    assert capsys.readouterr().out.startswith("[session_end_sync] synced s1 (2 msgs) in ")
+    assert blocker.read_text() == "x"
 
 
 def test_main_resyncs_when_the_message_count_changed(wired):
@@ -1102,32 +1163,44 @@ def test_main_appends_the_wiring_note_when_an_investigation_is_active(wired, pat
     assert "| ⚠ UNRESOLVED WIRING OBLIGATIONS: 1" in capsys.readouterr().out
 
 
-def test_wiring_payload_fields_never_reach_qdrant(wired, paths, capsys):
-    """BUG: _check_wiring_obligations() mutates `payload`, but it is called
-    *after* qdrant_upsert() has already serialised and sent it.  The
-    unresolved_wiring_obligations fields are therefore never persisted --
-    they only ever show up in the local stdout line."""
+def test_wiring_payload_fields_reach_qdrant(wired, paths, capsys):
+    """The unresolved-obligation fields are part of the point that is sent, not a
+    mutation applied to the dict after qdrant_upsert() has serialised it."""
     wired.ACTIVE_INV = "inv1"
     d = pathlib.Path(paths["loci"]) / "inv1"
     d.mkdir(parents=True)
     (d / "findings.jsonl").write_text(json.dumps(gap("f1", "wire me")) + "\n")
     seed_session(wired)
 
-    sent = {}
-
+    sent = []
     orig = wired.qdrant_upsert
 
     def spy(pid, vec, payload):
-        sent.update(payload)          # snapshot at send time
+        sent.append(json.loads(json.dumps(payload)))   # snapshot at send time
         return orig(pid, vec, payload)
 
     wired.qdrant_upsert = spy
     with mock.patch.dict(os.environ, {"LOCI_INVESTIGATIONS_DIR": paths["loci"]}):
-        run_main(wired, {"session_id": "s1"})
+        assert run_main(wired, {"session_id": "s1"}) is None
 
-    assert "unresolved_wiring_obligations" not in sent
-    # ...yet the very same dict object has been mutated after the fact
-    assert wired._rec["upsert"][0]["payload"]["unresolved_wiring_obligations"] == 1
+    assert len(sent) == 1
+    assert sent[0]["unresolved_wiring_obligations"] == 1
+    assert sent[0]["unresolved_wiring_obligation_samples"] == ["wire me"]
+    assert sent[0]["session_id"] == "s1"
+    assert "| ⚠ UNRESOLVED WIRING OBLIGATIONS: 1" in capsys.readouterr().out
+
+
+def test_wiring_note_is_not_printed_when_the_upsert_fails(wired, paths, capsys):
+    wired.ACTIVE_INV = "inv1"
+    d = pathlib.Path(paths["loci"]) / "inv1"
+    d.mkdir(parents=True)
+    (d / "findings.jsonl").write_text(json.dumps(gap("f1", "wire me")) + "\n")
+    seed_session(wired)
+    wired._rec["upsert_result"] = False
+    with mock.patch.dict(os.environ, {"LOCI_INVESTIGATIONS_DIR": paths["loci"]}):
+        run_main(wired, {"session_id": "s1"})
+    assert capsys.readouterr().out == ""
+    assert wired.cached_msg_count("s1") == -1
 
 
 def test_main_skips_the_wiring_check_without_an_active_investigation(wired, capsys):
@@ -1307,3 +1380,54 @@ def test_transcript_content_none_for_missing_or_empty(hook, tmp_path):
     # Records with no usable text are not a session.
     short = _write_transcript(tmp_path, [_msg("user", "hi")])
     assert hook.transcript_session_content(short, "s") is None
+
+
+# ---------------------------------------------------------------------------
+# main() over a Claude Code Stop payload
+# The session id is a Claude Code uuid that state.db has never heard of; the
+# transcript is the only record, and it is what must be synced.
+# ---------------------------------------------------------------------------
+
+def test_main_syncs_a_claude_code_session_from_its_transcript(wired, tmp_path, capsys):
+    make_db(wired.STATE_DB, session={"id": "some-hermes-session"},
+            messages=[{"session_id": "some-hermes-session", "role": "user",
+                       "content": "hermes-only message " + "h" * 30, "ts": 1}])
+    sid = "2f0c7c3e-cc-uuid-session"
+    path = _write_transcript(tmp_path, [
+        {"type": "ai-title", "aiTitle": "Fix the hooks"},
+        _msg("user", "please look at the hooks " + "u" * 30, ts="2026-09-24T10:00:00Z"),
+        _msg("assistant", "the hooks were reviewed " + "a" * 30, model="claude-opus-5-5"),
+        _msg("user", "ok"),     # too short to count
+    ])
+    assert run_main(wired, {"session_id": sid, "transcript_path": path}) is None
+
+    assert wired._rec["embed"] == [
+        "USER: please look at the hooks " + "u" * 30
+        + "\n\nASSISTANT: the hooks were reviewed " + "a" * 30]
+    (up,) = wired._rec["upsert"]
+    assert up["id"] == wired.stable_id(sid)
+    p = up["payload"]
+    assert (p["session_id"], p["title"], p["source"], p["model"], p["msg_count"],
+            p["started_at"]) == (sid, "Fix the hooks", "claude-code", "claude-opus-5-5", 2,
+                                 "2026-09-24T10:00:00Z")
+    assert "hermes-only" not in p["content_preview"]
+    assert wired.cached_msg_count(sid) == 2
+    assert capsys.readouterr().out.startswith(
+        f"[session_end_sync] synced {sid[:20]} (2 msgs) in ")
+
+
+def test_main_prefers_state_db_over_the_transcript(wired, tmp_path):
+    seed_session(wired, n=1)
+    path = _write_transcript(tmp_path, [_msg("user", "transcript text " + "t" * 30)])
+    run_main(wired, {"session_id": "s1", "transcript_path": path})
+    (up,) = wired._rec["upsert"]
+    assert up["payload"]["source"] == "web"
+    assert "transcript text" not in wired._rec["embed"][0]
+
+
+def test_main_exits_zero_when_neither_state_db_nor_transcript_has_the_session(wired, tmp_path):
+    make_db(wired.STATE_DB)
+    assert run_main(wired, {"session_id": "cc-uuid",
+                            "transcript_path": str(tmp_path / "missing.jsonl")}) == 0
+    assert wired._rec["embed"] == [] and wired._rec["upsert"] == []
+    assert wired._rec["ensure"] == 0

@@ -56,19 +56,41 @@ def make_examples(rows: list[dict]) -> tuple[list[InputExample], list[float]]:
     return examples, scores
 
 
+def _spearman(evaluator, result) -> float:
+    """The evaluator's headline Spearman as a float.
+
+    sentence-transformers >= 3 returns a metrics dict (keyed e.g.
+    "val-baseline_spearman_cosine") rather than a float, so main() formatting it
+    with ``:.4f`` raised TypeError and no fine-tune ever finished.
+    """
+    if not isinstance(result, dict):
+        return float(result)
+    key = getattr(evaluator, "primary_metric", None)
+    if key and key in result:
+        return float(result[key])
+    for k, v in result.items():
+        if k.endswith("spearman_cosine"):
+            return float(v)
+    raise ValueError(f"no spearman_cosine metric in evaluator result: {sorted(result)}")
+
+
+def _evaluate(model, val_examples: list[InputExample], name: str, out_dir: pathlib.Path) -> float:
+    evaluator = EmbeddingSimilarityEvaluator.from_input_examples(
+        val_examples,
+        name=name,
+        write_csv=False,
+    )
+    return _spearman(evaluator, evaluator(model, output_path=str(out_dir)))
+
+
 def baseline_spearman(
     model: SentenceTransformer,
     val_examples: list[InputExample],
     val_scores: list[float],
     out_dir: pathlib.Path,
 ) -> float:
-    evaluator = EmbeddingSimilarityEvaluator.from_input_examples(
-        val_examples,
-        name="val-baseline",
-        write_csv=False,
-    )
-    result = evaluator(model, output_path=str(out_dir))
-    return result
+    """``val_scores`` is unused: the evaluator reads the InputExample labels."""
+    return _evaluate(model, val_examples, "val-baseline", out_dir)
 
 
 def print_stats(rows: list[dict]) -> None:
@@ -76,7 +98,8 @@ def print_stats(rows: list[dict]) -> None:
     signals = {}
     for r in rows:
         signals[r.get("signal", "unknown")] = signals.get(r.get("signal", "unknown"), 0) + 1
-    pos = sum(labels)
+    # Count positives, not sum(labels): a stray label of 2 printed neg=-1.
+    pos = sum(1 for label in labels if label == 1)
     neg = len(labels) - pos
     print(f"Dataset: {len(rows)} rows — pos={pos}, neg={neg}")
     print(f"Signal breakdown: {signals}")
@@ -174,10 +197,7 @@ def main() -> None:
     print("\nEvaluating untrained baseline on val set...")
     eval_out = args.out / "eval_tmp"
     eval_out.mkdir(parents=True, exist_ok=True)
-    baseline_eval = EmbeddingSimilarityEvaluator.from_input_examples(
-        val_examples, name="val-baseline", write_csv=False
-    )
-    baseline_score = baseline_eval(model, output_path=str(eval_out))
+    baseline_score = baseline_spearman(model, val_examples, val_scores, eval_out)
     print(f"Baseline Spearman (untrained): {baseline_score:.4f}")
 
     train_loader = DataLoader(train_examples, shuffle=True, batch_size=args.batch_size)
@@ -203,10 +223,7 @@ def main() -> None:
 
     print("\nEvaluating fine-tuned model on val set...")
     trained_model = SentenceTransformer(str(model_out_dir), trust_remote_code=cfg["trust_remote_code"])
-    final_eval = EmbeddingSimilarityEvaluator.from_input_examples(
-        val_examples, name="val-final", write_csv=False
-    )
-    final_score = final_eval(trained_model, output_path=str(eval_out))
+    final_score = _evaluate(trained_model, val_examples, "val-final", eval_out)
     delta = final_score - baseline_score
     print(f"Fine-tuned Spearman: {final_score:.4f}  (delta from baseline: {delta:+.4f})")
 
