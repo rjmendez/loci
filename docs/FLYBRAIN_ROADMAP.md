@@ -2,6 +2,8 @@
 
 Canonical roadmap for FlyBrain models, the benchmark and serving, as of 2026-09-24. `FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md` covers the data-harness rollout (M0–M3). This file covers everything built on top of it.
 
+Local research reference (what is where, how trustworthy it is, how to cite it): [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md).
+
 Evidence:
 
 - Interim results: `FLYBRAIN_REAL_MODELS_INTERIM.md`.
@@ -78,6 +80,19 @@ The literature synthesis and the interim results back all of these.
 - **Edge exports:**
   - ONNX, checked against the original models, plus a Raspberry Pi runner.
   - ESP32 via an emlearn/m2cgen C export of logistic regression or small distilled trees. The ESP32 receives feature vectors and does no feature computation.
+
+### 4. Reference upkeep and Loci ingestion (after each workflow ships)
+
+- Refresh [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md): statuses (interim → audited, superseded), new reports and artifacts, pins, resolved errata.
+- Ingest audited material into Loci with provenance tiers. Details are in the reference, section 6:
+  - docs go through the docs indexer;
+  - headline lane results become findings in a  investigation ( plus report path, dataset version and status);
+  - literature claims carry their citation and verification status;
+  - model predictions are .
+- Replaced results are resolved as , not retracted.
+- Do not ingest interim numbers unless they are explicitly marked interim.
+- Do not ingest withdrawn material (the Phase 6 roadmap).
+- Resolve the registry licence gaps for  and , and add the missing  citation.
 
 ## Backlog
 
