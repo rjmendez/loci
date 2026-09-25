@@ -61,6 +61,7 @@ atomics, so GPU runs agree only up to float noise.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -429,6 +430,58 @@ def neighbor_vote_predictions(topology: GraphTopology, train_nodes: np.ndarray, 
     has = votes.sum(axis=1) > 0
     best = np.argmax(votes, axis=1)
     return [classes[b] if h else fallback for b, h in zip(best.tolist(), has.tolist())]
+
+
+def _sym_norm_adjacency(topology: GraphTopology) -> Any:
+    """Undirected ``D^-1/2 (A + A^T) D^-1/2`` over ``log1p(synapses)`` (scipy CSR), as in C&S [Huang 2020]."""
+    import scipy.sparse as sp
+
+    n = topology.n_nodes
+    w = np.log1p(topology.weight.astype(np.float64))
+    a = sp.csr_matrix((w, (topology.src, topology.dst)), shape=(n, n))
+    a = (a + a.T).tocsr()
+    deg = np.asarray(a.sum(axis=1)).ravel()
+    inv = np.where(deg > 0, 1.0 / np.sqrt(np.where(deg > 0, deg, 1.0)), 0.0)
+    return (sp.diags(inv) @ a @ sp.diags(inv)).tocsr()
+
+
+def correct_and_smooth(adjacency: Any, base_proba: np.ndarray, train_nodes: np.ndarray, train_y: np.ndarray, *,
+                       alpha_correct: float, alpha_smooth: float, iterations: int = 50) -> np.ndarray:
+    """Correct-and-Smooth [Huang 2020] with autoscale, using TRAINING labels only.
+
+    ``base_proba`` (n_nodes x k) are a feature-only model's probabilities for
+    every graph node; ``train_y`` are class indices of ``train_nodes``.
+    Correct: propagate the training residuals ``Y - Z`` and add them back,
+    scaled to the mean training residual. Smooth: propagate the corrected
+    scores with training rows clamped to their one-hot labels. Held-out labels
+    never enter; returns row-normalized scores (n_nodes x k).
+    """
+    n, k = base_proba.shape
+    train_nodes = np.asarray(train_nodes, dtype=np.int64)
+    y_train = np.zeros((len(train_nodes), k))
+    y_train[np.arange(len(train_nodes)), np.asarray(train_y, dtype=np.int64)] = 1.0
+    z = base_proba.astype(np.float64)
+    e0 = np.zeros((n, k))
+    e0[train_nodes] = y_train - z[train_nodes]
+    e = e0.copy()
+    for _ in range(int(iterations)):
+        e = (1.0 - alpha_correct) * e0 + alpha_correct * (adjacency @ e)
+        e[train_nodes] = e0[train_nodes]
+    sigma = float(np.abs(e0[train_nodes]).sum(axis=1).mean()) if len(train_nodes) else 0.0
+    norm = np.abs(e).sum(axis=1)
+    scale = np.where(norm > 1e-12, sigma / np.where(norm > 1e-12, norm, 1.0), 0.0)
+    corrected = z + scale[:, None] * e
+    g0 = corrected.copy()
+    g0[train_nodes] = y_train
+    g = g0.copy()
+    for _ in range(int(iterations)):
+        g = (1.0 - alpha_smooth) * g0 + alpha_smooth * (adjacency @ g)
+    g = np.clip(g, 0.0, None)
+    total = g.sum(axis=1, keepdims=True)
+    return np.where(total > 0, g / np.where(total > 0, total, 1.0), 1.0 / k)
+
+
+DEFAULT_CS_GRID: tuple[tuple[float, float], ...] = tuple((a, b) for a in (0.5, 0.8, 0.95) for b in (0.5, 0.8, 0.95))
 
 
 # =========================================================================== network
@@ -830,6 +883,9 @@ class GraphEvalConfig:
     gnn_ablation: str = "full"  # "full" (graph + every family) | "graph" (message passing + direction only)
     reload_check: bool = True
     verbose: bool = False
+    # HGB + correct-and-smooth baseline (train labels only) [Huang 2020]; () disables it.
+    cs_grid: tuple[tuple[float, float], ...] = DEFAULT_CS_GRID
+    cs_iterations: int = 50
 
     def as_dict(self) -> dict[str, Any]:
         return fl._jsonable({"eval": self.eval.as_dict(), "gnn_grid": [dict(g) for g in self.gnn_grid],
@@ -838,7 +894,8 @@ class GraphEvalConfig:
                                                                    "param_grid": [dict(p) for p in self.hgb.param_grid],
                                                                    "calibration": self.hgb.calibration},
                              "ablation_models": list(self.ablation_models), "gnn_ablation": self.gnn_ablation,
-                             "reload_check": self.reload_check})
+                             "reload_check": self.reload_check,
+                             "cs_grid": [list(p) for p in self.cs_grid], "cs_iterations": self.cs_iterations})
 
 
 def _gnn_inputs(data: fme.EvalDataset, rows: np.ndarray, columns: Sequence[str] | None = None) -> pd.DataFrame:
@@ -886,6 +943,50 @@ def _gate(entry: dict[str, Any], view_base: Mapping[str, Any], boot: Mapping[str
     }
 
 
+def _hgb_correct_and_smooth(final_h: fl.Learner, ctx: GraphContext, feature_cols: Sequence[str],
+                            nodes: Mapping[str, np.ndarray], y: Mapping[str, np.ndarray], classes: Sequence[str],
+                            config: "GraphEvalConfig", cfg: fme.EvalConfig) -> dict[str, Any]:
+    """HGB probabilities for every graph node, then C&S with train labels only; (alpha_c, alpha_s) tuned on val."""
+    base_all = final_h.predict_proba(ctx.features[list(feature_cols)].reset_index(drop=True))
+    order = [list(final_h.classes_).index(c) if c in final_h.classes_ else None for c in classes]
+    z = np.zeros((ctx.topology.n_nodes, len(classes)))
+    for j, src in enumerate(order):
+        if src is not None:
+            z[:, j] = base_all[:, src]
+    adjacency = _sym_norm_adjacency(ctx.topology)
+    index = {c: i for i, c in enumerate(classes)}
+    train_y = np.asarray([index[str(v)] for v in y["train"]], dtype=np.int64)
+    trials = []
+    best = None
+    for a_c, a_s in config.cs_grid:
+        scores = correct_and_smooth(adjacency, z, nodes["train"], train_y, alpha_correct=a_c, alpha_smooth=a_s,
+                                    iterations=config.cs_iterations)
+        scored = fme._score(y["val"].tolist(), scores[nodes["val"]], list(classes), cfg.ece_bins)
+        metric = -scored["log_loss"] if cfg.tune_metric == "log_loss" else scored[cfg.tune_metric]
+        trials.append({"params": {"alpha_correct": a_c, "alpha_smooth": a_s}, "val_metric": metric,
+                       "val": fme._strip(scored)})
+        if best is None or metric > best[0]:
+            best = (metric, (a_c, a_s), scores, scored)
+    assert best is not None
+    scores = best[2]
+    # ---- the single held-out test evaluation of the selected (alpha_c, alpha_s)
+    test = fme._score(y["test"].tolist(), scores[nodes["test"]], list(classes), cfg.ece_bins)
+    entry = {
+        "backend": "hgb+correct_and_smooth", "view": VIEW_GRAPH, "calibration": None,
+        "calibration_source": "none (C&S scores row-normalized; ECE reported for completeness only)",
+        "tuning": {"selection": f"val {cfg.tune_metric}", "trials": trials,
+                   "best_params": {"alpha_correct": best[1][0], "alpha_smooth": best[1][1]}},
+        "describe": {"method": "Correct-and-Smooth [Huang 2020] over the calibrated hgb; symmetric-normalized "
+                               "undirected log1p(synapse) adjacency; autoscale; labels = train split only",
+                     "iterations": config.cs_iterations},
+        "fit_info": {},
+        "val": {"raw": fme._strip(best[3]), "calibrated": fme._strip(best[3])},
+        "test": {**fme._strip(test), "raw_uncalibrated": fme._strip(test),
+                 "confusion": fme.confusion(y["test"].tolist(), test["predictions"])},
+    }
+    return {"entry": entry, "test_predictions": test["predictions"]}
+
+
 def _fit_gnn(params: Mapping[str, Any], mode: str, ctx: GraphContext, X: pd.DataFrame, y: np.ndarray,
              groups: np.ndarray, *, seed: int, device: str) -> GraphSageLearner:
     learner = fl.make_learner("graphsage", seed=seed, **{**dict(params), "mode": mode, "device": device})
@@ -918,7 +1019,9 @@ def run_graph_evaluation(data: fme.EvalDataset, context: GraphContext, config: G
     classes = tuple(sorted(set(y["train"].tolist())))
     feature_cols = list(data.features.columns)
     heldout_ids = [data.sample_ids[i] for i in np.concatenate([idx["val"], idx["test"]])]
-    ctx = context.with_heldout(heldout_ids)
+    # The context may already hold every node sharing a held-out group (prepare_mc_task mask_policy="group"):
+    # keep those too, so inductive training never sees any node of a val/test cell type or hemilineage.
+    ctx = context.with_heldout(set(map(str, heldout_ids)) | set(context.heldout))
     topo = ctx.topology
     nodes = {name: topo.indices([data.sample_ids[i] for i in rows]) for name, rows in idx.items()}
 
@@ -933,6 +1036,7 @@ def run_graph_evaluation(data: fme.EvalDataset, context: GraphContext, config: G
         "notes": fl._jsonable(dict(data.notes)),
         "leakage_check": {**leakage, "context_feature_columns_checked": len(context.features.columns),
                           "heldout_nodes": len(heldout_ids),
+                          "heldout_nodes_incl_group_members": len(ctx.heldout),
                           "heldout_rule": "val+test node labels never enter training loss; wiring-feature partner "
                                           "categories masked for val+test (masked_split_ids_sha256); inductive mode "
                                           "also removes val+test nodes and their edges from the training graph"},
@@ -1035,6 +1139,15 @@ def run_graph_evaluation(data: fme.EvalDataset, context: GraphContext, config: G
             preds[spec.label] = test["predictions"]
             fitted[spec.label] = (spec.backend, dict(tuning["best_params"]), final_h)
             say(f"hgb best {tuning['best_params']} done")
+            if config.cs_grid:
+                t0 = time.time()
+                cs = _hgb_correct_and_smooth(final_h, ctx, feature_cols, nodes, y, classes, config, cfg)
+                models["hgb_cs"] = {**cs["entry"], "fit_seconds": round(time.time() - t0, 3)}
+                preds["hgb_cs"] = cs["test_predictions"]
+                say(f"hgb+C&S best {cs['entry']['tuning']['best_params']} done")
+        size = fme._size_baseline(data, idx, y, g_train, cfg)
+        if size.get("available"):
+            report["size_baseline"] = {k: v for k, v in size.items() if k != "_predictions"}
 
         # ---- bootstrap CIs + paired gains, gate
         hgb_label = None if config.hgb is None else config.hgb.label
@@ -1086,6 +1199,12 @@ def run_graph_evaluation(data: fme.EvalDataset, context: GraphContext, config: G
             g["pass"] = bool(g["trivial_baseline_gate"]["pass"] and g["beats_trivial_macro_f1"]
                              and g["paired_gain_significant"] and ok_shuffle)
 
+        if "hgb_cs" in models:
+            g = models["hgb_cs"]["gate"]
+            g["shuffle_ok"] = None
+            g["pass"] = bool(g["trivial_baseline_gate"]["pass"] and g["beats_trivial_macro_f1"]
+                             and g["paired_gain_significant"])
+            g["note"] = "report-only baseline: no shuffle control (C&S has no trainable parameters beyond hgb)"
         gnn_labels = [m for m in models if models[m]["backend"] == "graphsage"]
         best_gnn = sorted(gnn_labels, key=lambda m: (-models[m]["val"]["calibrated"]["macro_f1"], m))[0] if gnn_labels else None
         report["best_on_val"] = sorted(models, key=lambda m: (-models[m]["val"]["calibrated"]["macro_f1"], m))[0]
@@ -1202,7 +1321,8 @@ _DROP_SUPER = {"unknown", "non_neuronal", "other"}
 
 def prepare_mc_task(target: str, *, storage_root: str = DEFAULT_STORAGE_ROOT, cache_root: str = fwf.DEFAULT_CACHE_ROOT,
                     eval_config: fme.EvalConfig = fme.EvalConfig(models=()), min_class_count: int = 100,
-                    min_edge_weight: float = 0.0, log=print) -> tuple[fme.EvalDataset, GraphContext]:
+                    min_edge_weight: float = 0.0, mask_policy: str = "group",
+                    log=print) -> tuple[fme.EvalDataset, GraphContext]:
     """Labels, grouped split plan, masked wiring features and graph for one male-cns target.
 
     Nothing is written into the snapshot: hash stamps go to
@@ -1210,7 +1330,16 @@ def prepare_mc_task(target: str, *, storage_root: str = DEFAULT_STORAGE_ROOT, ca
     Held-out (val + test) nodes' super-class is masked in every node's
     partner-composition features for EVERY target (the hierarchy and NT are
     correlated, and same-type partners share them).
+
+    ``mask_policy="group"`` (default, fully inductive): the mask AND the
+    context's held-out set cover every node that shares a held-out sample's
+    cell type or hemilineage (labelled or not), so no same-type / same-lineage
+    partner of a test neuron exposes its category in message passing and the
+    inductive GNN never trains on such a node. ``"samples"`` masks only the
+    sampled val/test nodes (the v1 behaviour).
     """
+    if mask_policy not in ("group", "samples"):
+        raise ValueError("mask_policy must be 'group' or 'samples'")
     import flybrain_mc_adapter as mca
 
     if target not in MC_TARGETS:
@@ -1243,15 +1372,27 @@ def prepare_mc_task(target: str, *, storage_root: str = DEFAULT_STORAGE_ROOT, ca
                                   group_keys, eval_config)
     edges = fwf.EdgeSource(path=str(snap.path(mca.ROLE_EDGELIST)), pre="body_pre", post="body_post", weight="weight",
                            provenance={"manifest_sha256": snap.manifest_sha256})
+    held_samples = {str(v) for v in list(plan["val"]) + list(plan["test"])}
+    if mask_policy == "group":
+        held = frame[frame["bodyId"].astype(str).isin(held_samples)]
+        hit = np.zeros(len(meta), dtype=bool)
+        for key, column in (("cell_type", "type"), ("hemilineage", "itoleeHl")):
+            values = {v for v in held[key].dropna().tolist() if str(v).strip()}
+            hit |= meta[column].isin(values).to_numpy()
+        mask_ids = sorted(held_samples | set(meta.loc[hit, "bodyId"].astype(str)))
+    else:
+        mask_ids = sorted(held_samples)
     feats = fwf.build_wiring_features(dataset="mc", objective=target, edges=edges, nodes=meta, id_column="bodyId",
                                       category_column="superclass", vocab_map=fwf.harmonize_super_class,
                                       params=fwf.WiringFeatureParams(two_hop=True), cache_root=cache_root,
-                                      mask_category_ids=list(plan["val"]) + list(plan["test"]))
+                                      mask_category_ids=mask_ids)
+    log(f"mask_policy={mask_policy}: {len(mask_ids)} nodes masked (sampled val+test {len(held_samples)})")
     log(f"features {feats.frame.shape} excluded {len(feats.excluded_features)} ({time.time() - t0:.0f}s)")
     topo = build_graph_topology(dataset="mc", edges=edges, node_ids=feats.frame[fwf.NODE_ID_COLUMN].tolist(),
                                 cache_root=cache_root).filtered(min_edge_weight)
     log(f"graph {topo.n_nodes} nodes {topo.n_edges} edges ({time.time() - t0:.0f}s)")
-    context = GraphContext.from_node_frame(topo, feats.frame)
+    in_graph = [m for m in mask_ids if m in topo._index]
+    context = GraphContext.from_node_frame(topo, feats.frame, heldout=in_graph if mask_policy == "group" else ())
     fcols = [c for c in feats.frame.columns if c != fwf.NODE_ID_COLUMN]
     merged = frame[["bodyId", "label", *group_keys]].merge(feats.frame, left_on="bodyId", right_on=fwf.NODE_ID_COLUMN,
                                                            how="left", validate="one_to_one")
@@ -1265,7 +1406,10 @@ def prepare_mc_task(target: str, *, storage_root: str = DEFAULT_STORAGE_ROOT, ca
                    "super_class": "annotations.superclass harmonized (unknown/non_neuronal/other dropped)",
                    "cell_class": "annotations.class (slug, _tbc merged)",
                    "nt_ground_truth": "body-neurotransmitters.ground_truth (short codes; predictions never used)"}[target],
-               "partner_category": "harmonized superclass, val+test nodes masked"})
+               "partner_category": "harmonized superclass, masked for held-out nodes (mask_policy)",
+               "mask_policy": mask_policy, "masked_partner_category_nodes": len(mask_ids),
+               "inductive_heldout_nodes": len(in_graph) if mask_policy == "group" else None,
+               "wiring_params": dict(feats.meta.get("params") or {})})
     return data, context
 
 
@@ -1281,19 +1425,57 @@ DEFAULT_GNN_GRID: tuple[Mapping[str, Any], ...] = (
 )
 
 
+GPU_MIN_FREE_GB = 2.0  # R8: a card qualifies only with >= 2 GB free at start; never wait for one
+GPU_KEEP_FREE_GB = 1.0  # R8: leave >= 1 GB free on the card (Loci's embedding model must stay loadable)
+
+
+def select_device(requested: str, *, min_free_gb: float = GPU_MIN_FREE_GB,
+                  keep_free_gb: float = GPU_KEEP_FREE_GB) -> dict[str, Any]:
+    """R8 device policy: the requested CUDA device if it has >= ``min_free_gb`` free now, else CPU (never wait).
+
+    Returns ``{"device", "name", "memory_fraction", "free_gb", "total_gb", "note"}``. The memory fraction
+    caps this process so that at least ``keep_free_gb`` stays free on the card (and never above 0.6).
+    Pin the physical card with ``CUDA_VISIBLE_DEVICES`` (``CUDA_DEVICE_ORDER=PCI_BUS_ID``) and pass cuda:0.
+    """
+    info: dict[str, Any] = {"device": "cpu", "name": "cpu", "memory_fraction": None, "free_gb": None,
+                            "total_gb": None, "note": None,
+                            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")}
+    if not str(requested).startswith("cuda"):
+        return info
+    import torch
+
+    if not torch.cuda.is_available():
+        info["note"] = "cpu_fallback: cuda unavailable"
+        return info
+    device = torch.device(str(requested))
+    free, total = torch.cuda.mem_get_info(device)
+    free_gb, total_gb = free / (1 << 30), total / (1 << 30)
+    info.update(free_gb=round(free_gb, 2), total_gb=round(total_gb, 2))
+    if free_gb < float(min_free_gb):
+        info["note"] = f"cpu_fallback: gpus busy ({free_gb:.1f} GiB free < {min_free_gb} GiB)"
+        return info
+    fraction = min(0.6, max(0.05, (free_gb - float(keep_free_gb)) / total_gb))
+    info.update(device=str(device), name=torch.cuda.get_device_name(device), memory_fraction=round(fraction, 3))
+    return info
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="FlyBrain graph-model experiments on male-cns")
     parser.add_argument("--target", choices=MC_TARGETS, required=True)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default="cuda:0",
+                        help="cuda:N (falls back to cpu when < 2 GB free: R8, never wait) or cpu")
     parser.add_argument("--storage-root", default=DEFAULT_STORAGE_ROOT)
     parser.add_argument("--cache-root", default=fwf.DEFAULT_CACHE_ROOT)
     parser.add_argument("--report-root", default=DEFAULT_GRAPH_REPORT_ROOT)
     parser.add_argument("--run-label", default="v1")
+    parser.add_argument("--seeds", default="0", help="comma-separated model seeds (same split); one report each")
+    parser.add_argument("--mask-policy", choices=("group", "samples"), default="group")
     parser.add_argument("--min-class-count", type=int, default=100)
     parser.add_argument("--n-bootstrap", type=int, default=1000)
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--n-threads", type=int, default=8)
     parser.add_argument("--quick", action="store_true", help="one GNN config, no ablations (smoke)")
+    parser.add_argument("--no-ablation", action="store_true", help="skip ablations (seeds > first)")
     parser.add_argument("--grid", choices=("default", "cpu"), default="default",
                         help="cpu: one small balanced config (for CPU-only runs)")
     parser.add_argument("--gnn-ablation", choices=("full", "graph"), default="full",
@@ -1301,31 +1483,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--min-edge-weight", type=float, default=0.0,
                         help="drop graph edges with fewer synapses (features are unaffected)")
     args = parser.parse_args(argv)
-    ecfg = fme.EvalConfig(models=(), cv_folds=args.cv_folds, n_bootstrap=args.n_bootstrap, n_threads=args.n_threads,
-                          report_root=args.report_root, run_label=args.run_label, ablation=not args.quick)
     t0 = time.time()
 
     def log(msg: str) -> None:
         print(f"[{time.time() - t0:7.1f}s] {msg}", flush=True)
 
+    dev = select_device(args.device)
+    log(f"device {dev['device']} ({dev['name']}) memory_fraction={dev['memory_fraction']} "
+        f"free={dev['free_gb']}/{dev['total_gb']} GiB CUDA_VISIBLE_DEVICES={dev['cuda_visible_devices']} "
+        f"note={dev['note']}")
+    seeds = [int(v) for v in args.seeds.split(",") if v.strip()]
+    base_cfg = fme.EvalConfig(models=(), cv_folds=args.cv_folds, n_bootstrap=args.n_bootstrap, n_threads=args.n_threads,
+                              report_root=args.report_root, run_label=args.run_label, ablation=False)
     data, context = prepare_mc_task(args.target, storage_root=args.storage_root, cache_root=args.cache_root,
-                                    eval_config=ecfg, min_class_count=args.min_class_count,
-                                    min_edge_weight=args.min_edge_weight, log=log)
-    grid = CPU_GNN_GRID if args.grid == "cpu" else DEFAULT_GNN_GRID
-    gcfg = GraphEvalConfig(eval=ecfg, gnn_grid=grid[:1] if args.quick else grid, device=args.device, verbose=True,
-                           gnn_ablation=args.gnn_ablation)
-    report = run_graph_evaluation(data, context, gcfg)
-    for row in report["summary"]:
-        print(json.dumps(fl._jsonable(row)), flush=True)
-    for label, entry in report["models"].items():
-        if "vs_hgb" in entry:
-            print(label, "vs hgb", json.dumps(fl._jsonable(entry["vs_hgb"])), flush=True)
-    log(f"done; report under {fme.report_dir(args.report_root, 'mc', args.target, args.run_label)}")
+                                    eval_config=base_cfg, min_class_count=args.min_class_count,
+                                    min_edge_weight=args.min_edge_weight, mask_policy=args.mask_policy, log=log)
+    grid = CPU_GNN_GRID if (args.grid == "cpu" or dev["device"] == "cpu") else DEFAULT_GNN_GRID
+    extra = {"max_gpu_memory_fraction": dev["memory_fraction"], "min_free_gpu_gb": GPU_MIN_FREE_GB} \
+        if dev["device"] != "cpu" else {}
+    grid = tuple({**g, **extra} for g in (grid[:1] if args.quick else grid))
+    for i, seed in enumerate(seeds):
+        label = args.run_label if len(seeds) == 1 else f"{args.run_label}-s{seed}"
+        ablate = not (args.quick or args.no_ablation) and i == 0
+        ecfg = dataclasses.replace(base_cfg, seed=seed, run_label=label, ablation=ablate)
+        data.notes = {**dict(data.notes), "device": dev, "seed": seed}
+        gcfg = GraphEvalConfig(eval=ecfg, gnn_grid=grid, device=dev["device"], verbose=True,
+                               gnn_ablation=args.gnn_ablation)
+        log(f"seed {seed}: run_label={label} ablation={ablate} grid={len(grid)} device={dev['device']}")
+        report = run_graph_evaluation(data, context, gcfg)
+        for row in report["summary"]:
+            print(json.dumps(fl._jsonable({**row, "seed": seed})), flush=True)
+        for name, entry in report["models"].items():
+            if "vs_hgb" in entry:
+                print(name, "vs hgb", json.dumps(fl._jsonable(entry["vs_hgb"])), flush=True)
+        log(f"seed {seed} done; report under {fme.report_dir(args.report_root, 'mc', args.target, label)}")
+        context.clear_adjacency_cache()
     return 0
 
 
 __all__ = [
     "CPU_GNN_GRID",
+    "DEFAULT_CS_GRID",
+    "correct_and_smooth",
+    "select_device",
     "DEFAULT_GNN_GRID",
     "DEFAULT_GRAPH_REPORT_ROOT",
     "GRAPH_MODEL_SCHEMA_VERSION",

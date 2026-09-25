@@ -277,7 +277,11 @@ def test_run_graph_evaluation_end_to_end(tmp_path):
     cfg = _gcfg(tmp_path)
     report = fgm.run_graph_evaluation(_eval_data(ctx, frame, cfg.eval), ctx, cfg)
     rows = {r["model"]: r for r in report["summary"]}
-    assert set(rows) == {"graphsage_transductive", "graphsage_inductive", "hgb"}
+    assert set(rows) == {"graphsage_transductive", "graphsage_inductive", "hgb", "hgb_cs"}
+    # C&S propagates TRAIN labels through the shared hubs, so it recovers what hgb (own noise features) cannot
+    assert rows["hgb_cs"]["model_acc"] > rows["hgb"]["model_acc"] + 0.2
+    assert report["models"]["hgb_cs"]["tuning"]["best_params"].keys() == {"alpha_correct", "alpha_smooth"}
+    assert "model-minus-hgb" in report["models"]["hgb_cs"]["test"]["bootstrap"]["paired"]
     for key in ("majority", "best_trivial", "best_trivial_rule", "model_acc", "model_ci", "macro_f1", "ece",
                 "shuffle_acc", "n_train", "n_test", "gate"):
         assert key in rows["hgb"]
@@ -356,3 +360,68 @@ def test_filtered_topology_and_no_refit_mode():
     assert learner.fit_info["refit_on_all_train_rows"] is False
     Xte, yte, _ = _rows(frame, te)
     assert np.mean(np.asarray(learner.predict(Xte)) == yte) > 0.8
+
+
+# ---------------------------------------------------------------- lanes-v2 additions: C&S, group held-out, R8 devices
+
+
+def _chain(n=7):
+    ids = [f"c{i}" for i in range(n)]
+    src = list(range(n - 1))
+    dst = list(range(1, n))
+    return fgm.graph_from_arrays(ids, src, dst, [5.0] * (n - 1))
+
+
+def test_correct_and_smooth_spreads_train_labels_and_keeps_rows_normalized():
+    topo = _chain()
+    adj = fgm._sym_norm_adjacency(topo)
+    dense = adj.toarray()
+    assert np.allclose(dense, dense.T)
+    base = np.full((topo.n_nodes, 2), 0.5)
+    out = fgm.correct_and_smooth(adj, base, np.array([0, 6]), np.array([0, 1]), alpha_correct=0.8,
+                                 alpha_smooth=0.9, iterations=60)
+    assert np.allclose(out.sum(axis=1), 1.0)
+    assert out[1, 0] > out[1, 1] and out[5, 1] > out[5, 0]  # neighbours follow their nearest train label
+    assert out[0, 0] > 0.7 and out[6, 1] > 0.7  # train rows re-injected through G0 each step
+
+
+def test_correct_and_smooth_uses_only_the_given_training_labels():
+    topo = _chain()
+    adj = fgm._sym_norm_adjacency(topo)
+    base = np.random.default_rng(0).dirichlet([1, 1], size=topo.n_nodes)
+    a = fgm.correct_and_smooth(adj, base, np.array([0]), np.array([0]), alpha_correct=0.5, alpha_smooth=0.5)
+    b = fgm.correct_and_smooth(adj, base, np.array([0]), np.array([0]), alpha_correct=0.5, alpha_smooth=0.5)
+    assert np.array_equal(a, b)  # deterministic; no other label source exists in the signature
+    none = fgm.correct_and_smooth(adj, base, np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                                  alpha_correct=0.5, alpha_smooth=0.0)
+    assert np.allclose(none, base / base.sum(axis=1, keepdims=True))  # no labels, no smoothing -> base
+
+
+def test_group_heldout_in_context_is_kept_by_the_evaluation(tmp_path):
+    ctx, frame = _synthetic(n_labelled=600, n_groups=60)
+    cfg = _gcfg(tmp_path, cs_grid=((0.5, 0.5),))
+    cfg = fgm.GraphEvalConfig(**{**cfg.__dict__, "modes": ("inductive",), "reload_check": False})
+    cfg = fgm.GraphEvalConfig(**{**cfg.__dict__, "eval": fme.EvalConfig(
+        **{**cfg.eval.__dict__, "ablation": False, "save_models": False, "random_split_control": False})})
+    extra = [f"h{j}" for j in range(5)]  # e.g. unlabelled members of a held-out group
+    report = fgm.run_graph_evaluation(_eval_data(ctx, frame, cfg.eval), ctx.with_heldout(extra), cfg)
+    leak = report["leakage_check"]
+    assert leak["heldout_nodes_incl_group_members"] == leak["heldout_nodes"] + len(extra)
+
+
+def test_select_device_policy_falls_back_to_cpu_and_caps_memory(monkeypatch):
+    assert fgm.select_device("cpu")["device"] == "cpu"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert fgm.select_device("cuda:0")["note"].startswith("cpu_fallback")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    gib = 1 << 30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1 * gib, 11 * gib))
+    busy = fgm.select_device("cuda:0")
+    assert busy["device"] == "cpu" and "gpus busy" in busy["note"]
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (3 * gib, 11 * gib))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device=None: "Fake GPU")
+    ok = fgm.select_device("cuda:0")
+    assert ok["device"] == "cuda:0" and ok["name"] == "Fake GPU"
+    assert ok["memory_fraction"] == pytest.approx(2 / 11, abs=1e-3)  # leaves >= 1 GiB of the 3 free
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (10 * gib, 11 * gib))
+    assert fgm.select_device("cuda:0")["memory_fraction"] == pytest.approx(0.6)
