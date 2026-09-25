@@ -366,7 +366,7 @@ def _is_subagent(payload: dict) -> bool:
     if os.environ.get("HERMES_SUBAGENT"):
         return True
     task_id = (payload.get("extra") or {}).get("task_id") or payload.get("session_id") or ""
-    return "subagent" in task_id.lower()
+    return "subagent" in str(task_id).lower()
 
 
 # ---- Helpers for mutation tool inspection ------------------------------------

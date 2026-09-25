@@ -669,11 +669,14 @@ def test_is_subagent_handles_extra_none(monkeypatch):
     assert hook._is_subagent({"extra": None, "session_id": "subagent-1"}) is True
 
 
-def test_is_subagent_raises_on_non_string_session_id(monkeypatch):
-    # Characterization: no type guard -- an int session_id blows up on .lower().
+def test_is_subagent_tolerates_a_non_string_session_id(monkeypatch):
+    # An int session_id used to raise AttributeError on .lower() (a pinned bug); in
+    # BLOCK_MODE that crash sat exactly where a dangerous command is blocked.
     monkeypatch.delenv("HERMES_SUBAGENT", raising=False)
-    with pytest.raises(AttributeError):
-        hook._is_subagent({"session_id": 123})
+    assert hook._is_subagent({"session_id": 123}) is False
+    assert hook._is_subagent({"extra": {"task_id": 7}, "session_id": "main"}) is False
+    # positive twin: the naming convention still detects a subagent
+    assert hook._is_subagent({"extra": {"task_id": "subagent-7"}}) is True
 
 
 # =============================================================================
