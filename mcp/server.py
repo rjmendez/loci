@@ -3397,6 +3397,7 @@ def investigation_store(
         _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
     except StoreBusyError as exc:
         return _busy_result(exc, investigation_id=investigation_id)
+    _record_memory_cited(investigation_id, finding)
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
@@ -4957,6 +4958,8 @@ def investigation_pre_answer_check(
             )
 
         claim_results.append(claim_result)
+
+    _record_memory_answer_check(investigation_id, claim_results)
 
     unique_errors = sorted(set(qdrant_errors))
     degraded_active, degraded_reason = _qdrant_degraded_mode(
@@ -8368,6 +8371,145 @@ def _surface_apply_decay(rows: list[dict]) -> None:
             pass  # decay is optional enhancement; never break the tool
 
 
+# ---------------------------------------------------------------------------
+# Memory-use instrumentation: which surfaced memories were actually used.
+#
+# Three event kinds go to <data home>/instrumentation/memory_use.jsonl:
+#   surfaced      memory_surface returned these findings (exposure).
+#   answer_check  investigation_pre_answer_check tied these evidence ids to a
+#                 claim: support refs, contradiction refs, and the semantic
+#                 candidates it looked at but did not count.
+#   cited         investigation_store recorded these ids as derived_from parents.
+#
+# A memory is USED when its id is a support or contradiction ref of a checked
+# claim, or a derived_from parent of a stored finding. A surfaced memory that no
+# later answer_check or cited event names is IGNORED. Joining the two is an
+# offline job; nothing here changes what any tool returns.
+#
+# Rows hold ids, scores, enums and counts only: no claim, query, context or
+# finding text. On by default because no tool output changes; set
+# LOCI_MEMORY_USE_LOG=0 to turn it off.
+# ---------------------------------------------------------------------------
+MEMORY_USE_LOG_NAME = "memory_use.jsonl"
+MEMORY_USE_SCHEMA = 1
+_MEMORY_USE_MAX_REFS = 8
+
+
+def _memory_use_log_path() -> Path:
+    return MEMORY_DIR.parent / "instrumentation" / MEMORY_USE_LOG_NAME
+
+
+def _record_memory_use(row: dict) -> bool:
+    """Append one memory-use event. Fail-open: never raises, never blocks the caller."""
+    try:
+        from instrumentation_log import append_rows, env_enabled
+
+        if not env_enabled("LOCI_MEMORY_USE_LOG", True):
+            return False
+        return append_rows(
+            _memory_use_log_path(),
+            [{"schema": MEMORY_USE_SCHEMA, "ts": _now(), **row}],
+        )
+    except Exception as exc:
+        logger.debug("memory-use instrumentation failed (fail-open): %r", exc)
+        return False
+
+
+def _score_or_none(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 4) if math.isfinite(number) else None
+
+
+def _use_refs(refs) -> list[dict]:
+    """Id, origin and score of each evidence ref, at most _MEMORY_USE_MAX_REFS."""
+    out = []
+    for ref in list(refs or [])[:_MEMORY_USE_MAX_REFS]:
+        if not isinstance(ref, dict):
+            continue
+        evidence_id = str(ref.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        out.append({
+            "id": evidence_id,
+            "origin": ref.get("origin"),
+            "score": _score_or_none(ref.get("score")),
+        })
+    return out
+
+
+def _record_memory_surfaced(tool: str, scope_investigation_id: Optional[str], rows: list[dict]) -> bool:
+    """Record the findings a surfacing tool returned. Docs guidance rows are counted, not listed."""
+    items = []
+    docs = 0
+    for rank, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        if row.get("origin") == "docs_search":
+            docs += 1
+            continue
+        finding_id = str(row.get("finding_id") or "").strip()
+        if not finding_id:
+            continue
+        items.append({
+            "rank": rank,
+            "finding_id": finding_id,
+            "investigation_id": str(row.get("investigation_id") or ""),
+            "score": _score_or_none(row.get("score")),
+        })
+    if not items:
+        return False
+    return _record_memory_use({
+        "event": "surfaced",
+        "tool": tool,
+        "scope_investigation_id": scope_investigation_id or None,
+        "items": items,
+        "docs_rows": docs,
+    })
+
+
+def _record_memory_answer_check(investigation_id: str, claim_results: list[dict]) -> bool:
+    """Record which evidence ids each checked claim was tied to, by role."""
+    claims = []
+    for index, result in enumerate(claim_results or []):
+        if not isinstance(result, dict):
+            continue
+        claims.append({
+            "claim_index": index,
+            "supported": bool(result.get("supported")),
+            "contradicted": bool(result.get("contradicted")),
+            "support_basis": result.get("support_basis"),
+            "support": _use_refs(result.get("support_refs")),
+            "contradiction": _use_refs(result.get("contradiction_refs")),
+            "semantic_candidates": _use_refs(result.get("semantic_candidates")),
+        })
+    if not claims:
+        return False
+    return _record_memory_use({
+        "event": "answer_check",
+        "tool": "investigation_pre_answer_check",
+        "investigation_id": investigation_id,
+        "claims": claims,
+    })
+
+
+def _record_memory_cited(investigation_id: str, finding: dict) -> bool:
+    """Record a stored finding's derived_from parents. Store validated them as existing ids."""
+    parents = [str(p) for p in (finding or {}).get("derived_from") or [] if str(p).strip()]
+    if not parents:
+        return False
+    return _record_memory_use({
+        "event": "cited",
+        "tool": "investigation_store",
+        "investigation_id": investigation_id,
+        "finding_id": str((finding or {}).get("id") or ""),
+        "cited_ids": parents[:32],
+        "cited_count": len(parents),
+    })
+
+
 def _surface_rows(top_results: list[dict], ctx_prefix: str, investigation_id: Optional[str]) -> list[dict]:
     """Build the memory_surface 'surfaced' response rows from top_results.
 
@@ -8554,6 +8696,8 @@ def memory_surface(
             # Docs guidance only fills slots the memory hits left free: an unscored lexical
             # hit must not outrank (and so displace) a finding with a real similarity score.
             surfaced = (surfaced + docs_hits)[:top_k]
+
+        _record_memory_surfaced("memory_surface", investigation_id, surfaced)
 
         return json.dumps({
             "surfaced": surfaced,
