@@ -2141,22 +2141,64 @@ def _judge_conflict_pair(new_finding: dict, neighbor_finding: dict, *, gen_fn=No
     after the cheap gate has produced a candidate pair, and it stays fail-open:
     any import/backend/model issue returns ``verdict=None`` so the caller preserves the
     prior heuristic-only behaviour exactly.
-    """
-    try:
-        from conflict_verify import judge_conflict
 
-        return judge_conflict(
+    The result also carries ``model`` and ``tier``: what the generation call reported
+    it ran on. ``tier`` is None on the primary local path, which does not tag itself;
+    both are None when no generation happened.
+    """
+    served: dict = {"model": None, "tier": None}
+    try:
+        import conflict_verify
+
+        base_fn = gen_fn or conflict_verify._lazy_generate
+
+        def _recording_gen_fn(prompt, **kwargs):
+            out = base_fn(prompt, **kwargs)
+            if isinstance(out, dict):
+                served["model"] = out.get("model") or None
+                served["tier"] = out.get("tier") or None
+            return out
+
+        result = conflict_verify.judge_conflict(
             str((new_finding or {}).get("text", "") or ""),
             str((neighbor_finding or {}).get("text", "") or ""),
             type_a=str((new_finding or {}).get("record_type")
                        or (new_finding or {}).get("type", "") or ""),
             type_b=str((neighbor_finding or {}).get("record_type")
                        or (neighbor_finding or {}).get("type", "") or ""),
-            gen_fn=gen_fn,
+            gen_fn=_recording_gen_fn,
         )
+        return {**result, **served}
     except Exception as exc:
         logger.debug("_judge_conflict_pair: fail-open on exception: %r", exc)
-        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200]}
+        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200], **served}
+
+
+# Every contradiction-judge decision is appended to <investigation>/judge_verdicts.jsonl
+# with ids, scores and enums only (no finding text, no judge reason), so the judge can
+# be audited and a pre-filter trained on real labels. It is on by default because it
+# changes no tool output. Set LOCI_JUDGE_VERDICT_LOG=0 to turn it off.
+JUDGE_VERDICT_LOG_NAME = "judge_verdicts.jsonl"
+JUDGE_VERDICT_SCHEMA = 1
+
+
+def _judge_verdict_log_enabled() -> bool:
+    from instrumentation_log import env_enabled
+
+    return env_enabled("LOCI_JUDGE_VERDICT_LOG", True)
+
+
+def _record_judge_verdicts(investigation_id: str, rows: list[dict]) -> bool:
+    """Append judged-pair rows to the investigation's verdict log. Fail-open."""
+    if not rows or not _judge_verdict_log_enabled():
+        return False
+    try:
+        from instrumentation_log import append_rows
+
+        return append_rows(_inv_dir(investigation_id) / JUDGE_VERDICT_LOG_NAME, rows)
+    except Exception as exc:
+        logger.debug("_record_judge_verdicts: fail-open on exception: %r", exc)
+        return False
 
 
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
@@ -2209,7 +2251,8 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
         new_neg = _has_negation(new_text)
 
         conflicts = []
-        for hit in result:
+        judged: list[dict] = []
+        for rank, hit in enumerate(result):
             payload = dict(hit.payload or {})
             neighbor_id = str(payload.get("id", hit.id))
             if neighbor_id == new_id:
@@ -2220,32 +2263,56 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             neighbor_neg = _has_negation(neighbor_text)
 
             heuristic_conflict = False
+            heuristic_rule = None
 
             # Heuristic 1: gap now filled by an observed finding
             if neighbor_type == "gap" and new_type == "observed":
                 heuristic_conflict = True
+                heuristic_rule = "gap_filled"
 
             # Heuristic 2: assumption overridden by a non-assumed finding
             elif neighbor_type == "assumed" and new_type != "assumed":
                 heuristic_conflict = True
+                heuristic_rule = "assumption_overridden"
 
             # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
             elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
                 heuristic_conflict = True
+                heuristic_rule = "negation_mismatch"
 
             llm = _judge_conflict_pair(new_finding, payload)
             llm_contradict = llm.get("verdict") == "contradict"
+            similarity = round(float(hit.score), 4)
+
+            judged.append({
+                "schema": JUDGE_VERDICT_SCHEMA,
+                "event": "conflict_judge",
+                "ts": _now(),
+                "new_finding_id": str(new_id),
+                "neighbor_id": neighbor_id,
+                "neighbor_rank": rank,
+                "similarity": similarity,
+                "new_type": str(new_type or ""),
+                "neighbor_type": str(neighbor_type or ""),
+                "heuristic_rule": heuristic_rule,
+                "verdict": llm.get("verdict"),
+                "judge_ok": bool(llm.get("ok")),
+                "model": llm.get("model"),
+                "tier": llm.get("tier"),
+                "conflict_candidate": bool(heuristic_conflict or llm_contradict),
+            })
 
             if heuristic_conflict or llm_contradict:
                 conflicts.append({
                     "neighbor_id": neighbor_id,
                     "neighbor_type": neighbor_type,
-                    "score": round(float(hit.score), 4),
+                    "score": similarity,
                     "heuristic_conflict": heuristic_conflict,
                     "llm_verdict": llm.get("verdict"),
                     "llm_reason": llm.get("reason", ""),
                 })
 
+        _record_judge_verdicts(investigation_id, judged)
         return conflicts
     except Exception as exc:
         logger.debug("_detect_conflicts: fail-open on exception: %s", exc)
@@ -3399,6 +3466,7 @@ def investigation_store(
         _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
     except StoreBusyError as exc:
         return _busy_result(exc, investigation_id=investigation_id)
+    _record_memory_cited(investigation_id, finding)
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
@@ -4959,6 +5027,8 @@ def investigation_pre_answer_check(
             )
 
         claim_results.append(claim_result)
+
+    _record_memory_answer_check(investigation_id, claim_results)
 
     unique_errors = sorted(set(qdrant_errors))
     degraded_active, degraded_reason = _qdrant_degraded_mode(
@@ -8370,6 +8440,150 @@ def _surface_apply_decay(rows: list[dict]) -> None:
             pass  # decay is optional enhancement; never break the tool
 
 
+# ---------------------------------------------------------------------------
+# Memory-use instrumentation: which surfaced memories were actually used.
+#
+# Three event kinds go to <data home>/instrumentation/memory_use.jsonl:
+#   surfaced      memory_surface returned these findings (exposure).
+#   answer_check  investigation_pre_answer_check tied these evidence ids to a
+#                 claim: support refs, contradiction refs, and the semantic
+#                 candidates it looked at but did not count.
+#   cited         investigation_store recorded these ids as derived_from parents.
+#
+# A memory is USED when its id is a support or contradiction ref of a checked
+# claim, or a derived_from parent of a stored finding. A surfaced memory that no
+# later answer_check or cited event names is IGNORED. Joining the two is an
+# offline job; nothing here changes what any tool returns.
+#
+# Rows hold ids, scores, enums and counts only: no claim, query, context or
+# finding text. On by default because no tool output changes; set
+# LOCI_MEMORY_USE_LOG=0 to turn it off.
+# ---------------------------------------------------------------------------
+MEMORY_USE_LOG_NAME = "memory_use.jsonl"
+MEMORY_USE_SCHEMA = 1
+# Only semantic_candidates is capped. Support and contradiction refs are all logged
+# (ids only): a cap there would make a memory cited as the 9th support ref join
+# offline as "ignored".
+_MEMORY_USE_MAX_SEMANTIC_CANDIDATES = 8
+
+
+def _memory_use_log_path() -> Path:
+    return MEMORY_DIR.parent / "instrumentation" / MEMORY_USE_LOG_NAME
+
+
+def _record_memory_use(row: dict) -> bool:
+    """Append one memory-use event. Fail-open: never raises, never blocks the caller."""
+    try:
+        from instrumentation_log import append_rows, env_enabled
+
+        if not env_enabled("LOCI_MEMORY_USE_LOG", True):
+            return False
+        return append_rows(
+            _memory_use_log_path(),
+            [{"schema": MEMORY_USE_SCHEMA, "ts": _now(), **row}],
+        )
+    except Exception as exc:
+        logger.debug("memory-use instrumentation failed (fail-open): %r", exc)
+        return False
+
+
+def _score_or_none(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 4) if math.isfinite(number) else None
+
+
+def _use_refs(refs, limit: Optional[int] = None) -> list[dict]:
+    """Id, origin and score of each evidence ref; the first ``limit`` refs when a limit is given."""
+    out = []
+    refs = list(refs or [])
+    for ref in (refs if limit is None else refs[:limit]):
+        if not isinstance(ref, dict):
+            continue
+        evidence_id = str(ref.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        out.append({
+            "id": evidence_id,
+            "origin": ref.get("origin"),
+            "score": _score_or_none(ref.get("score")),
+        })
+    return out
+
+
+def _record_memory_surfaced(tool: str, scope_investigation_id: Optional[str], rows: list[dict]) -> bool:
+    """Record the findings a surfacing tool returned. Docs guidance rows are counted, not listed."""
+    items = []
+    docs = 0
+    for rank, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        if row.get("origin") == "docs_search":
+            docs += 1
+            continue
+        finding_id = str(row.get("finding_id") or "").strip()
+        if not finding_id:
+            continue
+        items.append({
+            "rank": rank,
+            "finding_id": finding_id,
+            "investigation_id": str(row.get("investigation_id") or ""),
+            "score": _score_or_none(row.get("score")),
+        })
+    if not items:
+        return False
+    return _record_memory_use({
+        "event": "surfaced",
+        "tool": tool,
+        "scope_investigation_id": scope_investigation_id or None,
+        "items": items,
+        "docs_rows": docs,
+    })
+
+
+def _record_memory_answer_check(investigation_id: str, claim_results: list[dict]) -> bool:
+    """Record which evidence ids each checked claim was tied to, by role."""
+    claims = []
+    for index, result in enumerate(claim_results or []):
+        if not isinstance(result, dict):
+            continue
+        claims.append({
+            "claim_index": index,
+            "supported": bool(result.get("supported")),
+            "contradicted": bool(result.get("contradicted")),
+            "support_basis": result.get("support_basis"),
+            "support": _use_refs(result.get("support_refs")),
+            "contradiction": _use_refs(result.get("contradiction_refs")),
+            "semantic_candidates": _use_refs(result.get("semantic_candidates"),
+                                             limit=_MEMORY_USE_MAX_SEMANTIC_CANDIDATES),
+        })
+    if not claims:
+        return False
+    return _record_memory_use({
+        "event": "answer_check",
+        "tool": "investigation_pre_answer_check",
+        "investigation_id": investigation_id,
+        "claims": claims,
+    })
+
+
+def _record_memory_cited(investigation_id: str, finding: dict) -> bool:
+    """Record a stored finding's derived_from parents. Store validated them as existing ids."""
+    parents = [str(p) for p in (finding or {}).get("derived_from") or [] if str(p).strip()]
+    if not parents:
+        return False
+    return _record_memory_use({
+        "event": "cited",
+        "tool": "investigation_store",
+        "investigation_id": investigation_id,
+        "finding_id": str((finding or {}).get("id") or ""),
+        "cited_ids": parents[:32],
+        "cited_count": len(parents),
+    })
+
+
 def _surface_rows(top_results: list[dict], ctx_prefix: str, investigation_id: Optional[str]) -> list[dict]:
     """Build the memory_surface 'surfaced' response rows from top_results.
 
@@ -8556,6 +8770,8 @@ def memory_surface(
             # Docs guidance only fills slots the memory hits left free: an unscored lexical
             # hit must not outrank (and so displace) a finding with a real similarity score.
             surfaced = (surfaced + docs_hits)[:top_k]
+
+        _record_memory_surfaced("memory_surface", investigation_id, surfaced)
 
         return json.dumps({
             "surfaced": surfaced,
