@@ -11,20 +11,36 @@ label-shuffle and random-split controls, drop-one-family ablation). Targets:
   only. The partner category of the wiring features *is* this label, so it is
   masked (val + test samples and every node sharing a held-out cell type,
   homolog group or serial group) before any feature is computed.
-* ``hemilineage``: the developmental hemilineage (Truman/Lacin nomenclature;
-  ground truth from lineage tracing, not from connectivity) of VNC-born
-  neurons, predicted from wiring + soma position + birth time. Split groups
-  are cell type, homolog group and serial group (hemilineage cannot be a split
-  key when it is the label). Partner hemilineage composition (``*_comp_hl``)
-  is masked the same way.
+* ``hemilineage``: the MANC hemilineage annotation (Truman/Lacin nomenclature)
+  of VNC-born neurons, predicted from wiring + soma position + birth time.
+  Label provenance is ``connectivity_defined`` (R1): MANC hemilineages were
+  assigned from soma tract + NBLAST + connectivity clustering, with NT
+  predictions used to confirm [Marin 2024], so this lane is reported as
+  recovery of a connectivity-derived annotation and never gated; the headline
+  hemilineage target is FlyWire's (``flybrain_fw_targets``, cell-body-fibre
+  tracts). Split groups are cell type, homolog group and serial group
+  (hemilineage cannot be a split key when it is the label). Partner
+  hemilineage composition (``*_comp_hl``) is masked the same way.
 * ``neurotransmitter_dominance``: MANC's per-neuron transmitter *prediction*
   (``predictedNt``, ach / gaba / glut; there is no NT ground-truth column in
-  MANC v1.0) from wiring + class / birthtime / soma position. Hemilineage is
+  MANC v1.0) from wiring + class / birthtime / soma position: a distillation
+  of the MANC NT classifier (``model_predicted``), never gated. Hemilineage is
   never an input (one fast transmitter per hemilineage) and is a split key.
-  Partner predicted-NT composition (``*_comp_pnt``) is masked like above.
+  Partner predicted-NT composition is no longer built for it (R5: no
+  partner-NT-derived feature in any NT model).
+* ``nt_literature`` (+ ``_binary``, ``_all``, ``_all_binary``): the R2 literature
+  ground truth (``flybrain_nt_ground_truth``, confidence >= 4) mapped onto
+  MANC types by name. The MANC classifier's training types are not
+  identifiable (187 GT neurons, SYNTHESIS E6), so ``nt_literature`` and
+  ``nt_literature_all`` select the same types here (recorded in the coverage).
 * ``connectivity_tier`` / ``region_specialization_tier``: the existing labels
   from ``flybrain_brain_cluster_mv_samples.collect_mv_samples`` (unchanged
-  definitions, all candidates, no cap or balancing).
+  definitions, all candidates, no cap or balancing); connectivity_defined.
+
+``cell_class`` is ``curated_morphology`` with ``provenance_uncertain`` (gross
+class from soma / nerve anatomy). Per-target provenance is
+``TARGET_LABEL_PROVENANCE`` (checked against ``flybrain_target_registry`` at
+import) and ``run_target`` evaluates through ``run_gated_evaluation``.
 
 Wiring features (``flybrain_wiring_features``) use the traced-to-traced
 adjacency (``traced-connections.csv``, one row per pair) with the node table
@@ -50,7 +66,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import hashlib
 import json
 import os
 import time
@@ -61,6 +76,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+import flybrain_nt_ground_truth as ntgt
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
 from flybrain_brain_cluster_mv_samples import (
     STRUCTURED_FEATURES,
@@ -92,14 +109,27 @@ TARGET_HEMILINEAGE = "hemilineage"
 TARGET_NT = "neurotransmitter_dominance"
 TARGET_CONNECTIVITY = "connectivity_tier"
 TARGET_REGION_SPECIALIZATION = "region_specialization_tier"
+NT_LITERATURE_TARGETS: tuple[str, ...] = ntgt.NT_LITERATURE_TARGETS
 MV_REAL_TARGETS: tuple[str, ...] = (
     TARGET_CELL_CLASS,
     TARGET_HEMILINEAGE,
     TARGET_NT,
     TARGET_CONNECTIVITY,
     TARGET_REGION_SPECIALIZATION,
+    *NT_LITERATURE_TARGETS,
 )
 LEGACY_TARGETS = frozenset({TARGET_NT, TARGET_CONNECTIVITY, TARGET_REGION_SPECIALIZATION})
+_P = ftr.LabelProvenance
+# R1 label provenance per target (must equal flybrain_target_registry; checked at import).
+TARGET_LABEL_PROVENANCE: Mapping[str, str] = {
+    TARGET_CELL_CLASS: _P.CURATED_MORPHOLOGY.value,
+    TARGET_HEMILINEAGE: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_NT: _P.MODEL_PREDICTED.value,
+    TARGET_CONNECTIVITY: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_REGION_SPECIALIZATION: _P.CONNECTIVITY_DEFINED.value,
+    **{t: _P.MEASURED.value for t in NT_LITERATURE_TARGETS},
+}
+ftr.check_module_provenance("mv", TARGET_LABEL_PROVENANCE)
 
 ROLE_EDGELIST_PER_ROI = "edgelist_per_roi"
 PER_ROI_RELATIVE_PATH = "source/manc-traced-adjacencies-v1.0/traced-connections-per-roi.csv"
@@ -121,6 +151,7 @@ GROUP_KEYS: Mapping[str, tuple[str, ...]] = {
     TARGET_NT: DEFAULT_GROUP_KEYS,
     TARGET_CONNECTIVITY: DEFAULT_GROUP_KEYS,
     TARGET_REGION_SPECIALIZATION: DEFAULT_GROUP_KEYS,
+    **{t: DEFAULT_GROUP_KEYS for t in NT_LITERATURE_TARGETS},
 }
 
 # Categorical annotation features per target (plain names so the registered
@@ -131,16 +162,19 @@ CATEGORICAL_FEATURES: Mapping[str, tuple[str, ...]] = {
     TARGET_NT: STRUCTURED_FEATURES[TARGET_NT],
     TARGET_CONNECTIVITY: STRUCTURED_FEATURES[TARGET_CONNECTIVITY],
     TARGET_REGION_SPECIALIZATION: STRUCTURED_FEATURES[TARGET_REGION_SPECIALIZATION],
+    **{t: ("soma_neuromere", "soma_side", "class", "birthtime") for t in NT_LITERATURE_TARGETS},
 }
 
 # Partner-category feature sets: (tag, node-table category column, masked for this target?).
 # tag "" is the base set (all families); tagged sets contribute composition families only.
+# NT targets never get a partner-NT set (R5; flybrain_wiring_features refuses one anyway).
 WIRING_SETS: Mapping[str, tuple[tuple[str, str, bool], ...]] = {
     TARGET_CELL_CLASS: (("", "cls", True),),
     TARGET_HEMILINEAGE: (("", "cls", False), ("hl", "hl", True)),
-    TARGET_NT: (("", "cls", False), ("pnt", "pnt", True)),
+    TARGET_NT: (("", "cls", False),),
     TARGET_CONNECTIVITY: (("", "cls", False),),
     TARGET_REGION_SPECIALIZATION: (("", "cls", False),),
+    **{t: (("", "cls", False),) for t in NT_LITERATURE_TARGETS},
 }
 WIRING_FAMILIES = ("degree", "out_comp", "in_comp", "out_np", "in_np", "recip", "out2_comp", "in2_comp")
 COMPOSITION_FAMILIES = ("out_comp", "in_comp", "out2_comp", "in2_comp")
@@ -157,7 +191,9 @@ EXTRA_EXCLUDED: Mapping[str, tuple[str, ...]] = {
                         "long_tract", "origin", "target", "prefix", "receptor*", "position*", "*_pnt__*"),
     TARGET_HEMILINEAGE: ("class", "subclass", "*_pnt__*", "predicted*", "nt*", "prefix", "*nerve*", "target",
                          "origin", "long_tract"),
-    TARGET_NT: ("hemilineage", "*_hl__*", "predicted*", "nt*", "transmission"),
+    TARGET_NT: ("hemilineage", "*_hl__*", "predicted*", "nt*", "transmission", "*_pnt__*"),
+    **{t: ("hemilineage", "*_hl__*", "predicted*", "nt*", "transmission", "*_pnt__*")
+       for t in NT_LITERATURE_TARGETS},
     TARGET_CONNECTIVITY: ("downstream", "upstream", "pre", "post", "size", "synweight", "*_hl__*", "*_pnt__*"),
     TARGET_REGION_SPECIALIZATION: ("subclass", "prefix", "target", "origin", "long_tract", "*nerve*",
                                    "serial_motif", "hemilineage", "primary_neuropil", "*_hl__*", "*_pnt__*"),
@@ -181,6 +217,8 @@ class MvRealModelConfig:
     min_region_samples: int = 25
     high_connectivity_quantile: float = 0.75
     specialization_share_threshold: float = 0.9
+    # R2 literature NT ground truth (flybrain_nt_ground_truth), used by the nt_literature* targets
+    nt_root: str = ntgt.DEFAULT_NT_GT_ROOT
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -418,12 +456,22 @@ def label_frame(target: str, config: MvRealModelConfig, inputs: MvInputs, nodes:
     else:
         loaded = load_mv_candidates(MvSampleBuildConfig(objective=TARGET_CONNECTIVITY, **common))
         cand = loaded["frame"]
+        lit: dict[str, str] = {}
+        if target in NT_LITERATURE_TARGETS:
+            typed = pd.DataFrame({"root_id": cand["bodyId"].astype(str),
+                                  "cell_type": [None if _missing(v) else str(v).strip() for v in cand["type"]]})
+            labelled = ntgt.label_neurons(typed, dataset=MV_SYMBOL, source=ntgt.open_nt_ground_truth(config.nt_root),
+                                          target=target, id_column="root_id")
+            lit = dict(zip(labelled.frame["root_id"].astype(str), labelled.frame["label"].astype(str)))
+            info["nt_literature_coverage"] = labelled.coverage
         rows = []
         for row in cand.itertuples(index=False):
             base = {"root_id": str(row.bodyId), "cell_type": str(row.type).strip(),
                     "hemilineage": _hemilineage(row.hemilineage), **_categorical_row(row)}
             if target == TARGET_CELL_CLASS:
                 base["label"] = fwf.harmonize_super_class(row.class_)
+            elif target in NT_LITERATURE_TARGETS:
+                base["label"] = lit.get(str(row.bodyId), "unknown")
             else:
                 base["label"] = _hemilineage(row.hemilineage)
             rows.append(base)
@@ -508,6 +556,7 @@ def build_target_dataset(target: str, config: MvRealModelConfig, eval_config: An
     if target not in MV_REAL_TARGETS:
         raise ValueError(f"target must be one of: {', '.join(MV_REAL_TARGETS)}")
     fwf.objective_exclusions(target)  # fail closed before any work
+    provenance = ftr.provenance_notes(MV_SYMBOL, target)
     t0 = time.time()
     inputs = inputs or open_inputs(config, paths=explicit_paths)
     nodes = load_node_table(inputs.paths[ROLE_META])
@@ -534,7 +583,9 @@ def build_target_dataset(target: str, config: MvRealModelConfig, eval_config: An
                               provenance={"manifest_sha256": inputs.manifest_sha256,
                                           "source_sha256": inputs.product_sha256.get(ROLE_EDGELIST_PER_ROI),
                                           "schema": NEUROPIL_EDGES_SCHEMA})
-    notes: dict[str, Any] = {"wiring": []}
+    notes: dict[str, Any] = {"wiring": [], **provenance}
+    if "nt_literature_coverage" in label_info:
+        notes["nt_literature_coverage"] = label_info.pop("nt_literature_coverage")
     merged = frame
     masked_any = False
     for tag, category, masked in WIRING_SETS[target]:
@@ -691,14 +742,13 @@ def run_target(target: str, config: MvRealModelConfig = MvRealModelConfig(), *, 
                feature_filter: Sequence[str] | None = None, inputs: MvInputs | None = None,
                explicit_paths: Mapping[str, str | Path] | None = None, shuffle_null: bool = True,
                log=print) -> dict[str, Any]:
-    import flybrain_model_eval as fme
     from threadpoolctl import threadpool_limits
 
     eval_config = eval_config or default_eval_config(target)
     build = build_target_dataset(target, config, eval_config, feature_filter=feature_filter, inputs=inputs,
                                  explicit_paths=explicit_paths, log=log)
     log(f"[mv] {target}: evaluating {build.info['n_samples']} samples x {build.info['n_features']} features")
-    report = fme.run_evaluation(build.data, eval_config)
+    report = ftr.run_gated_evaluation(build.data, eval_config)
     report["mv_build"] = build.info
     if shuffle_null:
         with threadpool_limits(limits=int(eval_config.n_threads)):
@@ -706,7 +756,7 @@ def run_target(target: str, config: MvRealModelConfig = MvRealModelConfig(), *, 
         log(f"[mv] {target}: shuffle null " + json.dumps(
             {m: round(v["mean_accuracy"], 3) for m, v in report["mv_shuffle_null"]["models"].items()}))
     if eval_config.report_root:
-        fme.write_report(report, eval_config.report_root, run_label=eval_config.run_label)
+        ftr.write_gated_report(report, eval_config.report_root, run_label=eval_config.run_label)
     return report
 
 

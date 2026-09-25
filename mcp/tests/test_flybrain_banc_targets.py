@@ -265,6 +265,10 @@ def test_super_class_dataset_masks_every_non_train_node_and_evaluates(tmp_path, 
     assert report["leakage_check"]["pass"] and report["summary"][0]["target"] == "super_class"
     assert (tmp_path / "reports" / "banc" / "super_class" / "t" / "report.json").is_file()
     assert _listing(snap) == before
+    # R1: curated_morphology (BANC rule undocumented -> provenance_uncertain), gated
+    assert data.notes["label_provenance"] == "curated_morphology" and data.notes["provenance_uncertain"] is True
+    assert all(r["label_provenance"] == "curated_morphology" and r["gate"] in ("pass", "fail")
+               for r in report["summary"])
 
 
 def test_masking_hides_train_labels_of_held_out_partners(tmp_path, snapshot):

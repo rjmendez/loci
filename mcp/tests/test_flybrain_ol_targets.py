@@ -285,6 +285,10 @@ def test_run_ol_target_end_to_end(inputs, tmp_path):
     out = tmp_path / "reports" / "ol" / "cell_family"
     assert (out / "report.json").is_file() and (out / "family_map.json").is_file()
     assert "snapshots" not in str(out)
+    # R1: optic-lobe families are connectivity-defined -> reported, never gated
+    assert report["notes"]["label_provenance"] == "connectivity_defined"
+    assert {r["gate"] for r in report["summary"]} == {"not_gated"}
+    assert report["summary"][0]["reporting_frame"] == "recovery of connectivity-derived annotations"
 
 
 def test_explicit_paths_all_or_none(tmp_path):

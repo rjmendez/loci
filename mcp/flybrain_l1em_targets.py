@@ -64,6 +64,7 @@ import pandas as pd
 import flybrain_brain_cluster_l1em_samples as l1s
 import flybrain_learners as fl
 import flybrain_model_eval as fme
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
 from flybrain_l1em_adapter import L1EM_DATASET_SYMBOL, load_l1em_snapshot
 
@@ -131,19 +132,25 @@ class TargetSpec:
     calibration: str
     hgb_min_leaf: int
     description: str
+    label_provenance: str = ""  # R1; must equal flybrain_target_registry (checked at import)
 
 
 TARGET_SPECS: Mapping[str, TargetSpec] = {
+    # io_class: larval S2 types are connectivity-defined (R1); whether the collapsed io classes are is
+    # open (SYNTHESIS E3), so the lane is reported as recovery of connectivity-derived annotations.
     TARGET_IO_CLASS: TargetSpec(
         TARGET_IO_CLASS, "io_class", True, True, ("etype", "cmpt", "ase"), "temperature", 10,
-        "anatomical brain input/output class (sensory / ascending / DN-SEZ / DN-VNC / RGN / interneuron)"),
+        "anatomical brain input/output class (sensory / ascending / DN-SEZ / DN-VNC / RGN / interneuron)",
+        ftr.LabelProvenance.CONNECTIVITY_DEFINED.value),
     TARGET_SENSORY_MODALITY: TargetSpec(
         TARGET_SENSORY_MODALITY, "io_class", False, False, ("etype", "cmpt", "ase"), "temperature", 5,
-        "sense-organ modality of brain sensory neurons"),
+        "sense-organ modality of brain sensory neurons", ftr.LabelProvenance.CURATED_MORPHOLOGY.value),
     TARGET_CONNECTIVITY: TargetSpec(
         TARGET_CONNECTIVITY, "io_class", False, True, ("etype", "cmpt"), "isotonic", 20,
-        "legacy connectivity_tier (total synapses >= q0.75), degree proxies excluded"),
+        "legacy connectivity_tier (total synapses >= q0.75), degree proxies excluded",
+        ftr.LabelProvenance.CONNECTIVITY_DEFINED.value),
 }
+ftr.check_module_provenance(L1EM_DATASET_SYMBOL, {k: v.label_provenance for k, v in TARGET_SPECS.items()})
 
 
 def io_class(celltype: str) -> str:
@@ -332,6 +339,7 @@ def build_eval_dataset(target: str, ctx: L1emContext, config: fme.EvalConfig, *,
     notes = {
         **notes,
         "target_description": spec.description,
+        **ftr.provenance_notes(L1EM_DATASET_SYMBOL, target),
         "partner_category": spec.partner_category,
         "partner_category_masked_for_val_test": bool(spec.mask_partner_category),
         "masked_nodes": len(mask),
@@ -415,7 +423,7 @@ def run_target(target: str, ctx: L1emContext, *, report_root: str | None = DEFAU
     models = default_models(target)
     out: dict[str, Any] = {"target": target}
     primary_cfg = eval_config(split_seed=base_seed, report_root=report_root, models=models)
-    primary = fme.run_evaluation(build_eval_dataset(target, ctx, primary_cfg), primary_cfg)
+    primary = ftr.run_gated_evaluation(build_eval_dataset(target, ctx, primary_cfg), primary_cfg)
     out["primary"] = {"summary": primary["summary"], "best_on_val": primary["best_on_val"],
                       "ablation": primary.get("ablation"), "split": primary["split"]}
     repeats = []
@@ -423,7 +431,7 @@ def run_target(target: str, ctx: L1emContext, *, report_root: str | None = DEFAU
         cfg = eval_config(split_seed=f"{base_seed}-l1em-r{i}", report_root=report_root, run_label=f"repeat-{i}",
                           models=models, full=False)
         try:
-            rep = fme.run_evaluation(build_eval_dataset(target, ctx, cfg), cfg)
+            rep = ftr.run_gated_evaluation(build_eval_dataset(target, ctx, cfg), cfg)
             repeats.append({"split_seed": cfg.split_seed, "summary": rep["summary"]})
         except ValueError as exc:  # e.g. an empty split on a tiny target
             repeats.append({"split_seed": cfg.split_seed, "error": str(exc)})
@@ -433,7 +441,7 @@ def run_target(target: str, ctx: L1emContext, *, report_root: str | None = DEFAU
         cfg = eval_config(split_seed=base_seed, report_root=report_root, run_label="cluster-grouped",
                           models=models, full=False)
         try:
-            rep = fme.run_evaluation(build_eval_dataset(target, ctx, cfg, group_keys=CLUSTER_GROUP_KEYS), cfg)
+            rep = ftr.run_gated_evaluation(build_eval_dataset(target, ctx, cfg, group_keys=CLUSTER_GROUP_KEYS), cfg)
             out["cluster_grouped"] = {"summary": rep["summary"], "split": rep["split"]}
         except ValueError as exc:
             out["cluster_grouped"] = {"error": str(exc)}
@@ -443,7 +451,7 @@ def run_target(target: str, ctx: L1emContext, *, report_root: str | None = DEFAU
     if legacy_text and target == TARGET_CONNECTIVITY:
         cfg = eval_config(split_seed=base_seed, report_root=report_root, run_label="legacy-text",
                           models=(fme.ModelSpec("nb", ({"alpha": 1.0},), "isotonic", "nb_legacy_text"),), full=False)
-        rep = fme.run_evaluation(build_eval_dataset(target, ctx, cfg, text_mode="legacy"), cfg)
+        rep = ftr.run_gated_evaluation(build_eval_dataset(target, ctx, cfg, text_mode="legacy"), cfg)
         out["legacy_text"] = {"summary": rep["summary"]}
     return out
 

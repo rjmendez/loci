@@ -396,6 +396,64 @@ def build_fw_training_samples(config: FwSampleBuildConfig) -> dict[str, Any]:
     return payload
 
 
+def build_fw_structured_samples(
+    target: str,
+    *,
+    storage_root: str | Path | None = None,
+    cache_root: str | Path | None = None,
+    config: Any = None,
+) -> dict[str, Any]:
+    """Real-model fw samples: wiring ``features`` + group metadata for a non-circular target.
+
+    Targets and their label / exclusion / masking rules live in
+    ``flybrain_fw_targets.FW_TARGETS`` (super_class, flow, cell_class,
+    neurotransmitter_dominance [label = NT *predictions*], nt_ground_truth,
+    connectivity_tier, and the ``*_no_neuropil`` variants). The legacy
+    ``build_fw_training_samples`` above is unchanged. The grouped split is fixed
+    by ``config`` (an ``EvalConfig``); features were masked for exactly that
+    split, recorded as ``metadata.notes.masked_split_ids_sha256``.
+    """
+    import flybrain_fw_targets as fwt
+    import flybrain_wiring_features as fwf
+
+    spec = fwt.FW_TARGETS[target]
+    root = fwt.DEFAULT_STORAGE_ROOT if storage_root is None else storage_root
+    cache = fwf.DEFAULT_CACHE_ROOT if cache_root is None else cache_root
+    roles = [fwt.ROLE_CONNECTIONS, fwt.ROLE_ANNOTATIONS] + ([fwt.ROLE_PRE_COUNTS] if spec.needs_pre_counts else [])
+    snapshot = fwt.open_fw_snapshot(root, required_roles=roles, stamp_dir=Path(cache) / "hash-stamps" / "fw")
+    annotations = fwt.load_fw_annotations(snapshot.path(fwt.ROLE_ANNOTATIONS))
+    totals = fwt.total_presynapse_counts(snapshot.path(fwt.ROLE_PRE_COUNTS)) if spec.needs_pre_counts else None
+    build = fwt.build_fw_eval_dataset(target, snapshot=snapshot, annotations=annotations,
+                                      config=config or fwt.default_eval_config(report_root=None),
+                                      presynapse_totals=totals, cache_root=cache)
+    data = build.data
+    samples = []
+    records = data.features.to_dict(orient="records")
+    for i, sample_id in enumerate(data.sample_ids):
+        features = {k: (None if isinstance(v, float) and v != v else v) for k, v in records[i].items()}
+        samples.append({
+            "sample_id": sample_id,
+            "region_id": "fw",
+            "input_text": data.text[i] if data.text is not None else "",
+            "expected_label": str(data.labels[i]),
+            "expected_confidence": 1.0,
+            "provenance_refs": [f"flywire783:root_id:{sample_id}", f"manifest:{snapshot.manifest_sha256}"],
+            "features": features,
+            "metadata": {**dict(data.group_values[i]), "dataset": "flywire", "dataset_version": "flywire783",
+                         "task_type": target},
+        })
+    return {
+        "samples": samples,
+        "metadata": {
+            "schema_version": "flybrain-fw-structured-samples/v1",
+            "objective": target,
+            "group_keys": list(data.group_keys),
+            "split": {k: list(v) for k, v in build.plan.items()},
+            "notes": dict(data.notes),
+        },
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Build deterministic brain-cluster training samples from FlyWire raw data."

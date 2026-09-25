@@ -236,10 +236,16 @@ def test_build_target_dataset_masks_and_excludes(tmp_path, synthetic_paths, targ
         assert not any(c.startswith("soma") or c == "birthtime" for c in cols)
     if target == "neurotransmitter_dominance":
         assert "hemilineage" not in cols and not any("_hl__" in c for c in cols)
-        assert any("_pnt__" in c for c in cols)
+        # R5: no partner-NT-derived feature in any NT model (the partner predicted-NT set is gone)
+        assert not any("_pnt__" in c for c in cols)
+        assert data.notes["label_provenance"] == "model_predicted"
+        assert "masked_split_ids_sha256" not in data.notes
+        fme.check_leakage(data, uses_text=True)
+        return
     if target == "hemilineage":
         assert any("_hl__" in c for c in cols)
         assert "hemilineage" not in data.group_keys
+        assert data.notes["label_provenance"] == "connectivity_defined"  # R1 [Marin 2024]
     # every masked build records the split it was masked for, and the harness recomputes the same split
     assert data.notes["masked_split_ids_sha256"]
     wiring = [w for w in data.notes["wiring"] if w["masked"]]
@@ -269,6 +275,53 @@ def test_run_target_end_to_end_writes_report(tmp_path, synthetic_paths):
     for row in report["summary"]:
         assert row["gate"] in ("pass", "fail")
         assert row["shuffle_acc"] is not None
+    # R1: cell_class is curated_morphology (uncertain) -> gated; every row carries its provenance
+    assert all(r["label_provenance"] == "curated_morphology" and r["gate"] in ("pass", "fail")
+               for r in report["summary"])
+    assert "Label provenance: `curated_morphology`" in (out / "report.md").read_text()
+
+
+def test_hemilineage_is_reported_but_never_gated(tmp_path, synthetic_paths):
+    report = mt.run_target("hemilineage", _config(tmp_path), eval_config=_quick_eval(tmp_path),
+                           explicit_paths=synthetic_paths, shuffle_null=False, log=lambda *_: None)
+    assert {r["gate"] for r in report["summary"]} == {"not_gated"}
+    assert all(not m["gate"]["pass"] for m in report["models"].values())
+
+
+def test_nt_literature_target_on_synthetic_manc(tmp_path, synthetic_paths, monkeypatch):
+    import hashlib
+
+    import flybrain_nt_ground_truth as ntgt
+
+    commit = "b" * 40
+    root = tmp_path / "ntgt"
+    repo = root / f"repo-{commit[:8]}"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text(commit)
+    records = []
+    for t in range(36):
+        rec = {c: 0 for c in ntgt.NT_COLUMNS}
+        rec.update({"species": ntgt.ADULT_SPECIES, "region": "ventral_nerve_cord", "hemilineage": "x",
+                    "cell_type": f"T{t:03d}", "neurotransmitter_verified_source": "S",
+                    "neurotransmitter_verified_evidence": "immuno", "neurotransmitter_verified_confidence": 4})
+        rec[("acetylcholine", "gaba", "glutamate")[t % 3]] = 1
+        records.append(rec)
+    (repo / ntgt.GT_DATA).write_text(pd.DataFrame(records).to_csv(index=False))
+    pins = {ntgt.GT_DATA: hashlib.sha256((repo / ntgt.GT_DATA).read_bytes()).hexdigest()}
+    (root / ntgt.SOURCE_FILE).write_text('{"commit": "' + commit + '"}')
+    monkeypatch.setattr(ntgt, "NT_GT_COMMIT", commit)
+    monkeypatch.setattr(ntgt, "PINNED_SHA256", pins)
+    config = _config(tmp_path, nt_root=str(root))
+    build = mt.build_target_dataset("nt_literature", config, _quick_eval(tmp_path), explicit_paths=synthetic_paths,
+                                    log=lambda *_: None)
+    data = build.data
+    assert set(data.labels) <= {"acetylcholine", "gaba", "glutamate"} and len(set(data.labels)) == 3
+    assert data.notes["label_provenance"] == "measured"
+    cov = data.notes["nt_literature_coverage"]
+    assert cov["cnn_training"]["identifiable"] is False and cov["types_used"] == cov["gt_types_matched"]
+    cols = list(data.features.columns)
+    assert "hemilineage" not in cols and not any("_pnt__" in c or "_hl__" in c for c in cols)
+    assert "hemilineage" in data.group_keys  # the oracle / grouping key, never a feature
 
 
 def test_masked_split_mismatch_fails_closed(tmp_path, synthetic_paths):

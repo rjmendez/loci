@@ -304,6 +304,17 @@ def test_run_evaluation_end_to_end_writes_only_under_report_root(synth):
     assert (tmp_path / "reports" / "mc" / "nt_ground_truth" / "report.json").is_file()
     assert "shuffle_control" in report["models"]["logreg"]
     assert not list(tmp_path.glob("**/snapshots"))
+    # R1: the mc ground_truth column is measured but uncertain (E5); the notes carry it for the harness gate
+    assert build.data.notes["label_provenance"] == "measured" and build.data.notes["provenance_uncertain"] is True
+    assert report["label_provenance"]["gate_applies"] is True
+
+
+def test_every_mc_target_declares_provenance():
+    import flybrain_target_registry as ftr
+
+    assert set(mct.TARGET_LABEL_PROVENANCE) == set(mct.MC_REAL_TARGETS)
+    assert mct.TARGET_LABEL_PROVENANCE["cell_class"] == "connectivity_defined"
+    assert not ftr.target_provenance("mc", "connectivity_tier").gateable
 
 
 def test_feature_filter_and_sparsity_control(synth):

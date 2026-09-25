@@ -12,13 +12,28 @@ This module turns the manifest-verified ``mc`` snapshot into
   the classifier's training target, so every classifier output
   (``predicted_nt*``, ``celltype_*``, ``consensus_nt``, which equals
   ``ground_truth`` on 100% of labelled rows) is excluded; none of them is ever
-  loaded into the feature frame.
+  loaded into the feature frame. Label provenance: ``measured`` but
+  uncertain (it is the synister_malecns training table: confidence >= 3 plus
+  hemilineage-inferred VNC labels, SYNTHESIS E5); superseded by
+  ``nt_literature``.
+* ``nt_literature`` (+ ``_binary``, ``_all``, ``_all_binary``): the R2
+  literature ground truth (``flybrain_nt_ground_truth``: drosophila_neurotransmitters,
+  confidence >= 4), mapped onto male-CNS types by name and by the male-CNS GT
+  table's ``gt_celltype -> cell_type_mcns`` column. ``nt_literature`` drops the
+  synister_malecns training types (R2); ``nt_literature_all`` keeps them.
 * ``super_class``: the curated ``superclass`` annotation, harmonized with
-  ``flybrain_wiring_features.harmonize_super_class``.
+  ``flybrain_wiring_features.harmonize_super_class`` (curated_morphology).
 * ``cell_class``: the curated ``class`` annotation (only rows where it is set;
-  mostly sensory modality and central-brain classes).
+  mostly sensory modality and central-brain classes). connectivity_defined:
+  male-CNS types used NBLAST + connectivity [Berg 2025], so this is reported as
+  recovery of connectivity-derived annotations and never gated.
 * ``connectivity_tier`` / ``region_specialization_tier``: the existing labels,
-  built by ``flybrain_brain_cluster_mc_samples`` (unchanged definitions).
+  built by ``flybrain_brain_cluster_mc_samples`` (unchanged definitions);
+  connectivity_defined (statistics of the connectome itself), never gated.
+
+Label provenance (R1) per target is ``TARGET_LABEL_PROVENANCE``, checked against
+``flybrain_target_registry`` at import; ``run_target`` evaluates through
+``flybrain_target_registry.run_gated_evaluation``.
 
 Features (``<family>__<name>``; ablations drop one family at a time):
 
@@ -72,6 +87,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+import flybrain_nt_ground_truth as ntgt
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
 from flybrain_mc_adapter import (
     MC_PRIMARY_ROIS,
@@ -98,14 +115,27 @@ TARGET_SUPER_CLASS = "super_class"
 TARGET_CELL_CLASS = "cell_class"
 TARGET_CONNECTIVITY = "connectivity_tier"
 TARGET_REGION_SPECIALIZATION = "region_specialization_tier"
+NT_LITERATURE_TARGETS: tuple[str, ...] = ntgt.NT_LITERATURE_TARGETS
 MC_REAL_TARGETS: tuple[str, ...] = (
     TARGET_NT_GROUND_TRUTH,
     TARGET_SUPER_CLASS,
     TARGET_CELL_CLASS,
     TARGET_CONNECTIVITY,
     TARGET_REGION_SPECIALIZATION,
+    *NT_LITERATURE_TARGETS,
 )
 LEGACY_TARGETS = frozenset({TARGET_CONNECTIVITY, TARGET_REGION_SPECIALIZATION})
+_P = ftr.LabelProvenance
+# R1 label provenance per target (must equal flybrain_target_registry; checked at import).
+TARGET_LABEL_PROVENANCE: Mapping[str, str] = {
+    TARGET_NT_GROUND_TRUTH: _P.MEASURED.value,
+    TARGET_SUPER_CLASS: _P.CURATED_MORPHOLOGY.value,
+    TARGET_CELL_CLASS: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_CONNECTIVITY: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_REGION_SPECIALIZATION: _P.CONNECTIVITY_DEFINED.value,
+    **{t: _P.MEASURED.value for t in NT_LITERATURE_TARGETS},
+}
+ftr.check_module_provenance("mc", TARGET_LABEL_PROVENANCE)
 # Partner category (super class) is the target or a function of it -> mask held-out nodes.
 MASKED_TARGETS = frozenset({TARGET_SUPER_CLASS, TARGET_CELL_CLASS})
 
@@ -116,6 +146,7 @@ CATEGORICAL_COLUMNS: tuple[str, ...] = (
 # Inputs dropped on top of the registered exclusion patterns (reason in the module docstring).
 EXTRA_EXCLUDED: Mapping[str, frozenset[str]] = {
     TARGET_NT_GROUND_TRUTH: frozenset({"hemilineage"}),
+    **{t: frozenset({"hemilineage"}) for t in NT_LITERATURE_TARGETS},
     TARGET_SUPER_CLASS: frozenset({"hemilineage"}),
     TARGET_CELL_CLASS: frozenset({"hemilineage"}),
     TARGET_CONNECTIVITY: frozenset(),
@@ -452,10 +483,20 @@ def _keep_classes_with_types(frame: pd.DataFrame, min_types: int) -> tuple[pd.Da
 
 
 def label_frame(target: str, population: pd.DataFrame, *, nt_ground_truth: pd.DataFrame | None,
-                config: McRealModelConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """``population`` rows that carry the target label (column ``label``), classes with enough types, capped."""
+                config: McRealModelConfig, nt_literature: pd.DataFrame | None = None
+                ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """``population`` rows that carry the target label (column ``label``), classes with enough types, capped.
+
+    ``nt_literature``: (root_id, label) rows from ``flybrain_nt_ground_truth.label_neurons`` for the
+    ``nt_literature*`` targets.
+    """
     info: dict[str, Any] = {}
-    if target == TARGET_NT_GROUND_TRUTH:
+    if target in NT_LITERATURE_TARGETS:
+        if nt_literature is None:
+            raise ValueError(f"{target} needs the literature NT labels (flybrain_nt_ground_truth)")
+        lit = nt_literature[["root_id", "label"]].astype({"root_id": str})
+        frame = population.merge(lit, on="root_id", how="inner")
+    elif target == TARGET_NT_GROUND_TRUTH:
         if nt_ground_truth is None:
             raise ValueError("nt_ground_truth target needs the body-neurotransmitter table")
         gt = nt_ground_truth[["root_id", "ground_truth"]]
@@ -568,7 +609,8 @@ def _held_out_mask_ids(nodes: pd.DataFrame, frame: pd.DataFrame, held_out: set[s
 def build_target_dataset(target: str, config: McRealModelConfig, eval_config: Any, *,
                          inputs: McInputs | None = None, explicit_paths: Mapping[str, str | Path] | None = None,
                          wiring_params: fwf.WiringFeatureParams | None = None,
-                         feature_filter: Sequence[str] | None = None, log=print) -> McTargetBuild:
+                         feature_filter: Sequence[str] | None = None, log=print,
+                         nt_root: str | Path = ntgt.DEFAULT_NT_GT_ROOT) -> McTargetBuild:
     """Labels + grouped-split plan + (masked) wiring and ROI features -> ``EvalDataset``.
 
     ``feature_filter``: optional family names to keep (e.g. to run a wiring-only variant).
@@ -578,6 +620,7 @@ def build_target_dataset(target: str, config: McRealModelConfig, eval_config: An
     if target not in MC_REAL_TARGETS:
         raise ValueError(f"target must be one of: {', '.join(MC_REAL_TARGETS)}")
     fwf.objective_exclusions(target)  # fail closed before any work
+    notes_extra: dict[str, Any] = ftr.provenance_notes(MC_SYMBOL, target)
     t0 = time.time()
     inputs = inputs or open_inputs(config, paths=explicit_paths)
     check_mc_roi_vocabulary(inputs.paths[ROLE_DATASET_META])
@@ -596,10 +639,17 @@ def build_target_dataset(target: str, config: McRealModelConfig, eval_config: An
         frame, label_info = legacy_label_frame(target, population, config, explicit_paths=explicit_paths)
     else:
         nt = None
+        lit = None
         if target == TARGET_NT_GROUND_TRUTH:
             nt = load_mc_nt_predictions(inputs.paths[ROLE_NT_PREDICTION], body_ids=population["root_id"].tolist())
             nt = nt.rename(columns={"body": "root_id"})[["root_id", "ground_truth"]]  # nothing else leaves here
-        frame, label_info = label_frame(target, population, nt_ground_truth=nt, config=config)
+        if target in NT_LITERATURE_TARGETS:
+            labelled = ntgt.label_neurons(population[["root_id", "cell_type"]], dataset=MC_SYMBOL,
+                                          source=ntgt.open_nt_ground_truth(nt_root), target=target,
+                                          id_column="root_id")
+            lit = labelled.frame
+            notes_extra["nt_literature_coverage"] = labelled.coverage
+        frame, label_info = label_frame(target, population, nt_ground_truth=nt, config=config, nt_literature=lit)
         if label_info.get("types_with_multiple_labels"):
             label_info["warning"] = "ground_truth differs within some cell types"
     if frame["label"].nunique() < 2:
@@ -611,7 +661,7 @@ def build_target_dataset(target: str, config: McRealModelConfig, eval_config: An
                     for ct, hg, st in zip(frame["cell_type"], frame["hemilineage_group"], frame["supertype"])]
     plan_ids = frame["sample_id"].tolist()
     plan = fme.plan_grouped_split(plan_ids, group_values, GROUP_KEYS, eval_config)
-    notes: dict[str, Any] = {}
+    notes: dict[str, Any] = dict(notes_extra)
     mask_ids: list[str] | None = None
     if target in MASKED_TARGETS:
         held_out = {sid.rsplit("-", 1)[1] for sid in plan["val"] + plan["test"]}
@@ -696,10 +746,10 @@ def run_target(target: str, config: McRealModelConfig = McRealModelConfig(), *, 
                                                 run_label="wiring-roi-v1", n_threads=8)
     build = build_target_dataset(target, config, eval_config, feature_filter=feature_filter, log=log)
     log(f"[mc] {target}: evaluating {build.info['n_samples']} samples x {build.info['n_features']} features")
-    report = fme.run_evaluation(build.data, eval_config)
+    report = ftr.run_gated_evaluation(build.data, eval_config)
     report["mc_build"] = build.info
     if eval_config.report_root:
-        fme.write_report(report, eval_config.report_root, run_label=eval_config.run_label)
+        ftr.write_gated_report(report, eval_config.report_root, run_label=eval_config.run_label)
     return report
 
 

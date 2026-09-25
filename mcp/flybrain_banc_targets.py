@@ -1,17 +1,30 @@
 """BANC v888 "real model" targets: structured wiring features, honest labels, grouped evaluation.
 
-Targets (all evaluated with ``flybrain_model_eval.run_evaluation``):
+Targets (all evaluated through ``flybrain_target_registry.run_gated_evaluation``,
+i.e. ``flybrain_model_eval.run_evaluation`` behind the R1 provenance gate):
 
 * ``super_class``: curated BANC ``super_class`` harmonized onto the shared
   cross-dataset vocabulary (``flybrain_wiring_features.harmonize_super_class``).
+  curated_morphology, provenance uncertain (the BANC rule is undocumented, E1).
 * ``cell_class``: curated BANC ``cell_class`` (classes with enough neurons and
-  enough distinct cell types to be split by group).
-* ``flow``: curated ``afferent`` / ``intrinsic`` / ``efferent``.
+  enough distinct cell types to be split by group). connectivity_defined
+  (uncertain): BANC types/classes were transferred through NBLAST +
+  connectivity co-clustering matches, so this is never gated.
+* ``flow``: curated ``afferent`` / ``intrinsic`` / ``efferent``;
+  curated_morphology, provenance uncertain (E1).
 * ``connectivity_tier`` and ``neurotransmitter_dominance``: the existing sample
   builder (``flybrain_brain_cluster_banc_samples``) defines the samples and
   labels unchanged; only the model inputs are new. NT labels are the BANC
   **v2 classifier predictions** (argmax of per-neuron scores), not annotated
-  ground truth.
+  ground truth: that lane is a *distillation of synister_banc*
+  (model_predicted) and connectivity_tier a connectivity-derived statistic;
+  neither is ever gated.
+* ``nt_literature`` (+ ``_binary``, ``_all``, ``_all_binary``): the R2
+  literature ground truth (``flybrain_nt_ground_truth``, confidence >= 4)
+  mapped onto proofread BANC neurons by ``cell_type`` (measured, gated).
+  ``nt_literature`` removes the synister_banc training types (every type in
+  the BANC GT tables minus ``banc_cell_types_removed_for_nt``);
+  ``nt_literature_all`` keeps them. At most ``NT_MAX_PER_TYPE`` neurons per type.
 
 Model inputs (never the curated annotation that is the target):
 
@@ -58,6 +71,8 @@ import numpy as np
 import pandas as pd
 
 import flybrain_model_eval as fme
+import flybrain_nt_ground_truth as ntgt
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
 from flybrain_banc_adapter import (
     BANC_PRODUCT_PATHS,
@@ -91,7 +106,20 @@ TARGET_CONNECTIVITY = "connectivity_tier"
 TARGET_NT = "neurotransmitter_dominance"
 ANNOTATION_TARGETS: tuple[str, ...] = (TARGET_SUPER_CLASS, TARGET_CELL_CLASS, TARGET_FLOW)
 LEGACY_TARGETS: tuple[str, ...] = (TARGET_CONNECTIVITY, TARGET_NT)
-BANC_TARGETS: tuple[str, ...] = ANNOTATION_TARGETS + LEGACY_TARGETS
+NT_LITERATURE_TARGETS: tuple[str, ...] = ntgt.NT_LITERATURE_TARGETS
+BANC_TARGETS: tuple[str, ...] = ANNOTATION_TARGETS + LEGACY_TARGETS + NT_LITERATURE_TARGETS
+NT_MAX_PER_TYPE = 20
+_P = ftr.LabelProvenance
+# R1 label provenance per target (must equal flybrain_target_registry; checked at import).
+TARGET_LABEL_PROVENANCE: Mapping[str, str] = {
+    TARGET_SUPER_CLASS: _P.CURATED_MORPHOLOGY.value,
+    TARGET_CELL_CLASS: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_FLOW: _P.CURATED_MORPHOLOGY.value,
+    TARGET_CONNECTIVITY: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_NT: _P.MODEL_PREDICTED.value,
+    **{t: _P.MEASURED.value for t in NT_LITERATURE_TARGETS},
+}
+ftr.check_module_provenance(DATASET, TARGET_LABEL_PROVENANCE)
 # Partner category (harmonized super_class) is the target or determines it -> mask non-train nodes.
 MASKED_TARGETS: frozenset[str] = frozenset(ANNOTATION_TARGETS)
 GROUP_KEYS: tuple[str, ...] = ("cell_type", "hemilineage")
@@ -282,6 +310,28 @@ def annotation_labels(nodes: pd.DataFrame, target: str) -> pd.Series:
     return out
 
 
+def nt_literature_labels(nodes: pd.DataFrame, target: str, *, nt_root: str | Path = ntgt.DEFAULT_NT_GT_ROOT
+                         ) -> tuple[pd.Series, dict[str, Any]]:
+    """Per-node literature NT (R2) for proofread neurons (None elsewhere) + coverage statistics."""
+    source = ntgt.open_nt_ground_truth(nt_root)
+    typed = pd.DataFrame({"banc_888_id": nodes["banc_888_id"].astype(str), "cell_type": nodes["cell_type"]})
+    labelled = ntgt.label_neurons(typed, dataset=DATASET, source=source, target=target, id_column="banc_888_id")
+    mapping = dict(zip(labelled.frame["banc_888_id"].astype(str), labelled.frame["label"].astype(str)))
+    out = pd.Series([mapping.get(i) for i in typed["banc_888_id"]], index=nodes.index, dtype=object)
+    out[~nodes["proofread_bool"].to_numpy()] = None
+    coverage = dict(labelled.coverage)
+    coverage["proofread_neurons_labelled"] = int(out.notna().sum())
+    return out, coverage
+
+
+def cap_per_type(frame: pd.DataFrame, *, max_per_type: int, salt: str) -> pd.DataFrame:
+    """At most ``max_per_type`` rows per cell type, in sha256(salt:id) order (type-level labels)."""
+    ranked = frame.assign(_r=_stable_rank(frame["banc_888_id"].astype(str).tolist(), salt))
+    ranked = ranked.sort_values(["cell_type", "_r"], kind="mergesort")
+    capped = ranked.groupby("cell_type", sort=False, dropna=False).head(int(max_per_type)).drop(columns=["_r"])
+    return capped.sort_values("banc_888_id", kind="mergesort").reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class SelectionConfig:
     min_class_count: int = 200
@@ -413,6 +463,10 @@ class BancTargetConfig:
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     legacy_max_samples: int = 30000
     drop_families: tuple[str, ...] = ()  # e.g. ("neuropil",) for a no-neuropil variant
+    # nt_literature*: smaller classes are kept (labels are per type), capped per type afterwards
+    nt_selection: SelectionConfig = field(default_factory=lambda: SelectionConfig(
+        min_class_count=40, min_class_cell_types=3, max_per_class=100_000, salt="flybrain-banc-nt-literature-v1"))
+    nt_root: str = ntgt.DEFAULT_NT_GT_ROOT
 
 
 def _required_files(config: BancTargetConfig, target: str) -> list[str]:
@@ -449,10 +503,10 @@ def build_eval_dataset(target: str, config: BancTargetConfig, eval_config: fme.E
                                 cache_root=config.cache_root)
     log(f"[banc:{target}] base features {base.frame.shape} cache={base.cache_path} ({time.time() - t0:.0f}s)")
     notes: dict[str, Any] = {"dataset_version": BANC_VERSION_ID, "provenance": inputs.provenance(),
-                             "base_features_fingerprint": base.fingerprint}
+                             "base_features_fingerprint": base.fingerprint,
+                             **ftr.provenance_notes(DATASET, target)}
 
-    if target in ANNOTATION_TARGETS:
-        labels = annotation_labels(nodes, target)
+    if target in ANNOTATION_TARGETS or target in NT_LITERATURE_TARGETS:
         base_idx = base.frame.set_index(fwf.NODE_ID_COLUMN)
         wired = base_idx.reindex(nodes["banc_888_id"].astype(str))
         has_wiring = (wired.filter(like="recip__").notna().any(axis=1)
@@ -460,6 +514,19 @@ def build_eval_dataset(target: str, config: BancTargetConfig, eval_config: fme.E
         if "degree__out_weight_total" in wired.columns:
             has_wiring = has_wiring | ((wired["degree__out_weight_total"].fillna(0)
                                         + wired["degree__in_weight_total"].fillna(0)) > 0).to_numpy()
+    if target in NT_LITERATURE_TARGETS:
+        labels, coverage = nt_literature_labels(nodes, target, nt_root=config.nt_root)
+        samples, selection = select_annotation_samples(nodes, labels, has_wiring, config.nt_selection)
+        samples = cap_per_type(samples, max_per_type=NT_MAX_PER_TYPE, salt=config.nt_selection.salt)
+        selection["class_counts_after_type_cap"] = {str(k): int(v) for k, v in
+                                                    samples["label"].value_counts().sort_index().items()}
+        ids = samples["banc_888_id"].astype(str).tolist()
+        group_values = samples[list(GROUP_KEYS)].to_dict(orient="records")
+        label_col = "label"
+        notes.update({"selection": selection, "nt_literature_coverage": coverage,
+                      "label_source": ntgt.NT_LITERATURE_SPECS[target].describe()})
+    elif target in ANNOTATION_TARGETS:
+        labels = annotation_labels(nodes, target)
         samples, selection = select_annotation_samples(nodes, labels, has_wiring, config.selection)
         ids = samples["banc_888_id"].astype(str).tolist()
         group_values = samples[list(GROUP_KEYS)].to_dict(orient="records")
@@ -577,7 +644,7 @@ def run_target(target: str, config: BancTargetConfig, eval_config: fme.EvalConfi
         present = {name: list(patterns) for name, patterns in eval_config.ablation_families.items()
                    if any(fnmatch.fnmatchcase(c, p) for c in cols for p in patterns)}
         eval_config = dataclasses.replace(eval_config, ablation_families=present)
-    report = fme.run_evaluation(data, eval_config)
+    report = ftr.run_gated_evaluation(data, eval_config)
     for row in report["summary"]:
         log(json.dumps(row, sort_keys=True, default=str))
     return report
@@ -641,6 +708,11 @@ __all__ = [
     "open_banc_inputs",
     "run_target",
     "select_annotation_samples",
+    "NT_LITERATURE_TARGETS",
+    "NT_MAX_PER_TYPE",
+    "TARGET_LABEL_PROVENANCE",
+    "cap_per_type",
+    "nt_literature_labels",
 ]
 
 

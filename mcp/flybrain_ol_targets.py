@@ -22,9 +22,24 @@ Targets (label source, all per neuron; samples are typed ``Traced`` neurons):
   0.75 quantile over candidates with downstream >= 10).
 * ``neurotransmitter_dominance``: the neuron's own synapse-classifier call
   ``predictedNt`` (PREDICTED; ``unclear`` dropped, ``totalNtPredictions`` >= 10).
+  This lane is a *distillation of the optic-lobe synapse NT classifier*
+  [Nern 2025] (model_predicted), never an NT accuracy, and never gated.
 * ``nt_ground_truth``: the type-level ``consensusNt`` restricted to types
   whose ``ntReference`` is set (literature / experimental reference, e.g.
   Davis et al. 2020 RNA-seq; CONSENSUS, not per-neuron ground truth).
+  measured with provenance uncertain (consensus mixes predictions with
+  curation); superseded by ``nt_literature``.
+* ``nt_literature`` (+ ``_binary``, ``_all``, ``_all_binary``): the R2
+  literature ground truth (``flybrain_nt_ground_truth``, confidence >= 4)
+  mapped by type name. ``nt_literature`` drops the classifier's training
+  types (Nern et al. table, ``Part_of_training_data == yes``).
+
+Label provenance (R1): ``cell_family`` is connectivity_defined (optic-lobe
+types were finalised by connectivity [Matsliah 2024; Nern 2025]: recovery of
+connectivity-derived annotations), ``super_class`` curated_morphology,
+``connectivity_tier`` connectivity_defined. ``TARGET_LABEL_PROVENANCE`` is
+checked against ``flybrain_target_registry`` at import and every evaluation
+goes through ``run_gated_evaluation``.
 
 Split: grouped by ``cell_type`` (the registry split key), so every test
 neuron belongs to a cell type the model never saw. The per-type sample cap
@@ -62,13 +77,15 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
+import flybrain_nt_ground_truth as ntgt
+import flybrain_target_registry as ftr
 import flybrain_wiring_features as fwf
 from flybrain_ol_adapter import (
     OL_NT_UNCLEAR,
@@ -93,8 +110,20 @@ TARGET_SUPER_CLASS = "super_class"
 TARGET_CONNECTIVITY = "connectivity_tier"
 TARGET_NT_PREDICTED = "neurotransmitter_dominance"
 TARGET_NT_CONSENSUS = "nt_ground_truth"
+NT_LITERATURE_TARGETS: tuple[str, ...] = ntgt.NT_LITERATURE_TARGETS
 OL_TARGETS: tuple[str, ...] = (TARGET_CELL_FAMILY, TARGET_SUPER_CLASS, TARGET_CONNECTIVITY, TARGET_NT_PREDICTED,
-                               TARGET_NT_CONSENSUS)
+                               TARGET_NT_CONSENSUS, *NT_LITERATURE_TARGETS)
+_P = ftr.LabelProvenance
+# R1 label provenance per target (must equal flybrain_target_registry; checked at import).
+TARGET_LABEL_PROVENANCE: Mapping[str, str] = {
+    TARGET_CELL_FAMILY: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_SUPER_CLASS: _P.CURATED_MORPHOLOGY.value,
+    TARGET_CONNECTIVITY: _P.CONNECTIVITY_DEFINED.value,
+    TARGET_NT_PREDICTED: _P.MODEL_PREDICTED.value,
+    TARGET_NT_CONSENSUS: _P.MEASURED.value,
+    **{t: _P.MEASURED.value for t in NT_LITERATURE_TARGETS},
+}
+ftr.check_module_provenance(OL_SYMBOL, TARGET_LABEL_PROVENANCE)
 GROUP_KEYS: tuple[str, ...] = ("cell_type",)
 ROLE_EDGELIST = "edgelist"
 ROLE_BODY_STATS = "body_stats"
@@ -153,6 +182,7 @@ OL_EXTRA_EXCLUSIONS: Mapping[str, tuple[str, ...]] = {
     TARGET_SUPER_CLASS: (),
     TARGET_NT_PREDICTED: (),
     TARGET_NT_CONSENSUS: (),
+    **{t: () for t in NT_LITERATURE_TARGETS},
 }
 
 
@@ -457,6 +487,7 @@ class OlTargetConfig:
     n_top_rois: int = 24
     cache_root: str | None = fwf.DEFAULT_CACHE_ROOT
     salt: str = "ol11-real-models"
+    nt_root: str = ntgt.DEFAULT_NT_GT_ROOT  # R2 literature NT (nt_literature* targets)
 
     def validate(self) -> None:
         if self.target not in OL_TARGETS:
@@ -517,6 +548,14 @@ def label_frame(inputs: OlStructuredInputs, config: OlTargetConfig, family_map: 
         frame = frame[ok].copy()
         frame["label"] = ["nt_" + nt_short_code(v) for v in frame["consensus_nt"]]
         definition = "CONSENSUS: type-level consensusNt where ntReference is set (literature/experiment-backed)"
+    elif target in NT_LITERATURE_TARGETS:
+        labelled = ntgt.label_neurons(frame[["body_id", "cell_type"]], dataset=OL_SYMBOL,
+                                      source=ntgt.open_nt_ground_truth(config.nt_root), target=target,
+                                      id_column="body_id")
+        mapping = dict(zip(labelled.frame["body_id"].astype(str), labelled.frame["label"].astype(str)))
+        frame["label"] = [mapping.get(str(b)) for b in frame["body_id"]]
+        stats["nt_literature_coverage"] = labelled.coverage
+        definition = ntgt.NT_LITERATURE_SPECS[target].describe()
     else:  # pragma: no cover - validated
         raise ValueError(target)
     frame = frame[frame["label"].notna()].copy()
@@ -547,7 +586,7 @@ def _text_keys(target: str) -> tuple[str, ...]:
 
     if target == TARGET_CONNECTIVITY:
         return tuple(ols.INPUT_FEATURES["connectivity_tier"])
-    if target in (TARGET_NT_PREDICTED, TARGET_NT_CONSENSUS):
+    if target in (TARGET_NT_PREDICTED, TARGET_NT_CONSENSUS, *NT_LITERATURE_TARGETS):
         return tuple(ols.INPUT_FEATURES["neurotransmitter_dominance"])
     return ols.STRUCTURED_TEXT_FEATURES
 
@@ -585,7 +624,9 @@ def build_ol_eval_dataset(inputs: OlStructuredInputs, config: OlTargetConfig, ev
     if samples.empty or samples["label"].nunique() < 2:
         raise ValueError(f"{target}: fewer than two labels after filtering")
     short = {TARGET_CELL_FAMILY: "fam", TARGET_SUPER_CLASS: "cls", TARGET_CONNECTIVITY: "out",
-             TARGET_NT_PREDICTED: "nt", TARGET_NT_CONSENSUS: "ntc"}[target]
+             TARGET_NT_PREDICTED: "nt", TARGET_NT_CONSENSUS: "ntc", ntgt.TARGET_NT_LITERATURE: "ntl",
+             ntgt.TARGET_NT_LITERATURE_BINARY: "ntlb", ntgt.TARGET_NT_LITERATURE_ALL: "ntla",
+             ntgt.TARGET_NT_LITERATURE_ALL_BINARY: "ntlab"}[target]
     samples["sample_id"] = [f"ol11-{short}-{b}" for b in samples["body_id"]]
     group_values = [{"cell_type": t} for t in samples["cell_type"]]
     plan = fme.plan_grouped_split(samples["sample_id"].tolist(), group_values, GROUP_KEYS, eval_config)
@@ -617,6 +658,7 @@ def build_ol_eval_dataset(inputs: OlStructuredInputs, config: OlTargetConfig, ev
     frame["input_text"] = input_texts(frame, target)
     wiring_meta = {k: v for k, v in wiring.meta.items() if k not in ("columns",)}
     notes = {
+        **ftr.provenance_notes(OL_SYMBOL, target),
         "masked_split_ids_sha256": fme.split_ids_sha256(plan),
         "masking": {"held_out_types": len(held_types), "masked_nodes": len(mask),
                     "rule": "partner category hidden for every node of a val/test cell type"},
@@ -677,7 +719,7 @@ def run_ol_target(inputs: OlStructuredInputs, target: str, *, feature_set: str =
         if feature_set != "full":  # the NB text view does not change with the feature set
             models = tuple(m for m in models if m.backend != "nb")
     eval_config = replace(eval_config, models=tuple(models))
-    report = fme.run_evaluation(data, eval_config)
+    report = ftr.run_gated_evaluation(data, eval_config)
     if eval_config.report_root and target == TARGET_CELL_FAMILY:
         out = fme.report_dir(eval_config.report_root, OL_SYMBOL, target, eval_config.run_label)
         (out / "family_map.json").write_text(json.dumps(extra["family_map"].as_dict(), indent=2, sort_keys=True) + "\n",
