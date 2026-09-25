@@ -22,10 +22,26 @@ _LOAD_VRAM_THRESHOLD = 85  # VRAM used% at or above this -> loaded
 _URGENT_UTIL_THRESHOLD = 92  # util% at or above this -> urgent (prefer cloud fallback)
 
 
-def _signal_path() -> Path:
-    """Tmpfs path for the GPU load snapshot, scoped to the current user."""
+SIGNAL_PATH_VAR = "LOCI_GPU_LOAD_PATH"
+
+
+def live_signal_path() -> Path:
+    """The default tmpfs path the sidecar writes, scoped to the current user."""
     uid = os.getuid()
     return Path(f"/run/user/{uid}/loci_gpu_load.json")
+
+
+def _signal_path() -> Path:
+    """Path of the GPU load snapshot: $LOCI_GPU_LOAD_PATH when set, else the live tmpfs path.
+
+    The override exists so the test harness (testsupport/loci_hermetic.py) can point
+    every reader away from the live signal: generate() reads it on each call, and a
+    busy workstation otherwise changes routing -- and test outcomes -- under test.
+    """
+    override = os.environ.get(SIGNAL_PATH_VAR, "").strip()
+    if override:
+        return Path(override)
+    return live_signal_path()
 
 
 @dataclass

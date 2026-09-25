@@ -134,3 +134,13 @@ class TestReadWriteRoundtrip:
             write_gpu_load(gpus)
         assert signal_file.exists()
         assert not (tmp_path / "loci_gpu_load.tmp").exists()
+
+
+def test_signal_path_honours_the_override(monkeypatch, tmp_path):
+    import gpu_load
+
+    target = tmp_path / "signal.json"
+    monkeypatch.setenv("LOCI_GPU_LOAD_PATH", str(target))
+    assert gpu_load._signal_path() == target
+    monkeypatch.setenv("LOCI_GPU_LOAD_PATH", "  ")
+    assert gpu_load._signal_path() == gpu_load.live_signal_path()

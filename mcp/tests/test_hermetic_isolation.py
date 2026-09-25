@@ -96,3 +96,40 @@ def test_the_repo_env_files_are_not_loaded(tmp_path):
         assert os.environ["LOCI_HERMETIC_PROBE"] == "1"
     finally:
         os.environ.pop("LOCI_HERMETIC_PROBE", None)
+
+
+def test_gpu_load_signal_is_redirected_into_the_temp_root():
+    import gpu_load
+
+    path = gpu_load._signal_path()
+    assert os.environ[loci_hermetic.GPU_LOAD_PATH_VAR] == str(path)
+    assert _inside_root(path)
+    assert not path.exists()
+    assert path != gpu_load.live_signal_path()
+
+
+def test_generate_sees_no_gpu_load_under_test():
+    """generate() reads the signal on every call; under test it must find none.
+
+    Before the redirect, a busy workstation GPU made _read_gpu_load() return a
+    loaded snapshot and changed routing and timeouts in test_llm_local*.py.
+    """
+    import llm_local
+
+    start = loci_hermetic.violation_count()
+    assert llm_local._read_gpu_load() is None
+    assert loci_hermetic.take_violations(start) == []
+
+
+@pytest.mark.skipif(not loci_hermetic.forbidden_files(), reason="no live GPU signal path on this OS")
+def test_reading_the_live_gpu_load_signal_is_refused_and_recorded(monkeypatch):
+    import gpu_load
+
+    live = gpu_load.live_signal_path()
+    assert str(live) in loci_hermetic.forbidden_files()
+    # Undo the redirect, as a regression would: the read must be refused and recorded.
+    monkeypatch.delenv(loci_hermetic.GPU_LOAD_PATH_VAR)
+    start = loci_hermetic.violation_count()
+    assert gpu_load.read_gpu_load() is None  # fail-open: the refusal is swallowed
+    recorded = loci_hermetic.take_violations(start)
+    assert len(recorded) == 1 and str(live) in recorded[0]

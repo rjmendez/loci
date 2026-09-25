@@ -12,17 +12,21 @@ incident recorded in mcp/tests/conftest.py is the worked example.
 any test module, and so before ``server`` is imported -- and does three things:
 
 1. Points every store at a fresh temp root: HOME, HERMES_HOME, LOCI_CONFIG,
-   LOCI_MEMORY_DIR, MNEMOSYNE_DATA_DIR; backend URLs at an unreachable port;
-   API keys removed; any inherited variable whose value lies under the real
-   ~/.loci or ~/.hermes removed.
+   LOCI_MEMORY_DIR, MNEMOSYNE_DATA_DIR; the GPU load signal
+   (LOCI_GPU_LOAD_PATH) at a file that does not exist, so generate() routes as
+   on an idle machine; backend URLs at an unreachable port; API keys removed;
+   any inherited variable whose value lies under the real ~/.loci or ~/.hermes
+   removed.
 2. Stops ``dotenv.load_dotenv`` from reading this checkout's own .env files,
    which would otherwise put the live QDRANT_URL/QDRANT_API_KEY back.
    Explicit paths (a test's tmp_path) still load.
 3. Installs an audit hook that refuses -- and records -- any open, sqlite
    connect, listdir, mkdir, rename, remove or rmtree under the real ~/.loci or
-   ~/.hermes. The refusal raises ``LiveStoreAccessError`` (a PermissionError, so
-   fail-open code degrades rather than crashes), and because fail-open code may
-   swallow it, the conftest also fails the test from the record.
+   ~/.hermes, or of the live GPU load signal /run/user/<uid>/loci_gpu_load.json
+   (written by the sidecar; a busy GPU changed test outcomes). The refusal
+   raises ``LiveStoreAccessError`` (a PermissionError, so fail-open code
+   degrades rather than crashes), and because fail-open code may swallow it,
+   the conftest also fails the test from the record.
 
 Opt-out, for an intentional live smoke test only: ``LOCI_TESTS_LIVE=1``.
 Nothing else disables it.
@@ -111,7 +115,27 @@ class LiveStoreAccessError(PermissionError):
     """A test touched the real ~/.loci or ~/.hermes."""
 
 
-_state: dict = {"installed": False, "root": None, "forbidden": (), "violations": []}
+_state: dict = {"installed": False, "root": None, "forbidden": (), "forbidden_files": (),
+                "violations": []}
+
+GPU_LOAD_PATH_VAR = "LOCI_GPU_LOAD_PATH"
+
+
+def live_gpu_load_path() -> str:
+    """The live GPU load signal the sidecar writes (mirrors gpu_load.live_signal_path)."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:  # Windows: no sidecar, no signal
+        return ""
+    return f"/run/user/{getuid()}/loci_gpu_load.json"
+
+
+def _forbidden_files() -> tuple[str, ...]:
+    files = set()
+    live = live_gpu_load_path()
+    if live:
+        files.add(os.path.abspath(live))
+        files.add(os.path.realpath(live))
+    return tuple(sorted(files))
 
 
 def _real_homes() -> set[str]:
@@ -144,7 +168,7 @@ def _forbidden_roots() -> tuple[str, ...]:
 
 
 def is_forbidden(path) -> bool:
-    """True when ``path`` lies under the real ~/.loci or ~/.hermes."""
+    """True when ``path`` lies under the real ~/.loci or ~/.hermes, or is the live GPU signal."""
     if isinstance(path, int) or path is None:
         return False
     try:
@@ -157,7 +181,7 @@ def is_forbidden(path) -> bool:
     for root in _state["forbidden"]:
         if absolute == root or absolute.startswith(root + os.sep):
             return True
-    return False
+    return absolute in _state["forbidden_files"]
 
 
 def _audit(event: str, args: tuple) -> None:
@@ -213,6 +237,7 @@ def install() -> dict:
         )
 
     forbidden = _forbidden_roots()
+    forbidden_files = _forbidden_files()
     root = Path(tempfile.mkdtemp(prefix="loci-tests-"))
     atexit.register(shutil.rmtree, root, ignore_errors=True)
 
@@ -238,12 +263,14 @@ def install() -> dict:
         "LOCI_CONFIG": str(root / "no-such-backends.toml"),
         "LOCI_MEMORY_DIR": str(root / "memory-sessions"),
         "MNEMOSYNE_DATA_DIR": str(root / "mnemosyne"),
+        # Never created: read_gpu_load() finds no signal and fails open, as on CI.
+        GPU_LOAD_PATH_VAR: str(root / "gpu-load" / "loci_gpu_load.json"),
     })
     for key in _UNREACHABLE_URLS:
         os.environ[key] = UNREACHABLE
 
     _guard_dotenv()
-    _state.update(root=root, forbidden=forbidden, installed=True)
+    _state.update(root=root, forbidden=forbidden, forbidden_files=forbidden_files, installed=True)
     sys.addaudithook(_audit)
     return _state
 
@@ -254,6 +281,10 @@ def root() -> "Path | None":
 
 def forbidden_roots() -> tuple[str, ...]:
     return _state["forbidden"]
+
+
+def forbidden_files() -> tuple[str, ...]:
+    return _state["forbidden_files"]
 
 
 def installed() -> bool:
