@@ -209,3 +209,56 @@ Explicit paths must be given for every required product or for none; a partial s
 - CLI: `python flybrain_brain_cluster_banc_samples.py --objective <obj> --output <json> --allow-planned [--storage-root F:\.flybrain]`
 - Tests re-register the builder per test and unregister it at module import, so the dispatcher's stub-`banc` tests keep an empty slot in the same pytest session.
 - Before promotion (registry `planned` to `active`, license `UNREVIEWED` to `CC-BY-4.0`): SC3 (thresholds from at least 2 eligible reports per (dataset, objective)), the grouped-split trivial-baseline gate (AC6) and the AB plan AC1-AC5 still apply. `region_specialization_tier` is on BANC's registry allow-list but has no builder yet (`BUILDER_NOT_REGISTERED`).
+
+## 9. Real models (2026-09-24, `flybrain_banc_targets`)
+
+`mcp/flybrain_banc_targets.py` builds structured model inputs for five BANC targets and runs `flybrain_model_eval.run_evaluation`: grouped split by `cell_type` + `hemilineage` (union-find), grouped CV tuning, calibration, one held-out test pass, cluster bootstrap, label shuffle, and a drop-one-family ablation. Reports and models are written to `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/banc/<target>/<run>/`.
+
+**Targets and labels**
+
+| Target | Label | Samples |
+|---|---|---|
+| `super_class` | curated `super_class`, harmonized to the shared vocabulary (`harmonize_super_class`); `unknown`/`non_neuronal`/`other` dropped | proofread, wired; at least 200 neurons and 5 cell types per class; hash-ordered cap per class |
+| `cell_class` | curated `cell_class` (slug) | same, with at least 150 neurons per class |
+| `flow` | curated `afferent` / `intrinsic` / `efferent` | same |
+| `connectivity_tier` | unchanged legacy builder (section 5.1) | legacy builder, `max_samples` raised |
+| `neurotransmitter_dominance` | unchanged legacy builder (section 5.2). The labels are **v2 classifier predictions, not ground truth.** | legacy builder |
+
+**Inputs (feature families)**
+
+- `degree`, `recip`: from `edgelist_simple_v3` (weight = `count`).
+- `out_np`, `in_np`: top-30 neuropil fractions plus other, entropy and count. They come from one streamed pass over the 198.8M-row `synapses_v3_enriched.parquet` (one synapse = weight 1), computed once with a constant partner category so the table is label-independent (cache `wiring-features/banc/82b4222f…`, 487 s, 7 GB RSS, under the heavy lock).
+- `out_comp`, `in_comp`, `out2_comp`, `in2_comp`: partner composition by harmonized super_class. For `super_class`, `cell_class` and `flow`, the partner category of **every node outside the train split is masked**, including neurons that are not in the evaluation sample. This is stricter than masking val and test only: an unsampled neuron of a held-out type would otherwise leak its label through homophily. The 2-hop return path is removed by the foundation.
+- `morph`: `banc_888_metrics.feather` (cable, volume, L2 nodes, branch/end points, axon/dendrite length, mitochondria, pd_width, segregation index, projection score, and derived ratios). For `connectivity_tier` the extensive size measures are dropped as size proxies (`LOCAL_EXCLUSIONS`).
+- `annot`: curated super_class, cell_class, flow and side, for `connectivity_tier` and NT only.
+- The registered `flybrain_wiring_features` exclusions apply on top of all of this: for example `degree__*` and `*n_neuropils*` are dropped for `connectivity_tier`. IDs are never features.
+- The NB text view is `name name_qK` tokens, with quantile bins fitted on train rows only.
+
+**Snapshot hygiene.** `open_banc_inputs` validates the manifest with `verify_hashes=False` (structure and sizes, so no stamp is written into the snapshot). It then sha256-verifies each file it reads against the manifest, keeping stamps in `/mnt/f/.flybrain/cache/hash-stamps/BANC-banc_888`. All five files matched on first hashing.
+
+**Results (run `quick`: capped samples, one config per model, 3-fold grouped CV).** The full-grid `v1` runs were queued behind the shared heavy lock for more than 2 h and never started, so these are the reported numbers. Test accuracy has a cluster-bootstrap 95% CI; the gate is the harness gate.
+
+| Target | Model | Majority | Best trivial (rule) | Model acc [95% CI] | Macro-F1 | ECE | Shuffle | Gate |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| super_class | nb | 0.073 | 0.445 (text lookup) | 0.819 [0.741, 0.879] | 0.810 | 0.060 | 0.090 | pass |
+| super_class | logreg | 0.073 | 0.377 (feature lookup) | 0.960 [0.942, 0.974] | 0.946 | 0.037 | 0.091 | pass |
+| super_class | hgb | 0.073 | 0.377 | 0.961 [0.948, 0.973] | 0.954 | 0.014 | 0.075 | pass |
+| super_class (no neuropil) | hgb | 0.073 | 0.356 | 0.921 [0.881, 0.956] | 0.909 | 0.024 | 0.074 | pass |
+| super_class (no neuropil) | logreg | 0.073 | 0.356 | 0.912 [0.866, 0.948] | 0.895 | 0.034 | 0.096 | fail (shuffle limit 0.093) |
+| cell_class | logreg | 0.000 | 0.051 | 0.625 [0.508, 0.765] | 0.555 | **0.419** | 0.005 | pass |
+| flow | logreg | 0.549 | 0.947 (lookup on missing `pd_width`) | 0.996 [0.990, 0.999] | 0.993 | 0.009 | 0.591 | fail (shuffle) |
+| flow | hgb | 0.549 | 0.947 | 0.990 [0.984, 0.995] | 0.986 | 0.008 | 0.604 | fail (shuffle) |
+| connectivity_tier | hgb | 0.597 | 0.753 (lookup `annot__super_class`) | 0.883 [0.859, 0.907] | 0.877 | 0.025 | 0.596 | pass |
+| connectivity_tier | logreg | 0.597 | 0.753 | 0.789 [0.748, 0.832] | 0.779 | 0.055 | 0.588 | fail (paired CI includes 0) |
+| NT (v2 predictions) | logreg | 0.415 | 0.476 (lookup `annot__cell_class`) | 0.622 [0.538, 0.721] | 0.554 | 0.129 | 0.402 | pass |
+| NT (v2 predictions) | hgb | 0.415 | 0.476 | 0.435 [0.309, 0.587] | 0.213 | 0.272 | 0.415 | fail |
+
+**Reading the results**
+
+- **super_class** is learnable from wiring and morphology across unseen cell types and hemilineages. The random-split accuracy (0.971) is close to the grouped accuracy (0.961), so memorizing groups adds little. Dropping neuropil costs 4 points. Neuropil location partly *defines* the intrinsic, ascending and descending classes, so the no-neuropil row is the stricter claim.
+- **flow** is nearly trivial: one missing-value lookup (afferents have no primary dendrite) reaches 0.947. The harness gate fails only on its single label permutation. Over 10 permutations (`shuffle_multi_flow.json`), the shuffle accuracy averages 0.48 (logreg) and 0.50 (hgb), below the 0.549 majority rate. With two dominant feature clusters, one permutation can map a whole cluster to the right class by chance. This is control variance, not leakage, but the harness verdict stands as fail.
+- **connectivity_tier** hgb beats the lookup rule by 9–17 points (paired CI). No single family is essential (largest drop: partner composition, −3 points). Entropy-type features correlate with neuron size, so treat this as "predictable from connectivity shape", not independent of size.
+- **NT**: logreg generalizes across hemilineage groups; hgb does not (random split 0.79 against grouped 0.44), and isotonic calibration does not rescue it. The labels are classifier predictions.
+- **cell_class**: the train majority class does not occur in test (grouped split), so the majority rate is 0. Accuracy is real but calibration is poor (ECE 0.42). This run has no ablation and no hgb, because the unlocked 5-minute budget did not fit about 60 classes.
+
+**Reproduce:** `python -m flybrain_banc_targets --target <t> --run-label v1` (full grid; run it under `flock /tmp/flybrain-heavy.lock`). The quick-run scripts are next to the reports.

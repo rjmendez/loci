@@ -159,3 +159,61 @@ payload = build_training_samples(
 - SC3: at least 2 calibrated threshold reports for (l1em, connectivity_tier).
 - A grouped-split (by pair) baseline must beat the majority baseline (0.750) and the cell-type-only rule, and the results must be recorded.
 - Do not redistribute derived models without attributing Winding et al. 2023 under CC-BY-4.0.
+
+## 11. Real models
+
+Modules: `mcp/flybrain_brain_cluster_l1em_samples.py` (structured features; the legacy text builder above is unchanged) and `mcp/flybrain_l1em_targets.py` (targets and runner). Tests: `mcp/tests/test_flybrain_l1em_real_models.py`, which runs offline on a synthetic snapshot.
+Run: `python -m flybrain_l1em_targets [--targets ...] [--repeats 4]` from `mcp/`. Reports go to `<report-root>/l1em/<target>/[<run_label>/]report.{json,md}` with saved models under `models/`. The run also writes `l1em/l1em_real_models.json` and `l1em/SUMMARY.md`. Run of 2026-09-24: `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/l1em/`.
+
+### 11.1 Which labels can be targets
+
+The paper defines most S2 cell types by connectivity, so a wiring model would only re-derive those definitions. They are rejected as targets (`REJECTED_TARGETS`), and no feature model reads them:
+
+| Candidate | Verdict | Why (Supplementary Material) |
+|---|---|---|
+| `celltype` (all 17 classes) | **rejected** | Fig. S4C gives each interneuron class a connectivity-motif definition. PN is postsynaptic to SN. PN-somato is postsynaptic to AN. LN is local within a sensory cohort (Fig. S10). LHN is downstream of olfactory, thermo or visual PNs. CN is downstream of LHN and MBON. MB-FBN and MB-FFN are defined by feedback or feedforward around MBIN and MBON. pre-DN-SEZ and pre-DN-VNC are presynaptic to the DNs. The KC and MBON motifs are also connectivity-based. |
+| `level_7_cluster` | **rejected** | This is the paper's spectral clustering of the connectivity graph (Fig. S8). The earlier "cluster" lookup was circular. |
+| ascending-neuron modality | **rejected** | Table S1 says the AN modalities are "based on connectivity". |
+| `l1em_io_class` | **kept** | Brain input and output classes are defined by anatomy. SN enters through a nerve. AN enters from the VNC. DN-SEZ, DN-VNC and RGN are defined by where their axon outputs land: SEZ, VNC or ring gland (Fig. S3C). Every other class is `interneuron`. |
+| `l1em_sensory_modality` | **kept** | SN modality comes from the sense organ or nerve and was "previously described for sensory neurons". thermo-cold and thermo-warm are merged. Classes with fewer than 10 neurons are dropped (none are dropped on the real data). |
+| `connectivity_tier` | kept, weak | This is the legacy label (total synapses >= q0.75). It is only meaningful under the exclusions in 11.2. |
+
+Caveat for `l1em_io_class`: S2 collapses overlapping classes by priority, so a DN-SEZ or RGN that also meets a higher-priority interneuron motif is labelled `interneuron`. That is label noise, not leakage.
+
+### 11.2 Features and leakage controls
+
+- **Wiring** (`flybrain_wiring_features` over `all-all` exported to `cache/l1em/edges/all_all-<key>.parquet`, keyed by `manifest_sha256`). Families: `degree`, `out_comp`/`in_comp`, `recip`, and `out2_comp`/`in2_comp` (io_class and connectivity_tier). The partner category is the **io class**. A connectivity-defined class is never used, because it would leak the class it is defined against: for example, `pre-DN-*` would leak DN.
+- **l1em-only**: `etype_out`/`etype_in` give the aa/ad/da/dd share of output and input synapses. The four split matrices must be listed in the manifest and must sum to all-all exactly, or the run fails closed. `cmpt` holds the axon share of output and input. `ase` holds 8 + 8 adjacency-spectral-embedding coordinates of log1p(all-all). This embedding is label-free, uses ARPACK with a fixed start vector, and fixes signs.
+- **Exclusions**: `l1em_io_class` and `l1em_sensory_modality` are registered in `fwf` with the `cell_class` patterns plus `*celltype*`, `*annotation*`, `*modality*`, `*cluster*`, `*io_class*`, `*pair_skid*`, `*hemisphere*` and `*skid*`. `connectivity_tier` uses the registered degree exclusions, which remove all 13 `degree__*` columns. It also drops `ase`, because the embedding norm tracks degree. `proxy_audit` fails closed if any remaining feature has |Spearman rho| >= 0.9 with the total synapse count. The real maximum is 0.544, for `out2_comp__interneuron`.
+- **Masking**: `l1em_io_class` uses its own label as the partner category. The split is planned first (`plan_grouped_split`). The io class of every val and test neuron is then hidden (`mask_category_ids`, 758 nodes on the primary split), and `notes.masked_split_ids_sha256` pins the split. A unit test shows that permuting held-out labels changes no feature, and that the unmasked build would change features.
+- **Text view for NB**: `binned_text` uses train-fitted quantile bins in the form `key key_q<b>`, so the NB tokenizer keeps the key with the value. The `legacy-text` run uses the old `input_text` for comparison.
+- **Protocol**: every run uses `flybrain_model_eval.run_evaluation`. The split is grouped by homologous pair (`split_group`), 70/15/15. Tuning uses 5-fold grouped CV inside train, scored by log loss. Probabilities are calibrated with temperature scaling (multiclass) or isotonic regression (binary) on out-of-fold predictions. The test set is used once. The run reports cluster-bootstrap CIs, the label shuffle, a random-split control, and drop-one-family ablation on val. Because the data are small, each target is re-run on 4 more split seeds.
+
+### 11.3 Results (held-out test, primary split `flybrain-real-models-v1`)
+
+| target | model | majority | best trivial (rule) | acc [95% CI] | macro-F1 | ECE | shuffle | gate | 5-seed acc (mean +- sd) | gate passes |
+|---|---|---|---|---|---|---|---|---|---|---|
+| l1em_io_class | nb | 0.697 | 0.813 (text lookup) | 0.863 [0.822, 0.901] | 0.706 | 0.062 | 0.642 | fail | 0.857 +- 0.024 | 1/5 |
+| l1em_io_class | logreg | 0.697 | 0.805 (lookup `cmpt__axon_input_share`) | 0.932 [0.899, 0.962] | 0.767 | 0.036 | 0.697 | **pass** | 0.940 +- 0.017 | 5/5 |
+| l1em_io_class | hgb | 0.697 | 0.805 (same) | 0.945 [0.916, 0.969] | 0.846 | 0.028 | 0.697 | **pass** | 0.952 +- 0.011 | 5/5 |
+| l1em_sensory_modality | nb | 0.241 | 0.519 (text lookup) | 0.611 [0.444, 0.768] | 0.541 | 0.139 | 0.111 | fail | 0.643 +- 0.083 | 0/5 |
+| l1em_sensory_modality | logreg | 0.241 | 0.426 (lookup `degree__log1p_out_n_annotated_partners`) | 0.704 [0.564, 0.839] | 0.636 | 0.143 | 0.167 | **pass** | 0.661 +- 0.043 | 2/5 |
+| l1em_sensory_modality | hgb | 0.241 | 0.426 (same) | 0.759 [0.621, 0.887] | 0.738 | 0.171 | 0.241 | **pass** | 0.788 +- 0.039 | 4/5 |
+| connectivity_tier | nb | 0.711 | 0.766 (text lookup) | 0.813 [0.761, 0.860] | 0.772 | 0.032 | 0.687 | fail | 0.811 +- 0.020 | 2/5 |
+| connectivity_tier | logreg | 0.711 | 0.726 (lookup `recip__partner_frac`) | 0.826 [0.775, 0.873] | 0.754 | 0.056 | 0.705 | **pass** | 0.821 +- 0.016 | 5/5 |
+| connectivity_tier | hgb | 0.711 | 0.726 (same) | 0.892 [0.853, 0.928] | 0.861 | 0.059 | 0.711 | **pass** | 0.876 +- 0.021 | 5/5 |
+
+Sizes: io_class and connectivity_tier have 1769 train, 378 val and 380 test samples, with 209 test components. sensory_modality has 247 train, 53 val and 54 test samples, with 32 test components.
+
+### 11.4 Skeptic's notes
+
+- **Controls behave.** For io_class and connectivity_tier, every label-shuffle run, on all 5 seeds, collapses to the majority rate or below. For sensory_modality, a shuffled model lands near chance (0.09 to 0.24). That is above the tiny test-majority rate on some seeds, as explained below. Accuracy on a random split is close to the grouped result (io_class hgb 0.945 vs 0.945; connectivity_tier hgb 0.887 vs 0.892), so pair grouping is not hiding a large leak.
+- **io_class is real but anatomically easy.** Sensory neurons receive almost only axonic input inside the brain, and DNs send most of their output out of it. A NaN-tolerant single-feature stump on val (`cmpt__axon_input_share`) reaches 0.839, against 0.944 for logreg. No single family carries the model: the largest drop in the val ablation is 0.016, for `etype_out`. The model also passes when the split is grouped by pair **and** level-7 cluster (logreg and hgb 0.940 vs 0.826 trivial). That split has only 11 test components, so its CI is wide.
+- **sensory_modality is small.** The signal comes mostly from `ase` (-0.075 val accuracy when dropped) and `degree` (-0.057). The data are few, so calibration is weak (ECE 0.14 to 0.17). The single hgb seed that failed the gate (repeat 1: 0.778 vs 0.444) failed **only** on the shuffle criterion. Its test-majority rate is 0.13 with 7 classes, so a shuffled model at chance (0.185) exceeds majority + 0.02. See `shared_edits_needed`. The pair + cluster grouping is **degenerate** for this target: SN clusters are modality-pure (Cramer's V 0.71 in the paper), and only 3 test components remain. All models fail there, and that result should not be read as evidence either way. Pairs alone may not group near-identical, unpaired SNs of one organ, which is a residual optimism risk.
+- **connectivity_tier signal is not quantization.** Fractions from few synapses leak count through their granularity. The val-only `granularity_probe` (`connectivity_tier/granularity_probe.json`) scores 0.717 on exact-0/1/missing counts alone, the same as majority (0.717). Adding the smallest positive fraction (about 1/count) gives 0.741. The full feature set gives 0.833. The NaN-tolerant stump scores 0.706. The remaining signal is network position: `in2_comp` alone scores 0.783. The harness threshold rule skips columns with any NaN, so the reported feature-view "best trivial" for this target has no stump. The NaN-tolerant stump above shows this does not change the verdict.
+- **The legacy text NB (`legacy-text` run) fails the gate.** It scores 0.861 against a 0.903 text lookup, which reads `cluster` and `annotation`. The new feature models are the ones to keep.
+- One exploratory diagnostic (hgb on test with feature subsets) ran before the val-only probe was written. No configuration was chosen from it. All numbers quoted above come from val or the harness's single test pass.
+
+### 11.5 Artifacts
+
+`models/<nb|logreg|hgb>/manifest.json` under each target's report directory. Load with `flybrain_learners.load_learner(dir, trusted_root=...)`. Wiring-feature caches live in `/mnt/f/.flybrain/cache/wiring-features/l1em/` and the edge list in `/mnt/f/.flybrain/cache/l1em/edges/`. Nothing is written under `snapshots/`. Attribute Winding et al. 2023 (CC-BY-4.0) when redistributing any derived model.

@@ -562,6 +562,46 @@ def build_banc_training_samples(objective: str, config: BancSampleBuildConfig) -
     )
 
 
+def attach_structured_features(payload: Mapping[str, Any], features, *, objective: str,
+                               id_column: str = "node_id") -> dict[str, Any]:
+    """Return a copy of a built payload whose samples carry ``features`` (structured model inputs).
+
+    ``features`` is a DataFrame with ``id_column`` (BANC root id as str) plus
+    feature columns, e.g. ``flybrain_wiring_features.build_wiring_features(...).frame``.
+    Fails closed (``LabelLeakageError``) when any column is excluded for
+    ``objective``; NaN becomes None. ``input_text`` and labels are unchanged, so
+    existing text-model callers see the same payload.
+    """
+    import math
+
+    import flybrain_wiring_features as fwf
+
+    columns = [c for c in features.columns if c != id_column]
+    fwf.assert_features_allowed(columns, objective)
+    ids = features[id_column].astype(str)
+    if ids.duplicated().any():
+        raise ValueError(f"features.{id_column} is not unique")
+    table = features[columns].set_axis(ids.tolist(), axis=0)
+    samples = []
+    missing = 0
+    for sample in payload["samples"]:
+        root_id = str(sample["metadata"]["root_id"])
+        values: dict[str, Any] = {name: None for name in columns}
+        if root_id in table.index:
+            for name, value in table.loc[root_id].items():
+                if hasattr(value, "item"):
+                    value = value.item()
+                if isinstance(value, float) and not math.isfinite(value):
+                    value = None
+                values[str(name)] = value
+        else:
+            missing += 1
+        samples.append({**sample, "features": values})
+    metadata = dict(payload["metadata"])
+    metadata["structured_features"] = {"objective": objective, "columns": sorted(columns), "missing_rows": missing}
+    return {**payload, "samples": samples, "metadata": metadata}
+
+
 def register_banc_sample_builders(*, replace: bool = False) -> None:
     register_sample_builder(
         BANC_SYMBOL,
