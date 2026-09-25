@@ -509,6 +509,9 @@ def degree_values(frame: pd.DataFrame, column: str | None = None) -> tuple[str |
         if column not in frame.columns:
             return None, None
         return column, pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=np.float64)
+    if "size__total_degree" in frame.columns:  # fme.size_side_aux: out + in weight total (raw or rank)
+        return "size__total_degree", pd.to_numeric(frame["size__total_degree"], errors="coerce").to_numpy(
+            dtype=np.float64)
     if {"degree__out_weight_total", "degree__in_weight_total"} <= set(frame.columns):
         total = (pd.to_numeric(frame["degree__out_weight_total"], errors="coerce").fillna(0)
                  + pd.to_numeric(frame["degree__in_weight_total"], errors="coerce").fillna(0))

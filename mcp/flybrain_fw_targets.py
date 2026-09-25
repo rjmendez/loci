@@ -658,6 +658,9 @@ def build_fw_eval_dataset(
     data = fme.EvalDataset.from_frame(frame, dataset="fw", target=target, id_column="root_id", label_column="label",
                                       feature_columns=fcols, group_columns=list(keys),
                                       text_column=text_col, notes=notes)
+    data.aux = fme.size_side_aux(data.features, size_frame=feats.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                                 ids=frame["root_id"], side=frame["side"] if "side" in frame.columns else None)
+    data.__post_init__()  # re-validate aux against the features
     return FwBuild(data=data, plan=plan, features=feats, rows=rows, info={"n_features": len(fcols)})
 
 

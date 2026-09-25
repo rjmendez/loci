@@ -65,7 +65,6 @@ import fnmatch
 import hashlib
 import json
 import math
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -195,6 +194,62 @@ class EvalDataset:
                            expected_confidence=1.0, provenance_refs=("eval",), metadata=dict(meta))
             for sid, label, meta in zip(self.sample_ids, self.labels, self.group_values)
         ]
+
+
+HEMISPHERE_AUX = "hemisphere"
+TOTAL_DEGREE_AUX = "size__total_degree"
+_SIDE_NORMAL = {"left": "left", "l": "left", "lhs": "left", "right": "right", "r": "right", "rhs": "right"}
+
+
+def normalize_hemisphere(value: Any) -> str:
+    """left / right / other (midline, unknown, missing) for the hemisphere split level."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "unknown"
+    return _SIDE_NORMAL.get(str(value).strip().lower(), "other")
+
+
+def size_side_aux(features: pd.DataFrame, *, size_frame: pd.DataFrame | None = None, id_column: str | None = None,
+                  ids: Sequence[Any] | None = None, side: Sequence[Any] | None = None,
+                  extra: Mapping[str, Sequence[Any]] | None = None) -> pd.DataFrame | None:
+    """Row-aligned ``EvalDataset.aux``: size/degree columns not already features, total degree, hemisphere.
+
+    ``size_frame`` is a per-node table (``id_column`` + degree columns, e.g.
+    ``WiringFeatureResult.size_frame``) aligned to ``ids``. Size columns that are
+    already model features are skipped (aux may not duplicate features);
+    ``size__total_degree`` (out + in weight total, raw or rank) is always added
+    when both are present so the degree-decile axis is the same for every
+    target. None of these ever reaches a model [R3].
+    """
+    n = len(features)
+    out = pd.DataFrame(index=range(n))
+    if size_frame is not None:
+        if id_column is None or ids is None:
+            raise ValueError("size_frame needs id_column and ids")
+        table = size_frame.assign(**{id_column: size_frame[id_column].astype(str)}).drop_duplicates(id_column)
+        aligned = table.set_index(id_column).reindex([str(i) for i in ids]).reset_index(drop=True)
+        if len(aligned) != n:
+            raise ValueError("size_frame alignment changed the row count")
+        for col in aligned.columns:
+            if col not in features.columns and pd.api.types.is_numeric_dtype(aligned[col].dtype):
+                out[col] = aligned[col].astype(np.float64).to_numpy()
+        for suffix in ("", "_rank"):
+            o, i = f"degree__out_weight_total{suffix}", f"degree__in_weight_total{suffix}"
+            if o in aligned.columns and i in aligned.columns:
+                out[TOTAL_DEGREE_AUX] = (aligned[o].astype(np.float64).fillna(0.0)
+                                         + aligned[i].astype(np.float64).fillna(0.0)).to_numpy()
+                break
+    if side is not None:
+        side = list(side)
+        if len(side) != n:
+            raise ValueError("side length differs from features")
+        out[HEMISPHERE_AUX] = [normalize_hemisphere(v) for v in side]
+    for name, values in (extra or {}).items():
+        values = list(values)
+        if len(values) != n:
+            raise ValueError(f"aux column {name!r} length differs from features")
+        out[name] = values
+    out = out[[c for c in out.columns if c not in features.columns]]
+    return out if len(out.columns) else None
 
 
 @dataclass(frozen=True)
@@ -1510,6 +1565,10 @@ def write_report(report: Mapping[str, Any], report_root: str | Path, *, run_labe
 
 
 __all__ = [
+    "HEMISPHERE_AUX",
+    "TOTAL_DEGREE_AUX",
+    "normalize_hemisphere",
+    "size_side_aux",
     "DEFAULT_REPORT_ROOT",
     "EVAL_REPORT_SCHEMA_VERSION",
     "EvalConfig",

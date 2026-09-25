@@ -678,6 +678,10 @@ def build_ol_eval_dataset(inputs: OlStructuredInputs, config: OlTargetConfig, ev
     data = fme.EvalDataset.from_frame(
         frame, dataset=OL_SYMBOL, target=target, id_column="sample_id", label_column="label",
         feature_columns=feature_cols, group_columns=list(GROUP_KEYS), text_column="input_text", notes=notes)
+    side_col = next((c for c in ("side", "soma_side", "hemisphere") if c in frame.columns), None)
+    data.aux = fme.size_side_aux(data.features, size_frame=wiring.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                                 ids=frame["body_id"], side=None if side_col is None else frame[side_col])
+    data.__post_init__()  # re-validate aux against the features
     return data, {"plan": plan, "frame": frame, "family_map": family_map, "feature_columns": feature_cols}
 
 

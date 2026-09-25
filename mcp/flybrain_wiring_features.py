@@ -481,6 +481,9 @@ class WiringFeatureResult:
     objective: str
     excluded_features: tuple[str, ...]
     meta: Mapping[str, Any]
+    # node id + every degree / size column BEFORE objective exclusions (R3 size baseline and degree
+    # deciles read these through EvalDataset.aux; they never reach a model).
+    size_frame: pd.DataFrame | None = None
 
     def feature_families(self) -> dict[str, list[str]]:
         return feature_families(c for c in self.frame.columns if c != NODE_ID_COLUMN)
@@ -1046,6 +1049,7 @@ def build_wiring_features(
         objective=objective,
         excluded_features=tuple(dropped),
         meta={**meta, "exclusion_rule": rule.as_dict()},
+        size_frame=size_columns_frame(full),
     )
 
 
@@ -1065,11 +1069,24 @@ def load_wiring_features(path: str | Path, *, objective: str) -> WiringFeatureRe
                 f"objective {objective!r} is an NT target and cached features {parquet.name} were built on an "
                 f"NT-derived partner category ({meta.get('category_column')!r}); partner-NT features are banned "
                 "from every NT model [SYNTHESIS F3; R5]")
-    kept, dropped = apply_objective_exclusions(pd.read_parquet(parquet), objective)
+    full = pd.read_parquet(parquet)
+    kept, dropped = apply_objective_exclusions(full, objective)
     return WiringFeatureResult(frame=kept, fingerprint=str(meta["fingerprint"]), cache_path=str(parquet),
                                objective=objective, excluded_features=tuple(dropped),
-                               meta={**meta, "exclusion_rule": rule.as_dict()})
+                               meta={**meta, "exclusion_rule": rule.as_dict()}, size_frame=size_columns_frame(full))
 
+
+def size_columns_frame(full: pd.DataFrame) -> pd.DataFrame:
+    """Node id + the degree family and neuropil counts of a full (pre-exclusion) feature frame.
+
+    These are size / degree proxies [R3; Bernett 2024]: the harness uses them for
+    the size-only baseline and the degree-decile axis via EvalDataset.aux
+    (never as model features), so an objective that excludes them as features
+    (connectivity_tier) still gets a size bar.
+    """
+    cols = [c for c in full.columns if c != NODE_ID_COLUMN
+            and (feature_family(c) == "degree" or c.endswith("__n_neuropils") or c.endswith("__n_neuropils_rank"))]
+    return full[[NODE_ID_COLUMN, *cols]].reset_index(drop=True)
 
 
 def _sha256_file(path: Path) -> str:
@@ -1081,6 +1098,7 @@ def _sha256_file(path: Path) -> str:
 
 
 __all__ = [
+    "size_columns_frame",
     "DEFAULT_CACHE_ROOT",
     "EdgeSource",
     "GLOBAL_EXCLUDED_PATTERNS",

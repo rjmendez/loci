@@ -418,7 +418,8 @@ def _keep_families(result: fwf.WiringFeatureResult, prefixes: Sequence[str]) -> 
     cols = [fwf.NODE_ID_COLUMN] + [c for c in result.frame.columns if c.startswith(tuple(prefixes))]
     return fwf.WiringFeatureResult(frame=result.frame[cols], fingerprint=result.fingerprint,
                                    cache_path=result.cache_path, objective=result.objective,
-                                   excluded_features=result.excluded_features, meta=result.meta)
+                                   excluded_features=result.excluded_features, meta=result.meta,
+                                   size_frame=result.size_frame)
 
 
 def local_exclusions(columns: Sequence[str], target: str) -> list[str]:
@@ -511,9 +512,10 @@ def build_eval_dataset(target: str, config: BancTargetConfig, eval_config: fme.E
         wired = base_idx.reindex(nodes["banc_888_id"].astype(str))
         has_wiring = (wired.filter(like="recip__").notna().any(axis=1)
                       | wired.filter(like="out_np__").notna().any(axis=1)).to_numpy()
-        if "degree__out_weight_total" in wired.columns:
-            has_wiring = has_wiring | ((wired["degree__out_weight_total"].fillna(0)
-                                        + wired["degree__in_weight_total"].fillna(0)) > 0).to_numpy()
+        for suffix in ("", "_rank"):  # R5 rank profile renames the columns; rank > 0 iff raw > 0
+            if f"degree__out_weight_total{suffix}" in wired.columns:
+                has_wiring = has_wiring | ((wired[f"degree__out_weight_total{suffix}"].fillna(0)
+                                            + wired[f"degree__in_weight_total{suffix}"].fillna(0)) > 0).to_numpy()
     if target in NT_LITERATURE_TARGETS:
         labels, coverage = nt_literature_labels(nodes, target, nt_root=config.nt_root)
         samples, selection = select_annotation_samples(nodes, labels, has_wiring, config.nt_selection)
@@ -595,6 +597,10 @@ def build_eval_dataset(target: str, config: BancTargetConfig, eval_config: fme.E
     data = fme.EvalDataset.from_frame(frame, dataset=DATASET, target=target, id_column="banc_888_id",
                                       label_column=label_col, feature_columns=feature_cols,
                                       group_columns=list(GROUP_KEYS), text_column="__text__", notes=notes)
+    side_col = next((c for c in ("side", "annot__side") if c in frame.columns), None)
+    data.aux = fme.size_side_aux(data.features, size_frame=base.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                                 ids=frame["banc_888_id"], side=None if side_col is None else frame[side_col])
+    data.__post_init__()  # re-validate aux against the features
     log(f"[banc:{target}] dataset n={len(ids)} features={len(feature_cols)} ({time.time() - t0:.0f}s)")
     return data
 

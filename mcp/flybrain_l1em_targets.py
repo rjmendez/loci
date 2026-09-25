@@ -358,9 +358,14 @@ def build_eval_dataset(target: str, ctx: L1emContext, config: fme.EvalConfig, *,
         "citation": ctx.snapshot.citation,
         "license": ctx.snapshot.license_spdx,
     }
-    return fme.EvalDataset.from_frame(
+    data = fme.EvalDataset.from_frame(
         data_frame, dataset=L1EM_DATASET_SYMBOL, target=target, id_column="sample_id", label_column="label",
         feature_columns=list(features.columns), group_columns=list(group_keys), text_column="__text__", notes=notes)
+    data.aux = fme.size_side_aux(data.features, size_frame=wiring.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                                 ids=frame["skid"].tolist(),
+                                 side=frame["hemisphere"].tolist() if "hemisphere" in frame.columns else None)
+    data.__post_init__()  # re-validate aux against the features
+    return data
 
 
 def granularity_probe(data: fme.EvalDataset, config: fme.EvalConfig, *, backend: str = "hgb",

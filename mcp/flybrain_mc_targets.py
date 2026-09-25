@@ -718,7 +718,9 @@ def build_target_dataset(target: str, config: McRealModelConfig, eval_config: An
         dataset=MC_SYMBOL, target=target, sample_ids=tuple(frame["sample_id"]),
         labels=frame["label"].astype(str).to_numpy(dtype=object),
         features=frame[feature_columns].copy(), group_keys=GROUP_KEYS,
-        group_values=tuple(plan_groups[sid] for sid in frame["sample_id"]), text=texts, notes=notes)
+        group_values=tuple(plan_groups[sid] for sid in frame["sample_id"]), text=texts, notes=notes,
+        aux=fme.size_side_aux(frame[feature_columns], size_frame=wiring.size_frame, id_column=fwf.NODE_ID_COLUMN,
+                              ids=frame["root_id"], side=frame["side"] if "side" in frame.columns else None))
     info = {"elapsed_seconds": round(time.time() - t0, 1), "n_samples": len(frame), "n_features": len(feature_columns),
             "plan_counts": {k: len(v) for k, v in plan.items()}, **{k: notes[k] for k in ("labels", "population")}}
     return McTargetBuild(target, data, info)

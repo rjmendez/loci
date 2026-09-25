@@ -588,6 +588,7 @@ def build_target_dataset(target: str, config: MvRealModelConfig, eval_config: An
         notes["nt_literature_coverage"] = label_info.pop("nt_literature_coverage")
     merged = frame
     masked_any = False
+    base_size_frame = None
     for tag, category, masked in WIRING_SETS[target]:
         mask_ids = held_out_mask_ids(nodes, frame, held_out, keys) if masked else None
         params = fwf.WiringFeatureParams(two_hop=bool(config.two_hop), top_k_neuropils=int(config.top_k_neuropils),
@@ -597,6 +598,8 @@ def build_target_dataset(target: str, config: MvRealModelConfig, eval_config: An
             category_column=category, params=params, neuropil_edges=np_edges if not tag else None,
             cache_root=config.cache_root, mask_category_ids=mask_ids)
         cols = [c for c in wiring.frame.columns if c != fwf.NODE_ID_COLUMN]
+        if not tag:
+            base_size_frame = wiring.size_frame
         if tag:  # tagged sets only add their composition families
             cols = [c for c in cols if fwf.feature_family(c) in {f"{fam}_{tag}" for fam in COMPOSITION_FAMILIES}]
         sub = wiring.frame[[fwf.NODE_ID_COLUMN, *cols]]
@@ -645,7 +648,10 @@ def build_target_dataset(target: str, config: MvRealModelConfig, eval_config: An
         dataset=MV_SYMBOL, target=target, sample_ids=tuple(merged["sample_id"]),
         labels=merged["label"].astype(str).to_numpy(dtype=object),
         features=merged[feature_columns].copy(), group_keys=keys,
-        group_values=tuple(plan_groups[sid] for sid in merged["sample_id"]), text=texts, notes=notes)
+        group_values=tuple(plan_groups[sid] for sid in merged["sample_id"]), text=texts, notes=notes,
+        aux=fme.size_side_aux(merged[feature_columns], size_frame=base_size_frame, id_column=fwf.NODE_ID_COLUMN,
+                              ids=merged["root_id"],
+                              side=merged["soma_side"] if "soma_side" in merged.columns else None))
     info = {"elapsed_seconds": round(time.time() - t0, 1), "n_samples": int(len(merged)),
             "n_features": len(feature_columns), "n_categorical": len(categorical),
             "plan_counts": {k: len(v) for k, v in plan.items()}, "labels": label_info,
