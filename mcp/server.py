@@ -11326,6 +11326,19 @@ def _route_trace_overlap_fn(decision: dict) -> Optional[Callable[[dict, dict], O
     return _lookup
 
 
+def _route_trace_dedup_exact(decision: dict, overlap_fn, deduplicate: bool, dedup_threshold) -> bool:
+    """Whether replaying ``decision`` with this dedup setting reproduces text-based dedup exactly.
+
+    A text trace (no overlap_fn) or no dedup is always exact. An overlap-edge trace
+    stored only the pairwise overlaps at or above its ``overlap_floor``; any pair
+    below the floor reads as 0.0, so a threshold below the floor is not exact.
+    """
+    if overlap_fn is None or not deduplicate:
+        return True
+    floor = _safe_float(decision.get("overlap_floor"), 0.0)
+    return _safe_float(dedup_threshold, 0.80) >= floor
+
+
 def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) -> tuple[list[dict], int]:
     """Extract replayable memory_route decisions from audit entries."""
     decisions: list[dict] = []
@@ -11479,7 +11492,6 @@ def memory_route_counterfactual_simulate(
             removed = sorted(baseline_set - counter_set)
             if added or removed:
                 changed += 1
-            floor = _safe_float(decision.get("overlap_floor"), 0.0)
             comparisons.append({
                 "decision_id": decision.get("decision_id"),
                 "ts": decision.get("ts"),
@@ -11488,11 +11500,7 @@ def memory_route_counterfactual_simulate(
                 # "overlap_edges": the trace stored overlaps >= its floor, not text.
                 # Dedup replay is then exact only for thresholds at or above that floor.
                 "dedup_basis": "overlap_edges" if overlap_fn is not None else "text",
-                "dedup_exact": (
-                    overlap_fn is None
-                    or not use_deduplicate
-                    or _safe_float(dedup_threshold, 0.80) >= floor
-                ),
+                "dedup_exact": _route_trace_dedup_exact(decision, overlap_fn, use_deduplicate, dedup_threshold),
                 "counterfactual": {
                     "policy": {
                         "agent_id": use_agent_id,
@@ -11741,8 +11749,15 @@ def _route_eval_candidate(
     removed = 0
     added = 0
     overlap = 0
+    skipped_inexact = 0
     for decision in decisions or []:
         if not isinstance(decision, dict):
+            continue
+        overlap_fn = _route_trace_overlap_fn(decision)
+        if not _route_trace_dedup_exact(decision, overlap_fn, deduplicate, dedup_threshold):
+            # Pairs below the trace's overlap floor were not stored and would read as
+            # 0.0 (never duplicates): the replay would be wrong, so leave it out.
+            skipped_inexact += 1
             continue
         counter = _route_apply_policy(
             decision.get("candidate_hits") or [],
@@ -11750,7 +11765,7 @@ def _route_eval_candidate(
             deduplicate=deduplicate,
             dedup_threshold=dedup_threshold,
             agent_id=decision.get("baseline_policy", {}).get("agent_id"),
-            overlap_fn=_route_trace_overlap_fn(decision),
+            overlap_fn=overlap_fn,
         )
         baseline_rows = decision.get("baseline_routed") or []
         counter_rows = _route_rows(counter["hits"])
@@ -11762,7 +11777,6 @@ def _route_eval_candidate(
         removed += len([x for x in (baseline_ids - counter_ids) if x])
         added += len([x for x in (counter_ids - baseline_ids) if x])
         overlap += len(baseline_ids & counter_ids)
-    compared = max(compared, 1)
     # We optimize for stability first; modest compression is good, evidence loss is bad.
     baseline_nonzero = max(total_baseline, 1)
     stability = overlap / baseline_nonzero
@@ -11782,8 +11796,13 @@ def _route_eval_candidate(
             "deduplicate": bool(deduplicate),
             "dedup_threshold": max(0.0, min(1.0, _safe_float(dedup_threshold, 0.80))),
         },
+        # False when some decisions could not be replayed exactly at this threshold (an
+        # overlap-edge trace below its floor); those were left out of the metrics
+        # (decisions_skipped_inexact counts them), so read its objective with care.
+        "dedup_exact": skipped_inexact == 0,
         "metrics": {
             "decisions_compared": compared,
+            "decisions_skipped_inexact": skipped_inexact,
             "baseline_ids": total_baseline,
             "counter_ids": total_counter,
             "overlap_ids": overlap,

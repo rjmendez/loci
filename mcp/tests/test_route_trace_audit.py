@@ -208,6 +208,40 @@ def test_policy_optimize_evaluation_uses_stored_overlaps(routed, monkeypatch):
     assert looser["metrics"]["added_ids"] == 1
 
 
+
+def test_policy_optimize_evaluation_skips_decisions_below_the_floor(routed, monkeypatch):
+    """Below the trace's overlap floor the stored edges cannot reproduce dedup: leave the decision out."""
+    monkeypatch.setenv("LOCI_ROUTE_TRACE_AUDIT_RATE", "1")
+    text_trace = _route(include_trace=True)
+    [entry] = _audit_entries(routed)
+    text_entry = {"tool": "memory_route", "ts": "t", "output": json.dumps(text_trace)}
+    [sampled], _ = server._route_counterfactual_decisions_from_audit([entry], 1)
+    [text], _ = server._route_counterfactual_decisions_from_audit([text_entry], 1)
+    assert sampled["overlap_floor"] == 0.5
+
+    def ev(decisions, threshold, dedup=True):
+        return server._route_eval_candidate(decisions, top_k=3, deduplicate=dedup,
+                                            dedup_threshold=threshold, consolidation_flagged_rate=0.0)
+
+    below = ev([sampled], 0.3)
+    assert below["dedup_exact"] is False
+    assert below["metrics"]["decisions_skipped_inexact"] == 1
+    assert below["metrics"]["decisions_compared"] == 0
+    assert below["metrics"]["baseline_ids"] == 0
+    at_floor = ev([sampled], 0.5)
+    assert at_floor["dedup_exact"] is True
+    assert at_floor["metrics"]["decisions_skipped_inexact"] == 0
+    assert at_floor["metrics"]["decisions_compared"] == 1
+    # no dedup, or a text trace, is exact at any threshold
+    assert ev([sampled], 0.3, dedup=False)["dedup_exact"] is True
+    mixed = ev([sampled, text], 0.3)
+    assert mixed["dedup_exact"] is False
+    assert mixed["metrics"]["decisions_skipped_inexact"] == 1
+    assert mixed["metrics"]["decisions_compared"] == 1
+    # only the text trace is replayed at 0.3: f-2 is still a duplicate of f-1 and f-3 is not,
+    # so the routed set equals the baseline
+    assert mixed["metrics"]["baseline_ids"] == 2 and mixed["metrics"]["removed_ids"] == 0
+
 @pytest.mark.parametrize("raw,expected", [
     (None, 0.0), ("", 0.0), ("abc", 0.0), ("nan", 0.0), ("inf", 0.0),
     ("-1", 0.0), ("2", 1.0), ("0.25", 0.25),
