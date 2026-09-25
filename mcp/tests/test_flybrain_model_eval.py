@@ -11,12 +11,20 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import flybrain_brain_cluster_baselines as fbb  # noqa: E402
+import flybrain_eval_stats as es  # noqa: E402
 import flybrain_model_eval as fme  # noqa: E402
 import flybrain_wiring_features as fwf  # noqa: E402
 
 
-def _interaction_dataset(n_groups=90, per_group=10, seed=0, target="super_class", extra=None):
-    """Label = sign pattern of (x1, x2): no single-feature rule does well, a tree model does."""
+AUX = ("size__total_synapses", "hemilineage", "side")
+
+
+def _interaction_dataset(n_groups=90, per_group=10, seed=0, target="super_class", extra=None, aux=AUX, notes=None):
+    """Label = sign pattern of (x1, x2): no single-feature rule does well, a tree model does.
+
+    Aux (never a model input): a label-independent size column, a hemilineage
+    shared by every 9th type, and alternating left/right sides.
+    """
     rng = np.random.default_rng(seed)
     rows = []
     for g in range(n_groups):
@@ -27,29 +35,77 @@ def _interaction_dataset(n_groups=90, per_group=10, seed=0, target="super_class"
             label = "a" if (x1 > 0 and x2 > 0) else "b" if (x1 < 0 and x2 < 0) else "c"
             rows.append({"sample_id": f"s{g}_{j}", "label": label, "cell_type": f"type{g}",
                          "wire__x1": x1, "wire__x2": x2, "noise__z": rng.normal(),
-                         "annot_colour": ["red", "green"][int(rng.integers(0, 2))]})
+                         "annot_colour": ["red", "green"][int(rng.integers(0, 2))],
+                         "size__total_synapses": float(rng.lognormal(5, 1)), "hemilineage": f"hl{g % 9}",
+                         "side": "left" if j % 2 == 0 else "right"})
     frame = pd.DataFrame(rows)
     if extra:
         extra(frame)
-    feature_cols = [c for c in frame.columns if c not in ("sample_id", "label", "cell_type")]
+    feature_cols = [c for c in frame.columns if c not in ("sample_id", "label", "cell_type", *AUX)]
     return fme.EvalDataset.from_frame(frame, dataset="toy", target=target, id_column="sample_id", label_column="label",
-                                      feature_columns=feature_cols, group_columns=["cell_type"])
+                                      feature_columns=feature_cols, group_columns=["cell_type"],
+                                      aux_columns=list(aux), notes=notes)
 
 
 def _config(tmp_path, **kwargs):
     base = dict(models=(fme.ModelSpec("hgb", ({"max_iter": 150},), "isotonic"),
                         fme.ModelSpec("logreg", ({"C": 0.1}, {"C": 1.0}), "temperature")),
-                cv_folds=3, n_bootstrap=200, report_root=str(tmp_path / "reports"), n_threads=2)
+                cv_folds=3, n_bootstrap=200, report_root=str(tmp_path / "reports"), n_threads=2,
+                calibration_bootstrap=50)
     base.update(kwargs)
     return fme.EvalConfig(**base)
 
 
+def _fast(tmp_path, **kwargs):
+    """No permutation null (not required) and no optional extras: for tests about other parts of the protocol."""
+    base = dict(n_permutations=0, require_permutation_null=False, split_curve=False, ablation=False,
+                random_split_control=False)
+    base.update(kwargs)
+    return _config(tmp_path, **base)
+
+
 def test_full_protocol_on_interaction_data(tmp_path):
-    data = _interaction_dataset()
-    report = fme.run_evaluation(data, _config(tmp_path))
+    data = _interaction_dataset(notes={"label_provenance": "curated_morphology"})
+    levels = (es.SplitLevel("random"), es.SplitLevel("type", ("cell_type",)),
+              es.SplitLevel("type+hemilineage", ("cell_type", "hemilineage")),
+              es.SplitLevel("hemisphere", (), "side", ("left",), ("right",)))
+    report = fme.run_evaluation(data, _config(tmp_path, split_levels=levels))
     rows = {r["model"]: r for r in report["summary"]}
     hgb = rows["hgb"]
     assert hgb["gate"] == "pass", report["models"]["hgb"]["gate"]
+    gate = report["models"]["hgb"]["gate"]
+    assert gate["failed_criteria"] == [] and gate["gate_applies"] is True
+    # R3 size/degree baseline: read from aux, label-independent here, so it is beaten
+    assert report["baselines"]["size_degree"]["columns"] == ["size__total_synapses"]
+    assert report["baselines"]["size_degree"]["columns_from_aux"] == ["size__total_synapses"]
+    assert gate["beats_size_baseline"] is True and hgb["size_baseline"] < hgb["model_acc"] - 0.1
+    deciles = report["models"]["hgb"]["test"]["degree_deciles"]
+    assert deciles["degree_column"] == "size__total_synapses"
+    assert sum(r["n"] for r in deciles["rows"]) == report["split"]["counts"]["test"]
+    assert {"acc_model", "acc_size_baseline", "acc_best_trivial", "acc_majority"} <= set(deciles["rows"][0])
+    # R4 group-permutation null (>= 100) gates; effective n = groups
+    perm = report["models"]["hgb"]["permutation_null"]
+    assert perm["n_permutations"] == 100 and perm["p_value_accuracy"] <= 0.02
+    assert gate["null_control"] == "group_permutation" and gate["null_control_ok"] is True
+    assert hgb["perm_p"] == perm["p_value_accuracy"]
+    assert report["split"]["effective_n"]["test"] == report["split"]["n_test_components"]
+    # R4 split curve: random is per-sample, hemisphere trains on left and tests on right
+    curve = {r["level"]: r for r in report["split_curve"]["levels"]}
+    assert curve["random"]["n_test_components"] == curve["random"]["n_test"]
+    assert curve["type"]["n_test_components"] < curve["type"]["n_test"]
+    assert curve["type+hemilineage"]["n_test_components"] <= 3  # 9 hemilineages merge the 90 types
+    assert curve["hemisphere"]["n_train"] + curve["hemisphere"]["n_test"] == len(data.sample_ids)
+    # R6 calibration: grouped calibration fold + debiased metrics with CIs
+    cal = report["models"]["hgb"]["calibration_protocol"]
+    assert cal["protocol"] == "grouped_fold" and 0 < cal["calibration_rows"] < report["split"]["counts"]["train"]
+    metrics = report["models"]["hgb"]["test"]["calibration"]["calibrated"]
+    for key in es.CALIBRATION_METRIC_KEYS:
+        lo, hi = metrics[f"{key}_ci95"]
+        assert lo <= hi
+    assert hgb["ece_sweep"] == metrics["ece_sweep"]
+    # R1 provenance columns
+    assert hgb["label_provenance"] == "curated_morphology" and hgb["gate_applies"] is True
+    assert "nt_hooks" not in report  # not an NT target
     assert hgb["model_acc"] > hgb["best_trivial"] + 0.1
     assert report["models"]["hgb"]["shuffle_control"]["collapsed_to_majority"]
     # logistic regression cannot represent the sign interaction: an honest negative
@@ -92,7 +148,7 @@ def test_tautological_feature_fails_gate(tmp_path):
         frame["score_hint"] = frame["label"].map({"a": 0.0, "b": 1.0, "c": 2.0})
 
     data = _interaction_dataset(extra=leak, target="flow")
-    report = fme.run_evaluation(data, _config(tmp_path, models=(fme.ModelSpec("hgb", ({"max_iter": 100},), None),),
+    report = fme.run_evaluation(data, _fast(tmp_path, models=(fme.ModelSpec("hgb", ({"max_iter": 100},), None),),
                                               ablation=False, random_split_control=False))
     row = report["summary"][0]
     assert row["best_trivial"] >= 0.99 and row["best_trivial_rule"] == "features:lookup"
@@ -138,7 +194,7 @@ def test_nb_text_model_runs_with_text_baselines(tmp_path):
         samples.append({"sample_id": f"s{i}", "expected_label": label, "metadata": {"cell_type": f"t{i // 5}"},
                         "input_text": f"colour {colour} shape {['sq', 'tri'][i % 2]}"})
     data = fme.EvalDataset.from_samples(samples, dataset="toy", target="super_class", group_keys=["cell_type"])
-    report = fme.run_evaluation(data, _config(tmp_path, models=(fme.ModelSpec("nb", ({"alpha": 1.0},), "sigmoid"),),
+    report = fme.run_evaluation(data, _fast(tmp_path, models=(fme.ModelSpec("nb", ({"alpha": 1.0},), "sigmoid"),),
                                               ablation=True))
     row = report["summary"][0]
     assert row["best_trivial_rule"].startswith("text:")
@@ -197,7 +253,7 @@ def test_eval_dataset_validation():
 
 def test_plan_grouped_split_matches_run_and_mismatch_fails(tmp_path):
     data = _interaction_dataset(n_groups=30)
-    cfg = _config(tmp_path, models=(fme.ModelSpec("logreg", ({},), None),), ablation=False, random_split_control=False,
+    cfg = _fast(tmp_path, models=(fme.ModelSpec("logreg", ({},), None),), ablation=False, random_split_control=False,
                   shuffle_control=False, report_root=None)
     plan = fme.plan_grouped_split(data.sample_ids, data.group_values, data.group_keys, cfg)
     data.notes = {"masked_split_ids_sha256": fme.split_ids_sha256(plan)}
