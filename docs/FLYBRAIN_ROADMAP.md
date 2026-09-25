@@ -86,13 +86,13 @@ The literature synthesis and the interim results back all of these.
 - Refresh [FLYBRAIN_REFERENCE.md](FLYBRAIN_REFERENCE.md): statuses (interim → audited, superseded), new reports and artifacts, pins, resolved errata.
 - Ingest audited material into Loci with provenance tiers. Details are in the reference, section 6:
   - docs go through the docs indexer;
-  - headline lane results become findings in a  investigation ( plus report path, dataset version and status);
+  - headline lane results become findings in a `flybrain-reference` investigation (`tool_verified` plus report path, dataset version and status);
   - literature claims carry their citation and verification status;
-  - model predictions are .
-- Replaced results are resolved as , not retracted.
+  - model predictions are `model_asserted`.
+- Replaced results are resolved as `superseded`, not retracted.
 - Do not ingest interim numbers unless they are explicitly marked interim.
 - Do not ingest withdrawn material (the Phase 6 roadmap).
-- Resolve the registry licence gaps for  and , and add the missing  citation.
+- Resolve the registry licence gaps for `fw` and `hb`, and add the missing `l1em` citation.
 
 ## Backlog
 
