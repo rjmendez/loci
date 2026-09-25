@@ -44,14 +44,6 @@ entries = [
 ]
 
 [[allow]]
-file = "mcp/tests/test_code_query_readonly_allowlist.py"
-entries = [
-  { test = "test_export_database_cannot_write_to_disk", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },
-  { test = "test_load_from_cannot_read_host_files", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },
-  { test = "test_non_read_statements_never_reach_the_engine", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },
-]
-
-[[allow]]
 file = "mcp/tests/test_flybrain_banc_adapter.py"
 entries = [
   { test = "test_real_snapshot_smoke", rule = "env-skipif", reason = "pre-existing at 3a1ad78: always skipped in CI: gated on LOCI_FLYBRAIN_STORAGE_ROOT, a real snapshot not in the repo (audit C5). Needs a checked-in schema-sample fixture that always runs; owner: FlyBrain owners" },
@@ -132,21 +124,9 @@ entries = [
 ]
 
 [[allow]]
-file = "mcp/tests/test_fuzz_mcp_inputs.py"
-entries = [
-  { test = "test_inv_dir_rejects_overlong_ids_with_value_error", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },
-]
-
-[[allow]]
 file = "mcp/tests/test_ladybug_store.py"
 entries = [
   { test = "test_code_query_write_guard", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; owner: mcp owners" },
-]
-
-[[allow]]
-file = "mcp/tests/test_slow_neuromodulation.py"
-entries = [
-  { test = "TestSlowNeuromodulationLayer::test_invariant_gates_fail_closed_on_invalid_policy_shapes", rule = "broad-raises", reason = "pre-existing at 3a1ad78: bare raises of a broad class without match=; any unrelated error passes (audit C4). Add the specific exception and match=; audit mcp-1 hollow_confirmed C10; owner: mcp owners" },
 ]
 
 [[allow]]

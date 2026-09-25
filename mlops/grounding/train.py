@@ -239,13 +239,9 @@ def oos_from_findings(
 
     def feat_pair(ta, tb):
         va, vb = emb_map[ta], emb_map[tb]
-        cos = float(va @ vb)
-        c_arr = np.array([[cos]], dtype=np.float32)
-        diff = np.abs(va - vb).reshape(1, -1)
-        prod = (va * vb).reshape(1, -1)
-        lr = np.array([[_len_ratio(ta, tb)]], dtype=np.float32)
-        jac = np.array([[_token_overlap(ta, tb)]], dtype=np.float32)
-        return np.concatenate([diff, prod, c_arr, c_arr ** 2, lr, jac], axis=1)[0], cos
+        # The shared layout (features.py), not a third copy of it: this is what the
+        # promoted model is scored on, and ground_gate builds the same thing.
+        return _feat.make_features([ta], [tb], va[None, :], vb[None, :])[0], float(va @ vb)
 
     model_f1s = {name: [] for name in candidates}
     cos_f1s = []

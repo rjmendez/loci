@@ -163,6 +163,12 @@ jobs:
         # trips a shorter per-test timeout as ~18 spurious errors.
         run: pytest mlops -v --tb=short --timeout=120
 
+      # The grounding gate and its feature contract (the layout mlops trains on) and
+      # the deep-think-loci argument guards, executed in node. Same deps as mlops;
+      # node is preinstalled on ubuntu-latest. Not run anywhere in CI before.
+      - name: Run deep_think_loci tests
+        run: pytest deep_think_loci -v --tb=short --timeout=60
+
   test-callgraph:
     name: Callgraph tool tests
     runs-on: ubuntu-latest

@@ -1092,6 +1092,39 @@ def test_oos_from_findings_scores_a_realistic_two_run_corpus(tmp_path, monkeypat
     assert out["lr"] == pytest.approx((1.0, 0.0))
 
 
+def test_oos_from_findings_trains_on_the_shared_feature_contract(tmp_path, monkeypatch):
+    """The OOS pass scores candidate models on exactly the layout ground_gate builds
+    (features.make_features). A private copy of the layout drifted once already."""
+    import itertools
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deep_think_loci" / "grounding"))
+    import features as F
+
+    fitted = []
+
+    class _Recording:
+        def fit(self, X, y):
+            fitted.append(np.array(X))
+            return self
+
+        def predict_proba(self, X):
+            return np.tile([0.5, 0.5], (len(X), 1))
+
+    monkeypatch.setattr(train, "embed_texts", _topic_embed)
+    glob_pat = _two_realistic_runs(tmp_path)
+    train.oos_from_findings(glob_pat, {}, "http://h", {"rec": _Recording()})
+
+    texts = sorted(f"{r} {t} {w}" for r in "ab" for t, ws in
+                   (("alpha", ("one", "two")), ("beta", ("three", "four"))) for w in ws)
+    emb = dict(zip(texts, _topic_embed(texts, None, None)))
+    # held-out run-a first: training pairs are run-b's 4 findings, in file order
+    run_b = ["b alpha one", "b alpha two", "b beta three", "b beta four"]
+    expected = np.stack([F.make_features([a], [b], emb[a][None, :], emb[b][None, :])[0]
+                         for a, b in itertools.combinations(run_b, 2)])
+    assert len(fitted) == 2 and fitted[0].shape == (6, 2 * 4 + 4)
+    np.testing.assert_allclose(fitted[0], expected, rtol=1e-6, atol=1e-7)
+
+
 def test_train_main_finishes_a_retrain_with_findings_glob(tmp_path, monkeypatch):
     """End to end, the way loop._retrain runs it: --findings-glob and
     --candidate-out. On a realistic corpus this died with TypeError, so the loop

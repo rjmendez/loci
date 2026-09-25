@@ -803,6 +803,22 @@ def test_run_monitor_without_a_rollback_raises_no_alert(env, monkeypatch):
     assert loop.ALERTS == [] and loop.FAILED_STEPS == []
 
 
+def test_main_exit_code_is_1_exactly_when_a_step_failed(mainenv, monkeypatch):
+    # A failed step (any, not only the deadline) must reach the shell as rc 1;
+    # the same run without it is rc 0.
+    e = mainenv
+    assert e.main() == 0
+    assert read_history(e)[-1]["failed_steps"] == []
+
+    def failing_monitor(*a, **k):
+        loop._fail("monitor", "boom")
+        return {}
+
+    monkeypatch.setattr(loop, "_run_monitor", failing_monitor)
+    assert e.main() == 1
+    assert read_history(e)[-1]["failed_steps"] == ["monitor"]
+
+
 def test_main_monitor_rollback_is_in_the_history_alerts(mainenv, monkeypatch):
     e = mainenv
     (e.grounding / "grounding_bleed_clf.joblib").write_text("m")
