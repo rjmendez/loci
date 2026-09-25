@@ -200,10 +200,10 @@ Investigation tools expose a durable queue for cross-session coordination. Queue
 
 Current MCP tools:
 - `investigation_queue_enqueue(...)` — create a queued item.
-- `investigation_queue_claim(...)` — claim or renew an item lease for a session.
+- `investigation_queue_claim(...)` — claim or renew an item lease for a session; refused until every dependency exists and is `done`.
 - `investigation_queue_complete(...)` — finalize as `done`, `blocked`, or `cancelled`.
-- `investigation_queue_release(...)` — convenience alias for blocked release.
-- `investigation_queue_status(...)` / `investigation_queue_list(...)` — inspect queue snapshots and filters.
+- `investigation_queue_release(...)` — give up a claim: the item returns to `queued` with no owner or lease (not terminal).
+- `investigation_queue_status(...)` / `investigation_queue_list(...)` — inspect queue snapshots and filters; each item also carries derived `lease_expired` and `available` flags.
 
 Safety invariants:
 1. Item IDs are unique per investigation.
@@ -644,6 +644,12 @@ ship alongside it: `post_commit_ingest.sh` (re-ingests changed `.py` files into 
 `loci-codebase` investigation) and `post-commit-contract-extract.sh` (extracts
 contracts from changed `.py/.ts/.go/.rs/.java` files into the active investigation;
 non-blocking, every path ends in `|| true`).
+
+Both spawn a background `claude -p`, so they run only for commits on `main` in the
+primary worktree: commits in linked worktrees, on feature branches or on a detached
+HEAD are skipped so unmerged code is never ingested. `LOCI_HOOK_INGEST_BRANCH`
+changes the branch and `LOCI_HOOK_INGEST=0` disables ingest. Logs go to
+`$(git rev-parse --git-common-dir)/loci-hook-logs/`.
 
 ---
 

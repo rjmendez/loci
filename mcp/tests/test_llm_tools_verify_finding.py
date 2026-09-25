@@ -50,22 +50,29 @@ class FindingProvenanceContextTest(unittest.TestCase):
         self.assertIsNone(tier)
         self.assertIsNone(rows)
 
-    def test_finds_own_tier_and_excludes_itself_from_evidence(self):
+    def test_finds_own_tier_and_only_linked_evidence(self):
+        # Evidence is what supports THIS claim, not every other finding: an
+        # unrelated tool_verified row must not be handed to the firewall.
         inv_id = "prov-ctx-1"
         server.investigation_start(investigation_id=inv_id, title="t")
-        other = _json(server.investigation_store(
-            inv_id, "observed", "tool output", "unit-test", confidence="high",
-            metadata={"evidence_provenance_tier": "tool_verified"},
+        related = _json(server.investigation_store(
+            inv_id, "observed", "nginx 1.24 serves port 443 on host alpha", "unit-test",
+            confidence="high", metadata={"evidence_provenance_tier": "tool_verified"},
+        ))["finding_id"]
+        unrelated = _json(server.investigation_store(
+            inv_id, "observed", "disk usage on host bravo is 41 percent", "unit-test",
+            confidence="high", metadata={"evidence_provenance_tier": "tool_verified"},
         ))["finding_id"]
         target = _json(server.investigation_store(
-            inv_id, "inferred", "model claim", "unit-test", confidence="high",
-            metadata={"evidence_provenance_tier": "model_asserted"},
+            inv_id, "inferred", "host alpha serves nginx 1.24 on port 443", "unit-test",
+            confidence="high", metadata={"evidence_provenance_tier": "model_asserted"},
         ))["finding_id"]
 
         tier, rows = llm_tools._finding_provenance_context(inv_id, target)
         self.assertEqual(tier, "model_asserted")
-        ids = {r["id"] for r in rows}
-        self.assertIn(other, ids)
+        ids = {r["evidence_id"] for r in rows}
+        self.assertIn(related, ids)
+        self.assertNotIn(unrelated, ids)
         self.assertNotIn(target, ids)
 
 
@@ -104,8 +111,9 @@ class VerifyFindingWrapperThreadingTest(unittest.TestCase):
     def test_model_only_finding_with_tool_verified_support_reaches_model(self):
         inv_id = "prov-wrap-2"
         server.investigation_start(investigation_id=inv_id, title="t")
+        # The support must be about the claim; an unrelated tool row is not support.
         _json(server.investigation_store(
-            inv_id, "observed", "python3 -m json.tool confirms the schema parses.",
+            inv_id, "observed", "Reflection loop replay run: loop fixed, model agreement 5/5.",
             "unit-test", confidence="high",
             metadata={"evidence_provenance_tier": "tool_verified"},
         ))

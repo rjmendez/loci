@@ -9,17 +9,17 @@ It is intentionally aligned with the semantics implemented in `mcp/investigation
 - `investigation_queue_enqueue(...)` creates a queue item.
 - `investigation_queue_claim(...)` claims or renews a lease.
 - `investigation_queue_complete(...)` finalizes a queue item as `done`, `blocked`, or `cancelled`.
-- `investigation_queue_release(...)` is an alias for `state="blocked"`.
+- `investigation_queue_release(...)` returns a non-final item to `queued`, clearing `owner_session` and `lease_expires_at`. It is not terminal; the stop-the-line action is `investigation_queue_complete(state="blocked")`.
 - The manifest is the source of truth for `id`, `scope_kind`, `scope_targets`, `state`, `owner_session`, `lease_expires_at`, `dependencies`, `notes`, `created_at`, and `updated_at`.
 
-Important: the queue API does not currently enforce dependency resolution automatically. `dependencies` is persisted as item metadata, but the actual unlock rule is a scheduler policy decision. This spec therefore defines the canonical policy model while preserving the implementation semantics: the queue stores the dependency list and enforces ownership/lease rules, but it does not auto-mutate an item's state based on dependency completion.
+Dependencies gate claims: `investigation_queue_claim(...)` is refused until every listed dependency exists and is `done` (the `all` rule in section 6). The queue never auto-mutates an item's state based on dependency completion; it only refuses the claim.
 
 ## 2. Canonical state set
 
 The queue lives in exactly these states:
 
 - `queued`: available to be claimed.
-- `claimed`: reserved by a session with a live lease.
+- `claimed`: reserved by a session with a lease. A claim always carries a lease: enqueue with `state="claimed"` requires `owner_session` and gets a default 300s lease when none is given, and a stored claim with no lease counts as expired.
 - `done`: terminal success state.
 - `blocked`: terminal blocked/unavailable state.
 - `cancelled`: terminal cancelled state.
@@ -33,13 +33,16 @@ The implementation normalizes unknown or invalid states to `queued` during enque
 | From | Event | To | Allowed? | Conditions / notes |
 |---|---|---|---|---|
 | -- | `enqueue` | `queued` | Yes | Item is created with stable `id`, valid `scope_kind`, non-empty `scope_targets`, and optional `dependencies`. Duplicate IDs are rejected. |
-| `queued` | `claim(owner_session, lease_seconds)` | `claimed` | Yes | `owner_session` must be non-empty; no other owner may hold a live lease. |
+| `queued` | `claim(owner_session, lease_seconds)` | `claimed` | Yes | `owner_session` must be non-empty; no other owner may hold a live lease; every dependency must exist and be `done`. |
 | `queued` | `complete(state=done|blocked|cancelled)` | `done` / `blocked` / `cancelled` | Yes | No current owner required if none exists. |
 | `claimed` | `claim(owner_session=same_owner, lease_seconds)` | `claimed` | Yes | Same-owner renewal/heartbeat. Lease expiry is reset to `now + ttl`. |
 | `claimed` | `claim(owner_session=other_owner, lease_seconds)` | `claimed` | Conditional | Only if the current lease is expired; otherwise rejected. This is the reclaim path. |
 | `claimed` | `complete(state=done|blocked|cancelled, owner_session=same_owner)` | final | Yes | Completion is allowed only by the current owner. |
 | `claimed` | `complete(..., owner_session=other_owner)` | unchanged | No | Rejected with `"owned by session ... and cannot be completed"` semantics. |
 | `claimed` | `complete(..., owner_session=None)` | unchanged | No | Rejected when current owner exists and no owner is supplied. |
+| `claimed` | `release(owner_session=same_owner)` | `queued` | Yes | Owner and lease are cleared; any session may claim again. |
+| `claimed` | `release(owner_session=other_owner or None)` | unchanged | No | Rejected with `"cannot be released"`. |
+| final | `release(...)` | unchanged | No | Final states are not released. |
 | `done` | `claim(...)` | unchanged | No | Final states are not claimable. |
 | `blocked` | `claim(...)` | unchanged | No | Final states are not claimable. |
 | `cancelled` | `claim(...)` | unchanged | No | Final states are not claimable. |
@@ -62,6 +65,7 @@ claimed
   ├─ claim(same owner) -------------> claimed (renew/heartbeat)
   ├─ claim(other owner, expired) --> claimed (reclaim)
   ├─ complete(same owner) ----------> done|blocked|cancelled
+  ├─ release(same owner) -----------> queued
   └─ complete(other owner/none) --> error
 
 final
@@ -74,7 +78,8 @@ final
 ### Lease lifecycle
 
 - Each claim sets `owner_session` and `lease_expires_at = now + lease_seconds`.
-- Lease expiry is computed against the current UTC time via `_coordination_lease_expired(item)`.
+- Lease expiry is computed against the current UTC time via `_coordination_lease_expired(item)`. A missing lease counts as expired.
+- The stored state stays `claimed` after a lease lapses. `investigation_queue_status(...)` / `list(...)` add two derived, read-only fields to each item: `lease_expired` (a `claimed` item whose lease has lapsed) and `available` (queued or lease-expired, with every dependency `done`).
 - A lease is expired when `lease_expires_at <= now`.
 - Renewal is the same as a claim by the same owner: it extends the lease without changing the logical state from `claimed` to anything else.
 - `lease_expires_at` is cleared to `null` when the item reaches a terminal state.
@@ -134,7 +139,7 @@ Recommended default:
 - Default to `all` for pipeline stages where correctness is more important than throughput.
 - Use `any` only for opportunistic or fan-out work where a partially successful dependency graph is sufficient.
 
-Operationally, the queue state machine should treat dependency completion as a gating condition for transitioning from `queued` to `claimed`, not as an internal queue state. The implementation does not currently enforce that gate automatically, so a caller must check dependency completion before calling `claim` or before promoting an item out of `queued`.
+The queue treats dependency completion as a gating condition for transitioning from `queued` to `claimed`, not as an internal queue state: `investigation_queue_claim(...)` enforces `all` with `done` as the only satisfying state. A missing, `blocked` or `cancelled` dependency keeps the dependent item unclaimable. Schedulers that want `any` semantics must restructure the dependency list; the raw queue does not implement it.
 
 ### Example dependency graph
 
@@ -252,6 +257,7 @@ queue item-42 (queued)
 3. Treat `lease_expires_at` as the authoritative ownership boundary.
 4. Use a backoff policy on claim conflicts while the current lease remains valid.
 5. Treat final states (`done`, `blocked`, `cancelled`) as sticky and idempotent.
-6. Do not rely on automatic dependency unlocks unless a scheduler layer implements and enforces `all` or `any` semantics outside of the raw queue engine.
+6. Dependencies are enforced at claim time (`all`, `done` only); the queue does not auto-unlock or auto-promote dependent items.
+7. To hand work back without finalizing it, use `investigation_queue_release(...)`; to stop the line, use `investigation_queue_complete(state="blocked")`.
 
 This spec is the canonical contract for queue state transitions and should be used for implementation, review, and debugging. Any future queue feature that changes this behavior must be reflected in both the code and this document.

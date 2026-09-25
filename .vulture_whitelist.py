@@ -23,13 +23,11 @@ _ = investigation_related_cases
 _ = entity_list
 _ = entity_timeline
 _ = investigation_reason
-_ = audit_log
 _ = code_memory_correlate
 _ = memory_health
 _ = memory_self_check
 _ = memory_consolidate
 _ = memory_demote
-_ = memory_promote
 _ = memory_retract
 _ = memory_restore
 _ = memory_confidence
@@ -82,12 +80,17 @@ _ = a2a_endpoint
 _ = get_task
 
 # ── MCP surface added after this list was last revised
-# health is @mcp.custom_route("/health"); the other three are @mcp.tool().
-# A tool missing from this list is a finding, not a gap: `mcp.list_tools()`
-# is the authority, and mcp/tests asserts its count.
-_ = health
+# All @mcp.tool(). A tool missing from this list is a finding, not a gap:
+# `mcp.list_tools()` is the authority, and mcp/tests asserts its count.
+# health (@mcp.custom_route) and loci_health left this list once vulture stopped
+# reporting them (another name reference satisfies it), as did audit_log and
+# memory_promote once server.py itself began calling them.
+_ = docs_ingest_indexer
+_ = docs_recall
 _ = finding_resolve
-_ = loci_health
+_ = loci_validated_knowledge_promotion
+_ = memory_route_counterfactual_simulate
+_ = memory_route_policy_optimize
 _ = retrieval_selftest
 
 # ── socketserver hooks and tuning attributes, read by the stdlib base class

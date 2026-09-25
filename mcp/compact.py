@@ -4,10 +4,19 @@ from __future__ import annotations
 import re
 from typing import Callable, Optional
 
+from untrusted_memory import _FRAME_TAG_RE, neutralize_frame_tags
+
 TRUNCATION_MARKER = " …[truncated]"
 _WS_RE = re.compile(r"\s+")
 _UNTRUSTED_RE = re.compile(
     r"(?s)^(?P<open><untrusted_memory_content\b[^>]*>)\s*(?P<body>.*?)\s*(?P<close></untrusted_memory_content>)$"
+)
+# One well-formed frame whose body holds no frame tag, found anywhere in a string.
+# Only used for text Loci composed itself from wrap_untrusted_memory_text output.
+_CLEAN_FRAME_RE = re.compile(
+    r"(?s)<untrusted_memory_content(?:\s[^<>]*)?>"
+    r"(?:(?!<\s*/?\s*(?i:untrusted_memory_content)).)*?"
+    r"</untrusted_memory_content>"
 )
 
 
@@ -38,18 +47,71 @@ def _clip_plain_text(
     return (cut or body[:budget].rstrip()) + TRUNCATION_MARKER
 
 
+def _compact_composed(body: str, max_chars: int, preserve_sentence_boundary: bool) -> str:
+    """Clip Loci-composed text made of clean frames and Loci's own plain text.
+
+    Clean frames are kept whole (or clipped inside their tags); every frame tag in
+    the text between them is escaped. The result never ends inside an open frame.
+    """
+    pieces: list[tuple[bool, str]] = []
+    pos = 0
+    for fm in _CLEAN_FRAME_RE.finditer(body):
+        if fm.start() > pos:
+            pieces.append((False, neutralize_frame_tags(body[pos:fm.start()])))
+        pieces.append((True, fm.group(0)))
+        pos = fm.end()
+    if pos < len(body):
+        pieces.append((False, neutralize_frame_tags(body[pos:])))
+    full = "".join(t for _, t in pieces)
+    if len(full) <= max_chars:
+        return full
+    out = ""
+    for is_frame, piece in pieces:
+        if len(out) + len(piece) + len(TRUNCATION_MARKER) <= max_chars:
+            out += piece
+            continue
+        room = max_chars - len(out)
+        if is_frame:
+            m = _UNTRUSTED_RE.match(piece)
+            shell = (len(m.group("open")) + len(m.group("close")) + 2 + len(TRUNCATION_MARKER)) if m else 0
+            if m and room >= shell + 16:
+                return out + compact_text(piece, room, preserve_sentence_boundary)
+        elif room > len(TRUNCATION_MARKER) + 8:
+            return out + _clip_plain_text(piece, room, preserve_sentence_boundary=preserve_sentence_boundary)
+        break
+    return out.rstrip() + TRUNCATION_MARKER
+
+
 def compact_text(
     text: str,
     max_chars: int,
     preserve_sentence_boundary: bool = True,
+    *,
+    keep_frames: bool = False,
 ) -> str:
-    """Clip text deterministically and preserve untrusted-memory framing when present."""
+    """Clip text deterministically and preserve untrusted-memory framing when present.
+
+    ``keep_frames=True`` is for text Loci composed itself out of
+    wrap_untrusted_memory_text frames (a multi-row RAG context, a
+    "[superseded: ...] <frame>" line): every clean frame in it stays a real frame.
+    Without it, only a text that is exactly one clean frame keeps its tags; any
+    other frame tag is treated as stored content and escaped.
+    """
     body = str(text or "").strip()
     if max_chars <= 0:
         return ""
     m = _UNTRUSTED_RE.match(body)
+    if m and _FRAME_TAG_RE.search(m.group("body")):
+        # A frame with raw frame tags inside is not one Loci emitted (bodies are
+        # always neutralised): keeping its open tag would keep forged attributes
+        # and let the inner close tag end the frame early.
+        m = None
+    if not m and keep_frames:
+        return _compact_composed(body, max_chars, preserve_sentence_boundary)
     if not m:
-        return _clip_plain_text(body, max_chars, preserve_sentence_boundary=preserve_sentence_boundary)
+        return _clip_plain_text(
+            neutralize_frame_tags(body), max_chars, preserve_sentence_boundary=preserve_sentence_boundary
+        )
     open_tag = m.group("open")
     close_tag = m.group("close")
     shell = len(open_tag) + len(close_tag) + 1

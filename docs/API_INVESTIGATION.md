@@ -26,12 +26,12 @@ investigation_start(
 ```
 
 ### `investigation_load(investigation_id: str, last_n_findings: int = 20, include_retracted: bool = False, requesting_agent_id: Optional[str] = None, fidelity: str = "full") -> str`
-Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and can enforce ACL visibility when `requesting_agent_id` is supplied.
+Loads an investigation for resume or handoff. In `full` mode it returns the manifest plus a recent-finding window; in `summary`/`brief` mode it prefers persisted summary fields and deterministic set-level invariants. The implementation explicitly filters non-finding access rows out of `findings.jsonl`, excludes soft-retracted findings by default, and enforces the ACL: when the case has a non-empty ACL, a caller that is neither the owner nor an ACL member gets `{"error":"permission_denied"}`. The caller is the identity the transport vouches for: a per-agent bearer token (`LOCI_MCP_AGENT_TOKENS`) on the HTTP transports, or a `/bootstrap` session on A2A. Where nothing can be bound (stdio, a shared `LOCI_MCP_TOKEN`, unauthenticated loopback), the caller is the local agent, `HERMES_AGENT_ID`. `requesting_agent_id` is self-declared, so it can only narrow: the named agent must be allowed *as well*. The same rule gates `investigation_as_of`, `investigation_export`, `investigation_search`, `rag_context_search`, `memory_surface`, `memory_route` and `ground`.
 
 - **Key parameters**
   - `last_n_findings`: Recent window size. Older `gap` and `assumed` findings may be promoted into the window so open obligations do not age out silently.
   - `include_retracted`: Surfaces retracted findings instead of filtering them.
-  - `requesting_agent_id`: Applies manifest ACL filtering when the case is shared.
+  - `requesting_agent_id`: Narrows the transport-bound (or local) caller; it never admits a caller who is not a member. Members see findings authored by ACL members or themselves.
   - `fidelity`: `full`, `summary`, or `brief`.
 - **Returns**
   - `full`: `{"manifest":...,"fidelity":"full","total_findings":N,"recent_findings":[...],"field_invariants":...,"excluded_retracted":N,...}`
@@ -98,8 +98,8 @@ Lists investigation manifests, newest-updated first. Summary mode is the default
 investigation_list(limit=25, offset=0, summary=False)
 ```
 
-### `investigation_share(investigation_id: str, agent_ids: list) -> str`
-Adds agents to an investigation’s ACL so later `investigation_load(..., requesting_agent_id=...)` calls can see shared findings. The operation is additive and idempotent: already-present IDs stay in place and are not repeated in `shared_with`.
+### `investigation_share(investigation_id: str, agent_ids: list, requesting_agent_id: Optional[str] = None) -> str`
+Adds agents to an investigation’s ACL so later `investigation_load(..., requesting_agent_id=...)` calls can see shared findings. The operation is additive and idempotent: already-present IDs stay in place and are not repeated in `shared_with`. Only the owner or an existing ACL member may change the ACL; anyone else gets `permission_denied`.
 
 - **Key parameters**
   - `agent_ids`: List of agent IDs to grant access.
@@ -113,8 +113,8 @@ investigation_share(
 )
 ```
 
-### `investigation_unshare(investigation_id: str, agent_ids: list) -> str`
-Removes agents from an investigation ACL. Missing IDs are ignored, so the tool is safe to use as an idempotent cleanup step after a handoff or review.
+### `investigation_unshare(investigation_id: str, agent_ids: list, requesting_agent_id: Optional[str] = None) -> str`
+Removes agents from an investigation ACL. Same caller rule as `investigation_share`. Missing IDs are ignored, so the tool is safe to use as an idempotent cleanup step after a handoff or review.
 
 - **Key parameters**
   - `agent_ids`: List of agent IDs to revoke.
@@ -128,14 +128,14 @@ investigation_unshare(
 )
 ```
 
-### `investigation_export(investigation_id: str, include_embeddings: bool = False) -> str`
-Exports a portable JSON bundle for one investigation. The current implementation includes manifest, findings, conflicts, and entities, but `include_embeddings` is only a forward-compatibility flag: embeddings are not exported yet.
+### `investigation_export(investigation_id: str, include_embeddings: bool = False, requesting_agent_id: Optional[str] = None) -> str`
+Exports a portable JSON bundle (schema `1.1`) for one investigation: manifest, findings, conflicts, entities, and the lifecycle logs (`retractions`, `finding_updates`, `finding_verifications`) so an import keeps retracted findings retracted and resolutions resolved. A case with a non-empty ACL is exported only to its owner or an ACL member. `include_embeddings` `include_embeddings` is only a forward-compatibility flag: embeddings are not exported yet.
 
 - **Key parameters**
   - `include_embeddings`: Accepted but currently ignored for payload content.
 - **Returns**
   - `{"exported":true,"investigation_id":...,"bundle":{...},"finding_count":N,"size_bytes":N}`
-  - `bundle` contains `schema_version`, `exported_at`, `manifest`, `findings`, `conflicts`, `entities`.
+  - `bundle` contains `schema_version` (`"1.1"`), `exported_at`, `manifest`, `findings`, `conflicts`, `entities`, `retractions`, `finding_updates`, `finding_verifications`.
 - **Example**
 ```python
 investigation_export(
@@ -145,13 +145,13 @@ investigation_export(
 ```
 
 ### `investigation_import(bundle_json: str, new_title: Optional[str] = None) -> str`
-Imports an exported investigation bundle under a fresh investigation ID. The original ID is preserved as `imported_from`, findings are copied into the new case directory, and text-bearing findings are best-effort re-indexed into Qdrant. The tool accepts either the raw exported `bundle` object or the entire `investigation_export` response wrapper.
+Imports an exported investigation bundle under a fresh investigation ID. The original ID is preserved as `imported_from`. Every finding gets a fresh id (the bundle id is kept as `imported_finding_id`, and `derived_from`, conflict, entity and lifecycle-log references are remapped), so an import never overwrites another investigation's Qdrant points. The importer owns the copy: `owner` is the local agent, `acl` is empty, coordination leases are dropped and `finding_counts` is recomputed. Retractions, resolutions and verifications in a `1.1` bundle are replayed; `1.0` bundles still import. Text-bearing findings are best-effort re-indexed into Qdrant, and `qdrant_indexed` counts only confirmed upserts. The tool accepts either the raw exported `bundle` object or the entire `investigation_export` response wrapper.
 
 - **Key parameters**
   - `bundle_json`: JSON string containing either the raw bundle or the full export response.
   - `new_title`: Optional manifest title override.
 - **Returns**
-  - `{"imported":true,"new_investigation_id":"<uuid>","original_investigation_id":...,"findings_imported":N,"qdrant_indexed":N}`
+  - `{"imported":true,"new_investigation_id":"<uuid>","original_investigation_id":...,"schema_version":...,"findings_imported":N,"skipped_invalid":N,"retractions_imported":N,"resolutions_imported":N,"verifications_imported":N,"qdrant_indexed":N,"qdrant_failed":N}`
   - Rejects bundles over 10 MB or with unsupported `schema_version`.
 - **Example**
 ```python

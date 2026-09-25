@@ -55,7 +55,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -212,7 +211,7 @@ from qdrant_ops import (  # noqa: E402,F401
     _get_sparse_embedder, _get_cross_encoder, _embed_sparse, _create_payload_indexes,
     _purge_old_records, _get_qdrant, _embed_auth_headers, _embed, _qdrant_upsert,
     _qdrant_degraded_mode, _ce_rerank, _qdrant_similarity_search, _qdrant_search_collection,
-    probe_collection,
+    probe_collection, _embed_uncached, _qdrant_client_readonly,
 )
 from qdrant_ops import RERANK_MAX_CHARS as _RERANK_MAX_CHARS  # noqa: E402
 REFLECTION_STATE_DIR = MEMORY_DIR / "_reflection-loop"
@@ -232,6 +231,7 @@ AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
 # ---------------------------------------------------------------------------
 
 import inv_store  # noqa: E402
+import caller_identity  # noqa: E402
 # Lambda, not the Path value: tests rebind server.MEMORY_DIR to a tmpdir.
 inv_store.register(lambda: MEMORY_DIR)
 # Re-exported so server.<helper>() keeps resolving for callers and test patches.
@@ -243,10 +243,12 @@ from inv_store import (  # noqa: E402,F401
     _distinctive_entity_set, _CONFIDENCE_TO_NUMERIC, _node_numeric_confidence,
     StoreBusyError, _locked_file,
 )
+from recall_filter import build_recall_filter  # noqa: E402
 from provenance_firewall import (  # noqa: E402
     MODEL_ASSERTED,
-    TOOL_VERIFIED,
     assert_evidence_firewall,
+    audit_provenance_fields,
+    firewall_candidate_tier,
     normalize_provenance_tier,
     provenance_fields,
 )
@@ -493,6 +495,7 @@ from ladybug_ops import (  # noqa: E402,F401
 import mnemo_ops  # noqa: E402,F401
 from mnemo_ops import (  # noqa: E402,F401
     _mnemo_bank, _get_mnemo_funcs, _mnemo_remember, _coerce_mnemo_results, _mnemo_recall,
+    _mnemo_set_retracted,
 )
 
 
@@ -1075,10 +1078,13 @@ def _apply_lifecycle(findings: list[dict], investigation_id: str) -> None:
     """In-place: stamp effective ``resolution`` (append-log override else stored/'open')
     and ``stale`` (only when the finding carries usable code_refs). Fail-open."""
     overrides = _load_resolution_overrides(investigation_id)
+    tiers = inv_store._load_provenance_overrides(investigation_id)
     for f in findings:
         if not isinstance(f, dict):
             continue
         fid = str(f.get("id", ""))
+        if fid and fid in tiers:
+            f.update(inv_store._apply_provenance_override(f, tiers[fid]))
         if fid and fid in overrides:
             f["resolution"] = overrides[fid]
         elif not f.get("resolution"):
@@ -1679,15 +1685,25 @@ def build_validation_evidence(
     investigation_id: str,
     min_confidence: str,
 ) -> tuple[list[dict], dict]:
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    # Backfilled provenance tiers (provenance_updates.jsonl) overlay untagged rows.
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     scoped_audit = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
     global_recent_audit = _collect_recent_global_audit(limit=150, days=2)
     audit_lane, scoped_audit, global_recent_audit = _audit_lane_state(
         investigation_id, findings, scoped_audit, global_recent_audit
     )
+    # A retracted finding is not evidence for anything (pre_answer_check support,
+    # the provenance firewall's linked evidence, verify_all, promotion).
+    _rf = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False)
+    _retracted = _rf.all_retracted
+    excluded_retracted = 0
 
     evidence: list[dict] = []
     for idx, finding in enumerate(findings):
+        if str(finding.get("id") or "") in _retracted:
+            excluded_retracted += 1
+            continue
         conf = str(finding.get("confidence", "low")).lower()
         if not _confidence_allowed(conf, min_confidence):
             continue
@@ -1716,8 +1732,8 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "audit_jsonl",
-                "evidence_provenance_tier": TOOL_VERIFIED,
-                "provenance_defaulted": False,
+                # Caller-written receipt: tool_verified only for a non-model tool.
+                **audit_provenance_fields(entry.get("tool")),
             })
 
         for idx, entry in enumerate(global_recent_audit):
@@ -1732,10 +1748,10 @@ def build_validation_evidence(
                 "snippet": _entry_snippet(entry),
                 "tokens": tokenize(evidence_text),
                 "origin": "global_audit_jsonl",
-                "evidence_provenance_tier": TOOL_VERIFIED,
-                "provenance_defaulted": False,
+                **audit_provenance_fields(entry.get("tool")),
             })
-    return evidence, {"audit": audit_lane}
+    return evidence, {"audit": audit_lane,
+                      "retraction": {"excluded_retracted": excluded_retracted, **_rf.status()}}
 
 
 def _search_qdrant_claim_evidence(
@@ -1778,9 +1794,14 @@ def _search_qdrant_claim_evidence(
         pool_scores = [float(point.score) for point in points]
         pool_median = _median(pool_scores)
         claim_tokens = tokenize(claim)
+        # memory_retract keeps the Qdrant point: a retracted finding is not evidence.
+        _retracted = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False).all_retracted
         matches = []
         for point in points[:surfaced]:
             payload = point.payload or {}
+            if str(payload.get("id") or point.id) in _retracted:
+                status["excluded_retracted"] = status.get("excluded_retracted", 0) + 1
+                continue
             text = str(payload.get("text") or payload.get("output") or "")
             score = round(float(point.score), 4)
             matches.append({
@@ -1884,7 +1905,8 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     Pure over the JSONL — does NOT require qdrant. Returns the raw verdict lists
     keyed by check, plus a derived ``hallucination_candidates`` list. Already-
     retracted findings are excluded so a cleaned-up hallucination stops being
-    re-surfaced. Fail-open: a check error degrades to an empty list.
+    re-surfaced. Fail-open: a check error degrades to an empty list, and
+    ``check_status`` records which checks ran ok, failed, or fell back.
 
     When ``llm_verify`` is set (the deep_think -> loci merge path), the lexical
     contradiction verdicts are run through an embedding subject gate + LLM
@@ -1902,6 +1924,10 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     audit_entries = _read_jsonl(_inv_dir(investigation_id) / "audit.jsonl")
     audit_lane = _audit_lane_status(findings, audit_entries)
 
+    # Per-check outcome: a crashed check yields [] exactly like a clean store, so the
+    # caller must be told which lists are real results and which are failures.
+    check_status: dict = {}
+
     try:
         unsupported = run_provenance(
             findings,
@@ -1909,9 +1935,11 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             tokenizer=tokenize,
             lexical_score=_lexical_match_score,
         )
+        check_status["provenance"] = "ok"
     except Exception as exc:  # fail-open — advisory check must never break the caller
-        logger.debug("provenance check failed, degrading to none: %r", exc)
+        logger.warning("provenance check failed, degrading to none: %r", exc)
         unsupported = []
+        check_status["provenance"] = f"failed: {exc!r}"
 
     try:
         contradictions = run_contradiction(
@@ -1919,31 +1947,40 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             negation_re=_NEGATION_RE,
             tokenizer=tokenize,
         )
+        check_status["contradiction"] = "ok"
     except Exception as exc:  # fail-open
-        logger.debug("contradiction check failed, degrading to none: %r", exc)
+        logger.warning("contradiction check failed, degrading to none: %r", exc)
         contradictions = []
+        check_status["contradiction"] = f"failed: {exc!r}"
 
     if llm_verify:
         try:
             from memcheck.checks.contradiction_llm import verify_and_merge
 
             contradictions = verify_and_merge(findings, contradictions)
+            check_status["llm_verify"] = "applied"
         except Exception as exc:  # fail-open — keep lexical verdicts on any error
-            logger.debug("llm contradiction verify failed, keeping lexical: %r", exc)
+            logger.warning("llm contradiction verify failed, keeping lexical: %r", exc)
+            check_status["llm_verify"] = f"fallback_lexical: {exc!r}"
 
     try:
         candidates = _hallucination_candidates(
             findings, audit_entries, unsupported, contradictions
         )
+        # Candidates need both inputs; a failed input makes an empty list meaningless.
+        inputs_ok = check_status["provenance"] == "ok" and check_status["contradiction"] == "ok"
+        check_status["hallucination_candidates"] = "ok" if inputs_ok else "incomplete"
     except Exception as exc:  # fail-open
-        logger.debug("hallucination-candidate surfacing failed, degrading: %r", exc)
+        logger.warning("hallucination-candidate surfacing failed, degrading: %r", exc)
         candidates = []
+        check_status["hallucination_candidates"] = f"failed: {exc!r}"
 
     return {
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
         "hallucination_candidates": candidates,
         "audit_lane": audit_lane,
+        "check_status": check_status,
     }
 
 
@@ -2018,7 +2055,9 @@ def _hallucination_candidates(
     if not unsupported_ids or not contradictions:
         return []
 
-    # Approximates "has a receipt" as "not in unsupported_ids"; provenance only flags observed findings.
+    # Receipted = an observed finding the provenance check did not flag. Inferred/gap
+    # rows are never checked for receipts, so they are not receipted counter-evidence.
+    receipted_ids = _observed_ids - unsupported_ids
     findings_by_id = {str(f.get("id", "")): f for f in findings}
 
     candidates: list[dict] = []
@@ -2032,8 +2071,9 @@ def _hallucination_candidates(
         for unsup, other in pairs:
             if unsup not in unsupported_ids:
                 continue
-            if other in unsupported_ids and not _blanket:
-                continue  # other also unsupported — no receipted counter
+            counter_receipted = other in receipted_ids
+            if not counter_receipted and not _blanket:
+                continue  # no receipted counter
             if other not in findings_by_id:
                 continue
             if unsup in seen:
@@ -2043,12 +2083,20 @@ def _hallucination_candidates(
             candidates.append({
                 "finding_id": unsup,
                 "contradicted_by": other,
+                "counter_receipted": counter_receipted,
                 "excerpt": redact_excerpt(str(f.get("text", "") or "")),
                 "rationale": (
                     "unsupported observed finding (no receipt) contradicted by a "
                     "receipted finding — likely a self-generated hallucination"
+                    if counter_receipted else
+                    "unsupported observed finding contradicted by another finding; no "
+                    "audit receipt backs either side, so this cannot tell which is wrong"
                 ),
-                "hint": "review and run memory_retract(target=<finding_id>) to clean the lineage",
+                "hint": (
+                    "review and run memory_retract(target=<finding_id>) to clean the lineage"
+                    if counter_receipted else
+                    "verify both findings before retracting either; neither has a receipt"
+                ),
             })
     return candidates
 
@@ -2058,6 +2106,13 @@ def _hallucination_candidates(
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("loci")
+
+# Sync tools run on a worker thread, not inline on the event loop: one slow
+# backend call (Ollama, Qdrant) used to freeze /health and every client's
+# handshake. Must precede the first @mcp.tool() below.
+import tool_offload  # noqa: E402
+
+tool_offload.install(mcp)
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
@@ -2736,17 +2791,64 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
     return "new"
 
 
+_DOCS_INGEST_MAX_FILES = 500
+_DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
+
+
+def _docs_ingest_roots() -> list[Path]:
+    """Roots docs_ingest_indexer may read under: ``LOCI_DOCS_ROOTS``
+    (``os.pathsep``-separated), else the code root. Re-read each call."""
+    raw = os.environ.get("LOCI_DOCS_ROOTS", "")
+    roots = []
+    for part in raw.split(os.pathsep):
+        if part.strip():
+            try:
+                roots.append(Path(part.strip()).expanduser().resolve())
+            except Exception:  # noqa: BLE001
+                continue
+    return roots or [_code_root()]
+
+
+def _docs_ingest_confined(p: Path, roots: list[Path]) -> Optional[Path]:
+    """``p`` resolved (symlinks included) if it stays under a docs root, else None."""
+    try:
+        resolved = p.resolve(strict=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return resolved if any(resolved.is_relative_to(r) for r in roots) else None
+
+
 def _docs_ingest_targets(document_path: str) -> list[Path]:
-    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid."""
+    """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid.
+
+    Only paths under a docs root (``_docs_ingest_roots``) are read, and each file
+    is checked after symlink resolution: a ``notes.md`` link to a secret outside
+    the roots, or to a non-doc file, is skipped. At most _DOCS_INGEST_MAX_FILES."""
+    return _docs_ingest_all_targets(document_path)[:_DOCS_INGEST_MAX_FILES]
+
+
+def _docs_ingest_all_targets(document_path: str) -> list[Path]:
+    """Every target _docs_ingest_targets would pick, before the file cap."""
+    roots = _docs_ingest_roots()
     p = Path(document_path).expanduser()
-    if not p.exists():
+    if not p.is_absolute():
+        p = _code_root() / p
+    if _docs_ingest_confined(p, roots) is None:
         return []
-    doc_exts = {".md", ".markdown", ".txt"}
+
+    def _ok(x: Path) -> bool:
+        target = _docs_ingest_confined(x, roots)
+        return (
+            target is not None and target.is_file()
+            and x.suffix.lower() in _DOCS_INGEST_EXTS
+            and target.suffix.lower() in _DOCS_INGEST_EXTS
+        )
+
     if p.is_file():
-        return [p] if p.suffix.lower() in doc_exts else []
+        return [p] if _ok(p) else []
     if p.is_dir():
         return sorted(
-            {x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in doc_exts},
+            {x for x in p.rglob("*") if x.is_file() and _ok(x)},
             key=lambda item: str(item),
         )
     return []
@@ -2760,11 +2862,22 @@ def docs_ingest_indexer(
     source: str = "docs_ingest_indexer",
     confidence: str = "medium",
 ) -> str:
-    """Index markdown or text docs into the standard Loci investigation store with provenance."""
-    targets = _docs_ingest_targets(document_path)
+    """Index markdown or text docs into the standard Loci investigation store with provenance.
+
+    Only documents under the docs roots (``LOCI_DOCS_ROOTS``, ``os.pathsep``-separated;
+    default: the code root) are read, symlink targets included. Indexed findings are
+    tagged ``model_asserted``: the tool verifies which bytes it read (sha256), not
+    what the document claims, so its content is not independent evidence.
+    """
+    all_targets = _docs_ingest_all_targets(document_path)
+    targets = all_targets[:_DOCS_INGEST_MAX_FILES]
     if not targets:
         return json.dumps({
-            "error": f"No readable markdown/text documents found under: {document_path}",
+            "error": (
+                f"No readable markdown/text documents found under: {document_path} "
+                f"(only paths under the docs roots {[str(r) for r in _docs_ingest_roots()]} are read; "
+                "set LOCI_DOCS_ROOTS to widen them)"
+            ),
             "stored": 0,
             "investigation_id": investigation_id,
         })
@@ -2799,8 +2912,12 @@ def docs_ingest_indexer(
                 "document_sha256": content_hash,
                 "content_length": len(raw),
                 "ingested_at": _now(),
+                # The hash proves which bytes were read, not that their claims hold.
+                "content_verified": False,
             },
-            "evidence_provenance_tier": "tool_verified",
+            # Document text is an unverified claim of unknown authorship, so it takes
+            # the non-independent tier rather than tool_verified.
+            "evidence_provenance_tier": MODEL_ASSERTED,
         }
         if not summary_only:
             metadata["content_excerpt"] = raw[:1200]
@@ -2825,7 +2942,7 @@ def docs_ingest_indexer(
             confidence=confidence,
             tags=["docs", "markdown", "loci-index"],
             metadata=metadata,
-            evidence_provenance_tier="tool_verified",
+            evidence_provenance_tier=MODEL_ASSERTED,
         ))
         records.append({
             "path": str(doc_path),
@@ -2836,29 +2953,45 @@ def docs_ingest_indexer(
             "summary": summary,
         })
 
-    return json.dumps({
+    out = {
         "stored": sum(1 for r in records if r["stored"]),
         "unmodified": sum(1 for r in records if r.get("change_state") == "unchanged"),
         "changed": sum(1 for r in records if r.get("changed") is True),
         "investigation_id": investigation_id,
         "records": records,
-    })
+    }
+    if len(all_targets) > len(targets):
+        # The file cap cut the tree short: say so rather than read as complete.
+        out.update(truncated=True, files_found=len(all_targets),
+                   files_ingested=len(targets), max_files=_DOCS_INGEST_MAX_FILES)
+    return json.dumps(out)
+
+
+def _docs_search_score(text: str, query: str) -> float:
+    """Lexical match score of ``query`` against an indexed document string.
+
+    1.0 when the whole query occurs as a phrase; otherwise the fraction of
+    distinct query tokens that occur in the text (0.0 = no match). This is the
+    only relevance signal docs_search has. It is lexical, not semantic, and is
+    reported as such (``score_kind``) rather than presented as a similarity.
+    """
+    if not text or not query:
+        return 0.0
+    haystack = text.lower()
+    needle = query.lower().strip()
+    if not needle:
+        return 0.0
+    if needle in haystack:
+        return 1.0
+    tokens = sorted({token for token in re.findall(r"[A-Za-z0-9]+", needle) if token})
+    if not tokens:
+        return 0.0
+    return round(sum(1 for token in tokens if token in haystack) / len(tokens), 4)
 
 
 def _docs_search_matches_text(text: str, query: str) -> bool:
     """Return True when a query matches an indexed document string."""
-    if not text or not query:
-        return False
-    haystack = text.lower()
-    needle = query.lower().strip()
-    if not needle:
-        return False
-    if needle in haystack:
-        return True
-    tokens = [token for token in re.findall(r"[A-Za-z0-9]+", needle) if token]
-    if not tokens:
-        return False
-    return any(token in haystack for token in tokens)
+    return _docs_search_score(text, query) > 0.0
 
 
 @mcp.tool()
@@ -2921,7 +3054,8 @@ def docs_search(
             str(metadata.get("doc_summary") or ""),
             str(metadata.get("content_excerpt") or ""),
         ])
-        if not _docs_search_matches_text(search_text, q):
+        score = _docs_search_score(search_text, q)
+        if score <= 0.0:
             continue
 
         hit = {
@@ -2929,13 +3063,17 @@ def docs_search(
             "path": str(metadata.get("source_path") or ""),
             "summary": summary,
             "finding_id": finding.get("id"),
+            "score": score,
+            "score_kind": "lexical",
+            "origin": "docs_search",
         }
         if include_excerpt and metadata.get("content_excerpt"):
             hit["excerpt"] = str(metadata["content_excerpt"])[:1000]
         results.append(hit)
 
-        if len(results) >= n:
-            break
+    # Best lexical match first; ties keep file order (the sort is stable).
+    results.sort(key=lambda h: -h["score"])
+    results = results[:n]
 
     if not results:
         return json.dumps({
@@ -2994,7 +3132,12 @@ def docs_recall(
             "finding_id": item.get("finding_id"),
             "excerpt": item.get("excerpt"),
             "source": "docs_search",
-            "score": 0.95,
+            # docs_search's own match score (lexical phrase/token overlap), never
+            # a constant: a fixed 0.95 read as a strong semantic hit even when
+            # one shared token was the only match.
+            "score": item.get("score"),
+            "score_kind": item.get("score_kind", "lexical"),
+            "origin": item.get("origin", "docs_search"),
         })
 
     if result.get("error") and not docs_results:
@@ -3073,6 +3216,11 @@ def _store_build_finding(investigation_id, finding_type, text, source, confidenc
                 tool_name="flybrain_claim_scope_validator",
                 tier=str(flybrain_prov["audit_hook"].get("tier") or flybrain_prov.get("tier") or "T1"),
             )
+    # An assumption or a gap is by definition not observed evidence; unless the
+    # caller asserted a tier, it must not inherit the legacy tool_verified default.
+    if (not evidence_provenance_tier and finding_type in ("assumed", "gap")
+            and provenance_fields({"metadata": normalized_metadata})["provenance_defaulted"]):
+        evidence_provenance_tier = MODEL_ASSERTED
     if evidence_provenance_tier:
         normalized_metadata = normalized_metadata or {}
         normalized_metadata["evidence_provenance_tier"] = normalize_provenance_tier(
@@ -3488,20 +3636,17 @@ def procedure_attempt(
         success_count = target["procedure_meta"]["success_count"]
         success_rate = _procedure_success_rate(success_count, attempt_count)
 
-        # Atomic rewrite: write to temp file then rename
-        import tempfile as _tempfile
-        tmp_fd, tmp_path = _tempfile.mkstemp(dir=str(findings_path.parent), suffix=".jsonl.tmp")
-        try:
-            with os.fdopen(tmp_fd, "w") as tmp_fh:
-                for f in findings:
-                    tmp_fh.write(json.dumps(f) + "\n")
-            os.replace(tmp_path, str(findings_path))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except Exception as exc:
-                logger.debug("procedure_attempt: fail-open swallow: %r", exc)
-            raise
+        # Atomic, line-preserving rewrite of the first row for this id (the target).
+        # Unparseable lines and legacy access rows are kept verbatim.
+        _first = [True]
+
+        def _replace_target(f):
+            if _first[0] and f.get("id") == finding_id:
+                _first[0] = False
+                return target
+            return None
+
+        inv_store._rewrite_jsonl_preserving(findings_path, _replace_target)
 
         # Update Qdrant payload for the finding
         try:
@@ -3825,6 +3970,8 @@ def _reflection_store_finding(
         "source": "reflection_loop_tick",
         "confidence": confidence,
         "tags": tags,
+        # Heuristic self-reflection, no receipt: never the legacy tool_verified default.
+        "evidence_provenance_tier": MODEL_ASSERTED,
     }
     if metadata is not None:
         payload["metadata"] = metadata
@@ -4197,59 +4344,11 @@ def _search_retraction_scope(
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """Precompute retracted finding ids (and their texts) per investigation in scope.
 
-    Fail-safe: on any error both maps come back empty, which means nothing is
-    filtered rather than everything.
+    Thin view over the shared recall filter. A malformed or unreadable
+    investigation dir is handled per dir, so it never empties the whole map.
     """
-    retracted_by_inv: dict[str, set[str]] = {}
-    retracted_text_by_inv: dict[str, set[str]] = {}
-    try:
-        scope_invs = (
-            [investigation_id] if investigation_id
-            else ([p.name for p in MEMORY_DIR.iterdir() if p.is_dir()] if MEMORY_DIR.exists() else [])
-        )
-        for _inv in scope_invs:
-            rids = _load_retracted_ids(_inv)
-            if not rids:
-                continue
-            retracted_by_inv[_inv] = rids
-            texts: set[str] = set()
-            for f in _read_jsonl(MEMORY_DIR / _inv / "findings.jsonl"):
-                if str(f.get("id", "")) in rids:
-                    t = str(f.get("text", "") or "").strip()
-                    if t:
-                        texts.add(t)
-            retracted_text_by_inv[_inv] = texts
-    except Exception as exc:  # fail-safe — never block search on filtering
-        logger.debug("retraction scope precompute failed, not filtering: %r", exc)
-        return {}, {}
-    return retracted_by_inv, retracted_text_by_inv
-
-
-def _search_row_is_retracted(
-    row: dict,
-    rids_by_inv: dict[str, set[str]],
-    texts_by_inv: dict[str, set[str]],
-) -> bool:
-    """True when a search row names — or repeats the text of — a retracted finding.
-
-    An empty ``rids_by_inv`` means no filtering is in effect (either nothing is
-    retracted in scope, the precompute failed, or the caller asked for retracted
-    rows to be included).
-    """
-    if not rids_by_inv:
-        return False
-    inv = str(row.get("investigation_id", ""))
-    rids = rids_by_inv.get(inv)
-    rtexts = texts_by_inv.get(inv)
-    if not rids and not rtexts:
-        return False
-    rid = row.get("finding_id") or row.get("id")
-    if rid is not None and str(rid) in (rids or set()):
-        return True
-    text = str(row.get("text", "") or "").strip()
-    if text and rtexts and text in rtexts:
-        return True
-    return False
+    rf = build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+    return rf.retracted, rf.retracted_texts
 
 
 def _search_normalize_filters(min_confidence: str, resolution: Optional[str]) -> tuple[str, Optional[str]]:
@@ -4315,9 +4414,25 @@ def _search_annotate_rows(rows: list[dict]) -> None:
                 r["stale"] = _st
 
 
-def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
-    """Build the JSON payload for an empty investigation_search result set."""
+def _search_empty_response(
+    qdrant: dict,
+    mnemo_enabled: bool,
+    excluded_retracted: int = 0,
+    include_retracted: bool = False,
+    retraction_filter: Optional[dict] = None,
+) -> str:
+    """Build the JSON payload for an empty investigation_search result set.
+
+    An empty result is only ``no_matches`` when every lane answered and
+    nothing matched. Rows filtered as retracted report ``all_retracted`` and a
+    failed Qdrant lane (e.g. ``embedding_unavailable``) reports ``rag_degraded``.
+    """
     qdrant_avail = bool(os.environ.get("QDRANT_URL", ""))
+    honesty = {
+        "excluded_retracted": excluded_retracted,
+        "include_retracted": include_retracted,
+        "retraction_filter": retraction_filter or {"status": "ok"},
+    }
     # rag_required only when Qdrant is down; empty results with Qdrant up is a normal no-match.
     if not qdrant_avail or (qdrant.get("reason") == "qdrant_unavailable"):
         return json.dumps({
@@ -4326,18 +4441,31 @@ def _search_empty_response(qdrant: dict, mnemo_enabled: bool) -> str:
             "results": [],
             "qdrant_enabled": qdrant_avail,
             "error": "RAG_REQUIRED: Qdrant unavailable. Check QDRANT_URL and QDRANT_API_KEY.",
+            **honesty,
         }, indent=2)
-    return json.dumps({
-        "mode": "no_matches",
-        "reason": str(qdrant.get("reason") or "no_matches"),
+    _reason = str(qdrant.get("reason") or "no_matches")
+    _qdrant_failed = not qdrant.get("ok") and _reason != "not_attempted"
+    if _qdrant_failed:
+        mode = "rag_degraded"
+    elif excluded_retracted:
+        mode = "all_retracted"
+    else:
+        mode = "no_matches"
+    payload = {
+        "mode": mode,
+        "reason": _reason,
         "results": [],
         "qdrant_enabled": qdrant_avail,
+        **honesty,
         "mnemo_status": {
             "enabled": mnemo_enabled,
             "bank": _mnemo_bank() if mnemo_enabled else None,
             "match_count": 0,
         },
-    }, indent=2)
+    }
+    if _qdrant_failed:
+        payload["error"] = f"Qdrant search failed ({_reason}); an empty result is not evidence of no matches."
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -4348,6 +4476,7 @@ def investigation_search(
     include_retracted: bool = False,
     min_confidence: str = "low",
     resolution: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Search findings by similarity.
@@ -4370,18 +4499,40 @@ def investigation_search(
                     open/fixed/intentional/wontfix/superseded, only findings in that
                     resolution state are returned. Omit (default) to return all.
                     Each result row surfaces its ``resolution`` (absent -> "open").
+        requesting_agent_id: Optional agent_id of the caller. Rows from an
+                    investigation with a non-empty ACL that the caller is neither
+                    owner nor member of are dropped and counted under
+                    ``excluded_acl``.
 
     Returns:
         JSON list of matching findings with investigation context.
     """
     min_confidence, resolution = _search_normalize_filters(min_confidence, resolution)
 
-    # Fail-safe: an empty retracted map filters nothing.
-    _retracted_by_inv, _retracted_text_by_inv = (
-        _search_retraction_scope(investigation_id) if not include_retracted else ({}, {})
+    _acl_denied_by_inv: dict[str, Optional[str]] = {}
+
+    def _acl_denied(inv_id: str) -> Optional[str]:
+        if inv_id not in _acl_denied_by_inv:
+            try:
+                manifest = _load_manifest(inv_id) if inv_id else None
+            except Exception:  # noqa: BLE001 — a malformed row id has no manifest, hence no ACL
+                manifest = None
+            _acl_denied_by_inv[inv_id] = (
+                inv_store._acl_access_denied(manifest, requesting_agent_id) if manifest else None
+            )
+        return _acl_denied_by_inv[inv_id]
+
+    if investigation_id and _acl_denied(str(investigation_id)):
+        return json.dumps({"error": "permission_denied", "detail": _acl_denied(str(investigation_id))})
+    _excluded_acl = {"n": 0}
+
+    # Per-dir fail-safe: a malformed dir is reported, never disables filtering.
+    _rfilter = (
+        build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+        if not include_retracted else None
     )
 
-    _excluded_retracted = {"n": 0}
+    _excluded_retracted: set[str] = set()  # distinct findings, not duplicate rows
 
     _, recall_fn = _get_mnemo_funcs()
     mnemo_enabled = recall_fn is not None
@@ -4414,8 +4565,11 @@ def investigation_search(
     seen: set[str] = set()
 
     def _add_row(row: dict) -> None:
-        if _search_row_is_retracted(row, _retracted_by_inv, _retracted_text_by_inv):
-            _excluded_retracted["n"] += 1
+        if _rfilter is not None and _rfilter.is_retracted(row):
+            _excluded_retracted.add(_rfilter.finding_key(row))
+            return
+        if _acl_denied(str(row.get("investigation_id") or "")):
+            _excluded_acl["n"] += 1
             return
         key = "|".join([
             str(row.get("investigation_id", "")),
@@ -4466,8 +4620,15 @@ def investigation_search(
             source=row.get("source"),
         )
 
+    _rfilter_status = _rfilter.status() if _rfilter is not None else {"status": "ok"}
     if not deduped:
-        return _search_empty_response(qdrant, mnemo_enabled)
+        empty = _search_empty_response(
+            qdrant, mnemo_enabled, len(_excluded_retracted), include_retracted, _rfilter_status
+        )
+        if _excluded_acl["n"]:
+            # Everything matched was withheld by an ACL; say so rather than "no matches".
+            empty = json.dumps({**json.loads(empty), "excluded_acl": _excluded_acl["n"]}, indent=2)
+        return empty
 
     mode = "mnemo_primary"
     if qdrant.get("ok"):
@@ -4486,8 +4647,10 @@ def investigation_search(
     return json.dumps({
         "mode": mode,
         "results": deduped[: max(1, min(limit, 200))],
-        "excluded_retracted": _excluded_retracted["n"],
+        "excluded_retracted": len(_excluded_retracted),
+        **({"excluded_acl": _excluded_acl["n"]} if _excluded_acl["n"] else {}),
         "include_retracted": include_retracted,
+        "retraction_filter": _rfilter_status,
         "resolution_filter": resolution,
         "mnemo_status": {
             "enabled": mnemo_enabled,
@@ -4529,6 +4692,26 @@ def _pre_answer_lexical_refs(
             ref = _make_ref(evid, "support", score=score)
             claim_support_refs.append(ref)
     return claim_support_refs, claim_contradiction_refs
+
+
+def _firewall_linked_evidence(investigation_id: str, finding: dict,
+                              pool: Optional[list] = None) -> list[dict]:
+    """Evidence rows actually linked to ``finding``'s claim, for the provenance firewall.
+
+    Its ``derived_from`` parents plus the rows the pre_answer_check lexical lane
+    counts as support (findings and audit receipts). Never "every other finding":
+    an unrelated row says nothing about this claim. No link -> [] (fails closed).
+    ``pool`` lets a batch caller build the validation evidence once.
+    """
+    if pool is None:
+        pool, _ = build_validation_evidence(investigation_id, min_confidence="low")
+    fid = str(finding.get("id") or "")
+    parents = set(_normalize_derived_from(finding.get("derived_from")))
+    others = [e for e in pool if str(e.get("evidence_id") or "") != fid]
+    claim = str(finding.get("text") or "")
+    support, _ = _pre_answer_lexical_refs(tokenize(claim), bool(_NEGATION_RE.search(claim)), others)
+    linked_ids = parents | {str(ref.get("evidence_id") or "") for ref in support}
+    return [e for e in others if str(e.get("evidence_id") or "") in linked_ids]
 
 
 def _pre_answer_chain_confidence(
@@ -5295,6 +5478,8 @@ def audit_log(
         "investigation_id": investigation_id,
         "inputs": inputs_json,
         "output": output,
+        # The caller wrote this receipt; a model tool's output is model_asserted.
+        **audit_provenance_fields(tool_name),
     }
     fb_audit_fp = flybrain_audit_fingerprint(tool_name, inputs_json, output)
     if isinstance(fb_audit_fp, dict):
@@ -5329,6 +5514,7 @@ def audit_log(
             "tool": tool_name,
             "investigation_id": investigation_id,
             "source": "audit_log",
+            **audit_provenance_fields(tool_name),
             **({"flybrain_provenance": entry.get("flybrain_provenance")}
                if isinstance(entry.get("flybrain_provenance"), dict) else {}),
         },
@@ -5463,7 +5649,10 @@ def memory_self_check(
             through if embeddings or the LLM are unavailable.
 
     Returns:
-        JSON with advisory verdicts and per-investigation counts.
+        JSON with advisory verdicts and per-investigation counts. ``degraded`` is
+        true and ``degraded_checks`` names each check that crashed (its count is
+        then 0 because it did not run, not because the store is clean);
+        ``llm_verify_applied`` says whether the LLM path actually ran.
     """
     llm_verify = llm_verify or os.environ.get(
         "MEMCHECK_LLM_CONTRADICTION", ""
@@ -5490,9 +5679,28 @@ def memory_self_check(
     all_verdicts: list = []
     all_candidates: list[dict] = []
     per_investigation: list[dict] = []
+    skipped_investigations: list[dict] = []
+    degraded_checks: list[str] = []
 
     for inv_id in targets:
-        computed = _compute_self_check(inv_id, llm_verify=llm_verify)
+        try:
+            computed = _compute_self_check(inv_id, llm_verify=llm_verify)
+        except Exception as exc:
+            if investigation_id is not None:
+                raise
+            # Per-dir: a malformed dir (e.g. a legacy 'undefined') is reported, not fatal.
+            skipped_investigations.append({"investigation_id": inv_id, "reason": str(exc)})
+            continue
+        status_map = computed.get("check_status") or {}
+        relevant = set(requested)
+        if {"provenance", "contradiction"} <= requested:
+            relevant.add("hallucination_candidates")
+        if llm_verify and "contradiction" in requested:
+            relevant.add("llm_verify")
+        for name in sorted(relevant):
+            state = status_map.get(name, "ok")
+            if state not in ("ok", "applied"):
+                degraded_checks.append(f"{inv_id}:{name}: {state}")
         inv_verdicts: list = []
         if "provenance" in requested:
             inv_verdicts.extend(computed["unsupported_observed"])
@@ -5549,13 +5757,19 @@ def memory_self_check(
         "hallucination_candidates": all_candidates,
         "recorded": recorded,
         "qdrant": "ok" if qdrant_available else "unavailable",
+        # A crashed check reports zero verdicts; degraded says those zeros are not clean.
+        "degraded": bool(degraded_checks),
+        "degraded_checks": degraded_checks,
     }
+    if llm_verify:
+        result["llm_verify_applied"] = not any(":llm_verify:" in d for d in degraded_checks)
     if investigation_id is not None:
         result["investigation_id"] = investigation_id
         result["verdicts"] = per_investigation[0]["verdicts"] if per_investigation else []
     else:
-        result["investigation_ids"] = targets
+        result["investigation_ids"] = [e["investigation_id"] for e in per_investigation]
         result["investigations"] = per_investigation
+        result["skipped_investigations"] = skipped_investigations
 
     return json.dumps(result, indent=2)
 
@@ -5995,11 +6209,10 @@ def _health_probe_mnemo_mirror():
 def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
     """memory_health probe 1: is QDRANT_URL set and the server answering?
 
-    On a successful ``_get_qdrant()`` this publishes ``sink["client"]`` and
-    ``sink["main_col"]`` for probe 2. The assignment happens only *after*
-    ``_get_qdrant()`` returns, so if it raises the sink keeps its ``None``
-    initialisers and ``_health_check`` synthesizes the ``fail`` entry — the same
-    fail-open behaviour the ``nonlocal`` version had.
+    Uses ``_qdrant_client_readonly()`` (never creates the main collection, unlike
+    ``_get_qdrant()``) and makes a live ``get_collections`` call, so a cached client
+    cannot report "connected" while Qdrant is down. Publishes ``sink["client"]``
+    and ``sink["main_col"]`` for probe 2 only after that call succeeds.
     """
     if not qdrant_url:
         return (
@@ -6008,15 +6221,18 @@ def _health_probe_qdrant_reachable(qdrant_url: str, sink: dict) -> tuple:
             "to mnemosyne/keyword search.",
             "set QDRANT_URL if vector search is expected; otherwise this is benign",
         )
-    client, main_col = _get_qdrant()
-    sink["client"], sink["main_col"] = client, main_col
+    unreachable_hint = ("confirm the qdrant container is up and reachable at QDRANT_URL "
+                        "(docker ps; curl $QDRANT_URL/healthz)")
+    client, main_col = _qdrant_client_readonly()
     if client is None:
-        return (
-            "fail",
-            f"QDRANT_URL={qdrant_url} is set but the server is unreachable.",
-            "confirm the qdrant container is up and reachable at QDRANT_URL "
-            "(docker ps; curl $QDRANT_URL/healthz)",
-        )
+        return ("fail", f"QDRANT_URL={qdrant_url} is set but no client could be built.",
+                unreachable_hint)
+    try:
+        client.get_collections()  # live round trip, not the cached client object
+    except Exception as exc:
+        return ("fail", f"QDRANT_URL={qdrant_url} is set but the server did not answer: {exc!r}",
+                unreachable_hint)
+    sink["client"], sink["main_col"] = client, main_col
     return ("ok", f"connected to qdrant at {qdrant_url}", None)
 
 
@@ -6082,12 +6298,21 @@ def _health_probe_embeddings_dense(sink: dict) -> tuple:
 
     Publishes ``sink["embed_dim"]`` for the dimension-consistency probe.
     """
-    vec = _embed("memory_health probe")  # transient throwaway, never stored
+    # Uncached: through the embed cache this fixed string hit the embedder once per
+    # process and then reported "ok" from memory for the rest of any outage.
+    vec = _embed_uncached("memory_health probe")  # transient throwaway, never stored
     if not vec:
+        brownout = ""
+        try:
+            open_now, left = qdrant_ops._breaker_is_open("embed")
+            if open_now:
+                brownout = f" (embed brownout breaker open for another {left:.0f}s)"
+        except Exception as exc:
+            logger.debug("embeddings_dense probe: breaker state unreadable: %r", exc)
         return (
             "fail",
             "dense embedder (Ollama) unavailable — semantic/hybrid search "
-            "is disabled; the server runs on keyword fallback only.",
+            "is disabled; the server runs on keyword fallback only." + brownout,
             "ensure Ollama is running and the nomic-embed-text model is available "
             "(OLLAMA_BASE_URL and EMBED_MODEL env vars can override defaults).",
         )
@@ -6153,7 +6378,16 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
     total_active = 0
     total_orphans = 0
     parse_errors: list[str] = []
+    malformed: list[dict] = []
+    skipped: list[dict] = []
+    scanned = 0
     for inv in inv_targets:
+        try:
+            inv_store._validated_investigation_id(inv)
+        except ValueError as exc:
+            # A legacy dir (e.g. "undefined") is still scanned by path, and reported:
+            # its retractions are real and other global tools must tolerate it.
+            malformed.append({"investigation_id": inv, "reason": str(exc)})
         try:
             inv_path = MEMORY_DIR / inv
             findings = _read_jsonl(inv_path / "findings.jsonl")
@@ -6171,27 +6405,31 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
                     parsed = _read_jsonl(path)
                     if len(parsed) != len(raw):
                         parse_errors.append(f"{inv}/{label}: {len(raw) - len(parsed)} unparseable line(s)")
-            active = _load_retracted_ids(inv) if ret_path.exists() else set()
+            active = inv_store._fold_retracted_ids(ret_path) if ret_path.exists() else set()
             orphans = sorted(fid for fid in active if fid not in valid_ids)
             total_active += len(active)
             total_orphans += len(orphans)
+            scanned += 1
             if active or orphans:
                 per_inv.append({
                     "investigation_id": inv,
                     "active_retractions": len(active),
                     "orphaned_retractions": orphans,
                 })
-        except ValueError:
-            # A pre-existing directory whose name fails today's id validation
-            # (e.g. a legacy "undefined" dir) — skip it rather than let one
-            # bad entry fail the integrity check for every other investigation.
+        except Exception as exc:
+            # Per-dir: one unreadable dir is reported, never fails the rest.
+            skipped.append({"investigation_id": inv, "reason": repr(exc)})
             continue
     detail = {
-        "investigations_scanned": len(inv_targets),
+        "investigations_scanned": scanned,
         "active_retractions": total_active,
         "orphaned_retractions": total_orphans,
         "per_investigation": per_inv,
     }
+    if malformed:
+        detail["malformed_investigations"] = malformed
+    if skipped:
+        detail["skipped_investigations"] = skipped
     if parse_errors:
         detail["parse_errors"] = parse_errors
         return (
@@ -6207,6 +6445,14 @@ def _health_probe_retraction_integrity(inv_targets: list[str], inv_missing: str 
             "orphaned retraction(s): a retraction references a finding id "
             "not present in findings.jsonl — verify the finding wasn't lost",
         )
+    if skipped or malformed:
+        return (
+            "warn",
+            detail,
+            "investigation dir(s) with an invalid name or unreadable logs — see "
+            "malformed_investigations / skipped_investigations; tools that scan "
+            "every investigation must tolerate them",
+        )
     return ("ok", detail, None)
 
 
@@ -6218,7 +6464,11 @@ def _health_probe_store_counts(inv_targets: list[str], inv_missing: str | None) 
     totals = {"findings": 0, "audit": 0, "retractions": 0}
     for inv in inv_targets:
         inv_path = MEMORY_DIR / inv
-        f_n = len(_read_jsonl(inv_path / "findings.jsonl"))
+        # Real findings only: _read_jsonl drops legacy access rows. Rows sharing
+        # an id count once, and each row with no id counts as its own finding.
+        f_rows = [f for f in _read_jsonl(inv_path / "findings.jsonl") if isinstance(f, dict)]
+        f_n = (len({str(f["id"]) for f in f_rows if f.get("id")})
+               + sum(1 for f in f_rows if not f.get("id")))
         a_n = len(_read_jsonl(inv_path / "audit.jsonl"))
         r_n = len(_read_jsonl(inv_path / "retractions.jsonl"))
         totals["findings"] += f_n
@@ -6262,7 +6512,7 @@ def _selftest_rollup(rows: list[dict]) -> tuple[str, str]:
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-    broken = counts.get("width_mismatch", 0) + counts.get("error", 0)
+    broken = counts.get("width_mismatch", 0) + counts.get("error", 0) + counts.get("missing", 0)
     if broken and broken >= len(rows):
         status = "unhealthy"
     elif broken:
@@ -6287,7 +6537,7 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
 
     For each collection it reports points, dense width, sparse presence, and hit
     count, classifying results as ``ok`` | ``empty`` | ``no_results`` |
-    ``width_mismatch`` | ``error`` and rolling them up to ``ok`` |
+    ``width_mismatch`` | ``error`` | ``missing`` and rolling them up to ``ok`` |
     ``degraded`` | ``unhealthy``. Remediations are deduplicated because one
     missing width mapping often explains many collections.
 
@@ -6313,7 +6563,8 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
     Returns:
         JSON ``{status, summary, scope, collections, remediations}``.
     """
-    client, _col = _get_qdrant()
+    # Read-only client: _get_qdrant() would recreate a lost main collection empty.
+    client, _col = _qdrant_client_readonly()
     if client is None:
         return json.dumps({
             "status": "unhealthy",
@@ -6332,6 +6583,8 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
             names, in_scope = present, set(queried)
         else:
             names, in_scope = [n for n in queried if n in present], set(queried)
+        # A collection this server queries but that does not exist is a fault, not "nothing to probe".
+        missing = [] if collections else [n for n in queried if n not in present]
     except Exception as exc:
         return json.dumps({
             "status": "unhealthy",
@@ -6340,19 +6593,25 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
             "remediations": ["Check Qdrant connectivity and API key scope."],
         }, indent=2)
 
-    if not names:
+    if not names and not missing:
         return json.dumps({
             "status": "ok", "summary": "no collections exist",
             "collections": [], "remediations": [],
         }, indent=2)
 
-    try:
-        query_vec = _embed(query)
-    except Exception as exc:
-        logger.warning("retrieval_selftest: embed failed: %r", exc)
-        query_vec = None
+    query_vec = None
+    if names:
+        try:
+            query_vec = _embed_uncached(query)  # live: a cached default query hides an outage
+        except Exception as exc:
+            logger.warning("retrieval_selftest: embed failed: %r", exc)
 
     rows = [probe_collection(query_vec, client, name, limit=limit) for name in names]
+    rows += [{"collection": n, "hits": 0, "status": "missing",
+              "detail": "queried by this server but does not exist in Qdrant",
+              "remediation": (f"'{n}' is missing; if it existed before, its index was lost. "
+                              "Restore it from backup or re-run the backfill.")}
+             for n in missing]
     for r in rows:
         r["queried_by_server"] = r["collection"] in in_scope
     # Only the collections this server actually retrieves from can make it unhealthy.
@@ -6646,22 +6905,6 @@ def _retract_write_tombstones(
     return retracted_records, verdicts_forgotten
 
 
-def _retract_stamp_valid_until(investigation_id: str, contaminated_ids: list[str], ts: str) -> None:
-    """Bi-temporal hook: stamp valid_until on retracted findings so that
-    investigation_as_of queries exclude them from any future as-of view.
-    Fails open — never propagates."""
-    try:
-        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
-        _rewrite_jsonl_set_field(
-            findings_path,
-            set(contaminated_ids),
-            "valid_until",
-            ts,
-        )
-    except Exception as exc:  # fail-open
-        logger.debug("bi-temporal valid_until stamp failed, degrading: %r", exc)
-
-
 def _retract_quarantine_verdict(
     seeds: list[dict], seed_anchor: str, reason: str, contaminated_ids: list[str]
 ) -> bool:
@@ -6685,6 +6928,104 @@ def _retract_quarantine_verdict(
         return False
 
 
+def _retract_propagation_enabled() -> bool:
+    return os.environ.get("LOCI_RETRACT_PROPAGATE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _qdrant_set_retracted(finding_ids: list[str], *, retracted: bool, ts: str) -> dict:
+    """Flag (or unflag) the findings' own Qdrant points as retracted. Soft.
+
+    Sets ``retracted`` (and ``retracted_at`` / ``restored_at``) on each point's
+    payload; the vector and the rest of the payload stay, so memory_restore
+    flips it back and nothing is deleted. Points are updated one at a time: a
+    finding with no point (cold tier, never indexed) is counted as ``missing``
+    rather than failing the batch.
+
+    Returns ``{status, updated, missing, failed}``; status is ``ok``,
+    ``unavailable`` (no client), ``partial`` or ``failed``.
+    """
+    ids = sorted({str(f) for f in finding_ids or [] if f})
+    out = {"status": "ok", "updated": 0, "missing": 0, "failed": 0}
+    if not ids:
+        return out
+    client, col = _get_qdrant()
+    if client is None:
+        return {**out, "status": "unavailable"}
+    payload = ({"retracted": True, "retracted_at": ts} if retracted
+               else {"retracted": False, "restored_at": ts})
+    errors: list[str] = []
+    for n, fid in enumerate(ids):
+        try:
+            client.set_payload(collection_name=col, payload=payload, points=[fid], wait=True)
+            out["updated"] += 1
+        except Exception as exc:
+            text = str(exc).lower()
+            if "not found" in text or "no point" in text or "404" in text:
+                out["missing"] += 1
+                continue
+            # Anything else (unreachable, timeout, auth) will fail for the rest
+            # too; this runs under the investigation lock, so stop here rather
+            # than wait out one client timeout per remaining id.
+            out["failed"] += len(ids) - n
+            errors.append(f"{fid}: {str(exc)[:120]}")
+            break
+    if out["failed"]:
+        out["status"] = "failed" if not out["updated"] else "partial"
+        out["errors"] = errors[:5]
+        logger.warning("retraction flag not propagated to %d Qdrant point(s): %s", out["failed"], errors[:3])
+    return out
+
+
+def _propagate_retraction(finding_ids: list[str], *, retracted: bool, ts: str,
+                          mnemo_stamps: Optional[list[str]] = None) -> dict:
+    """Push a retract/restore to the Qdrant point payload and Mnemosyne rows.
+
+    JSONL (retractions.jsonl) stays the source of truth and every read path
+    filters by it; this makes the stores that recall reads directly agree with
+    it. Fail-open per store, but never silent: each store reports its status.
+    """
+    if not _retract_propagation_enabled():
+        return {"qdrant": {"status": "disabled"}, "mnemosyne": {"status": "disabled"}}
+    try:
+        q = _qdrant_set_retracted(finding_ids, retracted=retracted, ts=ts)
+    except Exception as exc:  # never let propagation undo an applied tombstone
+        q = {"status": "failed", "error": str(exc)[:200]}
+    try:
+        m = _mnemo_set_retracted(finding_ids, retracted=retracted, stamps=mnemo_stamps)
+    except Exception as exc:
+        m = {"status": "failed", "error": str(exc)[:200]}
+    return {"qdrant": q, "mnemosyne": m}
+
+
+def _retraction_mnemo_stamps(investigation_id: str, finding_id: str) -> list[str]:
+    """Every Mnemosyne valid_until stamp memory_retract wrote for this finding."""
+    stamps: list[str] = []
+    for rec in _read_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl"):
+        if not isinstance(rec, dict) or rec.get("action") != "retract":
+            continue
+        if finding_id not in [str(x) for x in rec.get("retracted_finding_ids") or []]:
+            continue
+        stamp = ((rec.get("propagation") or {}).get("mnemosyne") or {}).get("stamp")
+        if stamp:
+            stamps.append(str(stamp))
+    return stamps
+
+
+def _owner_only_denied(manifest: dict, investigation_id: str) -> Optional[str]:
+    """Owner-only tools (retract/restore): a permission_denied reply, or None.
+
+    The caller is the transport-bound identity (per-agent MCP token, A2A
+    session) when there is one, else this process's AGENT_ID. No tool argument
+    can name a different caller.
+    """
+    _owner = manifest.get("owner", "")
+    _who = caller_identity.bound_agent_id() or AGENT_ID
+    if _owner and _owner != _who:
+        return json.dumps({"error": "permission_denied",
+                           "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    return None
+
+
 @mcp.tool()
 def memory_retract(
     investigation_id: str,
@@ -6700,8 +7041,10 @@ def memory_retract(
     contaminated. This tool finds that lineage through shared distinctive
     entities, semantic proximity in Qdrant, and forward ``derived_from`` links,
     then soft-tombstones it so it drops out of recall, search, and reflect.
-    Nothing is hard-deleted: ``findings.jsonl`` stays append-only, and
-    ``memory_restore`` reverses retractions.
+    Nothing is hard-deleted or rewritten: only ``retractions.jsonl`` is
+    appended, ``findings.jsonl`` is left as-is, and ``memory_restore``
+    reverses retractions exactly (``investigation_as_of`` reads the
+    retraction intervals from the log).
 
     Advisory-first: ``dry_run`` defaults to ``True`` and changes nothing. It
     returns the proposed cluster for review; re-run with ``dry_run=False`` to
@@ -6730,9 +7073,9 @@ def memory_retract(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-    _owner = manifest.get("owner", "")
-    if _owner and _owner != AGENT_ID:
-        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    _denied = _owner_only_denied(manifest, investigation_id)
+    if _denied:
+        return _denied
     if not str(target or "").strip():
         return json.dumps({"error": "target must be a non-empty finding id or claim/entity string"})
 
@@ -6781,8 +7124,13 @@ def memory_retract(
                 retracted_records, verdicts_forgotten = _retract_write_tombstones(
                     retractions_path, contaminated_ids, by_id, reasons, seed_anchor, reason, ts
                 )
+                # findings.jsonl is not rewritten: investigation_as_of reads the
+                # retraction intervals from retractions.jsonl, so restore is an exact inverse.
 
-                _retract_stamp_valid_until(investigation_id, contaminated_ids, ts)
+                # Flag the findings' own index entries too, so a reader that goes
+                # to Qdrant or Mnemosyne directly (not through Loci's filters) also
+                # sees them as retracted. Soft: restore reverses both.
+                propagation = _propagate_retraction(contaminated_ids, retracted=True, ts=ts)
 
                 _append_jsonl(audit_path, {
                     "action": "retract",
@@ -6794,6 +7142,7 @@ def memory_retract(
                     "count": len(contaminated_ids),
                     "verdicts_forgotten": verdicts_forgotten,
                     "scope_semantic": scope_semantic,
+                    "propagation": propagation,
                 })
     except StoreBusyError as exc:
         logger.info("memory_retract busy for %s/%s: %s", investigation_id, target, exc)
@@ -6817,7 +7166,10 @@ def memory_retract(
         "verdicts_forgotten": verdicts_forgotten,
         "applied": True,
         "quarantine_verdict_recorded": quarantine_recorded,
-        "reversible": "findings.jsonl is untouched (append-only); reverse with memory_restore",
+        "propagation": propagation,
+        "reversible": ("retractions.jsonl was appended and findings.jsonl is untouched; the Qdrant "
+                       "point payload is flagged retracted=true and matching Mnemosyne rows get "
+                       "valid_until (see propagation). Nothing is deleted; memory_restore reverses all of it."),
     }, indent=2)
 
 
@@ -6849,16 +7201,20 @@ def memory_restore(
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
-    _owner = manifest.get("owner", "")
-    if _owner and _owner != AGENT_ID:
-        return json.dumps({"error": "permission_denied", "detail": f"investigation {investigation_id!r} is owned by {_owner!r}"})
+    _denied = _owner_only_denied(manifest, investigation_id)
+    if _denied:
+        return _denied
 
     retractions_path = _inv_dir(investigation_id) / "retractions.jsonl"
 
     ts = _now()
+    target_fid = str(finding_id or retraction_id or "")
     try:
         with _investigation_lock(investigation_id):
-            with _locked_file(retractions_path, "a+", exclusive=True):
+            # Serialise on the per-investigation .lock like memory_retract does:
+            # holding a flock on retractions.jsonl itself made the _append_jsonl
+            # below wait on this thread's own lock and always return "busy".
+            with _locked_file(_inv_dir(investigation_id) / ".lock", "a+", exclusive=True):
                 try:
                     existing = _read_jsonl(retractions_path)
                 except PermissionError as exc:
@@ -6890,11 +7246,16 @@ def memory_restore(
                     "ts": ts,
                     "active": False,
                 })
+                propagation = _propagate_retraction(
+                    [target_fid], retracted=False, ts=ts,
+                    mnemo_stamps=_retraction_mnemo_stamps(investigation_id, target_fid),
+                )
                 _append_jsonl(_inv_dir(investigation_id) / "retraction_audit.jsonl", {
                     "action": "restore",
                     "ts": ts,
                     "finding_id": target_fid,
                     "reason": reason or "restore",
+                    "propagation": propagation,
                 })
     except StoreBusyError as exc:
         logger.info("memory_restore busy for %s/%s: %s", investigation_id, target_fid, exc)
@@ -6904,6 +7265,7 @@ def memory_restore(
         "finding_id": target_fid,
         "restored": True,
         "reason": reason or "restore",
+        "propagation": propagation,
     }, indent=2)
 
 
@@ -6971,6 +7333,7 @@ def contract_declare(
         "source": "contract_declare",
         "confidence": "medium",
         "numeric_confidence": _store_numeric_confidence("medium", None),
+        "evidence_provenance_tier": MODEL_ASSERTED,  # a declaration, not evidence
         "tags": tags,
         "derived_from": [],
         "entities": {},
@@ -7213,6 +7576,7 @@ def wiring_obligation_declare(
         "source": "wiring_obligation_declare",
         "confidence": "medium",
         "numeric_confidence": _store_numeric_confidence("medium", None),
+        "evidence_provenance_tier": MODEL_ASSERTED,  # UNVERIFIED obligation, not evidence
         "tags": tags,
         "derived_from": [],
         "entities": {},
@@ -7319,7 +7683,9 @@ def wiring_obligation_resolve(
 
     jsonl_path = inv_dir / "findings.jsonl"
     try:
-        with _locked_file(jsonl_path, "a+", exclusive=True):
+        # Serialise on inv_dir/.lock and let _append_jsonl take the findings.jsonl
+        # flock: holding that flock here made the append wait on this thread's own lock.
+        with _locked_file(inv_dir / ".lock", "a+", exclusive=True):
             try:
                 findings = _read_jsonl(jsonl_path) if jsonl_path.exists() else []
             except PermissionError as exc:
@@ -7396,7 +7762,8 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
 
     import verify as _v
 
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     overrides = _load_resolution_overrides(investigation_id)
     retracted = _load_retracted_ids(investigation_id)
 
@@ -7425,10 +7792,14 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             open_findings.append(f)
 
     results = []
+    # One evidence pool for the batch; verify_all writes only to the verifications log,
+    # so the pool stays current across the loop.
+    _linked_pool = (build_validation_evidence(investigation_id, min_confidence="low")[0]
+                    if open_findings else [])
     for f in open_findings:
         fid = str(f.get("id", ""))
-        # Thread this finding's own stored provenance tier plus its investigation's
-        # other findings as candidate evidence, so a model_asserted finding with no
+        # Thread this finding's own stored provenance tier plus the evidence actually
+        # linked to it (parents, lexical support), so a model_asserted finding with no
         # independent (human/tool/deterministic) support is gated 'uncertain' by the
         # provenance firewall instead of reaching the model verifier unchecked.
         res = _v.verify_finding(
@@ -7439,11 +7810,8 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
             # WHICH checkout its source lives in; without them the skeptic reasons
             # over prose while the file sits on disk.
             code_refs=f.get("code_refs"),
-            candidate_provenance_tier=normalize_provenance_tier(f),
-            evidence_rows=[
-                g for g in findings
-                if isinstance(g, dict) and str(g.get("id") or "") != fid
-            ],
+            candidate_provenance_tier=firewall_candidate_tier(f),
+            evidence_rows=_firewall_linked_evidence(investigation_id, f, pool=_linked_pool),
         )
         verdict = res.get("verdict", "uncertain")
         confidence = res.get("confidence", 0.0)
@@ -7477,6 +7845,15 @@ def investigation_verify_all(investigation_id: str, limit: int = 20) -> str:
     }, indent=2)
 
 
+def _embed_probe_headers() -> dict:
+    """Auth headers the embed client sends (EMBED_API_KEY), for health probes. Never raises."""
+    try:
+        import qdrant_ops
+        return {k: v for k, v in qdrant_ops._embed_auth_headers().items() if k != "Content-Type"}
+    except Exception:
+        return {}
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -7492,10 +7869,16 @@ def loci_health() -> str:
                          — reflects the graph store state via a READ-ONLY probe (never
                          grabs the writer lock). 'contended' = another process holds the
                          writer lock right now (transient with per-op leasing).
-      ladybug_writer_pid: (optional) PID stamped as the current write-lease holder
-      ollama_reachable:  TCP reachability of the resolved Ollama endpoint
-      vllm_reachable:    TCP reachability of the resolved vLLM endpoint
-      qdrant_reachable:  TCP reachability of the resolved Qdrant endpoint
+      ladybug_writer_pid: (optional) PID stamped as the write-lease holder, only while
+                         that process is alive
+      ollama_reachable:  the resolved Ollama (embed) endpoint answers GET /api/tags; a
+                         non-Ollama OpenAI-compatible embeddings host (no /api/tags)
+                         counts when it answers that GET with a 4xx
+      ollama_gen_reachable: the generation endpoint (ollama_gen_url), same rule
+      ollama_gen_model_present: (optional) the configured gen model is listed there
+      vllm_reachable:    the resolved vLLM endpoint answers GET /health
+      qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
+                         (each is a short TCP gate followed by a bounded HTTP request)
       embed_model:       configured embedding model
       rerank_model:      configured cross-encoder rerank model
       warm:              whether the embed warm-ping has been fired this process
@@ -7505,6 +7888,7 @@ def loci_health() -> str:
         "code_version": "",
         "ladybug": "unavailable",
         "ollama_reachable": False,
+        "ollama_gen_reachable": False,
         "vllm_reachable": False,
         "qdrant_reachable": False,
         "embed_model": "",
@@ -7537,16 +7921,52 @@ def loci_health() -> str:
             "qdrant": bool(os.environ.get("QDRANT_URL")
                            or backends._cfg("qdrant", "url", "")),
         }
-        for key, resolver in (
-            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T)),
-            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T)),
-            ("qdrant_reachable", lambda: backends.qdrant()[0]),
+        # Generation has its own endpoint (backends.ollama_gen_url); it falls back to the embed one.
+        _gen_explicit = bool(os.environ.get("LOCI_OLLAMA_GEN_URL") or os.environ.get("OLLAMA_GEN_URL")
+                             or backends._cfg("ollama", "gen_url", ""))
+        explicit_backend["ollama_gen"] = _gen_explicit or explicit_backend["ollama"]
+        # TCP accept is not an answer: a hung server or a relay with a dead upstream passes
+        # it. After a short TCP gate, each endpoint must answer a bounded HTTP GET.
+        _HTTP_T = 1.0
+        _qdrant_key = ""
+        try:
+            _qdrant_key = backends.qdrant()[1]
+        except Exception as exc:
+            logger.debug("loci_health: qdrant key resolve failed: %r", exc)
+        http_answers: dict = {}
+        for key, resolver, path, headers in (
+            ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T), "/api/tags", None),
+            ("ollama_gen_reachable", lambda: backends.ollama_gen_url(_PROBE_T), "/api/tags", None),
+            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T), "/health", None),
+            ("qdrant_reachable", lambda: backends.qdrant()[0], "/readyz",
+             {"api-key": _qdrant_key} if _qdrant_key else None),
         ):
             try:
-                out[key] = bool(backends._alive(resolver(), timeout=_PROBE_T))
+                url = resolver()
+                out[key] = False
+                if backends._alive(url, timeout=_PROBE_T):
+                    ok, body = backends._http_probe(url, path, timeout=_HTTP_T, headers=headers)
+                    if not ok and key in ("ollama_reachable", "ollama_gen_reachable"):
+                        # OLLAMA_BASE_URL may name any OpenAI-compatible embeddings host, which
+                        # has no /api/tags: a 4xx still proves it answers HTTP. A 5xx (e.g. a
+                        # relay whose upstream is dead) or no answer does not.
+                        _st = backends._http_status(url, path, timeout=_HTTP_T,
+                                                    headers=_embed_probe_headers())
+                        ok = _st is not None and 400 <= _st < 500
+                    out[key] = bool(ok)
+                    http_answers[key] = body
             except Exception as exc:
                 logger.debug("loci_health: reachability probe %s failed: %r", key, exc)
                 pass
+        # When a generation model is configured, the gen endpoint must actually carry it.
+        _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        _tags = http_answers.get("ollama_gen_reachable")
+        if (out.get("ollama_gen_reachable") and _gen_model and isinstance(_tags, dict)
+                and isinstance(_tags.get("models"), list)):
+            names = {str(m.get("name") or m.get("model") or "")
+                     for m in _tags["models"] if isinstance(m, dict)}
+            out["ollama_gen_model_present"] = bool(
+                _gen_model in names or f"{_gen_model}:latest" in names)
         try:
             out["embed_model"] = backends.embed_model()
         except Exception as exc:
@@ -7561,14 +7981,17 @@ def loci_health() -> str:
         failures = []
         optional_down = []
         for label, key in (("ollama", "ollama_reachable"),
+                           ("ollama_gen", "ollama_gen_reachable"),
                            ("vllm", "vllm_reachable"),
                            ("qdrant", "qdrant_reachable")):
-            if out[key]:
+            if out.get(key):
                 continue
             if explicit_backend.get(label, False):
                 failures.append(f"{label}: configured/enabled but unreachable")
             else:
                 optional_down.append(label)
+        if out.get("ollama_gen_model_present") is False:
+            failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
         if failures:
             out["status"] = "unhealthy"
             out["failures"] = failures
@@ -7765,9 +8188,24 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
         logger.debug('Final CE re-pass failed: %s', exc)
 
 
-def _rag_record_access(results: list[dict], query: str) -> None:
-    """Append a last_accessed marker to each returned finding's JSONL.
+_SUPERSEDED_MARK = "[superseded: a later finding replaced this; do not rely on it] "
 
+
+def _rag_mark_superseded(rows: list[dict], rfilter) -> None:
+    """Tag superseded findings in place so they never read as current context."""
+    for r in rows:
+        if rfilter.is_superseded(r):
+            r["resolution"] = "superseded"
+            key = "text" if r.get("text") else "content"
+            if not str(r.get(key) or "").startswith(_SUPERSEDED_MARK):
+                r[key] = _SUPERSEDED_MARK + str(r.get(key) or "")
+
+
+def _rag_record_access(results: list[dict], query: str) -> None:
+    """Append a last_accessed marker for each returned finding to access.jsonl.
+
+    The marker goes to the investigation's access log and never to
+    findings.jsonl, where it would reuse the finding's id and shadow it.
     Best-effort per row: this must never block the response.
     """
     access_ts = int(time.time())
@@ -7778,10 +8216,10 @@ def _rag_record_access(results: list[dict], query: str) -> None:
             finding_id, inv_id = r.get("id"), r.get("investigation_id")
             if not finding_id or not inv_id:
                 continue
-            findings_path = _inv_dir(inv_id) / "findings.jsonl"
-            if not findings_path.exists():
+            inv_path = _inv_dir(inv_id)
+            if not (inv_path / "findings.jsonl").exists():
                 continue
-            _append_jsonl(findings_path, {
+            _append_jsonl(inv_path / inv_store.ACCESS_LOG_NAME, {
                 "id": finding_id,
                 "investigation_id": inv_id,
                 "record_type": "access",
@@ -7802,6 +8240,7 @@ def rag_context_search(
     decay: bool = True,
     expand_query: Optional[bool] = None,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Run hybrid RAG over Qdrant and return prompt-ready cited context.
@@ -7840,10 +8279,15 @@ def rag_context_search(
             ``+4% nDCG@10`` with no regression.
         mode: "normal" (default) for the legacy markdown block, or "compact" for
             deterministic cited one-liners plus slim source metadata.
+        requesting_agent_id: Optional agent_id to narrow ACL visibility. Hits
+            from an investigation whose ACL the caller cannot read are dropped
+            and counted in ``excluded_acl``. The caller is the transport-bound
+            identity (or this process); this argument can only narrow it.
 
     Returns:
         JSON ``{query, context, sources, total_chars, truncated, result_count,
-        mode, collections_searched, qdrant_available}``.
+        mode, collections_searched, qdrant_available, excluded_retracted,
+        excluded_acl}``.
     """
     if not query or not query.strip():
         return json.dumps({"error": "query must not be empty", "results": [], "query": query})
@@ -7886,6 +8330,17 @@ def rag_context_search(
     # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
     all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
+    # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
+    # before ranking, access tracking and assembly; mark superseded ones.
+    _rfilter = build_recall_filter(
+        MEMORY_DIR,
+        {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
+        with_superseded=True,
+    )
+    all_results, _rag_excluded = _rfilter.split(all_results)
+    # ACL: hits from investigations the caller may not read never reach the context.
+    all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
+
     # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
     if decay:
         _rag_apply_decay(all_results)
@@ -7898,6 +8353,7 @@ def rag_context_search(
 
     # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
+    _rag_mark_superseded(all_results, _rfilter)
 
     ctx = context_assemble(
         all_results,
@@ -7916,6 +8372,9 @@ def rag_context_search(
         ctx["mode"] = "rag_hybrid"
     ctx["collections_searched"] = _collections
     ctx["collections_failed"] = sorted(_failed_cols)
+    ctx["excluded_retracted"] = len(_rag_excluded)
+    ctx["excluded_acl"] = _rag_acl_excluded
+    ctx["retraction_filter"] = _rfilter.status()
     ctx["qdrant_available"] = True
     if expansion_info is not None:
         ctx["query_expansion"] = expansion_info
@@ -8050,7 +8509,9 @@ def memory_surface(
                             "text": str(item.get("summary") or item.get("title") or "").strip(),
                             "source": "docs_search",
                             "relevance_note": f"Related to: {context.strip().split()[:8]} (docs guidance)",
-                            "score": 0.95,
+                            # docs_search is lexical and carries no similarity score; never invent one.
+                            "score": item.get("score"),
+                            "origin": "docs_search",
                             "investigation_id": investigation_id or "loci-docs-index",
                         })
             except Exception as _docs_exc:
@@ -8060,6 +8521,10 @@ def memory_surface(
                     "surfaced": docs_hits,
                     "context_used": context[:200] if len(context) > 200 else context,
                     "count": len(docs_hits),
+                    # Memory surfacing did not run; these are docs guidance only.
+                    "degraded": True,
+                    "fallback": "docs_search",
+                    "reason": "qdrant unavailable",
                 }, indent=2)
             return json.dumps({
                 "error": "memory_surface requires Qdrant",
@@ -8098,6 +8563,17 @@ def memory_surface(
                 "count": 0,
             })
 
+        # Retracted findings keep their Qdrant point: drop them by id here.
+        _rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in candidates if r.get("investigation_id")}
+            | ({investigation_id} if investigation_id else set()),
+            with_superseded=True,
+        )
+        candidates, _surface_excluded = _rfilter.split(candidates)
+        # ACL: never surface findings from an investigation the caller cannot read.
+        candidates, _surface_acl_excluded = inv_store._acl_filter_rows(candidates)
+
         # Apply lower score threshold (0.25) to allow tangentially relevant findings
         _SURFACE_SCORE_THRESHOLD = 0.25
         filtered = [r for r in candidates if float(r.get("score") or 0.0) >= _SURFACE_SCORE_THRESHOLD]
@@ -8114,6 +8590,10 @@ def memory_surface(
         _ctx_prefix = " ".join(_ctx_words[:8])
 
         surfaced = _surface_rows(top_results, _ctx_prefix, investigation_id)
+        for _row in surfaced:
+            if _rfilter.is_superseded(_row):
+                _row["resolution"] = "superseded"
+                _row["text"] = _SUPERSEDED_MARK + _row["text"]
 
         docs_hits = []
         try:
@@ -8125,20 +8605,25 @@ def memory_surface(
                         "text": str(item.get("summary") or item.get("title") or "").strip(),
                         "source": "docs_search",
                         "relevance_note": f"Related to: {_ctx_prefix} (docs guidance)",
-                        "score": 0.95,
+                        "score": item.get("score"),  # lexical hit: no similarity score to report
+                        "origin": "docs_search",
                         "investigation_id": investigation_id or "loci-docs-index",
                     })
         except Exception as _docs_exc:
             logger.debug("memory_surface docs recall failed (fail-open): %r", _docs_exc)
 
         if docs_hits:
-            surfaced.extend(docs_hits)
-            surfaced = sorted(surfaced, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:top_k]
+            # Docs guidance only fills slots the memory hits left free: an unscored lexical
+            # hit must not outrank (and so displace) a finding with a real similarity score.
+            surfaced = (surfaced + docs_hits)[:top_k]
 
         return json.dumps({
             "surfaced": surfaced,
             "context_used": context[:200] if len(context) > 200 else context,
             "count": len(surfaced),
+            "excluded_retracted": len(_surface_excluded),
+            "excluded_acl": _surface_acl_excluded,
+            "retraction_filter": _rfilter.status(),
         }, indent=2)
 
     except Exception as _top_exc:
@@ -8168,7 +8653,11 @@ def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, No
         for d in MEMORY_DIR.iterdir():
             if not d.is_dir():
                 continue
-            manifest = _load_manifest(d.name)
+            try:
+                manifest = _load_manifest(d.name)
+            except Exception as exc:  # per-dir: a malformed dir (e.g. 'undefined') is skipped
+                logger.debug("consolidate: skipping investigation dir %r: %r", d.name, exc)
+                continue
             if manifest is None:
                 continue
             ts = str(manifest.get("updated_at") or "")
@@ -8178,7 +8667,12 @@ def _find_most_recent_investigation() -> tuple[str, list[dict]] | tuple[None, No
         if best_id is None:
             return None, None
         findings_path = MEMORY_DIR / best_id / "findings.jsonl"
-        findings = _read_jsonl(findings_path)
+        # Findings only, minus retracted ones: causal edges must not be inferred from them.
+        retracted = build_recall_filter(MEMORY_DIR, [best_id], with_texts=False).all_retracted
+        findings = [
+            f for f in investigation_tools._only_findings(_read_jsonl(findings_path))
+            if str(f.get("id", "")) not in retracted
+        ]
         return best_id, findings[-10:] if len(findings) > 10 else findings
     except Exception:
         return None, None
@@ -9046,7 +9540,16 @@ def causal_edges_list(investigation_id: str) -> str:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found"})
     try:
         edges_path = inv_path / "causal_edges.jsonl"
-        raw = _read_jsonl(edges_path)
+        # An edge touching a retracted finding is dropped (and counted), not served.
+        _retracted = build_recall_filter(MEMORY_DIR, [investigation_id], with_texts=False).all_retracted
+        raw = [e for e in _read_jsonl(edges_path) if isinstance(e, dict)]
+        _kept = [
+            e for e in raw
+            if str(e.get("source_id") or "") not in _retracted
+            and str(e.get("target_id") or "") not in _retracted
+        ]
+        _excluded_edges = len(raw) - len(_kept)
+        raw = _kept
         edges = [
             {
                 "id": str(e.get("id") or ""),
@@ -9059,7 +9562,7 @@ def causal_edges_list(investigation_id: str) -> str:
             for e in raw
             if isinstance(e, dict)
         ]
-        return json.dumps({"edges": edges, "count": len(edges)})
+        return json.dumps({"edges": edges, "count": len(edges), "excluded_retracted_edges": _excluded_edges})
     except Exception as exc:
         return json.dumps({"error": str(exc), "edges": [], "count": 0})
 
@@ -9103,6 +9606,26 @@ def _confidence_retrieve(query: str, top_k: int) -> tuple[list, Optional[str]]:
         return [], "search_failed"
 
     return results, None
+
+
+def _confidence_evidence_ref(r) -> dict:
+    """One evidence_refs row for memory_confidence from a Qdrant search result.
+
+    Results are ScoredPoint-shaped (``.id``/``.score``/``.payload``), exactly as
+    _confidence_cues reads them -- not dicts. Plain dicts are still accepted so a
+    caller that hands in pre-flattened rows keeps working.
+    """
+    if isinstance(r, dict):
+        pl, point_id, score = r, r.get("id"), r.get("score")
+    else:
+        pl = dict(getattr(r, "payload", None) or {})
+        point_id, score = getattr(r, "id", None), getattr(r, "score", None)
+    return {
+        "finding_id": str(pl.get("finding_id") or pl.get("id") or point_id or ""),
+        "source": str(pl.get("source") or ""),
+        "investigation_id": str(pl.get("investigation_id") or ""),
+        "score": round(_safe_float(score, 0.0), 4),
+    }
 
 
 def _confidence_cues(results: list) -> dict:
@@ -9419,15 +9942,7 @@ def memory_confidence(
                 "delta": round(float(_confidence_bias.get("delta", 0.0) or 0.0), 3),
                 "provenance": "deterministic_derived",
             },
-            "evidence_refs": [
-                {
-                    "finding_id": str(r.get("finding_id") or r.get("id") or ""),
-                    "source": str(r.get("source") or ""),
-                    "investigation_id": str(r.get("investigation_id") or ""),
-                    "score": round(_safe_float(r.get("score"), 0.0), 4),
-                }
-                for r in results[:5]
-            ],
+            "evidence_refs": [_confidence_evidence_ref(r) for r in results[:5]],
         },
     }
     if isinstance(llm_entailment, dict):
@@ -9453,7 +9968,8 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
 
     Rewrites findings.jsonl atomically, updating the tier field of the target
     finding. Returns a dict with {finding_id, old_tier, new_tier, ok} or {error}.
-    All Qdrant operations are fail-open.
+    Qdrant failures never undo the JSONL change, but they do set ok:false:
+    ``ok`` means the index matches the recorded tier.
     """
     if new_tier not in {"hot", "warm", "cold"}:
         return {"error": "tier must be one of: hot, warm, cold"}
@@ -9474,30 +9990,19 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
                 return {"error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."}
 
             old_tier = target.get("tier", "warm")
-            if old_tier == new_tier:
-                return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
-
             text = str(target.get("text", "") or "")
-            for f in findings:
-                if str(f.get("id", "")) == finding_id:
-                    f["tier"] = new_tier
-
-            dir_ = findings_path.parent
-            tmp_fd, tmp_name = tempfile.mkstemp(dir=dir_, suffix=".tmp")
-            try:
-                with os.fdopen(tmp_fd, "w") as tf:
-                    for f in findings:
-                        tf.write(json.dumps(f) + "\n")
-                tmp_path = Path(tmp_name)
-                tmp_path.replace(findings_path)
-            finally:
-                try:
-                    Path(tmp_name).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            # Same tier: nothing to rewrite, but the index step below still runs.
+            # A promote whose upsert failed reports ok:false and must be
+            # retryable; returning ok:true here would skip the upsert on retry.
+            if old_tier != new_tier:
+                # Line-preserving rewrite: a torn or unparseable line stays as it is.
+                inv_store._rewrite_jsonl_preserving(
+                    findings_path,
+                    lambda f: {**f, "tier": new_tier} if str(f.get("id", "")) == finding_id else None,
+                )
 
             # If promoting to hot, update manifest notes before releasing the lock.
-            if new_tier == "hot":
+            if new_tier == "hot" and old_tier != "hot":
                 manifest = _load_manifest_fresh(investigation_id)
                 if manifest is None:
                     raise FileNotFoundError(f"Investigation '{investigation_id}' not found.")
@@ -9510,27 +10015,48 @@ def _change_finding_tier(investigation_id: str, finding_id: str, new_tier: str) 
     except Exception as exc:
         return {"error": f"Failed to rewrite findings.jsonl: {exc}"}
 
-    # Handle Qdrant changes based on tier transition
+    # Handle Qdrant changes based on tier transition. hot and warm are documented
+    # as "Qdrant indexed", so a tier change into them succeeds only when the
+    # upsert actually landed; _qdrant_upsert returns False on a swallowed failure
+    # (no client, embed failure, upsert exception).
+    result = {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
     try:
         if new_tier == "cold":
             # Remove from Qdrant vector index
             client, col = _get_qdrant()
-            if client is not None:
+            if client is None:
+                # Unknown, not "removed": the point may still be in the index.
+                result["qdrant_removed"] = None
+                result["degraded"] = True
+            else:
                 try:
                     from qdrant_client.models import PointIdsList
                     client.delete(col, points_selector=PointIdsList(points=[finding_id]))
+                    result["qdrant_removed"] = True
                 except Exception as exc:
                     logger.warning("Qdrant delete failed (demote to cold) — JSONL updated: %s", exc)
-        elif new_tier in ("warm", "hot") and old_tier == "cold":
-            # Re-index in Qdrant (was cold, now searchable)
-            _qdrant_upsert(finding_id, text, target)
-        elif new_tier == "hot" and old_tier == "warm":
-            # Already in Qdrant; just ensure it stays indexed (upsert is idempotent)
-            _qdrant_upsert(finding_id, text, target)
+                    result.update(ok=False, qdrant_removed=False, degraded=True,
+                                  error=f"tier recorded as cold but the Qdrant point was not removed: {exc}")
+        elif old_tier == "hot":
+            # hot -> hot/warm: the point is already indexed; nothing to re-assert.
+            pass
+        else:
+            # cold -> warm/hot re-indexes; warm -> hot and a same-tier retry
+            # re-assert the point (upsert is idempotent).
+            indexed = bool(_qdrant_upsert(finding_id, text, target))
+            result["qdrant_indexed"] = indexed
+            if not indexed:
+                result.update(
+                    ok=False, degraded=True, retryable=True,
+                    error=(f"tier recorded as {new_tier} but the finding was not indexed in "
+                           "Qdrant (unavailable, embedding failed or upsert failed); "
+                           "retry memory_promote once Qdrant is reachable"),
+                )
     except Exception as exc:
-        logger.warning("Qdrant tier-change operation failed (fail-open): %s", exc)
+        logger.warning("Qdrant tier-change operation failed: %s", exc)
+        result.update(ok=False, degraded=True, error=f"Qdrant tier-change operation failed: {exc}")
 
-    return {"finding_id": finding_id, "old_tier": old_tier, "new_tier": new_tier, "ok": True}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -9576,7 +10102,8 @@ def loci_validated_knowledge_promotion(
     if not investigation_id or not finding_id:
         return json.dumps({"status": "blocked", "error": "investigation_id and finding_id are required."})
 
-    findings = _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl")
+    findings = inv_store._fold_provenance_overrides(
+        _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"), investigation_id)
     finding = next((f for f in findings if str(f.get("id") or "") == str(finding_id)), None)
     if not finding:
         return json.dumps({"status": "blocked", "error": f"Finding '{finding_id}' not found in investigation '{investigation_id}'."})
@@ -9597,29 +10124,33 @@ def loci_validated_knowledge_promotion(
         return json.dumps({"status": "blocked", "reason": "retracted_finding", "finding_id": finding_id})
 
     text = str(finding.get("text") or "")
-    evidence_tier = str(finding.get("evidence_provenance_tier") or "tool_verified")
+    # Same reader as verify_all: honours metadata.provenance_tier / evidence_kind aliases;
+    # an untagged (defaulted) finding is gated like model_asserted.
+    evidence_tier = firewall_candidate_tier(finding)
     import verify as _v
     verify_result = _v.verify_finding(
         text,
         investigation_id=investigation_id,
         finding_id=finding_id,
         candidate_provenance_tier=evidence_tier,
+        evidence_rows=_firewall_linked_evidence(investigation_id, finding),
     )
 
-    if verify_result.get("verdict") != "confirmed":
+    # verify_finding attaches provenance_firewall only when it blocked; absent means it passed.
+    firewall = verify_result.get("provenance_firewall")
+    if isinstance(firewall, dict) and not firewall.get("allowed", True):
         return json.dumps({
             "status": "blocked",
-            "reason": "verification_gate_failed",
+            "reason": "provenance_firewall",
             "finding_id": finding_id,
             "verification": verify_result,
             "promotion": None,
         })
 
-    firewall = verify_result.get("provenance_firewall") or {}
-    if not firewall.get("allowed", False):
+    if verify_result.get("verdict") != "confirmed":
         return json.dumps({
             "status": "blocked",
-            "reason": "provenance_firewall",
+            "reason": "verification_gate_failed",
             "finding_id": finding_id,
             "verification": verify_result,
             "promotion": None,
@@ -9653,7 +10184,8 @@ def loci_validated_knowledge_promotion(
     promotion = json.loads(memory_promote(investigation_id, finding_id, promoted_tier))
     return json.dumps({
         "status": "promoted" if promotion.get("ok") else "blocked",
-        "reason": "verified_repeat_promoted" if repeat_count > 0 else "verified_promoted",
+        "reason": ("promotion_failed" if not promotion.get("ok")
+                   else "verified_repeat_promoted" if repeat_count > 0 else "verified_promoted"),
         "finding_id": finding_id,
         "target_tier": promoted_tier,
         "repeat_count": repeat_count,
@@ -9684,7 +10216,11 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
         tier: Target tier — "hot", "warm", or "cold".
 
     Returns:
-        JSON: {finding_id, old_tier, new_tier, ok: true}
+        JSON: {finding_id, old_tier, new_tier, ok, qdrant_indexed}
+        ``ok`` is true only when the finding reached the Qdrant index. When the
+        upsert fails (Qdrant down, embedding failed) the tier is still recorded
+        but the reply is ``ok:false, degraded:true, retryable:true``; calling
+        memory_promote again with the same tier retries the index write.
         On error: {error: "<message>"}
     """
     try:
@@ -9868,6 +10404,7 @@ def investigation_reason(
                     source="investigation_reason",
                     confidence="medium",
                     tags="reasoned,investigation_reason",
+                    evidence_provenance_tier=MODEL_ASSERTED,
                 ))
                 if res.get("finding_id"):
                     persisted.append(res["finding_id"])
@@ -10570,6 +11107,18 @@ def memory_route(
                 "routed": [],
             })
 
+        # Retracted findings keep their Qdrant point (flagged retracted=true);
+        # drop them, and every hit from an investigation the caller cannot read,
+        # before ranking, so neither they nor the include_trace candidate list
+        # leak. agent_id is caller-supplied and can only narrow the ACL identity.
+        _route_rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in raw_hits if r.get("investigation_id")},
+            with_texts=False,
+        )
+        raw_hits, _route_retracted = _route_rfilter.split(raw_hits)
+        raw_hits, _route_acl_excluded = inv_store._acl_filter_rows(raw_hits, agent_id)
+
         policy_run = _route_apply_policy(
             raw_hits,
             top_k=top_k,
@@ -10591,6 +11140,9 @@ def memory_route(
             "total_before_dedup": metrics["candidate_count"],
             "total_after_dedup": metrics["after_top_k"],
             "count": len(routed),
+            "excluded_retracted": len(_route_retracted),
+            "excluded_acl": _route_acl_excluded,
+            "retraction_filter": _route_rfilter.status(),
             "routing_aggregation": aggregation,
             "slow_modulation": {
                 "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
@@ -11285,11 +11837,12 @@ from graph_tools import (  # noqa: E402,F401
 # Local-model / embedding passthrough tools live in llm_tools.py (P2a of the split).
 import llm_tools  # noqa: E402
 llm_tools.register(mcp)
+llm_tools.linked_evidence_fn = _firewall_linked_evidence
 # Re-exported so server.<tool>() keeps resolving for in-process callers and tests.
 from llm_tools import (  # noqa: E402,F401
     llm_local, generate_batch, query_expand, verify_finding, adversarial_review,
     classify_text, compress_text, semantic_dedup, semantic_relevance, ground,
-    swarm_reason,
+    swarm_reason, offload_tool_loop,
 )
 
 # Memory root injected as a lambda over MEMORY_DIR; collaborators are passed in so investigation_tools never imports server.
@@ -11311,6 +11864,13 @@ from investigation_tools import (  # noqa: E402,F401
     investigation_queue_status, investigation_queue_list,
 )
 
+# Real tools are injected into the offload loop here (server.py may run as __main__, so it cannot resolve them itself).
+import offload_loop  # noqa: E402
+offload_loop.bind_tools(
+    {n: globals()[n] for n in offload_loop.TOOL_SPECS if n in globals()},
+    lambda: MEMORY_DIR,
+)
+
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0:0:0:0:0:0:0:1"})
 
@@ -11330,14 +11890,34 @@ class _BearerAuthMiddleware:
 
     /health stays open so liveness probes work without the secret; it returns a
     fixed {"status": "ok"} and discloses nothing.
+
+    Per-agent tokens (``LOCI_MCP_AGENT_TOKENS``, ``{token: agent_id}`` here)
+    are what bind a caller's identity to the transport: a request presenting one
+    has that agent id written into the ASGI scope under
+    ``caller_identity.SCOPE_KEY``, which the ACL checks read in place of the
+    self-declared ``requesting_agent_id``. The shared token authenticates but
+    cannot tell callers apart, so it binds nothing.
     """
 
-    __slots__ = ("_app", "_token", "_exempt")
+    __slots__ = ("_app", "_token", "_exempt", "_agent_tokens")
 
-    def __init__(self, app, token: str, exempt_paths=frozenset({"/health"})):
+    def __init__(self, app, token: str, exempt_paths=frozenset({"/health"}), agent_tokens=None):
         self._app = app
-        self._token = token
+        self._token = token or ""
         self._exempt = exempt_paths
+        self._agent_tokens = dict(agent_tokens or {})
+
+    def _match(self, presented: str):
+        """(authenticated, bound agent id or None), checking every token."""
+        ok = False
+        agent = None
+        if self._token and hmac.compare_digest(presented, self._token):
+            ok = True
+        # No early exit: the loop's timing does not depend on which token matched.
+        for tok, agent_id in self._agent_tokens.items():
+            if hmac.compare_digest(presented, tok):
+                ok, agent = True, agent_id
+        return ok, agent
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") != "http" or scope.get("path") in self._exempt:
@@ -11347,7 +11927,8 @@ class _BearerAuthMiddleware:
         value = raw.decode("latin-1") if isinstance(raw, bytes) else str(raw)
         presented = value[7:] if value[:7].lower() == "bearer " else ""
         # compare_digest on both branches: == leaks token length/prefix, and an early return leaks whether a token was presented.
-        if not (presented and hmac.compare_digest(presented, self._token)):
+        ok, agent = self._match(presented) if presented else (False, None)
+        if not ok:
             body = b'{"error":"unauthorized"}'
             await send({"type": "http.response.start", "status": 401,
                         "headers": [(b"content-type", b"application/json"),
@@ -11355,8 +11936,267 @@ class _BearerAuthMiddleware:
                                     (b"www-authenticate", b"Bearer")]})
             await send({"type": "http.response.body", "body": body})
             return
+        scope = dict(scope)
+        if agent:
+            scope[caller_identity.SCOPE_KEY] = agent
+        else:
+            scope.pop(caller_identity.SCOPE_KEY, None)
         await self._app(scope, receive, send)
 
+
+# ---------------------------------------------------------------------------
+# Brain cluster inference tools
+# ---------------------------------------------------------------------------
+
+def _cluster_state_path() -> str:
+    path = os.environ.get("FLYBRAIN_CLUSTER_STATE_PATH", "").strip()
+    if not path:
+        raise ValueError(
+            "FLYBRAIN_CLUSTER_STATE_PATH is not set. "
+            "Point it at the brain_cluster_promotion_state.json written by run_brain_cluster_p0_dry_run."
+        )
+    return path
+
+
+def _load_promoted_bundle():
+    import flybrain_brain_cluster as fbc
+    state = fbc.read_brain_cluster_promotion_state(_cluster_state_path())
+    if state.promoted is None:
+        raise ValueError("No promoted brain cluster artifact. Run and promote the training pipeline first.")
+    return fbc.load_brain_cluster_artifacts(state.promoted.manifest_path)
+
+
+@mcp.tool()
+def flybrain_cluster_describe() -> str:
+    """Describe the currently promoted brain cluster -- experts, regions, labels, and validation metrics.
+
+    Reads the active promotion state from FLYBRAIN_CLUSTER_STATE_PATH and returns a
+    summary of every regional expert: which brain region it covers, the neuron-type labels
+    it can predict, its validation accuracy and sample counts, and the promotion timestamp.
+
+    Returns:
+        JSON with promoted artifact metadata, per-expert summaries, and routing table.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"error": str(exc), "ok": False})
+
+    router = bundle.router
+    experts_payload = bundle.experts
+    manifest = bundle.manifest
+
+    experts_out = []
+    for expert in experts_payload.get("experts", []):
+        expert_id = expert.get("expert_id", "")
+        region = expert.get("region", "")
+        shadow = expert.get("shadow_replay", {})
+        experts_out.append({
+            "expert_id": expert_id,
+            "region": region,
+            "confidence": shadow.get("confidence"),
+            "confidence_calibration": shadow.get("confidence_calibration"),
+            "provenance_refs": shadow.get("provenance_refs", []),
+        })
+
+    return json.dumps({
+        "ok": True,
+        "artifact_id": manifest.artifact_id,
+        "artifact_version": manifest.artifact_version,
+        "expert_count": len(experts_out),
+        "experts": experts_out,
+        "routing_table": router.get("routes_by_task_type", router.get("routes", {})),
+        "router_schema_version": router.get("schema_version"),
+        "experts_schema_version": experts_payload.get("schema_version"),
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_cluster_classify(
+    samples: str,
+    expert_id: str = "",
+) -> str:
+    """Classify one or more neurons using the promoted brain cluster models.
+
+    Each sample is routed to the appropriate regional expert (Naive-Bayes classifier)
+    and scored. The expert is selected by matching region_id to the trained experts;
+    pass expert_id to override and force a specific expert for all samples.
+
+    Args:
+        samples: JSON list of objects, each with sample_id (str), region_id (str),
+            and input_text (str -- the wiring description text for the neuron).
+        expert_id: Optional expert ID override (e.g. 'MB_expert'). When set, all
+            samples are scored against this expert regardless of region_id.
+
+    Returns:
+        JSON with predicted_label, confidence, expert_id, abstained per sample.
+    """
+    try:
+        raw_samples = json.loads(samples)
+        if not isinstance(raw_samples, list):
+            return json.dumps({"ok": False, "error": "samples must be a JSON array"})
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    import flybrain_brain_cluster_training as fbct
+
+    experts_payload = bundle.experts
+    region_to_expert: dict[str, str] = {}
+    for exp in experts_payload.get("experts", []):
+        eid = exp.get("expert_id", "")
+        rid = exp.get("region", "")
+        if eid and rid:
+            region_to_expert[rid] = eid
+
+    try:
+        manifest_dict = bundle.manifest.as_dict()
+        artifact_root_rel = manifest_dict.get("artifact", {}).get("root", "artifacts")
+        manifest_dir = Path(manifest_dict.get("manifest_path", "")).parent
+        artifact_root = (manifest_dir / artifact_root_rel).resolve() if manifest_dir != Path("") else None
+    except Exception:
+        artifact_root = None
+
+    model_cache: dict[str, Any] = {}
+
+    def _load_model(eid: str, rid: str):
+        if eid in model_cache:
+            return model_cache[eid]
+        if not artifact_root or not artifact_root.is_dir():
+            return None
+        for candidate in sorted(artifact_root.glob(f"*{rid}*.json")) + sorted(artifact_root.glob(f"*{eid}*.json")):
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                m = payload.get("model")
+                if isinstance(m, dict) and "labels" in m and "log_probs" in m:
+                    model_cache[eid] = m
+                    return m
+            except Exception:
+                continue
+        return None
+
+    predictions = []
+    for row in raw_samples:
+        sid = str(row.get("sample_id", "")).strip()
+        rid = str(row.get("region_id", "")).strip()
+        text = str(row.get("input_text", "")).strip()
+        if not sid:
+            predictions.append({"sample_id": sid, "error": "sample_id required", "abstained": True})
+            continue
+        if not text:
+            predictions.append({"sample_id": sid, "error": "input_text required", "abstained": True})
+            continue
+        eid = expert_id.strip() if expert_id.strip() else region_to_expert.get(rid, "")
+        if not eid:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": None, "abstained": True,
+                                 "reason": f"no expert for region_id={rid!r}"})
+            continue
+        resolved_rid = rid or next((r for r, e in region_to_expert.items() if e == eid), "")
+        model = _load_model(eid, resolved_rid)
+        if model is None:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": eid, "abstained": True, "reason": "model artifact not found"})
+            continue
+        try:
+            label, confidence = fbct._predict_multinomial_nb(model, text)
+            predictions.append({"sample_id": sid, "predicted_label": label,
+                                 "confidence": round(confidence, 6), "expert_id": eid, "abstained": False})
+        except Exception as exc:
+            predictions.append({"sample_id": sid, "predicted_label": "abstain", "confidence": 0.0,
+                                 "expert_id": eid, "abstained": True, "reason": str(exc)[:200]})
+
+    return json.dumps({
+        "ok": True,
+        "prediction_count": len(predictions),
+        "abstained_count": sum(1 for p in predictions if p.get("abstained")),
+        "predictions": predictions,
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_cluster_route(
+    task_type: str,
+) -> str:
+    """Return which expert(s) the router assigns for a given task type.
+
+    The brain cluster router maps task types (e.g. 'verification', 'analysis')
+    to regional expert IDs in priority order. Pass 'default' to see fallback routing.
+
+    Args:
+        task_type: Task type string to route (e.g. 'verification', 'analysis', 'default').
+
+    Returns:
+        JSON with experts list, fallback_used flag, and full routing table.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    routes = bundle.router.get("routes_by_task_type") or bundle.router.get("routes") or {}
+    matched = routes.get(task_type) or routes.get("default") or []
+    return json.dumps({
+        "ok": True,
+        "task_type": task_type,
+        "experts": matched,
+        "fallback_used": task_type not in routes and "default" in routes,
+        "all_routes": routes,
+        "router_schema_version": bundle.router.get("schema_version"),
+    }, indent=2)
+
+
+@mcp.tool()
+def flybrain_expert_inspect(
+    expert_id: str = "",
+    region_id: str = "",
+) -> str:
+    """Inspect a specific regional expert from the promoted brain cluster.
+
+    Returns the expert's validation confidence, calibration method, provenance
+    references, and training artifact fingerprints. Either expert_id (e.g. 'MB_expert')
+    or region_id (e.g. 'MB') is required.
+
+    Args:
+        expert_id: Expert identifier (e.g. 'MB_expert').
+        region_id: Brain region identifier (e.g. 'MB'); resolved to expert_id automatically.
+
+    Returns:
+        JSON with expert metadata, validation stats, and shadow-replay configuration.
+    """
+    try:
+        bundle = _load_promoted_bundle()
+    except (ValueError, Exception) as exc:
+        return json.dumps({"ok": False, "error": str(exc)})
+
+    eid = expert_id.strip()
+    rid = region_id.strip()
+    experts = bundle.experts.get("experts", [])
+    match = next(
+        (e for e in experts if (eid and e.get("expert_id") == eid) or (rid and e.get("region") == rid)),
+        None,
+    )
+    if match is None:
+        return json.dumps({
+            "ok": False,
+            "error": f"Expert not found. expert_id={eid!r} region_id={rid!r}",
+            "available_experts": [e.get("expert_id") for e in experts],
+        })
+
+    shadow = match.get("shadow_replay", {})
+    training = match.get("training_artifact", {})
+    return json.dumps({
+        "ok": True,
+        "expert_id": match.get("expert_id"),
+        "region": match.get("region"),
+        "confidence": shadow.get("confidence"),
+        "confidence_calibration": shadow.get("confidence_calibration"),
+        "provenance_refs": shadow.get("provenance_refs", []),
+        "replay_fingerprint_mode": shadow.get("replay_fingerprint_mode"),
+        "model_fingerprint": training.get("model_fingerprint"),
+        "metrics_fingerprint": training.get("metrics_fingerprint"),
+        "shadow_replay_config": shadow,
+    }, indent=2)
 
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
@@ -11373,7 +12213,14 @@ def main() -> None:
 
         # A token is what makes a NON-loopback bind defensible; without one we refuse rather than serve.
         token = os.environ.get("LOCI_MCP_TOKEN", "").strip()
-        if not token and not _is_loopback(mcp.settings.host):
+        try:
+            agent_tokens = caller_identity.load_agent_tokens()
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"refusing to start: LOCI_MCP_AGENT_TOKENS is unusable: {exc}")
+        if token and token in agent_tokens:
+            raise SystemExit("refusing to start: LOCI_MCP_TOKEN is also a per-agent token; "
+                             "a shared secret cannot also be one agent's identity")
+        if not token and not agent_tokens and not _is_loopback(mcp.settings.host):
             raise SystemExit(
                 f"refusing to serve {transport} on {mcp.settings.host} without "
                 "LOCI_MCP_TOKEN: this would expose every tool unauthenticated. "
@@ -11383,8 +12230,11 @@ def main() -> None:
 
         app = (mcp.streamable_http_app() if transport == "streamable-http"
                else mcp.sse_app())
-        if token:
-            app = _BearerAuthMiddleware(app, token)
+        if token or agent_tokens:
+            app = _BearerAuthMiddleware(app, token, agent_tokens=agent_tokens)
+            if agent_tokens:
+                logger.info("per-agent MCP tokens configured for %d agent(s); ACL identity "
+                            "is bound from the bearer token", len(set(agent_tokens.values())))
         else:
             logger.warning("LOCI_MCP_TOKEN is not set — serving %s on %s with no "
                            "authentication. Safe only because the bind is loopback.",

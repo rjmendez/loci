@@ -89,6 +89,51 @@ def _alive(url: str, timeout: float = 1.0) -> bool:
         return False
 
 
+def _http_probe(url: str, path: str = "", timeout: float = 1.0,
+                headers: "dict | None" = None) -> "tuple[bool, object]":
+    """Bounded HTTP GET of ``url + path``. Returns ``(ok, parsed_json_or_None)``. Never raises.
+
+    ``_alive`` only proves a socket accepts: a hung Qdrant, or a local relay whose
+    upstream is dead, passes it. This proves the service answers a request.
+    """
+    if not url:
+        return False, None
+    try:
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(url.rstrip("/") + path, headers=headers or {}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — operator-configured URL
+            ok = 200 <= resp.status < 400
+            body = resp.read(1_000_000)
+        try:
+            return ok, _json.loads(body) if body else None
+        except Exception:
+            return ok, None
+    except Exception as exc:
+        logger.debug("_http_probe %s%s failed: %r", url, path, exc)
+        return False, None
+
+
+def _http_status(url: str, path: str = "", timeout: float = 1.0,
+                 headers: "dict | None" = None) -> "int | None":
+    """HTTP status of a bounded GET of ``url + path`` (4xx/5xx included), or None
+    when nothing answered (refused, timeout, DNS). Never raises."""
+    if not url:
+        return None
+    try:
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(url.rstrip("/") + path, headers=headers or {}, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — operator-configured URL
+                return int(resp.status)
+        except urllib.error.HTTPError as exc:
+            return int(exc.code)
+    except Exception as exc:
+        logger.debug("_http_status %s%s failed: %r", url, path, exc)
+        return None
+
+
 @functools.lru_cache(maxsize=1)
 def _ollama_local_tags() -> set[str]:
     """Best-effort local Ollama tag inventory. Never raises."""
@@ -327,6 +372,213 @@ def openrouter() -> tuple[str, str]:
     return (os.environ.get("OPENROUTER_BASE_URL")
             or _cfg("openrouter", "url", "") or "https://openrouter.ai/api/v1",
             os.environ.get("OPENROUTER_API_KEY") or _cfg("openrouter", "key", "") or "")
+
+
+def openrouter_model(role: str | None = None) -> str:
+    """OpenRouter model resolver for cloud-tier routing.
+
+    Resolution order: role env -> role config -> shared env -> shared config -> default.
+    """
+    if role:
+        env = os.environ.get(_vllm_role_env("OPENROUTER_MODEL", role))
+        if env:
+            return env
+        configured = _cfg_nested("openrouter", role, "model", "") or ""
+        if configured:
+            return configured
+    return (os.environ.get("OPENROUTER_MODEL")
+            or _cfg("openrouter", "model", "")
+            or "qwen/qwen3.8-27b:free")
+
+
+def abliteration() -> tuple[str, str]:
+    """(base_url, api_key) for Abliteration cloud escalation."""
+    return (os.environ.get("ABLITERATION_BASE_URL")
+            or _cfg("abliteration", "url", "") or "https://api.abliteration.ai/v1",
+            os.environ.get("ABLITERATION_API_KEY") or _cfg("abliteration", "key", "") or "")
+
+
+def abliteration_model(role: str | None = None) -> str:
+    """Abliteration model resolver for cloud-tier routing."""
+    if role:
+        env = os.environ.get(_vllm_role_env("ABLITERATION_MODEL", role))
+        if env:
+            return env
+        configured = _cfg_nested("abliteration", role, "model", "") or ""
+        if configured:
+            return configured
+    return (os.environ.get("ABLITERATION_MODEL")
+            or _cfg("abliteration", "model", "")
+            or "abliterated-model")
+
+
+def cloud_tier_enabled() -> bool:
+    """Enable cloud third-tier fallback orchestration."""
+    v = (os.environ.get("LOCI_CLOUD_TIER_ENABLED")
+         or _cfg("cloud", "enabled", False))
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _int_nonneg(v, default: int = 0) -> int:
+    try:
+        n = int(v)
+    except Exception:
+        return default
+    return max(0, n)
+
+
+def _boolish(v, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _csvish_set(v) -> set[str]:
+    if v is None:
+        return set()
+    if isinstance(v, (list, tuple, set)):
+        raw = [str(x) for x in v]
+    else:
+        raw = str(v).split(",")
+    out = {s.strip().lower() for s in raw if str(s).strip()}
+    return out
+
+
+def _role_session_map(v) -> dict[str, str]:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        pairs = v.items()
+    else:
+        text = str(v).strip()
+        if not text:
+            return {}
+        try:
+            import json
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                pairs = parsed.items()
+            else:
+                pairs = []
+        except Exception:
+            pairs = []
+        if not pairs:
+            pairs = []
+            for token in text.split(","):
+                if "=" not in token:
+                    continue
+                role, session = token.split("=", 1)
+                pairs.append((role, session))
+    out: dict[str, str] = {}
+    for role, session in pairs:
+        rk = str(role).strip().lower()
+        sv = str(session).strip()
+        if rk and sv:
+            out[rk] = sv
+    return out
+
+
+def cloud_max_tokens_per_call() -> int:
+    """Per-call cloud tier token ceiling (0 disables guardrail)."""
+    return _int_nonneg(
+        os.environ.get("LOCI_CLOUD_TIER_MAX_TOKENS_PER_CALL",
+                       _cfg("cloud", "max_tokens_per_call", 0)),
+        default=0,
+    )
+
+
+def cloud_daily_call_budget() -> int:
+    """Max cloud fallback calls per UTC day (0 disables guardrail)."""
+    return _int_nonneg(
+        os.environ.get("LOCI_CLOUD_TIER_DAILY_CALL_BUDGET",
+                       _cfg("cloud", "daily_call_budget", 0)),
+        default=0,
+    )
+
+
+def cloud_daily_token_budget() -> int:
+    """Max requested cloud fallback tokens per UTC day (0 disables guardrail)."""
+    return _int_nonneg(
+        os.environ.get("LOCI_CLOUD_TIER_DAILY_TOKEN_BUDGET",
+                       _cfg("cloud", "daily_token_budget", 0)),
+        default=0,
+    )
+
+
+def cloud_deny_providers() -> set[str]:
+    """Denied cloud providers (openrouter, abliteration)."""
+    return _csvish_set(
+        os.environ.get("LOCI_CLOUD_TIER_DENY_PROVIDERS",
+                       _cfg("cloud", "deny_providers", ""))
+    )
+
+
+def cloud_deny_roles() -> set[str]:
+    """Denied routing roles (triage/coding/reasoning/synthesis/redteam)."""
+    return _csvish_set(
+        os.environ.get("LOCI_CLOUD_TIER_DENY_ROLES",
+                       _cfg("cloud", "deny_roles", ""))
+    )
+
+
+def cloud_allowed_roles() -> set[str]:
+    """Allow-list for routing roles (empty means all roles allowed)."""
+    return _csvish_set(
+        os.environ.get("LOCI_CLOUD_TIER_ALLOWED_ROLES",
+                       _cfg("cloud", "allowed_roles", ""))
+    )
+
+
+def cloud_budget_state_path() -> str:
+    """State file used for daily cloud budget accounting."""
+    return (os.environ.get("LOCI_CLOUD_TIER_BUDGET_STATE_PATH")
+            or _cfg("cloud", "budget_state_path", "")
+            or str(Path.home() / ".loci" / "cloud_tier_budget.json"))
+
+
+def cloud_supervisor_model() -> str:
+    """Local supervisor model used to dispatch unspecified model requests."""
+    return (os.environ.get("LOCI_CLOUD_TIER_SUPERVISOR_MODEL")
+            or _cfg("cloud", "supervisor_model", "")
+            or ollama_verify_model())
+
+
+def tmux_offload_enabled() -> bool:
+    """Enable tmux-lane policy for offload execution."""
+    return _boolish(
+        os.environ.get("LOCI_TMUX_OFFLOAD_ENABLED",
+                       _cfg("tmux_offload", "enabled", False)),
+        default=False,
+    )
+
+
+def tmux_offload_role_sessions() -> dict[str, str]:
+    """Role -> tmux session mapping for offload lanes."""
+    return _role_session_map(
+        os.environ.get("LOCI_TMUX_OFFLOAD_ROLE_SESSIONS",
+                       _cfg("tmux_offload", "role_sessions", {}))
+    )
+
+
+def tmux_offload_expensive_roles() -> set[str]:
+    """Roles considered expensive and lane-priority worthy."""
+    return _csvish_set(
+        os.environ.get("LOCI_TMUX_OFFLOAD_EXPENSIVE_ROLES",
+                       _cfg("tmux_offload", "expensive_roles", ""))
+    )
+
+
+def tmux_offload_require_mapped_session() -> bool:
+    """Fail closed when a mapped tmux session is unavailable."""
+    return _boolish(
+        os.environ.get("LOCI_TMUX_OFFLOAD_REQUIRE_MAPPED_SESSION",
+                       _cfg("tmux_offload", "require_mapped_session", False)),
+        default=False,
+    )
 
 
 def memory_dir() -> str:

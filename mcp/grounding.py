@@ -16,10 +16,13 @@ an import cycle.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 from untrusted_memory import wrap_untrusted_memory_text
@@ -174,28 +177,103 @@ def _jload(s: Any) -> dict | list | None:
         return None
 
 
+# Wall-clock budget for one ground() call. Lanes call into Qdrant, the embedder and (via
+# RAG query expansion) a local LLM with 120s per-request timeouts; without a deadline one
+# slow backend held ground() past the MCP client's 300s idle abort. <=0 disables.
+_GROUND_DEADLINE_DEFAULT_S = 90.0
+
+
+def _deadline_seconds(opts: dict) -> Optional[float]:
+    raw = opts.get("deadlineS")
+    if raw is None:
+        raw = os.environ.get("LOCI_GROUND_DEADLINE_S", "")
+    try:
+        val = float(raw) if str(raw).strip() != "" else _GROUND_DEADLINE_DEFAULT_S
+    except (TypeError, ValueError):
+        val = _GROUND_DEADLINE_DEFAULT_S
+    return val if val > 0 else None
+
+
+class _LaneTimeout(Exception):
+    """A lane call did not finish before ground()'s deadline."""
+
+
+def _call_bounded(deadline: Optional[float], fn, *args, **kwargs):
+    """Run ``fn`` but give up once the monotonic ``deadline`` passes.
+
+    The call runs on a daemon thread; on timeout it is abandoned (it may finish in
+    the background) and ``_LaneTimeout`` is raised so the lane is marked degraded.
+    """
+    if deadline is None:
+        return fn(*args, **kwargs)
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise _LaneTimeout("deadline already passed")
+    box: dict = {}
+    ctx = contextvars.copy_context()
+
+    def _run():
+        try:
+            box["v"] = ctx.run(fn, *args, **kwargs)
+        except BaseException as exc:  # re-raised on the caller's thread
+            box["e"] = exc
+
+    t = threading.Thread(target=_run, name="ground-lane", daemon=True)
+    t.start()
+    t.join(left)
+    if t.is_alive():
+        raise _LaneTimeout(f"lane exceeded ground deadline ({left:.1f}s left)")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 def ground(task: dict, opts: Optional[dict] = None) -> dict:
     """Assemble a fail-open grounding block for a task.
 
-    Returns ``{block: str, sources: [str], chars: int, degraded: bool}``.
+    Returns ``{block: str, sources: [str], chars: int, degraded: bool,
+    degraded_lanes: [{lane, reason}]}``. ``degraded`` is true whenever a lane
+    that should have run raised, returned an error, timed out, or reported a
+    backend failure; ``degraded_lanes`` names each one, so an empty block from a
+    failed lookup is distinguishable from "nothing stored".
     ``task`` is ``{title, focus?, caseIds?, entities?, codeRefs?}``.
     ``opts`` is ``{budgetChars=4000, memoryDir=..., allowKeyword=False,
-    graphAvailable=False}``.
+    graphAvailable=False, deadlineS=LOCI_GROUND_DEADLINE_S or 90}``.
     """
     opts = opts or {}
     budget = int(opts.get("budgetChars", 4000))
     compact_mode = opts.get("mode") == "compact"
     memory_dir = opts.get("memoryDir", _MEMORY_DIR_DEFAULT)
+    # ACL: the case and RAG lanes check the transport-bound (or local) caller;
+    # a requesting agent id can only narrow that.
+    acl_kwargs = ({"requesting_agent_id": str(opts["requestingAgentId"])}
+                  if opts.get("requestingAgentId") else {})
     parts: list[str] = []
     sources: list[str] = []
-    degraded = False
+    degraded_lanes: list[dict] = []
     remaining = [budget]
+    _dl_s = _deadline_seconds(opts)
+    deadline = time.monotonic() + _dl_s if _dl_s is not None else None
 
-    def add(tag: str, text: str, slice_frac: float) -> None:
+    def mark(lane: str, reason: str) -> None:
+        entry = {"lane": lane, "reason": str(reason)[:200]}
+        if entry not in degraded_lanes:
+            degraded_lanes.append(entry)
+
+    def call(fn, *args, **kwargs):
+        return _call_bounded(deadline, fn, *args, **kwargs)
+
+    def fail(lane: str, exc: BaseException) -> None:
+        mark(lane, "timeout" if isinstance(exc, _LaneTimeout) else f"raised: {exc!r}")
+
+    def add(tag: str, text: str, slice_frac: float, framed: bool = False) -> None:
+        # framed=True: ``text`` was composed here or by rag_context_search from
+        # wrap_untrusted_memory_text frames, so compact mode must keep those frames.
         if remaining[0] <= 0 or not text:
             return
         cap = min(remaining[0], max(200, int(budget * slice_frac)))
-        chunk = compact_text(text, cap, preserve_sentence_boundary=not compact_mode) if compact_mode else _truncate(text, cap)
+        chunk = (compact_text(text, cap, preserve_sentence_boundary=not compact_mode, keep_frames=framed)
+                 if compact_mode else _truncate(text, cap))
         if compact_mode:
             chunk = re.sub(r"\s+", " ", chunk).strip()
         block = f"[{tag}] {chunk}"
@@ -214,7 +292,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         # failure returns {block:"", chars:0, degraded:False} -- byte-identical to a
         # healthy "nothing stored for this task" result, so callers consume a lookup
         # that consulted nothing as full coverage.
-        degraded = True
+        mark("server", f"import failed: {exc!r}")
 
     # 1. Named cases -> investigation_load (structured, retracted excluded). Fail-open per
     # case: a raising server tool (or malformed finding) skips that case, never aborts ground().
@@ -222,8 +300,12 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if not S:
             break
         try:
-            data = _jload(S.investigation_load(cid, last_n_findings=6))
-            if isinstance(data, dict) and not data.get("error"):
+            data = _jload(call(S.investigation_load, cid, last_n_findings=6, **acl_kwargs))
+            if isinstance(data, dict) and data.get("error"):
+                # A case that does not exist is an honest empty; any other error is a failed lookup.
+                if "not found" not in str(data.get("error")).lower():
+                    mark("case", f"{cid}: {data.get('error')}")
+            elif isinstance(data, dict):
                 man = data.get("manifest", {})
                 summary = f"{cid} :: hypothesis={man.get('hypothesis')} | next={man.get('next_step')}"
                 add(
@@ -235,22 +317,30 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                         source="investigation_load",
                     ),
                     0.12,
+                    framed=True,
                 )
                 for f in (data.get("recent_findings") or [])[:3]:
                     if isinstance(f, dict):
+                        # A superseded/fixed finding must not read as a current case fact.
+                        res = str(f.get("resolution") or "open").lower()
+                        wrapped = _wrap_untrusted_memory_text(
+                            str(f.get("text", "")),
+                            investigation_id=cid,
+                            finding_id=str(f.get("id") or ""),
+                            kind=str(f.get("record_type") or f.get("type") or "finding"),
+                            source=str(f.get("source") or "investigation_load"),
+                        )
+                        if res != "open":
+                            wrapped = f"[{res}: not current; do not rely on it] " + wrapped
                         add(
-                            f"case:{cid}:finding",
-                            _wrap_untrusted_memory_text(
-                                str(f.get("text", "")),
-                                investigation_id=cid,
-                                finding_id=str(f.get("id") or ""),
-                                kind=str(f.get("record_type") or f.get("type") or "finding"),
-                                source=str(f.get("source") or "investigation_load"),
-                            ),
+                            f"case:{cid}:finding" + ("" if res == "open" else f":{res}"),
+                            wrapped,
                             0.08,
+                            framed=True,
                         )
         except Exception as exc:
             logger.debug("grounding: case lane failed for %r: %r", cid, exc)
+            fail("case", exc)
             continue
 
     # 2. Exclusion lane: findings already resolved (fixed/intentional/wontfix) for the
@@ -264,8 +354,10 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         if not S:
             break
         try:
-            data = _jload(S.investigation_load(cid, last_n_findings=200))
+            data = _jload(call(S.investigation_load, cid, last_n_findings=200, **acl_kwargs))
             if not isinstance(data, dict) or data.get("error"):
+                if isinstance(data, dict) and "not found" not in str(data.get("error")).lower():
+                    mark("resolved", f"{cid}: {data.get('error')}")
                 continue
             for f in (data.get("recent_findings") or []):
                 if not isinstance(f, dict):
@@ -291,55 +383,76 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                 )
         except Exception as exc:
             logger.debug("grounding: resolved-findings lane failed for %r: %r", cid, exc)
+            fail("resolved", exc)
             continue
     if resolved_known:
-        add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15)
+        add("known — do NOT re-report", " • ".join(resolved_known[:12]), 0.15, framed=True)
 
     # 3. Exact entities -> entity_lookup (O(1), no embedding). Fail-open per entity.
     for ent in (task.get("entities") or [])[:5]:
         if not S:
             break
         try:
-            data = _jload(S.investigation_entity_lookup(ent, limit=3))
-            if isinstance(data, dict) and data.get("total_findings"):
+            data = _jload(call(S.investigation_entity_lookup, ent, limit=3))
+            if isinstance(data, dict) and data.get("error"):
+                mark("entity", f"{ent}: {data.get('error')}")
+            elif isinstance(data, dict) and data.get("total_findings"):
                 add(f"entity:{ent}", f"seen in {data.get('investigations_count')} case(s), "
                                      f"{data.get('total_findings')} finding(s)", 0.06)
         except Exception as exc:
             logger.debug("grounding: entity lane failed for %r: %r", ent, exc)
+            fail("entity", exc)
             continue
 
     # 4. Code graph (only if reconnected / available).
     if opts.get("graphAvailable") and task.get("codeRefs") and S:
         for ref in (task.get("codeRefs") or [])[:2]:
             try:
-                rep = _jload(S.impact_report(ref))
+                rep = _jload(call(S.impact_report, ref))
+                if isinstance(rep, dict) and rep.get("error"):
+                    mark("code_graph", f"{ref}: {rep.get('error')}")
+                elif isinstance(rep, dict) and rep.get("partial"):
+                    mark("code_graph", f"{ref}: {rep.get('queries_failed')} graph queries failed")
                 if isinstance(rep, dict) and rep.get("resolved"):
                     add(f"code:{ref}", f"callers={rep.get('transitive_caller_count')} "
                                        f"findings={rep.get('referencing_finding_count')} "
                                        f"co={[c.get('name') for c in rep.get('co_referenced', [])[:4]]}", 0.10)
             except Exception as exc:
                 logger.debug("grounding: code-graph lane failed for %r: %r", ref, exc)
-                pass
+                fail("code_graph", exc)
     elif task.get("codeRefs"):
-        degraded = True  # code-graph grounding wanted but unavailable
+        mark("code_graph", "unavailable")  # code-graph grounding wanted but unavailable
 
     # 5. Semantic RAG (enhancement; live now that embeddings are up, degraded when down).
     if S and remaining[0] > 400:
         try:
             q = f"{task.get('title','')} {task.get('focus','')}".strip()
             rag_cap = max(_RAG_BUDGET_FLOOR, int(budget * _RAG_BUDGET_FRACTION))
-            rag_kwargs = {"budget_chars": min(remaining[0], rag_cap), "limit": 6}
+            rag_kwargs = {"budget_chars": min(remaining[0], rag_cap), "limit": 6, **acl_kwargs}
             if compact_mode:
                 rag_kwargs["mode"] = "compact"
-            res = _jload(S.rag_context_search(q, **rag_kwargs))
+            res = _jload(call(S.rag_context_search, q, **rag_kwargs))
             ctx = (res or {}).get("context", "") if isinstance(res, dict) else ""
             if ctx and (res.get("result_count") or 0) > 0:
-                add("rag", ctx, _RAG_BUDGET_FRACTION)
-            elif isinstance(res, dict) and not res.get("qdrant_available", True):
-                degraded = True
+                add("rag", ctx, _RAG_BUDGET_FRACTION, framed=True)
+            # Independent of whether some context came back: a partial failure still degrades.
+            if isinstance(res, dict):
+                if not res.get("qdrant_available", True):
+                    mark("rag", "qdrant unavailable")
+                elif res.get("mode") in ("rag_failed", "rag_degraded"):
+                    mark("rag", f"{res.get('mode')}: {res.get('collections_failed')}")
+                elif res.get("error"):
+                    mark("rag", str(res.get("error")))
+                elif res.get("collections_failed"):
+                    mark("rag", f"collections failed: {res.get('collections_failed')}")
+                _rf = res.get("retraction_filter") or {}
+                if isinstance(_rf, dict) and _rf.get("status", "ok") != "ok":
+                    # Some investigation's retractions could not be read, so its hits were
+                    # served unfiltered: the block may carry retracted findings.
+                    mark("rag", f"retraction filter degraded: {_rf.get('skipped_investigations')}")
         except Exception as exc:
             logger.debug("grounding: rag lane failed for %r: %r", task.get("title", ""), exc)
-            degraded = True
+            fail("rag", exc)
 
     # Curated memory files — a SUPPLEMENT after the precise (case/RAG) lanes, so a
     # fuzzy-matched memory can never crowd them out. Capped + thresholded selection.
@@ -362,7 +475,7 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     if not memory_dir:
         sources.append("memory-lane:unconfigured")
     elif not has_index:
-        degraded = True
+        mark("memory", "configured memory dir has no MEMORY.md")
         sources.append("memory-lane:missing-index")
     else:
         for fname, line, body in _select_memory_files(task, memory_dir):
@@ -371,7 +484,12 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
     # 6. Keyword/FTS fallback (off by default; filtered) — only if structured yield was thin.
     if opts.get("allowKeyword") and S and sum(len(p) for p in parts) < 500:
         try:
-            res = _jload(S.investigation_search(f"{task.get('title','')} {task.get('focus','')}", limit=8))
+            res = _jload(call(S.investigation_search, f"{task.get('title','')} {task.get('focus','')}", limit=8))
+            if isinstance(res, dict) and res.get("error"):
+                mark("keyword", str(res.get("error")))
+            _rf = res.get("retraction_filter") if isinstance(res, dict) else None
+            if isinstance(_rf, dict) and _rf.get("status", "ok") != "ok":
+                mark("keyword", f"retraction filter degraded: {_rf.get('skipped_investigations')}")
             items = (res or {}).get("results", []) if isinstance(res, dict) else []
             for r in items[:8]:
                 r["_wrapped_text"] = _wrap_untrusted_memory_text(
@@ -382,11 +500,12 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
                     source=str(r.get("source") or "investigation_search"),
                 )
             for it in filter_noise([{"text": r.get("_wrapped_text"), "source": r.get("source")} for r in items])[:3]:
-                add("recall", str(it.get("text", "")), 0.10)
+                add("recall", str(it.get("text", "")), 0.10, framed=True)
         except Exception as exc:
             logger.debug("grounding: keyword fallback lane failed for %r: %r", task.get("title", ""), exc)
-            pass
+            fail("keyword", exc)
 
+    degraded = bool(degraded_lanes)
     if compact_mode:
         compact_parts = list(parts)
         if degraded:
@@ -400,4 +519,5 @@ def ground(task: dict, opts: Optional[dict] = None) -> dict:
         footer = ("Do not present facts absent above as remembered; if grounding is silent on a "
                   "point, say so.")
         block = header + "\n" + "\n".join(parts) + "\n" + footer if parts else ""
-    return {"block": block, "sources": sources, "chars": len(block), "degraded": degraded}
+    return {"block": block, "sources": sources, "chars": len(block), "degraded": degraded,
+            "degraded_lanes": degraded_lanes}

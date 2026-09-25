@@ -51,12 +51,12 @@ AGENT_ENSEMBLE_SPEC: Dict[str, Any] = {
         {
             "role": "decomposer",
             "responsibility": "turns a topic into atomic subtasks and source-fit decisions",
-            "runtime_entry": "scripts.swarm_escalate.SwarmConfig.decompose",
+            "runtime_entry": "scripts.swarm_escalate.decompose_subtasks",
         },
         {
             "role": "cheap_worker",
             "responsibility": "answers the majority of subtasks on the cheap tier with bounded token use",
-            "runtime_entry": "scripts.swarm_escalate._cheap_answer",
+            "runtime_entry": "scripts.swarm_escalate.answer_subtasks",
         },
         {
             "role": "triage_critic",

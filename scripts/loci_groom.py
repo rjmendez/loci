@@ -118,9 +118,13 @@ def iter_findings(memory_dir: Optional[Path] = None) -> Iterable[dict]:
                     if not line:
                         continue
                     try:
-                        yield json.loads(line)
+                        rec = json.loads(line)
                     except ValueError:
                         continue
+                    # Legacy access rows are bookkeeping, not findings.
+                    if isinstance(rec, dict) and (rec.get("record_type") or rec.get("type") or "") == "access":
+                        continue
+                    yield rec
         except OSError:
             continue
 

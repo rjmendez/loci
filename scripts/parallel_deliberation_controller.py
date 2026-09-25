@@ -226,7 +226,10 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 
 
 def _answer_polarity(text: str) -> str:
-    cooked = f" {re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', str(text or '').lower())).strip()} "
+    # Built outside the f-string: a backslash inside an f-string expression is a
+    # SyntaxError before Python 3.12, and CI runs 3.11.
+    words = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(text or "").lower())).strip()
+    cooked = f" {words} "
     if " does not " in cooked or " do not " in cooked or " not require " in cooked:
         return "negative"
     negative = any(marker in cooked for marker in _NEGATIVE_MARKERS)

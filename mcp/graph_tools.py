@@ -75,8 +75,12 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     """
     Run a read-only Cypher query against the LadybugDB graph and return rows.
 
-    Write-shaped queries (``CREATE/DELETE/SET/MERGE/DROP/COPY/ALTER``) are
-    rejected: this tool never mutates the graph. Use it for traversal or impact
+    Only a single read query is accepted: it must start with MATCH, OPTIONAL
+    MATCH, WITH, UNWIND, RETURN or CALL of a read-only introspection procedure
+    (e.g. ``show_tables()``), and may use only reading clauses. Write clauses,
+    LOAD FROM, COPY, EXPORT/IMPORT DATABASE, INSTALL/LOAD EXTENSION, ATTACH,
+    file-reading table functions, comments and ``;``-chained statements are
+    rejected. Pass literals via ``params``. Use it for traversal or impact
     analysis, e.g. callers of a symbol, symbols defined by a file, or findings
     that reference a ``CodeSymbol``.
 
@@ -102,7 +106,16 @@ def code_graph_query(cypher: str, params: Optional[dict] = None) -> str:
     if not ks:
         return json.dumps({"error": "LadybugDB graph store unavailable."})
     try:
+        # code_query fails open to [] (engine errors, lease timeouts, a closed store),
+        # which is indistinguishable from "no matches"; only its failure counter can
+        # tell them apart, and an impact query read as "no callers" is a false negative.
+        if not getattr(ks, "ok", True):
+            return json.dumps({"error": "code_graph_query failed: graph store is not open"})
+        before = getattr(ks, "code_query_failures", 0)
         rows = ks.code_query(cypher, params or None)
+        if getattr(ks, "code_query_failures", 0) != before:
+            detail = getattr(ks, "code_query_last_error", "") or "see server log"
+            return json.dumps({"error": f"code_graph_query failed: the query did not run: {detail}"})
         return json.dumps({"row_count": len(rows), "rows": rows}, indent=2, default=str)
     except ValueError as exc:  # write-guard rejection
         return json.dumps({"error": f"rejected (read-only tool): {exc}"})

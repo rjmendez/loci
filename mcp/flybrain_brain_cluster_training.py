@@ -29,10 +29,16 @@ class TrainingSample:
     expected_confidence: float
     provenance_refs: tuple[str, ...] = field(default_factory=tuple)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Structured learner inputs (numeric or categorical values) used by the
+    # feature backends in ``flybrain_learners``; the legacy NB reads only
+    # ``input_text``. Omitted from ``as_dict`` when empty so legacy dataset
+    # digests (``samples_sha256``) are unchanged.
+    features: Mapping[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not self.sample_id.strip():
             raise ValueError("sample_id is required")
+        validate_sample_features(self.features)
         if not self.region_id.strip():
             raise ValueError("region_id is required")
         if not self.input_text.strip():
@@ -45,7 +51,7 @@ class TrainingSample:
             raise ValueError("provenance_refs must be non-empty")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "sample_id": self.sample_id,
             "region_id": self.region_id,
             "input_text": self.input_text,
@@ -54,6 +60,28 @@ class TrainingSample:
             "provenance_refs": list(self.provenance_refs),
             "metadata": dict(self.metadata),
         }
+        if self.features:
+            payload["features"] = dict(self.features)
+        return payload
+
+
+_FEATURE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_sample_features(features: Mapping[str, Any]) -> None:
+    """Feature names are identifiers; values are finite numbers, bools, strings or None."""
+    if not isinstance(features, Mapping):
+        raise ValueError("features must be a mapping")
+    for key, value in features.items():
+        if not isinstance(key, str) or not _FEATURE_NAME_RE.fullmatch(key):
+            raise ValueError(f"invalid feature name: {key!r}")
+        if value is None or isinstance(value, (str, bool)):
+            continue
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"feature {key} must be finite (use None for missing)")
+            continue
+        raise ValueError(f"feature {key} has unsupported type {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -618,6 +646,7 @@ def _normalize_training_sample(raw: TrainingSample | Mapping[str, Any]) -> Train
         expected_confidence=float(raw["expected_confidence"]),
         provenance_refs=provenance_refs,
         metadata=dict(raw.get("metadata") or {}),
+        features=dict(raw.get("features") or {}),
     )
     sample.validate()
     return sample
