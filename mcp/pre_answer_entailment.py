@@ -40,11 +40,16 @@ _FASTPATH_MIN_OVERLAP = 0.72
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 # Polarity cues. The reflex only compares tokens, so "No evidence that X" contains X
 # verbatim; a support row whose negation cues differ from the claim's is left to the model.
+# The list cannot be complete (a denial can be worded any way), so the exact-match path
+# also requires the evidence to *start* with the claim (see _reflex_arc_fastpath).
 _NEGATION_TOKENS = frozenset({
     "no", "not", "never", "none", "nothing", "nobody", "neither", "nor", "without",
     "false", "untrue", "cannot", "cant", "didn", "doesn", "don", "isn", "wasn", "weren",
     "aren", "hasn", "haven", "hadn", "won", "wouldn", "couldn", "shouldn",
     "refuted", "disproved", "disproven", "unconfirmed",
+    "deny", "denies", "denied", "ruled", "incorrect", "inaccurate", "wrong", "unfounded",
+    "baseless", "unsupported", "unproven", "unverified", "disputed", "retracted",
+    "debunked", "rejected", "dismissed", "failed", "alleged", "allegedly", "whether",
 })
 
 _PROMPT_TMPL = (
@@ -182,7 +187,10 @@ def _reflex_arc_fastpath(claim: str, evidence: list[dict]) -> dict | None:
                 continue  # polarity differs: lexical overlap cannot tell support from denial
             text_norm = _normalize_lexeme_text(text)
             overlap = _lexical_overlap_ratio(claim_text, text)
-            exactish = (claim_norm in text_norm) or (text_norm in claim_norm)
+            # The claim must lead the evidence ("X and ..."), not sit inside a
+            # wrapper that can deny it ("That X was ruled out", "Vendor denied that X").
+            exactish = (text_norm == claim_norm or text_norm.startswith(claim_norm + " ")
+                        or text_norm in claim_norm)
             if exactish and overlap >= 0.85:
                 return {
                     "available": True,

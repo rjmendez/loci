@@ -258,9 +258,19 @@ _MODEL_REFUTES = '{"verdict": "refuted", "rationale": "the evidence negates the 
     {"role": "support", "text": "No evidence that Host-b executed malware."},
     {"role": "support", "text": "It is false that host-b executed malware."},
     {"role": "support", "text": "Host-b executed malware? Not observed."},
+    # denials worded without a classic negation token (re-audit probes of the #12 fix)
+    {"role": "support", "text": "That Host-b executed malware was ruled out."},
+    {"role": "support", "text": "The report that Host-b executed malware is incorrect."},
+    {"role": "support", "text": "Claim: Host-b executed malware. Status: unfounded."},
+    {"role": "support", "text": "Vendor denied that Host-b executed malware."},
+    {"role": "support", "text": "Host-b executed malware. Status: unfounded."},
+    # no cue word at all: only the "evidence must start with the claim" rule stops it
+    {"role": "support", "text": "Reports that Host-b executed malware were overstated."},
     # prevalidated support with strong overlap but opposite polarity
     {"role": "support", "validation_status": "validated", "text": "Host-b never executed malware."},
     {"role": "support", "prevalidated": True, "text": "Host-b did not execute malware."},
+    {"role": "support", "validation_status": "validated", "text": "Vendor denied that Host-b executed malware."},
+    {"role": "support", "prevalidated": True, "text": "Host-b executed malware: disputed, later retracted."},
 ])
 def test_reflex_fastpath_never_confirms_negated_support(row):
     evidence = [dict(row, evidence_id="f-neg", record_type="observed", source="test")]
