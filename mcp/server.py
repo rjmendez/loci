@@ -8392,7 +8392,10 @@ def _surface_apply_decay(rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 MEMORY_USE_LOG_NAME = "memory_use.jsonl"
 MEMORY_USE_SCHEMA = 1
-_MEMORY_USE_MAX_REFS = 8
+# Only semantic_candidates is capped. Support and contradiction refs are all logged
+# (ids only): a cap there would make a memory cited as the 9th support ref join
+# offline as "ignored".
+_MEMORY_USE_MAX_SEMANTIC_CANDIDATES = 8
 
 
 def _memory_use_log_path() -> Path:
@@ -8423,10 +8426,11 @@ def _score_or_none(value) -> Optional[float]:
     return round(number, 4) if math.isfinite(number) else None
 
 
-def _use_refs(refs) -> list[dict]:
-    """Id, origin and score of each evidence ref, at most _MEMORY_USE_MAX_REFS."""
+def _use_refs(refs, limit: Optional[int] = None) -> list[dict]:
+    """Id, origin and score of each evidence ref; the first ``limit`` refs when a limit is given."""
     out = []
-    for ref in list(refs or [])[:_MEMORY_USE_MAX_REFS]:
+    refs = list(refs or [])
+    for ref in (refs if limit is None else refs[:limit]):
         if not isinstance(ref, dict):
             continue
         evidence_id = str(ref.get("evidence_id") or "").strip()
@@ -8483,7 +8487,8 @@ def _record_memory_answer_check(investigation_id: str, claim_results: list[dict]
             "support_basis": result.get("support_basis"),
             "support": _use_refs(result.get("support_refs")),
             "contradiction": _use_refs(result.get("contradiction_refs")),
-            "semantic_candidates": _use_refs(result.get("semantic_candidates")),
+            "semantic_candidates": _use_refs(result.get("semantic_candidates"),
+                                             limit=_MEMORY_USE_MAX_SEMANTIC_CANDIDATES),
         })
     if not claims:
         return False

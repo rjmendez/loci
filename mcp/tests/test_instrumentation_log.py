@@ -93,3 +93,22 @@ def test_size_and_keep_defaults_and_overrides(monkeypatch):
     assert IL.keep_generations() == 1
     monkeypatch.setenv("LOCI_INSTRUMENTATION_LOG_MAX_BYTES", "not-a-number")
     assert IL.max_bytes() == 4 * 1024 * 1024
+
+
+def test_a_contended_lock_drops_the_row_without_waiting(tmp_path):
+    """The lock is tried once: a held lock drops the row at once instead of stalling the caller."""
+    import fcntl
+    import time
+
+    log = tmp_path / "log.jsonl"
+    assert IL.append_rows(log, [{"a": 1}]) is True
+    with open(log.with_name(log.name + ".lock"), "a+") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        assert IL.append_rows(log, [{"a": 2}]) is False
+        elapsed = time.monotonic() - started
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+    assert elapsed < 0.25
+    assert [json.loads(line) for line in log.read_text().splitlines()] == [{"a": 1}]
+    assert IL.append_rows(log, [{"a": 3}]) is True  # free again: written
+    assert [json.loads(line)["a"] for line in log.read_text().splitlines()] == [1, 3]

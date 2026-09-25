@@ -134,6 +134,24 @@ def test_pre_answer_check_records_evidence_ids_per_claim(mem, no_vector_lane):
     assert FINDING_TEXT not in raw and "billing" not in raw
 
 
+
+def test_every_support_and_contradiction_ref_is_logged(mem):
+    """A memory cited as the 9th or later support ref must still count as used offline."""
+    def refs(prefix, n):
+        return [{"evidence_id": f"{prefix}-{i}", "origin": "findings_jsonl", "score": 0.5} for i in range(n)]
+
+    assert server._record_memory_answer_check("use-many", [{
+        "supported": True, "contradicted": True, "support_basis": "lexical",
+        "support_refs": refs("s", 12), "contradiction_refs": refs("c", 10),
+        "semantic_candidates": refs("v", 12),
+    }]) is True
+    [event] = _events(mem)
+    [claim] = event["claims"]
+    assert [r["id"] for r in claim["support"]] == [f"s-{i}" for i in range(12)]
+    assert [r["id"] for r in claim["contradiction"]] == [f"c-{i}" for i in range(10)]
+    # only the semantic candidates stay capped
+    assert [r["id"] for r in claim["semantic_candidates"]] == [f"v-{i}" for i in range(8)]
+
 def test_derived_from_parents_are_recorded_as_cited(mem):
     parent = _seed("use-cite")
     child = _seed("use-cite", text="the cookie drop comes from a SameSite change",
