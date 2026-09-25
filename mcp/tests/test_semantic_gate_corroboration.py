@@ -155,17 +155,14 @@ class CorroboratedSemanticHitTest(SemanticGateTestCase):
             server.tokenize("The M5Cardputer firmware hands an unsanitised filename "
                             "straight to FatFS on the SD card."),
         )
-        # getattr so this control still runs against the pre-fix module.
-        self.assertGreaterEqual(
-            overlap, getattr(server, "_SEMANTIC_SUPPORT_MIN_OVERLAP", 0.15))
+        self.assertGreaterEqual(overlap, server._SEMANTIC_SUPPORT_MIN_OVERLAP)
         self._patch_semantic([_ref(0.78, round(overlap, 4), 25, 0.66)])
         result = self._check(inv_id)
         claim = result["claim_results"][0]
 
         self.assertTrue(claim["supported"])
         self.assertEqual([r["evidence_id"] for r in claim["support_refs"]], ["ev-1"])
-        if "support_basis" in claim:  # absent on the pre-fix module
-            self.assertEqual(claim["support_basis"], "semantic_corroborated")
+        self.assertEqual(claim["support_basis"], "semantic_corroborated")
 
 
 class FlatNeighbourhoodTest(SemanticGateTestCase):

@@ -543,6 +543,37 @@ class TestMemoryHealth(unittest.TestCase):
             checks["retraction_integrity"]["detail"]["investigations_scanned"], 1
         )
 
+    def test_reachable_qdrant_reports_its_probes_ok(self):
+        # Success-path twin of the test above: same inventory, Qdrant reachable
+        # (in-memory client behind the real _get_qdrant), so the substrate probes
+        # must report ok with the real collection and dimension details.
+        from loci_fakes import FAKE_QDRANT_URL, in_memory_qdrant
+
+        inv_id = _new_id("health-ok")
+        with in_memory_qdrant():
+            server.investigation_start(investigation_id=inv_id, title="Health inventory")
+            stored = _json(server.investigation_store(
+                investigation_id=inv_id, finding_type="observed",
+                text="Service A calls service B over gRPC.", source="test:health", confidence="high",
+            ))
+            self.assertTrue(stored.get("stored"), stored)
+            result = _json(server.memory_health())
+
+        checks = {c["name"]: c for c in result["checks"]}
+        self.assertEqual([c["name"] for c in result["checks"]], self._CHECK_NAMES)
+        self.assertEqual((checks["qdrant_reachable"]["status"], checks["qdrant_reachable"]["detail"]),
+                         ("ok", f"connected to qdrant at {FAKE_QDRANT_URL}"))
+        self.assertEqual(checks["embeddings_dense"]["status"], "ok")
+        self.assertEqual(checks["dimension_consistency"]["status"], "ok")
+        self.assertEqual(checks["dimension_consistency"]["detail"]["collection_dims"],
+                         {server.QDRANT_COLLECTION_PREFIX: 768})
+        cols = checks["qdrant_collections"]["detail"]
+        self.assertIs(cols["main_present"], True)
+        self.assertEqual(cols[server.QDRANT_COLLECTION_PREFIX]["points"], 1)
+        # Only the optional pieces the test env lacks may be non-ok.
+        not_ok = {name for name, c in checks.items() if c["status"] != "ok"}
+        self.assertLessEqual(not_ok, {"qdrant_collections", "embeddings_sparse", "mnemo_mirror"})
+
     def test_with_missing_investigation_id(self):
         result = _json(server.memory_health(investigation_id="no-such-investigation"))
         self.assertEqual(result["scope"], "no-such-investigation")

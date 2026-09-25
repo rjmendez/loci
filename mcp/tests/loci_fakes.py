@@ -30,6 +30,10 @@ These fakes replace *dependencies* only, never the unit under test:
 ``fake_lazy_generate(responses)``
     Stand-in for a ``_lazy_generate``/``gen_fn`` model call: answers from a
     list (or a callable), records each prompt, and never touches a model.
+    Calls past the scripted list are recorded in ``.overflow`` and answered
+    like an unavailable model; the test asserts ``gen.overflow == []``. It does
+    not raise, because callers wrap the model call in ``except Exception`` and
+    would turn the raise into a quiet degraded result.
 """
 
 from __future__ import annotations
@@ -225,7 +229,11 @@ def fake_conflict_judge(verdict: "str | None | Callable[[dict, dict], dict]" = N
 
 
 def fake_lazy_generate(responses: "list[str] | Callable[[str], str]"):
-    """Build a ``_lazy_generate`` replacement. ``.prompts`` records every call."""
+    """Build a ``_lazy_generate`` replacement.
+
+    ``.prompts`` records every call; ``.overflow`` records calls made after the
+    scripted responses ran out (answered as an unavailable model, never raised).
+    """
     queue = None if callable(responses) else list(responses)
 
     def _gen(prompt, *args, **kwargs):  # noqa: ARG001
@@ -233,8 +241,10 @@ def fake_lazy_generate(responses: "list[str] | Callable[[str], str]"):
         if queue is None:
             return responses(prompt)
         if not queue:
-            raise AssertionError("fake_lazy_generate: more calls than scripted responses")
+            _gen.overflow.append(prompt)
+            return {"text": "", "ok": False, "why": "fake_lazy_generate: no scripted response left"}
         return queue.pop(0)
 
     _gen.prompts = []
+    _gen.overflow = []
     return _gen
