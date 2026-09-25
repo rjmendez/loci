@@ -149,15 +149,19 @@ def get_session_content(session_id: str):
 
         # Taken from the end so recent context drives the embedding.
         lines = [f"{m['role'].upper()}: {(m['content'] or '').strip()}" for m in msgs]
+        sep = "\n\n"
         buf = []
         total = 0
         for line in reversed(lines):
-            if total + len(line) > MAX_CHARS:
-                buf.append(line[:(MAX_CHARS - total)])
+            joiner = len(sep) if buf else 0     # the separators count against the budget too
+            if total + joiner + len(line) > MAX_CHARS:
+                room = MAX_CHARS - total - joiner
+                if room > 0:                    # never join in an empty line
+                    buf.append(line[:room])
                 break
             buf.append(line)
-            total += len(line)
-        content = "\n\n".join(reversed(buf))
+            total += joiner + len(line)
+        content = sep.join(reversed(buf))
 
         try:
             dt = datetime.datetime.fromtimestamp(float(row["started_at"]), tz=datetime.timezone.utc).isoformat()
@@ -392,7 +396,7 @@ def _check_wiring_obligations(investigation_id: str, payload: dict) -> "str | No
                 seen_ids.add(fid)
             tags = rec.get("tags", [])
             if "wiring_obligation" in tags and rec.get("record_type") == "gap":
-                unresolved.append(rec.get("text", fid)[:120])
+                unresolved.append(str(rec.get("text") or fid)[:120])
     except Exception as e:
         print(f"[session_end_sync] wiring-obligation check failed: {e}", file=sys.stderr)
         return None
@@ -428,11 +432,11 @@ def main():
     if not sess:
         sys.exit(0)
 
-    ensure_collection()
-
     prev_count = cached_msg_count(session_id)
     if sess["msg_count"] == prev_count:
-        sys.exit(0)
+        sys.exit(0)     # the fast path: nothing changed, so no Qdrant round-trip at all
+
+    ensure_collection()
 
     try:
         vector = embed(sess["content"])

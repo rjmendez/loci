@@ -2,9 +2,9 @@
 
 This hook runs before *every* LLM call in a Claude Code session, so its
 contract is mostly about what it emits on stdout and when it silently
-gets out of the way. These tests pin the behaviour AS IT IS TODAY --
-including several things that are arguably wrong (see the module-level
-BUG comments) -- so that a refactor can be checked against them.
+gets out of the way. These tests pin that behaviour so a refactor can be
+checked against them. They once also pinned bugs as-is; those now assert
+the correct behaviour (AGENTS.md rule 8: never pin a known bug).
 
 No network, no Qdrant, no Ollama: every outbound call goes through
 urllib.request.urlopen, which is patched, or through a module-level
@@ -821,12 +821,16 @@ def test_clean_content_json_list_with_no_usable_turns_becomes_empty(hook):
     assert hook._clean_content(json.dumps([{"role": "user", "content": "   "}])) == ""
 
 
-def test_clean_content_drops_non_transcript_json_arrays(hook):
-    """BUG: any payload that happens to start with '[{' or '["' is assumed to be
-    a chat transcript. Structured non-transcript content is silently erased,
-    which in _format_results means the hit is dropped from the output entirely."""
-    assert hook._clean_content('[{"file": "a.py", "lines": 12}]') == ""
-    assert hook._clean_content('["alpha", "beta"]') == ""
+def test_clean_content_keeps_non_transcript_json_arrays(hook):
+    """Only a chat transcript (dicts with a "role") is condensed. Other structured
+    content that happens to start with '[{' or '["' is kept as-is; it used to be
+    erased, which in _format_results dropped the hit from the output entirely."""
+    for blob in ('[{"file": "a.py", "lines": 12}]', '["alpha", "beta"]',
+                 '["broken", "json",', '[{"file": "a.py", "lines":'):
+        assert hook._clean_content(blob) == blob, blob
+    # positive twin: a transcript is still condensed
+    assert hook._clean_content('[{"role": "user", "content": "the pipeline is failing"}]') == \
+        "user: the pipeline is failing"
 
 
 def test_clean_content_regex_fallback_for_broken_json(hook):

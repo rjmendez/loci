@@ -6,9 +6,9 @@ outbound dependency (sqlite state.db, Ollama, Qdrant, the Loci findings
 file) is allowed to be missing or broken, and the hook must still exit 0
 without a traceback.
 
-These tests pin the behaviour AS IT IS TODAY, including several things
-that are arguably wrong.  Those are called out with `BUG:` comments and
-are asserted *as-is* on purpose -- they are the safety net, not the spec.
+These tests pin the hook's behaviour. They once also pinned several bugs
+as-is (`BUG:` comments); those tests now assert the correct behaviour and the
+bugs are fixed. Do not pin a known bug here again: see AGENTS.md rule 8.
 
 Nothing here touches the network.  urllib.request.urlopen is patched, or
 the module-level helper that calls it is patched.  The module reads ~10
@@ -411,33 +411,43 @@ def test_content_window_keeps_the_tail_and_truncates_the_oldest_line(hook):
     ])
     got = hook.get_session_content("s1")
     l1, l2, l3 = ("USER: " + c * 24 for c in "ABC")
-    assert got["content"] == "\n\n".join([l1[:20], l2, l3])
+    # 80 - 30 - 30 - two 2-char separators = 16 chars left for the oldest line
+    assert got["content"] == "\n\n".join([l1[:16], l2, l3])
+    assert len(got["content"]) == 80
     # msg_count still counts every qualifying message, even the truncated one.
     assert got["msg_count"] == 3
 
 
-def test_content_window_can_exceed_max_chars_because_separators_are_uncounted(hook):
-    """BUG: the "\\n\\n" joiners are not charged against MAX_CHARS, so the
-    embedded text is up to 2*(n-1) chars longer than the stated budget."""
-    hook.MAX_CHARS = 80
-    make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
-        {"role": "user", "content": c * 24, "ts": i}
-        for i, c in enumerate("ABC")
-    ])
-    assert len(hook.get_session_content("s1")["content"]) == 84
-
-
-def test_content_window_emits_a_leading_empty_line_on_exact_fit(hook):
-    """BUG: when the budget is exactly consumed, the next line is sliced to
-    line[:0] == "" and still joined in, so content starts with "\\n\\n"."""
-    hook.MAX_CHARS = 60          # exactly two 30-char lines
+@pytest.mark.parametrize("budget, expected_len", [
+    (40, 40), (61, 61), (62, 62),
+    (63, 62), (64, 62),          # no room for a separator plus a char: nothing more is joined
+    (65, 65), (80, 80), (93, 93), (94, 94), (200, 94),
+])
+def test_content_window_never_exceeds_max_chars(hook, budget, expected_len):
+    """The "\\n\\n" joiners count against MAX_CHARS (they used to be free, so the
+    embedded text ran up to 2*(n-1) chars over the stated budget)."""
+    hook.MAX_CHARS = budget
     make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
         {"role": "user", "content": c * 24, "ts": i}
         for i, c in enumerate("ABC")
     ])
     content = hook.get_session_content("s1")["content"]
-    assert content.startswith("\n\n")
-    assert content == "\n\n" + "USER: " + "B" * 24 + "\n\n" + "USER: " + "C" * 24
+    full = "\n\n".join("USER: " + c * 24 for c in "ABC")    # 94 chars
+    assert len(content) == expected_len <= budget
+    assert full.endswith(content[-30:])                       # the newest line is always whole
+    assert not content.startswith("\n")
+
+
+def test_content_window_has_no_empty_line_on_an_exact_fit(hook):
+    """Exactly two lines plus their separator fit: the third is dropped, not joined
+    in as an empty line (which used to make the content start with "\\n\\n")."""
+    hook.MAX_CHARS = 62          # 30 + 2 + 30
+    make_db(hook.STATE_DB, session={"id": "s1"}, messages=[
+        {"role": "user", "content": c * 24, "ts": i}
+        for i, c in enumerate("ABC")
+    ])
+    content = hook.get_session_content("s1")["content"]
+    assert content == "USER: " + "B" * 24 + "\n\n" + "USER: " + "C" * 24
 
 
 def test_single_oversized_message_is_head_truncated_to_max_chars(hook):
@@ -899,18 +909,30 @@ def test_wiring_samples_capped_at_three_but_count_is_total(inv_env):
     assert payload["unresolved_wiring_obligation_samples"] == ["t6", "t5", "t4"]
 
 
-def test_wiring_explicit_null_text_aborts_the_whole_scan(inv_env, capsys):
-    """BUG (still): `rec.get("text", fid)` returns None for `"text": null`, and the
-    resulting TypeError discards *every* obligation in the file, not just the bad
-    record. It now reports None ("could not check") rather than "" ("none open")."""
+def test_wiring_explicit_null_text_is_counted_and_sampled_by_id(inv_env, capsys):
+    """`"text": null` used to raise TypeError on slicing and discard *every*
+    obligation in the file. It is one obligation, sampled by its id."""
     write_findings(inv_env, "inv1", [
         gap("f1", "real obligation"),
         {"id": "f2", "text": None, "tags": ["wiring_obligation"], "record_type": "gap"},
     ])
     payload = {}
-    assert inv_env._check_wiring_obligations("inv1", payload) is None
-    assert payload == {}
-    assert "wiring-obligation check failed" in capsys.readouterr().err
+    assert inv_env._check_wiring_obligations("inv1", payload) == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 2"
+    assert payload["unresolved_wiring_obligation_samples"] == ["f2", "real obligation"]
+    assert capsys.readouterr().err == ""
+
+
+def test_wiring_a_legacy_access_row_does_not_shadow_its_finding(inv_env):
+    """Access rows reuse the finding's id and sit AFTER it in the file; reading
+    newest-first they must be skipped, not taken as the finding's latest state."""
+    write_findings(inv_env, "inv1", [
+        gap("f1", "still open"),
+        {"id": "f1", "record_type": "access", "ts": "2026-09-01T00:00:00Z"},
+        {"id": "f1", "type": "access", "ts": "2026-09-02T00:00:00Z"},
+    ])
+    payload = {}
+    assert inv_env._check_wiring_obligations("inv1", payload) == " | ⚠ UNRESOLVED WIRING OBLIGATIONS: 1"
+    assert payload["unresolved_wiring_obligation_samples"] == ["still open"]
 
 
 def test_wiring_unreadable_findings_file_is_reported_not_read_as_zero(inv_env, capsys):
@@ -1045,14 +1067,18 @@ def test_main_fast_path_skips_embed_when_msg_count_is_unchanged(wired, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_fast_path_still_calls_ensure_collection_first(wired):
-    """BUG (latency): the docstring promises an immediate exit when nothing
-    changed, but ensure_collection() -- one or two Qdrant round-trips -- runs
-    *before* the cache comparison."""
+def test_fast_path_exits_before_touching_qdrant(wired):
+    """Nothing changed: the hook exits without ensure_collection()'s one or two
+    Qdrant round-trips (they used to run before the cache comparison)."""
     seed_session(wired, n=2)
     wired.write_cache("s1", 2)
     run_main(wired, {"session_id": "s1"})
+    assert wired._rec["ensure"] == 0
+    # positive twin: a changed session still ensures the collection before upserting
+    wired.write_cache("s1", 1)
+    run_main(wired, {"session_id": "s1"})
     assert wired._rec["ensure"] == 1
+    assert len(wired._rec["upsert"]) == 1
 
 
 def test_main_still_syncs_when_the_cache_dir_is_unusable(wired, tmp_path, capsys):

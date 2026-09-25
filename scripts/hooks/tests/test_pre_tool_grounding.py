@@ -289,10 +289,15 @@ def test_supply_chain_path_requires_separator_or_string_start():
     assert hook._check_supply_chain_path(["my__init__.py"]) is None
 
 
-def test_supply_chain_path_pth_requires_leading_separator():
-    # BUG-ish: the pattern demands a separator before site-packages, so a bare relative path is missed.
-    assert hook._check_supply_chain_path(["site-packages/x.pth"]) is None
-    assert hook._check_supply_chain_path(["./site-packages/x.pth"]) is not None
+def test_supply_chain_path_pth_matches_a_relative_site_packages_path():
+    # A bare relative path is the same import hook; it used to be missed because the
+    # pattern demanded a separator before site-packages.
+    for path in ("site-packages/x.pth", "./site-packages/x.pth", "dist-packages\\x.pth",
+                 "/usr/lib/python3/dist-packages/evil.pth"):
+        assert hook._check_supply_chain_path([path]) is not None, path
+    # ...but only inside a site/dist-packages directory, and only a .pth file there
+    for path in ("mysite-packages/x.pth", "site-packages/sub/x.pth", "site-packages/x.pthx"):
+        assert hook._check_supply_chain_path([path]) is None, path
 
 
 def test_supply_chain_path_init_must_be_at_end_of_string():
@@ -769,14 +774,17 @@ def test_rotate_truncates_to_last_two_megabytes(tmp_path, monkeypatch):
     assert set(data) == {ord("B")}  # keeps the *tail*
 
 
-def test_rotate_is_a_noop_for_files_smaller_than_the_2mb_tail(tmp_path, monkeypatch):
-    # BUG-ish: the retained slice is a hardcoded 2 MB, so a threshold under 2 MB never rotates.
+def test_rotate_honours_a_threshold_below_the_2mb_tail(tmp_path, monkeypatch):
+    # The retained slice used to be a hard-coded 2 MB, so a threshold under 2 MB never
+    # rotated. It keeps at most half the threshold (capped at 2 MB).
     log = tmp_path / "s.log"
     log.write_bytes(b"0123456789abc")
     monkeypatch.setattr(hook, "_audit_log", log)
     monkeypatch.setattr(hook, "MAX_AUDIT_BYTES", 10)
     hook._rotate_if_needed()
-    assert log.read_bytes() == b"0123456789abc"
+    assert log.read_bytes() == b"89abc"
+    hook._rotate_if_needed()                 # now under the threshold: untouched
+    assert log.read_bytes() == b"89abc"
 
 
 def test_rotate_swallows_all_exceptions(tmp_path, monkeypatch):

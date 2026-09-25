@@ -467,6 +467,8 @@ def _clean_content(content: str) -> str:
     try:
         obj = json.loads(stripped)
         if isinstance(obj, list):
+            if not any(isinstance(msg, dict) and "role" in msg for msg in obj):
+                return stripped     # structured content, not a chat transcript
             parts = []
             for msg in obj:
                 if not isinstance(msg, dict):
@@ -480,6 +482,8 @@ def _clean_content(content: str) -> str:
             return " | ".join(parts[:2]) if parts else ""
     except (json.JSONDecodeError, TypeError):
         pass
+    if '"role"' not in stripped:
+        return stripped             # broken JSON that is not a transcript either
     m = re.search(r'"role"\s*:\s*"user"[^}]*"content"\s*:\s*"([^"]{10,})"', stripped)
     return f"user: {m.group(1)[:200]}" if m else ""
 

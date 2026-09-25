@@ -248,9 +248,9 @@ SUPPLY_CHAIN_PATH_PATTERNS: list[tuple[str, str]] = [
      ".claude/setup.mjs (Hades IDE-open vector)"),
     (r"(^|[/\\])\.vscode[/\\]tasks\.json$",
      ".vscode/tasks.json (Hades IDE-open vector)"),
-    (r"[/\\]site-packages[/\\][^/\\]+\.pth$",
+    (r"(^|[/\\])site-packages[/\\][^/\\]+\.pth$",
      ".pth in site-packages (Python import hook)"),
-    (r"[/\\]dist-packages[/\\][^/\\]+\.pth$",
+    (r"(^|[/\\])dist-packages[/\\][^/\\]+\.pth$",
      ".pth in dist-packages (Python import hook)"),
     (r"(^|[/\\])binding\.gyp$",
      "binding.gyp (Phantom Gyp / Miasma install-hook)"),
@@ -345,7 +345,10 @@ def _rotate_if_needed() -> None:
     try:
         if _audit_log.exists() and _audit_log.stat().st_size > MAX_AUDIT_BYTES:
             content = _audit_log.read_bytes()
-            _audit_log.write_bytes(content[-2 * 1024 * 1024:])
+            # Keep the tail: 2 MB, or half the threshold when that is smaller (a
+            # fixed 2 MB tail never shrank a log whose threshold is under 2 MB).
+            keep = min(2 * 1024 * 1024, max(1, MAX_AUDIT_BYTES // 2))
+            _audit_log.write_bytes(content[-keep:])
     except Exception:
         pass
 
