@@ -831,59 +831,6 @@ def _entity_lookup_cascade(
 # ---------------------------------------------------------------------------
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def _rewrite_jsonl_set_field(path: Path, target_ids: set, field: str, value) -> int:
-    """
-    Atomically rewrite a JSONL file, setting ``field`` = ``value`` on every
-    entry whose "id" is in ``target_ids``.
-
-    Returns the count of entries that were modified.  Fails open — if any I/O
-    or JSON error occurs the original file is left untouched.
-    """
-    if not path.exists():
-        return 0
-    try:
-        lines = path.read_text().splitlines()
-        new_lines = []
-        modified = 0
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                new_lines.append(line)
-                continue
-            try:
-                entry = json.loads(stripped)
-            except Exception:
-                new_lines.append(line)
-                continue
-            if str(entry.get("id", "")) in target_ids:
-                entry[field] = value
-                new_lines.append(json.dumps(entry))
-                modified += 1
-            else:
-                new_lines.append(line)
-        # Atomic replace via temp file in the same directory
-        _atomic_write_text(path, "\n".join(new_lines) + ("\n" if new_lines else ""))
-        return modified
-    except Exception as exc:
-        logger.debug("_rewrite_jsonl_set_field failed (fail-open): %r", exc)
-        return 0
-
-
 # ---------------------------------------------------------------------------
 # Finding lifecycle: append-only updates log + staleness (code-ref hashing).
 # ---------------------------------------------------------------------------
@@ -2818,17 +2765,13 @@ def _docs_ingest_confined(p: Path, roots: list[Path]) -> Optional[Path]:
     return resolved if any(resolved.is_relative_to(r) for r in roots) else None
 
 
-def _docs_ingest_targets(document_path: str) -> list[Path]:
+def _docs_ingest_all_targets(document_path: str) -> list[Path]:
     """Resolve a file or directory to markdown/text targets; fail-open to [] if the path is invalid.
 
     Only paths under a docs root (``_docs_ingest_roots``) are read, and each file
     is checked after symlink resolution: a ``notes.md`` link to a secret outside
-    the roots, or to a non-doc file, is skipped. At most _DOCS_INGEST_MAX_FILES."""
-    return _docs_ingest_all_targets(document_path)[:_DOCS_INGEST_MAX_FILES]
-
-
-def _docs_ingest_all_targets(document_path: str) -> list[Path]:
-    """Every target _docs_ingest_targets would pick, before the file cap."""
+    the roots, or to a non-doc file, is skipped. Every match, before the caller
+    applies ``_DOCS_INGEST_MAX_FILES``."""
     roots = _docs_ingest_roots()
     p = Path(document_path).expanduser()
     if not p.is_absolute():
@@ -2987,11 +2930,6 @@ def _docs_search_score(text: str, query: str) -> float:
     if not tokens:
         return 0.0
     return round(sum(1 for token in tokens if token in haystack) / len(tokens), 4)
-
-
-def _docs_search_matches_text(text: str, query: str) -> bool:
-    """Return True when a query matches an indexed document string."""
-    return _docs_search_score(text, query) > 0.0
 
 
 @mcp.tool()
