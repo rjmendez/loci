@@ -582,13 +582,16 @@ def cap_per_type(frame: pd.DataFrame, *, max_per_type: int, salt: str) -> pd.Dat
 # ---------------------------------------------------------------------------
 
 def _text_keys(target: str) -> tuple[str, ...]:
+    """NB text-view keys; the objective exclusions apply here too (no hemilineage token for literature NT)."""
     import flybrain_brain_cluster_ol_samples as ols
 
     if target == TARGET_CONNECTIVITY:
-        return tuple(ols.INPUT_FEATURES["connectivity_tier"])
-    if target in (TARGET_NT_PREDICTED, TARGET_NT_CONSENSUS, *NT_LITERATURE_TARGETS):
-        return tuple(ols.INPUT_FEATURES["neurotransmitter_dominance"])
-    return ols.STRUCTURED_TEXT_FEATURES
+        keys = tuple(ols.INPUT_FEATURES["connectivity_tier"])
+    elif target in (TARGET_NT_PREDICTED, TARGET_NT_CONSENSUS, *NT_LITERATURE_TARGETS):
+        keys = tuple(ols.INPUT_FEATURES["neurotransmitter_dominance"])
+    else:
+        keys = tuple(ols.STRUCTURED_TEXT_FEATURES)
+    return tuple(k for k in keys if not fwf.excluded_feature_names([k], target))
 
 
 def input_texts(frame: pd.DataFrame, target: str) -> list[str]:

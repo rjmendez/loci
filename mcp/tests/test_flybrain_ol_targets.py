@@ -316,3 +316,12 @@ def test_no_network_imports():
     source = open(olt.__file__, encoding="utf-8").read()
     for name in ("requests", "urllib", "http.client", "socket", "httpx"):
         assert f"import {name}" not in source
+
+
+def test_text_view_keys_obey_objective_exclusions():
+    import flybrain_wiring_features as fwf
+
+    for target in olt.OL_TARGETS:
+        keys = olt._text_keys(target)
+        assert not fwf.excluded_feature_names(list(keys), target), target
+    assert "hemilineage" not in olt._text_keys("nt_literature")
