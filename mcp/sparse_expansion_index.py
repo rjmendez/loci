@@ -281,14 +281,15 @@ def build_connectivity(spec: ExpansionSpec, n_kc: int, *, mode: str = "sample", 
 
 def k_winners(activations: np.ndarray, k: int) -> np.ndarray:
     """Boolean mask of the top-``k`` entries per row; ties broken by lower index."""
-    a = np.asarray(activations, dtype=np.float64)
+    a = np.asarray(activations)
     n, m = a.shape
     if not 1 <= k <= m:
         raise ValueError("k must be in [1, n_columns]")
-    order = np.argsort(-a, axis=1, kind="stable")[:, :k]
-    mask = np.zeros((n, m), dtype=bool)
-    np.put_along_axis(mask, order, True, axis=1)
-    return mask
+    kth = np.partition(a, m - k, axis=1)[:, m - k][:, None]  # k-th largest value per row
+    above = a > kth
+    need = k - above.sum(axis=1, keepdims=True)
+    tied = a == kth
+    return above | (tied & (np.cumsum(tied, axis=1) <= need))
 
 
 def pack_codes(bits: np.ndarray) -> np.ndarray:
@@ -332,6 +333,17 @@ def top_k_from_scores(scores: np.ndarray, k: int, *, larger_is_better: bool) -> 
     return np.argsort(key, axis=1, kind="stable")[:, :k]
 
 
+def pca_basis(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(mean, eigenvalues desc, eigenvectors as columns) of the covariance of ``x``."""
+    x = np.asarray(x, dtype=np.float64)
+    mean = x.mean(axis=0)
+    xc = x - mean
+    cov = xc.T @ xc / max(x.shape[0] - 1, 1)
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(-evals, kind="stable")
+    return mean, evals[order], evecs[:, order]
+
+
 class SparseExpansionIndex:
     """Mushroom-body-style sparse binary index (offline design study)."""
 
@@ -367,8 +379,11 @@ class SparseExpansionIndex:
         self._codes = np.zeros((0, (self.n_kc + 63) // 64), dtype=np.uint64)
 
     # -- projection -----------------------------------------------------
-    def fit(self, x: np.ndarray) -> "SparseExpansionIndex":
-        """Fit the D -> G projection on ``x`` (the vectors to be indexed)."""
+    def fit(self, x: np.ndarray, *, basis: Optional[tuple] = None) -> "SparseExpansionIndex":
+        """Fit the D -> G projection on ``x`` (the vectors to be indexed).
+
+        ``basis`` optionally reuses :func:`pca_basis` computed on the same ``x``.
+        """
         x = np.asarray(x, dtype=np.float64)
         d = x.shape[1]
         g = self.spec.n_glomeruli
@@ -383,10 +398,16 @@ class SparseExpansionIndex:
         else:
             if g > min(x.shape):
                 raise ValueError("PCA needs n_glomeruli <= min(n_items, dim)")
-            _, s, vt = np.linalg.svd(x - self._mean, full_matrices=False)
-            proj = vt[:g].T
+            if basis is None:
+                basis = pca_basis(x)
+            mean, evals, evecs = basis
+            if mean.shape != self._mean.shape or not np.allclose(mean, self._mean, atol=1e-6):
+                raise ValueError("pca basis was computed on different data")
+            top = np.arange(g)
+            evals = evals[:g]
+            proj = evecs[:, :g]
             if self.whiten:
-                proj = proj / np.maximum(s[:g] / np.sqrt(max(x.shape[0] - 1, 1)), 1e-12)
+                proj = proj / np.sqrt(np.maximum(evals[top], 1e-24))
             # assign components to glomeruli in a seeded random order, so a
             # heavily sampled glomerulus is not systematically the top PC
             proj = proj[:, rng.permutation(g)]
@@ -458,6 +479,7 @@ __all__ = [
     "idealised_spec",
     "jaccard_similarity",
     "k_winners",
+    "pca_basis",
     "load_spec",
     "pack_codes",
     "spec_from_matrix",

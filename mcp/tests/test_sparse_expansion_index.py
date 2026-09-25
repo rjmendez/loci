@@ -98,7 +98,19 @@ def test_matrix_mode_subsamples_measured_columns():
     conn = sei.build_connectivity(s, 4, mode="matrix", seed=3)
     assert conn.shape == (4, 3)
     assert all(tuple(row) in cols for row in conn)
-    assert len({tuple(r) for r in conn}) >= 3  # drawn without replacement from 5 columns (4 distinct)
+    assert conn.sum(axis=1).min() >= 1  # zero-claw KCs are never drawn
+
+
+def test_matrix_mode_with_k_equal_n_uses_each_measured_kc_once():
+    rng = np.random.default_rng(2)
+    m = (rng.random((9, 30)) < 0.4).astype(np.uint8)
+    m[:, :3] = 0  # three KCs without claws
+    m[0, 3:] = 1
+    s = sei.spec_from_matrix(m, name="r")
+    n = int((s.matrix.sum(axis=0) > 0).sum())
+    assert n == 27
+    conn = sei.build_connectivity(s, n, mode="matrix", seed=5)
+    np.testing.assert_array_equal(conn, s.matrix.T[3:])  # without replacement, index order
 
 
 def test_matrix_mode_beyond_n_preserves_degrees_and_breaks_duplicates():
@@ -195,6 +207,16 @@ def test_pca_projection_whitening_and_centring():
         sei.SparseExpansionIndex(sei.idealised_spec(40, 3), 64).fit(x)  # G > dim
 
 
+def test_precomputed_pca_basis_matches_and_is_checked():
+    x, _ = _clusters()
+    spec = sei.idealised_spec(8, 3)
+    a = sei.SparseExpansionIndex(spec, 128, seed=3).fit(x).encode(x)
+    b = sei.SparseExpansionIndex(spec, 128, seed=3).fit(x, basis=sei.pca_basis(x)).encode(x)
+    np.testing.assert_array_equal(a, b)
+    with pytest.raises(ValueError, match="different data"):
+        sei.SparseExpansionIndex(spec, 128).fit(x, basis=sei.pca_basis(x + 1.0))
+
+
 def test_identity_projection_requires_matching_dim():
     x, _ = _clusters(dim=8)
     sei.SparseExpansionIndex(sei.idealised_spec(8, 2), 64, projection="identity").fit(x)
@@ -210,6 +232,11 @@ def test_index_is_deterministic_per_seed():
     c = sei.SparseExpansionIndex(spec, 256, seed=12).fit(x).encode(x)
     np.testing.assert_array_equal(a, b)
     assert not np.array_equal(a, c)
+    # the PCA-component -> glomerulus assignment is itself seeded
+    ga = sei.SparseExpansionIndex(spec, 256, seed=11).fit(x).glomeruli(x)
+    gc = sei.SparseExpansionIndex(spec, 256, seed=12).fit(x).glomeruli(x)
+    assert not np.allclose(ga, gc)
+    np.testing.assert_allclose(np.sort(np.abs(ga).sum(axis=0)), np.sort(np.abs(gc).sum(axis=0)), rtol=1e-4)
 
 
 @pytest.mark.parametrize("metric", ["hamming", "jaccard"])
@@ -338,8 +365,14 @@ def test_load_spec_rejects_self_digest_tamper_even_with_pinned_sha(tmp_path):
 
 @pytest.mark.parametrize("npz_name", ["../m.npz", "sub/m.npz", ""])
 def test_load_spec_rejects_non_sibling_matrix_path(tmp_path, npz_name):
-    path, sha, _ = _write_spec(tmp_path, npz_name=npz_name)
-    with pytest.raises(sei.SpecIntegrityError):
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    path, sha, _ = _write_spec(spec_dir, npz_name=npz_name)
+    # plant a valid matrix at the escaped location so only the path rule can refuse it
+    (spec_dir / "sub").mkdir()
+    for target in (tmp_path / "m.npz", spec_dir / "sub" / "m.npz"):
+        target.write_bytes((spec_dir / "m.npz").read_bytes())
+    with pytest.raises(sei.SpecIntegrityError, match="plain sibling"):
         sei.load_spec(path, expected_sha256=sha)
 
 
