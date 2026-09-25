@@ -500,3 +500,11 @@ def test_aux_is_never_a_model_input(tmp_path):
     with pytest.raises(ValueError, match="aux columns duplicate"):
         fme.EvalDataset("d", "super_class", ("a", "b"), np.asarray(["x", "y"]), pd.DataFrame({"f": [1, 2]}), (),
                         ({}, {}), aux=pd.DataFrame({"f": [1, 2]}))
+
+
+def test_normalize_nt_accepts_prefixed_dataset_spellings():
+    assert es.normalize_nt("nt_ach") == es.normalize_nt("acetylcholine")
+    assert es.normalize_nt("nt_glut") == es.normalize_nt("glutamate")
+    assert es.normalize_nt("nt_gaba") == es.normalize_nt("GABA")
+    assert es.normalize_nt("nt_his") is None and es.normalize_nt("nt_oct") is None
+    assert es.binary_nt_label("nt_glut") == es.binary_nt_label("gaba")

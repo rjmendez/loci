@@ -565,6 +565,8 @@ _NT_LOOKUP = {alias: nt for nt, aliases in _NT_ALIASES.items() for alias in alia
 def normalize_nt(label: Any) -> str | None:
     """Map a dataset NT spelling to acetylcholine / gaba / glutamate; anything else -> None."""
     key = str(label).strip().lower().replace("-", "_").replace(" ", "_")
+    if key not in _NT_LOOKUP and key.startswith("nt_"):  # optic-lobe / fw spellings: nt_ach, nt_glut, nt_gaba
+        key = key[3:]
     return _NT_LOOKUP.get(key)
 
 
