@@ -1,6 +1,8 @@
-# FlyBrain real models: interim results (2026-09-24)
+# FlyBrain real models: interim results (2026-09-24, lanes v2 added 2026-09-25)
 
 These are interim results from the `flybrain-real-models` workflow. Five dataset tracks (l1em, BANC, optic lobe, MANC, male-cns) are finished. FlyWire (fw) and the graph model are still running. The numbers have **not** been through the workflow's leakage or reproducibility audits. The last row of the location-free table below comes from fw's report while that track is still running. Reports, logs and model artifacts live under `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/`.
+
+**Update 2026-09-25:** the rigor re-evaluation (lanes v2) is in the next section. The per-dataset tables further down are the **old harness** (single-shuffle gate, no size/degree baseline, raw features); where a lane has been re-run, the lanes-v2 verdict supersedes them.
 
 ## Method
 
@@ -11,6 +13,79 @@ These are interim results from the `flybrain-real-models` workflow. Five dataset
 - **Learners:** logistic regression and sklearn `HistGradientBoosting`, both with calibrated probabilities. Naive Bayes is reported only as a weak baseline.
 - **Splits:** grouped, so no cell type, hemilineage, homolog group or left/right pair crosses train/val/test. The test set is used once.
 - **Gate:** the model must beat the best trivial rule (majority, threshold stump or one-column lookup) with a bootstrap CI. The gate also includes a label-shuffle control and a random-vs-grouped split gap.
+
+## Lanes v2: the rigor re-evaluation (2026-09-25, partial)
+
+Every lane is being re-run with the research-driven rules. The live table, with every lane that has finished since this doc was committed, is `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/lanes-v2.md` (`.json`). A watcher re-aggregates it whenever a report lands.
+
+**What changed from the table below:**
+
+- **Features (R5):** degree columns are within-dataset percentile ranks, and 2-hop composition uses only pairs with ≥ 5 synapses [Schlegel 2024]. Partner-NT features are hard-blocked for every NT target.
+- **Gate (R3/R4):** a model must beat all of the following:
+  - the best trivial rule, on accuracy and macro-F1;
+  - a paired cluster-bootstrap gain;
+  - a size/degree-only HGB (by the margin, with a paired CI above 0) [Bernett 2024];
+  - a 100-permutation group-block null (p ≤ 0.05) [Ojala & Garriga 2010].
+
+  The gate applies only to measured and curated_morphology labels (R1). Connectivity-defined lanes read as "recovery of connectivity-derived annotations", and model-predicted lanes as distillation.
+- **Size baseline inputs:** degree columns excluded as features, such as connectivity_tier's, still reach the size baseline through a side channel (`EvalDataset.aux`). The same channel feeds the degree-decile axis and the hemisphere split level.
+- **Calibration (R6):** a dedicated grouped calibration fold. Reported metrics are debiased L2 ECE, ECE-sweep, classwise ECE, log-loss and Brier, each with a cluster-bootstrap CI.
+
+**Finished lanes at commit time.** "Groups" is the number of test groups (the effective n). The size column is the size/degree-only HGB.
+
+| Lane | Provenance | Groups | Trivial | Size | Best model acc [95% CI] / macro-F1 | Perm p | Verdict | Old |
+|---|---|---:|---:|---:|---|---:|---|---|
+| mc super_class | curated | 527 | 0.739 | 0.690 | hgb 0.979 [0.970–0.987] / 0.80; debiased ECE 0.010 | 0.01 | **pass** | pass |
+| ol super_class | curated | 158 | 0.855 | 0.846 | hgb 0.966 [0.946–0.981] / 0.92 | 0.01 | **pass** | pass |
+| l1em sensory_modality | curated | 32 | 0.426 | 0.593 | hgb 0.722 [0.582–0.860] / 0.72 | 0.01 | **fail** (size baseline) | pass |
+| ol nt_ground_truth (consensus) | measured? | 23 | 0.581 | 0.645 | hgb 0.758 [0.539–0.911] / 0.69 | 0.01 | **fail** (paired gain, size) | fail |
+| ol nt_literature (strict R2) | measured | 12 | 0.750 | 0.707 | hgb 0.707 [0.234–0.961] / 0.28 | 0.69 | **fail** (every criterion) | new |
+| mc nt_literature (strict R2) | measured | **2** | – | – | not evaluable: the 103 strict types merge into 25 grouped components (type + hemilineage + supertype), 2 of them in test | – | **not evaluable** | new |
+| l1em io_class | conn-defined | 209 | 0.805 | 0.897 | hgb 0.945 [0.916–0.971] | 0.01 | not gated (criteria met) | pass |
+| l1em connectivity_tier | conn-defined | 209 | 0.726 | **0.997** | hgb 0.874 | 0.01 | not gated; loses to the size baseline by construction | pass |
+| ol cell_family | conn-defined | 159 | 0.252 | 0.354 | hgb 0.742 [0.643–0.830] / 0.53 | 0.01 | not gated (criteria met) | pass |
+
+**Reading:**
+
+- **super_class from wiring survives every new control** in male-cns and the optic lobe:
+  - It beats a size/degree-only model by 22–35 points (mc) and 6–19 points (ol), both paired CIs.
+  - Permutation p is 1/101.
+  - mc calibration is excellent (debiased ECE 0.010).
+  - The mc split curve falls from 0.994 (random) to 0.989 (type), 0.978 (type + hemilineage) and 0.978 (+ supertype). Left→right transfer is 0.994.
+- **l1em sensory modality loses its pass.** Wiring beats the trivial rule, but not a size/degree-only model: the paired gain CI touches 0 with 32 test groups.
+- **Literature NT (R2) is a negative result wherever it can be evaluated:**
+  - ol strict: 12 test types, p = 0.27 (logreg) / 0.69 (hgb). A random split scores 0.97 against 0.55 on the type split: type memorisation.
+  - mc strict: cannot be evaluated on the primary split. The type-only level of the split curve reaches 0.93 [0.81–1.00] against a 0.59 majority over 19 types. That level lets hemilineages cross train/test, and lineage largely fixes NT [Lacin 2019; Eckstein 2024], so it is not evidence of wiring→NT.
+- **connectivity_tier is its own definition.** On l1em a size/degree-only model reaches 0.997, so the tier is not a wiring result.
+
+**Graph model** (male-cns, fully inductive):
+
+- **Setup:**
+  - Every node sharing a held-out cell type or hemilineage has its partner category masked, and is removed from the inductive training graph.
+  - R5 features; graph edges with ≥ 5 synapses.
+  - GPUs per R8: 2080 Ti and 4070 Ti, one card per job, capped at 0.6 of the card.
+- **super_class over 5 seeds:**
+
+  | Model | Accuracy | Macro-F1 |
+  |---|---|---|
+  | GraphSAGE inductive | 0.982 ± 0.002 | 0.888 ± 0.004 |
+  | GraphSAGE transductive | 0.982 ± 0.002 | 0.881 ± 0.006 |
+  | hgb | 0.981 ± 0.003 | **0.908 ± 0.005** |
+  | HGB + Correct-and-Smooth (train labels only) [Huang 2020] | 0.975 ± 0.003 | 0.878 |
+
+  - The GNN's accuracy gain over hgb has a CI crossing 0 in 5 of 5 seeds.
+  - The GNN's macro-F1 is about 0.02–0.03 lower in every seed.
+  - C&S is significantly worse than hgb in 5 of 5 seeds.
+  - Removing message passing does not hurt validation accuracy.
+  - This agrees with the synthesis: 2-hop composition already carries what a 2-layer GraphSAGE learns [Hamilton 2017; SYNTHESIS F7/F9].
+- cell_class and nt_ground_truth (3 seeds each) were still queued at commit time.
+
+**Honest caveats:**
+
+- **Compute:** the shared box ran at load 80–160 for most of the day. The WSL VM also crashed once (OOM from another agent's 45 GB job), and all jobs were restarted.
+- **Pending lanes:** 30 lanes were still queued at commit time behind other agents' jobs. `lanes-v2.md` lists them under "Pending"; nothing pending is reported as a result here.
+- **Split-curve bias:** levels other than the primary grouping are optimistic for masked targets, because features were masked for the primary split only.
+- **ol super_class random-split control:** the hgb random-split control reads 0.79, below the grouped 0.966. It is reported as measured; it is not used by the gate.
 
 ## Label provenance
 
@@ -170,6 +245,9 @@ Parts of this exist; we did not find this combination. Sources were verified in 
 This is based on one literature pass. Repeat the search before publishing.
 
 ## Next (in the running workflow)
+
+- Finish the queued lanes-v2 runs (the watcher keeps `lanes-v2.md` current). Then run the r5:10 2-hop sensitivity on the headline lanes, and the graph cell_class / nt_ground_truth seeds.
+- The earlier rigor-stage items below are now implemented (provenance gate, literature NT, size/degree gate, group bootstrap and permutation, split curve, R5 features, debiased calibration). The hierarchical super_class → cell_class model exists as a report-only harness hook (R7), and no lane has turned it on yet.
 
 - Finish the mc, fw and graph-model tracks.
 - **Rigor stage:**
