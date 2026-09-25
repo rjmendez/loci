@@ -27,33 +27,12 @@ dependencies = [
 mnemosyne = [
     "mnemosyne-memory[mcp]",
 ]
-# pyarrow reads the FlyWire .feather snapshots in flybrain_brain_cluster_fw_samples
-# (the braincluster-build-fw-samples entry point) and converts them with
-# Table.to_pandas(), which needs pandas. Both are imported lazily there,
-# so the MCP server runs without them, but that module's tests build feather
-# fixtures: without pyarrow they fail collection (aborting the whole pytest
-# run), and without pandas every sample build raises.
-flybrain = [
-    "pyarrow>=14",
-    "pandas>=2",
-]
 test = [
     "hypothesis>=6.0",
-    "pyarrow>=14",
-    "pandas>=2",
 ]
 
 [project.scripts]
 loci-mcp = "server:main"
-braincluster-goldenset-gate-runner = "flybrain_brain_cluster_training:main"
-braincluster-p0-dry-run = "flybrain_brain_cluster_pipeline:main"
-braincluster-threshold-calibrate = "flybrain_brain_cluster_thresholds:main"
-braincluster-build-fw-samples = "flybrain_brain_cluster_fw_samples:main"
-braincluster-build-banc-samples = "flybrain_brain_cluster_banc_samples:main"
-braincluster-build-mc-samples = "flybrain_brain_cluster_mc_samples:main"
-braincluster-build-mv-samples = "flybrain_brain_cluster_mv_samples:main"
-braincluster-build-ol-samples = "flybrain_brain_cluster_ol_samples:main"
-braincluster-release-prep = "flybrain_brain_cluster_release_prep:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -67,30 +46,6 @@ py-modules = [
     "batched_gen",
     "embed_ops",
     "graph_tools",
-    "flybrain_harness_storage",
-    "flybrain_brain_cluster",
-    "flybrain_brain_cluster_training",
-    "flybrain_brain_cluster_pipeline",
-    "flybrain_brain_cluster_thresholds",
-    "flybrain_brain_cluster_fw_samples",
-    "flybrain_brain_cluster_release_prep",
-    "flybrain_hb_adapter",
-    "flybrain_fw_metadata_adapter",
-    "flybrain_scope_engine",
-    "flybrain_dataset_registry",
-    "flybrain_brain_cluster_samples",
-    "flybrain_banc_adapter",
-    "flybrain_brain_cluster_banc_samples",
-    "flybrain_l1em_adapter",
-    "flybrain_brain_cluster_l1em_samples",
-    "flybrain_mc_adapter",
-    "flybrain_brain_cluster_mc_samples",
-    "flybrain_mv_adapter",
-    "flybrain_brain_cluster_mv_samples",
-    "flybrain_ol_adapter",
-    "flybrain_brain_cluster_ol_samples",
-    "flybrain_brain_cluster_baselines",
-    "flybrain_hash_stamps",
     "replay_fingerprint",
     "grounding",
     "inv_store",
