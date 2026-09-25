@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -48,6 +49,52 @@ def _coerce_list(value: Any) -> list[Any]:
     return [value]
 
 
+_CONFIDENCE_LABELS = {
+    "high": 0.9,
+    "medium": 0.6,
+    "low": 0.3,
+}
+_DATASET_ALIASES = {
+    "fw": "fw",
+    "flywire": "fw",
+    "fly wire": "fw",
+    "hb": "hb",
+    "hemibrain": "hb",
+    "fafb": "fafb",
+    "banc": "banc",
+    "mc": "mc",
+    "male cns": "mc",
+    "mv": "mv",
+    "ol": "ol",
+    "l1em": "l1em",
+}
+
+
+def _coerce_unit_interval(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(score):
+        return 0.0
+    return max(0.0, min(1.0, score))
+
+
+def _coerce_confidence(value: Any) -> float:
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _CONFIDENCE_LABELS:
+            return _CONFIDENCE_LABELS[token]
+    return _coerce_unit_interval(value)
+
+
+def _normalize_dataset_symbol(value: Any) -> str:
+    token = " ".join(str(value or "").strip().lower().split())
+    return _DATASET_ALIASES.get(token, token or "unknown")
+
+
 @dataclass(frozen=True)
 class ComparativeClaim: 
     dataset: str = "unknown"
@@ -83,7 +130,7 @@ class ComparativeClaim:
         species = str(claim_scope.get("species") or scope.get("species") or "Drosophila melanogaster")
         provenance = dict(scope.get("provenance") if isinstance(scope.get("provenance"), Mapping) else {})
         evidence_strength = str(scope.get("evidence_strength") or scope.get("evidence") or "structural")
-        confidence = float(scope.get("confidence", 0.0) or 0.0)
+        confidence = _coerce_confidence(scope.get("confidence", 0.0))
         scope_notes = tuple(str(v) for v in _coerce_list(scope.get("scope_notes")))
         return cls(
             dataset=dataset,
@@ -397,22 +444,43 @@ class ResearchPriorityScoring:
 
     def score(self, path: Mapping[str, Any] | None) -> dict[str, Any]:
         payload = _coerce_mapping(path)
-        payoff = float(payload.get("payoff", 0.0) or 0.0)
-        confidence = float(payload.get("confidence", 0.0) or 0.0)
-        scope_compatibility = float(payload.get("scope_compatibility", 0.0) or 0.0)
-        evidence_strength = float(payload.get("evidence_strength", 0.0) or 0.0)
-        risk = float(payload.get("risk", 0.0) or 0.0)
-        latency = float(payload.get("latency", 0.0) or 0.0)
-        raw = (0.35 * payoff) + (0.3 * confidence) + (0.2 * scope_compatibility) + (0.15 * evidence_strength) - (0.1 * risk) - (0.05 * latency)
+        payoff = _coerce_unit_interval(payload.get("payoff", 0.0))
+        confidence = _coerce_confidence(payload.get("confidence", 0.0))
+        scope_compatibility = _coerce_unit_interval(payload.get("scope_compatibility", 0.0))
+        evidence_strength = _coerce_unit_interval(payload.get("evidence_strength", 0.0))
+        risk = _coerce_unit_interval(payload.get("risk", 0.0))
+        latency = _coerce_unit_interval(payload.get("latency", 0.0))
+        dataset = _normalize_dataset_symbol(payload.get("dataset") or payload.get("dataset_symbol"))
+        dataset_bonus = {
+            "fw": 0.025,
+            "mc": 0.02,
+            "banc": 0.015,
+            "hb": 0.01,
+            "mv": 0.01,
+            "ol": 0.01,
+            "fafb": 0.015,
+            "l1em": 0.01,
+        }.get(dataset, 0.0)
+        raw = (
+            (0.35 * payoff)
+            + (0.3 * confidence)
+            + (0.2 * scope_compatibility)
+            + (0.15 * evidence_strength)
+            + dataset_bonus
+            - (0.1 * risk)
+            - (0.05 * latency)
+        )
         score = max(0.0, min(1.0, raw))
+        rounded_score = round(score, 4)
         return {
-            "score": round(score, 4),
-            "priority": "high" if score >= 0.75 else "medium" if score >= 0.45 else "low",
+            "score": rounded_score,
+            "priority": "high" if rounded_score >= 0.75 else "medium" if rounded_score >= 0.45 else "low",
             "components": {
                 "payoff": payoff,
                 "confidence": confidence,
                 "scope_compatibility": scope_compatibility,
                 "evidence_strength": evidence_strength,
+                "dataset_bonus": dataset_bonus,
                 "risk": risk,
                 "latency": latency,
             },
