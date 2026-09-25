@@ -53,6 +53,7 @@ import json
 import math
 import os
 import re
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -279,6 +280,7 @@ class WiringFeatureParams:
     reciprocity: bool = True
     two_hop: bool = False
     min_edge_weight: float = 0.0
+    min_syn_count: int = 0
     category_tag: str = ""
     max_pair_rows: int = 120_000_000
     batch_rows: int = 1 << 20
@@ -439,6 +441,8 @@ def compute_wiring_features(
     pair_rows = 0
     scanned = 0
     min_w = float(params.min_edge_weight)
+    min_syn_count = int(params.min_syn_count)
+    warned_missing_syn_weight = False
 
     columns = [edges.pre, edges.post] + [c for c in (edges.weight, edges.neuropil) if c]
     dataset, batches = _iter_batches(edges, columns, params.batch_rows)
@@ -450,6 +454,20 @@ def compute_wiring_features(
         pre_idx = _index_of(batch.column(edges.pre), value_set)
         post_idx = _index_of(batch.column(edges.post), value_set)
         w = _weights(batch, edges.weight)
+        if min_syn_count > 0:
+            if edges.weight is None:
+                if not warned_missing_syn_weight:
+                    warnings.warn(
+                        "WiringFeatureParams.min_syn_count requested but no edge weight column is available; "
+                        "skipping strong-edge filter",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    warned_missing_syn_weight = True
+            else:
+                keep = w >= min_syn_count
+                pre_idx, post_idx, w = pre_idx[keep], post_idx[keep], w[keep]
+                batch = batch.filter(pa.array(keep))
         if min_w > 0:
             keep = w >= min_w
             pre_idx, post_idx, w = pre_idx[keep], post_idx[keep], w[keep]

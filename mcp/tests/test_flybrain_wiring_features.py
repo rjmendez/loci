@@ -134,6 +134,27 @@ def test_min_edge_weight_filter(tmp_path):
     assert _row(result, 1)["degree__out_weight_total"] == pytest.approx(5)
 
 
+def test_min_syn_count_filters_weak_edges(tmp_path):
+    weighted_edges = [
+        (1, 2, 1, "X"),
+        (1, 3, 2, "X"),
+        (2, 3, 5, "Y"),
+        (3, 1, 10, "Y"),
+        (4, 3, 20, "Z"),
+    ]
+    path = _write_edges(tmp_path / "weighted.feather", weighted_edges)
+    unfiltered = _build(tmp_path, objective="flow", edges=path)
+    filtered = _build(
+        tmp_path,
+        objective="flow",
+        edges=path,
+        params=fwf.WiringFeatureParams(min_syn_count=10),
+    )
+
+    assert _row(unfiltered, 3)["degree__in_weight_total"] == pytest.approx(27)
+    assert _row(filtered, 3)["degree__in_weight_total"] == pytest.approx(20)
+
+
 def test_cache_hit_and_fingerprint_changes(tmp_path, monkeypatch):
     edges = _write_edges(tmp_path / "edges.feather", EDGES)
     first = _build(tmp_path, objective="flow", edges=edges)

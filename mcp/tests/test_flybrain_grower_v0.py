@@ -58,6 +58,13 @@ def test_genome_from_data_maps_synapse_params(stats_file):
     assert p["mean"] > 0.0 and p["std"] > 0.0
 
 
+def test_genome_from_data_includes_nt_type(stats_file):
+    g = genome_from_data(stats_file)
+    assert "nt_type" in g
+    assert set(g["nt_type"].keys()) == set(g["cell_types"])
+    assert all(value == "unknown" for value in g["nt_type"].values())
+
+
 def test_genome_from_data_raises_on_missing_field(tmp_path):
     bad = dict(MINIMAL_STATS)
     del bad["neuron_counts"]

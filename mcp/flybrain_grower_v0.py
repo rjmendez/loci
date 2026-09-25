@@ -8,6 +8,26 @@ import numpy as np
 GENOME_SCHEMA_VERSION = "flybrain-grower-genome/v0"
 _REQUIRED_STATS_KEYS = {"cell_types","neuron_counts","connection_probability","mean_synapse_count","std_synapse_count"}
 _DEFAULT_COMPARTMENT_BIAS = {"axon_out_frac": 0.75, "dendrite_in_frac": 0.68}
+_L1EM_NT_BY_TYPE = {
+    "sensory": "acetylcholine",
+    "ascending": "unknown",
+    "PN": "acetylcholine",
+    "PN-somato": "acetylcholine",
+    "LHN": "acetylcholine",
+    "KC": "acetylcholine",
+    "MBON": "acetylcholine",
+    "MBIN": "dopamine_or_octopamine",
+    "LN": "gaba",
+    "CN": "gaba",
+    "interneuron": "unknown",
+    "DN-SEZ": "unknown",
+    "DN-VNC": "unknown",
+    "pre-DN-SEZ": "unknown",
+    "pre-DN-VNC": "unknown",
+    "RGN": "unknown",
+    "MB-FBN": "acetylcholine",
+    "MB-FFN": "acetylcholine",
+}
 
 
 def genome_from_data(type_stats_path):
@@ -51,6 +71,7 @@ def genome_from_data(type_stats_path):
         "connection_probs": connection_probs,
         "synapse_count_params": synapse_count_params,
         "compartment_bias": compartment_bias,
+        "nt_type": {t: _L1EM_NT_BY_TYPE.get(t, "unknown") for t in cell_types},
         "metadata": {
             "source_path": str(path),
             "source_dataset": stats.get("dataset", "unknown"),
@@ -80,6 +101,7 @@ def validate_genome(genome):
         raise ValueError(f"sum(type_counts) must be >= 2, got {n}")
     conn = genome["connection_probs"]
     syn = genome["synapse_count_params"]
+    nt_type = genome.get("nt_type")
     for pre in cell_types:
         if pre not in conn:
             raise ValueError(f"connection_probs missing pre-type {pre!r}")
@@ -96,6 +118,11 @@ def validate_genome(genome):
             params = syn[pre][post]
             if "mean" not in params or "std" not in params:
                 raise ValueError(f"synapse_count_params[{pre!r}][{post!r}] must have mean and std")
+    if nt_type is not None:
+        if not isinstance(nt_type, Mapping):
+            raise ValueError("nt_type must be a mapping when present")
+        if set(nt_type.keys()) != set(cell_types):
+            raise ValueError("nt_type keys must match cell_types exactly")
 
 
 def sample_connectome(genome, seed=None):

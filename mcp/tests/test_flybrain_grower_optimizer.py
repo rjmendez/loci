@@ -112,4 +112,15 @@ def test_run_returns_best_genome(monkeypatch, patch_joblib_load):
     assert result["best_genome"].shape == (optimizer.genome_dim,)
     assert result["best_score"] > 0.0
     assert result["history"]
+    assert result["degeneracy_count"] >= 0
+    assert result["behavioral_diversity"] >= 0.0
     np.testing.assert_allclose(optimizer.sbm_to_genome(result["best_sbm"]), result["best_genome"])
+
+
+def test_run_records_degeneracy_count(monkeypatch, patch_joblib_load):
+    optimizer = _optimizer(monkeypatch, patch_joblib_load, hit_probability=0.95, reward=0.8)
+    monkeypatch.setattr(optimizer, "evaluate_genome", lambda genome, n_samples=10: 1.0)
+
+    result = optimizer.run(max_iter=1)
+
+    assert result["degeneracy_count"] >= 0

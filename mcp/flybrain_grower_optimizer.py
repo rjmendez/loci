@@ -65,6 +65,7 @@ class GrowerOptimizer:
         self._critic_feature_columns = self._critic_feature_names()
         self._class_index = {str(name): idx for idx, name in enumerate(self._critic_classes())}
         self._cache_root = DEFAULT_CACHE_ROOT
+        self._last_evaluation: dict[str, Any] | None = None
 
     def genome_to_sbm(self, genome: np.ndarray) -> dict[str, Any]:
         flat = self._coerce_genome(genome)
@@ -142,10 +143,12 @@ class GrowerOptimizer:
     def evaluate_genome(self, genome: np.ndarray, n_samples: int = 10) -> float:
         if int(n_samples) < 1:
             raise ValueError("n_samples must be >= 1")
+        genome = self._coerce_genome(np.asarray(genome, dtype=np.float64))
         sbm = self.genome_to_sbm(genome)
         base_seed = self._stable_seed(self.sbm_to_genome(sbm))
         sampled: list[dict[str, Any]] = []
         realism_scores: list[float] = []
+        self._last_evaluation = None
 
         for sample_index in range(int(n_samples)):
             connectome = self._sample_connectome(sbm, seed=base_seed + sample_index)
@@ -162,9 +165,19 @@ class GrowerOptimizer:
 
         mean_realism = float(np.mean(realism_scores))
         if mean_realism < REALISM_GATE:
+            self._last_evaluation = {
+                "passed_realism_gate": False,
+                "task_reward": 0.0,
+                "genome": genome.copy(),
+            }
             return 0.0
 
         task_reward = self._task_reward(genome=self.sbm_to_genome(sbm), sbm=sbm, samples=sampled)
+        self._last_evaluation = {
+            "passed_realism_gate": True,
+            "task_reward": float(task_reward),
+            "genome": genome.copy(),
+        }
         return float(mean_realism * task_reward)
 
     def run(self, max_iter: int = 100) -> dict[str, Any]:
@@ -188,10 +201,27 @@ class GrowerOptimizer:
         best_genome: np.ndarray | None = None
         best_score = float("-inf")
         history: list[dict[str, float]] = []
+        gate_passing_genomes: list[np.ndarray] = []
+        gate_passing_rewards: list[float] = []
 
         for iteration in range(int(max_iter)):
             candidates = [self._coerce_genome(np.asarray(candidate, dtype=np.float64)) for candidate in es.ask()]
-            scores = [float(self.evaluate_genome(candidate)) for candidate in candidates]
+            scores: list[float] = []
+            for candidate in candidates:
+                score = float(self.evaluate_genome(candidate))
+                scores.append(score)
+                evaluation = self._last_evaluation if isinstance(self._last_evaluation, Mapping) else None
+                if evaluation and evaluation.get("passed_realism_gate"):
+                    gate_passing_rewards.append(float(evaluation.get("task_reward", 0.0)))
+                    if len(gate_passing_genomes) < 50:
+                        passed_genome = evaluation.get("genome")
+                        gate_passing_genomes.append(
+                            self._coerce_genome(np.asarray(passed_genome if passed_genome is not None else candidate, dtype=np.float64)).copy()
+                        )
+                elif evaluation is None and score > 0.0:
+                    gate_passing_rewards.append(score)
+                    if len(gate_passing_genomes) < 50:
+                        gate_passing_genomes.append(candidate.copy())
             es.tell(candidates, [-score for score in scores])
 
             iteration_best = max(scores)
@@ -212,11 +242,15 @@ class GrowerOptimizer:
 
         if best_genome is None:
             raise RuntimeError("CMA-ES terminated before producing a candidate genome")
+        behavioral_diversity = float(np.std(np.asarray(gate_passing_rewards, dtype=np.float64))) if len(gate_passing_rewards) >= 2 else 0.0
         return {
             "best_genome": best_genome,
             "best_score": best_score,
             "best_sbm": self.genome_to_sbm(best_genome),
             "history": history,
+            "degeneracy_count": int(len(gate_passing_rewards)),
+            "behavioral_diversity": behavioral_diversity,
+            "gate_passing_genomes": gate_passing_genomes,
             "stop_reason": dict(es.stop()),
         }
 
