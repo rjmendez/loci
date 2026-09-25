@@ -232,6 +232,34 @@ class TestTagsPass(unittest.TestCase):
             self.assertEqual(second["proposed"], 0)
             self.assertEqual(second["generated"], 1)   # regenerated, then deduped
 
+    def _calibrate(self, answer):
+        """pass_tags --calibrate over 6 mqtt+acoustic and 6 build findings."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            _corpus(tmp, {"inv": [_f(f"t{i}", tags=["mqtt", "acoustic"]) for i in range(6)]
+                                 + [_f(f"b{i}", text="the build broke on the runner", tags=["build"])
+                                    for i in range(6)]})
+            gd = tmp / "_groom"
+            gen = lambda prompts: [  # noqa: E731
+                {"text": json.dumps({"tags": answer("build broke" in p)}), "ok": True} for p in prompts]
+            report = groom.pass_tags(gen_fn=gen, memory_dir=tmp, groom_dir=gd, calibrate=True)
+            self.assertFalse((gd / "proposals.jsonl").exists())
+        return report
+
+    def test_calibrate_scores_precision_against_the_authors_tags(self):
+        # mqtt findings get ["mqtt"] (precision 1.0); build findings get
+        # ["mqtt", "build"] (precision 0.5): the mean is 0.75, and every pick hits.
+        report = self._calibrate(lambda is_build: ["mqtt", "build"] if is_build else ["mqtt"])
+        self.assertEqual(report["checked"], 12)
+        self.assertEqual(report["mean_precision"], 0.75)
+        self.assertEqual(report["any_correct_rate"], 1.0)
+
+    def test_calibrate_reports_a_pure_miss_as_zero(self):
+        report = self._calibrate(lambda is_build: ["mqtt"] if is_build else ["build"])
+        self.assertEqual((report["checked"], report["mean_precision"], report["any_correct_rate"]),
+                         (12, 0.0, 0.0))
+
     def test_no_generation_tier_degrades(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:

@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
+from .conftest import VALIDATED_REV, needs_corpus_deps, needs_git_history  # noqa: F401
 from .helpers import mcp_tool_functions, source_at
 
 from ..cli import main
@@ -171,6 +171,25 @@ def test_holes_groups_by_reason(capsys):
     code, out = _run(capsys, ["holes", "--rev", "HEAD", "--scope", "mcp/graph_tools.py"])
     assert code == 0
     assert "callsite(s) total" in out
+    code, out = _run(capsys, ["holes", "--rev", "HEAD", "--scope", "mcp/graph_tools.py",
+                              "--format", "json"])
+    payload = json.loads(out)
+    # every unresolved callsite is attributed to a real reason, and the groups add up
+    assert sum(payload["by_reason"].values()) == payload["total"] > 0
+    assert "unknown" not in payload["by_reason"]
+
+
+@needs_git_history
+def test_holes_reason_breakdown_at_the_validated_rev(capsys):
+    # Exact at the fixed revision (HEAD moves as code lands; the tool must not).
+    code, out = _run(capsys, ["holes", "--rev", VALIDATED_REV, "--scope", "mcp/graph_tools.py",
+                              "--format", "json"])
+    assert code == 0
+    assert json.loads(out) == {
+        "by_reason": {"attribute-unknown-receiver": 26, "call-result-unresolved": 1,
+                      "name-not-bound-in-module-scope": 20},
+        "total": 47,
+    }
 
 
 # -- probable tier: dispatch / injected globals -------------------------------

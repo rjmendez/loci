@@ -65,8 +65,29 @@ def test_brownout_l3_forces_local_for_reasoning():
     req = _base_request()
     req["task_class"] = "reasoning"
     decision = mod.choose_lane(req, brownout_level="L3")
-    assert decision.lane_id == "local-batch"
-    assert decision.degraded is True
+    assert (decision.lane_id, decision.reason, decision.degraded) == \
+        ("local-batch", "brownout_local_only", True)
+
+
+def test_brownout_keeps_integration_and_tooling_on_copilot():
+    # Every branch of the brownout rule, at both local-only levels.
+    mod = _load()
+    for level in ("L3", "L4"):
+        for task_class in ("integration", "tooling"):
+            req = _base_request()
+            req["task_class"] = task_class
+            d = mod.choose_lane(req, brownout_level=level)
+            assert (d.lane_id, d.reason, d.degraded) == \
+                ("copilot-general", "brownout_keep_integration", True), (level, task_class)
+        req = _base_request()
+        d = mod.choose_lane(req, brownout_level=level, local_healthy=False)
+        assert (d.lane_id, d.reason, d.degraded) == \
+            ("local-recovery", "brownout_local_unhealthy", True), level
+    # below L3 the brownout rule does not apply: tooling is routed normally, not degraded
+    req = _base_request()
+    req["task_class"] = "tooling"
+    d = mod.choose_lane(req, brownout_level="L2")
+    assert (d.lane_id, d.reason, d.degraded) == ("copilot-general", "integration_or_tooling", False)
 
 
 def test_main_emits_json_decision(tmp_path, capsys):
