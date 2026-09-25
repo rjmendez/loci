@@ -248,3 +248,180 @@ python flybrain_brain_cluster_mc_samples.py --objective <obj> --output <payload.
 - A real build takes about 13-22 s with a warm cache, plus first-open hashing of about 5.7 GB of required products (27 s on F:). Peak RSS is about 1.5-2 GB.
 - The tests re-register the builder for each test and unregister it when the module is imported. This keeps the dispatcher's stub-`mc` tests working in the same session.
 - Before promotion (`planned` to `active`): SC3 threshold reports per (dataset, objective), the grouped-split trivial-baseline gate (AC6) and AB plan AC1-AC5 still apply.
+
+## 8. Real models (2026-09-24)
+
+Module: `mcp/flybrain_mc_targets.py` (new). Tests: `mcp/tests/test_flybrain_mc_targets.py`, synthetic fixtures only.
+
+The payload builders in sections 5-6 are unchanged. The one addition to `flybrain_brain_cluster_mc_samples` is `attach_structured_features(samples, frame, objective=...)`:
+
+- It returns copies of the samples with a `features` dict.
+- It applies the registered exclusions, then re-checks them and fails closed on any leak.
+- It leaves `input_text` untouched.
+
+### 8.1 Targets
+
+| Target | Label source | Rows used |
+|---|---|---|
+| `nt_ground_truth` | The `ground_truth` column of `body-neurotransmitters` (only rows where it is set). It is the transmitter known outside the synapse classifier: from literature, transcriptomics and, in the VNC, hemilineage-transmitter assignments. It was also the classifier's training target. In v1.0 it is set per cell type: all 3,318 labelled types carry exactly one value. `consensus_nt` equals it on 100% of those rows. | 18,336 neurons, 3,318 types. Types per transmitter: ach 1,641, gaba 1,172, glut 431, da 38, oct 15, ser 13, his 8. |
+| `super_class` | Curated `superclass`, harmonized with `harmonize_super_class`: 11 classes, with `unknown`, `other` and non-neuronal dropped. | 55,250 neurons, 11,738 types |
+| `cell_class` | Curated `class`, only rows where it is set and only classes with at least 5 types. This drops chemosensory, hygrosensory and thermosensory. | 8,466 neurons, 1,016 types, 17 classes |
+| `connectivity_tier` | The unchanged builder (section 5.1), taking every candidate and then capping per type. Threshold: 1,816 output synapses. | 55,064 neurons |
+| `region_specialization_tier` | The unchanged builder (section 5.1), taking every candidate and then capping per type. | 55,214 neurons |
+
+The population is every typed body that meets all of these (157,856 bodies):
+
+- status is Traced or Anchor
+- not glia
+- at least 100 primary-ROI synapses
+
+At most 20 neurons are kept per cell type, picked in sha256(`mc-real-models/v1`:body id) order. This stops the columnar optic-lobe types, some of which have about 2,000 copies, from dominating.
+
+### 8.2 Features
+
+- **Wiring** (`flybrain_wiring_features`):
+  - Families: `degree`, `out_comp`, `in_comp`, `recip`, `out2_comp`, `in2_comp`.
+  - Input: 151,856,684 minconf-0.5 edges. The node table is all 211,577 annotated bodies. The partner category is the harmonized super class. `two_hop=True`.
+  - The mc pair table has no neuropil column, so there is no `out_np` or `in_np`.
+- **`roi`** (from `roiInfo` in `Neuprint_Neurons.feather`, cached under `<cache_root>/mc-roi/`):
+  - Pre and post synapse fractions in the top 24 base neuropils, with hemispheres merged.
+  - An `other` fraction, pre/post entropy, and the left-hemisphere share.
+  - `degree__roi_pre_share` and `degree__roi_n_primary_rois` belong to the `degree` family, so `connectivity_tier` drops them.
+- **Categorical columns** use plain names so the registered patterns catch them:
+  - `cns_division`, `subdivision`, `primary_neuropil` (the measured top primary ROI)
+  - `side`, `super_class`, `cell_class`, `hemilineage`
+- **The `nb` view** is `key value` text over the allowed categorical columns only.
+
+Exclusions are the registered patterns plus `EXTRA_EXCLUDED`:
+
+- `hemilineage` is never an input for `nt_ground_truth`, because VNC ground truth is assigned per hemilineage.
+- `hemilineage` is never an input for `super_class` or `cell_class`, because its sentinel values mark non-intrinsic neurons.
+- Cell type, supertype and body id are never inputs.
+- No NT-classifier column is loaded at all. The NT table is cut down to `(root_id, ground_truth)` as soon as it is read.
+- For `region_specialization_tier`, the registry drops every `roi__*` column plus `cns_division`, `subdivision` and `primary_neuropil`. So the NB text for that target no longer carries the neuropil token it used to.
+
+### 8.3 Protocol
+
+- **Split.** `flybrain_model_eval.run_evaluation` with a 0.7/0.15/0.15 split and seed `flybrain-real-models-v1`. Samples are grouped by union-find over `cell_type`, `hemilineage` (real lineages only) and `supertype`. Supertype is new here: it keeps sister types together.
+- **Masking.** When the partner category is the target or is determined by it (`super_class`, `cell_class`), the split is planned first, then:
+  - Every node in the node table that shares a held-out component's cell type, hemilineage or supertype is masked to `unannotated` before the wiring features are built. That includes non-sample copies of held-out types. The per-type cap leaves those out of the sample, but their labels would otherwise leak through partner composition.
+  - 52,257 nodes are masked for `super_class` and 10,267 for `cell_class`.
+  - The harness fails closed on any split mismatch (`masked_split_ids_sha256`).
+- **Models and tuning:**
+  - `nb`: alpha 0.5 or 1.
+  - `logreg`: C 0.1, C 1, or C 1 balanced.
+  - `hgb`: lr 0.1, 300 iterations, with or without balanced weights.
+  - Each model is tuned by grouped 3-fold CV inside train on macro-F1, then temperature-calibrated on the out-of-fold probabilities.
+- **Test.** Test is scored once, with a cluster bootstrap by split component (1,000 draws).
+- **Controls.** A label-shuffle refit, a random-split refit, and a drop-one-family ablation on val.
+
+### 8.4 Results (run `wiring-roi-v1`, held-out test)
+
+Artifacts, all under `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/mc/`:
+
+- Reports: `<target>/wiring_roi_v1/report.{json,md}`; saved models: `<target>/wiring_roi_v1/models/`.
+- Run log: `runs/all-v1.log`. The run took 2 h 12 min under the heavy lock, with peak RSS 5.5 GB.
+- Summary rows: `runs/summary.jsonl`.
+
+| Target | Model | Majority | Best trivial (rule) | Acc [95% CI] | Macro-F1 | ECE | Shuffle | Random-split | Gate |
+|---|---|---:|---|---|---:|---:|---:|---:|---|
+| nt_ground_truth | nb | 0.288 | 0.381 (text lookup `cell_class`) | 0.514 [0.282, 0.771] | 0.449 | 0.092 | 0.277 | 0.454 | fail |
+| nt_ground_truth | logreg | 0.288 | 0.381 (lookup `cell_class`) | 0.556 [0.371, 0.801] | 0.505 | 0.076 | 0.271 | 0.779 | fail |
+| nt_ground_truth | hgb | 0.288 | 0.381 (lookup `cell_class`) | 0.522 [0.365, 0.769] | 0.579 | 0.156 | 0.283 | 0.891 | fail |
+| super_class | nb | 0.420 | 0.739 (text lookup) | 0.713 [0.633, 0.770] | 0.264 | 0.096 | 0.420 | 0.795 | fail |
+| super_class | logreg | 0.420 | 0.739 (lookup `primary_neuropil`) | 0.979 [0.971, 0.987] | 0.774 | 0.013 | 0.420 | 0.987 | pass |
+| super_class | hgb | 0.420 | 0.739 (lookup `primary_neuropil`) | 0.979 [0.970, 0.987] | 0.803 | 0.011 | 0.277 | 0.994 | pass |
+| cell_class | nb | 0.008 | 0.656 (text lookup) | 0.627 [0.542, 0.712] | 0.353 | 0.220 | 0.009 | 0.710 | fail |
+| cell_class | logreg | 0.008 | 0.656 (lookup `primary_neuropil`) | 0.916 [0.866, 0.951] | 0.787 | 0.165 | 0.027 | 0.981 | pass |
+| cell_class | hgb | 0.008 | 0.656 (lookup `primary_neuropil`) | 0.842 [0.770, 0.898] | 0.769 | 0.429 | 0.098 | 0.992 | fail (shuffle) |
+| connectivity_tier | nb | 0.534 | 0.682 (text lookup) | 0.691 [0.641, 0.745] | 0.689 | 0.073 | 0.438 | 0.686 | fail |
+| connectivity_tier | logreg | 0.534 | 0.709 (lookup `out_comp__descending`) | 0.778 [0.748, 0.811] | 0.774 | 0.019 | 0.531 | 0.803 | pass |
+| connectivity_tier | hgb | 0.534 | 0.709 (lookup `out_comp__descending`) | 0.856 [0.833, 0.881] | 0.855 | 0.010 | 0.472 | 0.918 | pass |
+| region_specialization_tier | nb | 0.640 | 0.700 (text lookup) | 0.692 [0.614, 0.771] | 0.668 | 0.115 | 0.585 | 0.795 | fail |
+| region_specialization_tier | logreg | 0.640 | 0.700 (lookup `hemilineage`) | 0.799 [0.753, 0.839] | 0.768 | 0.014 | 0.639 | 0.846 | pass |
+| region_specialization_tier | hgb | 0.640 | 0.700 (lookup `hemilineage`) | 0.844 [0.812, 0.877] | 0.826 | 0.015 | 0.377 | 0.931 | pass |
+
+### 8.5 Reading the results
+
+- **`nt_ground_truth` fails, which is a negative result, not a bug.**
+  - Point estimates beat the best trivial rule by 14-18 points. Macro-F1 is 0.50-0.58 against 0.35 for the best trivial rule.
+  - But the paired cluster-bootstrap CI of the gain crosses zero: [-0.011, 0.337] for logreg.
+  - The grouped split leaves only 392 components (largest 768 neurons) and 60 test components. The label mix also swings between splits: the majority is 0.528 on val but 0.288 on test, because the dopaminergic components put 240 da neurons into test and only 56 into train.
+  - On val the best model (hgb) is below the val majority (0.469 vs 0.528).
+  - The random-split accuracy (0.89 for hgb) shows how much of any "NT from wiring" result is cell-type memorization.
+  - The ablation is flat: no family matters by more than about 1 point.
+- **`super_class` passes and looks robust.**
+  - 0.979 accuracy against 0.739 for a `primary_neuropil` lookup, with shuffle collapsed and a random-split gap of only 1.5 points.
+  - Dropping any single family costs at most 1.1 points, so the signal is redundant across families rather than coming from one leaky column.
+  - What remains easy: sensory neurons have almost no inputs, and ascending/descending neurons have partners in both the brain and the VNC. These are genuine wiring signatures.
+  - Rare classes (efferent 6 test neurons, endocrine 8) are near 0 recall, which is why macro-F1 is about 0.8.
+- **`cell_class`: logreg passes; hgb fails only the shuffle rule.**
+  - The split puts almost all CX neurons (one 1,327-neuron component) in train, and Kenyon cells are train-only. So the train majority (`cx`) is 0.8% of test.
+  - That makes the "shuffle <= majority + 0.02" rule nearly unsatisfiable: a shuffled hgb scores 0.098 just by predicting the train label mix.
+  - I read this as a split artifact, not leakage. It is still reported as a fail.
+  - Temperature calibration hurts here (logreg ECE 0.031 raw -> 0.165 calibrated; hgb 0.212 -> 0.429). The out-of-fold class mix differs from test (prior shift), so calibrated confidences for `cell_class` should not be trusted.
+- **`connectivity_tier` passes but stays close to tautological (B1).**
+  - Degree is excluded, but the partner-composition vectors still carry size. The number of nonzero partner categories has Spearman 0.65 with the label-defining total output weight. On all annotated neurons it alone lifts a one-feature stump from 0.783 to 0.840.
+  - Dropping `out_comp` costs 4.6 points in the ablation.
+  - See 8.6 for a sparsity-only control.
+  - Treat this target as a plumbing check, not a science result.
+- **`region_specialization_tier` passes.**
+  - The model has no ROI, neuropil or division inputs, only partner composition, reciprocity and degree.
+  - The top ablation families are `in2_comp` (-4.1) and `out_comp` (-3.2), meaning partner type mix predicts how spread out a neuron is.
+  - Partner super classes are themselves partly anatomical (optic vs central vs VNC), so this is wiring-mediated anatomy, not an independent biological label.
+- **`nb` fails everywhere.** The categorical tokens it sees are exactly what the lookup baselines see, so it cannot beat them.
+
+### 8.6 Variants and controls
+
+Both variants ran through `flybrain-slot`. Logs are in `runs/`, and reports are under `<target>/wiring_only_v1/`, `super_class/wiring_only_v1_superclass_manual/` and `connectivity_tier/sparsity_control_v1/`.
+
+**`wiring-only-v1`** keeps the graph families only (`degree`, `out_comp`, `in_comp`, `recip`, `out2_comp`, `in2_comp`), with no `roi` and no categorical columns, and runs `logreg` and `hgb`. The `super_class` row came from a separate launch of the same command, labelled `wiring-only-v1-superclass-manual`.
+
+| Target | Model | Majority | Best trivial | Acc [95% CI] | Macro-F1 | Paired gain CI | Val acc (val majority / trivial) | Gate |
+|---|---|---:|---|---|---:|---|---|---|
+| super_class | logreg | 0.420 | 0.654 (threshold) | 0.972 [0.963, 0.980] | 0.757 | [0.250, 0.406] | 0.958 (0.495 / 0.726) | pass |
+| super_class | hgb | 0.420 | 0.654 (threshold) | 0.976 [0.966, 0.984] | 0.798 | [0.252, 0.412] | 0.968 | pass |
+| cell_class | logreg | 0.008 | 0.246 (lookup) | 0.896 [0.836, 0.945] | 0.777 | [0.534, 0.735] | 0.916 (0.225 / 0.358) | fail (shuffle 0.033 > 0.028) |
+| cell_class | hgb | 0.008 | 0.246 (lookup) | 0.736 [0.648, 0.809] | 0.662 | [0.359, 0.604] | 0.813 | fail (shuffle 0.089) |
+| nt_ground_truth | logreg | 0.288 | 0.317 (lookup `recip__partner_frac`) | 0.464 [0.344, 0.652] | 0.470 | [0.011, 0.286] | 0.466 (0.528 / 0.538) | pass (see below) |
+| nt_ground_truth | hgb | 0.288 | 0.317 (lookup) | 0.484 [0.326, 0.711] | 0.376 | [0.078, 0.280] | 0.487 | pass (see below) |
+
+Reading the variants:
+
+- **Graph structure alone gives `super_class` at 0.97-0.98.** Dropping `roi` and the anatomy columns loses less than 1 point.
+- **The `cell_class` failures are the same shuffle-rule artifact as in 8.5.** The paired gains are large, and val agrees: 0.92 against a trivial rule at 0.36.
+- **The `nt_ground_truth` wiring-only pass is not robust.**
+  - It passes because the wiring-only view has a weaker trivial rule (0.317) than the full view (0.381, a `cell_class` lookup). Its test accuracy (0.46-0.48) is actually lower than the full model's.
+  - On val, both models are below the val majority (0.466 and 0.487 against 0.528).
+  - The random-split accuracy (0.90 for hgb) is far above the grouped accuracy.
+  - Conclusion: NT-from-wiring is not established on mc. This lane is split-variance dominated (60 test components).
+
+**`sparsity-control-v1`** runs `connectivity_tier` on two features only: the count of nonzero out and in partner categories.
+
+- These features are opt-in (`--families sparsity`) and never in the default set.
+- The registry does not catch them (`n_*` only matches a prefix). This is listed as a needed shared edit.
+
+| Model | Majority | Best trivial | Acc [95% CI] | Paired gain CI | Gate |
+|---|---:|---|---|---|---|
+| logreg | 0.534 | 0.668 (lookup `sparsity__n_nonzero_in_comp`) | 0.662 [0.628, 0.707] | [-0.022, 0.010] | fail (and its shuffle refit scores 0.667) |
+| hgb | 0.534 | 0.668 | 0.680 [0.646, 0.721] | [0.001, 0.023] | pass |
+
+Reading the control:
+
+- Two partner-category counts alone take `connectivity_tier` from 0.534 to about 0.67-0.68. That is roughly 45% of the full model's lift (0.856).
+- A trivial rule on one of them already reaches 0.668. This confirms that the size signal hides in the composition vectors.
+- The logreg shuffle refit at 0.667 is a known weakness of the shuffle control in one or two dimensions. A random coefficient sign on a monotone feature matches the true direction half the time.
+
+### 8.7 Reproduce
+
+```
+cd mcp && ~/.local/bin/flybrain-slot python flybrain_mc_targets.py \
+    [--target <t> ...] [--run-label wiring-roi-v1] [--families degree,out_comp,...] [--models nb,logreg,hgb] \
+    [--storage-root /mnt/f/.flybrain] [--stamp-dir /mnt/f/.flybrain/cache/hash-stamps/mc] \
+    [--cache-root /mnt/f/.flybrain/cache] [--report-root /mnt/f/.flybrain/logs/real-models-20260924T174122Z] \
+    [--summary-out <jsonl>]
+```
+
+- Hash stamps go to `--stamp-dir`, outside the snapshot.
+- The feature caches are `<cache_root>/wiring-features/mc/<fingerprint>.parquet` and `<cache_root>/mc-roi/<key>.parquet`. Each has a sha256 sidecar and is rebuilt on mismatch.
+- Warm-cache build time per target is 10-35 s. A wiring build takes about 200 s. Evaluation takes 10-35 min per target.

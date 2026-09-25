@@ -597,6 +597,66 @@ def label_derivability_audit(
     }
 
 
+# ---------------------------------------------------------------------------
+# Structured (real-model) path: shared anatomy tokens + the new targets
+# ---------------------------------------------------------------------------
+
+# input_text keys for the structured targets that are not legacy objectives
+# (cell_family, super_class): no hemilineage and no hex-column flag, both of
+# which are curated, type-derived annotations.
+STRUCTURED_TEXT_FEATURES: tuple[str, ...] = (
+    "side",
+    "soma",
+    "primary_neuropil",
+    "input_neuropil",
+    "output_neuropil",
+    "arbor",
+    "dominant_layer",
+    "polarity_tier",
+    "column_span_tier",
+)
+_NO_ROI_TOKENS = {"primary_neuropil": "none", "input_neuropil": "none", "output_neuropil": "none", "arbor": "none",
+                  "dominant_layer": "none", "polarity_tier": "none", "column_span_tier": "t0"}
+
+
+def anatomy_tokens(frame, config: OlSampleBuildConfig | None = None) -> dict[str, dict[str, str]]:
+    """body_id -> the categorical anatomy tokens the legacy builder puts in ``input_text``.
+
+    ``frame`` needs the canonical neuron columns (``body_id``, ``cell_type``,
+    ``instance``, ``pre``, ``post``, ``soma_location``, ``assigned_ol_hex1``,
+    ``hemilineage``, ``roi_info``). Neurons without a primary-ROI synapse get
+    ``none`` region tokens instead of being dropped.
+    """
+    cfg = config or OlSampleBuildConfig()
+    rows, _ = _annotate(frame, cfg)
+    out = {item["body_id"]: dict(item["features"]) for item in rows}
+    for row in frame.itertuples(index=False):
+        body_id = str(row.body_id)
+        if body_id not in out:
+            out[body_id] = {"side": _side(row.instance), "soma": "no" if _missing(row.soma_location) else "yes",
+                            "hex_column": "no" if _missing(row.assigned_ol_hex1) else "yes",
+                            "hemilineage": _clean(row.hemilineage), **_NO_ROI_TOKENS}
+    return out
+
+
+def render_input_text(features: Mapping[str, str], keys: Sequence[str]) -> str:
+    """``dataset ol11`` + ``key value`` pairs in ``keys`` order (same format as the legacy builder)."""
+    return " ".join([f"dataset {_DATASET_TAG}", *(f"{key} {features[key]}" for key in keys)])
+
+
+def build_ol_structured_eval_dataset(target: str, *, storage_root: str | Path | None = None, **overrides: Any):
+    """Real-model path: ``(EvalDataset, extras)`` for ``target`` (see ``flybrain_ol_targets``).
+
+    Opens the snapshot read-only (``verify_hashes=False`` + manifest sha256 of
+    the extra products), so nothing is written into it.
+    """
+    import flybrain_model_eval as fme
+    import flybrain_ol_targets as olt
+
+    inputs = olt.load_ol_structured_inputs(storage_root)
+    return olt.build_ol_eval_dataset(inputs, olt.OlTargetConfig(target=target, **overrides), fme.EvalConfig())
+
+
 def register_ol_sample_builders(*, replace: bool = False) -> None:
     register_sample_builder(
         OL_SYMBOL,

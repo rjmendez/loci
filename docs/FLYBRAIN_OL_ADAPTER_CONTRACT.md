@@ -242,3 +242,138 @@ Explicit paths (`neurons_path`, `meta_path`) must be given together or not at al
 - The default `verify_hashes=None` writes a hash stamp under `manifest/hash-stamps/` the first time each product is verified. Use `verify_hashes=False` (as the smoke tests do) for a read-only run.
 - Tests re-register the builder per test and unregister it at module import, following the BANC pattern.
 - Before promotion (registry `planned` to `active`): SC3 thresholds per (dataset, objective), the grouped-split trivial-baseline gate (AC6; see §6 for the expected NT outcome), and AB AC1-AC5 still apply.
+
+## 9. Real models (structured features, new targets)
+
+Module: `mcp/flybrain_ol_targets.py` (tests: `mcp/tests/test_flybrain_ol_targets.py`). The legacy builder above is unchanged. `flybrain_brain_cluster_ol_samples.py` gains `anatomy_tokens`, `render_input_text`, `STRUCTURED_TEXT_FEATURES` and `build_ol_structured_eval_dataset(target, ...)`, which delegates here.
+
+Evaluation uses the shared harness (`flybrain_model_eval.run_evaluation`):
+
+- a split grouped by cell type
+- trivial baselines for each view
+- grouped-CV tuning inside train
+- one held-out test per final config
+- cluster-bootstrap CIs
+- a label-shuffle control and the random-split gap
+- a drop-one-family ablation on val
+
+CLI (run under the heavy lock):
+
+```
+OMP_NUM_THREADS=8 flock /tmp/flybrain-heavy.lock python flybrain_ol_targets.py --storage-root /mnt/f/.flybrain \
+    --targets cell_family,super_class,connectivity_tier,neurotransmitter_dominance,nt_ground_truth \
+    --feature-sets full[,wiring_only,anatomy_only] --report-root /mnt/f/.flybrain/logs/real-models-20260924T174122Z
+```
+
+Outputs:
+
+- `<report-root>/ol/<target>/[<feature_set>/]report.{json,md}`
+- `models/<nb|logreg|hgb>/`: manifest-hashed artifacts
+- `family_map.json` (`cell_family` only)
+
+Set `OMP_NUM_THREADS`. Without it, the HGB OpenMP pool ignored the harness's `threadpool_limits(8)` and the first run used about 17 cores.
+
+### 9.1 Read-only inputs
+
+`load_ol_structured_inputs` opens the snapshot with `verify_hashes=False`. That checks the manifest self-hash, the sidecar and every listed size, and writes no hash stamps. It then reads two products the adapter does not expose as roles. It finds them through the manifest `role` field and checks each one's sha256 against the manifest by reading the file:
+
+- `edgelist`: `source/flat-connectome/connectome-weights-...-ol.feather` (22,250,147 `body_pre, body_post, weight` rows, all ROIs, minconf 0.5)
+- `body_stats`: `source/flat-connectome/body-stats-...-ol.feather` (its `class` column is the `super_class` label)
+
+It also reads `Neuprint_Neurons.feather`, using projection and a typed-only filter over every typed body of any status (53,987). Peak RSS is about 2 GB. A feature build streams the edge list once, takes about 35 s, and is cached under `/mnt/f/.flybrain/cache/wiring-features/ol/`.
+
+### 9.2 Targets and label definitions
+
+Sample rules:
+
+- **Eligible neurons:** typed `Traced` neurons with pre+post >= 10.
+- **Provisional types** (`*_unclear`, `*TBD*`, parenthesised names) are never labels.
+- **Classes** with fewer than `min_types` (5) distinct cell types are dropped, because a type-grouped split cannot test them.
+- **Per-type cap:** at most `max_per_type` (20) neurons per type, chosen in `sha256("ol11-real-models:<bodyId>")` order, so the ~900-neuron columnar types do not dominate.
+
+| Target | Label | Kind |
+|---|---|---|
+| `cell_family` | `FamilyMap` of the cell type (below) | curated |
+| `super_class` | flat-connectome `class`, `harmonize_super_class`; `*_tbc` dropped; sensory, motor and ascending dropped (< 5 types) | curated |
+| `connectivity_tier` | legacy: `downstream` >= 0.75 quantile (1,252) over candidates with downstream >= 10 | derived count |
+| `neurotransmitter_dominance` | per-neuron **predicted** `predictedNt` (unclear dropped, `totalNtPredictions` >= 10) | classifier output |
+| `nt_ground_truth` | type-level **consensus** `consensusNt` where `ntReference` is set (Davis 2020 RNA-seq, Nern 2024, Konstantinides 2018, ...); da and ser dropped (2 types each) | consensus, literature-backed; not per-neuron ground truth |
+
+**Family map.** `raw_family` and `build_family_map` build it, and each report records its sha256. The rules:
+
+1. The family is the leading letter run of the type name: `Tm5a` becomes `Tm`, `TmY9b` becomes `TmY`, `T4a` becomes `T` (so T1–T5 form one family), and `R1-R6` becomes `R`.
+2. Merges:
+   - `MeVPLo`, `MeVPLp`, `MeVPaMe` and `MeVPOL` become `MeVP`. `MeVPMe` stays separate, with 13 types.
+   - `LoVCLo` becomes `LoVC`, and `MeVCMe` becomes `MeVC`.
+   - `HSE`, `HSN`, `HSS` and `HST` become `HS`, and `VSm` becomes `VS`.
+   - Every `DN*` becomes `DN`.
+3. Types whose majority body class is central, ascending or motor become `central_brain`. The hemibrain neuropil-prefixed names (PLP, AVLP, SLP, ...) are not families.
+4. Families with fewer than 5 labelled types are pooled into `other`. That covers C, Lawf, Lai, LPLC, LLPC, LPC, Tlp, HS, VS, CT, Am and others; `family_map.json` lists them all.
+
+The result is 30 classes over 1,012 types. The largest are `central_brain` (290 types), LoVP (107), MeVP (67), LT (54), `other` (48) and LC (47).
+
+### 9.3 Features and leakage controls
+
+Every feature is a numeric column named `<family>__<name>`.
+
+**Wiring features** come from `flybrain_wiring_features` with `two_hop=True`:
+
+- `out_comp` and `in_comp`: the weighted partner-family composition and its entropy
+- `out2_comp` and `in2_comp`: the same, two hops out, with the i->j->i return path removed
+- `recip`
+- `degree`
+
+**Anatomy features** come from the neuron's own `roiInfo`. None of them is an absolute synapse count:
+
+- `roi`: the input and output fraction in each of the top 24 primary ROIs, plus `other`; the optic-lobe share; the ROI entropy; and pre/(pre+post)
+- `layer`: the fraction of layer synweight in each of the 21 ME/LO/LOP layers, plus the layer share of synweight
+- `col`: log1p of the column span
+
+**Partner categories are masked by held-out cell type.** The split is planned first (`plan_grouped_split`). Every node whose cell type falls in val or test, whatever its tracing status, is passed as `mask_category_ids` (18,456 of 53,987 nodes for `cell_family`). This includes held-out neurons that the per-type cap or the status filter left out of the samples. As a result, no held-out type can reveal its family through same-type partners. `masked_split_ids_sha256` is pinned in the notes, and `run_evaluation` re-checks it. Provisional types get the partner category `unclear`, never their prefix family.
+
+**Exclusions:**
+
+- `cell_family` is registered in `flybrain_wiring_features`. It uses the `cell_class` patterns plus `*family*`, `*lineage*`, `ito*`, `truman*`, `*instance*`, `*hex*`, `*serial*` and `*flywire*`.
+- For `connectivity_tier`, fwf drops the whole `degree` family. `OL_EXTRA_EXCLUSIONS` also drops `col__*`, `roi__entropy_bits` and `roi__out_in_ratio`, which are size proxies the shared patterns miss.
+- On the connectivity dataset, no surviving feature has a univariate AUC above 0.70 against the label, or |Spearman| above 0.40 against `downstream`.
+
+**Never a feature, for any target:** body id, type, instance, hemilineage, `assignedOlHex*`, and any NT field.
+
+**NB text views:**
+
+- `cell_family` and `super_class` use `STRUCTURED_TEXT_FEATURES`, which also leaves out hemilineage and the hex-column flag.
+- The connectivity and NT targets use the legacy `INPUT_FEATURES`.
+
+### 9.4 Results (held-out test, grouped by cell type, 2026-09-24)
+
+All five targets use the full feature set. "Best trivial" is the strongest trivial rule for the model's view, scored on test. "Shuffle" is the test accuracy after refitting on permuted train labels. The CI is a 95% cluster bootstrap over test cell types. ECE is after calibration: isotonic for binary targets, temperature for multiclass.
+
+| Target | Test n (types) | Majority | Model | Best trivial (rule) | Acc [95% CI] | Macro-F1 | ECE | Shuffle | Gate |
+|---|---|---|---|---|---|---|---|---|---|
+| cell_family (30 cl.) | 984 (159) | 0.057 | hgb | 0.252 (feat lookup) | **0.756** [0.655, 0.844] | 0.558 | 0.111 | 0.057 | pass |
+| | | | logreg | 0.252 | 0.703 [0.593, 0.795] | 0.542 | 0.076 | 0.026 | pass |
+| | | | nb (text) | 0.470 (text lookup) | 0.577 [0.467, 0.687] | 0.402 | 0.179 | 0.000 | pass |
+| super_class (5 cl.) | 980 (158) | 0.611 | hgb | 0.855 (feat threshold) | **0.992** [0.983, 0.998] | 0.985 | 0.005 | 0.611 | pass |
+| | | | logreg | 0.855 | 0.970 [0.952, 0.986] | 0.948 | 0.041 | 0.238 | pass |
+| | | | nb (text) | 0.853 (text lookup) | 0.870 [0.798, 0.930] | 0.738 | 0.081 | 0.613 | fail |
+| connectivity_tier | 984 (159) | 0.611 | hgb | 0.692 (feat lookup) | **0.775** [0.715, 0.838] | 0.766 | 0.056 | 0.611 | pass |
+| | | | logreg | 0.692 | 0.758 [0.695, 0.821] | 0.752 | 0.051 | 0.545 | fail (gain CI crosses 0) |
+| | | | nb (text) | 0.643 | 0.616 | 0.615 | 0.064 | 0.450 | fail |
+| neurotransmitter_dominance (predicted) | 797 (86) | 0.493 | hgb | 0.529 (feat lookup) | **0.784** [0.690, 0.872] | 0.648 | 0.045 | 0.493 | pass |
+| | | | logreg | 0.529 | 0.660 [0.571, 0.744] | 0.567 | 0.087 | 0.263 | fail (gain CI crosses 0) |
+| | | | nb (text) | 0.551 | 0.536 | 0.423 | 0.121 | 0.449 | fail |
+| nt_ground_truth (consensus, referenced) | 310 (23) | 0.426 | hgb | 0.581 (feat lookup) | 0.697 [0.473, 0.875] | 0.563 | 0.126 | 0.426 | **fail** (gain CI [-0.05, 0.29]) |
+| | | | logreg | 0.581 | 0.561 | 0.569 | 0.096 | 0.281 | fail |
+| | | | nb (text) | 0.471 | 0.474 | 0.440 | 0.149 | 0.390 | fail |
+
+What the results mean:
+
+- **cell_family is a real result.** On unseen cell types, a model predicts the family (Tm, TmY, Mi, Dm, Pm, Li, LC, MeVP, ...) at 0.76, against a best trivial rule of 0.25. The random-split accuracy is 0.96, so the 0.2 gap is what type memorisation would add. Families whose held-out types differ from their train types fail completely: T (T4/T5 versus T1–T3), MeLo and Y all score F1 0. In the ablation (val), `roi` matters most (-0.025 acc, -0.078 macro-F1), then `in_comp` and `layer`. The partner families contribute on top of morphology.
+- **super_class passes, but it is near-definitional.** The curated class (intrinsic optic, VPN, VCN, central) is defined anatomically by where a neuron receives and sends synapses, and the `roi` in/out fractions encode exactly that. Dropping `roi` costs 0.235 macro-F1. Read 0.99 as "the curation rule is recoverable from roiInfo", not as a learned biological inference. No leakage path was found: the split is grouped, partner categories are masked, and the shuffle control collapses.
+- **connectivity_tier: hgb passes narrowly.** The paired gain CI is [0.020, 0.154], and logreg's gain CI includes 0. Size proxies are excluded (§9.3), so the remaining signal is partner composition and ROI/layer profile.
+- **neurotransmitter_dominance (predicted NT): hgb passes clearly** (0.784 vs 0.529). The label is the synapse classifier's own call, so this measures agreement with a classifier, not ground truth.
+- **nt_ground_truth: an honest negative.** Only 134 referenced types remain, so the test split holds 23 types and the CI is too wide for the gate. The point estimate beats the trivial rule, but that proves nothing at this size.
+
+The label shuffle collapsed to majority or below for every model. Artifacts are under `<report-root>/ol/<target>/models/`. Their `manifest_sha256` values are in each `report.json` (`models.<name>.artifact`).
+
+**Pending:** the `wiring_only` runs (all five targets) and the `anatomy_only` run (`cell_family`) were queued under the heavy lock and write to `<report-root>/ol/<target>/<feature_set>/`.

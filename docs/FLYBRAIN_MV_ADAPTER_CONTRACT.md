@@ -199,3 +199,94 @@ Each sample's metadata carries `root_id` (the bodyId as a string), `cell_type`, 
 - A default open hashes at most 92 MB (meta and edgelist); this took about 0.5 s on the real snapshot. Later opens use stamps. A full build took 2 to 5 s per objective.
 - The multi-GB neuPrint synapse exports are listed and size-checked, but no code path reads them. Adding a reader for them needs its own column-projected, filtered design.
 - Before promotion (registry `planned` to `active`), these still apply: SC3 thresholds per (dataset, objective), the grouped-split trivial-baseline gate (AC6), the p0 golden-set accuracy and calibration thresholds, and the AB plan AC1-AC5.
+
+## 10. Real models (grouped, gated, calibrated)
+
+Run date: 2026-09-24. Run label: `wiring-v1`. Each report is at `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/mv/<target>/wiring_v1/report.{json,md}`, and the saved models are in `models/<name>/`.
+
+### 10.1 Code
+
+- `mcp/flybrain_brain_cluster_mv_samples.py` gains the pieces below. Existing callers are unaffected: with defaults, payloads and fingerprints are byte-identical.
+  - `STRUCTURED_FEATURES[objective]`: the categorical inputs for the feature learners. It is a subset of the legacy input keys: `out_partner_tier` is removed everywhere, and `primary_neuropil` is removed for region specialization.
+  - `MvSampleBuildConfig.attach_features` (default `False`) puts those inputs in `sample["features"]`.
+  - `load_mv_candidates(config)` and `collect_mv_samples(objective, config)` return every labelled candidate, with no cap and no balancing. The majority rate is therefore the true class prior.
+- `mcp/flybrain_mv_targets.py` (new) builds the `EvalDataset` for each target and runs `flybrain_model_eval.run_evaluation`. CLI: `python mcp/flybrain_mv_targets.py --target <t> [--run-label L] [--families degree,out_comp,...] [--quick] [--summary out.jsonl]`.
+- Snapshot access is read-only:
+  - Inputs are opened with `open_mv_snapshot(required_roles=(meta, edgelist), use_stamp_cache=False)`, so nothing is written into `snapshots/`.
+  - The per-ROI edge list (`traced-connections-per-roi.csv`) has no adapter role. Before it is read, its sha256 is checked against its entry (role `edgelist_per_roi`) in the verified manifest.
+- Wiring features come from `flybrain_wiring_features`, run on `traced-connections.csv`:
+  - Node table: all 23,200 Traced bodies. Partner category: harmonized class.
+  - Families: `degree`, `out_comp`/`in_comp`, `out2_comp`/`in2_comp` (two-hop, with the return path removed), `recip` and `out_np`/`in_np`.
+  - The neuropil families use a derived table, cached under `/mnt/f/.flybrain/cache/mv-derived/`. It keeps only the 13 VNC base neuropils, with the side stripped. `CV`, `GF`, the nerves and `NotPrimary` are dropped, so "passes through the neck connective or a nerve" never becomes a feature.
+- Two tagged composition sets are added per target: `*_comp_hl` (partner hemilineage) for the hemilineage target, and `*_comp_pnt` (partner predicted NT) for the NT target. When the partner category is the label, or determines it, the set is masked for the val and test samples and for every node that shares a held-out cell type, homolog `group`, `serial` set or hemilineage. The notes record `masked_split_ids_sha256`, which `run_evaluation` checks.
+- NB view: fused `key key_<value>` tokens. Numeric features are cut at deciles fitted on the train split only. The legacy NB tokenizer splits `key value` into separate tokens, so without fusing, the numeric value tokens would be shared across all features.
+- `report["mv_shuffle_null"]`: a supplementary label-shuffle control (see 10.4). It is reported next to the harness gate and does not replace it.
+
+### 10.2 Targets, labels and exclusions
+
+| Target | Label (independent of inputs) | n | Split keys (union-find) | Never an input (beyond the registered `fwf` patterns and ids/type/group/serial) |
+|---|---|---:|---|---|
+| `cell_class` | curated MANC `class`, harmonized (6 classes) | 21,650 | cell_type, hemilineage, group, serial | any annotation. somaNeuromere/somaSide/birthtime are null exactly for DNs and sensory neurons. Also excluded: nerve/CV/GF synapses, subclass, modality |
+| `hemilineage` | developmental hemilineage (lineage ground truth). 34 classes, each with >= 50 neurons and >= 4 types | 13,381 | cell_type, group, serial (a target cannot group on its own label) | class, subclass, partner predicted NT, NT scores |
+| `neurotransmitter_dominance` | MANC `predictedNt` (ach/gaba/glut). This is a classifier output: MANC v1.0 has no NT ground-truth column | 21,151 | cell_type, hemilineage, group, serial | hemilineage, partner-hemilineage composition, NT probabilities, transmission |
+| `connectivity_tier` | `downstream` >= q75 (definition unchanged) | all candidates | same as NT | the whole `degree` family, `*n_neuropils*`, pre/post/upstream/downstream/size |
+| `region_specialization_tier` | top side-specific neuropil share >= 0.9 (definition unchanged) | all candidates | same as NT | every `*_np__*` column, primary_neuropil, subclass/target/origin/long tract/nerves, hemilineage |
+
+Models:
+
+- Backends: nb (alpha grid), logreg (C in {0.1, 1}) and hgb (two configs; one for hemilineage).
+- Tuning: grouped K-fold inside train on macro-F1 (5-fold; 3-fold for hemilineage).
+- Calibration: temperature scaling, fitted on grouped out-of-fold probabilities.
+- Test: scored once per final config, with 1,000-draw cluster-bootstrap CIs.
+
+### 10.3 Results (held-out grouped test split)
+
+"Best trivial" is the best rule in the model's own view, which is what the harness gates on. Rules named `features:*` apply to logreg and hgb. Rules named `text:*` are lookups over the binned tokens and apply to nb.
+
+| Target | Model | Majority | Best trivial (rule) | Test acc [95% CI] | Macro-F1 | ECE | Shuffle | Gate |
+|---|---|---:|---|---|---:|---:|---:|---|
+| cell_class | logreg | 0.675 | 0.731 (threshold) | **0.891** [0.808, 0.948] | 0.668 | 0.021 | 0.675 | pass |
+| cell_class | hgb | 0.675 | 0.731 (threshold) | 0.877 [0.759, 0.951] | 0.642 | 0.034 | 0.675 | pass |
+| cell_class | nb | 0.675 | 0.765 (text lookup) | 0.685 [0.520, 0.837] | 0.536 | 0.085 | 0.590 | fail |
+| hemilineage | logreg | 0.029 | 0.097 (lookup) | **0.493** [0.433, 0.555] | 0.461 | 0.031 | 0.045 | pass |
+| hemilineage | hgb | 0.029 | 0.097 (lookup) | 0.365 [0.318, 0.415] | 0.340 | 0.103 | 0.032 | pass |
+| hemilineage | nb | 0.029 | 0.135 (text lookup) | 0.366 [0.302, 0.433] | 0.324 | 0.068 | 0.059 | fail (harness shuffle) |
+| neurotransmitter_dominance | logreg | 0.520 | 0.532 (lookup) | 0.580 [0.423, 0.734] | 0.499 | 0.052 | 0.571 | fail |
+| neurotransmitter_dominance | hgb | 0.520 | 0.532 (lookup) | 0.560 [0.366, 0.756] | 0.431 | 0.095 | 0.520 | fail |
+| neurotransmitter_dominance | nb | 0.520 | 0.595 (text lookup) | 0.349 [0.207, 0.574] | 0.317 | 0.145 | 0.414 | fail |
+
+The full connectivity_tier and region_specialization_tier runs were queued behind the shared heavy-job lock when this was written; their reports land in the same tree. A preliminary logreg-only check was run outside the lock (<5 min, 2-fold CV, no ablation, no report written) on the same split:
+
+- connectivity_tier: 0.829 [0.762, 0.903] vs lookup 0.715 (majority 0.633). The shuffle control collapsed.
+- region_specialization_tier: 0.805 [0.727, 0.873] vs threshold 0.700 (majority 0.400). The harness shuffle check fails here, with a shuffle score of 0.46 against a bar of 0.42; the prior-shift effect in 10.4 explains this.
+
+### 10.4 Reading the results
+
+**`cell_class` passes. Most of the signal is polarity and reciprocity.**
+
+- The best single rule is a threshold on in-degree, or a lookup on the binned out/(in+out) weight ratio, which scores 0.765 in the text view. Sensory neurons get almost no VNC input, and motor neurons make no VNC output.
+- logreg still beats that rule by 0.13 (paired-bootstrap gain CI [0.07, 0.34]) and roughly doubles its macro-F1 (0.67 vs 0.29).
+- Ablation (hgb, scored on val): dropping `recip` costs 0.26 and dropping `degree` costs 0.08, while dropping `out_comp` improves accuracy by 0.08.
+- A random per-neuron split reaches 0.94-0.97. The gap to the grouped split is the optimism that grouping removes.
+
+**`hemilineage` from wiring is a real, non-trivial result.**
+
+- Baselines: 34 classes, majority 0.03, best one-feature lookup 0.10.
+- logreg reaches 0.49 (CI [0.43, 0.56]) on cell types it never saw, with ECE 0.03 after temperature scaling.
+- The signal is spread across families. The largest ablation drop is the masked partner-hemilineage composition (`out_comp_hl`, -0.04); neuropil and degree each cost about 0.01.
+- A random split reaches 0.84, so most of the easy accuracy there comes from same-type siblings.
+
+**`neurotransmitter_dominance` (predicted transmitter) does not beat the trivial rules. This is a negative result.**
+
+- The split groups by hemilineage, and each hemilineage uses one transmitter, so every test hemilineage is unseen in training.
+- The class prior moves between splits: val has 39 GABA neurons and test has 453. Only 145 test components exist, dominated by a few large hemilineages, so the CI is about ±0.15.
+- hgb looks strong on val (0.84) but reaches only 0.56 on test.
+- The legacy lookup-by-class result (section 7.0: class lookup 0.652 beat the NB expert's 0.603) comes from the capped, balanced sample. In the uncapped, prior-true sample, class is not even the best single feature: the best is a lookup on a binned out-partner count, at 0.53.
+- No wiring model generalises NT to new hemilineages above the trivial rules. Dale-type homophily (the masked `*_comp_pnt` features) adds nothing in ablation (-0.001).
+- On a random split, hgb reaches 0.87. The earlier model-beats-baseline numbers came from same-hemilineage leakage.
+
+**The harness shuffle check misfires under prior shift.**
+
+- The check compares one shuffled refit against the train-majority label scored on test. When the test prior differs from train, a shuffled model that spreads its predictions can beat that label by chance: NT logreg scores 0.571 against 0.520, and hemilineage nb 0.059 against 0.029.
+- `mv_shuffle_null` refits 3 permutations per model. Its bar is `max(majority, sum_c q_c p_c)`: the accuracy of feature-independent guessing with the same output mix.
+- Every model collapses to within 0.02 of that bar, so these shuffle failures are not leakage. The harness gate is still reported unchanged.
