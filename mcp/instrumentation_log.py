@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_KEEP = 3
 _MIN_MAX_BYTES = 4096
-_LOCK_TIMEOUT_S = 1.0
+# Non-blocking: one lock attempt, no wait. A contended instrumentation write is
+# dropped (dropped rows are allowed) rather than delaying a hot path such as memory_surface.
+_LOCK_TIMEOUT_S = 0.0
 
 
 def env_enabled(name: str, default: bool) -> bool:
@@ -98,8 +100,8 @@ def append_rows(
         path.parent.mkdir(parents=True, exist_ok=True)
         from inv_store import _locked_file
 
-        # A short lock wait: a contended instrumentation write is dropped (False),
-        # never allowed to stall the store or search path it is recording.
+        # No lock wait (_LOCK_TIMEOUT_S = 0): a contended instrumentation write is
+        # dropped (False), never allowed to stall the store or search path it is recording.
         with _locked_file(path.with_name(path.name + ".lock"), "a+", exclusive=True,
                           timeout_s=_LOCK_TIMEOUT_S):
             size = path.stat().st_size if path.exists() else 0
