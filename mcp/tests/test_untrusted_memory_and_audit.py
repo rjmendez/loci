@@ -200,6 +200,40 @@ def test_audit_lane_keeps_fresh_empty_investigation_distinct_from_stale(isolated
     assert lane["usable"] is False
 
 
+def _audit_lane_with_receipts(memory_dir, inv_id: str, receipt_ts: list) -> dict:
+    """Seed a fresh finding plus scoped audit receipts at ``receipt_ts``; return the audit lane."""
+    _seed_investigation(inv_id, f"finding for {inv_id}")
+    with open(memory_dir / inv_id / "audit.jsonl", "a", encoding="utf-8") as fh:
+        for ts in receipt_ts:
+            fh.write(json.dumps({"ts": ts, "tool": "mcp__loci__investigation_store",
+                                 "investigation_id": inv_id}) + "\n")
+    result = _json(server.investigation_pre_answer_check(
+        investigation_id=inv_id, claims=f"finding for {inv_id}", record=False))
+    return result["evidence_lanes"]["audit"]
+
+
+def test_audit_lane_is_stale_when_receipts_predate_the_findings(isolated_memory):
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    lane = _audit_lane_with_receipts(isolated_memory, "stale-audit", [old])
+    assert (lane["status"], lane["reason"], lane["usable"]) == ("stale", "audit_older_than_investigation", False)
+    assert lane["scoped_receipts"] == 1
+    assert 29 * 86400 < lane["lag_seconds"] < 31 * 86400
+
+
+def test_audit_lane_is_stale_when_no_receipt_timestamp_parses(isolated_memory):
+    lane = _audit_lane_with_receipts(isolated_memory, "garbled-audit", ["not a timestamp"])
+    assert (lane["status"], lane["reason"], lane["usable"]) == ("stale", "audit_timestamps_unparseable", False)
+
+
+def test_audit_lane_is_fresh_and_usable_with_a_current_receipt(isolated_memory):
+    # Positive twin of the empty and stale cases: same setup, a receipt from now.
+    from datetime import datetime, timezone
+    lane = _audit_lane_with_receipts(isolated_memory, "fresh-audit", [datetime.now(timezone.utc).isoformat()])
+    assert (lane["status"], lane["reason"], lane["usable"]) == ("fresh", None, True)
+    assert lane["scoped_receipts"] == 1
+
+
 @pytest.mark.parametrize("tool_name", [
     "mcp__loci__investigation_import",
     "mcp__loci__memory_consolidate",

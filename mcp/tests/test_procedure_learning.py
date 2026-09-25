@@ -76,23 +76,26 @@ class TestProcedureLearning:
         return inv_id, stored["finding_id"]
 
     def test_action_shaped_claim_promotes(self):
-        inv_id, finding_id = self._start_and_store(
-            text="This incident is resolved by toggling the compatibility flag before retrying."
+        # The real heuristic cannot decide this text (no leading verb, no cue), so the
+        # classifier label decides; the stub records what it was asked.
+        text = "This incident is resolved by toggling the compatibility flag before retrying."
+        inv_id, finding_id = self._start_and_store(text=text)
+        prompts = []
+
+        def _label(prompt, *, fmt=None, max_tokens=256):
+            prompts.append(prompt)
+            return {"text": "procedure", "ok": True}
+
+        result = PL.maybe_promote_to_procedure(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            verify_verdict={"verdict": "confirmed", "degraded": False},
+            gen_fn=_label,
         )
-        original = PL._heuristic_procedure_shape
-        PL._heuristic_procedure_shape = lambda text: None
 
-        try:
-            result = PL.maybe_promote_to_procedure(
-                investigation_id=inv_id,
-                finding_id=finding_id,
-                verify_verdict={"verdict": "confirmed", "degraded": False},
-                gen_fn=_label_gen("procedure"),
-            )
-        finally:
-            PL._heuristic_procedure_shape = original
-
+        assert len(prompts) == 1 and f"Text: {text}" in prompts[0]
         assert result["promoted"] is True
+        assert result["degraded"] is False
         finding = _find_finding(inv_id, finding_id)
         assert finding["record_type"] == "procedure"
         assert finding["type"] == "procedure"
@@ -101,6 +104,38 @@ class TestProcedureLearning:
         manifest = _load_manifest(inv_id)
         assert manifest["finding_counts"]["procedure"] == 1
         assert manifest["finding_counts"]["observed"] == 0
+
+    def test_classifier_non_procedure_label_does_not_promote(self):
+        # Negative twin with the same ambiguous text: the label, not the text, decides.
+        inv_id, finding_id = self._start_and_store(
+            text="This incident is resolved by toggling the compatibility flag before retrying."
+        )
+        result = PL.maybe_promote_to_procedure(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            verify_verdict={"verdict": "confirmed", "degraded": False},
+            gen_fn=_label_gen("non_procedure"),
+        )
+        assert result == {"promoted": False, "reason": "classifier_non_action_shape", "degraded": False}
+        assert _find_finding(inv_id, finding_id)["record_type"] == "observed"
+
+    def test_imperative_claim_promotes_on_the_heuristic_without_the_classifier(self):
+        inv_id, finding_id = self._start_and_store(text="Restart the worker to clear the stuck queue.")
+        calls = []
+
+        def _recording(prompt, **kwargs):
+            calls.append(prompt)
+            return {"text": "non_procedure", "ok": True}
+
+        result = PL.maybe_promote_to_procedure(
+            investigation_id=inv_id,
+            finding_id=finding_id,
+            verify_verdict={"verdict": "confirmed", "degraded": False},
+            gen_fn=_recording,
+        )
+        assert result["promoted"] is True
+        assert calls == []
+        assert _find_finding(inv_id, finding_id)["record_type"] == "procedure"
 
     def test_non_action_claim_does_not_promote(self):
         inv_id, finding_id = self._start_and_store(text="The logs show timeout spikes on replica 3.")
@@ -143,8 +178,8 @@ class TestProcedureLearning:
         assert finding["procedure_meta"]["success_count"] == 0
 
     def test_fail_open_on_model_error(self, monkeypatch):
+        # The real heuristic cannot decide this text, so the (raising) classifier runs.
         inv_id, finding_id = self._start_and_store(text="Applying the compatibility shim resolves the issue.")
-        monkeypatch.setattr(PL, "_heuristic_procedure_shape", lambda text: None)
 
         def _raises(prompt, *, fmt=None, max_tokens=256):
             raise RuntimeError("ollama down")

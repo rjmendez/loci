@@ -67,11 +67,36 @@ class TestRowIdentity(unittest.TestCase):
         self.assertEqual(_search(pts)[0]["id"], "finding-uuid")
 
     def test_dedup_no_longer_folds_a_collection_to_one_hit(self):
+        # Real rows from the real per-collection search, fed to the real union/dedup.
         rows = _search([_P(f"pt{i}", 0.9, {"text": f"c{i}", "origin": "col"}) for i in range(5)])
-        best = {}
-        for h in rows:                      # mirrors _rag_search_collections
-            best[(h.get("origin"), h.get("id"))] = h
-        self.assertEqual(len(best), 5)
+        calls, errors = [], []
+
+        def _per_collection(sq, collection_name, limit, query_filter=None):
+            calls.append((sq, collection_name, limit, query_filter))
+            return [dict(r) for r in rows]
+
+        with mock.patch.object(server, "_qdrant_search_collection", _per_collection):
+            out = server._rag_search_collections(["col"], ["q"], 5, None, errors)
+        self.assertEqual(sorted(h["id"] for h in out), sorted(r["id"] for r in rows))
+        self.assertEqual(len(out), 5)
+        self.assertEqual(calls, [("q", "col", 5, None)])
+        self.assertEqual(errors, [])
+
+    def test_dedup_keeps_the_best_score_per_origin_and_id(self):
+        # Positive twin: the same (origin, id) seen by two expanded queries is one hit
+        # with the higher score; the same id in another origin is a different hit.
+        per_query = {
+            "q1": [{"origin": "a", "id": "x", "score": 0.8, "text": "x@q1"},
+                   {"origin": "b", "id": "x", "score": 0.3, "text": "bx"}],
+            "q2": [{"origin": "a", "id": "x", "score": 0.4, "text": "x@q2"},
+                   {"origin": "a", "id": "y", "score": 0.5, "text": "y"}],
+        }
+        errors = []
+        with mock.patch.object(server, "_qdrant_search_collection",
+                               lambda sq, collection_name, limit, query_filter=None: per_query[sq]):
+            out = server._rag_search_collections(["col"], ["q1", "q2"], 5, None, errors)
+        got = sorted((h["origin"], h["id"], h["score"], h["text"]) for h in out)
+        self.assertEqual(got, [("a", "x", 0.8, "x@q1"), ("a", "y", 0.5, "y"), ("b", "x", 0.3, "bx")])
 
 
 class TestBothCrossEncodersShareTheBudget(unittest.TestCase):
