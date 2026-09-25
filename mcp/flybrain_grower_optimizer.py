@@ -34,6 +34,12 @@ DEFAULT_COMPARTMENT_BIAS: Mapping[str, Mapping[str, float]] = {
 }
 
 
+def load_warm_start_genome(type_stats_path: str | Path) -> dict[str, Any]:
+    from flybrain_grower_v0 import genome_from_data
+
+    return genome_from_data(type_stats_path)
+
+
 class GrowerOptimizer:
     """CMA-ES scaffold for grow-to-spec optimization over a compact SBM genome.
 
@@ -48,11 +54,15 @@ class GrowerOptimizer:
         realism_critic_path: str,
         n_neurons: int = 300,
         sigma0: float = 0.3,
+        warm_start_genome: Mapping[str, Any] | None = None,
+        gate_schedule: list[float] | None = None,
+        gate_steps: list[int] | None = None,
     ) -> None:
         self.body_adapter = body_adapter
         self.realism_critic_path = str(realism_critic_path)
         self.n_neurons = int(n_neurons)
         self.sigma0 = float(sigma0)
+        self.warm_start_genome = dict(warm_start_genome) if isinstance(warm_start_genome, Mapping) else warm_start_genome
         if self.n_neurons < 2:
             raise ValueError("n_neurons must be >= 2")
         if self.sigma0 <= 0.0:
@@ -64,8 +74,10 @@ class GrowerOptimizer:
         self.genome_dim = self.n_cell_types + (2 * self.n_cell_types * self.n_cell_types)
         self._critic_feature_columns = self._critic_feature_names()
         self._class_index = {str(name): idx for idx, name in enumerate(self._critic_classes())}
+        self.gate_schedule, self.gate_steps = self._normalize_gate_schedule(gate_schedule, gate_steps)
         self._cache_root = DEFAULT_CACHE_ROOT
         self._last_evaluation: dict[str, Any] | None = None
+        self._current_generation: int = 0
 
     def genome_to_sbm(self, genome: np.ndarray) -> dict[str, Any]:
         flat = self._coerce_genome(genome)
@@ -140,7 +152,7 @@ class GrowerOptimizer:
             return self._coerce_genome(np.concatenate(pieces, axis=0))
         raise ValueError("sbm payload does not contain genome_vector or raw_parameters")
 
-    def evaluate_genome(self, genome: np.ndarray, n_samples: int = 10) -> float:
+    def evaluate_genome(self, genome: np.ndarray, n_samples: int = 10, current_generation: int | None = None) -> float:
         if int(n_samples) < 1:
             raise ValueError("n_samples must be >= 1")
         genome = self._coerce_genome(np.asarray(genome, dtype=np.float64))
@@ -163,12 +175,14 @@ class GrowerOptimizer:
             )
             realism_scores.append(realism_score)
 
+        gate_threshold = self.gate_at(self._current_generation if current_generation is None else current_generation)
         mean_realism = float(np.mean(realism_scores))
-        if mean_realism < REALISM_GATE:
+        if mean_realism < gate_threshold:
             self._last_evaluation = {
                 "passed_realism_gate": False,
                 "task_reward": 0.0,
                 "genome": genome.copy(),
+                "realism_gate": gate_threshold,
             }
             return 0.0
 
@@ -177,6 +191,7 @@ class GrowerOptimizer:
             "passed_realism_gate": True,
             "task_reward": float(task_reward),
             "genome": genome.copy(),
+            "realism_gate": gate_threshold,
         }
         return float(mean_realism * task_reward)
 
@@ -196,6 +211,8 @@ class GrowerOptimizer:
                 "verb_disp": 0,
                 "verb_log": 0,
                 "verbose": -9,
+                "tolFun": 1e-11,
+                "tolX": 1e-11,
             },
         )
         best_genome: np.ndarray | None = None
@@ -204,11 +221,13 @@ class GrowerOptimizer:
         gate_passing_genomes: list[np.ndarray] = []
         gate_passing_rewards: list[float] = []
 
+        self._current_generation = 0
         for iteration in range(int(max_iter)):
+            self._current_generation = iteration
             candidates = [self._coerce_genome(np.asarray(candidate, dtype=np.float64)) for candidate in es.ask()]
             scores: list[float] = []
             for candidate in candidates:
-                score = float(self.evaluate_genome(candidate))
+                score = float(self.evaluate_genome(candidate, current_generation=self._current_generation))
                 scores.append(score)
                 evaluation = self._last_evaluation if isinstance(self._last_evaluation, Mapping) else None
                 if evaluation and evaluation.get("passed_realism_gate"):
@@ -280,6 +299,16 @@ class GrowerOptimizer:
             if numeric or categorical:
                 return tuple(numeric + categorical)
         raise ValueError("critic model does not expose feature_names_in_ and schema.json is missing")
+
+    def gate_at(self, generation: int) -> float:
+        """Return the realism gate threshold for this generation."""
+
+        gate = self.gate_schedule[0]
+        for step, threshold in zip(self.gate_steps, self.gate_schedule):
+            if int(generation) < step:
+                break
+            gate = threshold
+        return gate
 
     def _layout_slices(self) -> tuple[slice, slice, slice]:
         counts = slice(0, self.n_cell_types)
@@ -587,11 +616,36 @@ class GrowerOptimizer:
         return self._cache_root / "edge-tables" / f"grower-{digest.hexdigest()[:24]}.parquet"
 
     def _initial_genome_mean(self) -> np.ndarray:
+        if self.warm_start_genome is not None:
+            try:
+                return self.sbm_to_genome(self.warm_start_genome).copy()
+            except Exception:
+                pass
         count_slice, conn_slice, syn_slice = self._layout_slices()
         mean = np.zeros((self.genome_dim,), dtype=np.float64)
         mean[conn_slice] = -2.0
         mean[syn_slice] = self._inverse_softplus(np.full((syn_slice.stop - syn_slice.start,), 3.0, dtype=np.float64))
         return mean
+
+    @staticmethod
+    def _normalize_gate_schedule(
+        gate_schedule: Sequence[float] | None,
+        gate_steps: Sequence[int] | None,
+    ) -> tuple[list[float], list[int]]:
+        schedule = list(gate_schedule) if gate_schedule is not None else [REALISM_GATE]
+        steps = list(gate_steps) if gate_steps is not None else [0]
+        if not schedule or not steps:
+            raise ValueError("gate_schedule and gate_steps must be non-empty")
+        if len(schedule) != len(steps):
+            raise ValueError("gate_schedule and gate_steps must have the same length")
+        normalized = sorted((int(step), float(threshold)) for step, threshold in zip(steps, schedule))
+        resolved_steps = [step for step, _threshold in normalized]
+        resolved_schedule = [threshold for _step, threshold in normalized]
+        if any(step < 0 for step in resolved_steps):
+            raise ValueError("gate_steps must be >= 0")
+        if any(not math.isfinite(threshold) for threshold in resolved_schedule):
+            raise ValueError("gate_schedule must contain only finite values")
+        return resolved_schedule, resolved_steps
 
     @staticmethod
     def _stable_seed(values: np.ndarray) -> int:
@@ -612,4 +666,4 @@ class GrowerOptimizer:
         return np.log(np.expm1(values))
 
 
-__all__ = ["GrowerOptimizer", "BodyAdapter", "REALISM_GATE"]
+__all__ = ["GrowerOptimizer", "BodyAdapter", "REALISM_GATE", "load_warm_start_genome"]

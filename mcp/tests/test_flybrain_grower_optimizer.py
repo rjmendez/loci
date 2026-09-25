@@ -88,6 +88,45 @@ def test_evaluate_genome_hard_gates_low_realism(monkeypatch, patch_joblib_load):
     assert 0.5 < REALISM_GATE
 
 
+def test_warm_start_changes_initial_mean(monkeypatch, patch_joblib_load):
+    optimizer = _optimizer(monkeypatch, patch_joblib_load)
+    warm_genome = np.linspace(-0.75, 0.75, optimizer.genome_dim)
+    warm_start = optimizer.genome_to_sbm(warm_genome)
+
+    warm_started = GrowerOptimizer(
+        MockBodyAdapter(),
+        realism_critic_path="mock.joblib",
+        n_neurons=optimizer.n_neurons,
+        sigma0=optimizer.sigma0,
+        warm_start_genome=warm_start,
+    )
+
+    np.testing.assert_allclose(warm_started._initial_genome_mean(), warm_genome)
+    assert not np.allclose(warm_started._initial_genome_mean(), optimizer._initial_genome_mean())
+
+
+def test_gate_schedule_ramps(monkeypatch, patch_joblib_load):
+    patch_joblib_load(0.95)
+    optimizer = GrowerOptimizer(
+        MockBodyAdapter(),
+        realism_critic_path="mock.joblib",
+        n_neurons=24,
+        sigma0=0.2,
+        gate_schedule=[0.5, 0.6, 0.7, 0.8, 0.9],
+        gate_steps=[0, 10, 20, 30, 50],
+    )
+
+    assert optimizer.gate_at(0) < optimizer.gate_at(50)
+    assert optimizer.gate_at(75) == pytest.approx(0.9)
+
+
+def test_gate_schedule_fixed_backward_compat(monkeypatch, patch_joblib_load):
+    optimizer = _optimizer(monkeypatch, patch_joblib_load)
+
+    assert optimizer.gate_at(0) == pytest.approx(REALISM_GATE)
+    assert optimizer.gate_at(500) == pytest.approx(REALISM_GATE)
+
+
 def test_evaluate_genome_combines_realism_and_reward(monkeypatch, patch_joblib_load):
     optimizer = _optimizer(monkeypatch, patch_joblib_load, hit_probability=0.95, reward=0.8)
     genome = np.zeros(optimizer.genome_dim, dtype=np.float64)
@@ -104,7 +143,7 @@ def test_run_returns_best_genome(monkeypatch, patch_joblib_load):
     monkeypatch.setattr(
         optimizer,
         "evaluate_genome",
-        lambda genome, n_samples=10: float(1.0 / (1.0 + np.linalg.norm(np.asarray(genome) - target) ** 2)),
+        lambda genome, n_samples=10, current_generation=None: float(1.0 / (1.0 + np.linalg.norm(np.asarray(genome) - target) ** 2)),
     )
 
     result = optimizer.run(max_iter=2)
@@ -119,7 +158,7 @@ def test_run_returns_best_genome(monkeypatch, patch_joblib_load):
 
 def test_run_records_degeneracy_count(monkeypatch, patch_joblib_load):
     optimizer = _optimizer(monkeypatch, patch_joblib_load, hit_probability=0.95, reward=0.8)
-    monkeypatch.setattr(optimizer, "evaluate_genome", lambda genome, n_samples=10: 1.0)
+    monkeypatch.setattr(optimizer, "evaluate_genome", lambda genome, n_samples=10, current_generation=None: 1.0)
 
     result = optimizer.run(max_iter=1)
 
