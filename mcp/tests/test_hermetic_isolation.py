@@ -56,13 +56,20 @@ def test_investigation_store_writes_into_the_temp_root():
 
     inv = f"hermetic-{uuid.uuid4().hex[:8]}"
     investigation_start(inv, "hermetic isolation probe")
-    json.loads(server.investigation_store(
-        inv, "observation", "isolation probe finding", "test_hermetic_isolation",
+    # "observed", not "observation": the store rejects an unknown finding_type, and
+    # this probe then passed on the directory investigation_start had already made.
+    stored = json.loads(server.investigation_store(
+        inv, "observed", "isolation probe finding", "test_hermetic_isolation",
     ))
+    assert "error" not in stored, stored
 
     hits = [p for p in _root().rglob("*") if inv in str(p)]
     assert hits, f"nothing for {inv} under {_root()}"
     assert all(_inside_root(p) for p in hits)
+    findings = [p for p in hits if p.name == "findings.jsonl"]
+    assert len(findings) == 1
+    assert [json.loads(line)["id"] for line in findings[0].read_text().splitlines()] == [
+        stored["finding_id"]]
 
 
 @pytest.mark.parametrize("opener", ["open", "sqlite", "mkdir"])
@@ -96,6 +103,47 @@ def test_the_repo_env_files_are_not_loaded(tmp_path):
         assert os.environ["LOCI_HERMETIC_PROBE"] == "1"
     finally:
         os.environ.pop("LOCI_HERMETIC_PROBE", None)
+
+
+def test_the_event_log_is_written_inside_the_temp_root():
+    """Pin the leak that inflated the live event log.
+
+    Before this harness, 26 test files pointed LOCI_MEMORY_DIR at a temp dir and
+    none redirected the event log. Test findings went to the temp dir and were
+    deleted with it. Their "store" events went to the live
+    ~/.hermes/event_log.jsonl and stayed. By 2026-09-24 the live log held about
+    43,000 store events for about 1,800 investigations that never existed on
+    disk. That is why it showed 46,798 stores against about 5,790 findings. Both
+    event-log writers must resolve inside the temp root, and a real store must
+    land its event there.
+    """
+    import sys
+
+    import server
+    from investigation_tools import investigation_start
+
+    scripts_dir = str(Path(loci_hermetic.REPO_ROOT) / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import event_log
+    import route_audit
+
+    log = Path(event_log._DEFAULT_LOG)
+    assert _inside_root(log)
+    assert _inside_root(route_audit._default_log_path())
+
+    start = loci_hermetic.violation_count()
+    inv = f"hermetic-evlog-{uuid.uuid4().hex[:8]}"
+    investigation_start(inv, "event log isolation probe")
+    stored = json.loads(server.investigation_store(
+        inv, "observed", "event log isolation probe finding", "test_hermetic_isolation",
+    ))
+    assert "error" not in stored, stored
+    assert loci_hermetic.take_violations(start) == []
+
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    mine = [e for e in events if e.get("investigation_id") == inv]
+    assert [(e["op"], e["finding_id"]) for e in mine] == [("store", stored["finding_id"])]
 
 
 def test_gpu_load_signal_is_redirected_into_the_temp_root():
