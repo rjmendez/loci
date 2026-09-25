@@ -1476,6 +1476,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n-threads", type=int, default=8)
     parser.add_argument("--quick", action="store_true", help="one GNN config, no ablations (smoke)")
     parser.add_argument("--no-ablation", action="store_true", help="skip ablations (seeds > first)")
+    parser.add_argument("--light-controls", action="store_true",
+                        help="skip shuffle / random-split controls on every seed (a second process adding seeds)")
     parser.add_argument("--grid", choices=("default", "cpu"), default="default",
                         help="cpu: one small balanced config (for CPU-only runs)")
     parser.add_argument("--gnn-ablation", choices=("full", "graph"), default="full",
@@ -1505,7 +1507,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     for i, seed in enumerate(seeds):
         label = args.run_label if len(seeds) == 1 else f"{args.run_label}-s{seed}"
         ablate = not (args.quick or args.no_ablation) and i == 0
-        ecfg = dataclasses.replace(base_cfg, seed=seed, run_label=label, ablation=ablate)
+        # Later seeds only re-measure seed variance: the legacy shuffle and random-split controls (and the
+        # ablation) run on the first seed; the GNN / hgb / hgb+C&S comparison runs on every seed.
+        first = i == 0 and not args.light_controls
+        ecfg = dataclasses.replace(base_cfg, seed=seed, run_label=label, ablation=ablate,
+                                   shuffle_control=first, random_split_control=first)
         data.notes = {**dict(data.notes), "device": dev, "seed": seed}
         gcfg = GraphEvalConfig(eval=ecfg, gnn_grid=grid, device=dev["device"], verbose=True,
                                gnn_ablation=args.gnn_ablation)
