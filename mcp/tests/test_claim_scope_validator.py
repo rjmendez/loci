@@ -1,4 +1,9 @@
-"""Validation/preservation tests for flybrain claim_scope metadata."""
+"""Validation/preservation tests for flybrain claim_scope metadata.
+
+These exercise Loci's own guardrail (server.investigation_store claim-scope
+validation) for FlyBrain-derived findings arriving via MCP. The scope-engine
+tests that used to live here moved with FlyBrain to rjmendez/flybrain
+(tests/test_flybrain_scope_engine_claims.py)."""
 
 import json
 import sys
@@ -12,7 +17,6 @@ if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
 
 import server  # noqa: E402
-from flybrain_scope_engine import comparative_claim_tier_engine, hemibrain_flywire_compat_layer  # noqa: E402
 
 
 def _json(result: str) -> dict:
@@ -123,34 +127,6 @@ class FlybrainClaimScopeValidatorTest(unittest.TestCase):
             _valid_claim_scope(),
         )
 
-    def test_comparative_scope_engine_is_deterministic_without_llm(self):
-        payload = {
-            "dataset": "hb",
-            "dataset_version": "neuprint_JRC_Hemibrain_1point2point1",
-            "sex": "female",
-            "life_stage": "adult",
-            "annotation_completeness": 0.93,
-            "circuit_class": "mushroom_body",
-            "experience_window": "naive",
-            "evidence_strength": "validated",
-            "confidence": 0.9,
-        }
-        tier = comparative_claim_tier_engine.tier(payload)
-        self.assertIn(tier["tier"], {"T2", "T3"})
-        self.assertGreaterEqual(tier["score"], 0.7)
-
-        normalized = hemibrain_flywire_compat_layer.normalize_scope({
-            "dataset": "hb",
-            "dataset_version": "neuprint_JRC_Hemibrain_1point2point1",
-            "sex": "female",
-            "life_stage": "adult",
-            "annotation_completeness": 0.93,
-            "circuit_class": "mushroom_body",
-            "experience_window": "naive",
-        })
-        self.assertEqual(normalized["dataset"], "hemibrain")
-        self.assertEqual(normalized["dataset_version"], "neuprint_JRC_Hemibrain_1point2point1")
-
     def test_nested_claim_scope_json_string_is_accepted_and_normalized(self):
         inv_id = "fb-scope-nested-json"
         _json(server.investigation_start(investigation_id=inv_id, title="nested claim_scope json"))
@@ -215,22 +191,6 @@ class FlybrainClaimScopeValidatorTest(unittest.TestCase):
             },
         ))
         self.assertTrue(res.get("stored"), res)
-
-    def test_tier_engine_downgrades_unsupported_cross_sex_generalization(self):
-        payload = {
-            "dataset": "fw",
-            "dataset_version": "flywire783",
-            "sex": "both male/female",
-            "life_stage": "adult",
-            "annotation_completeness": 0.98,
-            "circuit_class": "mushroom_body",
-            "experience_window": "naive",
-            "evidence_strength": "generalizable",
-            "confidence": 0.98,
-        }
-        tier = comparative_claim_tier_engine.tier(payload)
-        self.assertEqual(tier["tier"], "T1")
-        self.assertIn("unsupported_cross_sex_generalization", tier["ceiling_reasons"])
 
 
 if __name__ == "__main__":

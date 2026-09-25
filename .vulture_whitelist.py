@@ -93,6 +93,21 @@ _ = memory_route_counterfactual_simulate
 _ = memory_route_policy_optimize
 _ = retrieval_selftest
 
+# ── Private helper called only from mcp/tests/ (out of vulture's scanned
+# paths -- server.py, mcp/memcheck/, scripts/, a2a_server/server.py -- so a
+# test-only caller never satisfies it)
+_ = _search_retraction_scope
+
+# ── Cross-module wiring: server.py assigns this attribute on the llm_tools
+# module; llm_tools.py (not in vulture's scanned paths) reads it back. Same
+# shape as the audit_log/memory_promote case above, but the read lives in a
+# module vulture never opens, so no in-repo reference will ever satisfy it.
+_ = linked_evidence_fn
+
+# ── pytest module-level marker convention: pytest applies `pytestmark` to
+# every test in the module by name convention, never by an explicit call.
+_ = pytestmark
+
 # ── socketserver hooks and tuning attributes, read by the stdlib base class
 # MemcheckDaemon subclasses ThreadingUnixStreamServer; _Handler subclasses
 # BaseRequestHandler. Both names are called through the base, never directly.

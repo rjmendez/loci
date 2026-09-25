@@ -25,67 +25,13 @@ Collections:
 - `loci_memory` — findings (named vectors: dense=768 cosine + sparse=BM25 IDF); created on first Qdrant connection
 - `loci_verdicts` — pre-answer claim check verdicts; 384-dim hash vectors, schema owned by `memcheck/vectors.py`, created lazily on the first verdict write
 
-## Brain-cluster artifact promotion state
+## FlyBrain
 
-`flybrain_brain_cluster.py` includes a durable promotion-state contract for
-artifact manifests. State is persisted as JSON with
-`schema_version=braincluster-promotion-state/v1`, timestamps, and candidate /
-promoted / previous_promoted pointers. Promotion and rollback are fail-closed:
-the target manifest must pass full `load_brain_cluster_artifacts(...)`
-validation before pointers are switched. Invalid transitions (for example,
-promoting an already-active manifest) and missing transition prerequisites
-return explicit error codes.
-
-## Brain-cluster P0 dry-run pipeline
-
-`flybrain_brain_cluster_pipeline.py` provides a deterministic train/evaluate
-pipeline for first-pass trainability checks:
-
-`train -> artifact manifest -> golden-set gate -> shadow replay -> promote/rollback`
-
-The training stage now includes a **swarm consensus student** distilled from
-multi-expert agreement, so swarm behavior is represented in both runtime policy
-and trained artifacts.
-
-CLI entrypoint:
-
-`braincluster-p0-dry-run --samples <samples.json> --output-dir <dir> --state-path <promotion-state.json> --split-seed <seed>`
-
-FlyWire raw-snapshot sample builder:
-
-`braincluster-build-fw-samples --storage-root F:\.flybrain --output <samples.json>`
-
-Additional objective for richer labels:
-
-`braincluster-build-fw-samples --storage-root F:\.flybrain --objective neurotransmitter_dominance --output <samples.json>`
-
-Objectives currently supported:
-- `connectivity_tier` (default): labels `high_connectivity` vs `baseline_connectivity`
-- `neurotransmitter_dominance`: labels dominant transmitter class from FlyWire proofread connection probabilities
-
-Production guardrails on sample build:
-- label diversity floor (`--min-distinct-labels`, default `2`)
-- label concentration ceiling (`--max-label-share`, default `0.9`)
-- deterministic fingerprinted metadata for audit/replay
-
-Per-(dataset, objective) threshold bundle generation from real run history (`--min-reports-per-objective` counts reports per group):
-
-`braincluster-release-prep --runs-root F:\.flybrain\cache\braincluster-runs --output-dir F:\.flybrain\cache\braincluster-thresholds --min-reports-per-objective 2`
-
-The pipeline emits a machine-readable report (`schema_version=braincluster-p0-dry-run/v1`)
-including dataset split fingerprints, expert/router artifact fingerprints,
-gate/shadow metrics, and final promotion-state pointers.
-Router runtime payloads now include a deterministic `swarm_policy`
-(`parallel_fanout`, bounded `fanout_k`, consensus mode) so parallel
-multi-expert execution is a first-class deployment contract.
-
-Threshold calibration entrypoint:
-
-`braincluster-threshold-calibrate --reports <reports.json> --output <thresholds.json>`
-
-Calibration emits `schema_version=braincluster-threshold-calibration/v1` with
-versioned gate + shadow threshold candidates derived from held-out run metrics
-and a reproducible input fingerprint.
+The brain-cluster pipeline, its console entry points and the in-server
+`flybrain_cluster_*` / `flybrain_expert_inspect` tools moved to the private repo
+`rjmendez/flybrain`. This server only validates FlyBrain-derived findings
+(`claim_scope`, `metadata.flybrain_provenance`, replay fingerprints); see
+[../docs/FLYBRAIN.md](../docs/FLYBRAIN.md).
 
 ## Requirements
 

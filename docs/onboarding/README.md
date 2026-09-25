@@ -25,8 +25,7 @@ The design is grounded in cognitive science:
 
 - **New people** — engineers and operators standing up, running, and maintaining Loci. Start with [running.md](running.md) and [architecture.md](architecture.md).
 - **New agents** — models that will *use* Loci as their memory and reasoning substrate. Start with [for-agents.md](for-agents.md) and [tools.md](tools.md).
-- **FlyBrain readers** — start with [../FLYBRAIN_GUIDE.md](../FLYBRAIN_GUIDE.md), then [../FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md](../FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md), [../FLYBRAIN_DATASET_PROVENANCE_MATRIX.md](../FLYBRAIN_DATASET_PROVENANCE_MATRIX.md), and [../FLYBRAIN_IO_TO_LOCI_MAPPING.md](../FLYBRAIN_IO_TO_LOCI_MAPPING.md). Use [../FLYBRAIN_ARCHIVE.md](../FLYBRAIN_ARCHIVE.md) for deeper technical or historical notes.
-- **FlyBrain harness operators** — enforce write-path controls from [../FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](../FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md) before running filesystem-writing jobs.
+- **FlyBrain readers** — FlyBrain moved to its own private repo, `rjmendez/flybrain`. Start with [../FLYBRAIN.md](../FLYBRAIN.md) for how Loci reaches it (MCP only) and which claim-scope and provenance guardrails stay in Loci.
 
 ## The doc set
 
@@ -48,10 +47,7 @@ The canonical deep-dive docs live under `docs/`:
 - `docs/CONCEPTS.md` — start here for the mental model
 - `docs/ARCHITECTURE.md`, `docs/COMPONENTS.md`, `docs/COGNITIVE_FOUNDATIONS.md`
 - `docs/OPERATIONS.md`, `docs/DEPLOYMENT.md`, `docs/CALLGRAPH.md`
-- `docs/FLYBRAIN_GUIDE.md` — short FlyBrain entry point and canonical reading path
-- `docs/FLYBRAIN_DATA_PROVENANCE_GUIDANCE.md`, `docs/FLYBRAIN_DATASET_PROVENANCE_MATRIX.md`, `docs/FLYBRAIN_IO_TO_LOCI_MAPPING.md`
-- `docs/FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md` — allowlist-only FlyBrain harness path policy for configured storage-root safety
-- `docs/FLYBRAIN_REASONING_GLOSSARY.md`, `docs/FLYBRAIN_ARCHIVE.md`
+- `docs/FLYBRAIN.md` — pointer to the FlyBrain repo and the guardrails Loci keeps
 - `mcp/README.md` — the MCP server and tool surface
 
 This onboarding set is the front door; those docs are the detail.
