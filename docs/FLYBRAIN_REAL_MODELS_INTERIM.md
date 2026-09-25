@@ -1,6 +1,6 @@
 # FlyBrain real models: interim results (2026-09-24)
 
-These are interim results from the `flybrain-real-models` workflow. Four dataset tracks (l1em, BANC, optic lobe, MANC) are finished. male-cns (mc), FlyWire (fw) and the graph model are still running. The numbers have **not** been through the workflow's leakage or reproducibility audits. The last row of the location-free table below comes from fw's report while that track is still running. Reports, logs and model artifacts live under `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/`.
+These are interim results from the `flybrain-real-models` workflow. Five dataset tracks (l1em, BANC, optic lobe, MANC, male-cns) are finished. FlyWire (fw) and the graph model are still running. The numbers have **not** been through the workflow's leakage or reproducibility audits. The last row of the location-free table below comes from fw's report while that track is still running. Reports, logs and model artifacts live under `/mnt/f/.flybrain/logs/real-models-20260924T174122Z/`.
 
 ## Method
 
@@ -75,6 +75,18 @@ The S2 cell types, `level_7_cluster` and ascending modality were rejected as tar
 | connectivity_tier | size proxy | hgb | 0.775 [0.715–0.838] | 0.692 | narrow pass |
 | NT (predictedNt) | predicted | hgb | 0.784 | 0.529 | distillation only |
 | NT (consensusNt with ntReference) | literature-backed | hgb | 0.697 [0.473–0.875] | 0.581 | fail: 134 types, 23 in test |
+
+### male-cns v1.0 (mc)
+
+Split groups are cell type, real hemilineage and supertype, which keeps sister types together. There are at most 20 neurons per type.
+
+| Target | Provenance | Best | Held-out acc [CI] | Trivial | Gate |
+|---|---|---|---:|---:|---|
+| super_class | curated | hgb / logreg | 0.979 [0.970–0.987]; wiring-only 0.976 | 0.739 (primary-neuropil lookup) | pass; random-vs-grouped gap 1.5 pts |
+| cell_class | conn-defined (male-CNS types used NBLAST + connectivity) | logreg | 0.916 [0.866–0.951] | 0.656 | pass (hgb fails the shuffle rule); ECE 0.17–0.43, confidences unreliable |
+| region_specialization_tier | — | hgb | 0.844 [0.812–0.877] | 0.700 | pass, with all ROI, neuropil and division inputs excluded |
+| connectivity_tier | size proxy | hgb | 0.856 [0.833–0.881] | 0.709 | pass, but a 2-feature sparsity control reaches 0.68 (about 45% of the lift), so this is quasi-tautological |
+| NT (type-level `nt_ground_truth`) | literature/curated per type (classifier columns never loaded; hemilineage excluded) | logreg | 0.556 [0.371–0.801]; wiring-only 0.46–0.48 | 0.381 / 0.317 | fail (paired CI crosses 0). The wiring-only pass does not hold on validation; random split 0.78–0.90 is type memorisation |
 
 ### MANC v1.0 (mv)
 
