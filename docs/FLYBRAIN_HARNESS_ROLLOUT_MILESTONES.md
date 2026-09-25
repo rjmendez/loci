@@ -12,6 +12,8 @@ This sequencing is aligned with:
 - [FLYBRAIN_NEO4J_NEUPRINT_LOCAL_STACK_PLAN.md](./FLYBRAIN_NEO4J_NEUPRINT_LOCAL_STACK_PLAN.md)
 - [FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md](./FLYBRAIN_HARNESS_MANIFEST_PROVENANCE_SCHEMA.md)
 
+> The canonical roadmap for models, benchmark, serving and backlog is **[FLYBRAIN_ROADMAP.md](FLYBRAIN_ROADMAP.md)**. This file covers only the data-harness rollout milestones.
+
 ## Current roadmap status (2026-09-23)
 
 The rollout is now in a staged operational posture, not a blank-slate plan:
