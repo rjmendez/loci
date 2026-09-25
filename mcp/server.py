@@ -52,6 +52,7 @@ import hmac
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -245,6 +246,7 @@ from inv_store import (  # noqa: E402,F401
 )
 from recall_filter import build_recall_filter  # noqa: E402
 from provenance_firewall import (  # noqa: E402
+    DETERMINISTIC_DERIVED,
     MODEL_ASSERTED,
     assert_evidence_firewall,
     audit_provenance_fields,
@@ -2139,22 +2141,64 @@ def _judge_conflict_pair(new_finding: dict, neighbor_finding: dict, *, gen_fn=No
     after the cheap gate has produced a candidate pair, and it stays fail-open:
     any import/backend/model issue returns ``verdict=None`` so the caller preserves the
     prior heuristic-only behaviour exactly.
-    """
-    try:
-        from conflict_verify import judge_conflict
 
-        return judge_conflict(
+    The result also carries ``model`` and ``tier``: what the generation call reported
+    it ran on. ``tier`` is None on the primary local path, which does not tag itself;
+    both are None when no generation happened.
+    """
+    served: dict = {"model": None, "tier": None}
+    try:
+        import conflict_verify
+
+        base_fn = gen_fn or conflict_verify._lazy_generate
+
+        def _recording_gen_fn(prompt, **kwargs):
+            out = base_fn(prompt, **kwargs)
+            if isinstance(out, dict):
+                served["model"] = out.get("model") or None
+                served["tier"] = out.get("tier") or None
+            return out
+
+        result = conflict_verify.judge_conflict(
             str((new_finding or {}).get("text", "") or ""),
             str((neighbor_finding or {}).get("text", "") or ""),
             type_a=str((new_finding or {}).get("record_type")
                        or (new_finding or {}).get("type", "") or ""),
             type_b=str((neighbor_finding or {}).get("record_type")
                        or (neighbor_finding or {}).get("type", "") or ""),
-            gen_fn=gen_fn,
+            gen_fn=_recording_gen_fn,
         )
+        return {**result, **served}
     except Exception as exc:
         logger.debug("_judge_conflict_pair: fail-open on exception: %r", exc)
-        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200]}
+        return {"verdict": None, "reason": "", "ok": False, "error": str(exc)[:200], **served}
+
+
+# Every contradiction-judge decision is appended to <investigation>/judge_verdicts.jsonl
+# with ids, scores and enums only (no finding text, no judge reason), so the judge can
+# be audited and a pre-filter trained on real labels. It is on by default because it
+# changes no tool output. Set LOCI_JUDGE_VERDICT_LOG=0 to turn it off.
+JUDGE_VERDICT_LOG_NAME = "judge_verdicts.jsonl"
+JUDGE_VERDICT_SCHEMA = 1
+
+
+def _judge_verdict_log_enabled() -> bool:
+    from instrumentation_log import env_enabled
+
+    return env_enabled("LOCI_JUDGE_VERDICT_LOG", True)
+
+
+def _record_judge_verdicts(investigation_id: str, rows: list[dict]) -> bool:
+    """Append judged-pair rows to the investigation's verdict log. Fail-open."""
+    if not rows or not _judge_verdict_log_enabled():
+        return False
+    try:
+        from instrumentation_log import append_rows
+
+        return append_rows(_inv_dir(investigation_id) / JUDGE_VERDICT_LOG_NAME, rows)
+    except Exception as exc:
+        logger.debug("_record_judge_verdicts: fail-open on exception: %r", exc)
+        return False
 
 
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
@@ -2207,7 +2251,8 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
         new_neg = _has_negation(new_text)
 
         conflicts = []
-        for hit in result:
+        judged: list[dict] = []
+        for rank, hit in enumerate(result):
             payload = dict(hit.payload or {})
             neighbor_id = str(payload.get("id", hit.id))
             if neighbor_id == new_id:
@@ -2218,32 +2263,56 @@ def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
             neighbor_neg = _has_negation(neighbor_text)
 
             heuristic_conflict = False
+            heuristic_rule = None
 
             # Heuristic 1: gap now filled by an observed finding
             if neighbor_type == "gap" and new_type == "observed":
                 heuristic_conflict = True
+                heuristic_rule = "gap_filled"
 
             # Heuristic 2: assumption overridden by a non-assumed finding
             elif neighbor_type == "assumed" and new_type != "assumed":
                 heuristic_conflict = True
+                heuristic_rule = "assumption_overridden"
 
             # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
             elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
                 heuristic_conflict = True
+                heuristic_rule = "negation_mismatch"
 
             llm = _judge_conflict_pair(new_finding, payload)
             llm_contradict = llm.get("verdict") == "contradict"
+            similarity = round(float(hit.score), 4)
+
+            judged.append({
+                "schema": JUDGE_VERDICT_SCHEMA,
+                "event": "conflict_judge",
+                "ts": _now(),
+                "new_finding_id": str(new_id),
+                "neighbor_id": neighbor_id,
+                "neighbor_rank": rank,
+                "similarity": similarity,
+                "new_type": str(new_type or ""),
+                "neighbor_type": str(neighbor_type or ""),
+                "heuristic_rule": heuristic_rule,
+                "verdict": llm.get("verdict"),
+                "judge_ok": bool(llm.get("ok")),
+                "model": llm.get("model"),
+                "tier": llm.get("tier"),
+                "conflict_candidate": bool(heuristic_conflict or llm_contradict),
+            })
 
             if heuristic_conflict or llm_contradict:
                 conflicts.append({
                     "neighbor_id": neighbor_id,
                     "neighbor_type": neighbor_type,
-                    "score": round(float(hit.score), 4),
+                    "score": similarity,
                     "heuristic_conflict": heuristic_conflict,
                     "llm_verdict": llm.get("verdict"),
                     "llm_reason": llm.get("reason", ""),
                 })
 
+        _record_judge_verdicts(investigation_id, judged)
         return conflicts
     except Exception as exc:
         logger.debug("_detect_conflicts: fail-open on exception: %s", exc)
@@ -3397,6 +3466,7 @@ def investigation_store(
         _store_commit(investigation_id, manifest, finding, finding_type, text, tier)
     except StoreBusyError as exc:
         return _busy_result(exc, investigation_id=investigation_id)
+    _record_memory_cited(investigation_id, finding)
     mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
@@ -4957,6 +5027,8 @@ def investigation_pre_answer_check(
             )
 
         claim_results.append(claim_result)
+
+    _record_memory_answer_check(investigation_id, claim_results)
 
     unique_errors = sorted(set(qdrant_errors))
     degraded_active, degraded_reason = _qdrant_degraded_mode(
@@ -8368,6 +8440,150 @@ def _surface_apply_decay(rows: list[dict]) -> None:
             pass  # decay is optional enhancement; never break the tool
 
 
+# ---------------------------------------------------------------------------
+# Memory-use instrumentation: which surfaced memories were actually used.
+#
+# Three event kinds go to <data home>/instrumentation/memory_use.jsonl:
+#   surfaced      memory_surface returned these findings (exposure).
+#   answer_check  investigation_pre_answer_check tied these evidence ids to a
+#                 claim: support refs, contradiction refs, and the semantic
+#                 candidates it looked at but did not count.
+#   cited         investigation_store recorded these ids as derived_from parents.
+#
+# A memory is USED when its id is a support or contradiction ref of a checked
+# claim, or a derived_from parent of a stored finding. A surfaced memory that no
+# later answer_check or cited event names is IGNORED. Joining the two is an
+# offline job; nothing here changes what any tool returns.
+#
+# Rows hold ids, scores, enums and counts only: no claim, query, context or
+# finding text. On by default because no tool output changes; set
+# LOCI_MEMORY_USE_LOG=0 to turn it off.
+# ---------------------------------------------------------------------------
+MEMORY_USE_LOG_NAME = "memory_use.jsonl"
+MEMORY_USE_SCHEMA = 1
+# Only semantic_candidates is capped. Support and contradiction refs are all logged
+# (ids only): a cap there would make a memory cited as the 9th support ref join
+# offline as "ignored".
+_MEMORY_USE_MAX_SEMANTIC_CANDIDATES = 8
+
+
+def _memory_use_log_path() -> Path:
+    return MEMORY_DIR.parent / "instrumentation" / MEMORY_USE_LOG_NAME
+
+
+def _record_memory_use(row: dict) -> bool:
+    """Append one memory-use event. Fail-open: never raises, never blocks the caller."""
+    try:
+        from instrumentation_log import append_rows, env_enabled
+
+        if not env_enabled("LOCI_MEMORY_USE_LOG", True):
+            return False
+        return append_rows(
+            _memory_use_log_path(),
+            [{"schema": MEMORY_USE_SCHEMA, "ts": _now(), **row}],
+        )
+    except Exception as exc:
+        logger.debug("memory-use instrumentation failed (fail-open): %r", exc)
+        return False
+
+
+def _score_or_none(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 4) if math.isfinite(number) else None
+
+
+def _use_refs(refs, limit: Optional[int] = None) -> list[dict]:
+    """Id, origin and score of each evidence ref; the first ``limit`` refs when a limit is given."""
+    out = []
+    refs = list(refs or [])
+    for ref in (refs if limit is None else refs[:limit]):
+        if not isinstance(ref, dict):
+            continue
+        evidence_id = str(ref.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        out.append({
+            "id": evidence_id,
+            "origin": ref.get("origin"),
+            "score": _score_or_none(ref.get("score")),
+        })
+    return out
+
+
+def _record_memory_surfaced(tool: str, scope_investigation_id: Optional[str], rows: list[dict]) -> bool:
+    """Record the findings a surfacing tool returned. Docs guidance rows are counted, not listed."""
+    items = []
+    docs = 0
+    for rank, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        if row.get("origin") == "docs_search":
+            docs += 1
+            continue
+        finding_id = str(row.get("finding_id") or "").strip()
+        if not finding_id:
+            continue
+        items.append({
+            "rank": rank,
+            "finding_id": finding_id,
+            "investigation_id": str(row.get("investigation_id") or ""),
+            "score": _score_or_none(row.get("score")),
+        })
+    if not items:
+        return False
+    return _record_memory_use({
+        "event": "surfaced",
+        "tool": tool,
+        "scope_investigation_id": scope_investigation_id or None,
+        "items": items,
+        "docs_rows": docs,
+    })
+
+
+def _record_memory_answer_check(investigation_id: str, claim_results: list[dict]) -> bool:
+    """Record which evidence ids each checked claim was tied to, by role."""
+    claims = []
+    for index, result in enumerate(claim_results or []):
+        if not isinstance(result, dict):
+            continue
+        claims.append({
+            "claim_index": index,
+            "supported": bool(result.get("supported")),
+            "contradicted": bool(result.get("contradicted")),
+            "support_basis": result.get("support_basis"),
+            "support": _use_refs(result.get("support_refs")),
+            "contradiction": _use_refs(result.get("contradiction_refs")),
+            "semantic_candidates": _use_refs(result.get("semantic_candidates"),
+                                             limit=_MEMORY_USE_MAX_SEMANTIC_CANDIDATES),
+        })
+    if not claims:
+        return False
+    return _record_memory_use({
+        "event": "answer_check",
+        "tool": "investigation_pre_answer_check",
+        "investigation_id": investigation_id,
+        "claims": claims,
+    })
+
+
+def _record_memory_cited(investigation_id: str, finding: dict) -> bool:
+    """Record a stored finding's derived_from parents. Store validated them as existing ids."""
+    parents = [str(p) for p in (finding or {}).get("derived_from") or [] if str(p).strip()]
+    if not parents:
+        return False
+    return _record_memory_use({
+        "event": "cited",
+        "tool": "investigation_store",
+        "investigation_id": investigation_id,
+        "finding_id": str((finding or {}).get("id") or ""),
+        "cited_ids": parents[:32],
+        "cited_count": len(parents),
+    })
+
+
 def _surface_rows(top_results: list[dict], ctx_prefix: str, investigation_id: Optional[str]) -> list[dict]:
     """Build the memory_surface 'surfaced' response rows from top_results.
 
@@ -8554,6 +8770,8 @@ def memory_surface(
             # Docs guidance only fills slots the memory hits left free: an unscored lexical
             # hit must not outrank (and so displace) a finding with a real similarity score.
             surfaced = (surfaced + docs_hits)[:top_k]
+
+        _record_memory_surfaced("memory_surface", investigation_id, surfaced)
 
         return json.dumps({
             "surfaced": surfaced,
@@ -10673,27 +10891,43 @@ def _route_filter_by_agent(hits: list[dict], agent_id: str) -> list[dict]:
     return filtered
 
 
-def _route_dedup_by_overlap(hits: list[dict], threshold: float = 0.80) -> list[dict]:
+def _route_word_overlap(hit_a: dict, hit_b: dict) -> Optional[float]:
+    """Word-set Jaccard of two hits' text; None when both texts are empty."""
+    words_a = set(str(hit_a.get("text", "")).lower().split())
+    words_b = set(str(hit_b.get("text", "")).lower().split())
+    union = words_a | words_b
+    if not union:
+        return None
+    return len(words_a & words_b) / max(len(union), 1)
+
+
+def _route_dedup_by_overlap(
+    hits: list[dict],
+    threshold: float = 0.80,
+    overlap_fn: Optional[Callable[[dict, dict], Optional[float]]] = None,
+) -> list[dict]:
     """
     Deduplicate memory_route hits by word-overlap (>threshold overlap → keep
     the highest-scoring hit). Assumes `hits` is already sorted by score
     (descending), so among an overlapping pair the later one in iteration
     order is always the lower-scoring one to suppress.
+
+    ``overlap_fn`` replaces the text comparison. Replay of an audited trace that
+    carries precomputed overlaps instead of text uses it (see
+    ``_route_trace_overlap_fn``).
     """
+    overlap_of = overlap_fn or _route_word_overlap
     kept = []
     suppressed = set()
     for i, hit_a in enumerate(hits):
         if i in suppressed:
             continue
-        words_a = set(str(hit_a.get("text", "")).lower().split())
         for j, hit_b in enumerate(hits):
             if j <= i or j in suppressed:
                 continue
-            words_b = set(str(hit_b.get("text", "")).lower().split())
-            union = words_a | words_b
-            if not union:
+            overlap = overlap_of(hit_a, hit_b)
+            if overlap is None:
                 continue
-            overlap = len(words_a & words_b) / max(len(union), 1)
             if overlap > threshold:
                 # Suppress the lower-scoring one (raw_hits already sorted by score)
                 suppressed.add(j)
@@ -10889,6 +11123,7 @@ def _route_apply_policy(
     dedup_threshold: float = 0.80,
     agent_id: Optional[str] = None,
     priority_slots: Optional[int] = None,
+    overlap_fn: Optional[Callable[[dict, dict], Optional[float]]] = None,
 ) -> dict:
     """Apply a routing policy deterministically over a captured candidate set."""
     hits = list(candidate_hits or [])
@@ -10897,7 +11132,7 @@ def _route_apply_policy(
     if deduplicate and len(filtered) > 1:
         threshold = _safe_float(dedup_threshold, 0.80)
         threshold = max(0.0, min(1.0, threshold))
-        deduped = _route_dedup_by_overlap(filtered, threshold=threshold)
+        deduped = _route_dedup_by_overlap(filtered, threshold=threshold, overlap_fn=overlap_fn)
     cap = max(0, int(top_k))
     if priority_slots is None:
         trimmed = deduped[:cap]
@@ -11088,28 +11323,29 @@ def memory_route(
                 "provenance": "deterministic_derived",
             },
         }
+        trace_policy = _route_trace_policy(agent_id, top_k, deduplicate, homeostasis, slow_mod)
         if include_trace:
             payload["routing_trace"] = {
                 "version": 1,
                 "captured_at": _now(),
-                "policy": {
-                    "agent_id": agent_id,
-                    "top_k": int(top_k),
-                    "deduplicate": bool(deduplicate),
-                    "dedup_threshold": 0.80,
-                    "drive_state": homeostasis["drives"],
-                    "candidate_multiplier": homeostasis["candidate_multiplier"],
-                    "priority_ratio": homeostasis["priority_ratio"],
-                    "slow_modulation": {
-                        "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
-                        "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
-                        "provenance": "deterministic_derived",
-                    },
-                },
+                "policy": trace_policy,
                 "candidate_hits": [_route_policy_trace_hit(hit) for hit in raw_hits],
                 "metrics": metrics,
                 "aggregation": aggregation,
             }
+        _audit_route_trace_sample(
+            query=query,
+            agent_id=agent_id,
+            top_k=top_k,
+            deduplicate=deduplicate,
+            drive_state_given=drive_state is not None,
+            policy=trace_policy,
+            candidate_hits=raw_hits,
+            routed_hits=final_hits,
+            metrics=metrics,
+            excluded_retracted=len(_route_retracted),
+            excluded_acl=_route_acl_excluded,
+        )
         try:
             route_signal = 0.0
             if int(metrics.get("after_top_k", 0)) > 0:
@@ -11133,6 +11369,190 @@ def memory_route(
             "error": f"memory_route failed: {exc}",
             "routed": [],
         })
+
+
+def _route_trace_policy(agent_id, top_k, deduplicate, homeostasis: dict, slow_mod: dict) -> dict:
+    """The policy block of a routing trace: everything replay needs besides the candidates."""
+    return {
+        "agent_id": agent_id,
+        "top_k": int(top_k),
+        "deduplicate": bool(deduplicate),
+        "dedup_threshold": 0.80,
+        "drive_state": homeostasis["drives"],
+        "candidate_multiplier": homeostasis["candidate_multiplier"],
+        "priority_ratio": homeostasis["priority_ratio"],
+        "slow_modulation": {
+            "routing_tone": round(float(slow_mod.get("routing_tone", 0.0) or 0.0), 3),
+            "qdrant_limit": int(slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])),
+            "provenance": "deterministic_derived",
+        },
+    }
+
+
+# Sampled routing traces in the global audit log, so the counterfactual replay
+# and policy-optimize tools have decisions to read without anyone remembering to
+# call memory_route(include_trace=True) and audit_log by hand.
+#
+# LOCI_ROUTE_TRACE_AUDIT_RATE is the fraction of memory_route calls traced, 0..1.
+# Default 0 (off): the audit-lane readers take the newest global receipts, so
+# traces written at a high rate can push other receipts out of that window.
+#
+# A sampled trace holds ids, scores, tiers and counts only. The query is reduced
+# to its length; the candidate texts are replaced by their pairwise word-overlap
+# at or above ROUTE_TRACE_OVERLAP_FLOOR, which is all dedup replay needs for any
+# threshold at or above that floor.
+ROUTE_TRACE_AUDIT_SOURCE = "route_trace_sampler"
+ROUTE_TRACE_VERSION = 2
+ROUTE_TRACE_OVERLAP_FLOOR = 0.5
+_route_trace_rng = random.Random()
+
+
+def _route_trace_audit_rate() -> float:
+    raw = os.environ.get("LOCI_ROUTE_TRACE_AUDIT_RATE", "")
+    try:
+        rate = float(raw) if raw.strip() else 0.0
+    except ValueError:
+        return 0.0
+    if not math.isfinite(rate):
+        return 0.0
+    return max(0.0, min(1.0, rate))
+
+
+def _route_overlap_edges(hits: list[dict], floor: float = ROUTE_TRACE_OVERLAP_FLOOR) -> list[list]:
+    """``[i, j, overlap]`` for every candidate pair i < j whose word overlap is >= floor."""
+    edges: list[list] = []
+    for i in range(len(hits)):
+        for j in range(i + 1, len(hits)):
+            overlap = _route_word_overlap(hits[i], hits[j])
+            if overlap is not None and overlap >= floor:
+                edges.append([i, j, overlap])
+    return edges
+
+
+def _route_compact_trace_hit(idx: int, hit: dict) -> dict:
+    """A candidate as a sampled trace stores it: ids, score and tier, no text or source."""
+    return {
+        "trace_idx": idx,
+        "finding_id": hit.get("finding_id") or hit.get("id", ""),
+        "id": hit.get("id") or hit.get("finding_id", ""),
+        "investigation_id": hit.get("investigation_id", ""),
+        "authored_by": hit.get("authored_by", ""),
+        "score": _safe_float(hit.get("score"), 0.0),
+        "tier": hit.get("tier") or hit.get("record_type", "finding"),
+    }
+
+
+def _audit_route_trace_sample(
+    *,
+    query: str,
+    agent_id: Optional[str],
+    top_k: int,
+    deduplicate: bool,
+    drive_state_given: bool,
+    policy: dict,
+    candidate_hits: list[dict],
+    routed_hits: list[dict],
+    metrics: dict,
+    excluded_retracted: int,
+    excluded_acl: int,
+) -> bool:
+    """Write a sampled memory_route decision to the global audit log. Fail-open."""
+    try:
+        rate = _route_trace_audit_rate()
+        if rate <= 0.0 or _route_trace_rng.random() >= rate:
+            return False
+        routed_ids = [
+            {
+                "finding_id": h.get("finding_id") or h.get("id", ""),
+                "investigation_id": h.get("investigation_id", ""),
+                "score": _safe_float(h.get("score"), 0.0),
+                "tier": h.get("tier") or h.get("record_type", "finding"),
+            }
+            for h in routed_hits
+        ]
+        output = {
+            # Never the query text. Replay derives the drives from policy.drive_state,
+            # which already includes the keyword-derived values.
+            "query": "",
+            "query_features": {"chars": len(query or ""), "tokens": len(str(query or "").split())},
+            "routed": routed_ids,
+            "count": len(routed_ids),
+            "excluded_retracted": int(excluded_retracted),
+            "excluded_acl": int(excluded_acl),
+            "routing_trace": {
+                "version": ROUTE_TRACE_VERSION,
+                "captured_at": _now(),
+                "policy": policy,
+                "candidate_hits": [_route_compact_trace_hit(i, h) for i, h in enumerate(candidate_hits)],
+                "overlap_floor": ROUTE_TRACE_OVERLAP_FLOOR,
+                "overlap_edges": _route_overlap_edges(candidate_hits),
+                "metrics": metrics,
+            },
+        }
+        entry = {
+            "ts": _now(),
+            "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
+            "tool": "memory_route",
+            "source": ROUTE_TRACE_AUDIT_SOURCE,
+            "investigation_id": None,
+            "inputs": json.dumps({
+                "top_k": int(top_k),
+                "deduplicate": bool(deduplicate),
+                "agent_id": agent_id,
+                "drive_state_given": bool(drive_state_given),
+                "sample_rate": rate,
+            }),
+            "output": json.dumps(output),
+            "evidence_provenance_tier": DETERMINISTIC_DERIVED,
+            "provenance_defaulted": False,
+        }
+        audit_dir = MEMORY_DIR.parent / "audit"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _append_jsonl(audit_dir / f"{date_str}.jsonl", entry)
+        return True
+    except Exception as exc:
+        logger.debug("memory_route trace sampling failed (fail-open): %r", exc)
+        return False
+
+
+def _route_trace_overlap_fn(decision: dict) -> Optional[Callable[[dict, dict], Optional[float]]]:
+    """Overlap lookup for a replayed decision whose trace stored overlap edges instead of text.
+
+    None for a trace that carries candidate text (include_trace, version 1): replay
+    then compares the text, exactly as before.
+    """
+    edges = decision.get("overlap_edges")
+    if not isinstance(edges, list):
+        return None
+    table: dict[tuple[int, int], float] = {}
+    for edge in edges:
+        try:
+            a, b, value = int(edge[0]), int(edge[1]), float(edge[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        table[(min(a, b), max(a, b))] = value
+
+    def _lookup(hit_a: dict, hit_b: dict) -> Optional[float]:
+        ia, ib = hit_a.get("trace_idx"), hit_b.get("trace_idx")
+        if not isinstance(ia, int) or not isinstance(ib, int):
+            return None
+        return table.get((min(ia, ib), max(ia, ib)), 0.0)
+
+    return _lookup
+
+
+def _route_trace_dedup_exact(decision: dict, overlap_fn, deduplicate: bool, dedup_threshold) -> bool:
+    """Whether replaying ``decision`` with this dedup setting reproduces text-based dedup exactly.
+
+    A text trace (no overlap_fn) or no dedup is always exact. An overlap-edge trace
+    stored only the pairwise overlaps at or above its ``overlap_floor``; any pair
+    below the floor reads as 0.0, so a threshold below the floor is not exact.
+    """
+    if overlap_fn is None or not deduplicate:
+        return True
+    floor = _safe_float(decision.get("overlap_floor"), 0.0)
+    return _safe_float(dedup_threshold, 0.80) >= floor
 
 
 def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) -> tuple[list[dict], int]:
@@ -11176,6 +11596,8 @@ def _route_counterfactual_decisions_from_audit(entries: list[dict], limit: int) 
             "baseline_policy": baseline_policy,
             "baseline_routed": baseline_routed,
             "candidate_hits": candidates,
+            "overlap_edges": trace.get("overlap_edges"),
+            "overlap_floor": trace.get("overlap_floor"),
         })
     return decisions, skipped_missing_trace
 
@@ -11265,6 +11687,7 @@ def memory_route_counterfactual_simulate(
             candidates_for_policy = list(decision.get("candidate_hits") or [])[
                 : max(1, int(counter_slow_mod.get("qdrant_limit", homeostasis["candidate_limit"])))
             ]
+            overlap_fn = _route_trace_overlap_fn(decision)
             counter = _route_apply_policy(
                 candidates_for_policy,
                 top_k=use_top_k,
@@ -11272,6 +11695,7 @@ def memory_route_counterfactual_simulate(
                 dedup_threshold=dedup_threshold,
                 agent_id=use_agent_id,
                 priority_slots=homeostasis["priority_slots"],
+                overlap_fn=overlap_fn,
             )
             counter_rows = _route_rows(counter["hits"])
             counter_aggregation = _route_aggregation_with_provenance(counter["hits"], candidates_for_policy)
@@ -11289,6 +11713,10 @@ def memory_route_counterfactual_simulate(
                 "ts": decision.get("ts"),
                 "query": decision.get("query", ""),
                 "baseline_count": len(baseline_rows),
+                # "overlap_edges": the trace stored overlaps >= its floor, not text.
+                # Dedup replay is then exact only for thresholds at or above that floor.
+                "dedup_basis": "overlap_edges" if overlap_fn is not None else "text",
+                "dedup_exact": _route_trace_dedup_exact(decision, overlap_fn, use_deduplicate, dedup_threshold),
                 "counterfactual": {
                     "policy": {
                         "agent_id": use_agent_id,
@@ -11537,8 +11965,15 @@ def _route_eval_candidate(
     removed = 0
     added = 0
     overlap = 0
+    skipped_inexact = 0
     for decision in decisions or []:
         if not isinstance(decision, dict):
+            continue
+        overlap_fn = _route_trace_overlap_fn(decision)
+        if not _route_trace_dedup_exact(decision, overlap_fn, deduplicate, dedup_threshold):
+            # Pairs below the trace's overlap floor were not stored and would read as
+            # 0.0 (never duplicates): the replay would be wrong, so leave it out.
+            skipped_inexact += 1
             continue
         counter = _route_apply_policy(
             decision.get("candidate_hits") or [],
@@ -11546,6 +11981,7 @@ def _route_eval_candidate(
             deduplicate=deduplicate,
             dedup_threshold=dedup_threshold,
             agent_id=decision.get("baseline_policy", {}).get("agent_id"),
+            overlap_fn=overlap_fn,
         )
         baseline_rows = decision.get("baseline_routed") or []
         counter_rows = _route_rows(counter["hits"])
@@ -11557,7 +11993,6 @@ def _route_eval_candidate(
         removed += len([x for x in (baseline_ids - counter_ids) if x])
         added += len([x for x in (counter_ids - baseline_ids) if x])
         overlap += len(baseline_ids & counter_ids)
-    compared = max(compared, 1)
     # We optimize for stability first; modest compression is good, evidence loss is bad.
     baseline_nonzero = max(total_baseline, 1)
     stability = overlap / baseline_nonzero
@@ -11577,8 +12012,13 @@ def _route_eval_candidate(
             "deduplicate": bool(deduplicate),
             "dedup_threshold": max(0.0, min(1.0, _safe_float(dedup_threshold, 0.80))),
         },
+        # False when some decisions could not be replayed exactly at this threshold (an
+        # overlap-edge trace below its floor); those were left out of the metrics
+        # (decisions_skipped_inexact counts them), so read its objective with care.
+        "dedup_exact": skipped_inexact == 0,
         "metrics": {
             "decisions_compared": compared,
+            "decisions_skipped_inexact": skipped_inexact,
             "baseline_ids": total_baseline,
             "counter_ids": total_counter,
             "overlap_ids": overlap,
