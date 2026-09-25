@@ -243,14 +243,13 @@ class MeasuredOperatingPointTest(unittest.TestCase):
         """The tool's verdict for one probe row, expressed against whatever rule
         the module currently ships.
 
-        With the fix reverted _semantic_ref_corroborated does not exist and the
-        fallback reproduces the shipped rule exactly -- any ref over the
-        pre-filter is support -- so this test fails on the measured rate, not on
-        a missing attribute.
+        The corroboration predicate is the shipped one; the pre-filter and the
+        lexical short-circuit mirror investigation_pre_answer_check, whose real
+        path is driven end to end in test_claim_evidence_inmemory_qdrant.py.
         """
         if row["lexical_support_refs"]:
             return True
-        corroborated = getattr(server, "_semantic_ref_corroborated", lambda ref: True)
+        corroborated = server._semantic_ref_corroborated
         pool_median = statistics.median(row["scores"])
         for ref in row["refs"]:
             if ref["score"] < server._QDRANT_SUPPORT_MIN_SCORE:
@@ -273,11 +272,15 @@ class MeasuredOperatingPointTest(unittest.TestCase):
         """Claims copied verbatim out of a DIFFERENT investigation. Was 88.0%."""
         rate = self._rate("negative")
         self.assertLessEqual(rate, 0.05, f"false support {rate:.1%} (measured 1.7%)")
+        # Exactly the measured operating point: 5 of 300. Dropping the margin half of
+        # the rule gives 14 (4.7%), which the 5% ceiling alone would let through.
+        self.assertEqual(round(rate * 300), 5)
 
     def test_true_support_stays_above_seventy_eight_percent(self):
         """Claims the investigation really does back. Was 100%, now 80.3%."""
         rate = self._rate("positive")
         self.assertGreaterEqual(rate, 0.78, f"true support {rate:.1%} (measured 80.3%)")
+        self.assertEqual(round(rate * 300), 241)
 
 
 if __name__ == "__main__":
