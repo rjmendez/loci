@@ -42,6 +42,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from grounding_gate import CONTEXT_CAP  # investigation_reason puts at most 12 kept findings in the prompt
+
 logger = logging.getLogger(__name__)
 
 ARTIFACT_DIR = Path(__file__).resolve().parent / "models" / "d10_pair_gate"
@@ -63,7 +65,6 @@ MAX_PAIRS_ENV = "LOCI_D10_SHADOW_MAX_PAIRS"
 DEFAULT_MAX_PAIRS = 512
 SHADOW_LOG_NAME = "d10_shadow.jsonl"
 SHADOW_SCHEMA = 1
-CONTEXT_CAP = 12        # investigation_reason puts at most 12 kept findings in the prompt
 
 _NEG = re.compile(r"\b(?:not|no|never|none|cannot|without|neither|nor)\b|n't\b", re.IGNORECASE)
 _NUM = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
@@ -254,6 +255,13 @@ def _rank_desc(values: Sequence[float]) -> list[int]:
     return rank
 
 
+def mlp_decisions(scores: Sequence[float], tau: float) -> tuple[list[bool], list[bool]]:
+    """Per pair: kept (score >= tau) and in the prompt (kept and among the CONTEXT_CAP highest kept)."""
+    keep = [float(s) >= tau for s in scores]
+    rank = _rank_desc([float(s) if k else -math.inf for s, k in zip(scores, keep)])
+    return keep, [bool(k and r <= CONTEXT_CAP) for k, r in zip(keep, rank)]
+
+
 def record_shadow(log_path: Path, *, investigation_id: str, question: str, finding_ids: Sequence[str],
                   finding_texts: Sequence[str], vectors: Sequence[Sequence[float]], cosines: Sequence[Any],
                   cos_threshold: float, context_ids: Sequence[str]) -> bool:
@@ -279,8 +287,7 @@ def record_shadow(log_path: Path, *, investigation_id: str, question: str, findi
         cos = [float(c) if c is not None and math.isfinite(float(c)) else None for c in cosines]
         cos_rank = _rank_desc([c if c is not None else -math.inf for c in cos])
         mlp = [float(s) for s in scores]
-        mlp_keep = [s >= gate.tau for s in mlp]
-        mlp_rank = _rank_desc([s if k else -math.inf for s, k in zip(mlp, mlp_keep)])
+        mlp_keep, mlp_ctx = mlp_decisions(mlp, gate.tau)
         in_context = set(str(i) for i in context_ids)
         call_id = uuid.uuid4().hex[:16]
         ts = datetime.now(timezone.utc).isoformat()
@@ -304,7 +311,7 @@ def record_shadow(log_path: Path, *, investigation_id: str, question: str, findi
                 "mlp_score": round(mlp[i], 6),
                 "mlp_tau": round(gate.tau, 6),
                 "mlp_keep": mlp_keep[i],
-                "mlp_in_context": bool(mlp_keep[i] and mlp_rank[i] <= CONTEXT_CAP),
+                "mlp_in_context": mlp_ctx[i],
                 "gate_version": gate.version,
                 "latency_us_call": round(latency_us, 1),
                 "latency_us_per_pair": round(latency_us / n, 2),
