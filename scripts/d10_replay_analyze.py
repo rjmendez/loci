@@ -30,7 +30,7 @@ Estimators (the plan gives the reasoning):
 Duplicated items (the sheet repeats a few under new ids) measure test-retest agreement
 and are left out of every other number.
 
-Usage: d10_replay_analyze.py --key KEY.json --labels LABELS.json|.jsonl [--out FILE] [--bootstrap 2000]
+Usage: d10_replay_analyze.py --key KEY.json --labels LABELS.json|.jsonl [--out FILE] [--bootstrap-reps 2000]
 """
 from __future__ import annotations
 
@@ -296,13 +296,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--key", type=Path, required=True)
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=None)
-    ap.add_argument("--bootstrap", type=int, default=2000)
+    ap.add_argument("--bootstrap-reps", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
     key = json.loads(args.key.read_text(encoding="utf-8"))
     sheet_id, labels = load_labels(args.labels)
     try:
-        res = analyse(key, labels, sheet_id=sheet_id, reps=args.bootstrap, seed=args.seed)
+        res = analyse(key, labels, sheet_id=sheet_id, reps=args.bootstrap_reps, seed=args.seed)
     except ValueError as exc:
         print(f"d10_replay_analyze: {exc}", file=sys.stderr)
         return 1
