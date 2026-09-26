@@ -1,0 +1,174 @@
+{
+ "check": {
+  "rows": 16,
+  "seed": 20260926,
+  "sklearn_proba": [
+   1.372725856685336e-05,
+   5.041734008597297e-08,
+   4.651643607101123e-07,
+   1.1685955851162003e-06,
+   4.497701681294638e-09,
+   2.648312532136107e-07,
+   9.808670415821856e-07,
+   0.003309343029182586,
+   4.629328486826236e-06,
+   2.941992790974411e-07,
+   5.269879034925006e-07,
+   3.8682991540322234e-07,
+   4.523829565983801e-09,
+   1.552240188533606e-07,
+   6.365376439193698e-10,
+   6.0639081885503213e-05
+  ]
+ },
+ "created_at": "2026-09-26T17:20:18Z",
+ "embed_dim": 768,
+ "embedding": {
+  "digest": "0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f",
+  "float32_sha256": "071e8e318ace34f8749bea928267b4e9fd0914c0e1f1bdc2110cd9667240027d",
+  "max_chars": 2000,
+  "model": "nomic-embed-text",
+  "normalised": true,
+  "source": "precomputed"
+ },
+ "feature_dim": 3082,
+ "loro_offline_results": {
+  "caveats": [
+   "labels are structural proxies (same dt_target tag = grounded), not judgments that evidence grounds a claim",
+   "only 4 recovered runs; run-level intervals are wide",
+   "lineage recall of strong models is 0.42-0.50: they learned target-tag agreement",
+   "trained on finding-finding pairs; the live gate scores question-finding pairs"
+  ],
+  "cosine_rule_0.59": {
+   "m1_ci95_run": [
+    0.49,
+    0.985
+   ],
+   "m1_tnr_at_r95": 0.949
+  },
+  "mlp_pair": {
+   "ece_debiased": 0.033,
+   "f1": 0.943,
+   "lineage_recall": 0.503,
+   "m1_ci95_run": [
+    0.84,
+    1.0
+   ],
+   "m1_tnr_at_r95": 0.987,
+   "p95_us_per_pair": 582,
+   "params": 203541
+  },
+  "paired_m1_gain_over_cosine": {
+   "ci95_run": [
+    0.012,
+    0.377
+   ],
+   "point": 0.038
+  },
+  "protocol": "leave-one-run-out over 4 recovered runs, 1,811 topical test pairs",
+  "source": "FlyBrain D10 (rjmendez/flybrain PR #21, docs/tasks/loci_d10.md section 3)"
+ },
+ "loro_reproduced_here": {
+  "cosine_0.59_oof": {
+   "f1": 0.6648381788261108,
+   "recall": 0.9853658536585366,
+   "tnr": 0.49665551839464883
+  },
+  "cosine_m1_per_run": {
+   "0": 0.9797421731123389,
+   "1": 0.9787234042553191,
+   "2": 0.631578947368421,
+   "3": 0.23076923076923073
+  },
+  "cosine_m1_tnr_at_r95": 0.9489966555183946,
+  "mlp_m1_per_run": {
+   "0": 1.0,
+   "1": 0.9946808510638298,
+   "2": 0.8289473684210527,
+   "3": 1.0
+  },
+  "mlp_m1_tnr_at_r95": 0.9866220735785953,
+  "n_oof_pairs": 1811,
+  "oof_at_tau": {
+   "f1": 0.9527687296416938,
+   "recall": 0.9512195121951219,
+   "tnr": 0.9765886287625418
+  }
+ },
+ "n_params": 203541,
+ "recipe": {
+  "activation": "relu",
+  "alpha": 0.001,
+  "early_stopping": false,
+  "features": "[u, v, |u-v|, u*v] of unit-norm embeddings (u=claim, v=evidence) + cos, cos2, token_jaccard, len_ratio, log_len_min, log_len_max, neg_any, neg_xor, log_num_shared, log_num_only_one",
+  "hidden": 64,
+  "max_iter": 200,
+  "model": "StandardScaler + sklearn.neural_network.MLPClassifier",
+  "numpy": "2.4.6",
+  "random_state": 0,
+  "sklearn": "1.9.0",
+  "solver": "adam",
+  "train_rows": "topical pairs of all runs"
+ },
+ "schema": "loci-d10-pair-gate/v1",
+ "threshold": {
+  "chosen_on": "pooled leave-one-run-out out-of-fold scores (topical pairs)",
+  "name": "tau_R95",
+  "recall_floor": 0.95,
+  "tau": 0.21443252465796228
+ },
+ "threshold_table": [
+  {
+   "oof_f1": 0.9389830508474576,
+   "oof_recall": 0.9008130081300812,
+   "oof_tnr": 0.9908026755852842,
+   "recall_floor": 0.9,
+   "tau": 0.8858369411898015
+  },
+  {
+   "oof_f1": 0.9527687296416938,
+   "oof_recall": 0.9512195121951219,
+   "oof_tnr": 0.9765886287625418,
+   "recall_floor": 0.95,
+   "tau": 0.21443252465796228
+  },
+  {
+   "oof_f1": 0.9554140127388535,
+   "oof_recall": 0.975609756097561,
+   "oof_tnr": 0.9657190635451505,
+   "recall_floor": 0.975,
+   "tau": 0.05333013483550104
+  },
+  {
+   "oof_f1": 0.9199395770392749,
+   "oof_recall": 0.9902439024390244,
+   "oof_tnr": 0.9163879598662208,
+   "recall_floor": 0.99,
+   "tau": 0.010551793911206229
+  }
+ ],
+ "training_data": {
+  "label_note": "structural proxy: topical = same dt_target tag",
+  "loci_commit": "113efecbe7f69c887b99e6d87c0457c02ca1b0a3",
+  "n_findings": 143,
+  "n_rows": 5418,
+  "n_runs": 4,
+  "n_train_pairs": 5235,
+  "n_train_pos": 1745,
+  "path": "deep_think_loci/grounding/grounding_dataset.jsonl",
+  "repo": "rjmendez/loci",
+  "run_sizes": [
+   53,
+   54,
+   23,
+   13
+  ],
+  "sha256": "2da3b224ba4ca7682d0c9813fdad890ac0812ca8e010e7b16590d28135581676"
+ },
+ "version": "d10-mlp-pair-v1",
+ "weights": {
+  "bytes": 1559704,
+  "file": "weights.npz",
+  "sha256": "61fd567fa06599309547d8a81087ab76bcac2f18a5d1ec666e930065d0bd284a"
+ }
+}
