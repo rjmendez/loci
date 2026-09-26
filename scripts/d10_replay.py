@@ -74,7 +74,6 @@ MIN_FINDINGS, MAX_FINDINGS = 8, 400
 EXCLUDE_NAMES = {"flybrain-ops"}
 EXCLUDE_PATTERN = re.compile(r"smoke|probe|test|recover-", re.IGNORECASE)
 CATEGORIES = ("cos_only", "mlp_only", "both_keep", "both_drop")
-DISAGREEMENT = ("cos_only", "mlp_only")
 LABELS = ("relevant", "not_relevant", "unsure")
 MAX_TEXT_CHARS = 2000        # memcheck.llm.embed_texts truncates here; so does the cache key
 SHEET_TRUNCATE = 700
@@ -643,11 +642,13 @@ def draw_sample(rows: list[dict], targets: SampleTargets, seed: int) -> tuple[li
     by_cat: dict[str, list[dict]] = {c: [] for c in CATEGORIES}
     for r in rows:
         by_cat[r["category"]].append(r)
+    want = {"cos_only": targets.cos_only, "mlp_only": targets.mlp_only,
+            "both_keep": targets.both_keep, "both_drop": targets.both_drop}
     design = {}
     picked: list[dict] = []
     for c in CATEGORIES:
         pool = sorted(by_cat[c], key=lambda r: (r["investigation_id"], r["question_kind"], r["finding_index"]))
-        k = min(getattr(targets, c), len(pool))
+        k = min(want[c], len(pool))
         take = rng.sample(pool, k)
         design[c] = {"population": len(pool), "sampled": k}
         picked.extend(take)
