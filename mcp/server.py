@@ -10513,6 +10513,7 @@ def investigation_reason(
         grounded_findings, gate_applied, confidence_score, converged_claims,
         contested_areas, final_answer, persisted_finding_ids}``.
     """
+    import grounding_gate as _grounding_gate
     from memcheck import llm as _llm
     from memcheck.checks.contradiction_llm import extract_json as _extract_json
 
@@ -10543,8 +10544,7 @@ def investigation_reason(
         if vecs and len(vecs) == len(findings) + 1:
             qv = vecs[0]
             scored = [(_llm.cosine(qv, vecs[i + 1]), f) for i, f in enumerate(findings)]
-            kept = [(c, f) for c, f in scored if c >= ground_threshold]
-            gated = [f for _, f in sorted(kept, key=lambda x: x[0], reverse=True)[:12]]
+            gated = _grounding_gate.cosine_gate(scored, ground_threshold)
             gate_applied = True
             _d10_shadow_gate(investigation_id, question, findings, vecs, scored, gated, ground_threshold)
 

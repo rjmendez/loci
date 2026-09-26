@@ -14,7 +14,9 @@ model sees. It is off unless the operator turns it on.
 | Trained artifact (no pickle) | `mcp/models/d10_pair_gate/weights.npz`, `manifest.json` |
 | Trainer / exporter | `deep_think_loci/grounding/train_d10_pair_gate.py` |
 | Read-only analysis | `scripts/d10_shadow_report.py` |
-| Tests | `mcp/tests/test_d10_gate.py`, `scripts/tests/test_d10_shadow_report.py` |
+| Offline replay, blind labelling sheet, analysis | `scripts/d10_replay.py`, `scripts/d10_replay_analyze.py`, `docs/d10_replay_plan.md` |
+| The cosine keep rule both gates are compared against | `mcp/grounding_gate.py` |
+| Tests | `mcp/tests/test_d10_gate.py`, `mcp/tests/test_d10_replay.py`, `scripts/tests/test_d10_shadow_report.py` |
 
 ## Why this model, and why only in shadow
 
@@ -184,6 +186,45 @@ The report opens files read-only and prints JSON aggregates to stdout:
   findings were scored in the same shadow call are joined. At the time of writing the
   live store holds one verdict log, and all of its verdicts are null (judge
   unavailable), so expect this section to stay thin.
+
+## Offline replay and blind labelling
+
+Point 2 below does not have to wait for weeks of live calls. `scripts/d10_replay.py`
+replays historical investigations: it asks each sampled investigation the questions its
+manifest already states (title, hypothesis, next step), embeds them and the active
+findings with the live embedder, and scores every pair with both gates' production code
+(`grounding_gate.cosine_gate`, which `investigation_reason` now calls, and
+`d10_gate.load_gate` / `mlp_decisions`, which the shadow logger calls). A test runs
+`investigation_reason` with shadow on and checks that the replay reproduces every
+logged decision. It then draws a blind labelling sample and writes a self-contained
+HTML sheet. The analysis plan and the decision rule are pre-registered in
+[`docs/d10_replay_plan.md`](d10_replay_plan.md); `sample` refuses to run until that file
+is committed. A title is a proxy for a real question, so where the replay and live
+shadow data disagree, the live data wins.
+
+It reads the store and never writes to it, and it refuses an output directory under the
+memory dir, `~/.loci` or `~/.hermes`. The output directory holds investigation text, so
+keep it private: never commit it, never upload it. It is polite to the host's
+five-minutely CronJobs: one request of 16 texts at a time, a pause between requests, no
+request in the first 90 s after a minute divisible by 5 or while `/proc/pressure` io/cpu
+`some avg60` is above 15 %/50 %. It caches every vector as it arrives, exits 75 after
+30 minutes of continuous holding (rerun to resume) and exits 1 after 5 consecutive
+failed requests. It never calls a generation endpoint.
+
+```bash
+OUT=/mnt/f/.flybrain/cache/private/loci_d10_replay
+# 1. replay (heavy step; through the scheduler; rerun the same command to resume)
+FLYBRAIN_OWNER=loci-d10-replay FLYBRAIN_JOB_MEM=4G FLYBRAIN_JOB_THREADS=2 \
+  ~/.local/bin/flybrain-slot python3 scripts/d10_replay.py run --out-dir "$OUT"
+# 2. labelling sample and sheet (once, after docs/d10_replay_plan.md is committed)
+python3 scripts/d10_replay.py sample --out-dir "$OUT"
+# 3. label: open $OUT/label_sheet.html in a browser (1 relevant, 2 not relevant,
+#    3 unsure, e expand, Backspace back, u undo), then "Export labels".
+#    Terminal alternative: python3 scripts/d10_replay.py label --out-dir "$OUT"
+# 4. analyse (aggregates only)
+python3 scripts/d10_replay_analyze.py --key "$OUT/key.json" \
+  --labels ~/Downloads/relevance_labels_<sheet id>.json      # or "$OUT/labels.jsonl"
+```
 
 ## What would justify enforcement
 
