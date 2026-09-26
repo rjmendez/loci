@@ -29,6 +29,8 @@ mnemosyne = [
 ]
 test = [
     "hypothesis>=6.0",
+    # tests/test_d10_gate.py checks numpy inference against the sklearn model.
+    "scikit-learn>=1.3",
 ]
 
 [project.scripts]
@@ -44,6 +46,7 @@ include = ["memcheck*", "graph*"]
 py-modules = [
     "backends",
     "batched_gen",
+    "d10_gate",
     "embed_ops",
     "graph_tools",
     "replay_fingerprint",

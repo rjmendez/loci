@@ -10445,6 +10445,39 @@ Identify where perspectives independently converged (high confidence) and where 
 {{"confidence_score": <integer 0-100>, "converged_claims": ["..."], "contested_areas": ["..."], "final_answer": "<integrated answer: lead with convergence, mark contested areas, note gaps>"}}"""
 
 
+# D10 shadow gate: with LOCI_D10_SHADOW=1, every grounding-gate call in
+# investigation_reason also scores its (question, finding) pairs with the D10
+# pair MLP (mcp/d10_gate.py) and logs both gates' keep/drop decisions to
+# <data home>/instrumentation/d10_shadow.jsonl (ids, scores, enums; no text).
+# It reuses the embeddings the cosine gate already computed and never changes
+# what the gate keeps. Off by default; unset the variable to roll back.
+# docs/d10_shadow_gate.md.
+def _d10_shadow_gate(investigation_id: str, question: str, findings: list[dict], vecs: list,
+                     scored: list, gated: list[dict], ground_threshold: float) -> bool:
+    """Shadow-score the grounding gate's pairs. Fail-open: never raises, never alters ``gated``."""
+    try:
+        from instrumentation_log import env_enabled
+
+        if not env_enabled("LOCI_D10_SHADOW", False):
+            return False
+        import d10_gate
+
+        return d10_gate.record_shadow(
+            MEMORY_DIR.parent / "instrumentation" / d10_gate.SHADOW_LOG_NAME,
+            investigation_id=investigation_id,
+            question=question,
+            finding_ids=[str(f.get("id") or "") for f in findings],
+            finding_texts=[str(f.get("text") or "") for f in findings],
+            vectors=vecs,
+            cosines=[c for c, _ in scored],
+            cos_threshold=ground_threshold,
+            context_ids=[str(f.get("id") or "") for f in gated],
+        )
+    except Exception as exc:  # noqa: BLE001 - shadow instrumentation must not fail the tool
+        logger.debug("d10 shadow gate: fail-open on exception: %r", exc)
+        return False
+
+
 @mcp.tool()
 def investigation_reason(
     investigation_id: str,
@@ -10513,6 +10546,7 @@ def investigation_reason(
             kept = [(c, f) for c, f in scored if c >= ground_threshold]
             gated = [f for _, f in sorted(kept, key=lambda x: x[0], reverse=True)[:12]]
             gate_applied = True
+            _d10_shadow_gate(investigation_id, question, findings, vecs, scored, gated, ground_threshold)
 
     evidence = "\n".join(
         f"- [{f.get('type', f.get('record_type', '?'))}] "
