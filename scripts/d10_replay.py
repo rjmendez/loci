@@ -120,8 +120,12 @@ def check_out_dir(out_dir: Path, memory_dir: Path) -> Path:
 
 
 def _atomic_write(path: Path, text: str) -> None:
+    """Write a temporary file, fsync it, rename it over ``path``: readers see old or new, never half."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -266,18 +270,43 @@ def cache_key(model: str, text: str) -> str:
 
 
 class VectorCache:
-    """Append-only JSONL of {key, model, dim, vec}. A torn last line is ignored."""
+    """Append-only JSONL of {key, model, dim, vec, sum}, one row per vector.
+
+    A kill can leave only a torn tail, never a row that reads as valid: each batch is
+    one write followed by fsync, and a row counts only when it ends in a newline, its
+    ``sum`` (sha256 of key, model and vector) matches and its length equals ``dim``.
+    Appending after a torn tail first writes a newline, so the next row starts on a
+    line of its own. A rejected row is simply embedded again.
+    """
 
     def __init__(self, path: Path):
         self.path = path
         self.vectors: dict[str, list[float]] = {}
+        self.rejected = 0
         if path.is_file():
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    row = json.loads(line)
+            lines = path.read_bytes().decode("utf-8", errors="replace").split("\n")
+            for line in lines[:-1]:          # what follows the last newline is unterminated
+                row = self._valid(line)
+                if row is not None:
                     self.vectors[row["key"]] = row["vec"]
-                except (ValueError, KeyError, TypeError):
-                    continue
+                elif line.strip():
+                    self.rejected += 1
+            self.rejected += bool(lines[-1].strip())
+
+    @staticmethod
+    def _sum(key: str, model: str, vec: Sequence[float]) -> str:
+        return hashlib.sha256(json.dumps([key, model, list(vec)]).encode("utf-8")).hexdigest()[:32]
+
+    def _valid(self, line: str) -> Optional[dict]:
+        try:
+            row = json.loads(line)
+            vec = row["vec"]
+            if (isinstance(vec, list) and vec and len(vec) == row["dim"]
+                    and row["sum"] == self._sum(row["key"], row["model"], vec)):
+                return row
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None
 
     def __contains__(self, key: str) -> bool:
         return key in self.vectors
@@ -286,8 +315,19 @@ class VectorCache:
         return self.vectors[key]
 
     def put_many(self, model: str, keys: Sequence[str], vecs: Sequence[Sequence[float]]) -> None:
-        rows = [{"key": k, "model": model, "dim": len(v), "vec": [float(x) for x in v]} for k, v in zip(keys, vecs)]
-        _append_jsonl(self.path, rows)
+        rows = []
+        for k, v in zip(keys, vecs):
+            vec = [float(x) for x in v]
+            rows.append({"key": k, "model": model, "dim": len(vec), "vec": vec, "sum": self._sum(k, model, vec)})
+        payload = "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows).encode("utf-8")
+        with open(self.path, "a+b") as fh:
+            if fh.seek(0, os.SEEK_END) > 0:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    payload = b"\n" + payload      # seal off a torn tail left by a kill
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
         for r in rows:
             self.vectors[r["key"]] = r["vec"]
 

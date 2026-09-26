@@ -293,6 +293,32 @@ def test_a_stopped_run_resumes_without_redoing_work(tmp_path):
     assert len(R.VectorCache(tmp_path / "v.jsonl").vectors) == 40
 
 
+def test_a_kill_mid_batch_never_leaves_a_row_that_reads_as_valid(tmp_path):
+    """Truncate a batch write at every byte: only complete, checksummed rows count, and
+    the next append after the torn tail is read back intact."""
+    full = tmp_path / "full.jsonl"
+    c = R.VectorCache(full)
+    c.put_many("m", ["k0"], [[0.5] * 4])
+    base = full.stat().st_size
+    c.put_many("m", ["k1", "k2"], [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    data = full.read_bytes()
+    row1_end = data.index(b"\n", base) + 1
+    for cut in range(base, len(data)):
+        torn = tmp_path / f"torn{cut}.jsonl"
+        torn.write_bytes(data[:cut])
+        got = R.VectorCache(torn)
+        assert set(got.vectors) == ({"k0", "k1"} if cut >= row1_end else {"k0"}), cut
+        assert all(got.get(k) == R.VectorCache(full).get(k) for k in got.vectors)
+        got.put_many("m", ["k3"], [[9.0, 9.0]])            # resume after the kill
+        again = R.VectorCache(torn)
+        assert "k3" in again and again.get("k3") == [9.0, 9.0], cut
+        torn.unlink()
+    # A row whose numbers were altered (but still parse) is rejected, not trusted.
+    bad = tmp_path / "bad.jsonl"
+    bad.write_bytes(data.replace(b"2.0", b"2.5", 1))
+    assert set(R.VectorCache(bad).vectors) == {"k0", "k2"} and R.VectorCache(bad).rejected == 1
+
+
 # --------------------------------------------------------------------------- scoring with the production code
 
 
