@@ -134,31 +134,72 @@ def _http_status(url: str, path: str = "", timeout: float = 1.0,
         return None
 
 
+_SIZE_UNITS = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
+
+
 @functools.lru_cache(maxsize=1)
-def _ollama_local_tags() -> set[str]:
-    """Best-effort local Ollama tag inventory. Never raises."""
+def _ollama_list() -> dict[str, "int | None"]:
+    """Best-effort local Ollama inventory: tag -> size in bytes (None if unparsed). Never raises."""
     try:
         p = subprocess.run(["ollama", "list"], capture_output=True, text=True,
                            timeout=_OLLAMA_LIST_TIMEOUT, check=False)
     except Exception:
-        return set()
+        return {}
     if p.returncode != 0:
-        return set()
-    tags: set[str] = set()
+        return {}
+    models: dict[str, "int | None"] = {}
     for line in (p.stdout or "").splitlines():
         s = line.strip()
         if not s or s.startswith("NAME "):
             continue
-        tag = s.split()[0]
-        if tag:
-            tags.add(tag)
-    return tags
+        cols = s.split()
+        size = None
+        # NAME  ID  SIZE UNIT  MODIFIED...  e.g. "qwen2.5:3b  357c53fb659c  1.9 GB  3 weeks ago"
+        if len(cols) >= 4 and cols[3].upper() in _SIZE_UNITS:
+            try:
+                size = int(round(float(cols[2]) * _SIZE_UNITS[cols[3].upper()]))
+            except ValueError:
+                size = None
+        models[cols[0]] = size
+    return models
+
+
+@functools.lru_cache(maxsize=1)
+def _ollama_local_tags() -> set[str]:
+    """Best-effort local Ollama tag inventory. Never raises."""
+    return set(_ollama_list())
+
+
+# Built-in last resort when neither env nor config names a model: small enough to load
+# on one consumer GPU. A model larger than one card is split across GPUs by Ollama, and
+# on 11-12 GB cards those loads time out and block Ollama's scheduler for minutes at a
+# time (2026-09-26: 75 of 77 gemma4:26b loads failed, starving the embedding model).
+ONE_GPU_FALLBACK_MODEL = "qwen2.5:3b"
+ONE_GPU_REDTEAM_FALLBACK_MODEL = "heretic-llama31-8b-instruct:latest"
+
+
+def _auto_pick_max_bytes() -> int:
+    """Largest installed model the resolvers may pick on their own (env LOCI_OLLAMA_AUTO_MAX_GB)."""
+    try:
+        return int(float(os.environ.get("LOCI_OLLAMA_AUTO_MAX_GB", "10")) * 10**9)
+    except ValueError:
+        return 10 * 10**9
+
+
+def _fits_one_gpu(tag: str) -> bool:
+    """True unless `ollama list` reports this tag above the auto-pick size cap.
+
+    Only guards automatic picks from the local inventory. A tag named by env or
+    config is the operator's choice and is never filtered.
+    """
+    size = _ollama_list().get(tag)
+    return size is None or size <= _auto_pick_max_bytes()
 
 
 def _first_installed(candidates: tuple[str, ...]) -> str:
     tags = _ollama_local_tags()
     for c in candidates:
-        if c in tags:
+        if c in tags and _fits_one_gpu(c):
             return c
     return ""
 
@@ -166,7 +207,7 @@ def _first_installed(candidates: tuple[str, ...]) -> str:
 def _first_non_embedding_local() -> str:
     tags = sorted(_ollama_local_tags())
     for t in tags:
-        if "embed" not in t.lower():
+        if "embed" not in t.lower() and _fits_one_gpu(t):
             return t
     return ""
 
@@ -175,7 +216,7 @@ def _first_matching_local(patterns: tuple[str, ...]) -> str:
     tags = sorted(_ollama_local_tags())
     for t in tags:
         lt = t.lower()
-        if any(p in lt for p in patterns):
+        if any(p in lt for p in patterns) and _fits_one_gpu(t):
             return t
     return ""
 
@@ -229,8 +270,8 @@ def ollama_gen_model() -> str:
                   or _cfg("ollama", "gen_model", ""))
     if env_or_cfg:
         return env_or_cfg
-    preferred = ("qwen2.5:3b", "qwen3.8:latest", "heretic-llama31-8b-instruct:latest")
-    return _first_installed(preferred) or _first_non_embedding_local() or "qwen2.5:3b"
+    preferred = (ONE_GPU_FALLBACK_MODEL, "heretic-llama31-8b-instruct:latest")
+    return _first_installed(preferred) or _first_non_embedding_local() or ONE_GPU_FALLBACK_MODEL
 
 
 def _task_model(env_var: str, cfg_key: str) -> str:
@@ -251,6 +292,22 @@ def _task_model(env_var: str, cfg_key: str) -> str:
 def ollama_verify_model() -> str:
     """Model for verify_finding's adversarial reasoning. Env -> [ollama].verify_model -> gen_model."""
     return _task_model("LOCI_OLLAMA_VERIFY_MODEL", "verify_model")
+
+
+def swarm_escalate_model() -> str:
+    """swarm_escalate's escalation tier. Env LOCI_SWARM_ESCALATE_MODEL ->
+    [ollama].swarm_escalate_model -> verify_model (the same stronger reasoning tier)."""
+    return (os.environ.get("LOCI_SWARM_ESCALATE_MODEL")
+            or _cfg("ollama", "swarm_escalate_model", "")
+            or ollama_verify_model())
+
+
+def swarm_synthesize_model() -> str:
+    """swarm_escalate's synthesis tier. Env LOCI_SWARM_SYNTHESIZE_MODEL ->
+    [ollama].swarm_synthesize_model -> verify_model."""
+    return (os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL")
+            or _cfg("ollama", "swarm_synthesize_model", "")
+            or ollama_verify_model())
 
 
 def ollama_classify_model() -> str:
@@ -279,8 +336,8 @@ def ollama_guardian_model() -> str:
                   or _cfg("ollama", "guardian_model", ""))
     if env_or_cfg:
         return env_or_cfg
-    preferred = ("llama-guard3:8b", "granite3-guardian:2b", "qwen3.8:latest",
-                 "heretic-llama31-8b-instruct:latest", "qwen2.5:3b")
+    preferred = ("llama-guard3:8b", "granite3-guardian:2b",
+                 "heretic-llama31-8b-instruct:latest", ONE_GPU_FALLBACK_MODEL)
     return _first_installed(preferred) or _first_non_embedding_local() or "granite3-guardian:2b"
 
 
@@ -291,17 +348,16 @@ def ollama_redteam_model() -> str:
     uncensored or abliterated local model. The point of the red-team phase is to phrase
     attacks the way an adversary would, without the softening/refusal behavior aligned
     instruct models often introduce on "attack this" prompts. Resolution stays portable:
-    env -> [ollama].redteam_model -> a known-good heretic default.
+    env -> [ollama].redteam_model -> an installed heretic/abliterated tag that fits one
+    GPU -> a one-GPU heretic default.
     """
     env_or_cfg = (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
                   or _cfg("ollama", "redteam_model", ""))
     if env_or_cfg:
         return env_or_cfg
-    preferred = ("hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M",
-                 "qwen3.8:latest")
-    return (_first_installed(preferred)
+    return (_first_installed((ONE_GPU_REDTEAM_FALLBACK_MODEL,))
             or _first_matching_local(("heretic", "abliterated"))
-            or "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M")
+            or ONE_GPU_REDTEAM_FALLBACK_MODEL)
 
 
 def _vllm_role_env(prefix: str, role: str) -> str:
@@ -666,7 +722,7 @@ def load_env(repo: "Path | None" = None) -> dict:
 
 def _reset_cache() -> None:
     """Test hook: clear memoized resolutions (env/config may have changed)."""
-    for fn in (_config, _ollama_local_tags, ollama_url, vllm_url):
+    for fn in (_config, _ollama_list, _ollama_local_tags, ollama_url, vllm_url):
         clear = getattr(fn, "cache_clear", None)
         if clear:
             clear()
