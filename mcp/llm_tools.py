@@ -510,10 +510,11 @@ def swarm_reason(topic: str,
             bool(safety_check) if safety_check is not None
             else _env_bool("LOCI_SWARM_SAFETY_CHECK")
         )
-        # Tier gating mirrors scripts/swarm_escalate.py's _resolve_config: the new 8B/27B
-        # models only replace the legacy qwen3.8:latest default when the caller opts into
-        # one of the new tier knobs, and an explicit escalate_model/synthesize_model
-        # (even if it equals the legacy default) always wins over both defaults.
+        # Tier gating mirrors scripts/swarm_escalate.py's _resolve_config: the 8B tier
+        # model only replaces the config-resolved default (backends.swarm_escalate_model /
+        # swarm_synthesize_model) when the caller opts into one of the new tier knobs, and
+        # an explicit escalate_model/synthesize_model (even if it equals the default)
+        # always wins over both defaults.
         tier_active = (
             resolved_seeds > 1
             or resolved_synthesize_think

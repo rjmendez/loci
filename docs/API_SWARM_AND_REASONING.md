@@ -971,7 +971,7 @@ Multi-model ideation with strict grounding:
 ```bash
 python3 scripts/local_deep_think.py \
   "What explains the recent auth cache misses?" \
-  --ideate-models llama3.1-agent:latest,qwen3.8:latest \
+  --ideate-models llama3.1-agent:latest,qwen2.5:3b \
   --ideas-per-model 2 \
   --strict-grounding \
   --pretty

@@ -6,6 +6,25 @@ change any existing default tier, environment variable, or runtime routing path.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Last resort when mcp/backends.py cannot be imported: small enough to load on one GPU.
+_ONE_GPU_FALLBACK_MODEL = "qwen2.5:3b"
+
+
+def _backends_model(resolver: str) -> str:
+    """Resolve a role model the same way scripts/swarm_escalate.py does. Fail-open."""
+    try:
+        mcp_dir = str(Path(__file__).resolve().parents[1] / "mcp")
+        if mcp_dir not in sys.path:
+            sys.path.insert(0, mcp_dir)
+        import backends
+
+        return str(getattr(backends, resolver)() or "").strip() or _ONE_GPU_FALLBACK_MODEL
+    except Exception:
+        return _ONE_GPU_FALLBACK_MODEL
+
 
 CODE_SPECIALIST_MODEL = "qwen2.5-coder:7b"
 MATH_SPECIALIST_MODEL = "hf.co/bartowski/Qwen2.5-Math-7B-Instruct-GGUF:Q4_K_M"
@@ -16,10 +35,10 @@ MATH_SPECIALIST_MODEL = "hf.co/bartowski/Qwen2.5-Math-7B-Instruct-GGUF:Q4_K_M"
 # refused padlock guidance; llama-guard3 timed out at 120s on all 3 prompts; the
 # live-pulled granite3-guardian:2b returned a terse "No" once and otherwise
 # failed the swarm JSON contract on those prompts, so it stays out of answer-stage
-# safety routing for now.
+# safety routing for now. qwen3.8:latest was dropped 2026-09-26: at 17.7 GB it splits
+# across both 11/12 GB GPUs and its loads time out.
 SAFETY_SPECIALIST_MODELS = (
     "llama-guard3:8b",
-    "qwen3.8:latest",
 )
 TOOL_CALLING_SPECIALIST_MODEL = "hf.co/eaddario/Watt-Tool-8B-GGUF:Q4_K_M"
 
@@ -31,8 +50,9 @@ SWARM_CHEAP_FANOUT_MODELS = (
     "llama3.1-agent:latest",
 )
 SWARM_GUARDIAN_MODELS = SAFETY_SPECIALIST_MODELS
-SWARM_ESCALATION_MODEL = "qwen3.8:latest"
-SWARM_SYNTHESIS_MODEL = "qwen3.8:latest"
+# Same resolution as swarm_escalate's defaults: env -> backends.toml -> one-GPU fallback.
+SWARM_ESCALATION_MODEL = _backends_model("swarm_escalate_model")
+SWARM_SYNTHESIS_MODEL = _backends_model("swarm_synthesize_model")
 
 SPECIALIST_MODELS = {
     "code": CODE_SPECIALIST_MODEL,

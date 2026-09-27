@@ -83,8 +83,8 @@ If any opt-in tier knob is enabled, the code switches to a larger budget envelop
 the caller explicitly pins a model:
 
 - escalate model: `heretic-llama31-8b-instruct:latest`
-- synthesize model:
-  `hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M`
+- synthesize model: `heretic-llama31-8b-instruct:latest` (the 27B Qwen3.8 heretic
+  build was the tier default until 2026-09-26; it does not fit one GPU)
 - decompose budget: 2200 tokens
 - synthesize budget: 2200 tokens
 - synthesize-think budget: 4000 tokens

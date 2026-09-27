@@ -20,7 +20,7 @@ The repo already points to a clear specialist-model pattern:
 
 - code specialist: `qwen2.5-coder:7b` (`scripts/model_catalog.py`)
 - math specialist: `Qwen2.5-Math-7B-Instruct` (GGUF variant, same catalog)
-- safety specialist: `llama-guard3:8b` / `qwen3.8:latest` (catalog)
+- safety specialist: `llama-guard3:8b` (catalog)
 - tool-calling specialist: `Watt-Tool-8B` (catalog)
 
 These belong on dedicated local endpoints, not the general batched generation lane:
