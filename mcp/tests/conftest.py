@@ -98,3 +98,16 @@ def _isolate_offload_audit(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("LOCI_OFFLOAD_AUDIT_DIR", str(tmp_path / "offload-audit"))
 
+
+
+@pytest.fixture(autouse=True)
+def _fresh_conflict_judge_breaker(monkeypatch):
+    """Give each test its own contradiction-judge circuit breaker.
+
+    The breaker is process-global state in server.py. Tests that store against a
+    faked Qdrant with the hermetic, unreachable judge record failures, and once
+    enough accumulate the breaker skips the judge in whatever test runs next.
+    """
+    server = sys.modules.get("server")
+    if server is not None and hasattr(server, "_JudgeCircuitBreaker"):
+        monkeypatch.setattr(server, "_CONFLICT_JUDGE_BREAKER", server._JudgeCircuitBreaker())

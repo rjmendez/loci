@@ -136,3 +136,12 @@
 # model = "abliterated-model"          # heavy uncensored escalation default
 # [abliteration.redteam]
 # model = "abliterated-model-large-v2"
+
+[conflict_judge]
+# investigation_store answers from the conflict heuristics at once; the LLM contradiction
+# judge runs afterwards on a background worker. Env vars (LOCI_CONFLICT_JUDGE_*) win.
+# sync = false                  # true: judge inline, blocking the store (tests, debugging)
+# max_pairs = 3                 # highest-cosine neighbours judged per store; 0 disables the judge
+# breaker_failures = 3          # consecutive failures/timeouts that open the circuit breaker
+# breaker_cooldown_s = 300      # how long the breaker skips the judge once open
+# slow_s = 60                   # a judge call slower than this counts as a failure
