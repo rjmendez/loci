@@ -52,6 +52,7 @@ import hmac
 import json
 import math
 import os
+import queue
 import random
 import re
 import subprocess
@@ -2201,122 +2202,320 @@ def _record_judge_verdicts(investigation_id: str, rows: list[dict]) -> bool:
         return False
 
 
+# The contradiction judge is a local LLM call per candidate pair. It used to run inline,
+# up to ten serial calls inside every investigation_store, so a model that could not load
+# held each store for minutes and starved Ollama for every other caller. Now the store
+# records the heuristic result immediately and hands at most max_pairs of the
+# highest-cosine neighbours to one background worker, behind a circuit breaker. The
+# verdicts land later in the same places the inline path wrote them: judge_verdicts.jsonl
+# rows, and a conflicts.jsonl record when the judge finds a contradiction the heuristics
+# missed. Every knob reads env first, then [conflict_judge] in backends.toml:
+#   LOCI_CONFLICT_JUDGE_SYNC=1               judge inline, as before (tests, debugging)
+#   LOCI_CONFLICT_JUDGE_MAX_PAIRS            neighbours judged per store (default 3; 0 = off)
+#   LOCI_CONFLICT_JUDGE_BREAKER_FAILURES     consecutive failures that open the breaker (3)
+#   LOCI_CONFLICT_JUDGE_BREAKER_COOLDOWN_S   seconds the breaker stays open (300)
+#   LOCI_CONFLICT_JUDGE_SLOW_S               a call slower than this counts as a failure (60)
+_CONFLICT_JUDGE_QUEUE_MAX = 64
+
+
+def _conflict_judge_setting(env_var: str, cfg_key: str, default, cast):
+    raw = os.environ.get(env_var, "")
+    if raw == "":
+        try:
+            import backends
+
+            raw = backends._cfg("conflict_judge", cfg_key, "")
+        except Exception:
+            raw = ""
+    if raw is None or raw == "":
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s: ignoring invalid value %r", env_var, raw)
+        return default
+
+
+def _boolish(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _conflict_judge_sync() -> bool:
+    return _conflict_judge_setting("LOCI_CONFLICT_JUDGE_SYNC", "sync", False, _boolish)
+
+
+def _conflict_judge_max_pairs() -> int:
+    return max(0, _conflict_judge_setting("LOCI_CONFLICT_JUDGE_MAX_PAIRS", "max_pairs", 3, int))
+
+
+class _JudgeCircuitBreaker:
+    """Stop calling the judge after repeated failures, for a cool-down window.
+
+    Consecutive failures (``ok=False``, or slower than LOCI_CONFLICT_JUDGE_SLOW_S) open
+    the breaker; while open, every pair is skipped without touching the model. Once the
+    window passes the next call goes through: success closes it, another failure reopens
+    it at once. Opening logs one warning per episode, not one per skipped pair.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._open_until = 0.0
+        self._tripped = False
+
+    def allow(self) -> bool:
+        with self._lock:
+            return self._clock() >= self._open_until
+
+    def record(self, ok: bool) -> None:
+        with self._lock:
+            if ok:
+                if self._tripped:
+                    logger.info("conflict judge circuit breaker closed: judge answering again")
+                self._failures = 0
+                self._tripped = False
+                return
+            self._failures += 1
+            threshold = max(1, _conflict_judge_setting(
+                "LOCI_CONFLICT_JUDGE_BREAKER_FAILURES", "breaker_failures", 3, int))
+            if self._failures < threshold:
+                return
+            cooldown = max(0.0, _conflict_judge_setting(
+                "LOCI_CONFLICT_JUDGE_BREAKER_COOLDOWN_S", "breaker_cooldown_s", 300.0, float))
+            self._open_until = self._clock() + cooldown
+            if not self._tripped:
+                self._tripped = True
+                logger.warning(
+                    "conflict judge circuit breaker open: %d consecutive failures; "
+                    "skipping the LLM judge for %.0fs (heuristic conflicts unaffected)",
+                    self._failures, cooldown)
+
+
+_CONFLICT_JUDGE_BREAKER = _JudgeCircuitBreaker()
+
+
+def _conflict_candidates(investigation_id: str, new_finding: dict) -> list[dict]:
+    """Same-investigation neighbours of new_finding (cosine >= 0.82, itself excluded),
+    in Qdrant's score order, each with the heuristic rule it trips (or None).
+
+    No LLM work happens here; this is the part of detection a store waits for.
+    """
+    client, col = _get_qdrant()
+    if client is None:
+        return []
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+    except ImportError:
+        return []
+
+    dense_vec = _embed(new_finding.get("text", ""))
+    if dense_vec is None:
+        return []
+
+    search_filter = Filter(must=[
+        FieldCondition(
+            key="investigation_id",
+            match=MatchValue(value=investigation_id),
+        )
+    ])
+
+    try:
+        from qdrant_client.models import SearchParams, QuantizationSearchParams
+        _sp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
+        result = _query_points_compat(
+            client, col, dense_vec,
+            query_filter=search_filter,
+            limit=10,
+            score_threshold=0.82,
+            search_params=_sp,
+        )
+    except Exception as exc:
+        logger.warning("_detect_conflicts: neighbour search failed: %r", exc)
+        return []
+
+    new_id = new_finding.get("id", "")
+    new_type = new_finding.get("record_type", "")
+    new_neg = _has_negation(new_finding.get("text", ""))
+
+    candidates = []
+    for rank, hit in enumerate(result):
+        payload = dict(hit.payload or {})
+        neighbor_id = str(payload.get("id", hit.id))
+        if neighbor_id == new_id:
+            continue
+
+        neighbor_type = payload.get("record_type") or payload.get("type", "")
+        neighbor_neg = _has_negation(str(payload.get("text", "")))
+
+        heuristic_rule = None
+        # Heuristic 1: gap now filled by an observed finding
+        if neighbor_type == "gap" and new_type == "observed":
+            heuristic_rule = "gap_filled"
+        # Heuristic 2: assumption overridden by a non-assumed finding
+        elif neighbor_type == "assumed" and new_type != "assumed":
+            heuristic_rule = "assumption_overridden"
+        # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
+        elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
+            heuristic_rule = "negation_mismatch"
+
+        candidates.append({
+            "rank": rank,
+            "neighbor_id": neighbor_id,
+            "neighbor_type": neighbor_type,
+            "similarity": round(float(hit.score), 4),
+            "heuristic_rule": heuristic_rule,
+            "payload": payload,
+        })
+    return candidates
+
+
+def _judge_conflict_candidates(
+    investigation_id: str,
+    new_finding: dict,
+    candidates: list[dict],
+    *,
+    skip_reason: Optional[str] = None,
+) -> list[dict]:
+    """LLM-judge the top candidates, log one verdict row per candidate, return conflicts.
+
+    Only the first max_pairs candidates (highest cosine first) reach the model, and none
+    do while the circuit breaker is open or when ``skip_reason`` is given. A skipped pair
+    is logged like a failed judgement (verdict None, judge_ok False) plus a
+    ``judge_skipped`` reason, so its heuristic result stands exactly as a fail-open
+    judge would leave it.
+    """
+    max_pairs = _conflict_judge_max_pairs()
+    slow_s = _conflict_judge_setting("LOCI_CONFLICT_JUDGE_SLOW_S", "slow_s", 60.0, float)
+    new_id = new_finding.get("id", "")
+    new_type = new_finding.get("record_type", "")
+
+    conflicts = []
+    judged: list[dict] = []
+    attempted = 0
+    for cand in candidates:
+        skipped = skip_reason
+        if skipped is None and attempted >= max_pairs:
+            skipped = "cap"
+        elif skipped is None and not _CONFLICT_JUDGE_BREAKER.allow():
+            skipped = "circuit_open"
+
+        if skipped is None:
+            attempted += 1
+            started = time.monotonic()
+            llm = _judge_conflict_pair(new_finding, cand["payload"])
+            # ok with no verdict means an empty text short-circuited: no model call to score.
+            if not (llm.get("ok") and llm.get("verdict") is None):
+                _CONFLICT_JUDGE_BREAKER.record(
+                    bool(llm.get("ok")) and time.monotonic() - started <= slow_s)
+        else:
+            llm = {"verdict": None, "reason": "", "ok": False, "model": None, "tier": None}
+
+        heuristic_conflict = cand["heuristic_rule"] is not None
+        llm_contradict = llm.get("verdict") == "contradict"
+        row = {
+            "schema": JUDGE_VERDICT_SCHEMA,
+            "event": "conflict_judge",
+            "ts": _now(),
+            "new_finding_id": str(new_id),
+            "neighbor_id": cand["neighbor_id"],
+            "neighbor_rank": cand["rank"],
+            "similarity": cand["similarity"],
+            "new_type": str(new_type or ""),
+            "neighbor_type": str(cand["neighbor_type"] or ""),
+            "heuristic_rule": cand["heuristic_rule"],
+            "verdict": llm.get("verdict"),
+            "judge_ok": bool(llm.get("ok")),
+            "model": llm.get("model"),
+            "tier": llm.get("tier"),
+            "conflict_candidate": bool(heuristic_conflict or llm_contradict),
+        }
+        if skipped is not None:
+            row["judge_skipped"] = skipped
+        judged.append(row)
+
+        if heuristic_conflict or llm_contradict:
+            conflicts.append({
+                "neighbor_id": cand["neighbor_id"],
+                "neighbor_type": cand["neighbor_type"],
+                "score": cand["similarity"],
+                "heuristic_conflict": heuristic_conflict,
+                "llm_verdict": llm.get("verdict"),
+                "llm_reason": llm.get("reason", ""),
+            })
+
+    _record_judge_verdicts(investigation_id, judged)
+    return conflicts
+
+
 def _detect_conflicts(investigation_id: str, new_finding: dict) -> list[dict]:
     """
     Search Qdrant for near-neighbors of new_finding (same investigation, cosine
     > 0.82, excluding the new finding itself), then add an LLM contradiction judge
-    on top of the existing heuristics.
+    on top of the existing heuristics, inline.
 
     Returns a list of conflict dicts (may be empty). Fail-open — any exception
     returns an empty list so investigation_store is never blocked.
     """
     try:
-        client, col = _get_qdrant()
-        if client is None:
-            return []
-
-        try:
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-        except ImportError:
-            return []
-
-        dense_vec = _embed(new_finding.get("text", ""))
-        if dense_vec is None:
-            return []
-
-        search_filter = Filter(must=[
-            FieldCondition(
-                key="investigation_id",
-                match=MatchValue(value=investigation_id),
-            )
-        ])
-
-        try:
-            from qdrant_client.models import SearchParams, QuantizationSearchParams
-            _sp = SearchParams(quantization=QuantizationSearchParams(rescore=True, oversampling=2.0))
-            result = _query_points_compat(
-                client, col, dense_vec,
-                query_filter=search_filter,
-                limit=10,
-                score_threshold=0.82,
-                search_params=_sp,
-            )
-        except Exception as exc:
-            logger.warning("_detect_conflicts: neighbour search failed: %r", exc)
-            return []
-
-        new_id = new_finding.get("id", "")
-        new_type = new_finding.get("record_type", "")
-        new_text = new_finding.get("text", "")
-        new_neg = _has_negation(new_text)
-
-        conflicts = []
-        judged: list[dict] = []
-        for rank, hit in enumerate(result):
-            payload = dict(hit.payload or {})
-            neighbor_id = str(payload.get("id", hit.id))
-            if neighbor_id == new_id:
-                continue
-
-            neighbor_type = payload.get("record_type") or payload.get("type", "")
-            neighbor_text = str(payload.get("text", ""))
-            neighbor_neg = _has_negation(neighbor_text)
-
-            heuristic_conflict = False
-            heuristic_rule = None
-
-            # Heuristic 1: gap now filled by an observed finding
-            if neighbor_type == "gap" and new_type == "observed":
-                heuristic_conflict = True
-                heuristic_rule = "gap_filled"
-
-            # Heuristic 2: assumption overridden by a non-assumed finding
-            elif neighbor_type == "assumed" and new_type != "assumed":
-                heuristic_conflict = True
-                heuristic_rule = "assumption_overridden"
-
-            # Off by default: bare token presence, not polarity — it manufactures conflicts from incidental wording.
-            elif _CONFLICT_NEGATION_HEURISTIC and new_neg != neighbor_neg:
-                heuristic_conflict = True
-                heuristic_rule = "negation_mismatch"
-
-            llm = _judge_conflict_pair(new_finding, payload)
-            llm_contradict = llm.get("verdict") == "contradict"
-            similarity = round(float(hit.score), 4)
-
-            judged.append({
-                "schema": JUDGE_VERDICT_SCHEMA,
-                "event": "conflict_judge",
-                "ts": _now(),
-                "new_finding_id": str(new_id),
-                "neighbor_id": neighbor_id,
-                "neighbor_rank": rank,
-                "similarity": similarity,
-                "new_type": str(new_type or ""),
-                "neighbor_type": str(neighbor_type or ""),
-                "heuristic_rule": heuristic_rule,
-                "verdict": llm.get("verdict"),
-                "judge_ok": bool(llm.get("ok")),
-                "model": llm.get("model"),
-                "tier": llm.get("tier"),
-                "conflict_candidate": bool(heuristic_conflict or llm_contradict),
-            })
-
-            if heuristic_conflict or llm_contradict:
-                conflicts.append({
-                    "neighbor_id": neighbor_id,
-                    "neighbor_type": neighbor_type,
-                    "score": similarity,
-                    "heuristic_conflict": heuristic_conflict,
-                    "llm_verdict": llm.get("verdict"),
-                    "llm_reason": llm.get("reason", ""),
-                })
-
-        _record_judge_verdicts(investigation_id, judged)
-        return conflicts
+        candidates = _conflict_candidates(investigation_id, new_finding)
+        return _judge_conflict_candidates(investigation_id, new_finding, candidates)
     except Exception as exc:
         logger.debug("_detect_conflicts: fail-open on exception: %s", exc)
         return []
+
+
+_CONFLICT_JUDGE_QUEUE: "queue.Queue[tuple]" = queue.Queue(maxsize=_CONFLICT_JUDGE_QUEUE_MAX)
+_conflict_judge_worker_lock = threading.Lock()
+_conflict_judge_worker: Optional[threading.Thread] = None
+
+
+def _run_conflict_judge_job(investigation_id: str, new_finding: dict,
+                            candidates: list[dict], conflict_recorded: bool) -> None:
+    """Judge one store's candidates; record a conflict the heuristics missed."""
+    conflicts = _judge_conflict_candidates(investigation_id, new_finding, candidates)
+    # The store already wrote the first heuristic conflict. Otherwise every conflict
+    # here is a judge contradiction, and the first one is what the inline path wrote.
+    if conflicts and not conflict_recorded:
+        _write_conflict(investigation_id, new_finding["id"], conflicts[0]["neighbor_id"])
+
+
+def _conflict_judge_loop() -> None:
+    while True:
+        job = _CONFLICT_JUDGE_QUEUE.get()
+        try:
+            _run_conflict_judge_job(*job)
+        except Exception as exc:
+            logger.debug("conflict judge worker: fail-open on exception: %r", exc)
+        finally:
+            _CONFLICT_JUDGE_QUEUE.task_done()
+
+
+def _enqueue_conflict_judge(investigation_id: str, new_finding: dict,
+                            candidates: list[dict], conflict_recorded: bool) -> bool:
+    """Queue a store's candidates for the background judge. Never blocks.
+
+    One daemon worker, so judge calls stay serial and a slow model delays only other
+    judgements, never a store. A full queue drops the job (its pairs are logged as
+    skipped) rather than letting the backlog grow while the model is struggling.
+    """
+    global _conflict_judge_worker
+    finding = {k: new_finding.get(k) for k in ("id", "text", "record_type", "type")}
+    with _conflict_judge_worker_lock:
+        if _conflict_judge_worker is None or not _conflict_judge_worker.is_alive():
+            _conflict_judge_worker = threading.Thread(
+                target=_conflict_judge_loop, name="loci-conflict-judge", daemon=True)
+            _conflict_judge_worker.start()
+    try:
+        _CONFLICT_JUDGE_QUEUE.put_nowait((investigation_id, finding, candidates, conflict_recorded))
+        return True
+    except queue.Full:
+        logger.debug("conflict judge queue full; %d pair(s) left unjudged", len(candidates))
+        _judge_conflict_candidates(investigation_id, finding, candidates, skip_reason="queue_full")
+        return False
 
 
 def _write_conflict(investigation_id: str, finding_id_a: str, neighbor_id: str) -> str:
@@ -3339,13 +3538,26 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
 def _store_conflicts(investigation_id: str, finding: dict) -> tuple:
     """Detect conflicts with existing findings. Fail-open: never blocks a store.
 
-    Returns (detected, conflicting_finding_id, conflict_id).
+    Returns (detected, conflicting_finding_id, conflict_id) from the heuristics alone;
+    the LLM judge's verdicts are recorded later by the background worker, unless
+    LOCI_CONFLICT_JUDGE_SYNC=1 restores the inline judge.
     """
     try:
-        conflicts = _detect_conflicts(investigation_id, finding)
-        if conflicts:
-            first = conflicts[0]
-            conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"])
+        if _conflict_judge_sync():
+            conflicts = _detect_conflicts(investigation_id, finding)
+            if conflicts:
+                first = conflicts[0]
+                conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"])
+                return True, first["neighbor_id"], conflict_id
+            return False, None, None
+
+        # The heuristic answer is immediate; the LLM judge runs after the store returns.
+        candidates = _conflict_candidates(investigation_id, finding)
+        first = next((c for c in candidates if c["heuristic_rule"] is not None), None)
+        conflict_id = _write_conflict(investigation_id, finding["id"], first["neighbor_id"]) if first else None
+        if candidates:
+            _enqueue_conflict_judge(investigation_id, finding, candidates, first is not None)
+        if first:
             return True, first["neighbor_id"], conflict_id
     except Exception as exc:
         logger.debug("investigation_store: conflict detection failed (fail-open): %s", exc)
