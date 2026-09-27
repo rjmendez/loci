@@ -735,8 +735,21 @@ def investigation_start(
     Returns:
         JSON ``{"status":"created"|"resumed","manifest":{...}}``. The
         investigation ID is at ``result["manifest"]["id"]``, not
-        ``result["investigation_id"]``.
+        ``result["investigation_id"]``. An invalid id (empty, a missing-value
+        sentinel such as ``undefined``/``null``/``None``, or characters outside
+        ``[A-Za-z0-9_-]``) returns ``{"error": ...}`` and creates nothing.
     """
+    # Reject before anything touches disk. The legacy 'undefined' investigation came from an
+    # orchestrator that substituted an unset JS variable into the id; answering with a clear
+    # error (rather than an uncaught ValueError) tells the caller to fix its template.
+    try:
+        investigation_id = _validated_investigation_id(investigation_id)
+    except ValueError as exc:
+        return json.dumps({
+            "error": str(exc),
+            "hint": "pass a real investigation id; 'undefined'/'null'/'None' usually means the "
+                    "caller substituted an unset variable",
+        })
     existing = _load_manifest(investigation_id)
     if existing:
         existing = _coordination_migrate_manifest(existing)
@@ -1636,7 +1649,11 @@ def investigation_list(
             return the full record including tier counts.
 
     Returns:
-        JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
+        JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...,
+        "skipped_investigations": [{"investigation_id", "reason"}]}. Directories
+        whose name fails id validation (e.g. a legacy ``undefined``) or whose
+        manifest cannot be read are listed in ``skipped_investigations`` and
+        excluded from ``total``, instead of failing the call.
     """
     # Coerce BEFORE any early return, so the empty-root path and the normal path echo the same normalized ints.
     try:
@@ -1661,16 +1678,35 @@ def investigation_list(
         summary = bool(summary)
 
     if not _root().exists():
-        return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
+        return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset,
+                           "skipped_investigations": []})
+
+    def _mtime(p):
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
 
     # Filter to real investigation dirs first: pagination is over investigations, and the findings scan only runs for the page returned.
+    # Per-dir fail-safe: one legacy dir whose name no longer validates (e.g. 'undefined', created before
+    # ids were validated) or whose manifest is unreadable must not fail every page. It is reported in
+    # skipped_investigations and left on disk untouched.
     entries = []
-    for d in sorted(_root().iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+    skipped = []
+    for d in sorted(_root().iterdir(), key=_mtime, reverse=True):
         if not d.is_dir():
             continue
-        manifest = _load_manifest(d.name)
-        if manifest:
-            entries.append((d, manifest))
+        try:
+            manifest = _load_manifest(d.name)
+        except (ValueError, TypeError, OSError) as exc:  # TypeError: a non-object manifest.json
+            skipped.append({"investigation_id": d.name, "reason": f"{type(exc).__name__}: {exc}"})
+            continue
+        if manifest is None:
+            continue
+        if not isinstance(manifest, dict):
+            skipped.append({"investigation_id": d.name, "reason": "manifest.json is not a JSON object"})
+            continue
+        entries.append((d, manifest))
 
     total = len(entries)
 
@@ -1681,12 +1717,13 @@ def investigation_list(
 
     investigations = []
     for d, manifest in page:
+        # .get(): a legacy manifest missing a field must not fail the whole page with a KeyError.
         record = {
-            "id": manifest["id"],
-            "title": manifest["title"],
-            "status": manifest["status"],
-            "updated_at": manifest["updated_at"],
-            "finding_counts": manifest["finding_counts"],
+            "id": manifest.get("id") or d.name,
+            "title": manifest.get("title"),
+            "status": manifest.get("status"),
+            "updated_at": manifest.get("updated_at"),
+            "finding_counts": manifest.get("finding_counts") or {},
         }
         if not summary:
             tier_counts = {"hot": 0, "warm": 0, "cold": 0}
@@ -1704,9 +1741,9 @@ def investigation_list(
             # acl only feeds visibility, a full-mode-only field, so the summary path skips the lookup.
             acl = manifest.get("acl") or []
             record.update({
-                "created_at": manifest["created_at"],
-                "open_questions_count": len(manifest["open_questions"]),
-                "hypothesis": manifest["hypothesis"],
+                "created_at": manifest.get("created_at"),
+                "open_questions_count": len(manifest.get("open_questions") or []),
+                "hypothesis": manifest.get("hypothesis"),
                 "visibility": "shared" if acl else "private",
                 "tier_counts": tier_counts,
             })
@@ -1717,6 +1754,7 @@ def investigation_list(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "skipped_investigations": skipped,
     }, indent=2)
 
 
