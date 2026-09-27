@@ -17,16 +17,20 @@
                                         # silently (fail-open -> degraded=True everywhere upstream:
                                         # compress_text, classify_text, query_expand, verify_finding)
 # verify_model = "your-pulled-model:tag"   # optional: model for verify_finding's adversarial
-                                            # reasoning specifically. If unset, code now routes to
-                                            # qwen3.8:latest by default (hardening), not gen_model.
-                                            # Set explicitly if you want a different tier.
+                                            # reasoning specifically. If unset, falls back to
+                                            # gen_model. Also the default for local_deep_think's
+                                            # verify/synthesize/self-reflect and, unless the swarm
+                                            # keys below are set, swarm_escalate's upper tiers.
+# swarm_escalate_model = "your-pulled-model:tag"   # optional: swarm_escalate escalation tier
+# swarm_synthesize_model = "your-pulled-model:tag" # optional: swarm_escalate synthesis tier
+                                            # (env LOCI_SWARM_ESCALATE_MODEL / _SYNTHESIZE_MODEL
+                                            # win; unset -> verify_model -> gen_model).
 # classify_model = "your-pulled-model:tag" # optional: model for classify_text's short semantic
                                             # routing. Leave unset to use gen_model; set this when
                                             # you want tiny high-throughput classification isolated
                                             # from other generation tasks.
 # compress_model = "your-pulled-model:tag" # optional: model for compress_text's summarization
-                                            # specifically. If unset, code now routes to
-                                            # qwen3.8:latest by default (hardening), not gen_model.
+                                            # specifically. If unset, falls back to gen_model.
                                             # Compress correctness varies far more across models
                                             # than classify does — worth tuning independently.
 # guardian_model = "granite3-guardian:2b"  # optional: model for guardian.check_injection_risk's
@@ -42,16 +46,19 @@
                                             # LOCI_OLLAMA_GUARDIAN_MODEL / OLLAMA_BASE_URL /
                                             # OLLAMA_GEN_URL env vars, since the hook is a
                                             # standalone stdlib script and doesn't import mcp/).
-# redteam_model = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+# redteam_model = "heretic-llama31-8b-instruct:latest"
                                             # optional: explicitly adversarial model for
                                             # scripts/local_deep_think.py's --red-team tier.
-                                            # Resolver defaults to a heretic/abliterated Qwen3.8
-                                            # build and, when that exact tag is absent, auto-picks
-                                            # an installed local heretic/abliterated tag.
+                                            # Resolver prefers this tag and, when it is absent,
+                                            # auto-picks an installed heretic/abliterated tag.
 #
 # If gen_model is unset, resolver uses qwen2.5:3b when available, otherwise the first
 # installed non-embedding local tag (to avoid broken defaults on sparse local installs).
 # Explicit env/config still wins.
+# Automatic picks (never an explicit env/config value) skip any installed model that
+# `ollama list` reports above LOCI_OLLAMA_AUTO_MAX_GB (default 10): a model bigger than
+# one GPU is split across cards by Ollama, and those loads can time out and stall its
+# scheduler for every other model, embeddings included.
 # For benchmark-driven assignment, generate this block from:
 #   python3 scripts/assign_models_from_benchmark.py --benchmark-json <quality_run.json>
                                             # Aligned models often refuse or soften the
@@ -76,7 +83,8 @@
 
 [cloud]
 # enabled = true                        # enable third-tier cloud fallback after local tiers fail
-# supervisor_model = "qwen3.8:latest"  # local supervisor that routes unspecified requests by role
+# supervisor_model = "your-pulled-model:tag"  # local supervisor that routes unspecified requests
+                                       # by role (unset -> [ollama].verify_model -> gen_model)
 # max_tokens_per_call = 512             # hard per-call cap for cloud fallback (0 disables)
 # daily_call_budget = 200               # max cloud fallback calls/day UTC (0 disables)
 # daily_token_budget = 50000            # max requested cloud tokens/day UTC (0 disables)

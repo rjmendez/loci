@@ -45,12 +45,35 @@ from parallel_deliberation_controller import ParallelDeliberationController
 
 
 _CONFIDENCE_LEVELS = ("low", "medium", "high")
+# Last resort when mcp/backends.py cannot be imported (e.g. a stripped-down cron copy):
+# small enough to load on one GPU. Mirrors backends.ONE_GPU_FALLBACK_MODEL.
+_ONE_GPU_FALLBACK_MODEL = "qwen2.5:3b"
+
+
+def _backends_model(resolver: str) -> str:
+    """Resolve a default model through mcp/backends.py (env -> backends.toml -> fallback).
+
+    Fail-open: this runs at import time and from cron, so any import or lookup error
+    yields the one-GPU fallback rather than an exception.
+    """
+    try:
+        mcp_dir = str(Path(__file__).resolve().parents[1] / "mcp")
+        if mcp_dir not in sys.path:
+            sys.path.insert(0, mcp_dir)
+        import backends
+
+        return str(getattr(backends, resolver)() or "").strip() or _ONE_GPU_FALLBACK_MODEL
+    except Exception:
+        return _ONE_GPU_FALLBACK_MODEL
+
+
 _DEFAULT_CHEAP_MODEL = os.environ.get("LOCI_SWARM_CHEAP_MODEL", "qwen2.5:3b")
-# Existing/default code path (no opt-in tier flags set): unchanged from before the
-# 2026-09-16 tier work. Do not change these without also changing the default behavior
-# for callers that pass no flags at all.
-_DEFAULT_ESCALATE_MODEL = os.environ.get("LOCI_SWARM_ESCALATE_MODEL", "qwen3.8:latest")
-_DEFAULT_SYNTHESIZE_MODEL = os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL", "qwen3.8:latest")
+# Existing/default code path (no opt-in tier flags set). Resolved env
+# LOCI_SWARM_{ESCALATE,SYNTHESIZE}_MODEL -> [ollama].swarm_{escalate,synthesize}_model
+# -> [ollama].verify_model / gen_model -> a one-GPU fallback. These used to be a literal
+# qwen3.8:latest (17.7 GB), which splits across two GPUs and times out loading.
+_DEFAULT_ESCALATE_MODEL = _backends_model("swarm_escalate_model")
+_DEFAULT_SYNTHESIZE_MODEL = _backends_model("swarm_synthesize_model")
 _DEFAULT_DECOMPOSE_MODEL = os.environ.get("LOCI_SWARM_DECOMPOSE_MODEL", "")
 _DEFAULT_STIGMERGIC_CONSENSUS = os.environ.get("LOCI_SWARM_STIGMERGIC_CONSENSUS", "").strip().lower() in {"1", "true", "yes", "on"}
 # Opt-in tier: chosen from a live 12-model / 4-task (code, math, JSON, security) benchmark
@@ -61,10 +84,11 @@ _DEFAULT_STIGMERGIC_CONSENSUS = os.environ.get("LOCI_SWARM_STIGMERGIC_CONSENSUS"
 # own escalate_model/synthesize_model -- see compute_tier_active()/resolve_tier_models()
 # below, which _resolve_config() (CLI) and mcp/llm_tools.py's swarm_reason (MCP tool) both
 # call before a SwarmConfig even exists, so an explicit override is never second-guessed
-# even when it happens to equal the legacy default (e.g. --escalate-model qwen3.8:latest
-# --seeds 2).
+# even when it happens to equal the default (e.g. --escalate-model <default> --seeds 2).
+# Synthesis used the 27B Qwen3.8 heretic build (17.2 GB) until 2026-09-26; that does
+# not fit one GPU, so both tier lanes now use the benchmarked 8B heretic model.
 _TIER_ESCALATE_MODEL = "heretic-llama31-8b-instruct:latest"
-_TIER_SYNTHESIZE_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_SYNTHESIZE_MODEL = "heretic-llama31-8b-instruct:latest"
 _TIER_DECOMPOSE_MAX_TOKENS = 2200
 _TIER_SYNTHESIZE_MAX_TOKENS = 2200
 _STOPWORDS = {
@@ -1501,22 +1525,26 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--escalate-model",
         default=None,
         help=(
-            "Model for the escalation tier. Default: qwen3.8:latest, unless a new "
+            "Model for the escalation tier. Default: LOCI_SWARM_ESCALATE_MODEL, else "
+            "[ollama].swarm_escalate_model / verify_model / gen_model in backends.toml "
+            f"(currently {_DEFAULT_ESCALATE_MODEL}), unless a new "
             "tier flag (--seeds>1, --synthesize-think, --safety-check, "
             "--self-consistency-samples>1, --reduce-group-size>0, "
             "--escalate-with-prior-context) is set, in which case it defaults to a "
             "faster benchmarked 8B model instead. An explicit value here always wins, "
-            "even if it equals the legacy default."
+            "even if it equals the default."
         ),
     )
     ap.add_argument(
         "--synthesize-model",
         default=None,
         help=(
-            "Model for the synthesis tier. Default: qwen3.8:latest, unless a new "
-            "tier flag is set (see --escalate-model), in which case it defaults to a "
-            "larger benchmarked model instead. An explicit value here always wins, "
-            "even if it equals the legacy default."
+            "Model for the synthesis tier. Default: LOCI_SWARM_SYNTHESIZE_MODEL, else "
+            "[ollama].swarm_synthesize_model / verify_model / gen_model in backends.toml "
+            f"(currently {_DEFAULT_SYNTHESIZE_MODEL}), unless a new "
+            "tier flag is set (see --escalate-model), in which case it defaults to the "
+            "benchmarked 8B tier model instead. An explicit value here always wins, "
+            "even if it equals the default."
         ),
     )
     ap.add_argument(
@@ -1620,7 +1648,7 @@ def _resolve_config(args: argparse.Namespace) -> SwarmConfig:
     # Tier gating: resolve escalate_model/synthesize_model BEFORE constructing
     # SwarmConfig, using the raw --escalate-model/--synthesize-model CLI input (None
     # when the flag is unset). This is what lets an explicit --escalate-model
-    # qwen3.8:latest survive even when --seeds/--safety-check/etc. are also set --
+    # <default model> survive even when --seeds/--safety-check/etc. are also set --
     # resolve_tier_models() never has to guess whether a value came from the caller
     # or from a default, because None only ever means "unset".
     tier_active = compute_tier_active(
