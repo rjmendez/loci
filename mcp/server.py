@@ -3487,7 +3487,8 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
                  text: str, source: str, confidence: str, tier: str) -> bool:
     """Fan the finding out to Mnemosyne, Qdrant, the event log and the graph.
 
-    Returns whether Mnemosyne accepted it. Cold tier skips Qdrant indexing; the
+    Returns {"mnemo_stored": bool, "qdrant_stored": bool|None} - None means not attempted
+    (cold tier). Whether Mnemosyne accepted it; cold tier skips Qdrant indexing; the
     graph mirror is tier-agnostic, since the relationship graph carries findings
     regardless of index tier.
     """
@@ -3520,8 +3521,9 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
             **provenance_fields(finding),
         },
     )
+    qdrant_stored = None  # None = not attempted (cold tier)
     if tier != "cold":
-        _qdrant_upsert(finding["id"], text, finding)
+        qdrant_stored = _qdrant_upsert(finding["id"], text, finding)
     _event_log_append({
         "op": "store",
         "investigation_id": investigation_id,
@@ -3532,7 +3534,7 @@ def _store_index(investigation_id: str, finding: dict, finding_type: str,
     })
     _mirror_finding_to_ladybug(finding, investigation_id)
     _autolink_finding_to_ladybug(finding)
-    return mnemo_stored
+    return {"mnemo_stored": mnemo_stored, "qdrant_stored": qdrant_stored}
 
 
 def _store_conflicts(investigation_id: str, finding: dict) -> tuple:
@@ -3679,7 +3681,8 @@ def investigation_store(
     except StoreBusyError as exc:
         return _busy_result(exc, investigation_id=investigation_id)
     _record_memory_cited(investigation_id, finding)
-    mnemo_stored = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
+    _store_status = _store_index(investigation_id, finding, finding_type, text, source, confidence, tier)
+    mnemo_stored = _store_status["mnemo_stored"]
     conflict_detected, conflicting_finding_id, conflict_id = _store_conflicts(investigation_id, finding)
 
     _session_hints_push(investigation_id, {
@@ -3698,6 +3701,8 @@ def investigation_store(
         "finding_id": finding["id"],
         "type": finding_type,
         "mnemo_stored": mnemo_stored,
+        "qdrant_stored": _store_status["qdrant_stored"],
+        "degraded_reason": (None if _store_status["qdrant_stored"] is not False else "rag_index_write_failed"),
         "conflict_detected": conflict_detected,
         "tier": tier,
     }
