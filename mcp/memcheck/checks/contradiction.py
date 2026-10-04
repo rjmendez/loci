@@ -23,7 +23,7 @@ import re
 from typing import Callable, Optional
 
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
-from ._common import _default_tokenize, _finding_id
+from ._common import _default_tokenize, _finding_id, _supersedes
 
 __all__ = ["run_contradiction"]
 
@@ -40,6 +40,10 @@ _DEFAULT_NEGATION_RE = re.compile(
     r"\b(?:no|not|never|none|without|cannot|can't|didn't|isn't|aren't|won't)\b", re.I
 )
 
+# Only claims of these types can contradict each other; procedures, gaps and
+# assumptions are not assertions about observed state. Untyped records stay in.
+_COMPARABLE_TYPES = {"observed", "inferred"}
+
 # Cap on the number of findings compared pairwise, newest-last preserved.
 _MAX_FINDINGS = 300
 
@@ -49,6 +53,11 @@ def _overlap(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / max(1, min(len(a), len(b)))
+
+
+def _comparable(finding: dict) -> bool:
+    rtype = str(finding.get("record_type") or finding.get("type", "") or "").lower()
+    return not rtype or rtype in _COMPARABLE_TYPES
 
 
 def _protection_weight(finding: dict) -> float:
@@ -106,7 +115,7 @@ def run_contradiction(
             if not text.strip():
                 continue
             tokens = tok(text)
-            if not tokens:
+            if not tokens or not _comparable(finding):
                 continue
             negated = bool(neg_re.search(text))
             prepared.append((_finding_id(finding, index), text, tokens, negated, finding))
@@ -123,6 +132,9 @@ def run_contradiction(
             id_b, text_b, tok_b, neg_b, raw_b = prepared[j]
             # Opposite negation polarity is the contradiction signal.
             if neg_a == neg_b:
+                continue
+            # A finding and the one it supersedes are a revision, not a conflict.
+            if id_b in _supersedes(raw_a) or id_a in _supersedes(raw_b):
                 continue
             # Cheap prefilter then the real overlap bar (same metric here).
             if _overlap(tok_a, tok_b) < min_overlap:
