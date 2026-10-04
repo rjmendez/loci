@@ -59,7 +59,8 @@ SHADOW_SCHEMA = 1
 DEFAULT_RESIDENT_BONUS = 0.5
 _TAGS_TTL_S = 30.0
 _PS_TTL_S = 5.0
-_HTTP_TIMEOUT_S = 1.5
+_STALE_MAX_S = 600.0          # a failed refresh serves the last good answer for up to this long
+_HTTP_TIMEOUT_S = 3.0
 
 # Substring -> roles, first match wins. Order matters: guard/embed before the generic chat families.
 _ROLE_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
@@ -187,6 +188,7 @@ def over_cap_fallback() -> bool:
 
 _lock = threading.Lock()
 _cache: dict[tuple[str, str], tuple[float, object]] = {}
+_good: dict[tuple[str, str], tuple[float, object]] = {}     # last successful load, for stale-if-error
 
 
 def _get_json(url: str) -> Optional[dict]:
@@ -199,15 +201,28 @@ def _get_json(url: str) -> Optional[dict]:
         return None
 
 
-def _cached(kind: str, base_url: str, ttl: float, loader: Callable[[], object]):
+def _cached(kind: str, base_url: str, ttl: float, loader: Callable[[], object], empty):
+    """TTL cache with stale-if-error. ``loader`` returns None when the fetch failed.
+
+    One slow or refused request must not blank the inventory: with every candidate
+    "not installed" the pool resolves to nothing and the legacy resolver returns a
+    possibly missing tag. A failed refresh keeps serving the last good value (up to
+    _STALE_MAX_S) and is itself cached for ``ttl`` so a down endpoint is not hammered.
+    """
     key = (kind, base_url)
     now = time.monotonic()
     with _lock:
         hit = _cache.get(key)
         if hit and now - hit[0] < ttl:
             return hit[1]
+        good = _good.get(key)
     value = loader()
     with _lock:
+        if value is None:
+            stale = good if good and time.monotonic() - good[0] < _STALE_MAX_S else None
+            value = stale[1] if stale else empty
+        else:
+            _good[key] = (time.monotonic(), value)
         _cache[key] = (time.monotonic(), value)
     return value
 
@@ -215,6 +230,7 @@ def _cached(kind: str, base_url: str, ttl: float, loader: Callable[[], object]):
 def clear_cache() -> None:
     with _lock:
         _cache.clear()
+        _good.clear()
 
 
 def _gen_url() -> str:
@@ -232,10 +248,12 @@ def inventory(base_url: Optional[str] = None) -> dict[str, Optional[int]]:
         return {}
 
     def load():
-        data = _get_json(url + "/api/tags") or {}
+        data = _get_json(url + "/api/tags")
+        if data is None:
+            return None
         return {str(m.get("name")): m.get("size") for m in (data.get("models") or []) if m.get("name")}
 
-    return dict(_cached("tags", url, _TAGS_TTL_S, load))
+    return dict(_cached("tags", url, _TAGS_TTL_S, load, {}))
 
 
 def resident_models(base_url: Optional[str] = None) -> set[str]:
@@ -245,10 +263,12 @@ def resident_models(base_url: Optional[str] = None) -> set[str]:
         return set()
 
     def load():
-        data = _get_json(url + "/api/ps") or {}
+        data = _get_json(url + "/api/ps")
+        if data is None:
+            return None
         return {str(m.get("name") or m.get("model")) for m in (data.get("models") or [])}
 
-    return set(_cached("ps", url, _PS_TTL_S, load))
+    return set(_cached("ps", url, _PS_TTL_S, load, set()))
 
 
 def _installed(name: str, inv: dict) -> bool:

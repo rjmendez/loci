@@ -379,3 +379,47 @@ def test_rendered_toml_keeps_role_rank():
     text = M.render_toml([M.PoolEntry("m", ("gen", "verify"), 1, role_rank=(("verify", 4.0),))])
     row = tomllib.loads(text)["models"]["pool"][0]
     assert row["role_rank"] == {"verify": 4.0}
+
+
+# ---- stale-if-error inventory cache ---------------------------------------------------
+
+def _fake_http(monkeypatch, responses):
+    calls = []
+
+    def fake(url):
+        calls.append(url)
+        item = responses.pop(0) if responses else None
+        return item
+
+    monkeypatch.setattr(M, "_get_json", fake)
+    return calls
+
+
+def test_a_failed_refresh_keeps_serving_the_last_good_inventory(monkeypatch):
+    calls = _fake_http(monkeypatch, [{"models": [{"name": "m1", "size": GB}]}, None])
+    assert M.inventory("http://x") == {"m1": GB}
+    monkeypatch.setattr(M, "_TAGS_TTL_S", 0.0)          # force a refresh on the next call
+    assert M.inventory("http://x") == {"m1": GB}        # refresh failed -> stale answer, not {}
+    assert len(calls) == 2
+
+
+def test_first_ever_failure_is_empty_and_cached_for_the_ttl(monkeypatch):
+    calls = _fake_http(monkeypatch, [None, {"models": [{"name": "m1", "size": GB}]}])
+    assert M.inventory("http://y") == {}
+    assert M.inventory("http://y") == {}                # cached failure: the endpoint is not hammered
+    assert len(calls) == 1
+
+
+def test_stale_answers_expire(monkeypatch):
+    _fake_http(monkeypatch, [{"models": [{"name": "m1", "size": GB}]}, None])
+    assert M.inventory("http://z") == {"m1": GB}
+    monkeypatch.setattr(M, "_TAGS_TTL_S", 0.0)
+    monkeypatch.setattr(M, "_STALE_MAX_S", 0.0)
+    assert M.inventory("http://z") == {}
+
+
+def test_residency_also_survives_a_failed_refresh(monkeypatch):
+    _fake_http(monkeypatch, [{"models": [{"name": "m1"}]}, None])
+    assert M.resident_models("http://r") == {"m1"}
+    monkeypatch.setattr(M, "_PS_TTL_S", 0.0)
+    assert M.resident_models("http://r") == {"m1"}
