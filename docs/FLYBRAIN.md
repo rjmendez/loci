@@ -57,3 +57,7 @@ fingerprints computed on either side match Loci's audit records. Change them tog
 - FlyBrain docs, research notes, runbooks (brain-cluster promotion, rollback, alert
   playbooks), design artifacts and the `flybrain-slot` job limiter. They are in the
   flybrain repo under `docs/`, `artifacts/` and `scripts/`.
+
+## Where FlyBrain-style brains could apply
+
+See [flybrain_brains_eval.md](flybrain_brains_eval.md): an evaluation of which Loci decisions a grown brain could plausibly improve, the shadow-mode integration shape, and the first pre-registered experiment. Docs only; Loci still imports no FlyBrain code.
