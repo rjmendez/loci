@@ -77,10 +77,6 @@
 [embed]
 # model = "nomic-embed-text"
 
-[vllm]
-# url = "http://gpu-host:8000"         # batched OpenAI-compatible server (omit -> Ollama fallback)
-# model = "Qwen/Qwen2.5-3B-Instruct"
-
 [cloud]
 # enabled = true                        # enable third-tier cloud fallback after local tiers fail
 # supervisor_model = "your-pulled-model:tag"  # local supervisor that routes unspecified requests

@@ -27,7 +27,7 @@ def test_lazy_import_edge_carries_scope_and_enclosing_fn():
     assert by_module["json"].attrs["scope"] == "module-level"
     assert by_module["json"].attrs["enclosing_fn"] is None
     assert by_module["numpy"].attrs["scope"] == "function-local"
-    assert by_module["numpy"].attrs["enclosing_fn"] == "resolve_vllm"
+    assert by_module["numpy"].attrs["enclosing_fn"] == "resolve_backend"
     assert by_module["numpy"].confidence.name == "PROVEN"  # third-party numpy
 
 

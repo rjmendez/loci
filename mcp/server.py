@@ -8406,7 +8406,6 @@ def loci_health() -> str:
                          counts when it answers that GET with a 4xx
       ollama_gen_reachable: the generation endpoint (ollama_gen_url), same rule
       ollama_gen_model_present: (optional) the configured gen model is listed there
-      vllm_reachable:    the resolved vLLM endpoint answers GET /health
       qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
                          (each is a short TCP gate followed by a bounded HTTP request)
       embed_model:       configured embedding model
@@ -8419,7 +8418,6 @@ def loci_health() -> str:
         "ladybug": "unavailable",
         "ollama_reachable": False,
         "ollama_gen_reachable": False,
-        "vllm_reachable": False,
         "qdrant_reachable": False,
         "embed_model": "",
         "rerank_model": "",
@@ -8449,8 +8447,6 @@ def loci_health() -> str:
             "ollama": bool(os.environ.get("OLLAMA_BASE_URL")
                            or os.environ.get("OLLAMA_URL")
                            or backends._cfg("ollama", "url", "")),
-            "vllm": bool(os.environ.get("VLLM_BASE_URL")
-                         or backends._cfg("vllm", "url", "")),
             "qdrant": bool(os.environ.get("QDRANT_URL")
                            or backends._cfg("qdrant", "url", "")),
         }
@@ -8470,7 +8466,6 @@ def loci_health() -> str:
         for key, resolver, path, headers in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T), "/api/tags", None),
             ("ollama_gen_reachable", lambda: backends.ollama_gen_url(_PROBE_T), "/api/tags", None),
-            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T), "/health", None),
             ("qdrant_reachable", lambda: backends.qdrant()[0], "/readyz",
              {"api-key": _qdrant_key} if _qdrant_key else None),
         ):
@@ -8515,7 +8510,6 @@ def loci_health() -> str:
         optional_down = []
         for label, key in (("ollama", "ollama_reachable"),
                            ("ollama_gen", "ollama_gen_reachable"),
-                           ("vllm", "vllm_reachable"),
                            ("qdrant", "qdrant_reachable")):
             if out.get(key):
                 continue

@@ -41,7 +41,6 @@ Key `[ollama]` endpoints:
 - **Ollama (default):** `http://localhost:11434`, model `nomic-embed-text`, 768-dim.
 - **OpenAI:** set `EMBED_API_KEY`, point at the OpenAI URL, model `text-embedding-3-small` (1536-dim → also set `MNEMOSYNE_EMBEDDING_DIM=1536`).
 - **Azure OpenAI:** as OpenAI, but set `EMBED_API_KEY_HEADER=api-key`.
-- **vLLM:** optional fallback from Ollama generation (`LOCI_VLLM_FALLBACK=1`, `LOCI_VLLM_URL`).
 
 ## Infrastructure (Qdrant)
 

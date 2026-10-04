@@ -141,7 +141,6 @@ candidate leads.
 MCP llm_tools
   -> llm_local
   -> Ollama generation
-  -> optional vLLM fallback when explicitly enabled
 
 swarm_reason
   -> swarm_escalate
@@ -182,7 +181,7 @@ environment loading
 ```
 
 Ladybug open/lock/IO failures are bounded and fail-open. Qdrant, Mnemosyne,
-Ollama, vLLM, reranking, and graph paths are optional or backend-dependent.
+Ollama, reranking, and graph paths are optional or backend-dependent.
 Health and self-check tools are advisory snapshots, not availability
 guarantees for every downstream path. Consolidation is also fail-open.
 

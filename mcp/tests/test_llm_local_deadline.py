@@ -1,7 +1,7 @@
 """llm_local.generate() is capped by one total deadline across every tier.
 
 Before: 120s on the configured model + 120s on a discovered model + 45s supervisor
-+ vLLM + cloud, all while the MCP server was frozen (see test_tool_offload).
++ cloud, all while the MCP server was frozen (see test_tool_offload).
 A fake clock advances by each request's timeout, so no test sleeps.
 """
 from __future__ import annotations
@@ -71,7 +71,6 @@ def test_retry_gets_only_the_remaining_budget_then_stops(clock):
 
     with mock.patch("requests.post", post), mock.patch("requests.get", fake_get), \
          mock.patch.object(llm_local, "_supervisor_route", record("supervisor")), \
-         mock.patch.object(llm_local, "_try_vllm", record("vllm")), \
          mock.patch.object(llm_local, "_try_cloud_tier", record("cloud")):
         out = llm_local.generate("hello", model="qwen3.8:latest", max_tokens=8)
 
@@ -91,7 +90,6 @@ def test_budget_smaller_than_one_attempt_skips_discovery_and_fallbacks(clock, mo
     calls: list[str] = []
     with mock.patch("requests.post", post), mock.patch("requests.get", get), \
          mock.patch.object(llm_local, "_supervisor_route", lambda *a, **k: calls.append("supervisor")), \
-         mock.patch.object(llm_local, "_try_vllm", lambda *a, **k: calls.append("vllm")), \
          mock.patch.object(llm_local, "_try_cloud_tier", lambda *a, **k: calls.append("cloud")):
         out = llm_local.generate("hello", model="m", max_tokens=8)
 
@@ -112,14 +110,14 @@ def test_fast_failure_still_reaches_fallbacks_with_bounded_supervisor(clock):
         seen["supervisor_timeout"] = timeout
         return {"role": "triage", "provider": "openrouter"}
 
-    vllm_result = {"text": "ok", "ok": True, "model": "v", "tier": "vllm"}
+    cloud_result = {"text": "ok", "ok": True, "model": "v", "tier": "cloud"}
     with mock.patch("requests.post", refused), \
          mock.patch("requests.get", side_effect=OSError("no tags")), \
          mock.patch.object(llm_local, "_supervisor_route", supervisor), \
-         mock.patch.object(llm_local, "_try_vllm", return_value=vllm_result):
+         mock.patch.object(llm_local, "_try_cloud_tier", return_value=cloud_result):
         out = llm_local.generate("hello", max_tokens=8)
 
-    assert out == vllm_result
+    assert out == cloud_result
     assert seen["supervisor_timeout"] == 120.0
 
 

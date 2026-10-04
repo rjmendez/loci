@@ -337,7 +337,6 @@ def _health_env(monkeypatch, http):
     monkeypatch.setattr(backends, "_http_probe", http, raising=False)
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://embed-host:11434")
     monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: "http://gen-host:11434")
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://vllm-host:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://qdrant-host:6333", ""))
     monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
 
@@ -403,11 +402,10 @@ def test_loci_health_non_ollama_embedder_is_judged_by_http_answer(monkeypatch, c
         monkeypatch.setenv("OLLAMA_BASE_URL", url)
         monkeypatch.setattr(qdrant_ops, "_EMBED_API_KEY", "sk-test")
         monkeypatch.setattr(qdrant_ops, "_EMBED_API_KEY_HEADER", "Authorization")
-        for var in ("LOCI_OLLAMA_GEN_URL", "OLLAMA_GEN_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+        for var in ("LOCI_OLLAMA_GEN_URL", "OLLAMA_GEN_URL", "QDRANT_URL"):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: url)
         monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: url)
-        monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "")
         monkeypatch.setattr(backends, "qdrant", lambda: ("", ""))
         monkeypatch.delenv("LOCI_TMUX_COMPANION_REQUIRED", raising=False)
         out = json.loads(server.loci_health())

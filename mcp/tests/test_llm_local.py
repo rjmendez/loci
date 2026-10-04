@@ -53,16 +53,8 @@ def _ensure_base(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_vllm_fallback(monkeypatch):
-    """Keep these tests on the Ollama path and off the network.
-
-    generate() now falls through to the vLLM tier when Ollama fails, so every
-    fail-open test below would otherwise attempt a real request to whatever
-    backends resolves. The fallback has its own tests in
-    test_llm_local_fallback.py; here it is disabled so a failure means what the
-    test name says it means.
-    """
-    monkeypatch.setattr(L, "_try_vllm", lambda *a, **k: None)
+def _pin_gen_model(monkeypatch):
+    """Keep these tests on the Ollama path and off the network."""
     # Pin the model: generate() otherwise resolves it from ~/.loci/backends.toml.
     import backends
     monkeypatch.setattr(backends, "ollama_gen_model", lambda: "qwen2.5:3b")

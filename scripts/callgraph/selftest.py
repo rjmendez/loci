@@ -299,7 +299,7 @@ def _check_lazy_import():
     store, _, _ = build_fixture_store(["lazy_import.py"])
     edges = list(store.edges_of_kind("IMPORTS"))
     lazy = [e for e in edges if e.attrs.get("scope") == "function-local" and e.src == "mod:lazy_import.py"]
-    assert any(e.attrs.get("module") == "numpy" and e.attrs.get("enclosing_fn") == "resolve_vllm" for e in lazy)
+    assert any(e.attrs.get("module") == "numpy" and e.attrs.get("enclosing_fn") == "resolve_backend" for e in lazy)
     assert any(e.attrs.get("module") == "textwrap" and e.attrs.get("enclosing_fn") == "Widget.render" for e in lazy)
     module_level = [e for e in edges if e.attrs.get("scope") != "function-local" and e.attrs.get("module") == "json"]
     assert module_level

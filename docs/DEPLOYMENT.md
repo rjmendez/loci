@@ -70,8 +70,7 @@ drops to keyword-only recall, `_qdrant_upsert` returns without writing, and
 
 Generation resolves separately from embeddings and does **not** read
 `OLLAMA_BASE_URL` (#222/#224/#225). Set `LOCI_OLLAMA_GEN_URL` (or
-`OLLAMA_GEN_URL`), else `mcp/backends.py:ollama_gen_url()` resolves it. The vLLM
-fallback is opt-in: `LOCI_VLLM_FALLBACK=1`, default off.
+`OLLAMA_GEN_URL`), else `mcp/backends.py:ollama_gen_url()` resolves it.
 
 **Options:**
 
@@ -276,7 +275,7 @@ See `.env.example` (root) and `mcp/.env.example` for the full variable list with
 descriptions, and `backends.toml.example` for the file-based alternative.
 
 `mcp/backends.py` resolves each backend as: environment variable → local probe
-(`localhost:11434` for Ollama, `:8000` for vLLM) → `~/.loci/backends.toml` (or
+(`localhost:11434` for Ollama) → `~/.loci/backends.toml` (or
 `$LOCI_CONFIG`) → safe default. The TOML file is the durable channel — it is
 parsed with stdlib `tomllib`, so nothing about it depends on a launcher
 remembering to export anything, or on `python-dotenv` being importable. Machine-

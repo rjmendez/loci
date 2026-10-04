@@ -65,7 +65,7 @@ The MCP server exposes roughly 75 tools (the live catalogue lists 76; `mcp/` int
 
 - **`swarm_reason(topic, perspectives?, fanout?, ground_threshold?, synthesize_think?, ...)`** — **CRITICAL.** Bounded local-model swarm reasoning: fan-out → escalate → synthesize with safety gates. The core multi-perspective reasoning tool.
 - **`llm_local(prompt, model?, fmt?, max_tokens?, temperature?, keep_alive?)`** — **CRITICAL.** Generate with a local Ollama model. `fmt='json'` constrains output. Returns `{text, ok, model}`.
-- `generate_batch(prompts, model?, max_tokens?, fmt?)` — generate for many prompts at once (vLLM/TGI, or Ollama fallback).
+- `generate_batch(prompts, model?, max_tokens?, fmt?)` — generate for many prompts at once (concurrent fan-out through Ollama).
 - `query_expand(query, n_queries?, n_keywords?)` — HyDE-lite query expansion for search.
 - `classify_text(text, labels)` — pick the best label for text.
 - `compress_text(text, max_chars?)` — semantically condense text to a char budget.

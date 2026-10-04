@@ -53,7 +53,7 @@ def _neighbours():
 def _verdict_by_text(prompt, **kwargs):
     verdict = "contradict" if "closed" in prompt else "agree"
     return {"text": json.dumps({"verdict": verdict, "reason": SECRET_REASON}),
-            "ok": True, "model": "judge-model:7b", "tier": "vllm"}
+            "ok": True, "model": "judge-model:7b", "tier": "ollama"}
 
 
 @pytest.fixture
@@ -88,12 +88,12 @@ def test_every_judged_pair_is_logged_not_only_the_first_conflict(inv, monkeypatc
          "neighbor_id": "n-gap", "neighbor_rank": 1, "similarity": 0.9123,
          "new_type": "observed", "neighbor_type": "gap",
          "heuristic_rule": "gap_filled", "verdict": "agree", "judge_ok": True,
-         "model": "judge-model:7b", "tier": "vllm", "conflict_candidate": True},
+         "model": "judge-model:7b", "tier": "ollama", "conflict_candidate": True},
         {"schema": 1, "event": "conflict_judge", "new_finding_id": "f-new",
          "neighbor_id": "n-obs", "neighbor_rank": 2, "similarity": 0.8765,
          "new_type": "observed", "neighbor_type": "observed",
          "heuristic_rule": None, "verdict": "contradict", "judge_ok": True,
-         "model": "judge-model:7b", "tier": "vllm", "conflict_candidate": True},
+         "model": "judge-model:7b", "tier": "ollama", "conflict_candidate": True},
     ]
 
 

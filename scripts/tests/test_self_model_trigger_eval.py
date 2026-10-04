@@ -98,7 +98,7 @@ def test_build_self_model_and_report(tmp_path, monkeypatch):
     state = mod.build_self_model(
         memory_dir,
         now=now,
-        health={"qdrant_reachable": True, "ollama_reachable": True, "vllm_reachable": True, "ladybug": "available"},
+        health={"qdrant_reachable": True, "ollama_reachable": True, "ladybug": "available"},
     )
     config = mod.TriggerConfig()
     triggers = mod._build_triggers(state, now=now, config=config)

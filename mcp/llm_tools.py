@@ -174,9 +174,8 @@ def generate_batch(prompts: list, model: Optional[str] = None, max_tokens: int =
     """
     Generate many prompts at once for fan-out stages.
 
-    Uses a batched OpenAI-compatible server (vLLM/TGI at ``VLLM_BASE_URL``)
-    when configured; otherwise fails open to sequential Ollama via
-    ``llm_local``. Returns a JSON list of ``{text, ok}`` aligned 1:1 to
+    Fans the prompts out concurrently through the local Ollama tier via
+    ``llm_local`` (bounded by ``OLLAMA_MAX_CONCURRENCY``). Returns a JSON list of ``{text, ok}`` aligned 1:1 to
     ``prompts``. Failed prompts return ``{text:'', ok:False}``; the tool does
     not raise.
     """
@@ -540,7 +539,6 @@ def swarm_reason(topic: str,
             subtasks=_coerce_labels(subtasks) or None,
             fanout_count=resolved_fanout,
             seeds=resolved_seeds,
-            auto_parallel=False,
             escalate_confidences=tuple(
                 str(item).strip().lower()
                 for item in _coerce_labels(escalate_confidences or ("low",))

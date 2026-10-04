@@ -384,9 +384,6 @@ measured here, embeddings are 93 ms in-cluster vs 5,595 ms over the tailnet, whi
 generation model exists only over the tailnet (35.7 s cold, 247 ms warm with
 `keep_alive`). One URL cannot serve both.
 
-The vLLM fallback is opt-in: `LOCI_VLLM_FALLBACK` must be set to something other than
-`""` / `0` (`mcp/llm_local.py:170-180`).
-
 ### Transports and auth
 
 `LOCI_MCP_TRANSPORT` defaults to `stdio`. For `sse` / `streamable-http`:

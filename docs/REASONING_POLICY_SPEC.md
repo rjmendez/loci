@@ -103,9 +103,8 @@ The following values are clamped before execution:
 - `reduce_group_size >= 0`
 - `stigmergic_ttl_minutes >= 0.0`
 
-Seed parallelism is bounded by the caller's explicit choice when provided. If seeds are
-omitted, the CLI may auto-parallelize only when a batched vLLM endpoint is detected and
-the deployment has not disabled that path.
+Seed parallelism is bounded by the caller's explicit choice when provided; if seeds are
+omitted the run uses a single seed.
 
 ### Budget policy boundaries
 
