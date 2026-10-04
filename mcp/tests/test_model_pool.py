@@ -423,3 +423,108 @@ def test_residency_also_survives_a_failed_refresh(monkeypatch):
     assert M.resident_models("http://r") == {"m1"}
     monkeypatch.setattr(M, "_PS_TTL_S", 0.0)
     assert M.resident_models("http://r") == {"m1"}
+
+
+# ---- outcome logging (labels for the pool decision) -----------------------------------
+
+def _outcomes_log(tmp_path):
+    return tmp_path / "instrumentation" / M.OUTCOMES_LOG_NAME
+
+
+def _rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_outcomes_are_not_logged_by_default(monkeypatch, tmp_path):
+    import llm_local
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setattr(llm_local, "_generate", lambda *a, **k: {"text": "hi", "ok": True, "model": "m1"})
+    assert llm_local.generate("hello")["ok"] is True
+    assert not _outcomes_log(tmp_path).exists()
+
+
+def test_generate_logs_model_ok_latency_and_enums_only(monkeypatch, tmp_path):
+    import llm_local
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    monkeypatch.setattr(llm_local, "_generate", lambda *a, **k: {"text": "SECRET OUTPUT", "ok": True, "model": "m1"})
+    out = llm_local.generate("SECRET PROMPT", fmt="json", role="triage")
+    assert out["text"] == "SECRET OUTPUT"                      # the caller's result is untouched
+    (row,) = _rows(_outcomes_log(tmp_path))
+    assert row["model"] == "m1" and row["ok"] is True and row["fmt"] == "json" and row["route_role"] == "triage"
+    assert row["tier"] == "ollama" and row["deadline_exceeded"] is False and row["latency_ms"] >= 0
+    blob = json.dumps(row)
+    assert "SECRET" not in blob and "why" not in row and "text" not in row
+
+
+def test_a_failed_call_and_a_deadline_are_logged_as_such(monkeypatch, tmp_path):
+    import llm_local
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    monkeypatch.setattr(llm_local, "_generate", lambda *a, **k: {
+        "text": "", "ok": False, "model": "m2", "why": "boom: private detail", "deadline_exceeded": True})
+    llm_local.generate("p", model="m2")
+    (row,) = _rows(_outcomes_log(tmp_path))
+    assert row["ok"] is False and row["deadline_exceeded"] is True and row["model"] == "m2"
+    assert "private detail" not in json.dumps(row)
+
+
+def test_the_requested_model_is_logged_when_the_result_names_none(monkeypatch, tmp_path):
+    import llm_local
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    monkeypatch.setattr(llm_local, "_generate", lambda *a, **k: {"text": "", "ok": False})
+    llm_local.generate("p", model="asked-for:7b")
+    assert _rows(_outcomes_log(tmp_path))[0]["model"] == "asked-for:7b"
+
+
+def test_a_logging_failure_never_breaks_generate(monkeypatch, tmp_path):
+    import llm_local
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    monkeypatch.setattr(llm_local, "_generate", lambda *a, **k: {"text": "hi", "ok": True, "model": "m1"})
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(M, "record_outcome", boom)
+    assert llm_local.generate("p") == {"text": "hi", "ok": True, "model": "m1"}
+
+
+def test_generate_keeps_its_signature_and_docstring():
+    import inspect
+    import llm_local
+    names = list(inspect.signature(llm_local.generate).parameters)
+    assert names == ["prompt", "model", "fmt", "max_tokens", "temperature", "keep_alive", "think",
+                     "role", "timeout"]
+    assert "Fail-open, never raises" in (llm_local.generate.__doc__ or "")
+
+
+def test_outcomes_summary_aggregates_per_model(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    for ok, ms, dl in ((True, 100, False), (True, 300, False), (False, 900, True), (True, 200, False)):
+        M.record_outcome("m1", ok, ms, deadline_exceeded=dl)
+    M.record_outcome("m2", True, 50)
+    s = M.outcomes_summary()
+    assert s["m1"]["calls"] == 4 and s["m1"]["ok_rate"] == 0.75 and s["m1"]["deadline_exceeded"] == 1
+    assert s["m1"]["p95_ms"] == 900.0 and s["m1"]["p50_ms"] == 300.0
+    assert s["m2"] == {"calls": 1, "ok_rate": 1.0, "p50_ms": 50.0, "p95_ms": 50.0, "deadline_exceeded": 0}
+
+
+def test_outcomes_summary_skips_bad_lines_and_a_missing_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    assert M.outcomes_summary() == {}
+    path = _outcomes_log(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text('not json\n{"model": "m1", "ok": true, "latency_ms": 5}\n{"no_model": 1}\n')
+    assert M.outcomes_summary() == {"m1": {"calls": 1, "ok_rate": 1.0, "p50_ms": 5.0, "p95_ms": 5.0,
+                                           "deadline_exceeded": 0}}
+
+
+def test_outcomes_cli_prints_a_row_per_model(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
+    monkeypatch.setenv(M.SHADOW_ENV, "1")
+    M.record_outcome("m1", True, 120)
+    assert M._main(["outcomes"]) == 0
+    out = capsys.readouterr().out
+    assert "m1" in out and "ok=100%" in out
