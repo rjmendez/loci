@@ -53,3 +53,25 @@ def _finding_id(finding: dict, index: int) -> str:
         return str(fid)
     inv = finding.get("investigation_id")
     return f"{inv}:{index}" if inv else f"finding:{index}"
+
+
+_SUPERSEDES_RE = re.compile(r"^\s*SUPERSEDES\s+([^\s,;:]+)", re.I)
+
+
+def _supersedes(finding: dict) -> set[str]:
+    """Ids this finding explicitly supersedes (metadata.supersedes, or a leading
+    ``SUPERSEDES <id>`` in the text; derived_from ids count only alongside the
+    text marker, since a plain derivation is not a replacement)."""
+    out: set[str] = set()
+    meta = finding.get("metadata")
+    if isinstance(meta, dict):
+        sup = meta.get("supersedes")
+        items = sup if isinstance(sup, (list, tuple, set)) else [sup]
+        out.update(str(i) for i in items if i)
+    m = _SUPERSEDES_RE.match(str(finding.get("text", "") or ""))
+    if m:
+        out.add(m.group(1).rstrip(".)"))
+        df = finding.get("derived_from")
+        df = df if isinstance(df, (list, tuple, set)) else [df]
+        out.update(str(i) for i in df if i)
+    return out
