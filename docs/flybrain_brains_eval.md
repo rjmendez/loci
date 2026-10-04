@@ -122,7 +122,7 @@ Real Loci finding embeddings as one corpus in a multi-input harness. Tasks: fami
 | Risk | Note |
 |---|---|
 | Labels are a model's verdicts | D11 labels distil one local model. A pre-filter learns the judge's habits, including its errors. Only a handful of human resolutions exist as gold. |
-| Skipped rows | Most verdict rows are `judge_skipped` (roughly two thirds in one store, a larger share in the other), and selection into the judged set is not recorded in the row. Check the cause before trusting the population; the same rows are what limits the power gate above. |
+| Skipped rows | Most verdict rows are `judge_skipped` (roughly two thirds in each local store), and selection into the judged set is not recorded in the row. Check the cause before trusting the population; the same rows are what limits the power gate above. |
 | Small N | About a dozen investigations. Intervals will be wide, as in D10. |
 | Prior from D10 | A grown brain lost there on size, latency and score. Expect a negative result; the harness value is the deliverable. |
 | Lower stakes than R6.1 scored | #409 made the judge async with a cap of 3 pairs and a circuit breaker. The latency argument for a pre-filter is gone; the remaining gain is judge compute. |
