@@ -78,7 +78,8 @@ def _taxonomy(exc: Exception) -> str:
         return "timeout"
     if ("connection" in name) or ("connection" in low) or ("refused" in low) or ("reset" in low):
         return "connection"
-    if "http" in name or "status" in low:
+    # qdrant-client raises UnexpectedResponse / ResponseHandlingException (no "http" in the name) for 4xx/5xx.
+    if "http" in name or "status" in low or "response" in name or isinstance(getattr(exc, "status_code", None), int):
         return "http"
     return "other"
 
@@ -179,7 +180,9 @@ def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
                 waited = _backoff_sleep(attempt - 1)
                 logger.info("transport retry op=%s next_attempt=%d backoff_s=%.2f", op, attempt + 1, waited)
                 continue
-            raise RuntimeError(f"{op}_{kind}") from exc
+            # Keep the cause in the message: callers surface str(exc) (rag_context_search puts it in
+            # collection_errors), and "<op>_other" alone says nothing about what actually failed.
+            raise RuntimeError(f"{op}_{kind}: {type(exc).__name__}: {' '.join(str(exc).split())[:200]}") from exc
     raise RuntimeError(f"{op}_failed") from last_exc
 
 
