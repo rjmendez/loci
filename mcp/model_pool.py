@@ -56,6 +56,8 @@ SHADOW_ENV = "LOCI_MODEL_POOL_SHADOW"
 SELECTOR_ENV = "LOCI_MODEL_POOL_SELECTOR"
 SHADOW_LOG_NAME = "model_pool_shadow.jsonl"
 SHADOW_SCHEMA = 1
+OUTCOMES_LOG_NAME = "model_pool_outcomes.jsonl"
+OUTCOME_SCHEMA = 1
 
 DEFAULT_RESIDENT_BONUS = 0.5
 _TAGS_TTL_S = 30.0
@@ -436,6 +438,62 @@ def _shadow(decision: Decision) -> None:
         logger.debug("model_pool: shadow log skipped: %r", exc)
 
 
+def record_outcome(model: str, ok: bool, latency_ms: float, *, route_role: str = "",
+                   deadline_exceeded: bool = False, tier: str = "", fmt: str = "") -> None:
+    """Log how one generate() call went, so a pool decision has a label (D23 in docs/flybrain_brains_eval.md).
+
+    Rows hold the model tag, ok, latency and enums only: no prompt, output or error text. Written
+    only under ``LOCI_MODEL_POOL_SHADOW=1``. An offline join takes a decision row (``chosen_rule``)
+    and the next outcome row for that model. Never raises.
+    """
+    if not _shadow_enabled():
+        return
+    try:
+        row = {
+            "schema": OUTCOME_SCHEMA, "ts": time.time(), "model": str(model or ""),
+            "ok": bool(ok), "latency_ms": round(float(latency_ms), 1),
+            "deadline_exceeded": bool(deadline_exceeded), "route_role": str(route_role or ""),
+            "tier": str(tier or "ollama"), "fmt": "json" if fmt == "json" else "",
+        }
+        from instrumentation_log import append_rows
+        append_rows(_log_path().with_name(OUTCOMES_LOG_NAME), [row])
+    except Exception as exc:
+        logger.debug("model_pool: outcome log skipped: %r", exc)
+
+
+def outcomes_summary(path: Optional[Path] = None) -> dict:
+    """Per model: calls, success rate, p50/p95 latency and deadline hits, from the outcomes log."""
+    base = path or _log_path().with_name(OUTCOMES_LOG_NAME)
+    files = [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 6)]
+    by: dict[str, list[dict]] = {}
+    for f in files:
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("model"):
+                    by.setdefault(row["model"], []).append(row)
+        except OSError:
+            continue
+
+    def pct(values: list[float], q: float) -> float:
+        values = sorted(values)
+        return values[min(len(values) - 1, int(q * len(values)))] if values else 0.0
+
+    out = {}
+    for model, rows in sorted(by.items()):
+        lat = [float(r.get("latency_ms") or 0.0) for r in rows]
+        out[model] = {
+            "calls": len(rows),
+            "ok_rate": round(sum(1 for r in rows if r.get("ok")) / len(rows), 3),
+            "p50_ms": round(pct(lat, 0.5), 1), "p95_ms": round(pct(lat, 0.95), 1),
+            "deadline_exceeded": sum(1 for r in rows if r.get("deadline_exceeded")),
+        }
+    return out
+
+
 # ------------------------------------------------------------------ discovery / suggestions
 
 def classify_model(name: str) -> tuple[str, ...]:
@@ -497,6 +555,14 @@ def _main(argv: list[str]) -> int:
     cmd = argv[0] if argv else "show"
     if cmd == "init":
         print(render_toml(suggest(inventory())))
+        return 0
+    if cmd == "outcomes":
+        summary_ = outcomes_summary()
+        if not summary_:
+            print("no outcomes logged; set LOCI_MODEL_POOL_SHADOW=1 and use Loci for a while")
+        for model, s_ in summary_.items():
+            print(f"{model:55s} n={s_['calls']:5d} ok={s_['ok_rate']:.0%} "
+                  f"p50={s_['p50_ms']:.0f}ms p95={s_['p95_ms']:.0f}ms deadline={s_['deadline_exceeded']}")
         return 0
     if cmd == "pick" and len(argv) > 1:
         print(pick(argv[1]) or "(none)")

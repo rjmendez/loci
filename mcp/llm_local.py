@@ -21,6 +21,7 @@ temperature/keep_alive), so it can be passed directly as a gen_fn.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -355,15 +356,15 @@ def _tmux_offload_policy(role: Optional[str]) -> dict:
     }
 
 
-def generate(prompt: str,
-             model: str = "",
-             fmt: Optional[str] = None,
-             max_tokens: int = 256,
-             temperature: float = 0.2,
-             keep_alive: str = "30m",
-             think: bool = False,
-             role: Optional[str] = None,
-             timeout: Optional[float] = None) -> dict:
+def _generate(prompt: str,
+              model: str = "",
+              fmt: Optional[str] = None,
+              max_tokens: int = 256,
+              temperature: float = 0.2,
+              keep_alive: str = "30m",
+              think: bool = False,
+              role: Optional[str] = None,
+              timeout: Optional[float] = None) -> dict:
     """Generate text from the local Ollama model. Fail-open, never raises.
 
     Args:
@@ -575,6 +576,38 @@ def generate(prompt: str,
         out["route_role"] = tmux_policy.get("role")
         out["tmux_priority"] = tmux_policy.get("priority")
     return out
+
+
+@functools.wraps(_generate)
+def generate(prompt: str,
+             model: str = "",
+             fmt: Optional[str] = None,
+             max_tokens: int = 256,
+             temperature: float = 0.2,
+             keep_alive: str = "30m",
+             think: bool = False,
+             role: Optional[str] = None,
+             timeout: Optional[float] = None) -> dict:
+    started = time.monotonic()
+    out = _generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
+                    keep_alive=keep_alive, think=think, role=role, timeout=timeout)
+    _log_outcome(out, model, fmt, role, started)
+    return out
+
+
+def _log_outcome(out: object, model: str, fmt: Optional[str], role: Optional[str], started: float) -> None:
+    """Record how the call went for the model pool's decision log (off unless LOCI_MODEL_POOL_SHADOW=1)."""
+    try:
+        import model_pool
+        if not model_pool._shadow_enabled() or not isinstance(out, dict):
+            return
+        model_pool.record_outcome(
+            str(out.get("model") or model or ""), bool(out.get("ok")),
+            (time.monotonic() - started) * 1000.0, route_role=str(role or out.get("route_role") or ""),
+            deadline_exceeded=bool(out.get("deadline_exceeded")), tier=str(out.get("tier") or "ollama"),
+            fmt=fmt or "")
+    except Exception as exc:
+        _LOG.debug("llm_local: outcome log skipped: %r", exc)
 
 
 def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,

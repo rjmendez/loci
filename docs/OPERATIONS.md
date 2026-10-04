@@ -275,7 +275,7 @@ owns (claim-scope and provenance validation for FlyBrain-derived findings).
 | `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
 | `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 | `LOCI_TRANSPORT_DEADLINE_S` | `30` | Total budget for one retried Qdrant/embed call. A retry starts only if another attempt of the same cost still fits, so a hung backend (20 s `LOCI_QDRANT_TIMEOUT` per attempt) fails after one attempt instead of three; fast failures such as connection refused keep every retry. Exhausted calls raise `<op>_deadline` |
-| `LOCI_MODEL_POOL_SHADOW` | unset | `1` logs each model-pool decision to `<data home>/instrumentation/model_pool_shadow.jsonl` (names, ranks, enums; no text). Never changes the pick |
+| `LOCI_MODEL_POOL_SHADOW` | unset | `1` logs each model-pool decision to `<data home>/instrumentation/model_pool_shadow.jsonl` and each `llm_local.generate` outcome to `model_pool_outcomes.jsonl` (model, ok, latency, enums; no text). Never changes the pick or the result |
 | `LOCI_MODEL_POOL_SELECTOR` | unset | `module:callable` called as `f(role, features) -> name or [names]` in shadow mode only; its answer is logged beside the rule's. Errors are ignored |
 | `LOCI_DOCS_INGEST_BUDGET_S` | `120` | Wall-clock budget for one `docs_ingest_indexer` call. Past it the call stops, returns `partial: true` with `files_remaining`, and a re-run resumes (indexed files are skipped as unchanged); at least one changed file is stored per call. Stops a big tree from holding a tool worker for tens of minutes (#418) |
 | `LOCI_LOG_FILE` | unset | When set, the server also writes a size-rotated log to this path (stderr logging is unchanged). `LOCI_LOG_MAX_BYTES` (default 10485760) and `LOCI_LOG_BACKUPS` (default 5) tune rotation. An unwritable path logs a warning and falls back to stderr only |
@@ -385,6 +385,11 @@ does not list keeps its legacy resolver.
 - Shadow mode follows the D10 shape in `docs/flybrain_brains_eval.md`: the rule always decides;
   `LOCI_MODEL_POOL_SHADOW=1` logs the decision, and `LOCI_MODEL_POOL_SELECTOR` can name a learned
   selector whose choice is logged beside it. Unset both to roll back.
+- The same flag logs how each `llm_local.generate` call went (`model_pool_outcomes.jsonl`: model tag,
+  `ok`, end-to-end `latency_ms`, `deadline_exceeded`, `route_role`, `tier`, `fmt`; never prompt, output
+  or error text). That is the label a decision needs: join a decision row's `chosen_rule` to the next
+  outcome row for that model. `python mcp/model_pool.py outcomes` prints per-model calls, success rate
+  and p50/p95 latency. The latency is the whole call, so it includes any fallback tier it fell through to.
 
 ## Model leases (borrowing GPU headroom)
 
