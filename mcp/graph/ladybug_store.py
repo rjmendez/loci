@@ -497,6 +497,10 @@ class LadybugStore:
         holds Kuzu's exclusive writer lock, so False == contended). Always closes."""
         if not self.ok:
             return False
+        if not os.path.exists(self.db_path):
+            # No database file yet: nothing can be holding it (the first write creates it). A read-only
+            # open of a missing file fails too, which health used to report as "contended".
+            return True
         try:
             with self._session(write=False, timeout_s=_READ_LEASE_TIMEOUT_S) as conn:
                 return conn is not None

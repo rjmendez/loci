@@ -45,3 +45,16 @@ def test_note_failure_keeps_the_first_time_and_latest_reason(monkeypatch):
     server._ladybug_note_failure("second " + "x" * 400)
     assert server._ladybug_since == first_since
     assert server._ladybug_last_error.startswith("second") and len(server._ladybug_last_error) == 200
+
+
+def test_fresh_store_with_no_database_file_is_not_reported_contended(tmp_path):
+    """A read-only open of a not-yet-created database fails, which health read as a held lock."""
+    from graph import ladybug_store as K
+
+    if not getattr(K, "_HAS_LADYBUG", False):
+        import pytest
+        pytest.skip("ladybug not installed")
+    store = K.LadybugStore(str(tmp_path / "graph.ladybug"))
+    assert store.available()
+    assert not os.path.exists(store.db_path)
+    assert store.readable_probe() is True
