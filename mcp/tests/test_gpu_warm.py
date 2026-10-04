@@ -103,6 +103,40 @@ def test_warm_once_pins_both_models(monkeypatch):
     assert any(u.endswith("/api/embed") for u in urls)
 
 
+def test_warm_once_pins_extra_specialized_models(monkeypatch):
+    monkeypatch.setenv("WARM_GEN_MODEL", "qwen2.5:3b")
+    monkeypatch.setenv("WARM_EXTRA_MODELS", "gen:gemma4:26b,gen:qwen3-4b-instruct-heretic-agent:latest")
+    monkeypatch.setattr(G, "_GEN_MODEL", G._resolve_gen_model())
+    monkeypatch.setattr(
+        G,
+        "_EXTRA_MODELS",
+        [("gen", "gemma4:26b"), ("gen", "qwen3-4b-instruct-heretic-agent:latest")],
+    )
+    poster = _RecordingPoster()
+    report = G.warm_once(keep_alive="-1", post_fn=poster, include_gpu=False)
+    names = [p["model"] for p in report["pins"]]
+    assert "gemma4:26b" in names
+    assert "qwen3-4b-instruct-heretic-agent:latest" in names
+    assert all(p["keep_alive"] == -1 for p in report["pins"])
+
+
+def test_drop_once_unloads_models_with_zero_keep_alive(monkeypatch):
+    monkeypatch.setenv("WARM_GEN_MODEL", "qwen2.5:3b")
+    monkeypatch.setenv("WARM_EXTRA_MODELS", "gen:gemma4:26b")
+    monkeypatch.setattr(G, "_GEN_MODEL", G._resolve_gen_model())
+    monkeypatch.setattr(G, "_EXTRA_MODELS", [("gen", "gemma4:26b")])
+    poster = _RecordingPoster()
+    report = G.drop_once(post_fn=poster, include_gpu=False)
+    assert report["degraded"] is False
+    assert all(p["ok"] and p["keep_alive"] == 0 for p in report["pins"])
+    # Keyed by endpoint, not full URL: gpu_warm resolves its base URL at import time, so another test
+    # module that imported it first (or the operator's config) can have fixed a different host.
+    calls = {c["url"].rsplit("/api/", 1)[1]: c["json"] for c in poster.calls if c["url"].endswith(("/api/generate", "/api/embed"))}
+    assert calls["generate"]["keep_alive"] == 0
+    assert calls["embed"]["keep_alive"] == 0
+    assert any(c["json"]["keep_alive"] == 0 for c in poster.calls if c["url"].endswith("/api/generate"))
+
+
 def test_pin_degraded_on_unreachable_ollama():
     r = G.pin_model("qwen2.5:3b", "gen", post_fn=_raising_poster)
     assert r["ok"] is False
@@ -126,3 +160,14 @@ def test_main_oneshot_exits_zero_even_when_degraded(monkeypatch, capsys):
     assert rc == 0  # fail-open: exit 0
     out = capsys.readouterr().out
     assert "DEGRADED" in out
+
+
+def test_main_drop_mode_uses_keep_alive_zero(monkeypatch):
+    monkeypatch.setenv("WARM_GEN_MODEL", "qwen2.5:3b")
+    monkeypatch.setattr(G, "_GEN_MODEL", G._resolve_gen_model())
+    poster = _RecordingPoster()
+    monkeypatch.setattr(G, "_resolve_post", lambda pf: poster)
+    rc = G.main(["--drop", "--no-gpu"])
+    assert rc == 0
+    assert any(call["json"]["keep_alive"] == 0 for call in poster.calls if call["url"].endswith("/api/generate"))
+    assert any(call["json"]["keep_alive"] == 0 for call in poster.calls if call["url"].endswith("/api/embed"))

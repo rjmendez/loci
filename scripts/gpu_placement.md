@@ -63,6 +63,10 @@ host**, not in this venv:
   parallel requests so a batched gen model doesn't evict the warm `nomic-embed-text`.
 - **`OLLAMA_KEEP_ALIVE`** (or per-request `keep_alive`) — keep hot models resident so a warm stream
   never re-pays the cold load.
+- **`WARM_EXTRA_MODELS` / `--extra-model`** — keep a configurable panel of specialized expert
+  models resident alongside the hot pair when evolution or analysis needs them.
+- **`keep_alive=0` / `scripts/gpu_warm.py --drop`** — unload the hot Ollama models before a test
+  or sim run when you need to claw back VRAM for FlyBrain evolution work.
 
 A clean split is **two Ollama endpoints**, each with its own `CUDA_VISIBLE_DEVICES`: one on the
 inference GPU for embeddings, one on a second card for the heavy gen model. A single Ollama over
@@ -75,6 +79,10 @@ both cards works too — keep `OLLAMA_SCHED_SPREAD` off and rely on `keep_alive`
 choose a card. Placement is decided by the env vars above on the Ollama host; `gpu_warm.py` then
 keeps the chosen models warm so the cold load is paid once. Run the keeper (`--loop`) pointed at
 each Ollama endpoint you stand up.
+
+For test windows, flip the same helper around with `--drop` so the resident models are released
+and the sim/evolution lane can use the freed VRAM. That keeps the Ollama lane warm when needed
+and makes it preemptible when GPU headroom matters more than latency.
 
 ## Design principles
 
