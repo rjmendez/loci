@@ -3043,6 +3043,10 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
 
 
 _DOCS_INGEST_MAX_FILES = 500
+# Wall-clock budget for one docs_ingest_indexer call. Each changed file costs a store + index write, so a big
+# tree can hold a tool worker for many minutes; past the budget the call returns partial progress and a re-run
+# resumes (unchanged files are skipped). At least one changed file is always stored per call, so repeated calls always progress.
+_DOCS_INGEST_BUDGET_S = max(0.0, float(os.environ.get("LOCI_DOCS_INGEST_BUDGET_S", "120") or 120))
 _DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
 
 
@@ -3136,7 +3140,10 @@ def docs_ingest_indexer(
     )
 
     records: list[dict] = []
-    for doc_path in targets:
+    started = time.monotonic()
+    deferred = 0
+    stored_now = 0
+    for idx, doc_path in enumerate(targets):
         text = doc_path.read_text(encoding="utf-8", errors="replace")
         raw = text.strip()
         doc_title = doc_path.stem.replace("-", " ").replace("_", " ").strip() or doc_path.name
@@ -3180,6 +3187,9 @@ def docs_ingest_indexer(
             })
             continue
 
+        if stored_now > 0 and time.monotonic() - started > _DOCS_INGEST_BUDGET_S:
+            deferred = len(targets) - idx
+            break
         finding_text = f"{doc_title}: {summary}"
         store_result = json.loads(investigation_store(
             investigation_id=investigation_id,
@@ -3191,6 +3201,7 @@ def docs_ingest_indexer(
             metadata=metadata,
             evidence_provenance_tier=MODEL_ASSERTED,
         ))
+        stored_now += 1
         records.append({
             "path": str(doc_path),
             "stored": bool(store_result.get("stored")),
@@ -3207,6 +3218,10 @@ def docs_ingest_indexer(
         "investigation_id": investigation_id,
         "records": records,
     }
+    if deferred:
+        # Out of time, not out of files: call again to continue (indexed files are skipped as unchanged).
+        out.update(partial=True, files_remaining=deferred + (len(all_targets) - len(targets)),
+                   budget_s=_DOCS_INGEST_BUDGET_S)
     if len(all_targets) > len(targets):
         # The file cap cut the tree short: say so rather than read as complete.
         out.update(truncated=True, files_found=len(all_targets),
