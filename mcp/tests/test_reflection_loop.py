@@ -423,6 +423,10 @@ class ReflectionLoopTests(unittest.TestCase):
             "warning_signature_observations": {"warn-signature": 1},
             "last_error_signatures": [{"signature": "repeat-signature", "count": 2}],
             "last_warning_signatures": [{"signature": "warn-signature", "count": 1}],
+            "by_source": {"copilot": {
+                "files_processed": 1, "dropped": 0, "errors_seen": 2,
+                "warnings_seen": 1, "findings_written": 1,
+            }},
         }
 
         with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
@@ -460,7 +464,7 @@ class ReflectionLoopTests(unittest.TestCase):
                 ),
                 "source": "reflection_loop_tick",
                 "confidence": "low",
-                "tags": "self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+                "tags": "self-reflection,loop-tick,artifact-mining,unreceipted-observed,source-copilot",
                 # Unreceipted heuristic output: stamped, never the tool_verified default.
                 "evidence_provenance_tier": "model_asserted",
             },
