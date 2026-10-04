@@ -30,7 +30,7 @@
 | Route traces | sampled `memory_route` traces (#403) | not counted | audit log | inferred |
 | Grounding pairs | labelled question-finding pairs from recovered runs; labels are structural proxies (same `dt_target`) | thousands | `deep_think_loci/grounding/grounding_dataset.jsonl` | read in R6.1 |
 
-Not signals: GPU load and model route events (low volume, tier choice only).
+Not a signal on its own: GPU load. Model-routing decisions and their outcomes are now logged (D23 below).
 
 ## (b) Candidate decisions, ranked
 
@@ -45,14 +45,17 @@ The ranking keeps the R6.1 rubric and updates it for what changed since 2026-09-
 | 5 | **Memory routing and per-turn injection (D1, D2, D8)** | query embedding, recent context | which store, how many | `memory_use` and route traces just started | Current drive rules; kNN over embeddings | < 300 ms path | Moderate to high (irrelevant context injected every prompt) |
 | 6 | **D12 store-time novelty / dedup** | finding embedding | similar exists? | **None.** Loci does no store-time dedup and logs no merges. Supersession is a weak proxy | Cosine threshold, SimHash/LSH, LR | microseconds | Low |
 | 7 | **D21 keep searching vs answer** | transcript state | continue / stop | **None.** No episode logs | Hard budgets already in `offload_loop` | per step | Moderate |
-| 8 | **D23 model tier routing** | prompt, GPU load | tier | route events with an `ok` flag | Heuristic route; budget < 1 ms | < 1 ms | Low |
+| 8 | **D23 model selection per role** | role, the ranked candidates (rank, resident, eligible), GPU load | which model | `model_pool_outcomes.jsonl`: `ok`, latency and `deadline_exceeded` per call, joined to the decision row. Accumulating since the pool shipped (#435) and outcomes were added (#439); off until `LOCI_MODEL_POOL_SHADOW=1` | The ranked-pool rule; budget < 1 ms | < 1 ms | Low (the legacy resolver is the fallback) |
 | n/a | D25 to D32 honesty and safety gates | | | | | | **No good fit.** Must stay rule-based |
+
+Decision IDs (D1 to D32) come from the R6.1 decision-point survey in the private FlyBrain repo; each ID used in this document is named in the table above.
 
 Notes on weak fits:
 
 - **D12 / novelty.** The plan's first hypothesis. No labels, no logged merges, several read-time rules exist. A fixed random sparse expansion is the known fly result (FlyHash); a grown brain has nothing to learn from. Useful as a **benchmark**, not as a decision (section e, track B).
 - **D13, D5 to D8.** The label that would matter ("was the injected memory used") exists in small numbers only. Revisit after `memory_use` has thousands of rows.
 - **D21 / keep searching.** Blocked on instrumentation, not on modelling.
+- **D23 / model selection.** Now a concrete decision with the integration shape of section (d) already in place (`mcp/model_pool.py`). The decision and outcome logs are off by default and start empty, so there is no volume yet. The input space is small and tabular (a handful of candidates per role), so a grown brain is unlikely to beat the ranked rule; the value is a second labelled benchmark with a hard latency budget.
 
 ## (c) Data and privacy constraints for training
 
@@ -80,6 +83,7 @@ Follow the D10 precedent exactly.
 | Fallback | Any load, shape or timeout error returns the current rule's decision. A pre-filter may only skip judge calls on pairs the brain scores below a threshold chosen for recall >= 0.95; it never removes a heuristic conflict. |
 | Rollback | Unset the env var, or delete the artifact directory. One step. |
 | Evidence to go beyond shadow | Pre-registered live metric (calls avoided at fixed recall) from a read-only report script, then an A/B. |
+| Worked example in Loci | The model pool (`mcp/model_pool.py`) follows this shape without a brain behind it: the rule always decides; `LOCI_MODEL_POOL_SHADOW=1` logs each decision and each call outcome (names, ranks, enums, latency; no text); `LOCI_MODEL_POOL_SELECTOR=module:callable` names a selector whose choice is logged beside the rule's and never used; unsetting both is the rollback. A learned D23 selector plugs into that hook. |
 
 ## (e) Recommended first experiment
 
@@ -97,7 +101,7 @@ Small enough for one PR on the FlyBrain side plus one exporter in Loci. Two trac
 | Baselines (same rows, splits, seeds) | Current rule; LR; HGB; pair MLP; fixed random sparse expansion + linear readout; majority and best single-feature stump. |
 | Statistics | Paired bootstrap that resamples investigations, not pairs. |
 | Acceptance bar | A brain is eligible for shadow only if (CI of brain minus best baseline on the primary metric excludes 0) **or** (non-inferior within 0.02 at <= 25% of the best baseline's parameters and p95 <= 1 ms). Otherwise it stays a research artifact. |
-| Power gate | Report as **exploratory** unless the test folds hold >= 40 positives from >= 8 investigations. A confirmatory run waits for >= 500 positives from >= 30 investigations. |
+| Power gate | Report as **exploratory** unless the test folds hold >= 40 positives from >= 8 investigations. A confirmatory run waits for >= 500 positives from >= 30 investigations. **Status 2026-10-04: not met.** Across the local stores the positives number in the low hundreds at most, sit in fewer than 8 investigations, and one investigation holds the large majority, so a leave-one-investigation-out split is dominated by a single fold. Track A stays blocked until more investigations carry judged pairs. |
 | Null path | If no brain qualifies, record the baselines and ship nothing. The best baseline may still be proposed as a shadow gate on its own merits. |
 
 ### Track B: generic familiarity and retrieval benchmark (FlyBrain repo only)
@@ -118,7 +122,7 @@ Real Loci finding embeddings as one corpus in a multi-input harness. Tasks: fami
 | Risk | Note |
 |---|---|
 | Labels are a model's verdicts | D11 labels distil one local model. A pre-filter learns the judge's habits, including its errors. Only a handful of human resolutions exist as gold. |
-| Skipped rows | Most verdict rows are `judge_skipped`, and selection into the judged set is not recorded in the row. Check the cause before trusting the population. |
+| Skipped rows | Most verdict rows are `judge_skipped` (roughly two thirds in one store, a larger share in the other), and selection into the judged set is not recorded in the row. Check the cause before trusting the population; the same rows are what limits the power gate above. |
 | Small N | About a dozen investigations. Intervals will be wide, as in D10. |
 | Prior from D10 | A grown brain lost there on size, latency and score. Expect a negative result; the harness value is the deliverable. |
 | Lower stakes than R6.1 scored | #409 made the judge async with a cap of 3 pairs and a circuit breaker. The latency argument for a pre-filter is gone; the remaining gain is judge compute. |
@@ -132,3 +136,4 @@ Open questions:
 3. Does D11 judge compute cost enough to justify any gate, now that it is async and capped at 3 pairs?
 4. Should `memory_use` logging get a wider sample so D5 to D8 become testable?
 5. Should hand-labelling for the D10 replay (#407) finish before any second D10 brain?
+6. Is the D23 outcome log (#439) enough label for a learned selector, or is a per-role success rate over the ranked candidates already the ceiling? Enable the shadow flag for a few weeks and read `python mcp/model_pool.py outcomes` before deciding.
