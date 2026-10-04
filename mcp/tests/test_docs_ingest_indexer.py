@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import sys
@@ -55,6 +56,48 @@ class DocsIngestIndexerTest(unittest.TestCase):
         self.assertEqual([r["path"] for r in whole["records"]], [str(docs_dir / "real.md")], whole)
         loaded = json.loads(server.investigation_load("docs-symlink"))
         self.assertNotIn("hunter2", json.dumps(loaded))
+
+    def test_docs_ingest_returns_partial_progress_past_the_time_budget_and_resumes(self):
+        docs_dir = Path(self._tmp.name) / "budget"
+        docs_dir.mkdir()
+        for n in range(3):
+            (docs_dir / f"doc{n}.md").write_text(f"# Doc {n}\n\nBody {n}.\n", encoding="utf-8")
+
+        # The store path is covered elsewhere (and needs Qdrant); this test is about the loop budget.
+        stored = set()
+
+        def _fake_store(**kw):
+            stored.add(kw["metadata"]["source_path"])
+            return json.dumps({"stored": True, "finding_id": f"f{len(stored)}"})
+
+        def _fake_state(_inv, path, _hash):
+            return "unchanged" if str(path) in stored else "new"
+
+        def ingest(budget):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(server, "investigation_store", _fake_store))
+                stack.enter_context(mock.patch.object(server, "_docs_ingest_state_for_path", _fake_state))
+                stack.enter_context(mock.patch.object(server, "_DOCS_INGEST_BUDGET_S", budget))
+                return json.loads(server.docs_ingest_indexer(str(docs_dir), investigation_id="docs-budget"))
+
+        first = ingest(0.0)
+        self.assertEqual(first["stored"], 1, first)
+        self.assertTrue(first["partial"], first)
+        self.assertEqual(first["files_remaining"], 2, first)
+        second = ingest(0.0)
+        self.assertEqual(second["unmodified"], 1, second)
+        self.assertEqual(second["stored"], 1, second)
+        self.assertEqual(second["files_remaining"], 1, second)
+        done = ingest(120.0)
+        self.assertNotIn("partial", done, done)
+        self.assertEqual(done["unmodified"], 2, done)
+        self.assertEqual(done["stored"], 1, done)
+
+    def test_docs_ingest_without_a_budget_overrun_is_not_partial(self):
+        doc = Path(self._tmp.name) / "one.md"
+        doc.write_text("# One\n\nBody.\n", encoding="utf-8")
+        out = json.loads(server.docs_ingest_indexer(str(doc), investigation_id="docs-nopartial"))
+        self.assertNotIn("partial", out, out)
 
     def test_docs_ingest_does_not_label_document_claims_tool_verified(self):
         doc_path = Path(self._tmp.name) / "CLAIMS.md"
