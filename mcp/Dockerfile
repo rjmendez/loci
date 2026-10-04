@@ -17,6 +17,8 @@ COPY pyproject.toml .env.example ./
 COPY *.py ./
 COPY memcheck/ ./memcheck/
 COPY graph/ ./graph/
+# d10_gate.py loads its pinned artifact from models/ (shadow mode, docs/d10_shadow_gate.md).
+COPY models/ ./models/
 COPY tests/ ./tests/
 RUN pip install --no-cache-dir --no-deps -e .
 

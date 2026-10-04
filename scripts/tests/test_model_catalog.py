@@ -24,7 +24,6 @@ def test_specialist_model_catalog_is_additive_only():
     assert catalog.MATH_SPECIALIST_MODEL == "hf.co/bartowski/Qwen2.5-Math-7B-Instruct-GGUF:Q4_K_M"
     assert catalog.SAFETY_SPECIALIST_MODELS == (
         "llama-guard3:8b",
-        "qwen3.8:latest",
     )
     assert catalog.TOOL_CALLING_SPECIALIST_MODEL == "hf.co/eaddario/Watt-Tool-8B-GGUF:Q4_K_M"
     assert catalog.SPECIALIST_MODELS == {
@@ -40,10 +39,10 @@ def test_specialist_model_catalog_is_additive_only():
     )
     assert catalog.SWARM_GUARDIAN_MODELS == (
         "llama-guard3:8b",
-        "qwen3.8:latest",
     )
-    assert catalog.SWARM_ESCALATION_MODEL == "qwen3.8:latest"
-    assert catalog.SWARM_SYNTHESIS_MODEL == "qwen3.8:latest"
+    # Catalog roles resolve exactly like the swarm runtime defaults (env -> config -> fallback).
+    assert catalog.SWARM_ESCALATION_MODEL == swarm._DEFAULT_ESCALATE_MODEL
+    assert catalog.SWARM_SYNTHESIS_MODEL == swarm._DEFAULT_SYNTHESIZE_MODEL
     assert catalog.SWARM_ROLE_MODELS == {
         "cheap_fanout": catalog.SWARM_CHEAP_FANOUT_MODELS,
         "guardian": catalog.SWARM_GUARDIAN_MODELS,

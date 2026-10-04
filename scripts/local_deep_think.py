@@ -17,7 +17,7 @@ is deterministic and the returned finding_ids are real.
 Usage:
   python3 scripts/local_deep_think.py "topic here"
   python3 scripts/local_deep_think.py "topic here" --collections loci_memory --red-team
-  python3 scripts/local_deep_think.py "topic here" --ideate-models llama3.1-agent:latest,qwen3.8:latest
+  python3 scripts/local_deep_think.py "topic here" --ideate-models llama3.1-agent:latest,qwen2.5:3b
   python3 scripts/local_deep_think.py "topic here" --no-self-reflect
   python3 scripts/local_deep_think.py "topic here" --no-learn-procedures
   python3 scripts/local_deep_think.py "topic here" --strict-grounding
@@ -42,21 +42,47 @@ from typing import Callable, Optional
 LOG = logging.getLogger("local_deep_think")
 _MODEL_SAFE_RE = re.compile(r"[^a-z0-9]+")
 _TEXT_KEYS = ("text", "snippet", "content", "chunk_text", "summary", "body", "passage")
-_DEFAULT_IDEATE_MODELS = "llama3.1-agent:latest,qwen3.8:latest"
-# Existing/default code path (no opt-in tier flags set): unchanged from before the
-# 2026-09-16 tier work. Do not change these without also changing the default behavior
-# for callers that pass no flags at all.
-_DEFAULT_VERIFY_MODEL = "qwen3.8:latest"
-_DEFAULT_SYNTH_MODEL = "qwen3.8:latest"
-_DEFAULT_REFLECT_MODEL = "qwen3.8:latest"
+# Last resort when mcp/backends.py cannot be imported: small enough to load on one GPU.
+# Mirrors backends.ONE_GPU_FALLBACK_MODEL / ONE_GPU_REDTEAM_FALLBACK_MODEL.
+_ONE_GPU_FALLBACK_MODEL = "qwen2.5:3b"
+_ONE_GPU_REDTEAM_FALLBACK_MODEL = "heretic-llama31-8b-instruct:latest"
+
+
+def _backends_model(resolver: str, fallback: str = _ONE_GPU_FALLBACK_MODEL) -> str:
+    """Resolve a default model through mcp/backends.py (env -> backends.toml -> fallback).
+
+    Fail-open: this runs at import time and from cron, so any import or lookup error
+    yields the one-GPU fallback rather than an exception.
+    """
+    try:
+        mcp_dir = str(Path(__file__).resolve().parents[1] / "mcp")
+        if mcp_dir not in sys.path:
+            sys.path.insert(0, mcp_dir)
+        backends = importlib.import_module("backends")
+        return str(getattr(backends, resolver)() or "").strip() or fallback
+    except Exception:
+        return fallback
+
+
+# Existing/default code path (no opt-in tier flags set). verify/synthesize/self-reflect
+# share one model, as they always have: LOCI_OLLAMA_VERIFY_MODEL -> [ollama].verify_model
+# -> gen_model -> a one-GPU fallback (the per-chain LOCI_LOCAL_DEEP_THINK_*_MODEL env and
+# [ollama].deep_think_*_model keys still win, see _resolve_model_input). These used to be
+# a literal qwen3.8:latest (17.7 GB), which splits across two GPUs and times out loading.
+_DEFAULT_VERIFY_MODEL = _backends_model("ollama_verify_model")
+_DEFAULT_SYNTH_MODEL = _DEFAULT_VERIFY_MODEL
+_DEFAULT_REFLECT_MODEL = _DEFAULT_VERIFY_MODEL
+_DEFAULT_IDEATE_MODELS = ",".join(dict.fromkeys(
+    ("llama3.1-agent:latest", _backends_model("ollama_gen_model"))))
 # Opt-in "safety_check" tier: chosen from a live 12-model / 4-task benchmark on
 # 2026-09-16 (see swarm_escalate.py's tier comments for the full methodology/results).
 # These only apply when the caller explicitly sets safety_check=True (or
 # --safety-check / LOCI_LOCAL_DEEP_THINK_SAFETY_CHECK); they must never change the
-# default code path used by every prior caller.
+# default code path used by every prior caller. Synthesize/reflect used the 27B Qwen3.8
+# heretic build (17.2 GB) until 2026-09-26; that does not fit one GPU.
 _TIER_VERIFY_MODEL = "heretic-llama31-8b-instruct:latest"
-_TIER_SYNTH_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
-_TIER_REFLECT_MODEL = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+_TIER_SYNTH_MODEL = "heretic-llama31-8b-instruct:latest"
+_TIER_REFLECT_MODEL = "heretic-llama31-8b-instruct:latest"
 _TIER_REDTEAM_MAX_TOKENS = 1600
 _TIER_SELF_REFLECT_REVISE_MAX_TOKENS = 2200
 _TIER_SYNTHESIZE_MAX_TOKENS = 2200
@@ -259,7 +285,7 @@ def _resolve_models(args: argparse.Namespace) -> ChainConfig:
         redteam_model = (
             args.redteam_model
             or os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
-            or "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+            or _ONE_GPU_REDTEAM_FALLBACK_MODEL
         )
 
     collections = _split_csv(
@@ -1265,7 +1291,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--synthesize-model")
     ap.add_argument(
         "--self-reflect-model",
-        help="Model for the bounded critique+revise pass. Default: qwen3.8:latest",
+        help=(
+            "Model for the bounded critique+revise pass. Default: the verify model "
+            f"(currently {_DEFAULT_REFLECT_MODEL})"
+        ),
     )
     ap.add_argument(
         "--no-self-reflect",

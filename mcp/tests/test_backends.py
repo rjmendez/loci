@@ -5,6 +5,15 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import backends as B  # noqa: E402
+import pytest  # noqa: E402
+
+_REAL_OLLAMA_LIST = B._ollama_list
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ollama_list(monkeypatch):
+    # Size lookups must not shell out to a real `ollama list` on a dev box.
+    monkeypatch.setattr(B, "_ollama_list", lambda: {})
 
 
 def _no_ollama_env(mp):
@@ -303,14 +312,123 @@ def test_guardian_model_env_wins_over_config(tmp_path, monkeypatch):
     assert B.ollama_guardian_model() == "env-guardian:latest"
 
 
-def test_redteam_model_defaults_to_heretic_qwen38(monkeypatch):
+def test_redteam_model_defaults_to_one_gpu_heretic(monkeypatch):
     monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
-    assert B.ollama_redteam_model() == (
-        "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+    assert B.ollama_redteam_model() == B.ONE_GPU_REDTEAM_FALLBACK_MODEL == (
+        "heretic-llama31-8b-instruct:latest"
     )
+
+
+# Tags that do not fit one 11-12 GB GPU and must never be picked without env/config.
+_OVERSIZED = ("qwen3.8", "gemma4:26b", "27b")
+
+
+def _assert_one_gpu(model: str) -> None:
+    assert not any(marker in model.lower() for marker in _OVERSIZED), model
+
+
+def _no_swarm_env(mp):
+    for k in ("LOCI_SWARM_ESCALATE_MODEL", "LOCI_SWARM_SYNTHESIZE_MODEL",
+              "LOCI_OLLAMA_GUARDIAN_MODEL", "LOCI_OLLAMA_REDTEAM_MODEL"):
+        mp.delenv(k, raising=False)
+
+
+def test_no_default_resolves_to_an_oversized_model_without_config(monkeypatch):
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
+    B._reset_cache()
+    for resolver in (B.ollama_gen_model, B.ollama_verify_model, B.ollama_classify_model,
+                     B.ollama_compress_model, B.ollama_guardian_model,
+                     B.ollama_redteam_model, B.swarm_escalate_model,
+                     B.swarm_synthesize_model):
+        _assert_one_gpu(resolver())
+    assert B.swarm_escalate_model() == B.ONE_GPU_FALLBACK_MODEL
+    assert B.swarm_synthesize_model() == B.ONE_GPU_FALLBACK_MODEL
+
+
+def test_auto_pick_skips_installed_models_too_big_for_one_gpu(monkeypatch):
+    # The failure seen 2026-09-26: only oversized tags plus one small one installed.
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    monkeypatch.delenv("LOCI_OLLAMA_AUTO_MAX_GB", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    inventory = {
+        "gemma4:26b": 18_600_000_000,
+        "qwen3.8:latest": 17_700_000_000,
+        "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M": 17_200_000_000,
+        "tiny-heretic:4b": 3_300_000_000,
+        "nomic-embed-text:latest": 274_000_000,
+        "small-chat:1b": 1_300_000_000,
+    }
+    monkeypatch.setattr(B, "_ollama_list", lambda: inventory)
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set(inventory))
+    assert B.ollama_gen_model() == "small-chat:1b"
+    assert B.ollama_redteam_model() == "tiny-heretic:4b"
+    assert B.ollama_guardian_model() == "small-chat:1b"
+    # The cap is an operator knob: raising it lets the big tags back into auto-pick.
+    monkeypatch.setenv("LOCI_OLLAMA_AUTO_MAX_GB", "40")
+    assert B.ollama_gen_model() == "gemma4:26b"
+
+
+def test_explicit_config_is_never_size_filtered(tmp_path, monkeypatch):
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\ngen_model = "gemma4:26b"\nredteam_model = "qwen3.8:latest"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_ollama_list", lambda: {"gemma4:26b": 18_600_000_000})
+    B._reset_cache()
+    assert B.ollama_gen_model() == "gemma4:26b"
+    assert B.ollama_redteam_model() == "qwen3.8:latest"
+
+
+def test_swarm_models_resolve_env_then_config_then_verify_model(tmp_path, monkeypatch):
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\ngen_model = "gemma4-e4b-hermes:64k"\n'
+                   'verify_model = "gemma4-e4b-hermes:64k"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    B._reset_cache()
+    assert B.swarm_escalate_model() == "gemma4-e4b-hermes:64k"
+    assert B.swarm_synthesize_model() == "gemma4-e4b-hermes:64k"
+
+    cfg.write_text('[ollama]\nverify_model = "v:1b"\nswarm_escalate_model = "esc:4b"\n'
+                   'swarm_synthesize_model = "syn:4b"\n')
+    B._reset_cache()
+    assert B.swarm_escalate_model() == "esc:4b"
+    assert B.swarm_synthesize_model() == "syn:4b"
+
+    monkeypatch.setenv("LOCI_SWARM_ESCALATE_MODEL", "env-esc:latest")
+    monkeypatch.setenv("LOCI_SWARM_SYNTHESIZE_MODEL", "env-syn:latest")
+    assert B.swarm_escalate_model() == "env-esc:latest"
+    assert B.swarm_synthesize_model() == "env-syn:latest"
+
+
+def test_ollama_list_parses_sizes(monkeypatch):
+    import subprocess
+
+    out = ("NAME                  ID              SIZE      MODIFIED\n"
+           "gemma4:26b            abc123          18 GB     2 days ago\n"
+           "qwen2.5:3b            def456          1.9 GB    3 weeks ago\n"
+           "nomic-embed-text:latest 0a109f422b47  274 MB    5 months ago\n")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
+    monkeypatch.setattr(B, "_ollama_list", _REAL_OLLAMA_LIST)
+    B._reset_cache()
+    try:
+        assert B._ollama_list() == {
+            "gemma4:26b": 18_000_000_000,
+            "qwen2.5:3b": 1_900_000_000,
+            "nomic-embed-text:latest": 274_000_000,
+        }
+        assert B._ollama_local_tags() == {"gemma4:26b", "qwen2.5:3b", "nomic-embed-text:latest"}
+    finally:
+        B._reset_cache()
 
 
 def test_gen_model_auto_selects_local_non_embedding_when_default_missing(monkeypatch):

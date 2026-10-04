@@ -11,15 +11,16 @@ place where Loci reported more evidentiary authority than it had:
   the firewall, and ignored metadata tier aliases;
 - audit_log receipts for model tools were stamped tool_verified;
 - memory_self_check claimed a "receipted" counter-finding that had no receipt;
-- investigation_load counted degraded (never-run) verifications as verified;
-- FlyBrain experts with no validation data got an invented 0.82 confidence.
+- investigation_load counted degraded (never-run) verifications as verified.
+
+(The FlyBrain uncalibrated-confidence regression moved with FlyBrain to
+rjmendez/flybrain: tests/test_flybrain_provenance_honesty.py.)
 
 Backends are stubbed; storage is a temp dir.
 """
 import json
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -420,58 +421,6 @@ class VerificationCountTest(unittest.TestCase):
         self.assertEqual(s["counts"]["degraded"], 20)
         self.assertEqual(s["verified_findings"], 0)
         self.assertEqual(s["verification_attempts"], 20)
-
-
-# --- flybrain-invented-0.82-confidence
-
-
-class FlyBrainUncalibratedConfidenceTest(unittest.TestCase):
-
-    def _payload(self):
-        import flybrain_brain_cluster_pipeline as p
-        manifest = types.SimpleNamespace(region_counts={"r_noval": 5, "r_zero": 5, "r_ok": 5},
-                                         manifest_id="m1")
-
-        def res(val):
-            return types.SimpleNamespace(metrics={"val_metrics": val},
-                                         model_fingerprint="a" * 64, metrics_fingerprint="b" * 64)
-        results = {
-            "r_noval": res({"sample_count": 0, "accuracy": 0.0,
-                            "warning": "no validation samples in selected split"}),
-            "r_zero": res({"sample_count": 12, "accuracy": 0.0}),
-            "r_ok": res({"sample_count": 12, "accuracy": 0.75}),
-        }
-        payload = p._build_experts_runtime_payload(manifest=manifest, expert_results=results,
-                                                   shadow_overrides=None)
-        return {row["region"]: row["shadow_replay"] for row in payload["experts"]}
-
-    def test_no_invented_confidence(self):
-        shadow = self._payload()
-        self.assertEqual(shadow["r_noval"]["confidence"], 0.0)
-        self.assertEqual(shadow["r_noval"]["confidence_calibration"], "uncalibrated")
-        self.assertEqual(shadow["r_zero"]["confidence"], 0.0)  # measured, kept
-        self.assertEqual(shadow["r_zero"]["confidence_calibration"], "validation_accuracy")
-        self.assertEqual(shadow["r_ok"]["confidence"], 0.75)
-
-    def test_uncalibrated_expert_fails_the_confidence_gate(self):
-        import flybrain_brain_cluster as fbc
-        gate = fbc.ConfidenceGate(min_confidence=0.65)
-        task = types.SimpleNamespace(task_type="verification", cluster_id="c", request_id="r")
-        prov = types.SimpleNamespace(replay_fingerprint="f" * 64)
-        # No confidence at all: used to default to 0.82 and pass.
-        out = fbc._ArtifactReplayExpert("e1", behavior={}).infer(task, prov)
-        self.assertEqual(out.confidence, 0.0)
-        result = gate.evaluate(task, prov, None, out)
-        self.assertEqual(result.decision, fbc.ClusterDecision.FAIL_CLOSED)
-        self.assertIn("uncalibrated", result.reason)
-        # Uncalibrated stays failed even if a number was forced in.
-        forced = fbc.ExpertOutput(expert_id="e2", confidence=0.99, claims=[],
-                                  artifacts={"confidence_calibration": "uncalibrated"})
-        self.assertEqual(gate.evaluate(task, prov, None, forced).decision,
-                         fbc.ClusterDecision.FAIL_CLOSED)
-        # A declared, measured confidence still passes.
-        ok = fbc._ArtifactReplayExpert("e3", behavior={"confidence": 0.9}).infer(task, prov)
-        self.assertEqual(gate.evaluate(task, prov, None, ok).decision, fbc.ClusterDecision.ACCEPT)
 
 
 # --- review follow-ups: retracted evidence, defaulted candidates, unknown tier aliases

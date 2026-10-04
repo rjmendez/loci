@@ -41,6 +41,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import math
+import os
 import re
 from typing import Callable
 from unittest import mock
@@ -224,7 +225,10 @@ def fake_conflict_judge(verdict: "str | None | Callable[[dict, dict], dict]" = N
 
     judge = _Judge()
     judge.calls = []
-    with mock.patch.object(server, "_judge_conflict_pair", judge):
+    # The judge runs on a background worker by default; sync mode keeps it inline so
+    # ``calls`` and the store response are deterministic.
+    with mock.patch.dict(os.environ, {"LOCI_CONFLICT_JUDGE_SYNC": "1"}), \
+            mock.patch.object(server, "_judge_conflict_pair", judge):
         yield judge
 
 

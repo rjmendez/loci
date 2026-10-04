@@ -24,7 +24,8 @@ not live in the repo.
 | `OLLAMA_BASE_URL` | _(none in code; `backends.ollama_url()` probes `http://localhost:11434`)_ | the **embedding** endpoint for 16 non-test files: `mcp/{qdrant_ops,embed_ops,backends,memcheck/llm}.py`, `scripts/hooks/{pre_llm_grounding,session_end_sync}.py`, `scripts/{loci_groom,glymphatic_sweep,gpu_warm}.py`, all of `mlops/`, `deep_think_loci/grounding/` |
 | `LOCI_OLLAMA_GEN_URL` / `OLLAMA_GEN_URL` | _(none; falls back to `backends.ollama_gen_url()` → `ollama_url()`)_ | the **generation** endpoint, resolved separately from embeddings (`mcp/llm_local.py`). `OLLAMA_BASE_URL` deliberately does **not** feed it |
 | `LOCI_OLLAMA_GEN_MODEL` | auto (`qwen2.5:3b` if present, else first local non-embedding tag, else `qwen2.5:3b`) | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). Explicit env/config still wins. This auto-fallback prevents hardcoded defaults from silently pointing at missing local tags. |
-| `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M`, then local heretic/abliterated tag, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
+| `LOCI_OLLAMA_AUTO_MAX_GB` | `10` | size cap (decimal GB, as `ollama list` reports) for models the `mcp/backends.py` resolvers pick *automatically* from the local inventory. Larger installed tags are skipped: Ollama splits a model bigger than one GPU across cards, and on 11-12 GB cards those loads time out and stall its scheduler for every other model, embeddings included. Explicit env/config model names are never filtered. |
+| `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `heretic-llama31-8b-instruct:latest`, then a local heretic/abliterated tag that fits one GPU, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
 | `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
 | `LOCI_TMUX_COMPANION_REQUIRED` | `0` (off) | if set truthy (`1/true/yes/on`), `loci_health` fails loud when required tmux companion sessions are missing. Use this when Copilot/Claude tmux loops are part of required runtime posture |
 | `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
@@ -250,18 +251,13 @@ This is the implementation-ready path for the `benchmark-harness-spec`, `rollout
 | `LOCI_STATE_DB` | `~/.hermes/state.db` | state_db_qdrant_sync |
 | `LOCI_DOCS_ROOTS` | `LOCI_CODE_ROOT`, else the service's cwd | docs_ingest_indexer: `os.pathsep`-separated roots it may read under (symlink targets must stay inside). Set it to ingest docs from any other repo; relative paths resolve against the code root. A directory ingest reads at most 500 files and reports `truncated: true` with `files_found` when it hits that cap. |
 
-### FlyBrain harness write-path safety
+### FlyBrain
 
-FlyBrain harness jobs must follow the allowlist-only path boundary in
-[FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md](./FLYBRAIN_WRITE_PATH_SAFETY_POLICY.md).
-
-Operationally:
-
-- Keep the effective write root at `LOCI_FLYBRAIN_STORAGE_ROOT` (or stricter approved override).
-- Block symlink/junction (reparse-point) escapes before any write/delete/move.
-- Never run destructive operations outside the allowlisted root.
-- Use the durable root structure in [FLYBRAIN_HARNESS_STORAGE_LAYOUT.md](./FLYBRAIN_HARNESS_STORAGE_LAYOUT.md): `graph\`, `snapshots\`, `cache\`, `backups\`, and `logs\` under `LOCI_FLYBRAIN_STORAGE_ROOT`.
-- Sequence operational gates using [FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md](./FLYBRAIN_HARNESS_ROLLOUT_MILESTONES.md), starting with `dry-run` inventory and ending at the first reproducible local query harness run.
+FlyBrain (harness storage, brain-cluster training, promotion and rollback) moved to
+the private repo `rjmendez/flybrain`; its operator runbooks live there. Loci no
+longer reads `LOCI_FLYBRAIN_STORAGE_ROOT`, `HARNESS_*` or
+`FLYBRAIN_CLUSTER_STATE_PATH`. See [FLYBRAIN.md](./FLYBRAIN.md) for what Loci still
+owns (claim-scope and provenance validation for FlyBrain-derived findings).
 
 ### Tuning parameters
 
@@ -277,6 +273,8 @@ Operationally:
 | `AGENTHER_GEN_MODEL` | `llama3.2:latest` | Ollama model for failure relabeling |
 | `EXIF_GEN_MODEL` | `llama3.2:latest` | Ollama model for skill gap analysis |
 | `TOP_K_PER_LEVEL` | `3` | Results per level in MemGAS search; used by memgas_hierarchy.py |
+| `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
+| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route, vLLM and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 
 ---
 
@@ -728,7 +726,7 @@ python3 -m pytest scripts/tests/test_model_catalog.py -q
 1. **Daily production mode:** run single-seed baseline for routine jobs.
 2. **Canary mode:** enable one tier knob at a time (`seeds`, `self-consistency`, then `synthesize-think`).
 3. **Incident containment:** force deterministic low-risk mode (`--seeds 1`, no `--synthesize-think`, no consensus), archive failing JSON, open follow-up.
-4. **Rollback defaults:** pin legacy models with `LOCI_SWARM_ESCALATE_MODEL=qwen3.8:latest` and `LOCI_SWARM_SYNTHESIZE_MODEL=qwen3.8:latest`, then re-run validation gates.
+4. **Rollback defaults:** pin known-good models with `LOCI_SWARM_ESCALATE_MODEL` / `LOCI_SWARM_SYNTHESIZE_MODEL` (or `[ollama].swarm_escalate_model` / `swarm_synthesize_model`), then re-run validation gates. Unset, both follow `[ollama].verify_model` -> `gen_model` -> `qwen2.5:3b`. Pick tags that fit one GPU.
 
 Query longitudinal scores:
 
@@ -843,336 +841,13 @@ secret redaction or hash chain; small local models may fall back often (safe, bu
 saving). Out of scope for this MVP: planner/executor split, swarm intent voting, write
 tools, approval tokens, cloud-vs-offload dashboards. Issue #376 is only partly done.
 
-### Braincluster trainlog privacy scrub (contract + usage)
-
-`scripts/braincluster_trainlog_privacy_scrub.py` is the required fail-closed
-redaction boundary before trainlog payloads are written or exported.
-
-Scrub rules:
-
-1. Field-name redaction wrappers: any key matching sensitive names (`token`,
-   `session_id`, `authorization`, `secret`, etc.) is replaced with a wrapper
-   object, not masked inline.
-2. Wrapper metadata is contractual: `__scrubbed__`, `redaction_kind`,
-   `field_name`, `path`, `fingerprint`, and `length` (for sized values) must be
-   present so downstream checks can audit redaction integrity deterministically.
-3. Inline string redaction is tokenized when the field name is not itself
-   sensitive: emails -> `[EMAIL_REDACTED]`, secret URLs -> `[URL_REDACTED]`,
-   and credential-like key/value fragments -> `[TOKEN_REDACTED]`. Sensitive
-   field-name wrappers take precedence over inline masking.
-4. Blob-like payloads (`raw_payload`, large multiline bodies, bytes) are wrapped
-   as `redaction_kind=raw_blob` with fingerprint metadata.
-5. Unsupported shapes fail closed: non-object roots, unsupported value types
-   (for example `set`), parse errors, or scrubber import failures return exit
-   `2` with a machine-readable error payload; no unsafe partial output is
-   emitted.
-
-Output metadata contract:
-
-- `privacy.schema_version=braincluster-trainlog-privacy-scrub/v1`
-- `privacy.scrubbed=true`
-- `privacy.redaction_count` equals `len(privacy.redactions)`
-- `privacy.redaction_kinds` is a deterministic sorted set of observed kinds
-- `privacy.redactions[*]` rows include `path`, `field_name`, `redaction_kind`,
-  and `fingerprint`
-
-Usage:
-
-```powershell
-python scripts\braincluster_trainlog_privacy_scrub.py `
-  --input artifacts\trainlog-raw.json `
-  --output artifacts\trainlog-scrubbed.json
-```
-
-Or stdin/stdout mode for pipeline composition:
-
-```powershell
-Get-Content artifacts\trainlog-raw.json -Raw | `
-python scripts\braincluster_trainlog_privacy_scrub.py > artifacts\trainlog-scrubbed.json
-```
-
-`braincluster_trainlog_schema_normalizer.py` invokes this scrubber before
-emitting canonical rows and fails closed if `privacy.scrubbed` is not true.
-
-### Braincluster feedback learning loop (bounded retraining gate)
-
-`scripts/braincluster_feedback_learning_loop.py` builds retraining samples from
-canonical trainlog rows while fail-closing on contamination risk.
-
-Deterministic inclusion defaults:
-
-- `source_name=qdrant_findings`
-- `confidence_tier >= high`
-- resolution in `fixed|intentional|wontfix|superseded`
-- `evidence_provenance_tier` in
-  `human_authored|tool_verified|deterministic_derived`
-- `provenance_refs` must contain both `investigation_id:*` and `text_hash:*`
-
-Deterministic exclusions:
-
-- uncertain labels (`confidence_tier` below threshold, missing/unknown primary label)
-- unresolved outcomes (`open`/unknown/missing resolution unless explicitly allowed)
-- retracted/tombstoned outcomes (`retract*` markers)
-- weak provenance tier/traceability (`model_asserted`, missing refs)
-
-Bounded-loop controls:
-
-- `--max-samples-total`: hard cap over admitted rows
-- `--max-samples-per-label`: per-label cap
-- stable ordering `(event_ts, row_id)` before bounds are applied
-
-Usage:
-
-```powershell
-python scripts\braincluster_feedback_learning_loop.py `
-  --canonical-rows-json artifacts\braincluster-trainlog-canonical-rows.json `
-  --max-samples-total 2000 `
-  --max-samples-per-label 300 `
-  --output artifacts\braincluster-feedback-training-samples.json
-```
-
-The output contains `samples[*]` in `TrainingSample`-compatible shape for
-downstream brain-cluster dry-run/training stages. If contamination guards reject
-all rows, the tool exits `2` and emits an explicit JSON error payload.
-
-### Brain-cluster operator checklists (preflight / deploy / rollback / incident)
-
-Use this sequence when promoting brain-cluster artifacts. Do not bypass any gate.
-
-#### 1) Preflight checklist
-
-- [ ] Run deterministic holdout campaign:
-
-  ```powershell
-  python scripts\braincluster_holdout_campaign.py `
-    --output-root F:\.flybrain\cache\braincluster-holdout `
-    --base-storage-root F:\.flybrain `
-    --holdout-storage-root F:\.flybrain-holdout `
-    --split-seed holdout-seed-20260923
-  ```
-
-- [ ] Confirm `holdout-campaign-report.json` contract:
-  - `schema_version=braincluster-holdout-campaign/v1`
-  - `status=pass`
-  - `pass=true`
-- [ ] Confirm `holdout-artifact-checklist.json` contract:
-  - `schema_version=braincluster-holdout-artifact-checklist/v1`
-  - `status=ok`
-  - `missing_count=0`
-- [ ] Confirm `release-prep-report.json` gate output:
-  - `schema_version=braincluster-release-prep/v2`
-  - `status=ok`
-
-#### 2) Deploy checklist
-
-- [ ] Generate readiness decision from holdout + release-prep outputs:
-
-  ```powershell
-  python mcp\flybrain_brain_cluster_promotion_readiness.py `
-    --holdout-report F:\.flybrain\cache\braincluster-holdout\holdout-campaign-report.json `
-    --release-prep-report F:\.flybrain\cache\braincluster-holdout\release-prep-report.json `
-    --output F:\.flybrain\cache\braincluster-holdout\promotion-readiness.json
-  ```
-
-- [ ] Confirm readiness contract:
-  - `schema_version=braincluster-promotion-readiness/v1`
-  - `status=ready`
-  - `pass=true`
-  - `decision=go`
-  - `summary.failed_checks=0`
-- [ ] Run canary promotion drill before production pointer changes:
-
-  ```powershell
-  python scripts\braincluster_canary_promotion_drill.py `
-    --state-path F:\.flybrain\cache\braincluster-holdout\promotion-state.json `
-    --candidate-manifest F:\.flybrain\cache\braincluster-holdout\candidate\artifact-bundle\manifest.json `
-    --readiness-report F:\.flybrain\cache\braincluster-holdout\promotion-readiness.json `
-    --report F:\.flybrain\cache\braincluster-holdout\canary-promotion-drill.json
-  ```
-
-- [ ] Confirm drill contract:
-  - `schema_version=braincluster-canary-promotion-drill/v1`
-  - `status=pass`
-  - `pass=true`
-  - `rollback_attempted=true`
-  - `rollback_succeeded=true`
-
-#### 3) Rollback checklist
-
-Trigger rollback when any deploy gate fails, when post-promotion audit fails, or when runtime behavior regresses versus the approved report.
-
-- [ ] Capture evidence first (no mutations):
-  - `promotion-readiness.json`
-  - `canary-promotion-drill.json`
-  - current `promotion-state.json`
-  - candidate `artifact-bundle\manifest.json`
-- [ ] Run promotion audit and require pass before/after rollback:
-
-  ```powershell
-  python -c "import json,sys; from pathlib import Path; sys.path.insert(0, str((Path.cwd() / 'mcp').resolve())); import flybrain_brain_cluster as fbc; print(json.dumps(fbc.check_brain_cluster_promotion_audit_trail(r'F:\.flybrain\cache\braincluster-holdout\promotion-state.json'), indent=2, sort_keys=True))"
-  ```
-
-- [ ] If active pointer is unsafe, execute rollback with the same state file:
-
-  ```powershell
-  python -c "import sys; from pathlib import Path; sys.path.insert(0, str((Path.cwd() / 'mcp').resolve())); import flybrain_brain_cluster as fbc; fbc.rollback_brain_cluster_promoted(r'F:\.flybrain\cache\braincluster-holdout\promotion-state.json')"
-  ```
-
-- [ ] Re-run audit; require `schema_version=braincluster-promotion-audit/v1`, `pass=true`, `failure_count=0`.
-
-#### 4) Incident response checklist
-
-- [ ] Stop new promotions immediately (`decision=no-go` until closed).
-- [ ] Preserve immutable artifacts for triage:
-  - `holdout-campaign-report.json`
-  - `holdout-artifact-checklist.json`
-  - `release-prep-report.json`
-  - `promotion-readiness.json`
-  - `canary-promotion-drill.json`
-  - `promotion-state.json`
-- [ ] Classify incident by contract break:
-  - artifact contract mismatch (`braincluster-artifact-manifest/v1` / missing files),
-  - gate breach (`gate_report.pass=false` or `shadow_report.pass=false`),
-  - pointer/audit breach (`braincluster-promotion-audit/v1 pass=false`).
-- [ ] Keep last known-good promoted pointer active until audit passes and a fresh readiness report returns `decision=go`.
-- [ ] Log closure with root cause, corrected artifact version, and exact report paths used for re-approval.
-
-### Brain-cluster alert response playbooks (queue / drift / thresholds / promotion)
-
-Use these when alerts fire; execute top-to-bottom and do not skip evidence capture.
-
-#### A) Queue alert playbook (`T1-QUEUE-FLOOD`, blocked-work surge)
-
-**Signals (source of truth)**
-- `scripts\self_model_trigger_eval.py` output:
-  - `_self-model\alerts.jsonl`: `trigger_type`, `tier`, `status`, `reason`, `value`, `cooldown_until`
-  - `_self-model\introspection_report.json`: `blockers[*].type=queue_overflow`, `metrics.reflection_queue_backlog`, `metrics.blocked_todos`
-- Queue ownership state from `investigation_queue_status`: per-item `state`, `owner_session`, `lease_expires_at`, `dependencies`.
-
-**Triage**
-1. Snapshot current trigger payload + introspection report (copy files before any queue mutation).
-2. Identify pressure type:
-   - reflection backlog (`reflection_queue_size >= LOCI_REFLECTION_QUEUE_THRESHOLD`), or
-   - coordination lock contention (high `claimed`/`blocked`, stale leases).
-3. List blocked/claimed queue items and sort by oldest `lease_expires_at`.
-
-**Mitigation**
-- Drain stale claims first: complete or release items that exceeded lease or are owner-abandoned.
-- Enforce bounded intake: pause new enqueues until backlog is below threshold.
-- For persistent blocked work, mark explicit `state=blocked` with notes and assign next owner before resuming intake.
-
-**Rollback / escalation**
-- Escalate when `T1-QUEUE-FLOOD` repeats after one drain cycle or blocked count keeps rising.
-- Roll back any scheduler/config change that widened queue intake (for example threshold/cooldown edits) and re-run `self_model_trigger_eval.py`.
-
-**Evidence to retain**
-- `_self-model\alerts.jsonl` slice covering the incident window.
-- `_self-model\introspection_report.json`.
-- Queue snapshot before/after mitigation (items with `state`, `owner_session`, `lease_expires_at`).
-
-#### B) Drift alert playbook (`routing_drift_*`, `routing_drift_alerts`)
-
-**Signals (source of truth)**
-- `braincluster-p0-dry-run/v1` report fields:
-  - `routing_drift_alerts[*].code|severity|signal|threshold|observed|delta_from_threshold`
-  - `shadow_report.pass`, `shadow_report.status`, `shadow_report.alerts`
-- Shadow metrics in `braincluster-shadow-replay-report/v1`:
-  - `decision_match_rate`
-  - `confidence_drift.mean_abs_delta`
-  - `routing_entropy.mean_abs_delta`
-  - `expert_collapse.candidate.concentration`
-  - `expert_collapse.concentration_delta`
-
-**Triage**
-1. Run/inspect latest holdout outputs (`scripts\braincluster_holdout_campaign.py`) and locate failing objective/slice rows.
-2. Classify drift:
-   - contract fail (`pass=false`) vs warning-only (`alerts` present but pass),
-   - concentration collapse vs confidence/entropy drift.
-3. Check `context.objective_task_type_deltas` on alert rows to localize drifted task types.
-
-**Mitigation**
-- Recalibrate thresholds from current holdout reports (`mcp\flybrain_brain_cluster_thresholds.py`) when drift is legitimate but bounded.
-- If collapse/concentration critical alerts fire, stop promotion and retrain candidate artifacts from balanced samples before rerun.
-- If `routing_drift_not_evaluable`, treat as critical data-quality fault: rebuild fixtures and rerun shadow replay before any promotion decision.
-
-**Rollback / escalation**
-- Escalate immediately on critical drift codes:
-  - `routing_drift_decision_match_rate`
-  - `routing_drift_expert_concentration`
-  - `routing_drift_not_evaluable`
-- Keep current promoted pointer; do not stage or promote candidate until shadow replay returns `pass=true` with no critical alerts.
-
-**Evidence to retain**
-- `holdout-campaign-report.json` (`runs[*]`, `errors`).
-- Failing p0 report(s) under `runs\<objective>\<slice>\p0-report.json`.
-- Threshold bundle(s) used for the run (`thresholds\braincluster-thresholds-*.json`).
-
-#### C) Threshold alert playbook (stale/invalid threshold bundles)
-
-**Signals (source of truth)**
-- Validation failures raised by `mcp\flybrain_brain_cluster_pipeline.py`:
-  - stale bundle: `generated_at ... older than 7 days`
-  - schema/objective/fingerprint mismatch
-  - missing required gate/shadow threshold fields
-- Readiness degradation where checks fail against threshold refs in `promotion-readiness.json`.
-
-**Triage**
-1. Inspect threshold metadata:
-   - `schema_version=braincluster-threshold-calibration/v1`
-   - `dataset_symbol`, `objective`, `generated_at`, `calibration_id`, `input_fingerprint`, `trivial_baseline`.
-2. Verify fingerprint continuity:
-   - `calibration_id == braincluster-thresholds-<input_fingerprint[:16]>`.
-3. Confirm release-prep points to the expected `threshold_file` per (dataset, objective) group.
-
-**Mitigation**
-- Regenerate thresholds from latest holdout runs (`mcp\flybrain_brain_cluster_thresholds.py`) and update release-prep outputs.
-- Re-run readiness evaluation (`mcp\flybrain_brain_cluster_promotion_readiness.py`) after replacing stale/invalid bundles.
-- Reject ad hoc manual threshold edits; only accept generated bundles with matching fingerprints.
-
-**Rollback / escalation**
-- Escalate when thresholds cannot be regenerated from valid holdout artifacts (missing/corrupt reports).
-- Roll back to last known-good threshold bundle set and hold `decision=no-go` until fresh calibration succeeds.
-
-**Evidence to retain**
-- Old and replacement threshold bundles.
-- `release-prep-report.json` (`groups_calibrated[*].threshold_file`).
-- `promotion-readiness.json` before/after recalibration.
-
-#### D) Promotion alert playbook (readiness/canary/audit failures)
-
-**Signals (source of truth)**
-- `promotion-readiness.json` (`status`, `pass`, `decision`, `summary.failed_checks`, `reasons`).
-- `canary-promotion-drill.json` (`status`, `pass`, `rollback_attempted`, `rollback_succeeded`, `reasons`).
-- `braincluster-promotion-audit/v1` from `check_brain_cluster_promotion_audit_trail(...)`:
-  - `pass`, `failure_count`, `failures[*].code`.
-
-**Triage**
-1. Stop promotions and snapshot:
-   - `promotion-state.json`
-   - candidate `artifact-bundle\manifest.json`
-   - readiness + canary reports.
-2. Run promotion audit; classify failure family:
-   - pointer continuity (`BROKEN_PROMOTED_POINTER_CONTINUITY`, `STATE_*_MISMATCH`)
-   - manifest integrity (`TARGET_MANIFEST_UNREADABLE`, `MANIFEST_IDENTITY_MISMATCH`)
-   - trail integrity (`MISSING_AUDIT_TRAIL`, `IMMUTABLE_RECORD_MISMATCH`).
-3. Confirm whether the active promoted pointer is still known-good.
-
-**Mitigation**
-- If pointer unsafe, execute `rollback_brain_cluster_promoted(...)`, then re-run audit and require `pass=true`, `failure_count=0`.
-- Restage candidate manifest and re-run canary drill only after readiness returns `decision=go`.
-- If audit failure is manifest-related, rebuild artifact bundle and restamp manifest identity before restaging.
-
-**Rollback / escalation**
-- Hard escalation when rollback cannot restore audited-good state.
-- Freeze deploy lane until:
-  - readiness `status=ready`, `pass=true`, `decision=go`
-  - canary drill `pass=true`, `rollback_succeeded=true`
-  - promotion audit `pass=true`.
-
-**Evidence to retain**
-- `promotion-readiness.json`, `canary-promotion-drill.json`, `promotion-state.json`.
-- Audit JSON before/after rollback.
-- Candidate + promoted manifest identity fields (`manifest_path`, `manifest_sha256`, `artifact_id`, `artifact_version`).
+### Brain-cluster operations (moved)
+
+The brain-cluster runbooks that used to be here (trainlog privacy scrub, feedback
+retraining gate, preflight/deploy/rollback/incident checklists, and the
+queue/drift/threshold/promotion alert playbooks) moved to `rjmendez/flybrain` with
+the code they operate. The in-server `flybrain_cluster_*` / `flybrain_expert_inspect`
+MCP tools were removed from Loci; see [FLYBRAIN.md](./FLYBRAIN.md).
 
 ---
 

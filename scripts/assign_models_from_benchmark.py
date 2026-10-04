@@ -80,7 +80,8 @@ def choose_redteam(winners: dict[str, list[str]], installed: set[str]) -> tuple[
         lower = model.lower()
         if "heretic" in lower or "abliterated" in lower:
             return model, True
-    default = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+    # Fits one GPU; mirrors backends.ONE_GPU_REDTEAM_FALLBACK_MODEL.
+    default = "heretic-llama31-8b-instruct:latest"
     return default, default in installed
 
 
