@@ -108,7 +108,7 @@ def _discover_generation_model(base: str, exclude: str = "", timeout: Optional[f
     an embedding tag or one that is not installed), pick a locally-installed
     non-embedding model that fits one GPU (size <= LOCI_OLLAMA_AUTO_MAX_GB, default
     10): a resident one if any qualifies, else the first listed. Never picks an
-    oversized tag; a load that big wedged the NVIDIA driver (2026-09-24, 09-27).
+    oversized tag; a tag without a size qualifies only if /api/ps shows it resident under the cap; a load that big wedged the NVIDIA driver (2026-09-24, 09-27).
     Fail-open: any error, or no eligible tag, returns ''.
     """
     try:
@@ -122,6 +122,23 @@ def _discover_generation_model(base: str, exclude: str = "", timeout: Optional[f
             return ""
         blocked = {exclude.strip().lower()} if exclude else set()
         cap = _auto_max_bytes()
+        running = None  # name.lower() -> /api/ps size; fetched at most once
+
+        def _resident():
+            nonlocal running
+            if running is None:
+                running = {}
+                try:
+                    pr = requests.get(f"{base}/api/ps", timeout=t)
+                    pr.raise_for_status()
+                    for m in (pr.json().get("models") or []):
+                        key = str((m or {}).get("name") or (m or {}).get("model") or "").lower()
+                        if key:
+                            running[key] = (m or {}).get("size")
+                except Exception:
+                    running = {}
+            return running
+
         eligible = []
         for item in models:
             name = str((item or {}).get("name") or "").strip()
@@ -132,21 +149,23 @@ def _discover_generation_model(base: str, exclude: str = "", timeout: Optional[f
             if _looks_embedding_model(name):
                 continue
             size = (item or {}).get("size")
-            if isinstance(size, (int, float)) and size > cap:
-                continue
+            if isinstance(size, (int, float)):
+                if size > cap:
+                    continue
+            else:
+                # No size in /api/tags: trust only a resident tag whose /api/ps size is under the cap.
+                ps_size = _resident().get(name.lower())
+                if not isinstance(ps_size, (int, float)) or ps_size > cap:
+                    _LOG.debug("llm_local discovery: skipping %r, no size and not resident under cap", name)
+                    continue
+                size = ps_size
             eligible.append((name, size))
         if not eligible:
             return ""
         chosen = eligible[0]
         if len(eligible) > 1:
-            try:
-                pr = requests.get(f"{base}/api/ps", timeout=t)
-                pr.raise_for_status()
-                running = {str((m or {}).get("name") or (m or {}).get("model") or "").lower()
-                           for m in (pr.json().get("models") or [])}
-                chosen = next((e for e in eligible if e[0].lower() in running), chosen)
-            except Exception:
-                pass
+            live = _resident()
+            chosen = next((e for e in eligible if e[0].lower() in live), chosen)
         size = chosen[1]
         _LOG.warning("llm_local model substitution: configured=%r missing or unusable, using %r (size=%s)",
                      exclude, chosen[0],
