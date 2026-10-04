@@ -360,7 +360,7 @@ name = "gemma4-e4b-hermes:64k"
 roles = ["gen", "verify", "compress"]
 rank = 1                 # lower is preferred
 # vram_gb = 5.0
-# pinned = true          # reserved for the lease/eviction layer: never evict (use it for the embedder)
+# pinned = true          # never evicted by a model lease (use it for the embedder); evictable = false does the same
 # role_rank = { verify = 3 }  # rank differently for one role
 ```
 
@@ -385,6 +385,33 @@ does not list keeps its legacy resolver.
 - Shadow mode follows the D10 shape in `docs/flybrain_brains_eval.md`: the rule always decides;
   `LOCI_MODEL_POOL_SHADOW=1` logs the decision, and `LOCI_MODEL_POOL_SELECTOR` can name a learned
   selector whose choice is logged beside it. Unset both to roll back.
+
+## Model leases (borrowing GPU headroom)
+
+`mcp/model_lease.py` lets a special job (a FlyBrain run, a batch on a bigger model) take a card for
+itself by evicting resident Ollama models, then give it back. It builds on the model pool.
+
+- **Ask:** `model_lease_acquire(job, need_gb, priority="normal", ttl_s=1800)` (MCP tool; also
+  `python mcp/model_lease.py acquire JOB NEED_GB [priority]` and `with model_lease.lease(...)`). It makes
+  `need_gb` free on **one** GPU, unloading models worst-first, and returns a lease id.
+- **Who can be evicted:** never a pool entry with `pinned = true` or `evictable = false`, never a model a
+  Loci call is using right now, and with `priority = "normal"` never the current primary for a pooled
+  role. `priority = "critical"` lets primaries go too. Order: models outside the pool, then the worst pool
+  rank, larger first on ties. A CPU-resident model (no VRAM) is skipped: unloading it frees nothing.
+- **Verified, not assumed:** after each eviction it waits for the model to leave `/api/ps` and for
+  `nvidia-smi` to show the memory back (`LOCI_LEASE_GPU_CMD` overrides the command), stopping as soon as
+  one GPU has the room. If everything allowed is gone and it still does not fit, it **puts the models
+  back** and returns `granted: false` with the shortfall. Without `nvidia-smi` it evicts every eligible
+  model and reports `verified: false`.
+- **While held:** the pool treats evicted models as unavailable, so a Loci call does not reload one into
+  the headroom the job reserved.
+- **Giving back:** `model_lease_release(lease_id)` loads the evicted models back (`[models].restore_keep_alive`,
+  default `30m`; `restore=false` skips it). Leases expire after `ttl_s` and are reaped on the next lease
+  call, so a crashed job cannot hold the GPU forever. `model_lease_status` lists leases, resident models
+  with their VRAM, and free VRAM per GPU.
+- **State:** `<data home>/leases/model_leases.json` (ids, model names, sizes, times; no text).
+- **Limits:** it governs the Ollama this server talks to and needs `nvidia-smi` on the same host to verify.
+  Other clients using the same Ollama are not tracked as in-flight, so keep their models `pinned`.
 
 ## Cron jobs
 

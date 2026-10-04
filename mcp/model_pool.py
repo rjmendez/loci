@@ -15,7 +15,8 @@ role instead. The pool is one declared list the resolvers consult:
     roles = ["gen", "verify", "compress"]
     rank = 1                 # lower is preferred
     vram_gb = 5.0            # optional; otherwise the size /api/tags reports
-    pinned = false           # reserved for the lease/eviction layer: never evict
+    pinned = false           # never evicted by a model lease (model_lease.py)
+    evictable = true         # false behaves like pinned for leases
     role_rank = { verify = 2 }   # optional: rank differently for one role
 
 Resolution for one role: take the entries listing the role, keep those installed at the
@@ -83,6 +84,7 @@ class PoolEntry:
     vram_gb: Optional[float] = None
     pinned: bool = False
     role_rank: tuple[tuple[str, float], ...] = ()
+    evictable: bool = True        # False (or pinned) keeps a model resident through a lease (model_lease)
 
     def rank_for(self, role: str) -> float:
         for r, value in self.role_rank:
@@ -163,6 +165,7 @@ def entries() -> list[PoolEntry]:
             name=name, roles=roles, rank=_num(item.get("rank"), 100.0),
             vram_gb=_num(vram, None) if vram is not None else None,
             pinned=bool(item.get("pinned", False)), role_rank=role_rank,
+            evictable=bool(item.get("evictable", True)),
         ))
     return out
 
@@ -280,7 +283,7 @@ def _installed(name: str, inv: dict) -> bool:
 def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] = None,
               inv: Optional[dict] = None, resident: Optional[set] = None,
               bonus: Optional[float] = None, cap_gb: Optional[float] = None,
-              fallback: Optional[bool] = None) -> Decision:
+              fallback: Optional[bool] = None, held_out: Optional[set] = None) -> Decision:
     """Order the candidates for ``role``. Pure when ``pool``/``inv``/``resident`` are passed."""
     role = (role or "").strip().lower()
     pool_entries = list(entries() if pool is None else pool)
@@ -289,6 +292,12 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
     bonus_ = resident_bonus() if bonus is None else bonus
     cap = max_vram_gb() if cap_gb is None else cap_gb
     relax = over_cap_fallback() if fallback is None else fallback
+    if held_out is None:      # models an active lease evicted: do not reload one into the headroom it reserved
+        try:
+            import model_lease
+            held_out = model_lease.held_out()
+        except Exception:
+            held_out = set()
 
     rows: list[tuple[PoolEntry, str]] = [(e, "pool") for e in pool_entries if role in e.roles]
     hint = (hint or "").strip()
@@ -308,8 +317,10 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
             raw = inventory_.get(entry.name) or inventory_.get(f"{entry.name}:latest")
             size = (raw / 1e9) if isinstance(raw, (int, float)) else None
         fits = cap is None or size is None or size <= cap
-        eligible = installed and fits
+        evicted = entry.name in held_out or f"{entry.name}:latest" in held_out
+        eligible = installed and fits and not evicted
         reason = ("" if eligible else "not installed" if not installed
+                  else "evicted by an active lease" if evicted and fits
                   else f"{size:.1f} GB over the {cap:g} GB cap")
         rank = entry.rank_for(role)
         cands.append(Candidate(
@@ -321,7 +332,7 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
     if relax and cands and not any(c.eligible for c in cands):
         # Nothing installed fits the cap: use the strongest (best-ranked) over-cap model rather than none.
         for c in cands:
-            if c.installed and not c.fits:
+            if c.installed and not c.fits and not (c.name in held_out or f"{c.name}:latest" in held_out):
                 c.eligible, c.over_cap = True, True
                 c.reason = f"{c.reason}; nothing fits, used as the strongest available"
     cands.sort(key=lambda c: (not c.eligible, c.effective_rank, c.rank, c.name))
@@ -474,6 +485,8 @@ def render_toml(pool_entries: Iterable[PoolEntry]) -> str:
             lines.append(f"vram_gb = {e.vram_gb:g}")
         if e.pinned:
             lines.append("pinned = true")
+        if not e.evictable:
+            lines.append("evictable = false")
         if e.role_rank:
             lines.append("role_rank = { " + ", ".join(f"{r} = {v:g}" for r, v in e.role_rank) + " }")
         lines.append("")
