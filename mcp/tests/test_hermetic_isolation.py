@@ -45,7 +45,7 @@ def test_home_config_and_memory_dir_are_in_the_temp_root():
 def test_backends_resolve_to_an_unreachable_endpoint():
     import server  # noqa: F401  (import runs load_env(), which must not refill these)
 
-    for key in ("QDRANT_URL", "OLLAMA_BASE_URL", "VLLM_BASE_URL"):
+    for key in ("QDRANT_URL", "OLLAMA_BASE_URL"):
         assert os.environ[key] == loci_hermetic.UNREACHABLE, key
     assert "QDRANT_API_KEY" not in os.environ
 

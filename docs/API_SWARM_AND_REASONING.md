@@ -67,8 +67,6 @@ result, and fails open to degraded JSON on wrapper/import/runtime errors.
 - `seeds > 1` means multiple independent full pipeline runs before one merged synthesis.
 - Empty `escalate_model` / `synthesize_model` means “use the resolved default for the
   current tier mode,” not “explicit override to empty”.
-- The MCP wrapper sets `auto_parallel=False`, so CLI auto-seed expansion does **not**
-  happen implicitly through the tool.
 
 **Parameters**
 
@@ -580,75 +578,7 @@ times.”
 
 ---
 
-## 3) Auto-parallel default (PR #359)
-
-The CLI script has explicit logic to auto-expand seed count when a batched vLLM backend is
-available.
-
-Relevant fields and functions:
-
-- `SwarmConfig.seeds`
-- `SwarmConfig.seeds_explicit`
-- `SwarmConfig.auto_parallel`
-- `_batched_backend_available()`
-- `_effective_seed_count(config)`
-- env vars `LOCI_SWARM_AUTO_PARALLEL` and `LOCI_SWARM_AUTO_VLLM_SEEDS`
-
-### Actual defaults
-
-`SwarmConfig.auto_parallel` defaults from:
-
-```python
-os.environ.get("LOCI_SWARM_AUTO_PARALLEL", "1")
-```
-
-So auto-parallel is **on by default**.
-
-`_AUTO_VLLM_SEEDS` is:
-
-```python
-int(os.environ.get("LOCI_SWARM_AUTO_VLLM_SEEDS", "3"))
-```
-
-So the literal default is **`3` seeds**.
-
-### Resolution logic
-
-`_effective_seed_count(config)` does this:
-
-1. Start with `requested = max(1, int(config.seeds or 1))`.
-2. If any of the following is true, return `requested` unchanged:
-   - `requested > 1`
-   - `config.seeds_explicit`
-   - `not config.auto_parallel`
-3. Otherwise, if `_batched_backend_available()` is true, return `max(1, _AUTO_VLLM_SEEDS)`.
-4. Else return `requested` (normally `1`).
-
-`_batched_backend_available()` returns `bool(str(backends.vllm_url(probe_timeout=0.2) or "").strip())`.
-That means it uses the resolved shared vLLM URL as the heuristic. On the shared path,
-that includes the localhost probe; if env or config already names a URL, the function
-trusts that configuration.
-
-### Meaning
-
-When `--seeds` is omitted:
-
-- resolved batched vLLM backend present -> auto-resolve to `3` seeds by default
-- no batched backend (for example plain Ollama) -> stay at `1`
-
-Why: vLLM continuous batching makes concurrent short requests relatively cheap, so
-multi-seed robustness is attractive there. On non-batched backends, multi-seed is a much
-more expensive latency or cost choice, so the script keeps historic single-seed behavior.
-
-### Important MCP vs CLI distinction
-
-The MCP tool `swarm_reason(...)` explicitly constructs `SwarmConfig(..., auto_parallel=False)`.
-So the auto-parallel behavior applies to **CLI `scripts/swarm_escalate.py` when `--seeds`
-is omitted**, not to default MCP tool calls.
-
----
-
-## 4) Tiered escalation model
+## 3) Tiered escalation model
 
 The swarm is a bounded gate stack, not merely “cheap model then strong model”.
 
@@ -762,82 +692,7 @@ In multi-seed mode, synthesis happens **after** merge and dedup across seeds.
 
 ---
 
-## 5) Per-role vLLM endpoint routing (PR #360)
-
-`mcp/backends.py` exposes:
-
-```python
-vllm_url(role: str | None = None, probe_timeout: float = 1.0) -> str
-vllm_model(role: str | None = None) -> str
-```
-
-Role-specific env var names are built as:
-
-- `VLLM_BASE_URL_<ROLE>`
-- `VLLM_MODEL_<ROLE>`
-
-with uppercasing and `-` converted to `_`.
-
-Example: role `tool-calling` maps to `VLLM_BASE_URL_TOOL_CALLING` and
-`VLLM_MODEL_TOOL_CALLING`.
-
-## `vllm_url(role=...)` resolution order
-
-### When `role` is provided
-
-1. `VLLM_BASE_URL_<ROLE>` env var
-2. `[vllm.<role>].url` in `~/.loci/backends.toml` (or `LOCI_CONFIG`)
-3. fall back to shared `vllm_url()` resolution
-
-There is intentionally **no role-specific localhost probe**. Specialist routing must be
-explicit, then it falls back to the shared resolver.
-
-### Shared `vllm_url()` resolution
-
-1. `VLLM_BASE_URL`
-2. localhost probe of `http://localhost:8000`
-3. `[vllm].url` from config
-4. empty string
-
-## `vllm_model(role=...)` resolution order
-
-### When `role` is provided
-
-1. `VLLM_MODEL_<ROLE>` env var
-2. `[vllm.<role>].model` in config
-3. fall back to shared `vllm_model()`
-
-### Shared `vllm_model()` resolution
-
-1. `VLLM_MODEL`
-2. `[vllm].model`
-3. default literal `Qwen2.5-3B-Instruct`
-
-## Supported roles
-
-The resolver accepts any role string, but the repository's canonical role sets are:
-
-### Specialist roles from `scripts/model_catalog.py`
-
-- `code`
-- `math`
-- `safety`
-- `tool_calling`
-
-### Swarm role names from `scripts/model_catalog.py`
-
-- `cheap_fanout`
-- `guardian`
-- `escalation`
-- `synthesis`
-
-`mcp/batched_gen.py` already supports `endpoint_role=...`, and the tests explicitly cover
-role-based resolution, for example `code`. Use the catalog role names when you want
-stable, semantically named routing.
-
----
-
-## 6) `local_deep_think.py` vs `swarm_escalate.py`
+## 4) `local_deep_think.py` vs `swarm_escalate.py`
 
 These scripts solve different problems.
 
@@ -991,11 +846,9 @@ python3 scripts/local_deep_think.py \
 
 ## 8) Quick guidance
 
-If you remember only three things:
+If you remember only two things:
 
 1. `--seeds N` means **N concurrent full swarm runs**, not N samples of one answer.
-2. Auto-parallel-to-3 is a **CLI optimization** for batched vLLM backends when `--seeds`
-   is omitted; it is not the MCP tool default.
-3. `local_deep_think.py` gets diversity from multiple models; `swarm_escalate.py` gets
+2. `local_deep_think.py` gets diversity from multiple models; `swarm_escalate.py` gets
    diversity from multiple independent decompositions and seeds.
 

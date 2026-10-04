@@ -54,8 +54,6 @@ _UNREACHABLE_URLS = (
     "QDRANT_URL",
     "OLLAMA_BASE_URL",
     "LOCI_LOCAL_OLLAMA",
-    "VLLM_BASE_URL",
-    "LOCI_LOCAL_VLLM",
 )
 
 # Endpoints whose unset value means "feature off", and credentials. Removed
@@ -77,7 +75,6 @@ _REMOVED = (
     "HERMES_MCP_TOKEN",
     "HERMES_MEMORY_DIR",
     "LOCI_MEMORY_MD_DIR",
-    "LOCI_VLLM_FALLBACK",
     "LOCI_EVENT_LOG",
     "RERANK_HTTP_URL",
     "MNEMOSYNE_LLM_BASE_URL",

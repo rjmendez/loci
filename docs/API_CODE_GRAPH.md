@@ -782,7 +782,7 @@ hard if one backend is down.
 
 **Return shape**
 
-- Success: `{"code_version", "ladybug", "ladybug_writer_pid"?, "ollama_reachable", "vllm_reachable", "qdrant_reachable", "embed_model", "rerank_model", "warm", "retention_days"?, "purge_active"?, "purge_warning"?}`
+- Success: `{"code_version", "ladybug", "ladybug_writer_pid"?, "ollama_reachable", "qdrant_reachable", "embed_model", "rerank_model", "warm", "retention_days"?, "purge_active"?, "purge_warning"?}`
 
 **Example**
 

@@ -54,15 +54,13 @@ def _resolve_ollama() -> str:
 _TIMEOUT = float(os.environ.get("OLLAMA_GEN_TIMEOUT", "120"))
 
 # One generate() call used to be able to spend 120s on the configured model, 120s
-# more on a discovered one, 45s on the supervisor route, then vLLM and cloud: 5+
+# more on a discovered one, 45s on the supervisor route, then cloud: 5+
 # minutes against a GPU-starved Ollama. This caps the whole call. A later tier is
 # attempted only when at least _MIN_ATTEMPT_S of budget is left.
 _DEFAULT_DEADLINE_S = 150.0
 _MIN_ATTEMPT_S = 5.0
-# When GPU is loaded, cap Ollama per-attempt timeout so vLLM/cloud can be reached within budget.
+# When GPU is loaded, cap Ollama per-attempt timeout so the cloud tier can be reached within budget.
 _GPU_LOADED_OLLAMA_TIMEOUT_S = float(os.environ.get("LOCI_GPU_LOADED_OLLAMA_TIMEOUT_S", "30"))
-# Roles that skip Ollama entirely and try vLLM first when the GPU is saturated.
-_EXPENSIVE_ROLES = frozenset({"reasoning", "synthesis", "redteam", "reflection"})
 
 
 def _read_gpu_load():
@@ -289,7 +287,7 @@ def _tmux_offload_policy(role: Optional[str]) -> dict:
     """Resolve tmux offload policy for a generation role.
 
     The policy is advisory: if a mapped tmux lane exists and is live, we surface it as a
-    higher-priority actor for expensive roles without disturbing the standard local/vLLM/cloud
+    higher-priority actor for expensive roles without disturbing the standard local/cloud
     fallback flow when the feature is disabled or no tmux lane is available. In strict mode
     (require_mapped_session=True), a missing mapped lane becomes a hard fail instead of
     silently falling back.
@@ -381,7 +379,7 @@ def generate(prompt: str,
         timeout: per-request HTTP timeout in seconds. Defaults to the module `_TIMEOUT`;
              callers with their own deadline (offload_loop) pass a shorter one.
              The whole call (every retry and fallback tier) is additionally capped by
-             LOCI_LLM_DEADLINE_S (default 150s); vLLM and cloud tiers are only tried
+             LOCI_LLM_DEADLINE_S (default 150s); the cloud tier is only tried
              while at least 5s of that budget remains, and their own client timeouts
              still apply once started.
 
@@ -451,27 +449,9 @@ def generate(prompt: str,
         return out
 
     # GPU load-aware routing: read shared load signal (written by loci-gpu-load sidecar).
-    # Expensive roles skip Ollama when GPU is saturated and go to vLLM first.
-    # All roles get a capped Ollama timeout so downstream tiers can be reached within budget.
+    # When the GPU is saturated every role gets a capped Ollama timeout so the cloud tier can be reached within budget.
     _gpu_load = _read_gpu_load()
-    _effective_role = normalized_role or _heuristic_route(prompt).get("role")
     if _gpu_load is not None and _gpu_load.is_loaded():
-        if _effective_role in _EXPENSIVE_ROLES:
-            _fast = _try_vllm(
-                prompt, fmt=fmt, max_tokens=max_tokens,
-                temperature=temperature, endpoint_role=_effective_role,
-            )
-            if _fast is not None:
-                _fast["gpu_routed"] = True
-                _LOG.info(
-                    "llm_local gpu_route tier=vllm util=%.0f%% vram=%.0f%% role=%s",
-                    _gpu_load.max_util_pct, _gpu_load.max_vram_pct, _effective_role,
-                )
-                return _fast
-            _LOG.info(
-                "llm_local gpu_route vllm_unavailable util=%.0f%% falling_to_ollama_capped",
-                _gpu_load.max_util_pct,
-            )
         per_request = min(per_request, _GPU_LOADED_OLLAMA_TIMEOUT_S)
         _LOG.info(
             "llm_local gpu_route ollama_timeout_capped=%.0fs util=%.0f%% vram=%.0f%%",
@@ -556,14 +536,6 @@ def generate(prompt: str,
                      if model_was_unspecified else None)
             if remaining() < _MIN_ATTEMPT_S:
                 return deadline_fail(last_error)
-            fallback = _try_vllm(prompt, fmt=fmt, max_tokens=max_tokens,
-                                 temperature=temperature, endpoint_role=(route or {}).get("role"))
-            if fallback is not None:
-                _LOG.info("llm_local fallback tier=%s model=%s",
-                          fallback.get("tier", "unknown"), fallback.get("model", ""))
-                return fallback
-            if remaining() < _MIN_ATTEMPT_S:
-                return deadline_fail(last_error)
             cloud = _try_cloud_tier(prompt, fmt=fmt, max_tokens=max_tokens,
                                     temperature=temperature, route=route, model=model)
             if cloud is not None:
@@ -593,46 +565,6 @@ def generate(prompt: str,
     return out
 
 
-def _try_vllm(prompt: str, *, fmt: Optional[str], max_tokens: int,
-              temperature: float, endpoint_role: Optional[str] = None) -> Optional[dict]:
-    """Second tier. Returns a result dict, or None if vLLM is not usable either.
-
-    batched_gen already resolves the vLLM endpoint AND the model name the server
-    actually registers (backends.vllm_model()), which is the part llm_local was
-    getting wrong. Reusing it keeps one definition of both.
-    """
-    # OPT-IN: the vLLM backends resolves is another project's service, not Loci's. Set LOCI_VLLM_FALLBACK=1 when Loci has its own.
-    if os.environ.get("LOCI_VLLM_FALLBACK", "").strip() in ("", "0"):
-        return None
-    try:
-        import batched_gen
-    except Exception:
-        return None
-    try:
-        out = batched_gen.generate_batch([prompt], max_tokens=max_tokens, fmt=fmt,
-                                         think=False, endpoint_role=endpoint_role)
-    except TypeError:
-        # older signature without temperature
-        try:
-            out = batched_gen.generate_batch([prompt], max_tokens=max_tokens, fmt=fmt)
-        except Exception:
-            return None
-    except Exception:
-        return None
-    if not out:
-        return None
-    first = out[0] or {}
-    if not first.get("ok"):
-        return None
-    served = first.get("model")
-    if not served:
-        try:
-            served = batched_gen._resolve_vllm_model(endpoint_role)
-        except Exception:
-            served = "vllm"
-    return {"text": first.get("text", ""), "ok": True, "model": served, "tier": "vllm"}
-
-
 def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
                       timeout: Optional[float] = None) -> Optional[dict]:
     """Use a stronger local supervisor to route unspecified calls across cloud tier options."""
@@ -649,7 +581,7 @@ def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
         return _heuristic_route(prompt)
 
     instruction = (
-        "Return strict JSON only: {\"provider\":\"openrouter|abliteration|vllm|ollama\","
+        "Return strict JSON only: {\"provider\":\"openrouter|abliteration|ollama\","
         "\"role\":\"triage|coding|reasoning|synthesis|redteam\","
         "\"reason\":\"short\"}. Pick cloud provider only when local first-tier would"
         " likely degrade for this prompt."
@@ -673,7 +605,7 @@ def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
         parsed = json.loads(text)
         provider = str(parsed.get("provider", "")).strip().lower()
         role = str(parsed.get("role", "")).strip().lower()
-        if provider not in {"openrouter", "abliteration", "vllm", "ollama"}:
+        if provider not in {"openrouter", "abliteration", "ollama"}:
             return _heuristic_route(prompt)
         if role not in {"triage", "coding", "reasoning", "synthesis", "redteam"}:
             role = "reasoning"

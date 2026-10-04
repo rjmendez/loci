@@ -206,7 +206,6 @@ Two `.env.example` files are provided:
 | `LOCI_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
 | `LOCI_MCP_TOKEN` | `""` | Bearer token for SSE/HTTP. Required for any non-loopback bind — the server exits rather than serve unauthenticated |
 | `LOCI_OLLAMA_GEN_URL` | _(resolved by `backends.py`)_ | Generation endpoint override (`OLLAMA_GEN_URL` also read) |
-| `LOCI_VLLM_FALLBACK` | `0` | Allow generation to fall back to vLLM (`VLLM_BASE_URL`) when Ollama fails |
 | `LOCI_CONFIG` | `~/.loci/backends.toml` | Backend resolution config file |
 
 ### A2A server

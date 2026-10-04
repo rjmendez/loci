@@ -5,7 +5,7 @@
 Settings resolve through a chain (`mcp/backends.py`):
 
 1. the environment variable
-2. a local probe — `http://localhost:11434` for Ollama, `:8000` for vLLM
+2. a local probe — `http://localhost:11434` for Ollama
 3. `~/.loci/backends.toml`, or `$LOCI_CONFIG` — gitignored, machine-specific
 4. the code default
 
@@ -26,7 +26,6 @@ not live in the repo.
 | `LOCI_OLLAMA_GEN_MODEL` | auto (`qwen2.5:3b` if present, else first local non-embedding tag, else `qwen2.5:3b`) | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). Explicit env/config still wins. This auto-fallback prevents hardcoded defaults from silently pointing at missing local tags. |
 | `LOCI_OLLAMA_AUTO_MAX_GB` | `10` | size cap (decimal GB, as `ollama list` reports) for models the `mcp/backends.py` resolvers pick *automatically* from the local inventory. Larger installed tags are skipped: Ollama splits a model bigger than one GPU across cards, and on 11-12 GB cards those loads time out and stall its scheduler for every other model, embeddings included. Explicit env/config model names are never filtered. |
 | `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `heretic-llama31-8b-instruct:latest`, then a local heretic/abliterated tag that fits one GPU, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
-| `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
 | `LOCI_TMUX_COMPANION_REQUIRED` | `0` (off) | if set truthy (`1/true/yes/on`), `loci_health` fails loud when required tmux companion sessions are missing. Use this when Copilot/Claude tmux loops are part of required runtime posture |
 | `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
 | `LOCI_TMUX_ROLE_SESSION_MAP` | _(empty)_ | optional `role=session` mappings for offload telemetry attribution (example: `triage=copilot,code=claude`) |
@@ -274,7 +273,7 @@ owns (claim-scope and provenance validation for FlyBrain-derived findings).
 | `EXIF_GEN_MODEL` | `llama3.2:latest` | Ollama model for skill gap analysis |
 | `TOP_K_PER_LEVEL` | `3` | Results per level in MemGAS search; used by memgas_hierarchy.py |
 | `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
-| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route, vLLM and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
+| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 | `LOCI_TRANSPORT_DEADLINE_S` | `30` | Total budget for one retried Qdrant/embed call. A retry starts only if another attempt of the same cost still fits, so a hung backend (20 s `LOCI_QDRANT_TIMEOUT` per attempt) fails after one attempt instead of three; fast failures such as connection refused keep every retry. Exhausted calls raise `<op>_deadline` |
 | `LOCI_DOCS_INGEST_BUDGET_S` | `120` | Wall-clock budget for one `docs_ingest_indexer` call. Past it the call stops, returns `partial: true` with `files_remaining`, and a re-run resumes (indexed files are skipped as unchanged); at least one changed file is stored per call. Stops a big tree from holding a tool worker for tens of minutes (#418) |
 | `LOCI_LOG_FILE` | unset | When set, the server also writes a size-rotated log to this path (stderr logging is unchanged). `LOCI_LOG_MAX_BYTES` (default 10485760) and `LOCI_LOG_BACKUPS` (default 5) tune rotation. An unwritable path logs a warning and falls back to stderr only |
@@ -434,7 +433,7 @@ ever actually run" has an answer.
 Per-run ceilings: `LOCI_GROOM_VERIFY_INVESTIGATIONS` (5),
 `LOCI_GROOM_VERIFY_FINDINGS` (10), `LOCI_GROOM_SUMMARY_INVESTIGATIONS` (12),
 `LOCI_GROOM_REFLECT_ITEMS` (3), `LOCI_GROOM_BATCH` (16). `LOCI_GROOM_MODEL` is
-unset on purpose — the vLLM and Ollama tiers name the same model differently, so
+unset on purpose — each backend names the same model differently, so
 each tier resolves its own.
 
 ---
@@ -638,8 +637,7 @@ well-formed JSON instead of raising across the MCP boundary.
 
 1. Ensure local generation lane is reachable (`LOCI_OLLAMA_GEN_URL`/`OLLAMA_GEN_URL`)
    and all configured tags resolve (`ollama show <tag>` for cheap/escalate/synthesize).
-2. Optional batched lane: set `VLLM_BASE_URL` (and role-specific `VLLM_MODEL_*` if used).
-3. Set explicit swarm defaults in env/backends config as needed:
+2. Set explicit swarm defaults in env/backends config as needed:
    - `LOCI_SWARM_CHEAP_MODEL`
    - `LOCI_SWARM_ESCALATE_MODEL`
    - `LOCI_SWARM_SYNTHESIZE_MODEL`
@@ -720,7 +718,6 @@ python3 -m pytest scripts/tests/test_model_catalog.py -q
 |---|---|---|
 | `degraded: true` with summary "Swarm reasoning degraded..." | wrapper/import/runtime failure in `swarm_reason` | Keep artifact, treat as non-authoritative, rerun CLI `swarm_escalate.py` directly to isolate |
 | `swarm_reason busy: global inflight limit ... reached` | `LOCI_SWARM_MAX_INFLIGHT` saturated | Retry after queue drains, or temporarily raise `LOCI_SWARM_MAX_INFLIGHT` |
-| Multi-seed run becomes slower than baseline | vLLM probe inconclusive or batched lane missing requested model | Pin `--seeds 1` or set `LOCI_SWARM_AUTO_PARALLEL=0`; verify `/v1/models` serves requested tags |
 | Many escalations with low confidence | cheap tier underpowered for workload | raise `self_consistency_samples`, enable `--escalate-with-prior-context`, or temporarily pin stronger `--cheap-model` |
 | Empty/unparseable synthesis in think mode | reasoning consumed synthesis budget | keep `--synthesize-think` optional; built-in fallback already retries with normal synthesis |
 
@@ -903,7 +900,7 @@ into `.git/hooks`.
 No infra address or path is hardcoded. To stand up on a new machine:
 
 1. `cp backends.toml.example ~/.loci/backends.toml` and fill in the endpoints and
-   keys for this machine — Ollama, vLLM, Qdrant, embed/rerank models, memory dir.
+   keys for this machine — Ollama, Qdrant, embed/rerank models, memory dir.
    This is the durable channel: it needs no third-party import and no launcher
    that remembers to export anything. Leave a section blank on a laptop that
    runs its own Ollama; the local probe finds it.

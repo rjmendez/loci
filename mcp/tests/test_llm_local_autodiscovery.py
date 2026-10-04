@@ -31,7 +31,6 @@ def _setup(monkeypatch, tags, ps=(), installed=()):
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama.test")
     monkeypatch.delenv("LOCI_OLLAMA_AUTO_MAX_GB", raising=False)
     monkeypatch.setattr(L, "_gen_env", lambda: "http://ollama.test")
-    monkeypatch.setattr(L, "_try_vllm", lambda *a, **k: None)
     monkeypatch.setattr(L, "_supervisor_route", lambda *a, **k: None)
     monkeypatch.setattr(L, "_try_cloud_tier", lambda *a, **k: None)
     posts = []

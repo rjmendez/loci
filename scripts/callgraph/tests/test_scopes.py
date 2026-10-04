@@ -71,7 +71,7 @@ def test_module_level_and_function_local_import_scope():
     assert len(module_level) == 1 and module_level[0].names == [("json", None)]
     assert {r.names[0][0] for r in local} == {"numpy", "textwrap"}
     numpy_rec = next(r for r in local if r.names[0][0] == "numpy")
-    assert numpy_rec.enclosing_fn == "resolve_vllm"
+    assert numpy_rec.enclosing_fn == "resolve_backend"
     textwrap_rec = next(r for r in local if r.names[0][0] == "textwrap")
     assert textwrap_rec.enclosing_fn == "Widget.render"
 

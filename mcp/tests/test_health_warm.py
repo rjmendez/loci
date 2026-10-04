@@ -19,7 +19,7 @@ import server  # noqa: E402
 
 
 _EXPECTED_KEYS = {
-    "code_version", "ladybug", "ollama_reachable", "vllm_reachable",
+    "code_version", "ladybug", "ollama_reachable",
     "qdrant_reachable", "embed_model", "rerank_model", "warm", "status",
 }
 
@@ -34,19 +34,17 @@ def test_loci_health_returns_expected_keys():
         "available", "contended", "unavailable", "latched", "backoff"
     )
     # booleans for reachability, strings for model names / version
-    for k in ("ollama_reachable", "vllm_reachable", "qdrant_reachable", "warm"):
+    for k in ("ollama_reachable", "qdrant_reachable", "warm"):
         assert isinstance(out[k], bool)
     for k in ("code_version", "embed_model", "rerank_model"):
         assert isinstance(out[k], str)
 
 
 def test_loci_health_probes_independent_and_fail_open(monkeypatch):
-    # _alive raises for the ollama endpoint, is up for vllm, down for qdrant.
+    # _alive raises for the ollama endpoint and is down for qdrant.
     def fake_alive(url, timeout=1.0):
         if "11434" in (url or ""):
             raise RuntimeError("boom: probe blew up")
-        if "8000" in (url or ""):
-            return True
         return False
 
     monkeypatch.setattr(backends, "_alive", fake_alive)
@@ -55,13 +53,11 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
     # Resolvers now accept a probe_timeout arg (loci_health passes a short one).
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
     monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: "http://localhost:11434")
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
     out = json.loads(server.loci_health())
     # The raising ollama probe must NOT mask the others (independent + fail-open).
     assert out["ollama_reachable"] is False   # swallowed -> default
-    assert out["vllm_reachable"] is True
     assert out["qdrant_reachable"] is False
     assert _EXPECTED_KEYS <= set(out.keys())
 
@@ -69,7 +65,6 @@ def test_loci_health_probes_independent_and_fail_open(monkeypatch):
 def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
     # Every probe is independent and fail-open: the full key set survives any resolver raising.
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(backends, "qdrant", lambda: (_ for _ in ()).throw(RuntimeError("x")))
     out = json.loads(server.loci_health())
     assert _EXPECTED_KEYS <= set(out.keys())
@@ -77,32 +72,29 @@ def test_loci_health_never_raises_when_resolvers_throw(monkeypatch):
 
 def test_loci_health_probes_are_bounded_short_timeout(monkeypatch):
     # Every probe, the resolvers' own included, must be short-timeout so a first call cannot block.
-    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "QDRANT_URL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(backends, "_config", lambda: {})
     backends.ollama_url.cache_clear()
-    backends.vllm_url.cache_clear()
 
 
 def test_loci_health_explicit_backend_down_is_unhealthy(monkeypatch):
-    monkeypatch.setenv("VLLM_BASE_URL", "http://explicit-vllm:18000")
+    monkeypatch.setenv("QDRANT_URL", "http://explicit-qdrant:6333")
     monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: False)
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://explicit-vllm:18000")
-    monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
+    monkeypatch.setattr(backends, "qdrant", lambda: ("http://explicit-qdrant:6333", ""))
 
     out = json.loads(server.loci_health())
     assert out["status"] == "unhealthy"
-    assert any("vllm" in x for x in out.get("failures", []))
+    assert any("qdrant" in x for x in out.get("failures", []))
 
 
 def test_loci_health_unconfigured_backend_down_stays_fail_open(monkeypatch):
-    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "QDRANT_URL"):
+    for var in ("OLLAMA_BASE_URL", "OLLAMA_URL", "QDRANT_URL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(backends, "_config", lambda: {})
     monkeypatch.setattr(backends, "_alive", lambda url, timeout=1.0: False)
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "")
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "")
     monkeypatch.setattr(backends, "qdrant", lambda: ("", ""))
 
     out = json.loads(server.loci_health())
@@ -132,7 +124,6 @@ def test_loci_health_tmux_optional_missing_stays_ok(monkeypatch):
     monkeypatch.setattr(backends, "_http_probe", lambda *a, **k: (True, {}))
     monkeypatch.setattr(backends, "ollama_url", lambda *a, **k: "http://localhost:11434")
     monkeypatch.setattr(backends, "ollama_gen_url", lambda *a, **k: "http://localhost:11434")
-    monkeypatch.setattr(backends, "vllm_url", lambda *a, **k: "http://localhost:8000")
     monkeypatch.setattr(backends, "qdrant", lambda: ("http://localhost:6333", ""))
 
     class _Proc:
