@@ -260,10 +260,30 @@ def ollama_gen_url(probe_timeout: float = 1.0) -> str:
     return ollama_url(probe_timeout)
 
 
+def _pool_pick(role: str, hint: str = "") -> str:
+    """Ranked pick from the model pool ([[models.pool]]), or "" when no pool is configured,
+    the role is not pooled, or nothing pooled is installed. ``hint`` is the operator's own
+    tag for the role: it joins as rank 0, so it still wins while installed and the pool
+    takes over when it is not. Never raises."""
+    try:
+        import model_pool
+        return model_pool.pick(role, hint)
+    except Exception as exc:
+        logger.debug("_pool_pick(%r): fail-open swallow: %r", role, exc)
+        return ""
+
+
 def ollama_gen_model() -> str:
-    """Generation model tag. Env -> [ollama].gen_model -> installed local -> default."""
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
-                  or _cfg("ollama", "gen_model", ""))
+    """Generation model tag. Env -> model pool ('gen', with [ollama].gen_model as its
+    top candidate) -> [ollama].gen_model -> installed local -> default."""
+    env = os.environ.get("LOCI_OLLAMA_GEN_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "gen_model", "")
+    pooled = _pool_pick("gen", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     preferred = (ONE_GPU_FALLBACK_MODEL, "heretic-llama31-8b-instruct:latest")
@@ -280,9 +300,12 @@ def _task_model(env_var: str, cfg_key: str) -> str:
     operator opt specific call sites into a different model without changing the default
     that classify_text (and anything else unspecified) keeps using.
     """
-    return (os.environ.get(env_var)
-            or _cfg("ollama", cfg_key, "")
-            or ollama_gen_model())
+    env = os.environ.get(env_var)
+    if env:
+        return env
+    cfg = _cfg("ollama", cfg_key, "")
+    pooled = _pool_pick(cfg_key.removesuffix("_model"), cfg)
+    return pooled or cfg or ollama_gen_model()
 
 
 def ollama_verify_model() -> str:
@@ -328,8 +351,14 @@ def ollama_guardian_model() -> str:
 
     Env -> [ollama].guardian_model -> "granite3-guardian:2b".
     """
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
-                  or _cfg("ollama", "guardian_model", ""))
+    env = os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "guardian_model", "")
+    pooled = _pool_pick("guardian", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     preferred = ("llama-guard3:8b", "granite3-guardian:2b",
@@ -347,8 +376,14 @@ def ollama_redteam_model() -> str:
     env -> [ollama].redteam_model -> an installed heretic/abliterated tag that fits one
     GPU -> a one-GPU heretic default.
     """
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
-                  or _cfg("ollama", "redteam_model", ""))
+    env = os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "redteam_model", "")
+    pooled = _pool_pick("redteam", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     return (_first_installed((ONE_GPU_REDTEAM_FALLBACK_MODEL,))

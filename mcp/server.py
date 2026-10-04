@@ -8488,6 +8488,13 @@ def loci_health() -> str:
                 pass
         # When a generation model is configured, the gen endpoint must actually carry it.
         _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        try:   # a model pool, when declared, decides which tag the gen endpoint must carry
+            import model_pool
+            if model_pool.configured():
+                _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends.ollama_gen_model()
+                out["model_pool"] = model_pool.summary()
+        except Exception as exc:
+            logger.debug("loci_health: model pool probe failed: %r", exc)
         _tags = http_answers.get("ollama_gen_reachable")
         if (out.get("ollama_gen_reachable") and _gen_model and isinstance(_tags, dict)
                 and isinstance(_tags.get("models"), list)):
