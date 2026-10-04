@@ -286,3 +286,96 @@ def _prefers_b(role, features):
 
 def _explodes(role, features):
     raise RuntimeError("selector bug")
+
+
+# ---- over-cap fallback and per-role ranks --------------------------------------------
+
+CAP_INV = {
+    "small-verifier:8b": int(4.9 * GB),
+    "big-verifier:26b": int(18.6 * GB),
+    "bigger-verifier:27b": int(17.2 * GB),
+}
+CAP_POOL = [
+    M.PoolEntry("small-verifier:8b", ("verify",), rank=1),
+    M.PoolEntry("big-verifier:26b", ("verify",), rank=10),
+    M.PoolEntry("bigger-verifier:27b", ("verify",), rank=11),
+]
+
+
+def test_cap_prefers_a_model_that_fits_even_when_a_bigger_one_ranks_higher():
+    pool = [M.PoolEntry("big-verifier:26b", ("verify",), rank=1),
+            M.PoolEntry("small-verifier:8b", ("verify",), rank=2)]
+    d = _rank("verify", pool=pool, inv=CAP_INV, fallback=True)
+    assert d.chosen == "small-verifier:8b"
+    assert not any(c.over_cap for c in d.candidates)
+
+
+def test_without_fallback_the_cap_leaves_the_role_unresolved():
+    inv = {k: v for k, v in CAP_INV.items() if k != "small-verifier:8b"}
+    assert _rank("verify", pool=CAP_POOL, inv=inv, fallback=False).chosen == ""
+
+
+def test_when_nothing_fits_the_strongest_over_cap_model_is_used():
+    inv = {k: v for k, v in CAP_INV.items() if k != "small-verifier:8b"}
+    d = _rank("verify", pool=CAP_POOL, inv=inv, fallback=True)
+    assert d.chosen == "big-verifier:26b"                  # best rank among the over-cap
+    chosen = next(c for c in d.candidates if c.name == d.chosen)
+    assert chosen.over_cap and "nothing fits" in chosen.reason
+    assert d.ordered() == ["big-verifier:26b", "bigger-verifier:27b"]
+
+
+def test_fallback_never_resurrects_a_model_that_is_not_installed():
+    d = _rank("verify", pool=CAP_POOL, inv={}, fallback=True)
+    assert d.chosen == ""
+
+
+def test_the_cap_relaxes_per_role_not_globally():
+    pool = CAP_POOL + [M.PoolEntry("small-gen:3b", ("gen",), rank=1)]
+    inv = dict(CAP_INV, **{"small-gen:3b": 2 * GB})
+    inv.pop("small-verifier:8b")
+    assert _rank("verify", pool=pool, inv=inv, fallback=True).chosen == "big-verifier:26b"
+    assert _rank("gen", pool=pool, inv=inv, fallback=True).chosen == "small-gen:3b"
+
+
+def test_role_rank_overrides_the_entry_rank_for_that_role_only():
+    pool = [M.PoolEntry("a", ("gen", "verify"), rank=1, role_rank=(("verify", 5.0),)),
+            M.PoolEntry("b", ("gen", "verify"), rank=2)]
+    inv = {"a": GB, "b": GB}
+    assert _rank("gen", pool=pool, inv=inv).chosen == "a"
+    assert _rank("verify", pool=pool, inv=inv).chosen == "b"
+
+
+def test_configured_hint_uses_rank_zero_even_with_a_role_rank():
+    pool = [M.PoolEntry("a", ("verify",), rank=1, role_rank=(("verify", 9.0),)),
+            M.PoolEntry("b", ("verify",), rank=2)]
+    assert _rank("verify", pool=pool, inv={"a": GB, "b": GB}, hint="a").chosen == "a"
+
+
+def test_role_rank_and_over_cap_fallback_parse_from_config(monkeypatch):
+    _cfg(monkeypatch, {"over_cap_fallback": True, "max_vram_gb": 10,
+                       "pool": [{"name": "m", "roles": ["verify"], "rank": 1,
+                                 "role_rank": {"Verify": 3, "gen": 7}}]})
+    assert M.over_cap_fallback() is True and M.max_vram_gb() == 10.0
+    (entry,) = M.entries()
+    assert entry.rank_for("verify") == 3.0 and entry.rank_for("gen") == 7.0 and entry.rank_for("code") == 1.0
+
+
+def test_over_cap_fallback_defaults_off(monkeypatch):
+    _cfg(monkeypatch, {"pool": [{"name": "m", "roles": ["gen"]}]})
+    assert M.over_cap_fallback() is False
+
+
+def test_summary_marks_an_over_cap_pick(monkeypatch):
+    _cfg(monkeypatch, {"max_vram_gb": 10, "over_cap_fallback": True,
+                       "pool": [{"name": "big-verifier:26b", "roles": ["verify"], "rank": 1}]})
+    monkeypatch.setattr(M, "inventory", lambda base_url=None: {"big-verifier:26b": int(18.6 * GB)})
+    monkeypatch.setattr(M, "resident_models", lambda base_url=None: set())
+    info = M.summary()["roles"]["verify"]
+    assert info["chosen"] == "big-verifier:26b" and info["over_cap"] is True
+
+
+def test_rendered_toml_keeps_role_rank():
+    import tomllib
+    text = M.render_toml([M.PoolEntry("m", ("gen", "verify"), 1, role_rank=(("verify", 4.0),))])
+    row = tomllib.loads(text)["models"]["pool"][0]
+    assert row["role_rank"] == {"verify": 4.0}
