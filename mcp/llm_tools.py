@@ -646,6 +646,44 @@ def offload_tool_loop(task: str, allowed_tools: Optional[list] = None,
         dry_run=dry_run), indent=2, default=str)
 
 
+def model_lease_acquire(job: str, need_gb: float, priority: str = "normal", ttl_s: int = 1800,
+                        wait_s: float = 60.0, restore: bool = True) -> str:
+    """
+    Borrow GPU headroom for a special job: unload resident Ollama models until one GPU has
+    ``need_gb`` free, and return a lease id.
+
+    Evicts worst-ranked models first (models outside the pool, then the lowest pool rank).
+    Never evicts a pinned/non-evictable pool entry or a model a Loci call is using. With
+    ``priority="normal"`` the current primary for each pooled role is also protected; use
+    ``"critical"`` to let primaries go. Progress is verified with nvidia-smi; if the room
+    cannot be made the models are put back and ``granted`` is false with the shortfall.
+    While the lease is active the pool will not reload what it evicted. The lease expires
+    after ``ttl_s`` and ``model_lease_release`` loads the evicted models back (unless
+    ``restore`` is false). Returns JSON.
+    """
+    import model_lease
+    return json.dumps(model_lease.acquire(job, need_gb, priority=priority, ttl_s=ttl_s,
+                                          wait_s=wait_s, restore=restore), indent=2)
+
+
+def model_lease_release(lease_id: str) -> str:
+    """
+    End a model lease and load back the models it evicted. Safe to call twice; an expired lease
+    has already been released. Returns JSON ``{released, job, restored, restore_failed}``.
+    """
+    import model_lease
+    return json.dumps(model_lease.release(lease_id), indent=2)
+
+
+def model_lease_status() -> str:
+    """
+    Active model leases, the models resident in Ollama with their VRAM use, and free VRAM per
+    GPU. Expired leases are released first. Returns JSON.
+    """
+    import model_lease
+    return json.dumps(model_lease.status(), indent=2)
+
+
 def register(mcp):
     """Register every local-model passthrough tool on the shared FastMCP instance."""
     for fn in (
@@ -661,5 +699,8 @@ def register(mcp):
         ground,
         swarm_reason,
         offload_tool_loop,
+        model_lease_acquire,
+        model_lease_release,
+        model_lease_status,
     ):
         mcp.tool()(fn)

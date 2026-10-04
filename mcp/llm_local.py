@@ -63,6 +63,16 @@ _MIN_ATTEMPT_S = 5.0
 _GPU_LOADED_OLLAMA_TIMEOUT_S = float(os.environ.get("LOCI_GPU_LOADED_OLLAMA_TIMEOUT_S", "30"))
 
 
+def _lease_inflight(model: str):
+    """Mark ``model`` busy so a model lease will not evict it mid-request. A no-op if unavailable."""
+    try:
+        import model_lease
+        return model_lease.inflight(model)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _read_gpu_load():
     """Read the shared GPU load signal without raising."""
     try:
@@ -491,7 +501,8 @@ def generate(prompt: str,
         import requests
         _LOG.info("llm_local request tier=ollama model=%s fmt=%s max_tokens=%s",
                   model, fmt or "", max_tokens)
-        r = requests.post(f"{base}/api/generate", json=body, timeout=attempt_timeout())
+        with _lease_inflight(model):
+            r = requests.post(f"{base}/api/generate", json=body, timeout=attempt_timeout())
         r.raise_for_status()
         payload = r.json()
         text = (payload.get("response") or "")
@@ -513,7 +524,8 @@ def generate(prompt: str,
             retry_body["model"] = discovered
             try:
                 _LOG.info("llm_local retry tier=ollama model=%s", discovered)
-                r = requests.post(f"{base}/api/generate", json=retry_body, timeout=attempt_timeout())
+                with _lease_inflight(discovered):
+                    r = requests.post(f"{base}/api/generate", json=retry_body, timeout=attempt_timeout())
                 r.raise_for_status()
                 payload = r.json()
                 text = (payload.get("response") or "")
