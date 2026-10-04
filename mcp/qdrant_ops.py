@@ -58,6 +58,9 @@ _TRANSPORT_BACKOFF_CAP_S = max(_TRANSPORT_BACKOFF_BASE_S, _float_env("LOCI_TRANS
 _TRANSPORT_BROWNOUT_THRESHOLD = max(2, _int_env("LOCI_TRANSPORT_BROWNOUT_THRESHOLD", 4))
 _TRANSPORT_BROWNOUT_SECONDS = max(1.0, _float_env("LOCI_TRANSPORT_BROWNOUT_SECONDS", 20.0))
 _TRANSPORT_READY_TIMEOUT_S = max(0.05, _float_env("LOCI_TRANSPORT_READY_TIMEOUT_S", 0.5))
+# One budget for a retried call. A hung backend (accepts the connection, never answers) costs a full
+# client timeout per attempt; without a budget 3 attempts x LOCI_QDRANT_TIMEOUT blocks a worker for minutes.
+_TRANSPORT_DEADLINE_S = max(1.0, _float_env("LOCI_TRANSPORT_DEADLINE_S", 30.0))
 _TRANSPORT_READY_CACHE_SECONDS = max(0.2, _float_env("LOCI_TRANSPORT_READY_CACHE_SECONDS", 3.0))
 
 _transport_lock = threading.Lock()
@@ -144,7 +147,9 @@ def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
     if open_now:
         raise RuntimeError(f"{op}_brownout:{remaining:.2f}s")
     last_exc = None
+    started = time.monotonic()
     for attempt in range(1, attempts + 1):
+        attempt_started = time.monotonic()
         try:
             result = call()
             _breaker_success(op)
@@ -161,6 +166,16 @@ def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
                 op, kind, attempt, attempts, retryable and (attempt < attempts), str(exc)[:180],
             )
             if retryable and attempt < attempts:
+                # Retry only if another attempt of the same cost still fits the budget. Fast failures
+                # (connection refused) keep every retry; a slow timeout stops after the first.
+                spent = time.monotonic() - started
+                last_cost = time.monotonic() - attempt_started
+                if spent + _TRANSPORT_BACKOFF_CAP_S + last_cost > _TRANSPORT_DEADLINE_S:
+                    logger.warning(
+                        "transport deadline op=%s spent_s=%.1f budget_s=%.1f; not retrying",
+                        op, spent, _TRANSPORT_DEADLINE_S,
+                    )
+                    raise RuntimeError(f"{op}_deadline") from exc
                 waited = _backoff_sleep(attempt - 1)
                 logger.info("transport retry op=%s next_attempt=%d backoff_s=%.2f", op, attempt + 1, waited)
                 continue
