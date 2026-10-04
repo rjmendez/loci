@@ -39,7 +39,7 @@ Tools:
     memory_health                — substrate self-check (qdrant / embedders / mirror / integrity)
     code_memory_correlate        — link code-hallucination flags to contaminated investigation findings
     wiring_obligation_scan       — advisory-only scan for implicit obligations that may merit manual declaration
-    reflection_loop_seed         — enqueue Copilot artifacts for bounded self-reflection
+    reflection_loop_seed         — enqueue Claude Code / Copilot / Hermes logs for bounded self-reflection
     reflection_loop_tick         — process small queued batches and store findings
     reflection_loop_status       — inspect reflection queue and aggregate loop stats
 """
@@ -65,7 +65,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Collection, Literal, Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -1100,6 +1100,7 @@ def _reflection_default_state() -> dict:
             "warning_signature_observations": {},
             "last_error_signatures": [],
             "last_warning_signatures": [],
+            "by_source": {},
         },
         "created_at": now,
         "updated_at": now,
@@ -1161,9 +1162,82 @@ def _reflection_queue_priority(kind: str) -> int:
     # Lower = higher priority.
     return {
         "process_log": 0,
+        "hermes_log": 0,
         "temp_ingest": 1,
         "session_event": 2,
     }.get(str(kind or ""), 3)
+
+
+REFLECTION_SOURCES = ("claude", "copilot", "hermes")
+_REFLECTION_KIND_SOURCE = {
+    "temp_ingest": "copilot",
+    "session_event": "copilot",
+    "process_log": "copilot",
+    "claude_code_event": "claude",
+    "hermes_log": "hermes",
+}
+# High-signal Hermes runtime logs, relative to <hermes root>/logs. ".1" is the first rotation.
+REFLECTION_HERMES_LOG_NAMES = (
+    "errors.log", "agent.log", "tool-audit.log", "gateway.log", "mcp-stderr.log",
+)
+REFLECTION_HERMES_TAIL_LINES = 2000
+
+
+def _reflection_source(kind: str, item: Optional[dict] = None) -> str:
+    """Source (claude|copilot|hermes) of a queue item; ``unknown`` for foreign kinds."""
+    if isinstance(item, dict) and item.get("source") in REFLECTION_SOURCES:
+        return str(item["source"])
+    return _REFLECTION_KIND_SOURCE.get(str(kind or ""), "unknown")
+
+
+def _reflection_roots(env_name: str, default: Path) -> list[Path]:
+    """Roots for one source: ``env_name`` as an os.pathsep list, else ``default``."""
+    raw = os.environ.get(env_name, "")
+    roots = [Path(part).expanduser() for part in raw.split(os.pathsep) if part.strip()]
+    return roots or [default]
+
+
+def _reflection_root_status(root: Path) -> str:
+    try:
+        if not root.exists():
+            return "missing"
+        if not root.is_dir():
+            return "not_a_directory"
+        next(iter(root.iterdir()), None)
+        return "ok"
+    except OSError:
+        return "unreadable"
+
+
+def _reflection_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+_REFLECTION_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
+_REFLECTION_BEARER_RE = re.compile(
+    r"\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{8,}", re.I)
+# key=value, key: value, "key": "value", 'key': 'value' and -H "Header: value" forms.
+_REFLECTION_SECRET_KV_RE = re.compile(
+    r"""(?P<key>["']?[A-Za-z0-9_.-]*(?:authorization|api[_-]?key|apikey|secret|passw(?:or)?d|passwd|token|credential|private[_-]?key|x-api-key)[A-Za-z0-9_.-]*["']?)"""
+    r"""(?P<sep>\s*[:=]\s*)(?P<q>["']?)(?:(?:bearer|basic)\s+)?[^\s"',;&}]+""",
+    re.I,
+)
+_REFLECTION_LONG_BLOB_RE = re.compile(r"\b(?:[0-9a-fA-F]{32,}|[A-Za-z0-9+/_-]{40,}={0,2})\b")
+
+
+def _reflection_scrub(text: str) -> str:
+    """Redact credentials from one excerpt. Applied before anything is stored or returned."""
+    out = str(text or "")
+    out = _REFLECTION_PRIVATE_KEY_RE.sub("<redacted:private-key>", out)
+    out = _REFLECTION_BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", out)
+    out = _REFLECTION_SECRET_KV_RE.sub(
+        lambda m: f"{m.group('key')}{m.group('sep')}{m.group('q')}<redacted>", out)
+    out = _REFLECTION_LONG_BLOB_RE.sub("<redacted:blob>", out)
+    return out
 
 
 def _read_tail_lines(path: Path, *, max_lines: int, max_bytes: int) -> list[str]:
@@ -1228,9 +1302,10 @@ class _ReflectionScan:
     bytes_scanned: int = 0
     sampling_mode: str = "full"
 
-    def scan_line(self, line: str) -> None:
+    def scan_line(self, line: str, severity: str | None = None) -> None:
+        line = _reflection_scrub(line)
         canon = _canonicalize_reflection_signature(line)
-        severity = _reflection_line_severity(line)
+        severity = severity or _reflection_line_severity(line)
         if severity == "error":
             self.error_counts[canon] += 1
         elif severity == "warning":
@@ -1279,6 +1354,71 @@ def _scan_session_event(file_path: Path, scan: "_ReflectionScan", max_lines: int
             scan.scan_line(joined)
 
 
+_CLAUDE_INTERRUPT_RE = re.compile(r"\[request interrupted by user", re.I)
+_CLAUDE_PERMISSION_DENIED_RE = re.compile(
+    r"permission (?:for this|to use).{0,80}(?:denied|rejected)|permission denied|was denied|doesn.t want to proceed|user rejected",
+    re.I,
+)
+
+
+def _reflection_text_of(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _scan_claude_blocks(blocks: list, scan: "_ReflectionScan") -> None:
+    """Signal that lives in non-text blocks: failed tool results and permission denials."""
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        text = _reflection_text_of(block.get("content"))[:600]
+        if _CLAUDE_PERMISSION_DENIED_RE.search(text):
+            scan.event_counts["permission_denied"] += 1
+            scan.scan_line("claude tool permission denied", severity="warning")
+        elif block.get("is_error"):
+            scan.event_counts["tool_result_error"] += 1
+            first = next((ln for ln in text.splitlines() if ln.strip()), "")
+            scan.scan_line(f"claude tool_result error: {first[:160]}", severity="error")
+
+
+def _scan_hermes_log_line(raw: str, scan: "_ReflectionScan") -> None:
+    scan.lines_scanned += 1
+    scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+    level = _HERMES_LEVEL_RE.search(raw[:80])
+    if level:
+        lv = level.group(1).upper()
+        if lv in ("ERROR", "CRITICAL", "FATAL"):
+            scan.scan_line(raw, severity="error")
+        elif lv.startswith("WARN"):
+            scan.scan_line(raw, severity="warning")
+        # DEBUG/INFO lines are not signal, whatever words they contain.
+    elif raw.startswith("Traceback (most recent call last)"):
+        scan.scan_line(raw, severity="error")
+    else:
+        scan.scan_line(raw)
+    m = re.search(r"\btool(?:Name|_name)?[=:\"]+\s*([a-zA-Z0-9_.:-]+)", raw)
+    if m:
+        scan.tool_counts[m.group(1)] += 1
+
+
+_HERMES_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)\b")
+
+
+def _scan_hermes_log(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
+    """Tail-bounded scan of one Hermes runtime log (plain text, timestamped, levelled)."""
+    scan.sampling_mode = "tail"
+    for raw in _read_tail_lines(
+        file_path,
+        max_lines=min(max_lines, REFLECTION_HERMES_TAIL_LINES),
+        max_bytes=REFLECTION_LOG_TAIL_READ_BYTES,
+    ):
+        _scan_hermes_log_line(raw, scan)
+
+
 def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
     with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
         for raw in fh:
@@ -1309,6 +1449,7 @@ def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines:
                 content = message.get("content") or ""
                 if isinstance(content, list):
                     # content may be a list of blocks: [{"type": "text", "text": "..."}]
+                    _scan_claude_blocks(content, scan)
                     content = " ".join(
                         str(block.get("text") or "") for block in content
                         if isinstance(block, dict)
@@ -1316,7 +1457,15 @@ def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines:
                 joined = str(content)
             else:
                 joined = str(message)
+            if _CLAUDE_INTERRUPT_RE.search(joined[:400]):
+                scan.event_counts["interrupted_turn"] += 1
+                scan.scan_line("claude turn interrupted", severity="warning")
             scan.scan_line(joined)
+            # API error entries: assistant message flagged isApiErrorMessage, or a system api_error.
+            if event.get("isApiErrorMessage") or event.get("subtype") == "api_error" or event.get("error"):
+                scan.event_counts["api_error"] += 1
+                scan.scan_line(f"claude api error: {_reflection_text_of(event.get('error') or joined)[:160]}",
+                               severity="error")
 
 
 def _scan_process_log(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
@@ -1372,6 +1521,8 @@ def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
         _scan_claude_code_event(file_path, scan, max_lines)
     elif kind == "process_log":
         _scan_process_log(file_path, scan, max_lines)
+    elif kind == "hermes_log":
+        _scan_hermes_log(file_path, scan, max_lines)
     else:
         return {
             "status": "unsupported_kind",
@@ -4071,30 +4222,37 @@ def reflection_loop_seed(
     session_events_limit: int = 250,
     process_logs_limit: int = 120,
     reset_queue: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """
-    Seed the bounded self-reflection queue from Copilot local artifacts.
+    Seed the bounded self-reflection queue from Claude Code, Copilot and Hermes logs.
 
     The queue is persisted under ``$LOCI_MEMORY_DIR/_reflection-loop/state.json``.
     This call only enqueues file targets — it does not parse files or write findings.
     Use ``reflection_loop_tick`` to process queued items in small batches.
+
+    Roots per source are ``LOCI_REFLECT_CLAUDE_ROOTS`` (default ``~/.claude/projects``),
+    ``LOCI_REFLECT_COPILOT_ROOTS`` (default ``~/.copilot``) and ``LOCI_REFLECT_HERMES_ROOTS``
+    (default ``~/.hermes``), each an ``os.pathsep``-separated list. The result reports
+    candidates / enqueued / duplicates and the status of every root per source.
+    ``dry_run=True`` enqueues and persists nothing and only returns those counts.
     """
     session_events_limit = max(1, min(int(session_events_limit), 2000))
     process_logs_limit = max(1, min(int(process_logs_limit), 2000))
 
-    _ensure_investigation_exists(
-        investigation_id,
-        title="Copilot self-reflection loop",
-        context=(
-            "Continuous bounded mining of ~/.copilot/temp_ingest, "
-            "~/.copilot/session-state/*/events.jsonl, ~/.copilot/logs/process-*.log, "
-            "and ~/.claude/projects/**/*.jsonl (Claude Code)"
-        ),
-    )
+    if not dry_run:
+        _ensure_investigation_exists(
+            investigation_id,
+            title="Agent self-reflection loop",
+            context=(
+                "Continuous bounded mining of Copilot (temp_ingest, session-state events, "
+                "process logs), Claude Code (projects/**/*.jsonl) and Hermes runtime logs"
+            ),
+        )
 
     state = _load_reflection_state()
     state["investigation_id"] = investigation_id
-    if reset_queue:
+    if reset_queue and not dry_run:
         state["queue"] = []
         state["processed"] = {}
 
@@ -4106,56 +4264,108 @@ def reflection_loop_seed(
     }
     existing_keys.update(processed.keys())
 
+    per_source: dict[str, dict] = {
+        src: {"roots": [], "candidates": 0, "enqueued": 0, "skipped_duplicate": 0, "skipped_missing_root": 0}
+        for src in REFLECTION_SOURCES
+    }
+    root_lists = {
+        "claude": _reflection_roots("LOCI_REFLECT_CLAUDE_ROOTS", Path.home() / ".claude" / "projects"),
+        "copilot": _reflection_roots("LOCI_REFLECT_COPILOT_ROOTS", Path.home() / ".copilot"),
+        "hermes": _reflection_roots("LOCI_REFLECT_HERMES_ROOTS", Path.home() / ".hermes"),
+    }
+    usable: dict[str, list[Path]] = {}
+    for src, roots in root_lists.items():
+        usable[src] = []
+        for root in roots:
+            status = _reflection_root_status(root)
+            per_source[src]["roots"].append({"root": str(root), "status": status})
+            if status == "ok":
+                usable[src].append(root)
+            else:
+                per_source[src]["skipped_missing_root"] += 1
+
+    def _newest(paths, limit):
+        uniq = {str(p): p for p in paths}.values()
+        return sorted(uniq, key=_reflection_mtime, reverse=True)[:limit]
+
+    def _glob(root: Path, pattern: str, src: str) -> list[Path]:
+        try:
+            return list(root.glob(pattern))
+        except OSError:
+            per_source[src]["skipped_missing_root"] += 1
+            return []
+
     candidates: list[dict] = []
-    temp_ingest = Path.home() / ".copilot" / "temp_ingest" / "payload.json"
-    if temp_ingest.exists():
-        candidates.append({"kind": "temp_ingest", "path": str(temp_ingest)})
+    temp_ingest_found = 0
+    session_files: list[Path] = []
+    process_logs: list[Path] = []
+    claude_code_files: list[Path] = []
+    for root in usable["copilot"]:
+        temp_ingest = root / "temp_ingest" / "payload.json"
+        if temp_ingest.exists():
+            temp_ingest_found += 1
+            candidates.append({"kind": "temp_ingest", "path": str(temp_ingest), "source": "copilot"})
+    session_files = _newest(
+        (p for root in usable["copilot"] for p in _glob(root, "session-state/*/events.jsonl", "copilot")),
+        session_events_limit,
+    )
+    candidates.extend({"kind": "session_event", "path": str(p), "source": "copilot"} for p in session_files)
+    process_logs = _newest(
+        (p for root in usable["copilot"] for p in _glob(root, "logs/process-*.log", "copilot")),
+        process_logs_limit,
+    )
+    candidates.extend({"kind": "process_log", "path": str(p), "source": "copilot"} for p in process_logs)
 
-    session_files = sorted(
-        (Path.home() / ".copilot" / "session-state").glob("*/events.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:session_events_limit]
-    candidates.extend({"kind": "session_event", "path": str(p)} for p in session_files)
+    # Claude Code source paths: <claude root>/**/*.jsonl (default ~/.claude/projects)
+    claude_code_files = _newest(
+        (p for root in usable["claude"] for p in _glob(root, "**/*.jsonl", "claude")),
+        session_events_limit,
+    )
+    candidates.extend({"kind": "claude_code_event", "path": str(p), "source": "claude"} for p in claude_code_files)
 
-    process_logs = sorted(
-        (Path.home() / ".copilot" / "logs").glob("process-*.log"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:process_logs_limit]
-    candidates.extend({"kind": "process_log", "path": str(p)} for p in process_logs)
-
-    # Claude Code source paths: ~/.claude/projects/**/*.jsonl
-    claude_code_files = sorted(
-        (Path.home() / ".claude" / "projects").glob("**/*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:session_events_limit]
-    candidates.extend({"kind": "claude_code_event", "path": str(p)} for p in claude_code_files)
+    # Hermes runtime logs: <hermes root>/logs/<name> and its first rotation.
+    hermes_files: list[Path] = []
+    for root in usable["hermes"]:
+        for name in REFLECTION_HERMES_LOG_NAMES:
+            for suffix in ("", ".1"):
+                f = root / "logs" / f"{name}{suffix}"
+                if f.is_file():
+                    hermes_files.append(f)
+    hermes_files = _newest(hermes_files, process_logs_limit)
+    candidates.extend({"kind": "hermes_log", "path": str(p), "source": "hermes"} for p in hermes_files)
 
     candidates.sort(key=lambda item: _reflection_queue_priority(item.get("kind")))
 
     added = 0
     for item in candidates:
+        rep_ = per_source[item["source"]]
+        rep_["candidates"] += 1
         key = f"{item['kind']}|{item['path']}"
         if key in existing_keys:
+            rep_["skipped_duplicate"] += 1
             continue
-        queue.append(item)
         existing_keys.add(key)
+        rep_["enqueued"] += 1
         added += 1
+        if not dry_run:
+            queue.append(item)
 
-    state["queue"] = queue
-    _save_reflection_state(state)
+    if not dry_run:
+        state["queue"] = queue
+        _save_reflection_state(state)
     return json.dumps({
+        "dry_run": bool(dry_run),
         "queued_added": added,
         "queue_size": len(queue),
         "investigation_id": investigation_id,
         "sources": {
-            "temp_ingest": int(temp_ingest.exists()),
+            "temp_ingest": temp_ingest_found,
             "session_events_candidates": len(session_files),
             "process_logs_candidates": len(process_logs),
             "claude_code_events_candidates": len(claude_code_files),
+            "hermes_logs_candidates": len(hermes_files),
         },
+        "per_source": per_source,
         "state_file": str(REFLECTION_STATE_FILE),
     }, indent=2)
 
@@ -4176,6 +4386,7 @@ def reflection_loop_status(queue_preview: int = 8) -> str:
     return json.dumps({
         "investigation_id": state.get("investigation_id"),
         "queue_size": len(queue),
+        "queue_by_source": dict(Counter(_reflection_source(i.get("kind"), i) for i in queue)),
         "processed_count": len(processed),
         "stats": stats,
         "last_tick": state.get("last_tick"),
@@ -4345,7 +4556,7 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
         finding_type="observed",
         text=finding_text,
         confidence="low",
-        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+        tags=f"self-reflection,loop-tick,artifact-mining,unreceipted-observed,source-{_reflection_source(kind)}",
         metadata=finding_metadata,
     ))
 
@@ -4374,13 +4585,15 @@ def _reflection_batch_low_signal(investigation_id: str, low_signal_session_event
         finding_type="observed",
         text=low_signal_text,
         confidence="low",
-        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal",
+        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal,source-copilot",
     ):
         return 1
     return 0
 
 
-def _reflection_batch_error_signature(investigation_id: str, batch_error_signatures: Counter) -> int:
+def _reflection_batch_error_signature(
+    investigation_id: str, batch_error_signatures: Counter, sources: Collection[str] = (),
+) -> int:
     """Store the batch dominant-error-signature inference finding.
 
     Returns the number to add to ``findings_written`` (0 or 1). Caller must
@@ -4396,7 +4609,8 @@ def _reflection_batch_error_signature(investigation_id: str, batch_error_signatu
         finding_type="inferred",
         text=infer_text,
         confidence="medium",
-        tags="self-reflection,error-cluster,inference",
+        tags="self-reflection,error-cluster,inference"
+        + "".join(f",source-{s_}" for s_ in sorted(set(sources))),
     ):
         return 1
     return 0
@@ -4426,7 +4640,7 @@ def _reflection_requeue_dropped(
                 finding_type="gap",
                 text=gap_text,
                 confidence="low",
-                tags="self-reflection,loop-tick,dropped-item,re-queued",
+                tags=f"self-reflection,loop-tick,dropped-item,re-queued,source-{_reflection_source(d_kind, dropped)}",
             ):
                 added += 1
     return added
@@ -4465,8 +4679,8 @@ def reflection_loop_tick(
     investigation_id = str(state.get("investigation_id") or REFLECTION_DEFAULT_INVESTIGATION)
     _ensure_investigation_exists(
         investigation_id,
-        title="Copilot self-reflection loop",
-        context="Bounded deterministic queue-based Copilot artifact reflection.",
+        title="Agent self-reflection loop",
+        context="Bounded deterministic queue-based Claude Code / Copilot / Hermes log reflection.",
     )
 
     processed = dict(state.get("processed") or {})
@@ -4478,6 +4692,8 @@ def reflection_loop_tick(
     stats.setdefault("bytes_scanned", 0)
     stats.setdefault("error_signatures_suppressed", 0)
     stats.setdefault("warning_signatures_suppressed", 0)
+    by_source = stats.setdefault("by_source", {})
+    batch_sources: set[str] = set()
     stats.setdefault("error_signature_observations", {})
     stats.setdefault("warning_signature_observations", {})
     error_observations = _prune_signature_observations(stats.get("error_signature_observations") or {})
@@ -4499,10 +4715,18 @@ def reflection_loop_tick(
         kind = str(item.get("kind") or "")
         path = str(item.get("path") or "")
         summary = _process_reflection_item(kind, path, max_lines=max_lines_per_file)
+        src = _reflection_source(kind, item)
+        summary["source"] = src
+        src_stats = by_source.setdefault(src, {})
+        for k_ in ("files_processed", "dropped", "errors_seen", "warnings_seen", "findings_written"):
+            src_stats.setdefault(k_, 0)
         item_reports.append(summary)
         if summary.get("status") != "processed":
+            src_stats["dropped"] += 1
             dropped_items.append(item)
             continue
+        batch_sources.add(src)
+        src_stats["files_processed"] += 1
 
         key = f"{kind}|{path}"
         stats["files_processed"] += 1
@@ -4512,6 +4736,8 @@ def reflection_loop_tick(
         raw_warnings = {str(k): int(v) for k, v in (summary.get("warnings") or {}).items()}
         stats["errors_seen"] += sum(raw_errors.values())
         stats["warnings_seen"] += sum(raw_warnings.values())
+        src_stats["errors_seen"] += sum(raw_errors.values())
+        src_stats["warnings_seen"] += sum(raw_warnings.values())
         if store_item_findings:
             # Only a tick that could store findings may mark an item done:
             # reflection_loop_seed permanently excludes every key in processed, so a
@@ -4533,12 +4759,13 @@ def reflection_loop_tick(
             llm_triage_budget=llm_triage_budget,
         ):
             findings_written += 1
+            src_stats["findings_written"] += 1
 
     if store_item_findings and low_signal_session_events:
         findings_written += _reflection_batch_low_signal(investigation_id, low_signal_session_events)
 
     if store_item_findings and batch_error_signatures:
-        findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures)
+        findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures, batch_sources)
 
     stats["last_error_signatures"] = [
         {"signature": sig, "count": count}

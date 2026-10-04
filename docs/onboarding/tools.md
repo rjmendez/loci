@@ -88,6 +88,10 @@ The MCP server exposes roughly 75 tools (the live catalogue lists 76; `mcp/` int
 - **Contracts & wiring:** `contract_declare`, `contract_query`, `contract_check`, `wiring_obligation_scan`, `wiring_obligation_declare`, `wiring_obligation_list`, `wiring_obligation_resolve`.
 - **Memory tiering & correlation:** `memory_promote`, `memory_demote`, `code_memory_correlate`.
 - **Reflection loop:** `reflection_loop_seed`, `reflection_loop_tick`, `reflection_loop_status`.
+  - Sources: Claude Code (`claude`), Copilot (`copilot`) and Hermes runtime logs (`hermes`). Every queue item and stored finding carries its source (`source-<name>` tag); `reflection_loop_status` returns `queue_by_source` and `stats.by_source`.
+  - Roots (each an `os.pathsep`-separated list, so a server on one OS can read another profile through a mount or UNC path): `LOCI_REFLECT_CLAUDE_ROOTS` (default `~/.claude/projects`), `LOCI_REFLECT_COPILOT_ROOTS` (default `~/.copilot`), `LOCI_REFLECT_HERMES_ROOTS` (default `~/.hermes`, reads `logs/{errors,agent,tool-audit,gateway,mcp-stderr}.log` and their first rotation, tail-bounded).
+  - Coverage check: `reflection_loop_seed(dry_run=true)` enqueues and persists nothing and returns `per_source` candidates, enqueued, duplicates and the status of each root (`ok`, `missing`, `unreadable`). Run it before the first real seed.
+  - Hermes excerpts are scrubbed of credentials (bearer/authorization values, key/token/password pairs, long hex/base64 blobs, private-key blocks) before anything is stored or returned; the same scrub runs on every source. LLM triage on tick stays opt-in (`enable_llm_triage`).
 - **Procedure & audit:** `procedure_attempt`, `procedure_search`, `finding_resolve`, `audit_log`.
 - **Health & diagnostics:** `loci_health`, `memory_health`, `retrieval_selftest`.
 - **Advanced reasoning:** `investigation_reason` (grounded multi-perspective synthesis).
