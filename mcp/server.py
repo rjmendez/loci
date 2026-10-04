@@ -79,6 +79,7 @@ from memcheck.checks import (  # noqa: E402
     find_contamination,
     run_code_checks,
     run_contradiction,
+    run_supersession,
     run_provenance,
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
@@ -197,6 +198,10 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger("loci-mcp")
+
+import log_setup  # noqa: E402
+
+log_setup.install_file_logging()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -1849,6 +1854,24 @@ def _compute_aggregate_confidence(
 
 
 
+def _cited_global_receipts(findings: list[dict]) -> list[dict]:
+    """Global daily-log receipts that findings cite by id (date is in the id)."""
+    wanted: dict[str, set[str]] = {}
+    for f in findings:
+        meta = f.get("metadata") if isinstance(f, dict) else None
+        ids = meta.get("receipt_ids") if isinstance(meta, dict) else None
+        for rid in ([ids] if isinstance(ids, str) else ids if isinstance(ids, (list, tuple)) else []):
+            m = re.fullmatch(r"rcpt-(\d{4})(\d{2})(\d{2})-[0-9a-f]+", str(rid))
+            if m:
+                wanted.setdefault("-".join(m.groups()), set()).add(str(rid))
+    out: list[dict] = []
+    for day, rids in wanted.items():
+        path = MEMORY_DIR.parent / "audit" / f"{day}.jsonl"
+        if path.exists():
+            out.extend(e for e in _read_jsonl(path) if e.get("receipt_id") in rids)
+    return out
+
+
 def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict:
     """Run provenance + contradiction inline over an investigation's JSONL.
 
@@ -1884,6 +1907,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             audit_entries,
             tokenizer=tokenize,
             lexical_score=_lexical_match_score,
+            global_audit_entries=_cited_global_receipts(findings),
         )
         check_status["provenance"] = "ok"
     except Exception as exc:  # fail-open — advisory check must never break the caller
@@ -1902,6 +1926,14 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         logger.warning("contradiction check failed, degrading to none: %r", exc)
         contradictions = []
         check_status["contradiction"] = f"failed: {exc!r}"
+
+    try:
+        superseded = run_supersession(findings)
+        check_status["supersession"] = "ok"
+    except Exception as exc:  # fail-open
+        logger.warning("supersession check failed, degrading to none: %r", exc)
+        superseded = []
+        check_status["supersession"] = f"failed: {exc!r}"
 
     if llm_verify:
         try:
@@ -1928,6 +1960,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     return {
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
+        "superseded": superseded,
         "hallucination_candidates": candidates,
         "audit_lane": audit_lane,
         "check_status": check_status,
@@ -2025,6 +2058,9 @@ def _hallucination_candidates(
             if not counter_receipted and not _blanket:
                 continue  # no receipted counter
             if other not in findings_by_id:
+                continue
+            # Only an observed counterpart can show this finding is wrong.
+            if other not in _observed_ids:
                 continue
             if unsup in seen:
                 continue
@@ -5696,10 +5732,14 @@ def audit_log(
                         per-tool templates.
 
     Returns:
-        JSON confirmation.
+        JSON confirmation including ``receipt_id``; pass it to
+        investigation_store as ``metadata={"receipt_ids": [<id>]}`` to cite it.
     """
+    # Cite this id in investigation_store(metadata={"receipt_ids": [...]}).
+    receipt_id = f"rcpt-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:12]}"
     entry = {
         "ts": _now(),
+        "receipt_id": receipt_id,
         "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
         "tool": tool_name,
         "investigation_id": investigation_id,
@@ -5759,6 +5799,7 @@ def audit_log(
 
     return json.dumps({
         "logged": True,
+        "receipt_id": receipt_id,
         "tool": tool_name,
         "ts": entry["ts"],
         "mnemo_stored": mnemo_stored,
@@ -5933,6 +5974,7 @@ def memory_self_check(
             inv_verdicts.extend(computed["unsupported_observed"])
         if "contradiction" in requested:
             inv_verdicts.extend(computed["contradictions"])
+            inv_verdicts.extend(computed.get("superseded", []))
         all_verdicts.extend(inv_verdicts)
         # Only surface when both the provenance and contradiction checks ran.
         inv_candidates = (
@@ -5951,6 +5993,7 @@ def memory_self_check(
                     1 for v in inv_verdicts if v.verdict_type == "contradiction"
                 ),
                 "hallucination_candidates": len(inv_candidates),
+                "superseded": sum(1 for v in inv_verdicts if v.verdict_type == "superseded"),
             },
             "verdicts": [_verdict_view(v) for v in inv_verdicts],
             "hallucination_candidates": inv_candidates,
@@ -5980,6 +6023,7 @@ def memory_self_check(
                 1 for v in all_verdicts if v.verdict_type == "contradiction"
             ),
             "hallucination_candidates": len(all_candidates),
+            "superseded": sum(1 for v in all_verdicts if v.verdict_type == "superseded"),
         },
         "hallucination_candidates": all_candidates,
         "recorded": recorded,

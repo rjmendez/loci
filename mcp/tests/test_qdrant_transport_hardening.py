@@ -134,3 +134,39 @@ def test_query_retry_helper_reports_timeout_when_exhausted(monkeypatch):
     monkeypatch.setattr(Q.time, "sleep", lambda _s: None)
     with pytest.raises(RuntimeError, match="qdrant_query_timeout"):
         Q._query_points_with_retry(lambda: (_ for _ in ()).throw(TimeoutError("timed out")), attempts=2, op="qdrant_query")
+
+
+def test_slow_timeouts_stop_retrying_inside_the_deadline(monkeypatch):
+    """Three 20 s timeouts used to cost 60 s; the budget lets only the first attempt run."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(Q.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(Q.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(Q, "_TRANSPORT_DEADLINE_S", 30.0)
+    monkeypatch.setattr(Q, "_TRANSPORT_BACKOFF_CAP_S", 1.5)
+    calls = []
+
+    def hung():
+        calls.append(clock["t"])
+        clock["t"] += 20.0
+        raise TimeoutError("timed out")
+
+    with pytest.raises(RuntimeError, match="qdrant_query_deadline"):
+        Q._query_points_with_retry(hung, attempts=3)
+    assert len(calls) == 1
+    assert clock["t"] == 20.0
+
+
+def test_fast_connection_failures_still_use_every_retry(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(Q.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(Q.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(Q, "_TRANSPORT_DEADLINE_S", 30.0)
+    calls = []
+
+    def refused():
+        calls.append(clock["t"])
+        raise ConnectionError("connection refused")
+
+    with pytest.raises(RuntimeError, match="qdrant_query_connection"):
+        Q._query_points_with_retry(refused, attempts=3)
+    assert len(calls) == 3

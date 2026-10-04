@@ -103,3 +103,34 @@ Holding watermark at <ts> — N send(s) failed and would otherwise be skipped pe
 ```
 
 A bridge that is failing is now noisy by design. Silence means it is working.
+
+## qdrant-pf + loci-mcp user dependency
+
+This repo ships a user-scoped localhost bridge for Qdrant plus a `loci-mcp`
+drop-in dependency:
+
+- `scripts/systemd/qdrant-pf.service`
+- `scripts/systemd/loci-mcp-qdrant-pf.conf`
+- `scripts/ops/qdrant_local_bridge.py`
+- `scripts/ops/install-qdrant-user-bridge.sh`
+
+Use this when `loci-mcp` must keep `QDRANT_URL` on loopback while Qdrant runs in
+k3s. The bridge resolves `infra/qdrant` clusterIP and forwards
+`127.0.0.1:30633 -> <clusterIP>:6333`.
+
+Install/update in one step:
+
+```bash
+cd ~/development/loci
+chmod +x scripts/ops/install-qdrant-user-bridge.sh
+scripts/ops/install-qdrant-user-bridge.sh
+```
+
+The installer:
+
+1. Copies `qdrant_local_bridge.py` to `~/.local/bin/`.
+2. Installs `qdrant-pf.service` under `~/.config/systemd/user/`.
+3. Installs the `loci-mcp` drop-in
+   `~/.config/systemd/user/loci-mcp.service.d/d20-qdrant-pf.conf`.
+4. Runs `systemctl --user daemon-reload`, enables/starts `qdrant-pf`, and
+   restarts `loci-mcp`.

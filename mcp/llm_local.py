@@ -92,35 +92,68 @@ def _looks_embedding_model(model: str) -> bool:
     return bool(tag) and ("embed" in tag or "embedding" in tag)
 
 
+def _auto_max_bytes() -> int:
+    """Size cap for automatic picks; shares LOCI_OLLAMA_AUTO_MAX_GB with backends."""
+    try:
+        import backends
+        return backends._auto_pick_max_bytes()
+    except Exception:
+        return 10 * 10**9
+
+
 def _discover_generation_model(base: str, exclude: str = "", timeout: Optional[float] = None) -> str:
     """Best-effort local model discovery for deployment-specific installs.
 
     If the configured generation model is invalid for this machine (for example
-    an embedding tag), pick the first locally-installed non-embedding model.
-    Fail-open: any error returns ''.
+    an embedding tag or one that is not installed), pick a locally-installed
+    non-embedding model that fits one GPU (size <= LOCI_OLLAMA_AUTO_MAX_GB, default
+    10): a resident one if any qualifies, else the first listed. Never picks an
+    oversized tag; a load that big wedged the NVIDIA driver (2026-09-24, 09-27).
+    Fail-open: any error, or no eligible tag, returns ''.
     """
     try:
         import requests
-        r = requests.get(f"{base}/api/tags", timeout=_TIMEOUT if timeout is None else timeout)
+        t = _TIMEOUT if timeout is None else timeout
+        r = requests.get(f"{base}/api/tags", timeout=t)
         r.raise_for_status()
         payload = r.json() if hasattr(r, "json") else {}
         models = payload.get("models") if isinstance(payload, dict) else []
         if not isinstance(models, list):
             return ""
         blocked = {exclude.strip().lower()} if exclude else set()
+        cap = _auto_max_bytes()
+        eligible = []
         for item in models:
             name = str((item or {}).get("name") or "").strip()
             if not name:
                 continue
-            low = name.lower()
-            if low in blocked:
+            if name.lower() in blocked:
                 continue
             if _looks_embedding_model(name):
                 continue
-            return name
+            size = (item or {}).get("size")
+            if isinstance(size, (int, float)) and size > cap:
+                continue
+            eligible.append((name, size))
+        if not eligible:
+            return ""
+        chosen = eligible[0]
+        if len(eligible) > 1:
+            try:
+                pr = requests.get(f"{base}/api/ps", timeout=t)
+                pr.raise_for_status()
+                running = {str((m or {}).get("name") or (m or {}).get("model") or "").lower()
+                           for m in (pr.json().get("models") or [])}
+                chosen = next((e for e in eligible if e[0].lower() in running), chosen)
+            except Exception:
+                pass
+        size = chosen[1]
+        _LOG.warning("llm_local model substitution: configured=%r missing or unusable, using %r (size=%s)",
+                     exclude, chosen[0],
+                     f"{size / 2**30:.1f} GiB" if isinstance(size, (int, float)) else "unknown")
+        return chosen[0]
     except Exception:
         return ""
-    return ""
 
 def _flag_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -518,7 +551,11 @@ def generate(prompt: str,
                 _LOG.info("llm_local fallback tier=%s model=%s",
                           cloud.get("tier", "unknown"), cloud.get("model", ""))
                 return cloud
-            return fail(f"ollama {type(exc).__name__}: {exc}"[:300])
+            why = f"ollama {type(exc).__name__}: {exc}"
+            if not discovered:
+                why += (f" (configured model {model!r} unavailable; no eligible fallback "
+                        f"under the {_auto_max_bytes() / 10**9:g} GB one-GPU cap)")
+            return fail(why[:300])
 
     if fmt == "json":
         # ok=True only if the body actually parses as JSON.
