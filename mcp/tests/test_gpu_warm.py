@@ -129,9 +129,11 @@ def test_drop_once_unloads_models_with_zero_keep_alive(monkeypatch):
     report = G.drop_once(post_fn=poster, include_gpu=False)
     assert report["degraded"] is False
     assert all(p["ok"] and p["keep_alive"] == 0 for p in report["pins"])
-    calls = {c["url"]: c["json"] for c in poster.calls if c["url"].endswith(("/api/generate", "/api/embed"))}
-    assert calls["http://stub-ollama:11434/api/generate"]["keep_alive"] == 0
-    assert calls["http://stub-ollama:11434/api/embed"]["keep_alive"] == 0
+    # Keyed by endpoint, not full URL: gpu_warm resolves its base URL at import time, so another test
+    # module that imported it first (or the operator's config) can have fixed a different host.
+    calls = {c["url"].rsplit("/api/", 1)[1]: c["json"] for c in poster.calls if c["url"].endswith(("/api/generate", "/api/embed"))}
+    assert calls["generate"]["keep_alive"] == 0
+    assert calls["embed"]["keep_alive"] == 0
     assert any(c["json"]["keep_alive"] == 0 for c in poster.calls if c["url"].endswith("/api/generate"))
 
 
