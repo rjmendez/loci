@@ -58,6 +58,7 @@ py-modules = [
     "legacy_env",
     "llm_local",
     "llm_tools",
+    "model_pool",
     "mnemo_ops",
     "model_json",
     "openrouter",

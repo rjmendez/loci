@@ -77,6 +77,20 @@
 [embed]
 # model = "nomic-embed-text"
 
+[models]
+# Optional ranked model pool (docs/OPERATIONS.md, "Model pool"). `python mcp/model_pool.py init`
+# prints a draft from what your generation endpoint has installed.
+# resident_bonus = 0.5
+# max_vram_gb = 12
+# [[models.pool]]
+# name = "your-main-model:tag"
+# roles = ["gen", "verify"]
+# rank = 1
+# [[models.pool]]
+# name = "your-fallback-model:tag"
+# roles = ["gen"]
+# rank = 2
+
 [cloud]
 # enabled = true                        # enable third-tier cloud fallback after local tiers fail
 # supervisor_model = "your-pulled-model:tag"  # local supervisor that routes unspecified requests
