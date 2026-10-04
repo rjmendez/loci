@@ -1214,3 +1214,28 @@ Run these through an MCP client connected to the service:
 | Hermes cron jobs can fast-forward forever if a stale `next_run_at` is never persisted | MED | Use `scripts/hermes_cron_runner.py`, which executes one catch-up run and writes the future `next_run_at` on the same tick (#205) |
 | `backends.toml.example` has no `[qdrant] retention_days` key | LOW | The key is read (`qdrant_ops._retention_days`) but not shown in the example; the code default of 0 applies |
 | SCoRe `corrections=0` until sessions accumulate overlap | INFO | Corrections require same-session failure→success pairs; grow naturally |
+
+
+## Hillclimb (graded self-improvement)
+
+`mcp/hillclimb.py` improves one graded surface at a time. A suite supplies graded cases and an allow-list
+of surfaces (a prompt guidance block, a numeric knob, a choice). Each round the proposer sees the
+failing train cases and proposes ONE change. It is accepted only when train improves by `--margin`
+(default 0.02) and the held-out test split improves by `--test-gain` (default 0.01); train up with
+test flat is reverted as overfitting. The split is by case-id hash, so adding cases never moves old ones.
+
+Before climbing it checks the grader: re-scoring must agree, each split should have at least 5 cases,
+and a baseline at or above 0.95 (train or test) means no headroom, so the run stops (`--force` overrides).
+Infrastructure failures (model down) are excluded from the mean; over 20% aborts the run.
+
+    python mcp/hillclimb.py run --suite triage --rounds 6
+    python mcp/hillclimb.py status --suite triage
+    python mcp/hillclimb.py promote --suite triage     # candidate_overlay.json -> overlay.json
+    python mcp/hillclimb.py rollback --suite triage    # previous overlay, else built-in defaults
+
+A run never changes production. Consumers read `overlay_get(suite, key, default)`, which returns the default
+when nothing has been promoted. State is under `<data home>/hillclimb/<suite>/` (`runs.jsonl` ledger with
+patches, rationales, scores and case ids only; no case text). Built-in suite: `triage` (reflection
+triage classifier, surface `guidance`, cases in `eval/hillclimb/triage_cases.jsonl`, override with
+`LOCI_HILLCLIMB_TRIAGE_CASES`). Another suite plugs in as `--suite module:factory`. The proposer model
+is the gen model, or `LOCI_HILLCLIMB_MODEL`.
