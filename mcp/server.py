@@ -199,6 +199,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("loci-mcp")
 
+import log_setup  # noqa: E402
+
+log_setup.install_file_logging()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
