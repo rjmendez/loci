@@ -4,7 +4,7 @@ IMPORTS edges can be asserted to carry the right `scope` and
 import json  # module-level
 
 
-def resolve_vllm():
+def resolve_backend():
     import numpy  # function-local: only live inside this function's scope
     return numpy.array([1, 2, 3])
 

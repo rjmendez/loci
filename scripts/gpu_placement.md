@@ -2,7 +2,7 @@
 
 When a machine has more than one GPU, place the Loci tiers so the **latency-sensitive retrieval
 tier** (reranker + embeddings) never queues behind the **throughput/heavy generation tier**. All
-endpoints are resolved through `backends` (`ollama_url()` / `vllm_url()`), so this is purely about
+endpoints are resolved through `backends` (`ollama_url()`), so this is purely about
 which physical card each backend lands on — no host is hardcoded.
 
 ## The tiers
@@ -11,8 +11,8 @@ which physical card each backend lands on — no host is hardcoded.
   (default `BAAI/bge-reranker-v2-m3`), loaded on torch `cuda:0` when available and used by
   `rag_context_search`. It's a small model on the critical path of **every** retrieval call.
 - **[embed]** Embeddings via Ollama (`nomic-embed-text`), warm on GPU.
-- **[gen]** Local generation via Ollama (`qwen2.5:3b`, pinned via `keep_alive`), with an optional
-  vLLM batched-gen server as the higher-throughput primary path (`mcp/batched_gen.py`).
+- **[gen]** Local generation via Ollama (`qwen2.5:3b`, pinned via `keep_alive`), with
+  concurrent fan-out through `mcp/batched_gen.py`.
 
 ## The contention problem
 
@@ -25,7 +25,7 @@ placement is to keep the latency-sensitive retrieval tier off the heavy generati
 | Tier | Workload | Target GPU |
 |------|----------|-----------|
 | Retrieval (latency-sensitive) | CrossEncoder rerank (torch) + warm Ollama embeddings | the **inference GPU** (`cuda:0`) |
-| Generation (throughput / batched) | vLLM/TGI batched-gen + heavy Ollama gen | a **separate GPU**, if available |
+| Generation (throughput / batched) | batched/heavy Ollama gen | a **separate GPU**, if available |
 
 Rerank stays on the inference GPU and must never queue behind a multi-second generation. A
 batched-gen server is heavier and belongs on a second card when one exists. If a card is shared

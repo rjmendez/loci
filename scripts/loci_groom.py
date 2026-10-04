@@ -95,7 +95,7 @@ MEMORY_DIR = Path(os.environ.get(
 ))
 GROOM_DIR = MEMORY_DIR / "_groom"
 
-# Unset on purpose: vLLM and Ollama name the same model differently.
+# Unset on purpose: each backend names the same model differently.
 GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
 GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
 # Per-run ceilings bound a nightly job, not an interactive operator.

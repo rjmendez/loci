@@ -7,7 +7,7 @@ tests are collected in the same session.
 
 Also isolates the whole session from the live Loci stores before anything
 imports ``server``: temp HOME / LOCI_MEMORY_DIR / MNEMOSYNE_DATA_DIR, no
-backends.toml, unreachable Qdrant/Ollama/vLLM, the repo .env files not loaded,
+backends.toml, unreachable Qdrant/Ollama, the repo .env files not loaded,
 and any access under the real ~/.loci or ~/.hermes refused and failed. See
 testsupport/loci_hermetic.py. Opt out only for a deliberate live smoke test:
 LOCI_TESTS_LIVE=1.

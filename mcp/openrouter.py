@@ -1,6 +1,6 @@
 """OpenRouter tier — the generation backend whose availability is not this node's.
 
-The local tiers (vLLM on the GPU node, Ollama) share a failure domain: one WSL2
+The local tier (Ollama on the GPU node) shares a failure domain: one WSL2
 node whose device plugin advertises phantom GPUs and periodically reports none
 healthy, taking running pods down with it. That is precisely when a passive
 grooming pass would otherwise stall. A remote tier turns that outage into a

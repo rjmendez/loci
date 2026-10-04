@@ -29,7 +29,7 @@ export const meta = {
 //     tasks:   [{ id, title, focus, tier?, verify?, graphKey? }]
 //               // tier ∈ 'graph' | 'cheap' | 'mechanical' | 'impl' | 'reason' (default 'impl')
 //               // tier:'cheap'  -> resolved from cheapFacts[cheapKey||id] with NO agent;
-//               //                  produce it with scripts/cheap_batch.py (vLLM -> Ollama
+//               //                  produce it with scripts/cheap_batch.py (Ollama
 //               //                  -> OpenRouter). Degrades to a mechanical agent if absent.
 //               // cheapKey      -> on ANY task: prepends that pre-computed answer to the prompt.
 //               // tier:'graph'  -> resolved from graphFacts[graphKey||id] with NO agent (zero tokens);
@@ -97,7 +97,7 @@ const results = await pipeline(
   TASKS,
   (t) => {
     // tier:'graph' -> resolve deterministically from injected facts, NO agent (zero tokens).
-    // tier:'cheap' -> resolved on vLLM/Ollama/OpenRouter BEFORE the run, NO agent.
+    // tier:'cheap' -> resolved on Ollama/OpenRouter BEFORE the run, NO agent.
     if (t.tier === 'cheap') {
       const txt = cheapText(t.cheapKey || t.id)
       if (txt) {

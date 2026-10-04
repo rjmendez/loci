@@ -4,7 +4,7 @@ Lets a Loci install work UNCHANGED on any machine without hardcoding infra — a
 its own local GPU, a headless box falls back to shared infra over tailscale — and keeps every
 machine-specific endpoint/key OUT of this (public) code. Each backend resolves via a chain:
 
-  1. explicit env var (OLLAMA_BASE_URL, VLLM_BASE_URL, EMBED_MODEL, ...) — power-user override
+  1. explicit env var (OLLAMA_BASE_URL, EMBED_MODEL, ...) — power-user override
   2. a LOCAL probe (e.g. localhost:11434 for Ollama) — a laptop auto-uses its own hardware
   3. a gitignored config file — remote infra (e.g. a GPU host over the network + Qdrant key)
   4. a safe default / empty — the tiers already fail-open when a backend is empty
@@ -16,9 +16,6 @@ below are PLACEHOLDERS — put your own local-GPU / remote-infra endpoints here,
     url = "http://gpu-host:11434"        # a GPU host reachable over your network (omit -> local :11434)
     [embed]
     model = "nomic-embed-text"
-    [vllm]
-    url = "http://gpu-host:8000"         # vLLM/OpenAI-compatible server (omit -> Ollama fallback)
-    model = "Qwen/Qwen2.5-3B-Instruct"
     [rerank]
     model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     [qdrant]
@@ -46,7 +43,6 @@ _CONFIG_PATH = os.environ.get("LOCI_CONFIG") or str(Path.home() / ".loci" / "bac
 # Local endpoints to probe (only reached when the env var is unset). Kept here, not in each
 # module, and generic (localhost) — nothing machine-specific.
 _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
-_LOCAL_VLLM = os.environ.get("LOCI_LOCAL_VLLM", "http://localhost:8000")
 _OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
 
 
@@ -264,10 +260,30 @@ def ollama_gen_url(probe_timeout: float = 1.0) -> str:
     return ollama_url(probe_timeout)
 
 
+def _pool_pick(role: str, hint: str = "") -> str:
+    """Ranked pick from the model pool ([[models.pool]]), or "" when no pool is configured,
+    the role is not pooled, or nothing pooled is installed. ``hint`` is the operator's own
+    tag for the role: it joins as rank 0, so it still wins while installed and the pool
+    takes over when it is not. Never raises."""
+    try:
+        import model_pool
+        return model_pool.pick(role, hint)
+    except Exception as exc:
+        logger.debug("_pool_pick(%r): fail-open swallow: %r", role, exc)
+        return ""
+
+
 def ollama_gen_model() -> str:
-    """Generation model tag. Env -> [ollama].gen_model -> installed local -> default."""
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GEN_MODEL")
-                  or _cfg("ollama", "gen_model", ""))
+    """Generation model tag. Env -> model pool ('gen', with [ollama].gen_model as its
+    top candidate) -> [ollama].gen_model -> installed local -> default."""
+    env = os.environ.get("LOCI_OLLAMA_GEN_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "gen_model", "")
+    pooled = _pool_pick("gen", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     preferred = (ONE_GPU_FALLBACK_MODEL, "heretic-llama31-8b-instruct:latest")
@@ -284,9 +300,12 @@ def _task_model(env_var: str, cfg_key: str) -> str:
     operator opt specific call sites into a different model without changing the default
     that classify_text (and anything else unspecified) keeps using.
     """
-    return (os.environ.get(env_var)
-            or _cfg("ollama", cfg_key, "")
-            or ollama_gen_model())
+    env = os.environ.get(env_var)
+    if env:
+        return env
+    cfg = _cfg("ollama", cfg_key, "")
+    pooled = _pool_pick(cfg_key.removesuffix("_model"), cfg)
+    return pooled or cfg or ollama_gen_model()
 
 
 def ollama_verify_model() -> str:
@@ -332,8 +351,14 @@ def ollama_guardian_model() -> str:
 
     Env -> [ollama].guardian_model -> "granite3-guardian:2b".
     """
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
-                  or _cfg("ollama", "guardian_model", ""))
+    env = os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "guardian_model", "")
+    pooled = _pool_pick("guardian", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     preferred = ("llama-guard3:8b", "granite3-guardian:2b",
@@ -351,8 +376,14 @@ def ollama_redteam_model() -> str:
     env -> [ollama].redteam_model -> an installed heretic/abliterated tag that fits one
     GPU -> a one-GPU heretic default.
     """
-    env_or_cfg = (os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
-                  or _cfg("ollama", "redteam_model", ""))
+    env = os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
+    if env:
+        return env
+    cfg = _cfg("ollama", "redteam_model", "")
+    pooled = _pool_pick("redteam", cfg)
+    if pooled:
+        return pooled
+    env_or_cfg = cfg
     if env_or_cfg:
         return env_or_cfg
     return (_first_installed((ONE_GPU_REDTEAM_FALLBACK_MODEL,))
@@ -360,50 +391,12 @@ def ollama_redteam_model() -> str:
             or ONE_GPU_REDTEAM_FALLBACK_MODEL)
 
 
-def _vllm_role_env(prefix: str, role: str) -> str:
+def _role_env(prefix: str, role: str) -> str:
     return f"{prefix}_{role.strip().upper().replace('-', '_')}"
-
-
-@functools.lru_cache(maxsize=32)
-def vllm_url(role: str | None = None, probe_timeout: float = 1.0) -> str:
-    """vLLM/OpenAI base URL: env -> config -> local probe -> '' (batched_gen falls back to Ollama).
-
-    `probe_timeout` bounds the local reachability probe (see ollama_url)."""
-    if role:
-        env = os.environ.get(_vllm_role_env("VLLM_BASE_URL", role))
-        if env:
-            return env
-        configured = _cfg_nested("vllm", role, "url", "") or ""
-        if configured:
-            return configured
-        # Deliberately no role-specific localhost probe: specialist routing must be explicit,
-        # then fall back to the shared/default resolver whose existing localhost probe remains.
-        return vllm_url(probe_timeout=probe_timeout)
-    env = os.environ.get("VLLM_BASE_URL")
-    if env:
-        return env
-    configured = _cfg("vllm", "url", "") or ""
-    if configured:
-        return configured
-    if _alive(_LOCAL_VLLM, timeout=probe_timeout):
-        return _LOCAL_VLLM
-    return ""
 
 
 def embed_model() -> str:
     return os.environ.get("EMBED_MODEL") or _cfg("embed", "model", "nomic-embed-text")
-
-
-def vllm_model(role: str | None = None) -> str:
-    if role:
-        env = os.environ.get(_vllm_role_env("VLLM_MODEL", role))
-        if env:
-            return env
-        configured = _cfg_nested("vllm", role, "model", "") or ""
-        if configured:
-            return configured
-        return vllm_model()
-    return os.environ.get("VLLM_MODEL") or _cfg("vllm", "model", "Qwen2.5-3B-Instruct")
 
 
 def rerank_model() -> str:
@@ -436,7 +429,7 @@ def openrouter_model(role: str | None = None) -> str:
     Resolution order: role env -> role config -> shared env -> shared config -> default.
     """
     if role:
-        env = os.environ.get(_vllm_role_env("OPENROUTER_MODEL", role))
+        env = os.environ.get(_role_env("OPENROUTER_MODEL", role))
         if env:
             return env
         configured = _cfg_nested("openrouter", role, "model", "") or ""
@@ -457,7 +450,7 @@ def abliteration() -> tuple[str, str]:
 def abliteration_model(role: str | None = None) -> str:
     """Abliteration model resolver for cloud-tier routing."""
     if role:
-        env = os.environ.get(_vllm_role_env("ABLITERATION_MODEL", role))
+        env = os.environ.get(_role_env("ABLITERATION_MODEL", role))
         if env:
             return env
         configured = _cfg_nested("abliteration", role, "model", "") or ""
@@ -722,7 +715,7 @@ def load_env(repo: "Path | None" = None) -> dict:
 
 def _reset_cache() -> None:
     """Test hook: clear memoized resolutions (env/config may have changed)."""
-    for fn in (_config, _ollama_list, _ollama_local_tags, ollama_url, vllm_url):
+    for fn in (_config, _ollama_list, _ollama_local_tags, ollama_url):
         clear = getattr(fn, "cache_clear", None)
         if clear:
             clear()

@@ -312,11 +312,21 @@ def _busy_result(exc: StoreBusyError, *, investigation_id: Optional[str] = None,
 _ladybug_store = None                     # LadybugStore singleton once initialized
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
+_ladybug_last_error = ""                  # why the store last failed to open (truncated); "" while healthy
+_ladybug_since = ""                       # UTC ISO time of the first failure in the current run of failures
 _ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
 _ladybug_backfill_lock = threading.Lock()  # own lock: _ladybug_lock is non-reentrant and already held on one path
 _LADYBUG_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
 _ladybug_lock = threading.Lock()
 
+
+
+def _ladybug_note_failure(reason: str) -> None:
+    """Remember why the graph store failed and since when, so loci_health can say it (#422)."""
+    global _ladybug_last_error, _ladybug_since
+    _ladybug_last_error = str(reason)[:200]
+    if not _ladybug_since:
+        _ladybug_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def _get_ladybug(backfill: bool = True):
     """Lazy, fail-open LadybugStore singleton. Returns None if unavailable.
@@ -333,6 +343,7 @@ def _get_ladybug(backfill: bool = True):
     use the graph.
     """
     global _ladybug_store, _ladybug_failed, _ladybug_last_attempt, _ladybug_backfilled
+    global _ladybug_last_error, _ladybug_since
     if _ladybug_store is not None:
         return _ladybug_backfill_once(backfill)
     if _ladybug_failed:
@@ -350,6 +361,7 @@ def _get_ladybug(backfill: bool = True):
             if not getattr(_kz, "_HAS_LADYBUG", True):
                 # ladybug itself isn't importable — unrecoverable, latch permanently.
                 _ladybug_failed = True
+                _ladybug_note_failure("ladybug not importable")
                 logger.warning("LadybugDB not importable — graph features disabled (permanent).")
                 return None
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
@@ -357,19 +369,24 @@ def _get_ladybug(backfill: bool = True):
             if not ks.available():
                 # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
+                _ladybug_note_failure("store open failed (lock contention or transient IO)")
                 logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
                                "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
                 return None
             _ladybug_store = ks
             _ladybug_last_attempt = 0.0
+            _ladybug_last_error = ""
+            _ladybug_since = ""
         except ImportError as exc:
             # graph module / ladybug genuinely missing — unrecoverable, latch permanently.
             _ladybug_failed = True
+            _ladybug_note_failure(f"graph module missing: {exc!r}")
             logger.warning("LadybugDB graph module missing (%r) — graph features disabled (permanent).", exc)
             return None
         except Exception as exc:  # fail-open — never break the server on graph init
             # Unknown/transient error (e.g. IO on mkdir/open) — do NOT latch; retry later.
             _ladybug_last_attempt = time.monotonic()
+            _ladybug_note_failure(f"graph init failed: {exc!r}")
             logger.warning("LadybugDB graph init failed (%r) — will retry after %ss.", exc, _LADYBUG_RETRY_SECONDS)
             return None
     return _ladybug_backfill_once(backfill)
@@ -8389,7 +8406,6 @@ def loci_health() -> str:
                          counts when it answers that GET with a 4xx
       ollama_gen_reachable: the generation endpoint (ollama_gen_url), same rule
       ollama_gen_model_present: (optional) the configured gen model is listed there
-      vllm_reachable:    the resolved vLLM endpoint answers GET /health
       qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
                          (each is a short TCP gate followed by a bounded HTTP request)
       embed_model:       configured embedding model
@@ -8402,7 +8418,6 @@ def loci_health() -> str:
         "ladybug": "unavailable",
         "ollama_reachable": False,
         "ollama_gen_reachable": False,
-        "vllm_reachable": False,
         "qdrant_reachable": False,
         "embed_model": "",
         "rerank_model": "",
@@ -8418,6 +8433,9 @@ def loci_health() -> str:
         pid = _ladybug_writer_pid()
         if pid is not None:
             out["ladybug_writer_pid"] = pid
+        if _ladybug_last_error:
+            out["ladybug_last_error"] = _ladybug_last_error
+            out["ladybug_failing_since"] = _ladybug_since
     except Exception as exc:
         logger.debug("loci_health: ladybug health-state probe failed: %r", exc)
         pass
@@ -8429,8 +8447,6 @@ def loci_health() -> str:
             "ollama": bool(os.environ.get("OLLAMA_BASE_URL")
                            or os.environ.get("OLLAMA_URL")
                            or backends._cfg("ollama", "url", "")),
-            "vllm": bool(os.environ.get("VLLM_BASE_URL")
-                         or backends._cfg("vllm", "url", "")),
             "qdrant": bool(os.environ.get("QDRANT_URL")
                            or backends._cfg("qdrant", "url", "")),
         }
@@ -8450,7 +8466,6 @@ def loci_health() -> str:
         for key, resolver, path, headers in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T), "/api/tags", None),
             ("ollama_gen_reachable", lambda: backends.ollama_gen_url(_PROBE_T), "/api/tags", None),
-            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T), "/health", None),
             ("qdrant_reachable", lambda: backends.qdrant()[0], "/readyz",
              {"api-key": _qdrant_key} if _qdrant_key else None),
         ):
@@ -8473,6 +8488,13 @@ def loci_health() -> str:
                 pass
         # When a generation model is configured, the gen endpoint must actually carry it.
         _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        try:   # a model pool, when declared, decides which tag the gen endpoint must carry
+            import model_pool
+            if model_pool.configured():
+                _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends.ollama_gen_model()
+                out["model_pool"] = model_pool.summary()
+        except Exception as exc:
+            logger.debug("loci_health: model pool probe failed: %r", exc)
         _tags = http_answers.get("ollama_gen_reachable")
         if (out.get("ollama_gen_reachable") and _gen_model and isinstance(_tags, dict)
                 and isinstance(_tags.get("models"), list)):
@@ -8495,7 +8517,6 @@ def loci_health() -> str:
         optional_down = []
         for label, key in (("ollama", "ollama_reachable"),
                            ("ollama_gen", "ollama_gen_reachable"),
-                           ("vllm", "vllm_reachable"),
                            ("qdrant", "qdrant_reachable")):
             if out.get(key):
                 continue
@@ -8503,6 +8524,13 @@ def loci_health() -> str:
                 failures.append(f"{label}: configured/enabled but unreachable")
             else:
                 optional_down.append(label)
+        if out.get("ladybug") == "latched":
+            failures.append(
+                "ladybug: graph store latched (permanent init failure"
+                + (f" since {_ladybug_since}" if _ladybug_since else "")
+                + (f": {_ladybug_last_error}" if _ladybug_last_error else "")
+                + "); code-graph and code-to-memory tools are unavailable until the server restarts"
+            )
         if out.get("ollama_gen_model_present") is False:
             failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
         if failures:
