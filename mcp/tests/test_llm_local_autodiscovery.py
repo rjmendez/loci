@@ -38,9 +38,10 @@ def _setup(monkeypatch, tags, ps=(), installed=()):
 
     def get(url, timeout=None):
         if url.endswith("/api/tags"):
-            return _Resp({"models": [{"name": n, "size": s} for n, s in tags]})
+            return _Resp({"models": [{"name": n, **({} if s is None else {"size": s})} for n, s in tags]})
         if url.endswith("/api/ps"):
-            return _Resp({"models": [{"name": n} for n in ps]})
+            return _Resp({"models": [{"name": n[0], "size": n[1]} if isinstance(n, tuple) else {"name": n}
+                                     for n in ps]})
         raise AssertionError(url)
 
     def post(url, json=None, timeout=None):  # noqa: A002
@@ -106,3 +107,26 @@ def test_present_configured_model_unchanged(monkeypatch):
     r = L.generate("hi")
     assert r["ok"] and r["model"] == "cfg:missing"
     assert posts == ["cfg:missing"]
+
+
+def test_sizeless_resident_small_is_eligible(monkeypatch):
+    posts = _setup(monkeypatch, [("mystery:7b", None)], ps=[("mystery:7b", 4 * GB)], installed={"mystery:7b"})
+    r = L.generate("hi")
+    assert r["ok"] and r["model"] == "mystery:7b"
+    assert posts == ["cfg:missing", "mystery:7b"]
+
+
+def test_sizeless_non_resident_is_skipped(monkeypatch):
+    posts = _setup(monkeypatch, [("mystery:7b", None)], installed={"mystery:7b"})
+    r = L.generate("hi")
+    assert r["ok"] is False
+    assert posts == ["cfg:missing"]
+    assert "no eligible fallback" in r["why"]
+
+
+def test_sizeless_resident_above_cap_is_skipped(monkeypatch):
+    posts = _setup(monkeypatch, [("mystery:70b", None), ("small:3b", 2 * GB)],
+                   ps=[("mystery:70b", 40 * GB)], installed={"mystery:70b", "small:3b"})
+    r = L.generate("hi")
+    assert r["ok"] and r["model"] == "small:3b"
+    assert "mystery:70b" not in posts

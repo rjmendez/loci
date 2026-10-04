@@ -39,7 +39,7 @@ class _TimeoutPost:
 def _tags_response(names):
     resp = mock.Mock()
     resp.raise_for_status = mock.Mock()
-    resp.json = mock.Mock(return_value={"models": [{"name": n} for n in names]})
+    resp.json = mock.Mock(return_value={"models": [{"name": n, "size": 2 * 10**9} for n in names]})
     return resp
 
 
