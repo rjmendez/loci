@@ -49,6 +49,7 @@ py-modules = [
     "d10_gate",
     "embed_ops",
     "graph_tools",
+    "log_setup",
     "replay_fingerprint",
     "grounding",
     "inv_store",

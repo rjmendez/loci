@@ -15,10 +15,12 @@ from .contagion import find_contamination
 from .contract_contradiction import run_contract_contradiction
 from .contradiction import run_contradiction
 from .provenance import run_provenance
+from .supersession import run_supersession
 
 __all__ = [
     "run_provenance",
     "run_contradiction",
+    "run_supersession",
     "run_contract_contradiction",
     "find_contamination",
     "run_code_checks",

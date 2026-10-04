@@ -1,0 +1,11 @@
+[Unit]
+Description=Localhost bridge to in-cluster qdrant service for Loci
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/qdrant_local_bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
