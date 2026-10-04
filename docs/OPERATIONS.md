@@ -352,7 +352,8 @@ with no pool every resolver behaves as before.
 ```toml
 [models]
 resident_bonus = 0.5     # rank credit for a model Ollama already holds in memory
-# max_vram_gb = 12       # skip entries bigger than this (declared vram_gb, else the size /api/tags reports)
+# max_vram_gb = 10       # prefer entries that fit one GPU (declared vram_gb, else the size /api/tags reports)
+# over_cap_fallback = true  # when NO installed candidate fits, relax the cap and use the best-ranked one
 
 [[models.pool]]
 name = "gemma4-e4b-hermes:64k"
@@ -360,10 +361,15 @@ roles = ["gen", "verify", "compress"]
 rank = 1                 # lower is preferred
 # vram_gb = 5.0
 # pinned = true          # reserved for the lease/eviction layer: never evict (use it for the embedder)
+# role_rank = { verify = 3 }  # rank differently for one role
 ```
 
 For a role the pool keeps the entries that list it and are installed at the generation endpoint,
-then orders them by `rank - resident_bonus`. The operator's own tag (`[ollama].gen_model`,
+then orders them by `rank - resident_bonus` (`role_rank` overrides `rank` for one role). With
+`max_vram_gb`, a model that fits always beats one that does not. With `over_cap_fallback = true`
+the cap only binds while some installed candidate fits: when none does, the over-cap candidates
+become eligible and the best-ranked (the strongest, by your ranking) is used. `model_pool.py show`
+and the `model_pool` health block mark such a pick `OVER-CAP` / `over_cap`. The operator's own tag (`[ollama].gen_model`,
 `verify_model`, `guardian_model`, `redteam_model`, `compress_model`, `classify_model`) joins as rank 0:
 it still wins while installed and the pool takes over when it is not, which is the failure a missing
 `gen_model` used to cause. Env overrides (`LOCI_OLLAMA_*_MODEL`) beat everything. A role the pool

@@ -7,7 +7,8 @@ role instead. The pool is one declared list the resolvers consult:
 
     [models]
     resident_bonus = 0.5     # rank credit for a model Ollama already holds in memory
-    max_vram_gb = 12         # optional: skip entries bigger than this
+    max_vram_gb = 10         # optional: prefer entries that fit one GPU
+    over_cap_fallback = true # when NOTHING fits, relax the cap and use the best-ranked model anyway
 
     [[models.pool]]
     name = "gemma4-e4b-hermes:64k"
@@ -15,10 +16,13 @@ role instead. The pool is one declared list the resolvers consult:
     rank = 1                 # lower is preferred
     vram_gb = 5.0            # optional; otherwise the size /api/tags reports
     pinned = false           # reserved for the lease/eviction layer: never evict
+    role_rank = { verify = 2 }   # optional: rank differently for one role
 
 Resolution for one role: take the entries listing the role, keep those installed at the
 generation endpoint (and under ``max_vram_gb``), and order by ``rank - resident_bonus``
-(ties break on rank, then name). An operator-configured tag (``[ollama].gen_model`` etc.)
+(ties break on rank, then name). With ``over_cap_fallback`` the cap only binds while some
+installed candidate fits: when none does, the over-cap candidates become eligible and the
+best-ranked one (the strongest, by the operator's ranking) is used. An operator-configured tag (``[ollama].gen_model`` etc.)
 joins as an implicit rank 0 so existing configs keep their behaviour while the tag is
 installed and fall through to the pool when it is not.
 
@@ -77,6 +81,13 @@ class PoolEntry:
     rank: float = 100.0
     vram_gb: Optional[float] = None
     pinned: bool = False
+    role_rank: tuple[tuple[str, float], ...] = ()
+
+    def rank_for(self, role: str) -> float:
+        for r, value in self.role_rank:
+            if r == role:
+                return value
+        return self.rank
 
 
 @dataclass
@@ -89,6 +100,7 @@ class Candidate:
     fits: bool
     eligible: bool
     reason: str = ""
+    over_cap: bool = False        # eligible only because nothing fit the cap (over_cap_fallback)
     source: str = "pool"          # "pool" or "configured" (the operator's own tag)
 
 
@@ -142,10 +154,14 @@ def entries() -> list[PoolEntry]:
         if not name or not roles:
             continue
         vram = item.get("vram_gb")
+        rr = item.get("role_rank")
+        role_rank = tuple(sorted(
+            (str(k).strip().lower(), _num(v, 100.0)) for k, v in rr.items()
+        )) if isinstance(rr, dict) else ()
         out.append(PoolEntry(
             name=name, roles=roles, rank=_num(item.get("rank"), 100.0),
             vram_gb=_num(vram, None) if vram is not None else None,
-            pinned=bool(item.get("pinned", False)),
+            pinned=bool(item.get("pinned", False)), role_rank=role_rank,
         ))
     return out
 
@@ -161,6 +177,10 @@ def resident_bonus() -> float:
 def max_vram_gb() -> Optional[float]:
     value = _models_cfg().get("max_vram_gb")
     return _num(value, None) if value is not None else None
+
+
+def over_cap_fallback() -> bool:
+    return bool(_models_cfg().get("over_cap_fallback", False))
 
 
 # ------------------------------------------------------------------------------- inventory
@@ -239,7 +259,8 @@ def _installed(name: str, inv: dict) -> bool:
 
 def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] = None,
               inv: Optional[dict] = None, resident: Optional[set] = None,
-              bonus: Optional[float] = None, cap_gb: Optional[float] = None) -> Decision:
+              bonus: Optional[float] = None, cap_gb: Optional[float] = None,
+              fallback: Optional[bool] = None) -> Decision:
     """Order the candidates for ``role``. Pure when ``pool``/``inv``/``resident`` are passed."""
     role = (role or "").strip().lower()
     pool_entries = list(entries() if pool is None else pool)
@@ -247,12 +268,14 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
     resident_ = resident_models() if resident is None else resident
     bonus_ = resident_bonus() if bonus is None else bonus
     cap = max_vram_gb() if cap_gb is None else cap_gb
+    relax = over_cap_fallback() if fallback is None else fallback
 
     rows: list[tuple[PoolEntry, str]] = [(e, "pool") for e in pool_entries if role in e.roles]
     hint = (hint or "").strip()
     if hint:
         # The operator's own tag outranks the pool: rank 0, keeping any size/pin the pool declares for it.
-        rows = [((replace(e, rank=0.0), "configured") if e.name == hint else (e, src)) for e, src in rows]
+        rows = [((replace(e, rank=0.0, role_rank=()), "configured") if e.name == hint else (e, src))
+                for e, src in rows]
         if not any(e.name == hint for e, _ in rows):
             rows.append((PoolEntry(name=hint, roles=(role,), rank=0.0), "configured"))
 
@@ -268,12 +291,19 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
         eligible = installed and fits
         reason = ("" if eligible else "not installed" if not installed
                   else f"{size:.1f} GB over the {cap:g} GB cap")
+        rank = entry.rank_for(role)
         cands.append(Candidate(
-            name=entry.name, rank=entry.rank,
-            effective_rank=entry.rank - (bonus_ if res else 0.0),
+            name=entry.name, rank=rank,
+            effective_rank=rank - (bonus_ if res else 0.0),
             installed=installed, resident=res, fits=fits, eligible=eligible,
             reason=reason, source=source,
         ))
+    if relax and cands and not any(c.eligible for c in cands):
+        # Nothing installed fits the cap: use the strongest (best-ranked) over-cap model rather than none.
+        for c in cands:
+            if c.installed and not c.fits:
+                c.eligible, c.over_cap = True, True
+                c.reason = f"{c.reason}; nothing fits, used as the strongest available"
     cands.sort(key=lambda c: (not c.eligible, c.effective_rank, c.rank, c.name))
     chosen = next((c.name for c in cands if c.eligible), "")
     return Decision(role=role, chosen=chosen, candidates=cands, resident_bonus=bonus_)
@@ -309,6 +339,7 @@ def summary() -> dict:
             "chosen": d.chosen or None,
             "rank": chosen.rank if chosen else None,
             "degraded": bool(top and chosen and chosen.name != top.name) or not chosen,
+            "over_cap": bool(chosen and chosen.over_cap),
         }
     return {"configured": True, "inventory_reachable": bool(inv), "roles": out}
 
@@ -423,6 +454,8 @@ def render_toml(pool_entries: Iterable[PoolEntry]) -> str:
             lines.append(f"vram_gb = {e.vram_gb:g}")
         if e.pinned:
             lines.append("pinned = true")
+        if e.role_rank:
+            lines.append("role_rank = { " + ", ".join(f"{r} = {v:g}" for r, v in e.role_rank) + " }")
         lines.append("")
     return "\n".join(lines)
 
@@ -440,7 +473,7 @@ def _main(argv: list[str]) -> int:
         print("no [[models.pool]] configured; run `python model_pool.py init` for a draft")
         return 0
     for role, info in s["roles"].items():
-        flag = "  DEGRADED" if info["degraded"] else ""
+        flag = ("  DEGRADED" if info["degraded"] else "") + ("  OVER-CAP" if info.get("over_cap") else "")
         print(f"{role:10s} -> {info['chosen']} (rank {info['rank']}){flag}")
     return 0
 
