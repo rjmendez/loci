@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 from ..verdict import Verdict, make_signature, new_verdict, redact_excerpt
@@ -31,6 +32,9 @@ from ._common import _default_tokenize, _finding_id
 __all__ = ["run_provenance"]
 
 _log = logging.getLogger("memcheck.provenance")
+
+# A receipt written this long after the finding cannot have been its source.
+_RECEIPT_MAX_LAG = timedelta(days=1)
 
 
 def _default_lexical_score(a: set[str], b: set[str]) -> float:
@@ -59,6 +63,39 @@ def _audit_names(entry: dict) -> set[str]:
     return names
 
 
+def _cited_receipt_ids(finding: dict) -> list[str]:
+    meta = finding.get("metadata")
+    ids = meta.get("receipt_ids") if isinstance(meta, dict) else None
+    if isinstance(ids, str):
+        ids = [ids]
+    return [str(i) for i in ids if i] if isinstance(ids, (list, tuple)) else []
+
+
+def _parse_ts(value) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _cited_receipt_ok(finding: dict, entry: dict) -> bool:
+    """A cited receipt is plausible when its tool matches the finding's source
+    (when both are named) and it was not written long after the finding."""
+    f_source = str(finding.get("source", "") or "").lower()
+    names = _audit_names(entry)
+    if f_source and names:
+        f_toks = set(re.split(r"[\W_]+", f_source)) - {""}
+        if not (f_source in names or any(
+            f_toks & (set(re.split(r"[\W_]+", n)) - {""}) for n in names
+        ) or f_source in _audit_text(entry).lower()):
+            return False
+    f_ts, r_ts = _parse_ts(finding.get("ts")), _parse_ts(entry.get("ts"))
+    if f_ts and r_ts and r_ts - f_ts > _RECEIPT_MAX_LAG:
+        return False
+    return True
+
+
 def run_provenance(
     findings: list[dict],
     audit_entries: list[dict],
@@ -66,6 +103,7 @@ def run_provenance(
     min_overlap: float = 0.45,
     tokenizer: Optional[Callable[[str], set]] = None,
     lexical_score: Optional[Callable[[set, set], float]] = None,
+    global_audit_entries: Optional[list[dict]] = None,
 ) -> list[Verdict]:
     """Flag ``observed`` findings that lack a matching audit receipt.
 
@@ -80,6 +118,14 @@ def run_provenance(
     tokenizer / lexical_score:
         Optional injected callables (the server's ``_tokenize`` / ``_lexical_match_score``).
         Internal defaults mirror the server's behavior when omitted.
+
+    global_audit_entries:
+        Optional receipts from the global daily log; consulted only for explicit
+        ``metadata.receipt_ids`` citations.
+
+    A finding that cites receipt ids in ``metadata.receipt_ids`` is supported when
+    a cited id exists in ``audit_entries`` (or ``global_audit_entries``) and the
+    receipt is plausible for it; the lexical rule below remains the fallback.
 
     Returns
     -------
@@ -100,6 +146,12 @@ def run_provenance(
             _log.debug("provenance: skipping malformed audit entry: %s", exc)
             continue
 
+    # Receipts addressable by id, for explicit citations.
+    by_receipt_id: dict[str, dict] = {}
+    for entry in list(global_audit_entries or []) + list(audit_entries or []):
+        if isinstance(entry, dict) and entry.get("receipt_id"):
+            by_receipt_id[str(entry["receipt_id"])] = entry
+
     verdicts: list[Verdict] = []
     for index, finding in enumerate(findings or []):
         if not isinstance(finding, dict):
@@ -115,8 +167,11 @@ def run_provenance(
             f_tokens = tok(text)
             f_source = str(finding.get("source", "") or "").lower()
 
-            supported = False
-            for r_tokens, r_names in receipts:
+            supported = any(
+                rid in by_receipt_id and _cited_receipt_ok(finding, by_receipt_id[rid])
+                for rid in _cited_receipt_ids(finding)
+            )
+            for r_tokens, r_names in ([] if supported else receipts):
                 # Name overlap: finding source names a known tool, or shares a
                 # token with the receipt's names.
                 name_ok = False

@@ -928,6 +928,62 @@ def _select_findings(findings: list, limit: int) -> tuple:
     return [findings[i] for i in kept], omitted
 
 
+_INDEX_HINT_CAP = 50
+_INDEX_HINT_TIMEOUT_S = 2.0
+
+
+def _index_only_hint(investigation_id: str) -> dict:
+    """One bounded, fail-open semantic-index lookup for an id missing from the store.
+
+    Servers sharing a Qdrant keep separate stores, so investigation_search can
+    surface findings for an id this server cannot load. Returns the extra
+    ``investigation_load`` error fields, or {} when the index has nothing or is
+    unreachable. Read-only: never writes a store or builds a manifest.
+    """
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from qdrant_ops import _get_qdrant
+        client, col = _get_qdrant()
+        if client is None:
+            return {}
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        def _scroll():
+            points, _ = client.scroll(
+                col,
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="investigation_id", match=MatchValue(value=investigation_id))]),
+                limit=_INDEX_HINT_CAP + 1,
+                with_payload=False,
+                with_vectors=False,
+                timeout=max(1, int(_INDEX_HINT_TIMEOUT_S)),
+            )
+            return len(points)
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            n = pool.submit(_scroll).result(timeout=_INDEX_HINT_TIMEOUT_S)
+        finally:
+            pool.shutdown(wait=False)
+        if not n:
+            return {}
+        hint = {
+            "indexed_findings": min(n, _INDEX_HINT_CAP),
+            "indexed_investigation_id": investigation_id,
+            "hint": (
+                "Findings for this id exist in the shared semantic index but "
+                "the investigation is not in this server's store, so there is "
+                "no manifest to load. Use investigation_search to read them."
+            ),
+        }
+        if n > _INDEX_HINT_CAP:
+            hint["indexed_findings_capped"] = True
+        return hint
+    except Exception as exc:
+        logger.debug("index-only hint for %r skipped: %s", investigation_id, exc)
+        return {}
+
+
 def investigation_load(
     investigation_id: str,
     last_n_findings: int = 20,
@@ -976,9 +1032,11 @@ def investigation_load(
     """
     manifest = _load_manifest(investigation_id)
     if not manifest:
-        return json.dumps({
+        out = {
             "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
-        })
+        }
+        out.update(_index_only_hint(investigation_id))
+        return json.dumps(out)
     manifest = _coordination_migrate_manifest(manifest)
     denied = _acl_access_denied(manifest, requesting_agent_id)
     if denied:

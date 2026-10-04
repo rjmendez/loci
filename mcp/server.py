@@ -79,6 +79,7 @@ from memcheck.checks import (  # noqa: E402
     find_contamination,
     run_code_checks,
     run_contradiction,
+    run_supersession,
     run_provenance,
 )
 from memcheck.verdict import make_signature, new_verdict, redact_excerpt  # noqa: E402
@@ -197,6 +198,10 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger("loci-mcp")
+
+import log_setup  # noqa: E402
+
+log_setup.install_file_logging()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -2000,6 +2005,24 @@ def _compute_aggregate_confidence(
 
 
 
+def _cited_global_receipts(findings: list[dict]) -> list[dict]:
+    """Global daily-log receipts that findings cite by id (date is in the id)."""
+    wanted: dict[str, set[str]] = {}
+    for f in findings:
+        meta = f.get("metadata") if isinstance(f, dict) else None
+        ids = meta.get("receipt_ids") if isinstance(meta, dict) else None
+        for rid in ([ids] if isinstance(ids, str) else ids if isinstance(ids, (list, tuple)) else []):
+            m = re.fullmatch(r"rcpt-(\d{4})(\d{2})(\d{2})-[0-9a-f]+", str(rid))
+            if m:
+                wanted.setdefault("-".join(m.groups()), set()).add(str(rid))
+    out: list[dict] = []
+    for day, rids in wanted.items():
+        path = MEMORY_DIR.parent / "audit" / f"{day}.jsonl"
+        if path.exists():
+            out.extend(e for e in _read_jsonl(path) if e.get("receipt_id") in rids)
+    return out
+
+
 def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict:
     """Run provenance + contradiction inline over an investigation's JSONL.
 
@@ -2035,6 +2058,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
             audit_entries,
             tokenizer=tokenize,
             lexical_score=_lexical_match_score,
+            global_audit_entries=_cited_global_receipts(findings),
         )
         check_status["provenance"] = "ok"
     except Exception as exc:  # fail-open — advisory check must never break the caller
@@ -2053,6 +2077,14 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
         logger.warning("contradiction check failed, degrading to none: %r", exc)
         contradictions = []
         check_status["contradiction"] = f"failed: {exc!r}"
+
+    try:
+        superseded = run_supersession(findings)
+        check_status["supersession"] = "ok"
+    except Exception as exc:  # fail-open
+        logger.warning("supersession check failed, degrading to none: %r", exc)
+        superseded = []
+        check_status["supersession"] = f"failed: {exc!r}"
 
     if llm_verify:
         try:
@@ -2079,6 +2111,7 @@ def _compute_self_check(investigation_id: str, llm_verify: bool = False) -> dict
     return {
         "unsupported_observed": unsupported,
         "contradictions": contradictions,
+        "superseded": superseded,
         "hallucination_candidates": candidates,
         "audit_lane": audit_lane,
         "check_status": check_status,
@@ -2176,6 +2209,9 @@ def _hallucination_candidates(
             if not counter_receipted and not _blanket:
                 continue  # no receipted counter
             if other not in findings_by_id:
+                continue
+            # Only an observed counterpart can show this finding is wrong.
+            if other not in _observed_ids:
                 continue
             if unsup in seen:
                 continue
@@ -3158,6 +3194,10 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
 
 
 _DOCS_INGEST_MAX_FILES = 500
+# Wall-clock budget for one docs_ingest_indexer call. Each changed file costs a store + index write, so a big
+# tree can hold a tool worker for many minutes; past the budget the call returns partial progress and a re-run
+# resumes (unchanged files are skipped). At least one changed file is always stored per call, so repeated calls always progress.
+_DOCS_INGEST_BUDGET_S = max(0.0, float(os.environ.get("LOCI_DOCS_INGEST_BUDGET_S", "120") or 120))
 _DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
 
 
@@ -3251,7 +3291,10 @@ def docs_ingest_indexer(
     )
 
     records: list[dict] = []
-    for doc_path in targets:
+    started = time.monotonic()
+    deferred = 0
+    stored_now = 0
+    for idx, doc_path in enumerate(targets):
         text = doc_path.read_text(encoding="utf-8", errors="replace")
         raw = text.strip()
         doc_title = doc_path.stem.replace("-", " ").replace("_", " ").strip() or doc_path.name
@@ -3295,6 +3338,9 @@ def docs_ingest_indexer(
             })
             continue
 
+        if stored_now > 0 and time.monotonic() - started > _DOCS_INGEST_BUDGET_S:
+            deferred = len(targets) - idx
+            break
         finding_text = f"{doc_title}: {summary}"
         store_result = json.loads(investigation_store(
             investigation_id=investigation_id,
@@ -3306,6 +3352,7 @@ def docs_ingest_indexer(
             metadata=metadata,
             evidence_provenance_tier=MODEL_ASSERTED,
         ))
+        stored_now += 1
         records.append({
             "path": str(doc_path),
             "stored": bool(store_result.get("stored")),
@@ -3322,6 +3369,10 @@ def docs_ingest_indexer(
         "investigation_id": investigation_id,
         "records": records,
     }
+    if deferred:
+        # Out of time, not out of files: call again to continue (indexed files are skipped as unchanged).
+        out.update(partial=True, files_remaining=deferred + (len(all_targets) - len(targets)),
+                   budget_s=_DOCS_INGEST_BUDGET_S)
     if len(all_targets) > len(targets):
         # The file cap cut the tree short: say so rather than read as complete.
         out.update(truncated=True, files_found=len(all_targets),
@@ -5923,10 +5974,14 @@ def audit_log(
                         per-tool templates.
 
     Returns:
-        JSON confirmation.
+        JSON confirmation including ``receipt_id``; pass it to
+        investigation_store as ``metadata={"receipt_ids": [<id>]}`` to cite it.
     """
+    # Cite this id in investigation_store(metadata={"receipt_ids": [...]}).
+    receipt_id = f"rcpt-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:12]}"
     entry = {
         "ts": _now(),
+        "receipt_id": receipt_id,
         "created_at_ts": int(datetime.now(timezone.utc).timestamp()),
         "tool": tool_name,
         "investigation_id": investigation_id,
@@ -5986,6 +6041,7 @@ def audit_log(
 
     return json.dumps({
         "logged": True,
+        "receipt_id": receipt_id,
         "tool": tool_name,
         "ts": entry["ts"],
         "mnemo_stored": mnemo_stored,
@@ -6160,6 +6216,7 @@ def memory_self_check(
             inv_verdicts.extend(computed["unsupported_observed"])
         if "contradiction" in requested:
             inv_verdicts.extend(computed["contradictions"])
+            inv_verdicts.extend(computed.get("superseded", []))
         all_verdicts.extend(inv_verdicts)
         # Only surface when both the provenance and contradiction checks ran.
         inv_candidates = (
@@ -6178,6 +6235,7 @@ def memory_self_check(
                     1 for v in inv_verdicts if v.verdict_type == "contradiction"
                 ),
                 "hallucination_candidates": len(inv_candidates),
+                "superseded": sum(1 for v in inv_verdicts if v.verdict_type == "superseded"),
             },
             "verdicts": [_verdict_view(v) for v in inv_verdicts],
             "hallucination_candidates": inv_candidates,
@@ -6207,6 +6265,7 @@ def memory_self_check(
                 1 for v in all_verdicts if v.verdict_type == "contradiction"
             ),
             "hallucination_candidates": len(all_candidates),
+            "superseded": sum(1 for v in all_verdicts if v.verdict_type == "superseded"),
         },
         "hallucination_candidates": all_candidates,
         "recorded": recorded,

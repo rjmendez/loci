@@ -191,7 +191,7 @@ def test_embedding_model_config_is_replaced_by_local_generation_model(monkeypatc
             return None
 
         def json(self):
-            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b", "size": 2 * 10**9}]}
 
     def fake_post(url, json=None, timeout=None):  # noqa: A002
         cap["model"] = json.get("model")
@@ -219,7 +219,7 @@ def test_generate_retries_with_discovered_model_after_initial_model_failure(monk
             return None
 
         def json(self):
-            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b", "size": 2 * 10**9}]}
 
     def fake_post(url, json=None, timeout=None):  # noqa: A002
         calls["post"].append(json.get("model"))
