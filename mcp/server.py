@@ -6777,10 +6777,12 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
     from memcheck.vectors import COLLECTION as VERDICTS_COLLECTION
     from memcheck.vectors import EMBED_DIM as VERDICTS_DIM
 
-    existing = {c.name for c in client.get_collections().collections}
+    existing, aliases = qdrant_ops.collection_names_with_aliases(client)
     report: dict = {}
     main = main_col or QDRANT_COLLECTION_PREFIX
     main_present = main in existing
+    if main in aliases:
+        report["main_is_alias_of"] = aliases[main]
     verdicts_present = VERDICTS_COLLECTION in existing
     verdicts_dim = None
     if main_present:
@@ -7104,7 +7106,7 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
         }, indent=2)
 
     try:
-        present = sorted(c.name for c in client.get_collections().collections)
+        present = sorted(qdrant_ops.collection_names_with_aliases(client)[0])
         queried = [QDRANT_COLLECTION_PREFIX] + (
             [_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
         if collections:
@@ -8384,6 +8386,83 @@ def _embed_probe_headers() -> dict:
         return {}
 
 
+_main_state_cache: dict = {"t": 0.0, "v": None}
+
+
+def _main_collection_state() -> dict | None:
+    """Does the main findings collection resolve (as a collection or an alias)? Cached 60 s; None when Qdrant
+    cannot be asked (qdrant_reachable already reports that)."""
+    now = time.monotonic()
+    if _main_state_cache["v"] is not None and now - _main_state_cache["t"] < 60.0:
+        return _main_state_cache["v"]
+    try:
+        client, main_col = _qdrant_client_readonly()
+        if client is None:
+            return None
+        main = main_col or QDRANT_COLLECTION_PREFIX
+        names, aliases = qdrant_ops.collection_names_with_aliases(client)
+        state = {"name": main, "present": main in names, "alias_of": aliases.get(main)}
+    except Exception as exc:
+        logger.debug("loci_health: main collection probe failed: %r", exc)
+        return None
+    _main_state_cache.update(t=now, v=state)
+    return state
+
+
+def _assess_degradation(transport: dict | None, main_state: dict | None, gen: dict | None,
+                        d10_errors: int = 0) -> tuple:
+    """(reasons, warnings) from signals that a reachability probe cannot see.
+
+    reasons make loci_health ``degraded``: a feature the server advertises is currently not working.
+    warnings are worth knowing but do not change the status. Every input may be None (not measured)."""
+    reasons: list = []
+    warnings: list = []
+    for kind, label, consec_limit in (("embed", "embedding", 3), ("index_write", "index writes", 1)):
+        t = (transport or {}).get(kind) or {}
+        consec = int(t.get("consecutive_failures") or 0)
+        if consec >= consec_limit:
+            extra = ""
+            if kind == "embed" and t.get("breaker_open_s"):
+                extra = f"; brownout breaker open for another {t['breaker_open_s']:.0f}s"
+            if kind == "index_write":
+                extra = "; findings are stored on disk but have no vector (investigation_store qdrant_stored=false)"
+            last_ok = t.get("last_ok_age_s")
+            reasons.append(
+                f"{label}: {consec} consecutive failures"
+                + (f", last success {last_ok:.0f}s ago" if last_ok is not None else ", no success seen since start")
+                + extra)
+        elif int(t.get("failed") or 0) > 0:
+            warnings.append(f"{label}: {t['failed']} failure(s) in the last {t.get('window_s', 900)}s, recovered")
+    if main_state is not None and not main_state.get("present"):
+        reasons.append(f"main memory collection '{main_state.get('name')}' does not resolve (neither a collection nor an alias)")
+    if gen:
+        if gen.get("resident") and gen.get("on_gpu") is False:
+            reasons.append(f"generation model {gen.get('model')!r} is resident but running on CPU (size_vram 0)")
+        elif gen.get("resident") is False:
+            warnings.append(f"generation model {gen.get('model')!r} is not loaded right now (first call will pay a load)")
+    if d10_errors:
+        warnings.append(f"D10 shadow gate has swallowed {d10_errors} error(s) since start; its log may be empty or short")
+    return reasons, warnings
+
+
+def _gen_residency(url: str, model: str) -> dict | None:
+    """Is the generation model loaded, and on the GPU? One bounded GET of /api/ps; None when it cannot be read."""
+    try:
+        import backends
+        ok, body = backends._http_probe(url, "/api/ps", timeout=1.0)
+        if not ok or not isinstance(body, dict):
+            return None
+        for m in body.get("models") or []:
+            if str(m.get("name") or m.get("model") or "") == model:
+                size, vram = float(m.get("size") or 0), float(m.get("size_vram") or 0)
+                return {"model": model, "resident": True, "size_gb": round(size / 1e9, 2),
+                        "size_vram_gb": round(vram / 1e9, 2), "on_gpu": (vram >= 0.9 * size) if size else None}
+        return {"model": model, "resident": False, "on_gpu": None}
+    except Exception as exc:
+        logger.debug("loci_health: /api/ps probe failed: %r", exc)
+        return None
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -8411,6 +8490,13 @@ def loci_health() -> str:
       embed_model:       configured embedding model
       rerank_model:      configured cross-encoder rerank model
       warm:              whether the embed warm-ping has been fired this process
+      status:            'ok' | 'degraded' | 'unhealthy'. 'unhealthy' = a configured backend is
+                         down; 'degraded' = everything answers but a feature is not working
+                         (see degraded_reasons: embeds failing, index writes failing, main
+                         collection not resolving, generation model on CPU)
+      embed_health / index_write_health: rolling in-process success and failure counts
+      main_collection:   whether the findings collection resolves, and the alias target if aliased
+      gen_residency:     whether the generation model is loaded and on the GPU
     """
     out: dict = {
         "status": "ok",
@@ -8550,6 +8636,40 @@ def loci_health() -> str:
     except Exception as exc:
         logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
+
+    # Signals a reachability probe cannot see: a hung embedder, index writes that fail while stores report success,
+    # a main collection that does not resolve, a generation model stuck on CPU. They turn "ok" into "degraded".
+    try:
+        import qdrant_ops as _qops   # not `qdrant_ops`: a later import in this function makes that name local to all of it
+        transport = _qops.transport_health()
+        out["embed_health"] = transport.get("embed")
+        out["index_write_health"] = transport.get("index_write")
+        main_state = _main_collection_state()
+        if main_state is not None:
+            out["main_collection"] = main_state
+        gen = None
+        if out.get("ollama_gen_reachable"):
+            import backends
+            gen = _gen_residency(backends.ollama_gen_url(0.5), backends.ollama_gen_model())
+            if gen is not None:
+                out["gen_residency"] = gen
+        d10_errors = 0
+        try:
+            import d10_gate
+            d10_errors = int(d10_gate.shadow_error_count())
+        except Exception as exc:
+            logger.debug("loci_health: d10 error count unavailable: %r", exc)
+        reasons, warnings = _assess_degradation(transport, main_state, gen, d10_errors)
+        if reasons:
+            out["degraded_reasons"] = reasons
+            if out.get("status") == "ok":
+                out["status"] = "degraded"
+        if warnings:
+            out["warnings"] = warnings
+    except Exception as exc:
+        # Not debug-only: a silently failed assessment reads as "nothing wrong", the failure this block exists to end.
+        logger.warning("loci_health: degradation assessment failed: %r", exc)
+        out.setdefault("warnings", []).append(f"degradation assessment failed, status may be too optimistic: {exc!r}")
 
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:

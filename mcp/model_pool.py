@@ -398,7 +398,8 @@ def _load_selector() -> Optional[Callable]:
 
 
 def _log_path() -> Path:
-    mem = os.environ.get("LOCI_MEMORY_DIR") or str(Path.home() / ".loci" / "memory-sessions")
+    import legacy_env
+    mem = str(legacy_env.memory_dir())
     return Path(mem).parent / "instrumentation" / SHADOW_LOG_NAME
 
 

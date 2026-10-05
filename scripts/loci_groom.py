@@ -89,10 +89,11 @@ def load_env() -> dict:
 
 logger = logging.getLogger("loci-groom")
 
-MEMORY_DIR = Path(os.environ.get(
-    "LOCI_MEMORY_DIR",
-    os.path.expanduser("~/.hermes/memory-sessions"),
-))
+# The server's own rule (LOCI_MEMORY_DIR, else ~/.loci/memory-sessions, else the legacy ~/.hermes one). A private
+# default here once pointed the pass at an empty store, so it reported coverage 1.0 over zero findings.
+import legacy_env  # noqa: E402
+
+MEMORY_DIR = Path(legacy_env.memory_dir())
 GROOM_DIR = MEMORY_DIR / "_groom"
 
 # Unset on purpose: each backend names the same model differently.
