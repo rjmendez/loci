@@ -34,7 +34,7 @@ def lockfile(tmp_path):
 def test_unlock_is_fast_and_really_releases(lockfile):
     a, b = lockfile(), lockfile()
     F.flock(a, F.LOCK_EX | F.LOCK_NB)
-    with pytest.raises(OSError) as held:
+    with pytest.raises(OSError, match=r"unavailable|denied|deadlock|locked") as held:
         F.flock(b, F.LOCK_EX | F.LOCK_NB)
     assert held.value.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)  # refused because it is held
     t = time.monotonic()
