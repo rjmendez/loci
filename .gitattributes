@@ -2,3 +2,4 @@
 # Never convert its line endings: with core.autocrlf=true on Windows the manifest checks out as CRLF,
 # no longer matches the pin, and the shadow gate silently refuses to load.
 mcp/models/d10_pair_gate/* -text
+deep_think_loci/grounding/grounding_dataset.jsonl -text
