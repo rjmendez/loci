@@ -411,6 +411,17 @@ class TestAudioCapture(CardBase):
         with self._pcm("01-00: HDA Analog : ALC285 Analog : playback 1\n"):
             self.assertEqual(a2a_server._probe_audio_capture(), [])
 
+    def test_the_setting_points_the_probe_at_a_mounted_copy_of_the_hosts_file(self):
+        """Docker masks /proc/asound in containers, so the node is given the host's file under another path."""
+        mounted = self.dir / "host-asound-pcm"
+        mounted.write_text(self.PCM, encoding="utf-8")
+        with patch.object(a2a_server, "_ASOUND_PCM", str(self.dir / "masked")), \
+             patch.dict(os.environ, {"LOCI_A2A_ASOUND_PCM": str(mounted)}):
+            self.assertEqual(a2a_server._probe_audio_capture(), ["00-00: USB Audio", "02-03: ADMAIF4"])
+        with patch.object(a2a_server, "_ASOUND_PCM", str(self.dir / "masked")):     # same fixture, setting absent
+            os.environ.pop("LOCI_A2A_ASOUND_PCM", None)
+            self.assertEqual(a2a_server._probe_audio_capture()["available"], False)
+
     def test_a_missing_procfs_file_is_reported_unavailable_with_a_reason(self):
         with patch.object(a2a_server, "_ASOUND_PCM", str(self.dir / "absent")):
             self.assertEqual(a2a_server._probe_audio_capture(),

@@ -61,6 +61,8 @@ Optional / tunable:
     live inventory. See README.md "Agent card and node profile". Default: none
   LOCI_A2A_BOARD_FILE file holding the board model for device_inventory. Default /proc/device-tree/model;
     a container cannot read that, so mount the host's /sys/firmware/devicetree/base/model and point this at it.
+  LOCI_A2A_ASOUND_PCM file listing the ALSA devices, for device_inventory. Default /proc/asound/pcm, which Docker
+    masks inside containers: mount the host's /proc/asound/pcm and point this at it.
   LOCI_A2A_INIT_DB 1 creates the Mnemosyne SQLite file and its memories table at startup when
     missing (a fresh node). Default: 0
   PEER_PUBKEYS_JSON / PEER_PUBKEYS_DIR Ed25519 public keys of agents that may sign requests:
@@ -2326,10 +2328,11 @@ _ASOUND_PCM = '/proc/asound/pcm'
 
 
 def _probe_audio_capture():
-    """Capture-capable ALSA devices, from procfs. Reading /proc/asound needs no device access, so it works in a
-    container where `arecord -l` cannot open /dev/snd without the container being handed read-write sound devices."""
+    """Capture-capable ALSA devices, from procfs. Reading /proc/asound/pcm needs no device access, so it works
+    where `arecord -l` cannot (a container must be handed read-write sound devices for that). Docker masks
+    /proc/asound inside containers, so LOCI_A2A_ASOUND_PCM can point at a mounted copy of the host's file."""
     try:
-        with open(_ASOUND_PCM, encoding='utf-8', errors='replace') as fh:
+        with open(os.environ.get('LOCI_A2A_ASOUND_PCM', _ASOUND_PCM), encoding='utf-8', errors='replace') as fh:
             lines = fh.read().splitlines()
     except OSError:
         return {'available': False, 'reason': 'no ALSA devices (/proc/asound/pcm is missing)'}
