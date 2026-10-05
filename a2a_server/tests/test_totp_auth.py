@@ -144,6 +144,44 @@ class TestTOTPAuth(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["detail"], "Invalid TOTP code")
 
+    # -- the limiter counts failed codes only ---------------------------------------
+
+    def test_valid_codes_never_trip_the_limiter(self):
+        """2026-10-05: every request with an X-TOTP header was counted, so a peer sending its
+        sixth valid broadcast within a minute was refused with 429."""
+        import pyotp
+        code = pyotp.TOTP(_TEST_SEED).now()
+        statuses = [self._post_with_code(code).status_code for _ in range(a2a_server._TOTP_MAX_ATTEMPTS * 3)]
+        self.assertEqual(set(statuses), {200})
+        self.assertNotIn("testclient", a2a_server._totp_attempts)   # successes leave no record
+
+    def test_failed_codes_still_lock_the_address_out(self):
+        import pyotp
+        max_attempts = a2a_server._TOTP_MAX_ATTEMPTS
+        bad = [self._post_with_code("000000").status_code for _ in range(max_attempts)]
+        self.assertEqual(bad, [401] * max_attempts)
+        # The cap is reached: even the right code is refused until the window passes.
+        resp = self._post_with_code(pyotp.TOTP(_TEST_SEED).now())
+        self.assertEqual(resp.status_code, 429)
+
+    def test_a_valid_code_does_not_erase_earlier_failures(self):
+        import pyotp
+        max_attempts = a2a_server._TOTP_MAX_ATTEMPTS
+        for _ in range(max_attempts - 1):
+            self.assertEqual(self._post_with_code("000000").status_code, 401)
+        good = pyotp.TOTP(_TEST_SEED).now()
+        self.assertEqual(self._post_with_code(good).status_code, 200)    # still under the cap
+        self.assertEqual(self._post_with_code("000000").status_code, 401)  # the cap-th failure
+        self.assertEqual(self._post_with_code(good).status_code, 429)      # earlier failures were kept
+
+    def test_failures_age_out_of_the_window(self):
+        import pyotp
+        old = time.monotonic() - a2a_server._TOTP_WINDOW - 1
+        a2a_server._totp_attempts["testclient"] = [old] * a2a_server._TOTP_MAX_ATTEMPTS
+        resp = self._post_with_code(pyotp.TOTP(_TEST_SEED).now())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertNotIn("testclient", a2a_server._totp_attempts)   # stale entries dropped, key removed
+
 
 if __name__ == "__main__":
     unittest.main()
