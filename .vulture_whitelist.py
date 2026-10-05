@@ -75,6 +75,7 @@ _ = client_address  # assigned in TCPServer.__init__ or similar; used by framewo
 # The router holds the only reference; no source line names them as a callee.
 _ = agent_card_rfc002
 _ = agent_card_legacy_alias
+_ = extended_card
 _ = bootstrap
 _ = a2a_endpoint
 _ = get_task

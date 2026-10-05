@@ -204,20 +204,20 @@ def test_callers_get_ladybug_shows_probable_injected_rows_with_why(capsys):
     assert "-- why: rule=name-via-injected-global  because=injected at mcp/server.py:" in out
 
 
-def test_callers_skill_shows_dispatch_row_as_one_of_thirteen(capsys):
+def test_callers_skill_shows_dispatch_row_as_one_of_fourteen(capsys):
     code, out = _run(capsys, ["callers", "a2a_server/server.py::skill_memory_recall", "--rev", "HEAD"])
     assert code == 0
-    assert "dispatch  1 of 13" in out
+    assert "dispatch  1 of 14" in out
 
 
-def test_explain_dispatch_callsite_lists_all_thirteen_candidates(capsys):
+def test_explain_dispatch_callsite_lists_all_fourteen_candidates(capsys):
     # Locate the callsite through the graph: a hardcoded line number drifts.
     _, callers_out = _run(capsys, ["callers", "a2a_server/server.py::skill_memory_recall", "--rev", "HEAD", "--format", "json"])
     disp = [r for r in json.loads(callers_out) if r["kind"] == "DISPATCHES"][0]
     code, out = _run(capsys, ["explain", disp["src"], "--rev", "HEAD", "--scope", "a2a_server/"])
     assert code == 0
-    assert out.count("DISPATCHES ->") == 13
-    assert "1 of 13" in out
+    assert out.count("DISPATCHES ->") == 14
+    assert "1 of 14" in out
 
 
 def test_paths_reports_minimum_confidence(capsys):

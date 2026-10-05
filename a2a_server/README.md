@@ -28,6 +28,46 @@ Optional env:
 - `LOCI_A2A_IDEMPOTENCY_TTL_S` (default `3600`) sets replay window TTL for
   `(sender, skill_id, idempotency_key)`.
 
+## Agent card and node profile
+
+`GET /.well-known/agent.json` (public) says what this node is: `name`, `version`, `url`, the **skills it
+actually serves**, how to authenticate, and a short summary of what it has. Nothing in it is hard-coded to a
+device, so each node advertises only its own hardware, sensors and data.
+
+- **`url`** is `LOCI_A2A_URL`. Set it to an address peers can reach (the node's tailnet or LAN address). A
+  loopback URL on a node that listens beyond loopback is reported at startup and as
+  `advertised_url_is_loopback` in `/health`, because a peer that follows the card cannot reach it.
+- **`skills`** is the served set, from `LOCI_A2A_SKILLS` (comma-separated; default all). A skill that is not
+  listed is refused as unknown, not just hidden. `privileged: true` marks skills that are refused unless the
+  caller is a privileged sender (`LOCI_A2A_PRIVILEGED_SENDERS`) and has proved who it is.
+- **`resources`** is the public summary of the node profile: hardware names, sensor names and kinds, data
+  names and kinds. Locations and details are not in it.
+- **`GET /a2a/extended-card`** needs the same credentials as `/a2a`. It adds the full profile and a live
+  inventory: host, GPUs, serial/USB/video/audio devices, storage, Ollama models, Qdrant collections with point
+  counts, and the memory store's size and row count. A probe that does not apply reports
+  `{"available": false, "reason": ...}`. The same inventory is the `device_inventory` skill. It is cached for
+  30 seconds. Tokens, seeds and keys are never part of it.
+
+`LOCI_A2A_PROFILE` points at a JSON file the operator writes. Only these fields are read; strings are clipped to
+300 characters, lists to 50 rows, and a file over 64 KB is ignored (with a log line):
+
+```json
+{
+  "description": "Field laptop: DAMA stack, local models, no GPU.",
+  "summary": "i7 laptop, 15 GB, no GPU",
+  "hardware": [{"name": "Intel i7-8550U", "detail": "4 cores / 8 threads"}],
+  "sensors": [{"name": "CubeCell radiation counter", "kind": "radiation", "status": "intermittent"}],
+  "data": [{"name": "DAMA telemetry", "kind": "timeseries", "description": "InfluxDB", "where": "influxdb:8086"}],
+  "notes": ["Free disk is tight."]
+}
+```
+
+Describe only what the node really has and can reach. The live inventory is the check on the profile: a
+profile that claims a GPU on a node whose inventory shows none is a profile bug.
+
+`LOCI_A2A_INIT_DB=1` creates the Mnemosyne SQLite file and its `memories` table when missing, for a fresh node.
+It never alters an existing database.
+
 ## Signed requests (Ed25519)
 
 A caller can prove who it is with a key instead of a shared token. It sends `X-Agent-ID` and

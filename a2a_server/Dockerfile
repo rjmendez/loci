@@ -4,6 +4,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# device_inventory lists USB devices with lsusb. Run the container with the host's /dev mounted read-only
+# (-v /dev:/dev:ro) for it to see real hardware; without it those sections say so. Audio capture devices are
+# read from /proc/asound, which needs no device access.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends usbutils \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
     "fastapi==0.133.1" \
     "uvicorn[standard]==0.41.0" \
@@ -29,8 +36,8 @@ ENV PYTHONPATH=/app/mcp
 
 # Mnemosyne SQLite path — mount a volume here for persistence across restarts
 ENV MNEMOSYNE_DATA_DIR=/data/mnemosyne
-# A2A identity
-ENV HERMES_AGENT_ID=mrpink
+# A2A identity: set HERMES_AGENT_ID at run time. There is deliberately no default here: an image
+# that names itself after one device would stamp that name on every node it is run as.
 # External services
 ENV QDRANT_URL=http://localhost:6333
 ENV QDRANT_API_KEY=

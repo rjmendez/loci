@@ -125,13 +125,14 @@ for registration anchors and call paths.*
 
 ---
 
-## A2A skills (13)
+## A2A skills (14)
 
-The A2A server exposes 13 skills via JSON-RPC 2.0 over HTTP, letting peer agents share
-memory without requiring the MCP stack. Twelve are advertised in the agent card;
-`memory_prime` is callable but not listed in discovery.
+The A2A server has 14 skills, served over JSON-RPC 2.0 so peer agents can share memory without the MCP
+stack. A node serves and advertises only the skills in `LOCI_A2A_SKILLS` (default: all), so the agent card
+always matches what the node answers; a skill that is not served is refused as unknown. See
+`a2a_server/README.md`, "Agent card and node profile".
 
-| Skill | Advertised |
+| Skill | Served and advertised by default |
 |---|---|
 | `memory_recall` | Yes |
 | `memory_remember` | Yes |
@@ -145,7 +146,8 @@ memory without requiring the MCP stack. Twelve are advertised in the agent card;
 | `gpu_inference` | Yes |
 | `docker_status` | Yes |
 | `ua_search` | Yes |
-| `memory_prime` | No |
+| `memory_prime` | Yes |
+| `device_inventory` | Yes |
 
 ---
 

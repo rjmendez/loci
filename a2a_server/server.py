@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loci A2A Server v0.1.0 — Mnemosyne memory over A2A JSON-RPC.
+"""Loci A2A Server v0.2.0 — Mnemosyne memory over A2A JSON-RPC.
 
 Runtime requirements
 - Python 3.11 (venv: ~/.hermes/hermes-agent/venv/bin/python3)
@@ -53,6 +53,18 @@ Optional / tunable:
   LOCI_A2A_AGENT_TOKENS per-agent bearer tokens: JSON {"agent": "token"} or
     agent=token,agent2=token2. Each token authenticates (and binds the sender to)
     one agent_id; a peer that fans out memory_remember needs one here. Default: ''
+  LOCI_A2A_SKILLS comma-separated skills this node serves and advertises; any other skill is refused
+    as unknown. Default: every skill. A node without a GPU, a Docker daemon or a Qdrant should not
+    offer the skills that need them.
+  LOCI_A2A_PROFILE path to a JSON file describing this node: description, hardware, sensors, data.
+    The card carries a short public summary; the authenticated extended card carries all of it plus a
+    live inventory. See README.md "Agent card and node profile". Default: none
+  LOCI_A2A_BOARD_FILE file holding the board model for device_inventory. Default /proc/device-tree/model;
+    a container cannot read that, so mount the host's /sys/firmware/devicetree/base/model and point this at it.
+  LOCI_A2A_ASOUND_PCM file listing the ALSA devices, for device_inventory. Default /proc/asound/pcm, which Docker
+    masks inside containers: mount the host's /proc/asound/pcm and point this at it.
+  LOCI_A2A_INIT_DB 1 creates the Mnemosyne SQLite file and its memories table at startup when
+    missing (a fresh node). Default: 0
   PEER_PUBKEYS_JSON / PEER_PUBKEYS_DIR Ed25519 public keys of agents that may sign requests:
     a JSON object {"agent_id": "<PEM>"} and/or a directory of <agent_id>.pub PEM files
     (the directory wins on a clash). A signed caller sends X-Agent-ID + X-Signature, is bound
@@ -129,7 +141,8 @@ Endpoints
 
 Skills
   _SKILL_MAP is the source of truth and is also exposed by GET /health.
-  Public descriptions live in AGENT_CARD. See README.md "A2A skills (13)".
+  Public descriptions live in _CARD_STATIC and are served by _build_card(); the card lists only the
+  skills this node serves. See README.md "Agent card and node profile".
 
 JSON-RPC call shape
   POST /a2a
@@ -161,8 +174,11 @@ JSON-RPC call shape
 """
 
 import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading, hashlib, re
+import glob, platform, shutil, subprocess
 from typing import Optional, Any
 from urllib.parse import urlsplit
+
+__version__ = '0.2.0'
 from contextlib import contextmanager
 
 # Accept legacy HERMES_* spellings. This server runs standalone and reaches
@@ -536,18 +552,16 @@ _SIGNING_KEY = _load_signing_key()
 
 
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
-AGENT_CARD = {
+_CARD_STATIC = {
     'name': AGENT_ID,
     'description': (
-        'Persistent memory and knowledge node for the Hermes agent mesh. '
-        'FTS + semantic search over session history, episodic memory, and working memory. '
-        'Write new memories with cross-agent author tagging. '
-        'Backend: Mnemosyne SQLite + Qdrant loci_sessions/mnemosyne/loci_memory collections.'
+        f'Loci A2A node {AGENT_ID}: memory skills over this node\'s own Mnemosyne store. '
+        'What this node serves is the skills list; what it has access to is in its profile.'
     ),
     'url': AGENT_URL,
     'protocol_version': '0.3.0',
     'agent_id': AGENT_ID,
-    'skills': [
+    'skills': [  # descriptions only: _build_card() lists the skills this node actually serves
         {
             'id': 'memory_recall',
             'name': 'Memory Recall',
@@ -649,6 +663,24 @@ AGENT_CARD = {
             'description': (
                 'Query the knowledge graph triples table by subject, predicate, or object. '
                 'Input: {subject?: str, predicate?: str, object?: str, limit?: int=20, bank?: str}'
+            )
+        },
+        {
+            'id': 'memory_prime',
+            'name': 'Defensive Priming',
+            'description': (
+                'SAR-style priming: a decaying skepticism boost for a topic cluster that lowers memcheck '
+                'thresholds on peers without sending the topic\'s content. '
+                'Input: {topic: str, skepticism_delta?: float=0.2, ttl_seconds?: int=3600, broadcast?: bool=true}'
+            )
+        },
+        {
+            'id': 'device_inventory',
+            'name': 'Device Inventory',
+            'description': (
+                'Live, read-only inventory of what this node has: host, GPUs, serial/USB/video/audio devices, '
+                'storage, Ollama models, Qdrant collections, memory-store sizes. A probe that does not apply '
+                'reports unavailable. Input: {}'
             )
         },
     ],
@@ -862,7 +894,7 @@ def _validate_boundary_metadata(skill_id: str, sender: str, params: dict) -> Opt
     )
 
 # ── FastAPI app + auth ──────────────────────────────────────────────────────────
-app = FastAPI(title=f'{AGENT_ID} A2A', version='0.1.0')
+app = FastAPI(title=f'{AGENT_ID} A2A', version=__version__)
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -1026,7 +1058,10 @@ _http_session: aiohttp.ClientSession | None = None
 def _get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        # aiohttp also advertises Brotli; a Qdrant that answers in Brotli (1.17 does) then fails every call
+        # with ClientPayloadError unless the optional brotli package is installed. Ask for what stdlib decodes.
+        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30),
+                                              headers={'Accept-Encoding': 'gzip, deflate'})
     return _http_session
 
 
@@ -2138,6 +2173,312 @@ async def skill_memory_prime(task: dict) -> dict:
     }
 
 
+# ── node profile, live inventory and the agent card ──────────────────────────────────────────
+# The card must say what this node serves and has, not what the code could do somewhere else.
+_SKILL_DOCS = {entry['id']: entry for entry in _CARD_STATIC['skills']}
+_PROFILE_MAX_BYTES = 65536
+_INVENTORY_TTL_S = 30
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host in ('localhost', '::1', '') or host.startswith('127.')
+
+
+def _advertised_url_is_loopback() -> bool:
+    """True when peers cannot use the card's URL: it names loopback while the server listens beyond it."""
+    url_host = (urlsplit(AGENT_URL).hostname or '')
+    return _is_loopback_host(url_host) and not _is_loopback_host(A2A_HOST)
+
+
+def _clean_items(value, fields: tuple, cap: int) -> list:
+    """Operator-authored list of small objects: known fields only, scalars only, bounded."""
+    out = []
+    if not isinstance(value, list):
+        return out
+    for item in value[:cap]:
+        if isinstance(item, str):
+            item = {fields[0]: item}
+        if not isinstance(item, dict):
+            continue
+        row = {}
+        for field in fields:
+            v = item.get(field)
+            if isinstance(v, (str, int, float, bool)):
+                row[field] = v[:300] if isinstance(v, str) else v
+        if row.get(fields[0]):
+            out.append(row)
+    return out
+
+
+def _load_profile(path: Optional[str] = None) -> dict:
+    """The node profile from LOCI_A2A_PROFILE, validated and bounded; {} when absent or unusable."""
+    path = os.environ.get('LOCI_A2A_PROFILE', '').strip() if path is None else path
+    if not path:
+        return {}
+    try:
+        with open(os.path.expanduser(path), 'rb') as fh:
+            raw = fh.read(_PROFILE_MAX_BYTES + 1)
+    except OSError as e:
+        log.error(f'LOCI_A2A_PROFILE unreadable ({e.__class__.__name__}); the card carries no profile')
+        return {}
+    if len(raw) > _PROFILE_MAX_BYTES:
+        log.error(f'LOCI_A2A_PROFILE is larger than {_PROFILE_MAX_BYTES} bytes; ignored')
+        return {}
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except ValueError:
+        log.error('LOCI_A2A_PROFILE is not valid JSON; ignored')
+        return {}
+    if not isinstance(data, dict):
+        log.error('LOCI_A2A_PROFILE must be a JSON object; ignored')
+        return {}
+    profile: dict = {}
+    for key, cap in (('description', 1000), ('summary', 300)):
+        if isinstance(data.get(key), str) and data[key].strip():
+            profile[key] = data[key].strip()[:cap]
+    for key, fields in (('hardware', ('name', 'detail', 'count')),
+                        ('sensors', ('name', 'kind', 'detail', 'status')),
+                        ('data', ('name', 'kind', 'description', 'where'))):
+        rows = _clean_items(data.get(key), fields, 50)
+        if rows:
+            profile[key] = rows
+    if isinstance(data.get('notes'), list):
+        profile['notes'] = [str(n)[:300] for n in data['notes'][:20]]
+    return profile
+
+
+_PROFILE: dict = _load_profile()
+
+
+def _enabled_skills() -> list:
+    """Skills this node serves, in dispatch order: LOCI_A2A_SKILLS, or all of them."""
+    raw = os.environ.get('LOCI_A2A_SKILLS', '').strip()
+    if not raw:
+        return list(_SKILL_MAP)
+    wanted = [n.strip() for n in raw.split(',') if n.strip()]
+    unknown = [n for n in wanted if n not in _SKILL_MAP]
+    if unknown:
+        log.error(f'LOCI_A2A_SKILLS names unknown skills {unknown}; they are ignored')
+    return [n for n in _SKILL_MAP if n in wanted]
+
+
+def _skill_entry(skill_id: str) -> dict:
+    doc = _SKILL_DOCS.get(skill_id, {})
+    return {'id': skill_id, 'name': doc.get('name', skill_id), 'description': doc.get('description', ''),
+            'privileged': skill_id in DESTRUCTIVE_SKILLS}
+
+
+def _build_card(extended: bool = False, inventory: Optional[dict] = None) -> dict:
+    """The agent card: identity, URL, version, the skills actually served, auth, and what this node has."""
+    card = {k: v for k, v in _CARD_STATIC.items() if k != 'skills'}
+    card['version'] = __version__
+    card['url'] = AGENT_URL
+    if _PROFILE.get('description'):
+        card['description'] = _PROFILE['description']
+    card['skills'] = [_skill_entry(sid) for sid in _ENABLED_SKILLS]
+    card['skills_note'] = ('privileged: true skills are refused unless the caller is a privileged sender '
+                           'on this node (LOCI_A2A_PRIVILEGED_SENDERS) and has proved who it is.')
+    if _PROFILE:
+        card['resources'] = {
+            'summary': _PROFILE.get('summary', ''),
+            'hardware': [h['name'] for h in _PROFILE.get('hardware', [])],
+            'sensors': [{'name': x['name'], 'kind': x.get('kind', '')} for x in _PROFILE.get('sensors', [])],
+            'data': [{'name': x['name'], 'kind': x.get('kind', '')} for x in _PROFILE.get('data', [])],
+            'detail': 'GET /a2a/extended-card (authenticated) adds the full profile and a live inventory.',
+        }
+    if extended:
+        card['extended'] = True
+        card['profile'] = _PROFILE
+        card['inventory'] = inventory
+    return card
+
+
+_TOOL_FALLBACK_DIRS = ('/usr/lib/wsl/lib', '/usr/local/sbin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/bin')
+
+
+def _tool_path(name: str) -> str:
+    """PATH lookup, then the places services miss: a systemd unit's PATH has no /usr/lib/wsl/lib, where WSL
+    keeps nvidia-smi, so a GPU workstation reported no GPU. Falls back to the bare name (reported as not installed)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _TOOL_FALLBACK_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return name
+
+
+def _run(cmd: list, timeout: int = 5):
+    """(stdout, '') or (None, reason); never raises."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, 'not installed'
+    except subprocess.TimeoutExpired:
+        return None, 'timed out'
+    except Exception as e:
+        return None, e.__class__.__name__
+    if done.returncode != 0:
+        return None, (done.stderr.strip()[:120] or f'exit {done.returncode}')
+    return done.stdout, ''
+
+
+_ASOUND_PCM = '/proc/asound/pcm'
+
+
+def _probe_audio_capture():
+    """Capture-capable ALSA devices, from procfs. Reading /proc/asound/pcm needs no device access, so it works
+    where `arecord -l` cannot (a container must be handed read-write sound devices for that). Docker masks
+    /proc/asound inside containers, so LOCI_A2A_ASOUND_PCM can point at a mounted copy of the host's file."""
+    try:
+        with open(os.environ.get('LOCI_A2A_ASOUND_PCM', _ASOUND_PCM), encoding='utf-8', errors='replace') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {'available': False, 'reason': 'no ALSA devices (/proc/asound/pcm is missing)'}
+    found = []
+    for line in lines:
+        if re.search(r'\bcapture \d+', line):             # '00-00: USB Audio : USB Audio : playback 1 : capture 1'
+            ident, _, rest = line.partition(':')
+            names = [part.strip() for part in rest.split(':')[:2] if part.strip()]
+            found.append(f'{ident.strip()}: {" / ".join(dict.fromkeys(names))}')
+    return found
+
+
+def _probe_local() -> dict:
+    """Probes that touch only this host. Each section stands alone: one failing never hides the rest."""
+    out: dict = {}
+    host = {'hostname': platform.node(), 'machine': platform.machine(), 'system': platform.system(),
+            'release': platform.release(), 'cpu_count': os.cpu_count(), 'python': platform.python_version()}
+    try:
+        with open('/proc/meminfo', encoding='utf-8') as fh:
+            host['mem_total_gb'] = round(int(re.search(r'MemTotal:\s+(\d+)', fh.read()).group(1)) / 1048576, 1)
+    except Exception:
+        pass
+    try:
+        with open(os.environ.get('LOCI_A2A_BOARD_FILE', '/proc/device-tree/model'), 'rb') as fh:
+            host['board'] = fh.read().decode('utf-8', 'replace').strip('\x00 \n')
+    except Exception:
+        pass
+    out['host'] = host
+
+    text, why = _run([_tool_path('nvidia-smi'), '--query-gpu=name,memory.total,memory.used', '--format=csv,noheader'])
+    if text is None:
+        out['gpus'] = {'available': False, 'reason': why}
+    else:
+        out['gpus'] = {'available': True, 'devices': [ln.strip() for ln in text.splitlines() if ln.strip()]}
+
+    if os.name == 'posix':
+        out['serial_ports'] = sorted(p for pat in ('/dev/ttyUSB*', '/dev/ttyACM*', '/dev/ttyTHS*', '/dev/ttyAMA*')
+                                     for p in glob.glob(pat))
+        out['video_devices'] = sorted(glob.glob('/dev/video*'))
+        out['i2c_spi'] = sorted(glob.glob('/dev/i2c-*') + glob.glob('/dev/spidev*'))
+        text, why = _run([_tool_path('lsusb')])
+        out['usb'] = ([re.sub(r'^Bus \d+ Device \d+: ID ', '', ln) for ln in text.splitlines() if 'root hub' not in ln]
+                      if text is not None else {'available': False, 'reason': why})
+        out['audio_capture'] = _probe_audio_capture()
+    else:
+        for key in ('serial_ports', 'video_devices', 'i2c_spi', 'usb', 'audio_capture'):
+            out[key] = {'available': False, 'reason': 'device probes are Linux only'}
+
+    storage = []
+    for label, path in (('root', '/'), ('mnemosyne', os.path.dirname(MNEMOSYNE_DB))):
+        try:
+            du = shutil.disk_usage(path)
+            storage.append({'name': label, 'free_gb': du.free // 2**30, 'total_gb': du.total // 2**30})
+        except OSError:
+            pass
+    out['storage'] = storage
+
+    store = {'name': os.path.basename(MNEMOSYNE_DB), 'present': os.path.exists(MNEMOSYNE_DB)}
+    if store['present']:
+        store['size_mb'] = round(os.path.getsize(MNEMOSYNE_DB) / 1048576, 1)
+        try:
+            conn = sqlite3.connect('file:' + MNEMOSYNE_DB.replace('\\', '/') + '?mode=ro', uri=True, timeout=3)
+            try:
+                store['memories'] = conn.execute('select count(*) from memories').fetchone()[0]
+            finally:
+                conn.close()
+        except Exception as e:
+            store['memories'] = f'unreadable ({e.__class__.__name__})'
+    out['memory_store'] = store
+    return out
+
+
+async def _probe_ollama() -> dict:
+    if not OLLAMA_BASE:
+        return {'available': False, 'reason': 'not configured'}
+    root = OLLAMA_BASE[:-3] if OLLAMA_BASE.endswith('/v1') else OLLAMA_BASE
+    try:
+        sess = _get_http_session()
+        async with sess.get(root.rstrip('/') + '/api/tags', timeout=aiohttp.ClientTimeout(total=5)) as r:
+            if r.status != 200:
+                return {'available': False, 'reason': f'HTTP {r.status}'}
+            models = sorted(m.get('name', '?') for m in (await r.json()).get('models', []))
+        return {'available': True, 'models': models[:60], 'model_count': len(models)}
+    except Exception as e:
+        return {'available': False, 'reason': e.__class__.__name__}
+
+
+async def _probe_qdrant() -> dict:
+    if not QDRANT_URL:
+        return {'available': False, 'reason': 'not configured'}
+    headers = {'api-key': QDRANT_KEY} if QDRANT_KEY else {}
+    base = QDRANT_URL.rstrip('/')
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        sess = _get_http_session()
+        async with sess.get(base + '/collections', headers=headers, timeout=timeout) as r:
+            if r.status != 200:
+                return {'available': False, 'reason': f'HTTP {r.status}'}
+            names = sorted(c['name'] for c in (await r.json()).get('result', {}).get('collections', []))[:40]
+
+        async def count(name):
+            try:
+                async with sess.get(f'{base}/collections/{name}', headers=headers, timeout=timeout) as cr:
+                    return name, (await cr.json()).get('result', {}).get('points_count') if cr.status == 200 else None
+            except Exception:
+                return name, None
+        counts = dict(await asyncio.gather(*[count(n) for n in names]))
+        return {'available': True, 'collections': [{'name': n, 'points': counts.get(n)} for n in names]}
+    except Exception as e:
+        return {'available': False, 'reason': e.__class__.__name__}
+
+
+_inventory_cache: dict = {'at': 0.0, 'data': None}
+
+
+async def _inventory(force: bool = False) -> dict:
+    """Live inventory, cached briefly so a chatty caller cannot make this host fork on every request."""
+    now = time.monotonic()
+    if not force and _inventory_cache['data'] is not None and now - _inventory_cache['at'] < _INVENTORY_TTL_S:
+        return _inventory_cache['data']
+    local = await asyncio.to_thread(_probe_local)
+    ollama, qdrant = await asyncio.gather(_probe_ollama(), _probe_qdrant())
+    data = {'node': AGENT_ID, 'version': __version__, **local, 'ollama': ollama, 'qdrant': qdrant,
+            'probed_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    _inventory_cache.update(at=now, data=data)
+    return data
+
+
+async def skill_device_inventory(task: dict) -> dict:
+    inv = dict(await _inventory())
+    inv['skills_served'] = list(_ENABLED_SKILLS)
+    return inv
+
+
+def _init_memory_db() -> None:
+    """Fresh node: create the Mnemosyne file and the table memory_remember writes to. Never alters an existing one."""
+    os.makedirs(os.path.dirname(MNEMOSYNE_DB), exist_ok=True)
+    conn = sqlite3.connect(MNEMOSYNE_DB, timeout=10)
+    try:
+        conn.execute('CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, content TEXT, source TEXT, '
+                     'timestamp TEXT, session_id TEXT, importance REAL, metadata_json TEXT, created_at TEXT)')
+        conn.commit()
+    finally:
+        conn.close()
+
+
 _SKILL_MAP: dict[str, Any] = {
     'memory_recall':           skill_memory_recall,
     'memory_remember':         skill_memory_remember,
@@ -2152,7 +2493,9 @@ _SKILL_MAP: dict[str, Any] = {
     'gpu_inference':           skill_gpu_inference,
     'docker_status':           skill_docker_status,
     'ua_search':               skill_ua_search,
+    'device_inventory':        skill_device_inventory,
 }
+_ENABLED_SKILLS: list = _enabled_skills()
 
 async def _dispatch(skill_id: str, task: dict) -> Any:
     handler = _SKILL_MAP.get(skill_id)
@@ -2168,13 +2511,19 @@ async def _dispatch(skill_id: str, task: dict) -> Any:
 @app.get('/.well-known/agent.json')
 async def agent_card_rfc002():
     """Agent card — RFC-002 spec location."""
-    return JSONResponse(AGENT_CARD)
+    return JSONResponse(_build_card())
 
 
 @app.get('/.well-known/agent-card.json')
 async def agent_card_legacy_alias():
     """Agent card — legacy alias."""
-    return JSONResponse(AGENT_CARD)
+    return JSONResponse(_build_card())
+
+
+@app.get('/a2a/extended-card')
+async def extended_card(auth: dict = Depends(_verify_bearer), _: None = Depends(_verify_totp)):
+    """Authenticated card: the full node profile plus a live inventory of what this node has."""
+    return JSONResponse(_build_card(extended=True, inventory=await _inventory()))
 
 
 @app.get('/health')
@@ -2183,7 +2532,10 @@ async def health():
     return JSONResponse({
         'status': 'ok',
         'agent': AGENT_ID,
-        'skills': list(_SKILL_MAP.keys()),
+        'version': __version__,
+        'skills': list(_ENABLED_SKILLS),
+        'advertised_url': AGENT_URL,
+        'advertised_url_is_loopback': _advertised_url_is_loopback(),
         'mnemosyne_db_found': db_ok,
         'qdrant_configured': bool(QDRANT_URL),
         'ollama_configured': bool(OLLAMA_BASE),
@@ -2316,7 +2668,7 @@ async def _handle_task_send(rpc_id: str, params: dict,
         }, status_code=400)
     skill_id = skill_id.strip()
 
-    if skill_id not in _SKILL_MAP:
+    if skill_id not in _SKILL_MAP or skill_id not in _ENABLED_SKILLS:
         return JSONResponse({
             'jsonrpc': '2.0', 'id': rpc_id,
             'error': {'code': -32601, 'message': f"Unknown skill '{skill_id}'."}
@@ -2412,7 +2764,14 @@ async def _handle_task_get(rpc_id: str, params: dict) -> JSONResponse:
 
 # ── entrypoint ───────────────────────────────────────────────────────────────────
 def main() -> None:
-    log.info(f'{AGENT_ID} A2A v0.1.0  {A2A_HOST}:{A2A_PORT}')
+    if os.environ.get('LOCI_A2A_INIT_DB', '0').strip().lower() in ('1', 'true', 'yes'):
+        _init_memory_db()
+    if _advertised_url_is_loopback():
+        log.warning(f'agent card advertises {AGENT_URL}, a loopback address, but the server listens on {A2A_HOST}: '
+                    'peers that follow the card cannot reach this node; set LOCI_A2A_URL to its real address')
+    if AGENT_ID == 'hermes-agent':
+        log.warning('HERMES_AGENT_ID is not set: this node identifies itself as the default "hermes-agent"')
+    log.info(f'{AGENT_ID} A2A v{__version__}  {A2A_HOST}:{A2A_PORT}')
     log.info(f'Agent card:    {AGENT_URL}/.well-known/agent.json')
     log.info(f'Mnemosyne DB:  {MNEMOSYNE_DB}  ({"found" if os.path.exists(MNEMOSYNE_DB) else "MISSING"})')
     log.info(f'Qdrant:        {QDRANT_URL}')

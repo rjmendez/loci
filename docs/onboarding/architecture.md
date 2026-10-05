@@ -61,7 +61,7 @@ Optional structured memory with a three-level hierarchy:
 
 7. **Decay & Refresh** — `ebbinghaus_consolidation.py` triggers on R < 0.3 (70%+ decay) using the FSRS DSR model. `amem_consolidation.py` discovers cross-links and detects conflicts. Both run on demand, not on cron.
 
-8. **A2A Mesh Server** — `a2a_server/server.py` exposes 13 JSON-RPC skills over HTTP for agent-to-agent memory. Key skills: `memory_recall`, `memory_remember`, `rag_search`, `context_broadcast` (fan to peers), `mnemosyne_triple_add/query`, `gpu_inference`, `docker_status`. Enables mesh-wide context sharing.
+8. **A2A Mesh Server** — `a2a_server/server.py` exposes 14 JSON-RPC skills over HTTP (each node serves and advertises its own subset, with a profile of its hardware, sensors and data) for agent-to-agent memory. Key skills: `memory_recall`, `memory_remember`, `rag_search`, `context_broadcast` (fan to peers), `mnemosyne_triple_add/query`, `gpu_inference`, `docker_status`. Enables mesh-wide context sharing.
 
 9. **Supply-chain security** — `pre_tool_grounding.py` scans writes for IOCs and injection patterns. Audit-only by default (`HOOK_BLOCK_MODE=0`), with an unconditional block on injection into agent config files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`).
 
