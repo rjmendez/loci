@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -118,15 +119,17 @@ class ReflectionLoopTests(unittest.TestCase):
         # Limit 1: the first sighting stays visible, only the second (5 hits) is suppressed.
         self.assertEqual(result["stats"]["error_signatures_suppressed"], 5)
 
+        # The first sighting is news and is stored. The second item carries only the now-known signature
+        # (every hit suppressed), so it is counted as low signal instead of being stored as a finding.
         observed = [c for c in stored_calls if c["finding_type"] == "observed"]
-        self.assertEqual(len(observed), 2)
+        self.assertEqual(len(observed), 1)
         for call in observed:
             self.assertEqual(call["confidence"], "low")
             self.assertIn("unreceipted-observed", call["tags"])
+        self.assertEqual(result["stats"]["low_signal"]["files"], 1)
 
         self.assertIn("repeat-signature", observed[0]["text"])
         self.assertNotIn("saturated=", observed[0]["text"])
-        self.assertIn("saturated=1 signatures (5 hits)", observed[1]["text"])
 
     def test_tick_prioritizes_process_logs_before_session_events(self):
         state = server._reflection_default_state()
@@ -206,7 +209,7 @@ class ReflectionLoopTests(unittest.TestCase):
         state = self._tick_with(store_item_findings=True)
         self.assertEqual(list(state["processed"]), ["process_log|/tmp/a.log"])
 
-    def test_tick_batches_low_signal_session_events_into_one_observed(self):
+    def test_tick_counts_low_signal_session_events_and_stores_the_rollup_only_when_asked(self):
         state = server._reflection_default_state()
         state["investigation_id"] = "test-inv"
         state["queue"] = [
@@ -231,20 +234,31 @@ class ReflectionLoopTests(unittest.TestCase):
             stored_calls.append(kwargs)
             return json.dumps({"stored": True})
 
-        with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
-            server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
-        ), patch.object(
-            server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
-        ), patch.object(
-            server, "_process_reflection_item", side_effect=[summary, summary]
-        ), patch.object(
-            server, "investigation_store", side_effect=fake_store
-        ):
-            server.reflection_loop_tick(max_items=2, max_lines_per_file=100, store_item_findings=True)
+        def run_tick(env):
+            stored_calls.clear()
+            state["queue"] = [
+                {"kind": "session_event", "path": "/tmp/s1.log"},
+                {"kind": "session_event", "path": "/tmp/s2.log"},
+            ]
+            with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
+                server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
+            ), patch.object(
+                server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
+            ), patch.object(
+                server, "_process_reflection_item", side_effect=[summary, summary]
+            ), patch.object(
+                server, "investigation_store", side_effect=fake_store
+            ), patch.dict(os.environ, env):
+                server.reflection_loop_tick(max_items=2, max_lines_per_file=100, store_item_findings=True)
+            return [c for c in stored_calls if c["finding_type"] == "observed"]
 
-        observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        # Default: the same sentence every tick is not a memory. The totals are kept as counters.
+        self.assertEqual(run_tick({"LOCI_REFLECTION_STORE_LOW_SIGNAL": ""}), [])
+        self.assertEqual(state["stats"]["low_signal"], {"files": 2, "lines": 20, "bytes": 200, "by_kind": {"session_event": 2}})
+        # Opt-in: the roll-up is stored as before.
+        observed = run_tick({"LOCI_REFLECTION_STORE_LOW_SIGNAL": "1"})
         self.assertEqual(len(observed), 1)
-        self.assertIn("batched low-signal session_event files count=2", observed[0]["text"])
+        self.assertIn("batched low-signal files count=2", observed[0]["text"])
         self.assertIn("batched-low-signal", observed[0]["tags"])
 
     def test_tick_attaches_llm_triage_metadata_when_enabled(self):
