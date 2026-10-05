@@ -500,6 +500,15 @@ def load_suite(spec: str):
     return suites.BUILTIN[spec]()
 
 
+def suite_name(spec: str) -> str:
+    """The on-disk suite name for a CLI spec: a built-in alias or ``module:factory`` resolves to the
+    suite's own ``name``; anything else is taken as the name itself."""
+    suites = importlib.import_module("hillclimb_suites")
+    if ":" in spec or spec in suites.BUILTIN:
+        return load_suite(spec).name
+    return spec
+
+
 def _main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="hillclimb")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -522,11 +531,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
                           repeats=a.repeats, patience=a.patience, force=a.force)
         res = climb(suite, LLMProposer(), start, cfg)
     elif a.cmd == "status":
-        res = status(load_suite(a.suite).name if ":" in a.suite else a.suite)
+        res = status(suite_name(a.suite))
     elif a.cmd == "promote":
-        res = promote(load_suite(a.suite).name if ":" in a.suite else a.suite)
+        res = promote(suite_name(a.suite))
     else:
-        res = rollback(load_suite(a.suite).name if ":" in a.suite else a.suite)
+        res = rollback(suite_name(a.suite))
     print(json.dumps(res, indent=1, default=str))
     return 0
 

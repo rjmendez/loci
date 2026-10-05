@@ -284,3 +284,19 @@ def test_saturated_test_split_blocks_the_climb(_state):
     res = H.climb(Easy(), Script(H.Patch("real", 1)), {}, H.ClimbConfig())
     assert res["stop"] == "diagnostics"
     assert any("held-out split" in w for w in res["diagnostics"]["warnings"])
+
+
+def test_cli_alias_resolves_to_the_suite_name_for_status_promote_rollback(_state, capsys):
+    # `triage` is an alias for the suite named `reflection_triage`; all subcommands must agree on the folder.
+    assert H.suite_name("triage") == "reflection_triage"
+    assert H.suite_name("reflection_triage") == "reflection_triage"
+    d = H.suite_dir("reflection_triage")
+    d.mkdir(parents=True)
+    (d / "candidate_overlay.json").write_text(json.dumps({"guidance": "x"}))
+    assert H._main(["promote", "--suite", "triage"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert json.loads((d / "overlay.json").read_text()) == {"guidance": "x"}
+    assert H._main(["status", "--suite", "triage"]) == 0
+    assert json.loads(capsys.readouterr().out)["live_overlay"] == {"guidance": "x"}
+    assert H._main(["rollback", "--suite", "triage"]) == 0
+    assert not (d / "overlay.json").exists()
