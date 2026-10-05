@@ -727,6 +727,11 @@ def _verify_totp(request: Request,
             raise HTTPException(status_code=401, detail='X-TOTP header required (TOTP is enabled)')
         client_ip = request.client.host if request.client else 'unknown'
         now = time.monotonic()
+        # Only FAILED codes count against the limit. Counting every request let a
+        # healthy peer lock itself out after five valid broadcasts a minute, and let
+        # anyone behind the same address (a relay, a NAT) spend that peer's budget
+        # with valid traffic. The check, the verification and the failure record run
+        # under one lock with no await, so parallel guesses cannot slip past the cap.
         with _totp_attempts_lock:
             # Evict timestamps older than the window, and drop the key when it
             # empties. Pruning only the lists left one dict entry per client IP
@@ -736,15 +741,22 @@ def _verify_totp(request: Request,
             if len(fresh) >= _TOTP_MAX_ATTEMPTS:
                 _totp_attempts[client_ip] = fresh
                 raise HTTPException(status_code=429, detail='Too many TOTP attempts — try again later')
-            fresh.append(now)
-            _totp_attempts[client_ip] = fresh
+            ok = pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1)
+            if ok:
+                if fresh:
+                    _totp_attempts[client_ip] = fresh
+                else:
+                    _totp_attempts.pop(client_ip, None)
+            else:
+                fresh.append(now)
+                _totp_attempts[client_ip] = fresh
             # Opportunistic sweep: bounded work, keeps idle keys from accumulating
             # between requests without needing a background task.
             if len(_totp_attempts) > _TOTP_SWEEP_AFTER:
                 for ip in [k for k, v in _totp_attempts.items()
                            if not v or now - v[-1] >= _TOTP_WINDOW]:
                     del _totp_attempts[ip]
-        if not pyotp.TOTP(TOTP_SEED).verify(x_totp, valid_window=1):
+        if not ok:
             raise HTTPException(status_code=401, detail='Invalid TOTP code')
 
 
