@@ -300,3 +300,99 @@ def test_cli_alias_resolves_to_the_suite_name_for_status_promote_rollback(_state
     assert json.loads(capsys.readouterr().out)["live_overlay"] == {"guidance": "x"}
     assert H._main(["rollback", "--suite", "triage"]) == 0
     assert not (d / "overlay.json").exists()
+
+
+# ------------------------------------------------------------------ observations and labelling
+
+def _item(errors=None, **kw):
+    base = {"status": "processed", "kind": "test_run", "path": r"C:\Users\bob\proj\tests\test_x.py",
+            "events": {"test_failed": 3}, "tools": {}, "errors": errors or {"TimeoutError: waited 5s": 3}, "warnings": {}}
+    base.update(kw)
+    return base
+
+
+def test_capture_keeps_processed_dedupes_by_content_and_trims_the_path(_state):
+    items = [_item(), _item(path="/other/place/tests/test_x.py"),          # same pattern, other file: one thing
+             _item(errors={"KeyError: 'score'": 2}), {"status": "skipped", "kind": "x"}, "junk", None]
+    assert H.capture_observations(items) == 2
+    assert H.capture_observations(items) == 0
+    rows = H._read_jsonl(H.suite_dir("reflection_triage") / "observations.jsonl")
+    assert len(rows) == 2 and rows[0]["path"] == "proj/tests/test_x.py"
+    assert all(r["id"].startswith("r") for r in rows)
+
+
+def test_capture_scrubs_secrets_and_caps_text(_state):
+    secret = {"auth failed key AKIAABCDEFGHIJKLMNOP for bob@example.com token=hunter2 "
+              "and a hash 0123456789abcdef0123456789abcdef0123 " + "x" * 400: 1}
+    H.capture_observations([_item(errors=secret)])
+    text = (H.suite_dir("reflection_triage") / "observations.jsonl").read_text()
+    for leak in ("AKIAABCDEFGHIJKLMNOP", "bob@example.com", "hunter2", "0123456789abcdef0123456789abcdef0123"):
+        assert leak not in text
+    assert "[REDACTED]" in text
+    key = next(iter(json.loads(text.splitlines()[0])["errors"]))
+    assert len(key) <= 200
+
+
+def test_capture_never_raises(_state, monkeypatch):
+    monkeypatch.setattr(H, "suite_dir", lambda s: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert H.capture_observations([_item()]) == 0
+
+
+def _answers(*a):
+    it = iter(a)
+    return lambda prompt: next(it)
+
+
+def test_label_writes_cases_and_resumes(_state):
+    H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2}), _item(errors={"503 Service Unavailable": 1})])
+    out = []
+    t = H.label(n=10, input_fn=_answers("zz", "R", "s", "u"), print_fn=out.append)   # invalid, then r; skip; unknown
+    assert t["labelled"] == 2 and t["skipped"] == 1
+    cases = H._read_jsonl(H.suite_dir("reflection_triage") / "labels.jsonl")
+    assert [c["gold"] for c in cases] == ["real_regression", "unknown"]
+    assert set(cases[0]) >= {"id", "gold", "kind", "path", "events", "tools", "errors", "warnings"}
+    again = H.label(n=10, input_fn=_answers(), print_fn=out.append)                   # nothing left (one skipped)
+    assert again == {"labelled": 0, "skipped": 0, "compared": 0, "agreed": 0}
+    t = H.label(n=10, include_skipped=True, input_fn=_answers("f"), print_fn=out.append)
+    assert t["labelled"] == 1
+    assert H.label_stats()["labelled"] == 3 and H.label_stats()["unlabelled"] == 0
+
+
+def test_label_quit_stops_and_model_answer_is_shown_after_you_answer(_state):
+    H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2})])
+    out = []
+    order = []
+
+    def classify(o):
+        order.append("classify")
+        return "real_regression"
+
+    def ask(prompt):
+        order.append("ask")
+        return "r"
+
+    t = H.label(n=10, input_fn=ask, print_fn=out.append, classify=classify)
+    assert order[:2] == ["ask", "classify"]               # never before the answer
+    assert t["compared"] == 2 and t["agreed"] == 2
+    assert any("agrees" in line for line in out)
+    t2 = H.label(n=10, input_fn=_answers("q"), print_fn=out.append)
+    assert t2["labelled"] == 0
+
+
+def test_label_stats_and_suite_reads_real_labels(_state, monkeypatch):
+    H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2})])
+    H.label(n=5, input_fn=_answers("c", "n"), print_fn=lambda *_: None)
+    st = H.label_stats()
+    assert st["labelled"] == 2 and st["by_category"] == {"config_or_environment": 1, "noise_or_benign": 1}
+    assert st["enough"] is False
+    suite = S.TriageSuite()
+    ids = {c.id for c in suite.cases()}
+    assert sum(1 for i in ids if i.startswith("r")) == 2 and any(i.startswith("t") for i in ids)
+    monkeypatch.setenv("LOCI_HILLCLIMB_TRIAGE_SYNTHETIC", "0")
+    assert {c.id for c in suite.cases()} == {i for i in ids if i.startswith("r")}
+
+
+def test_cli_labels_reports_counts(_state, capsys):
+    H.capture_observations([_item()])
+    assert H._main(["labels", "--suite", "triage"]) == 0
+    assert json.loads(capsys.readouterr().out)["captured"] == 1

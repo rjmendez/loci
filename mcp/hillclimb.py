@@ -489,6 +489,179 @@ def status(suite_name: str) -> dict:
             "last_run": ends[-1] if ends else None, "runs": len(ends)}
 
 
+# ----------------------------------------------------------------- observations and labels
+#
+# Real cases for the triage suite. The reflection tick sees each observation's inputs (kind, path,
+# event/tool counts, errors, warnings) and then drops them, so ``capture_observations`` keeps a
+# scrubbed, de-duplicated copy, and ``label`` lets a person give each one a category. Labels become
+# cases the suite reads next to the synthetic ones. Files, under the suite folder:
+#   observations.jsonl  captured inputs (id, kind, path tail, counts, short scrubbed error text)
+#   labels.jsonl        case records {id, gold, kind, path, events, tools, errors, warnings}
+#   skipped.json        ids the person passed on
+
+import re as _re
+
+LABELS = {"r": "real_regression", "f": "flaky_or_nondeterministic", "c": "config_or_environment",
+          "n": "noise_or_benign", "u": "unknown"}
+_OBS_TEXT = 200
+_OBS_KEYS = 6
+_EXTRA_SECRETS = [
+    _re.compile(r"AKIA[0-9A-Z]{12,}"),
+    _re.compile(r"\b[0-9a-fA-F]{32,}\b"),
+    _re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"),
+    _re.compile(r"(?i)(password|passwd|secret|token)\s*[:=]\s*\S+"),
+]
+
+
+def _scrub_text(s: str) -> str:
+    text = str(s)
+    try:
+        from llm_local import _sanitize_for_cloud
+        text = _sanitize_for_cloud(text, max_len=4000)
+    except Exception:
+        pass
+    for rx in _EXTRA_SECRETS:
+        text = rx.sub("[REDACTED]", text)
+    return text.replace("\n", " ")[:_OBS_TEXT]
+
+
+def _clean_counts(d: Any, text_keys: bool = False) -> dict:
+    out: dict = {}
+    for k, v in list((d or {}).items())[:_OBS_KEYS]:
+        key = _scrub_text(k) if text_keys else str(k)[:60]
+        out[key] = v if isinstance(v, (int, float)) else _scrub_text(v)
+    return out
+
+
+def _path_tail(p: Any) -> str:
+    return "/".join(str(p or "").replace("\\", "/").split("/")[-3:])[:120]
+
+
+def observation_id(item: dict) -> str:
+    """Stable id from what the classifier sees, not where it came from: the same pattern in a
+    hundred files is one thing to label."""
+    sig = json.dumps([item.get("kind"), item.get("events"), item.get("tools"),
+                      item.get("errors"), item.get("warnings")], sort_keys=True, default=str)
+    return "r" + hashlib.sha1(sig.encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return rows
+
+
+def capture_observations(items: list, suite: str = "reflection_triage") -> int:
+    """Append new, scrubbed observations from a tick's ``batch``; returns how many were new.
+    Only processed items are kept. Never raises (a capture problem must not break the loop)."""
+    try:
+        path = suite_dir(suite) / "observations.jsonl"
+        seen = {r.get("id") for r in _read_jsonl(path)}
+        new = []
+        for it in items or []:
+            if not isinstance(it, dict) or it.get("status") != "processed":
+                continue
+            obs = {"kind": str(it.get("kind") or "")[:40], "path": _path_tail(it.get("path")),
+                   "events": _clean_counts(it.get("events")), "tools": _clean_counts(it.get("tools")),
+                   "errors": _clean_counts(it.get("errors"), text_keys=True),
+                   "warnings": _clean_counts(it.get("warnings"), text_keys=True)}
+            if not (obs["errors"] or obs["warnings"] or obs["events"]):
+                continue
+            obs["id"] = observation_id(obs)
+            if obs["id"] in seen:
+                continue
+            seen.add(obs["id"])
+            obs["ts"] = int(time.time())
+            new.append(obs)
+        if new:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                for o in new:
+                    fh.write(json.dumps(o, sort_keys=True) + "\n")
+        return len(new)
+    except Exception:
+        return 0
+
+
+def _show(obs: dict) -> str:
+    def fmt(d: dict) -> str:
+        return ", ".join(f"{k} x{v}" if isinstance(v, int) else f"{k}: {v}" for k, v in d.items()) or "-"
+    return (f"  kind:     {obs.get('kind')}\n  path:     {obs.get('path')}\n  events:   {fmt(obs.get('events') or {})}\n"
+            f"  tools:    {fmt(obs.get('tools') or {})}\n  errors:   {fmt(obs.get('errors') or {})}\n"
+            f"  warnings: {fmt(obs.get('warnings') or {})}")
+
+
+PROMPT = "[r]egression  [f]laky  [c]onfig/env  [n]oise  [u]nknown  [s]kip  [q]uit > "
+
+
+def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool = False,
+          input_fn: Callable[[str], str] = input, print_fn: Callable[[str], None] = print,
+          classify: Optional[Callable[[dict], Optional[str]]] = None) -> dict:
+    """Label up to ``n`` unlabelled observations. ``classify(obs)`` (optional) returns the model's
+    category, shown only AFTER you answer so it cannot bias you; agreement is tallied."""
+    d = suite_dir(suite)
+    obs = _read_jsonl(d / "observations.jsonl")
+    done = {r.get("id") for r in _read_jsonl(d / "labels.jsonl")}
+    skipped = set(_read_json(d / "skipped.json").get("ids", []))
+    todo = [o for o in obs if o["id"] not in done and (include_skipped or o["id"] not in skipped)][:n]
+    tally = {"labelled": 0, "skipped": 0, "compared": 0, "agreed": 0}
+    print_fn(f"{len(todo)} to label ({len(obs)} captured, {len(done)} labelled, {len(skipped)} skipped)")
+    for i, o in enumerate(todo, 1):
+        print_fn(f"\n--- {i}/{len(todo)}  {o['id']}\n{_show(o)}")
+        while True:
+            ans = input_fn(PROMPT).strip().lower()[:1]
+            if ans in LABELS or ans in ("s", "q"):
+                break
+            print_fn("  r f c n u s q")
+        if ans == "q":
+            break
+        if ans == "s":
+            skipped.add(o["id"])
+            tally["skipped"] += 1
+            continue
+        case = {"id": o["id"], "gold": LABELS[ans], "kind": o["kind"], "path": o["path"], "events": o["events"],
+                "tools": o["tools"], "errors": o["errors"], "warnings": o["warnings"]}
+        with (d / "labels.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(case, sort_keys=True) + "\n")
+        skipped.discard(o["id"])
+        tally["labelled"] += 1
+        if classify is not None:
+            try:
+                got = classify(o)
+            except Exception:
+                got = None
+            if got:
+                tally["compared"] += 1
+                tally["agreed"] += int(got == case["gold"])
+                print_fn(f"  model said {got} ({'agrees' if got == case['gold'] else 'differs'})")
+    _atomic_write(d / "skipped.json", {"ids": sorted(skipped)})
+    return tally
+
+
+def label_stats(suite: str = "reflection_triage") -> dict:
+    """How far the real label set is from being useful: counts, per-category, and split sizes."""
+    d = suite_dir(suite)
+    obs = _read_jsonl(d / "observations.jsonl")
+    labels = _read_jsonl(d / "labels.jsonl")
+    skipped = _read_json(d / "skipped.json").get("ids", [])
+    by_cat: dict[str, int] = {}
+    for r in labels:
+        by_cat[r["gold"]] = by_cat.get(r["gold"], 0) + 1
+    tr, te = split([Case(r["id"]) for r in labels])
+    return {"captured": len(obs), "labelled": len(labels), "skipped": len(skipped),
+            "unlabelled": len([o for o in obs if o["id"] not in {r["id"] for r in labels}]),
+            "by_category": by_cat, "real_train": len(tr), "real_test": len(te),
+            "enough": len(tr) >= 30 and len(te) >= 30}
+
+
 # ---------------------------------------------------------------------------------- CLI
 
 def load_suite(spec: str):
@@ -523,7 +696,27 @@ def _main(argv: Optional[list[str]] = None) -> int:
     for name in ("status", "promote", "rollback"):
         s = sub.add_parser(name)
         s.add_argument("--suite", required=True)
+    lb = sub.add_parser("label", help="label captured observations (becomes real test cases)")
+    lb.add_argument("--suite", default="triage")
+    lb.add_argument("--n", type=int, default=30)
+    lb.add_argument("--skipped", action="store_true", help="show observations you skipped before")
+    lb.add_argument("--model", action="store_true", help="show what the classifier says AFTER you answer")
+    ls = sub.add_parser("labels", help="how many real labels exist and whether they are enough")
+    ls.add_argument("--suite", default="triage")
     a = p.parse_args(argv)
+    if a.cmd == "label":
+        classify = None
+        if a.model:
+            def classify(o):
+                from reflection_triage import classify_reflection_observation
+                return classify_reflection_observation(o["kind"], o["path"], events=o["events"], tools=o["tools"],
+                                                       errors=o["errors"], warnings=o["warnings"]).get("category")
+        res = label(suite_name(a.suite), a.n, a.skipped, classify=classify)
+        print(json.dumps(res))
+        return 0
+    if a.cmd == "labels":
+        print(json.dumps(label_stats(suite_name(a.suite)), indent=1))
+        return 0
     if a.cmd == "run":
         suite = load_suite(a.suite)
         start = _read_json(suite_dir(suite.name) / "overlay.json")

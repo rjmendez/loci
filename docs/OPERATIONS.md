@@ -1239,3 +1239,18 @@ patches, rationales, scores and case ids only; no case text). Built-in suite: `t
 triage classifier, surface `guidance`, cases in `eval/hillclimb/triage_cases.jsonl`, override with
 `LOCI_HILLCLIMB_TRIAGE_CASES`). Another suite plugs in as `--suite module:factory`. The proposer model
 is the gen model, or `LOCI_HILLCLIMB_MODEL`.
+
+### Hillclimb: real labels for the triage suite
+
+The synthetic cases are too few to rank patches. Real ones come from the reflection loop:
+
+- `hillclimb.capture_observations(batch)` keeps a scrubbed, de-duplicated copy of each processed tick item
+  (kind, path tail, event/tool counts, short error and warning text; secrets, emails, long hex redacted) in
+  `<data home>/hillclimb/reflection_triage/observations.jsonl`. De-duplication is by content, so one pattern seen in a
+  hundred files is one item. The scheduled driver calls it after each tick; it never raises.
+- `python mcp/hillclimb.py label [--n 30] [--model] [--skipped]` shows one observation at a time. Answer `r` regression,
+  `f` flaky, `c` config/env, `n` noise, `u` unknown, `s` skip, `q` quit. `--model` prints the classifier's answer
+  only after you answer, and tallies agreement. Labels append to `labels.jsonl` and resume where you left off.
+- `python mcp/hillclimb.py labels` shows counts, per-category totals and whether the real train and test splits each
+  have the 30 cases the guard needs (`enough`).
+- The `triage` suite reads `labels.jsonl` next to the synthetic cases (`LOCI_HILLCLIMB_TRIAGE_SYNTHETIC=0` for real only).
