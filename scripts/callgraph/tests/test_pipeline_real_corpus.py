@@ -380,7 +380,7 @@ def test_ladybug_ops_get_ladybug_calls_also_resolve_probable(head_build):
     assert all(r.edge.attrs["rung"] == "name-via-injected-global" for r in ladybug_ops_calls)
 
 
-def test_a2a_dispatch_fans_out_to_all_thirteen_skills(head_build):
+def test_a2a_dispatch_fans_out_to_all_fourteen_skills(head_build):
     store = head_build.store
     site = next(
         (n for n in store.nodes_of_kind("CALLSITE")
@@ -391,18 +391,18 @@ def test_a2a_dispatch_fans_out_to_all_thirteen_skills(head_build):
     call_edge = store.out_edges(site.id, "CALLS")[0]
     assert call_edge.dst == "?"
     assert call_edge.attrs["reason"] == "dict-dispatch-fanout"
-    assert call_edge.attrs["fanout"] == 13
+    assert call_edge.attrs["fanout"] == 14
     assert call_edge.attrs["registry"] == "reg:a2a_server/server.py::_SKILL_MAP"
 
     disp = store.out_edges(site.id, "DISPATCHES")
-    assert len(disp) == 13
+    assert len(disp) == 14
     assert all(e.confidence == Confidence.PROBABLE for e in disp)
-    assert all(e.attrs["fanout"] == 13 for e in disp)
+    assert all(e.attrs["fanout"] == 14 for e in disp)
     assert all(e.attrs["registry"] == "reg:a2a_server/server.py::_SKILL_MAP" for e in disp)
     targets = {e.dst for e in disp}
     registry_members = {e.dst for e in store.out_edges("reg:a2a_server/server.py::_SKILL_MAP", "REGISTERS")}
     assert targets == registry_members
-    assert len(registry_members) == 13
+    assert len(registry_members) == 14
 
 
 def test_dispatches_edges_participate_in_backward_closure(head_build):
