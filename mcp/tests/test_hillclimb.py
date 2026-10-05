@@ -343,14 +343,14 @@ def _answers(*a):
 def test_label_writes_cases_and_resumes(_state):
     H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2}), _item(errors={"503 Service Unavailable": 1})])
     out = []
-    t = H.label(n=10, input_fn=_answers("zz", "R", "s", "u"), print_fn=out.append)   # invalid, then r; skip; unknown
+    t = H.label(n=10, input_fn=_answers("zz", "R", "", "s", "u", ""), print_fn=out.append)   # invalid, r; skip; unknown
     assert t["labelled"] == 2 and t["skipped"] == 1
     cases = H._read_jsonl(H.suite_dir("reflection_triage") / "labels.jsonl")
     assert [c["gold"] for c in cases] == ["real_regression", "unknown"]
     assert set(cases[0]) >= {"id", "gold", "kind", "path", "events", "tools", "errors", "warnings"}
     again = H.label(n=10, input_fn=_answers(), print_fn=out.append)                   # nothing left (one skipped)
-    assert again == {"labelled": 0, "skipped": 0, "compared": 0, "agreed": 0}
-    t = H.label(n=10, include_skipped=True, input_fn=_answers("f"), print_fn=out.append)
+    assert again == {"labelled": 0, "skipped": 0, "rejected": 0, "compared": 0, "agreed": 0}
+    t = H.label(n=10, include_skipped=True, input_fn=_answers("f", ""), print_fn=out.append)
     assert t["labelled"] == 1
     assert H.label_stats()["labelled"] == 3 and H.label_stats()["unlabelled"] == 0
 
@@ -369,7 +369,7 @@ def test_label_quit_stops_and_model_answer_is_shown_after_you_answer(_state):
         return "r"
 
     t = H.label(n=10, input_fn=ask, print_fn=out.append, classify=classify)
-    assert order[:2] == ["ask", "classify"]               # never before the answer
+    assert order[:3] == ["ask", "ask", "classify"]        # never before the answers
     assert t["compared"] == 2 and t["agreed"] == 2
     assert any("agrees" in line for line in out)
     t2 = H.label(n=10, input_fn=_answers("q"), print_fn=out.append)
@@ -378,7 +378,7 @@ def test_label_quit_stops_and_model_answer_is_shown_after_you_answer(_state):
 
 def test_label_stats_and_suite_reads_real_labels(_state, monkeypatch):
     H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2})])
-    H.label(n=5, input_fn=_answers("c", "n"), print_fn=lambda *_: None)
+    H.label(n=5, input_fn=_answers("c", "", "n", ""), print_fn=lambda *_: None)
     st = H.label_stats()
     assert st["labelled"] == 2 and st["by_category"] == {"config_or_environment": 1, "noise_or_benign": 1}
     assert st["enough"] is False
@@ -435,3 +435,76 @@ def test_prune_cleans_rows_captured_before_the_filter_and_keeps_labels(_state):
     assert rows[0]["id"] == H.observation_id(rows[0])
     assert (d / "labels.jsonl").read_text().count("ra") == 1
     assert H.prune_observations() == {"before": 1, "after": 1}      # idempotent
+
+
+# --------------------------------------------------------------- novelty, notes, "not a failure"
+
+def test_parse_detail():
+    assert H.parse_detail("") == ("unclear", "")
+    assert H.parse_detail("k") == ("known_pattern", "")
+    assert H.parse_detail("w: first time we see this") == ("novel_signal", "first time we see this")
+    assert H.parse_detail("?: no idea") == ("unclear", "no idea")
+    assert H.parse_detail("just a thought: not a key") == ("unclear", "just a thought: not a key")
+    assert "hunter2" not in H.parse_detail("k: token=hunter2")[1]
+    assert len(H.parse_detail("k: " + "x" * 900)[1]) <= 300
+
+
+def test_label_records_novelty_and_note(_state):
+    H.capture_observations([_item(), _item(errors={"KeyError: 'score'": 2})])
+    H.label(n=5, input_fn=_answers("r", "w: new since the upgrade", "f", "k"), print_fn=lambda *_: None)
+    rows = H._read_jsonl(H.suite_dir("reflection_triage") / "labels.jsonl")
+    assert [(r["gold"], r["novelty"], r["note"]) for r in rows] == [
+        ("real_regression", "novel_signal", "new since the upgrade"), ("flaky_or_nondeterministic", "known_pattern", "")]
+    st = H.label_stats()
+    assert st["by_novelty"] == {"novel_signal": 1, "known_pattern": 1} and st["with_notes"] == 1
+
+
+def test_not_a_failure_is_remembered_and_capture_drops_matches(_state):
+    benign = {"claude turn interrupted": 3}
+    H.capture_observations([_item(errors=benign), _item(errors={"claude turn interrupted": 3, "KeyError: 'x'": 1})])
+    out = []
+    t = H.label(n=5, input_fn=_answers("x", "the user pressed escape", "q"), print_fn=out.append)
+    assert t["rejected"] == 1 and t["labelled"] == 0
+    assert any("claude turn interrupted" in line for line in out)           # says what it will drop
+    rej = H._read_jsonl(H.suite_dir("reflection_triage") / "rejected.jsonl")
+    assert rej[0]["keys"] == ["claude turn interrupted"] and rej[0]["note"] == "the user pressed escape"
+    # same pattern again (other file, other counts) is not captured; one with a real extra error is
+    n = H.capture_observations([_item(errors={"claude turn interrupted": 9}, path="/elsewhere/a.py"),
+                                _item(errors={"claude turn interrupted": 1, "KeyError: 'y'": 2})])
+    assert n == 1
+    st = H.label_stats()
+    assert st["rejected"] == 1 and st["rejected_keys"] == 1
+    assert H.label(n=5, input_fn=_answers("q"), print_fn=lambda *_: None)["rejected"] == 0   # rejected is not re-shown first
+
+
+def test_prune_applies_rejections(_state):
+    H.capture_observations([_item(errors={"claude turn interrupted": 3}), _item(errors={"KeyError: 'x'": 1})])
+    H.label(n=1, input_fn=_answers("x", ""), print_fn=lambda *_: None)
+    d = H.suite_dir("reflection_triage")
+    (d / "observations.jsonl").write_text((d / "observations.jsonl").read_text() + json.dumps(
+        {"id": "rzz", "kind": "k", "path": "p", "events": {}, "tools": {}, "warnings": {}, "errors": {"claude turn interrupted": 7}}) + chr(10))
+    assert H.prune_observations() == {"before": 3, "after": 1}
+
+
+def test_triage_suite_grades_novelty_only_when_rated_and_shows_the_note():
+    def gen(prompt, **kw):
+        return {"ok": True, "text": json.dumps({"category": "real_regression", "novelty": "known_pattern"})}
+
+    suite = S.TriageSuite(gen_fn=gen)
+    base = {"kind": "k", "path": "p", "errors": {"e": 1}, "gold": "real_regression"}
+    assert suite.run(H.Case("a", dict(base)), {}).score == 1.0                                  # category only
+    assert suite.run(H.Case("b", dict(base, novelty="known_pattern")), {}).score == 1.0         # both right
+    r = suite.run(H.Case("c", dict(base, novelty="novel_signal", note="first time")), {})
+    assert r.score == 0.5 and "novelty expected novel_signal" in r.trace and "reviewer note: first time" in r.trace
+    assert suite.run(H.Case("d", dict(base, novelty="unclear")), {}).score == 1.0               # unclear not graded
+    r = suite.run(H.Case("e", dict(base, gold="unknown", novelty="novel_signal")), {})
+    assert r.score == 0.0
+
+
+def test_old_labels_without_novelty_still_work(_state):
+    d = H.suite_dir("reflection_triage")
+    d.mkdir(parents=True)
+    (d / "labels.jsonl").write_text(json.dumps({"id": "rold", "gold": "unknown", "kind": "k", "path": "p", "events": {},
+                                                 "tools": {}, "errors": {"e": 1}, "warnings": {}}) + chr(10))
+    assert H.label_stats()["by_novelty"] == {"unrated": 1}
+    assert any(c.id == "rold" for c in S.TriageSuite().cases())
