@@ -148,5 +148,56 @@ class TestStatusFitsInAContextWindow(unittest.TestCase):
         self.assertEqual((data["queue_size"], data["processed_count"]), (0, 0))
 
 
+class TestTickResultFitsInAContextWindow(unittest.TestCase):
+    """2026-10-05: a tick returned 171 KB (158 KB of it the observation maps) and overflowed the tool-result limit."""
+
+    N = 3000
+
+    def _tick(self, **kw):
+        state = server._reflection_default_state()
+        state["investigation_id"] = "test-inv"
+        state["stats"]["error_signature_observations"] = {f"error line {i} " + "x" * 120: 1 for i in range(self.N)}
+        state["stats"]["warning_signature_observations"] = {f"warning line {i} " + "y" * 120: 2 for i in range(self.N)}
+        state["queue"] = [{"kind": "process_log", "path": "/tmp/process_log.log"}]
+        patches = [
+            patch.object(server, "_load_reflection_state", side_effect=lambda: state),
+            patch.object(server, "_save_reflection_state", side_effect=lambda new: state.update(new)),
+            patch.object(server, "_ensure_investigation_exists", side_effect=lambda *a, **k: None),
+            patch.object(server, "_process_reflection_item", side_effect=[_summary("process_log", errors={"disk full": 3})]),
+            patch.object(server, "investigation_store", side_effect=lambda **k: json.dumps({"stored": True})),
+            patch.object(server, "REFLECTION_SIGNATURE_OBSERVE_LIMIT", 10 ** 6),
+            patch.object(server, "_prune_signature_observations", side_effect=lambda m: m),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        out = server.reflection_loop_tick(max_items=1, max_lines_per_file=100, **kw)
+        return out, state
+
+    def test_the_default_tick_carries_counts_not_the_observation_maps(self):
+        out, _ = self._tick()
+        data = json.loads(out)
+        self.assertLess(len(out), 8000)
+        self.assertEqual(data["stats"]["error_signature_observation_count"], self.N + 1)
+        self.assertEqual(data["stats"]["warning_signature_observation_count"], self.N)
+        self.assertNotIn("error_signature_observations", data["stats"])
+        self.assertNotIn("warning_signature_observations", data["stats"])
+        self.assertEqual(data["stats"]["errors_seen"], 3)
+        self.assertEqual(data["stats"]["last_error_signatures"], [{"signature": "disk full", "count": 3}])
+        self.assertEqual((data["processed_items"], data["remaining_queue"]), (1, 0))
+
+    def test_verbose_returns_the_maps_whole(self):
+        """Positive twin: same tick, the maps are there when asked for."""
+        data = json.loads(self._tick(verbose=True)[0])
+        self.assertEqual(len(data["stats"]["error_signature_observations"]), self.N + 1)
+        self.assertEqual(len(data["stats"]["warning_signature_observations"]), self.N)
+        self.assertNotIn("error_signature_observation_count", data["stats"])
+
+    def test_the_saved_state_keeps_the_maps_whatever_the_view(self):
+        _, state = self._tick()
+        self.assertEqual(len(state["stats"]["error_signature_observations"]), self.N + 1)
+        self.assertEqual(len(state["stats"]["warning_signature_observations"]), self.N)
+
+
 if __name__ == "__main__":
     unittest.main()

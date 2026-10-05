@@ -495,6 +495,7 @@ class ReflectionLoopTests(unittest.TestCase):
                     max_items=1,
                     max_lines_per_file=100,
                     store_item_findings=True,
+                    verbose=True,  # the default view is counts-only; this test pins the whole stats dict
                 )
             )
 
