@@ -154,22 +154,41 @@ def test_supervise_findings_flags_bad_source_and_unsupported_count_and_clean_goo
         {"source": "DuckDuckGo", "claim": "Exactly 47 confirmed sightings.", "evidence": "blog mentions spiders generally"},
     ]
 
-    def gen_fn(**_kwargs):
-        return json.dumps({"fail_open": False, "verdicts": [
-            {"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "matches plan and evidence"},
-            {"finding_index": 1, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Redirect to iNaturalist GPS/photo observations.", "rationale": "Wikipedia cannot prove local observation"},
-            {"finding_index": 2, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Remove exact count unless backed by observation records.", "rationale": "no count evidence"},
-        ]})
+    prompts = []
+
+    def gen_fn(**kwargs):
+        # The stub judges only what the prompt shows it: a supervisor prompt that
+        # dropped the findings, the plan or the task cannot produce these verdicts.
+        prompt = kwargs["prompt"]
+        prompts.append(prompt)
+        assert f"Task: {TASK}" in prompt
+        routing = json.loads(prompt.split("Routing plan: ", 1)[1].split("\nFindings: ", 1)[0])
+        shown = json.loads(prompt.split("Findings: ", 1)[1])
+        preferred = {src for node in routing["decision_tree"] for src in node["preferred_sources"]}
+        verdicts = []
+        for idx, finding in enumerate(shown):
+            source_ok = finding["source"] in preferred
+            count_claim = any(ch.isdigit() for ch in finding["claim"])
+            supported = "photo" in finding["evidence"] and not count_claim
+            if source_ok and supported:
+                guidance, why = "", "matches plan and evidence"
+            elif count_claim:
+                guidance, why = "Remove exact count unless backed by observation records.", "no count evidence"
+            else:
+                guidance, why = "Redirect to iNaturalist GPS/photo observations.", f"{finding['source']} cannot prove local observation"
+            verdicts.append({"finding_index": idx, "on_task": True, "supported": supported,
+                             "source_appropriate": source_ok, "guidance": guidance, "rationale": why})
+        return json.dumps({"fail_open": False, "verdicts": verdicts})
 
     result = supervise_findings(TASK, findings, plan, gen_fn)
 
+    assert len(prompts) == 1
     assert result["fail_open"] is False
-    assert result["verdicts"][0] == {"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "matches plan and evidence"}
-    assert result["verdicts"][1]["source_appropriate"] is False
-    assert result["verdicts"][1]["supported"] is False
-    assert "iNaturalist" in result["verdicts"][1]["guidance"]
-    assert result["verdicts"][2]["supported"] is False
-    assert "exact count" in result["verdicts"][2]["guidance"]
+    assert result["verdicts"] == [
+        {"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": "matches plan and evidence"},
+        {"finding_index": 1, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Redirect to iNaturalist GPS/photo observations.", "rationale": "Wikipedia cannot prove local observation"},
+        {"finding_index": 2, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Remove exact count unless backed by observation records.", "rationale": "no count evidence"},
+    ]
 
 
 def test_supervise_findings_fail_open_neutral_on_parse_failure():
@@ -182,6 +201,56 @@ def test_supervise_findings_fail_open_neutral_on_parse_failure():
 
     assert result["fail_open"] is True
     assert result["verdicts"] == [{"finding_index": 0, "on_task": True, "supported": True, "source_appropriate": True, "guidance": "", "rationale": result["verdicts"][0]["rationale"]}]
+
+
+def test_supervise_and_correct_unparseable_supervisor_reply_is_fail_open_not_converged():
+    # The neutral verdicts a degraded review returns look clean. They must not be
+    # read as a clean review: the loop reports fail_open and does not converge.
+    findings = [{"source": "Wikipedia", "sub_need": "GPS/photo-verified local observations", "claim": "local proof", "evidence": "background"}]
+    worker_calls = []
+
+    def gen_fn(**_kwargs):
+        return {"text": "nonsense"}
+
+    def worker_fn(**kwargs):
+        worker_calls.append(kwargs)
+        return dict(kwargs["finding"])
+
+    result = supervise_and_correct(TASK, findings, {}, gen_fn, worker_fn, max_rounds=2)
+
+    assert result["fail_open"] is True
+    assert result["converged"] is False
+    assert result["findings"] == findings
+    assert result["error"].startswith("supervisor review degraded")
+    assert worker_calls == []
+    assert result["audit_trail"][0]["converged"] is False
+    assert result["audit_trail"][0]["rounds"] == []
+
+
+def test_supervise_and_correct_degraded_second_review_is_fail_open():
+    plan = {"decision_tree": [{"sub_need": "GPS/photo-verified local observations", "preferred_sources": ["iNaturalist"]}]}
+    findings = [{"source": "Wikipedia", "sub_need": "GPS/photo-verified local observations", "claim": "local proof", "evidence": "background"}]
+    replies = [
+        json.dumps({"fail_open": False, "verdicts": [{"finding_index": 0, "on_task": True, "supported": False, "source_appropriate": False, "guidance": "Use iNaturalist.", "rationale": "wrong source"}]}),
+        "not json at all",
+    ]
+    worker_calls = []
+
+    def gen_fn(**_kwargs):
+        return replies.pop(0)
+
+    def worker_fn(**kwargs):
+        worker_calls.append(kwargs["finding"])
+        return {"source": "iNaturalist", "sub_need": kwargs["finding"]["sub_need"], "claim": "corrected", "evidence": "photo yes"}
+
+    result = supervise_and_correct(TASK, findings, plan, gen_fn, worker_fn, max_rounds=2)
+
+    assert replies == []
+    assert worker_calls == [findings[0]]
+    assert result["fail_open"] is True
+    assert result["converged"] is False
+    assert result["rounds"] == 1
+    assert result["findings"] == findings
 
 
 def test_supervise_and_correct_redispatches_only_flagged_findings():
@@ -207,6 +276,7 @@ def test_supervise_and_correct_redispatches_only_flagged_findings():
     result = supervise_and_correct(TASK, findings, plan, gen_fn, worker_fn, max_rounds=2)
 
     assert result["converged"] is True
+    assert result["fail_open"] is False
     assert worker_calls == [findings[1]]
     assert result["findings"][0] == findings[0]
     assert result["findings"][1]["source"] == "iNaturalist"

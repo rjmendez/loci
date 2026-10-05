@@ -96,8 +96,80 @@ def test_session_bound_member_sees_acl_hits(mem):
 
 def test_primary_token_sender_can_only_narrow(mem):
     # Primary token: no bound agent; this node (no HERMES_AGENT_ID) is not the owner.
+    # The search itself must succeed: withholding is per hit, not an error.
     out = _run("bob")
+    assert "error" not in out
     assert SECRET not in json.dumps(out)
+    assert _contents(out) == ["public code chunk"]
+    assert out["excluded_acl"] == 1 and out["excluded_retracted"] == 1
+    assert out["total_hits"] == 1
+
+
+def test_primary_token_member_node_sees_hits_for_a_member_sender(mem, monkeypatch):
+    # Positive twin: this node IS a member, so a primary-token caller that names
+    # another member sees the finding...
+    monkeypatch.setenv("HERMES_AGENT_ID", "alice")
+    out = _run("bob")
+    assert "error" not in out
+    assert SECRET in _contents(out) and out["excluded_acl"] == 0
+
+
+def test_primary_token_member_node_narrowed_by_a_non_member_sender(mem, monkeypatch):
+    # ...but naming a non-member narrows: the node may read it, the named sender may not.
+    monkeypatch.setenv("HERMES_AGENT_ID", "alice")
+    out = _run("mallory")
+    assert SECRET not in json.dumps(out)
+    assert _contents(out) == ["public code chunk"] and out["excluded_acl"] == 1
+
+
+def test_acl_check_error_withholds_the_hit(mem, monkeypatch, caplog):
+    # A member would normally see it; when the ACL check itself raises, the
+    # investigation's hits must be withheld (fail closed), not served.
+    def boom(manifest, requesting_agent_id=None, **kw):
+        raise RuntimeError("acl backend exploded")
+
+    monkeypatch.setattr(a2a._inv_store_acl, "_acl_access_denied", boom)
+    with caplog.at_level("WARNING"):
+        out = _run("bob", bound="bob")
+    assert "error" not in out
+    assert SECRET not in json.dumps(out)
+    assert _contents(out) == ["public code chunk"]
+    assert out["excluded_acl"] == 1
+    assert "failed, withholding its hits" in caplog.text
+
+
+def test_unreadable_manifest_withholds_the_hit(mem):
+    (mem / "private-case" / "manifest.json").write_text("{not json")
+    out = _run("bob", bound="bob")
+    assert SECRET not in json.dumps(out)
+    assert out["excluded_acl"] == 1
+
+
+def test_hits_from_an_investigation_this_node_does_not_govern_stay_visible(mem, monkeypatch):
+    # No manifest here means no ACL here: the hit is not withheld (fail-closed applies
+    # to an ACL that exists but cannot be read, not to one that does not exist).
+    # Positive twin of the withholding tests, with the same non-member caller.
+    extra = [
+        {"id": "f-elsewhere", "score": 0.95,
+         "payload": {"text": "finding from another node", "investigation_id": "other-node-case"}},
+        {"id": "f-secret", "score": 0.9,
+         "payload": {"text": SECRET, "investigation_id": "private-case"}},
+    ]
+
+    async def fake_search(col, vec, top_k=5):
+        return [dict(h, payload=dict(h["payload"])) for h in extra] if col == "loci_memory" else []
+
+    monkeypatch.setattr(a2a, "_qdrant_search", fake_search)
+    out = _run("mallory", bound="mallory")
+    assert _contents(out) == ["finding from another node"]
+    assert out["excluded_acl"] == 1
+
+
+def test_acl_helpers_unavailable_withholds_investigation_hits(mem, monkeypatch):
+    monkeypatch.setattr(a2a, "_inv_store_acl", None)
+    out = _run("bob", bound="bob")
+    assert SECRET not in json.dumps(out)
+    assert _contents(out) == ["public code chunk"] and out["excluded_acl"] == 1
 
 
 def test_endpoint_binds_the_session_token_agent(mem):

@@ -12,6 +12,8 @@ blob rather than a possibly-mid-edit working tree file — the concurrent-
 edit scenario build_steps step 13 was written under (another workflow is
 mid-editing mcp/server.py while these tests run)."""
 
+import os
+
 from .conftest import needs_corpus_deps, needs_git_history  # noqa: F401
 from .. import config
 from ..ingest import load_corpus
@@ -53,19 +55,39 @@ def test_no_cache_flag_is_accepted_and_does_not_change_the_result():
 
 
 def test_rev_head_is_immune_to_a_concurrently_mid_edited_working_tree(tmp_path, monkeypatch):
-    # Assert the contract directly: with rev set, load_corpus goes through git plumbing and never reads disk.
+    # Assert the contract directly: with rev set, load_corpus goes through git plumbing and
+    # never reads a corpus file off disk -- by ANY route (Path.read_text/read_bytes/open,
+    # builtins.open, io.open). Reads are recorded, not raised, so no except can hide them.
+    import builtins
+    import io
     from pathlib import Path
 
-    original_read_text = Path.read_text
+    root = str(config.REPO_ROOT.resolve())
+    disk_reads = []
 
-    def _boom(self, *a, **kw):
-        raise AssertionError(f"load_corpus(rev=...) must not read {self} off disk directly")
+    def _is_corpus_file(path) -> bool:
+        try:
+            p = os.fspath(path)
+        except TypeError:
+            return False
+        p = os.path.abspath(p) if isinstance(p, str) else ""
+        return p.startswith(root) and p.endswith(".py")
 
-    monkeypatch.setattr(Path, "read_text", _boom)
+    def _spy(real):
+        def wrapper(target, *a, **kw):
+            if _is_corpus_file(target):
+                disk_reads.append(os.fspath(target))
+            return real(target, *a, **kw)
+        return wrapper
+
+    for owner, name in ((Path, "read_text"), (Path, "read_bytes"), (Path, "open"),
+                        (builtins, "open"), (io, "open")):
+        monkeypatch.setattr(owner, name, _spy(getattr(owner, name)))
     try:
         sources, origin = load_corpus(rev="HEAD")
     finally:
-        monkeypatch.setattr(Path, "read_text", original_read_text)
+        monkeypatch.undo()
+    assert disk_reads == []
     assert origin.startswith("rev ")
     assert len(sources) == len(config.iter_corpus_files_worktree())
     server = _source_for(sources, "mcp/server.py")

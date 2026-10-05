@@ -39,9 +39,7 @@ class TestSlowNeuromodulationLayer(unittest.TestCase):
 
     def test_state_observe_and_policies_are_fail_open_and_bounded(self):
         state = slow_neuromod.load_state(server.MEMORY_DIR)
-        self.assertEqual(state["routing_tone"], 0.0)
-        self.assertEqual(state["confidence_tone"], 0.0)
-        self.assertEqual(state["consolidation_tone"], 0.0)
+        self.assertEqual(state, slow_neuromod.neutral_state())
 
         out = slow_neuromod.observe(
             server.MEMORY_DIR,
@@ -50,31 +48,81 @@ class TestSlowNeuromodulationLayer(unittest.TestCase):
             confidence_signal=0.5,
             consolidation_signal=-1.0,
         )
-        self.assertIn("state", out)
         observed = out["state"]
-        self.assertGreater(observed["routing_tone"], 0.0)
-        self.assertGreater(observed["confidence_tone"], 0.0)
-        self.assertLess(observed["consolidation_tone"], 0.0)
+        self.assertIs(out["degraded"], False)
+        # One slow EMA step (alpha 0.08) from neutral.
+        self.assertAlmostEqual(observed["routing_tone"], 0.08)
+        self.assertAlmostEqual(observed["confidence_tone"], 0.04)
+        self.assertAlmostEqual(observed["consolidation_tone"], -0.08)
+        self.assertEqual((observed["events_seen"], observed["last_event"]), (1, "test-observe"))
+        self.assertEqual(slow_neuromod.load_state(server.MEMORY_DIR), observed)  # persisted
+
+        # A second event folds into the first; out-of-range signals are clamped to +-1.
+        again = slow_neuromod.observe(server.MEMORY_DIR, event="e2", routing_signal=10.0)["state"]
+        self.assertAlmostEqual(again["routing_tone"], 0.92 * 0.08 + 0.08 * 1.0)
+        self.assertAlmostEqual(again["confidence_tone"], 0.92 * 0.04)
+        self.assertEqual(again["events_seen"], 2)
 
         route = slow_neuromod.routing_policy(observed, mnemo_top_k=20, qdrant_limit=30)
-        self.assertGreaterEqual(route["mnemo_top_k"], 1)
-        self.assertGreaterEqual(route["qdrant_limit"], 1)
+        self.assertEqual((route["mnemo_top_k"], route["qdrant_limit"]), (19, 31))  # x0.96, x1.04
+        neutral_route = slow_neuromod.routing_policy({}, mnemo_top_k=20, qdrant_limit=30)
+        self.assertEqual((neutral_route["mnemo_top_k"], neutral_route["qdrant_limit"]), (20, 30))
 
         confidence = slow_neuromod.confidence_policy(observed, confidence=0.5)
-        self.assertGreaterEqual(confidence["confidence"], 0.0)
-        self.assertLessEqual(confidence["confidence"], 1.0)
+        self.assertAlmostEqual(confidence["delta"], 0.12 * 0.04)
+        self.assertAlmostEqual(confidence["confidence"], 0.5048)
+        self.assertEqual(slow_neuromod.confidence_policy({"confidence_tone": 0.4}, confidence=0.99)["confidence"], 1.0)
 
         consolidation = slow_neuromod.consolidation_policy(observed, default_min_findings=3)
-        self.assertGreaterEqual(consolidation["min_findings_for_causal"], 2)
-        self.assertLessEqual(consolidation["min_findings_for_causal"], 5)
+        self.assertEqual(consolidation["min_findings_for_causal"], 3)   # |tone| < 0.2: unchanged
+        for tone, expected in ((0.2, 2), (0.19, 3), (-0.2, 4), (-0.4, 4)):
+            got = slow_neuromod.consolidation_policy({"consolidation_tone": tone}, default_min_findings=3)
+            self.assertEqual(got["min_findings_for_causal"], expected, tone)
+
+    def test_stored_tones_are_clamped_and_corrupt_state_is_neutral(self):
+        path = server.MEMORY_DIR / "_slow_neuromodulation" / "state.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"routing_tone": 5.0, "confidence_tone": -5.0}))
+        state = slow_neuromod.load_state(server.MEMORY_DIR)
+        self.assertEqual((state["routing_tone"], state["confidence_tone"]), (0.4, -0.4))
+        path.write_text("{not json")
+        self.assertEqual(slow_neuromod.load_state(server.MEMORY_DIR), slow_neuromod.neutral_state())
 
     def test_invariant_gates_fail_closed_on_invalid_policy_shapes(self):
-        with self.assertRaises(ValueError):
-            slow_neuromod.assert_routing_policy_invariants({"mnemo_top_k": 10}, minimum_top_k=1)
-        with self.assertRaises(ValueError):
-            slow_neuromod.assert_confidence_policy_invariants({"confidence": 0.5})
-        with self.assertRaises(ValueError):
-            slow_neuromod.assert_consolidation_policy_invariants({"min_findings_for_causal": 3})
+        S = slow_neuromod
+        with self.assertRaisesRegex(ValueError, "missing qdrant_limit"):
+            S.assert_routing_policy_invariants({"routing_tone": 0.0, "mnemo_top_k": 10}, minimum_top_k=1)
+        with self.assertRaisesRegex(ValueError, "missing confidence_tone"):
+            S.assert_confidence_policy_invariants({"confidence": 0.5})
+        with self.assertRaisesRegex(ValueError, "missing consolidation_tone"):
+            S.assert_consolidation_policy_invariants({"min_findings_for_causal": 3})
+        # out-of-bounds values, one check each
+        bad_routing = [
+            ({"routing_tone": 0.5, "mnemo_top_k": 5, "qdrant_limit": 5}, "routing_tone out of bounds"),
+            ({"routing_tone": 0.0, "mnemo_top_k": 0, "qdrant_limit": 5}, "mnemo_top_k below minimum"),
+            ({"routing_tone": 0.0, "mnemo_top_k": 5, "qdrant_limit": 0}, "qdrant_limit below minimum"),
+        ]
+        for policy, msg in bad_routing:
+            with self.assertRaisesRegex(ValueError, msg):
+                S.assert_routing_policy_invariants(policy, minimum_top_k=1)
+        bad_conf = [
+            ({"confidence_tone": 0.5, "delta": 0.0, "confidence": 0.5}, "confidence_tone out of bounds"),
+            ({"confidence_tone": 0.0, "delta": 0.3, "confidence": 0.5}, "delta out of bounds"),
+            ({"confidence_tone": 0.0, "delta": 0.0, "confidence": 1.1}, "confidence out of range"),
+            ({"confidence_tone": 0.0, "delta": 0.0, "confidence": float("nan")}, "confidence must be finite"),
+        ]
+        for policy, msg in bad_conf:
+            with self.assertRaisesRegex(ValueError, msg):
+                S.assert_confidence_policy_invariants(policy)
+        for policy, msg in (({"consolidation_tone": -0.5, "min_findings_for_causal": 3}, "tone out of bounds"),
+                            ({"consolidation_tone": 0.0, "min_findings_for_causal": 9}, "out of range"),
+                            ({"consolidation_tone": 0.0, "min_findings_for_causal": 0}, "out of range")):
+            with self.assertRaisesRegex(ValueError, msg):
+                S.assert_consolidation_policy_invariants(policy)
+        # positive twins: in-bounds policies at the edges pass
+        S.assert_routing_policy_invariants({"routing_tone": 0.4, "mnemo_top_k": 1, "qdrant_limit": 1}, minimum_top_k=1)
+        S.assert_confidence_policy_invariants({"confidence_tone": -0.4, "delta": 0.2, "confidence": 1.0})
+        S.assert_consolidation_policy_invariants({"consolidation_tone": 0.4, "min_findings_for_causal": 8})
 
     def test_investigation_search_uses_slow_routing_bias(self):
         slow_neuromod.save_state(
@@ -150,6 +198,9 @@ class TestSlowNeuromodulationLayer(unittest.TestCase):
         )
 
     def test_memory_confidence_surfaces_provenance_preserving_aggregation(self):
+        state = slow_neuromod.neutral_state()
+        state["confidence_tone"] = 0.4           # delta = 0.12 * 0.4 = +0.048
+        slow_neuromod.save_state(server.MEMORY_DIR, state)
         fake_results = [{
             "score": 0.9,
             "text": "alpha confidence hit",
@@ -172,7 +223,10 @@ class TestSlowNeuromodulationLayer(unittest.TestCase):
             payload = _json(server.memory_confidence("alpha"))
         agg = payload["confidence_aggregation"]
         self.assertEqual(agg["method"], "cue_verdict_plus_slow_modulation")
-        self.assertEqual(agg["modulation"]["provenance"], "deterministic_derived")
+        self.assertEqual(agg["modulation"], {"confidence_tone": 0.4, "delta": 0.048,
+                                             "provenance": "deterministic_derived"})
+        self.assertEqual((agg["base_confidence"], agg["adjusted_confidence"]), (0.8, 0.848))
+        self.assertEqual(payload["confidence"], 0.848)
         self.assertEqual(agg["evidence_refs"][0]["finding_id"], "f-1")
 
 

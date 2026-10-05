@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import grounding as G  # noqa: E402
 import server  # noqa: E402
+from frame_assertions import assert_payload_framed, frame_spans, outside_frames  # noqa: E402
 
 
 def _row(text: str) -> dict:
@@ -270,6 +271,23 @@ def test_ground_compact_reuses_rag_compact_and_reduces_chars(monkeypatch):
     assert len(compact["block"]) < len(normal["block"]), (
         f"expected compact grounding block to shrink: {len(normal['block'])} -> {len(compact['block'])}"
     )
+
+    # Both modes: every frame is closed, the RAG payload and the manifest summary sit
+    # inside their frames, and nothing Loci wrote (tags, footer) lands inside a frame.
+    for block in (normal["block"], compact["block"]):
+        spans = frame_spans(block)
+        assert_payload_framed(block, "cached refresh guidance", finding_id="f-rag")
+        assert_payload_framed(block, "hypothesis=Auth refresh fails after cache eviction",
+                              investigation_id="c1", kind="manifest_summary")
+        assert not any("[rag]" in s["body"] or "Do not present facts" in s["body"] for s in spans)
+        assert "token cache is invalidated" not in outside_frames(block)
+    # Both modes: the 430-char finding cannot fit its 200-char slice whole, so it is clipped
+    # INSIDE a closed frame: its text survives and the frame still closes. (At 3a1ad78 normal
+    # mode lost the closing tag; an interim fix dropped the whole row and its content.)
+    for block in (normal["block"], compact["block"]):
+        span = assert_payload_framed(block, "The token cache is invalidated too early", finding_id="f-case")
+        assert span["body"].rstrip().endswith("…[truncated]"), span["body"]
+        assert "[case:c1:finding] …[truncated]" not in block
 
 
 def test_memory_hints_compact_clips_text_and_keeps_fields(monkeypatch):

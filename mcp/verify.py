@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from functools import lru_cache
@@ -496,14 +497,24 @@ def _coerce_verdict(raw) -> str:
 
 
 def _coerce_confidence(raw) -> float:
-    """Coerce confidence to a float in [0,1]; unparseable -> 0.0 (cautious)."""
+    """Coerce confidence to a float in [0,1]; unparseable or non-finite -> 0.0 (cautious)."""
     try:
         c = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0.0
-    if c != c:  # NaN
+    if not math.isfinite(c):  # NaN, +/-inf
         return 0.0
     return max(0.0, min(1.0, c))
+
+
+def _is_nonfinite_confidence(raw) -> bool:
+    """True for a confidence that parses as a number but is NaN, +/-inf or overflows."""
+    try:
+        return not math.isfinite(float(raw))
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _degraded(refutation: str = "", reasoning: str = "") -> dict:
@@ -625,6 +636,10 @@ def verify_finding(claim: str,
     raw = res.get("text", "")
     obj = _extract_json_object(raw)
     if obj is None:
+        return _degraded(reasoning=raw if isinstance(raw, str) else "")
+
+    if _is_nonfinite_confidence(obj.get("confidence")):
+        # A NaN/inf confidence is malformed output, not a score: do not keep its verdict.
         return _degraded(reasoning=raw if isinstance(raw, str) else "")
 
     verdict = _coerce_verdict(obj.get("verdict"))

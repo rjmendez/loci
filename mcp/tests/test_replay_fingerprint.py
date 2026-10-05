@@ -93,10 +93,45 @@ def test_apply_finding_fingerprints_adds_flybrain_and_provenance_fingerprints():
     }
     out = apply_finding_fingerprints(finding)
     fb = out["metadata"]["flybrain_provenance"]
-    assert fb["replay_fingerprint"]
+    # the fingerprint of exactly this tool + request + (canonicalised) dataset scope
+    assert fb["replay_fingerprint"] == flybrain_replay_fingerprint(
+        "virtual-fly-brain-query_connectivity",
+        {"upstream_type_input": "FBbt_00003686"},
+        {"excluded_symbols": [], "included_symbols": ["fw"], "version_ids_seen": ["flywire783"]},
+    )
+    assert out["flybrain_replay_fingerprint"] == fb["replay_fingerprint"]
     assert fb["replay_fingerprint_version"] == "v1"
-    assert out["metadata"]["provenance_access_path_fingerprint"]
+    access = out["metadata"]["provenance_access_path_fingerprint"]
+    assert len(access) == 64 and int(access, 16) >= 0
     assert out["metadata"]["provenance_access_path_fingerprint_version"] == "v1"
+    # the access-path fingerprint depends on the tier it certifies
+    other = json.loads(json.dumps(finding))
+    other["metadata"]["evidence_provenance_tier"] = "model_asserted"
+    assert apply_finding_fingerprints(other)["metadata"]["provenance_access_path_fingerprint"] != access
+
+
+def test_flybrain_replay_fingerprint_golden_value():
+    """Pinned against a hand-written canonical form: sorted keys, set-like lists
+    sorted, tool name lower-cased, compact separators, sha256."""
+    import hashlib
+    canonical = ('{"dataset_scope":{"included_symbols":["fw","mc"]},'
+                 '"request":{"a":"x","b":1},'
+                 '"tool_name":"virtual-fly-brain-query_connectivity","version":"v1"}')
+    assert flybrain_replay_fingerprint(
+        " Virtual-Fly-Brain-Query_Connectivity ", {"b": 1, "a": "x"}, {"included_symbols": ["mc", "fw"]},
+    ) == hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def test_flybrain_replay_fingerprint_changes_with_each_input():
+    base = ("virtual-fly-brain-query_connectivity", {"upstream_type_input": "FBbt_00003686"},
+            {"included_symbols": ["fw"]})
+    fp = flybrain_replay_fingerprint(*base)
+    assert flybrain_replay_fingerprint("virtual-fly-brain-run_query", *base[1:]) != fp
+    assert flybrain_replay_fingerprint(base[0], {"upstream_type_input": "FBbt_00000001"}, base[2]) != fp
+    assert flybrain_replay_fingerprint(base[0], base[1], {"included_symbols": ["mc"]}) != fp
+    # a list that is NOT set-like keeps its order
+    assert flybrain_replay_fingerprint(base[0], {"path": ["a", "b"]}, base[2]) != \
+        flybrain_replay_fingerprint(base[0], {"path": ["b", "a"]}, base[2])
 
 
 def test_flybrain_audit_fingerprint_extracts_dataset_scope():

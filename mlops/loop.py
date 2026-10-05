@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -311,12 +312,13 @@ _HONESTY_PROMPT = (
 # ── State I/O ─────────────────────────────────────────────────────────────────
 
 def _load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {
+    """Defaults, overlaid with whatever the state file holds.
+
+    main() indexes the default keys directly, so a file written by an older
+    schema (or truncated to ``{}``) used to raise KeyError on the first line of
+    the nightly. A file that is not a JSON object is treated like a corrupt one.
+    """
+    state = {
         "last_run": None,
         "last_dataset_size": 0,
         "runs_seen": [],
@@ -324,6 +326,16 @@ def _load_state() -> dict:
         "last_embedding_tune": None,
         "total_promotions": 0,
     }
+    if STATE_FILE.exists():
+        try:
+            loaded = json.loads(STATE_FILE.read_text())
+        except Exception:
+            loaded = None
+        if isinstance(loaded, dict):
+            state.update(loaded)
+        else:
+            print(f"[loop] {STATE_FILE} is not a JSON object — starting from defaults")
+    return state
 
 
 def _save_state(state: dict) -> None:
@@ -337,6 +349,7 @@ def _save_state(state: dict) -> None:
 
 
 def _append_history(record: dict) -> None:
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with HISTORY_FILE.open("a") as fh:
         fh.write(json.dumps(record) + "\n")
 
@@ -510,7 +523,7 @@ def check_summary_consistency(summary_text: str, history_record: dict,
 
 def _ollama_ok(base: str) -> bool:
     try:
-        urllib.request.urlopen(f"{base}/api/tags", timeout=5)
+        urllib.request.urlopen(f"{base.rstrip('/')}/api/tags", timeout=5)
         return True
     except Exception:
         return False
@@ -519,12 +532,15 @@ def _ollama_ok(base: str) -> bool:
 # ── New-run discovery ─────────────────────────────────────────────────────────
 
 def _discover_runs(findings_glob: str, seen: list[str]) -> list[str]:
+    """Unseen run ids, sorted and de-duplicated. Identity is the parent directory
+    name, so two same-named session dirs under different roots are ONE run id;
+    reporting it twice inflated the --min-new-runs count and runs_seen."""
     seen_set = set(seen)
-    new = []
+    new = set()
     for path in glob.glob(findings_glob):
         run_id = Path(path).parent.name
         if run_id not in seen_set:
-            new.append(run_id)
+            new.add(run_id)
     return sorted(new)
 
 
@@ -581,20 +597,31 @@ def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if dry_run:
         cmd.append("--dry-run")
 
+    # Only a metrics file THIS run wrote is an answer. train.py can exit 0
+    # without writing one (--dry-run does, by design), and re-reading last
+    # night's file acted on last night's PROMOTE again.
+    before = metrics_path.stat().st_mtime_ns if metrics_path.exists() else -1
     result = _run(cmd)
     if result.returncode != 0:
         _fail("train.py", f"train.py failed: {_last_error_line(result.stderr)}")
         return None
 
-    if metrics_path.exists():
+    if not metrics_path.exists() or metrics_path.stat().st_mtime_ns == before:
+        if not dry_run:
+            _fail("train.py", f"train.py exited 0 but did not write {metrics_path.name}")
+        return None
+    try:
         return json.loads(metrics_path.read_text())
-    return None
+    except ValueError as exc:
+        _fail("train.py", f"train.py wrote unreadable metrics: {exc}")
+        return None
 
 
 # ── Canary evaluation ─────────────────────────────────────────────────────────
 
-# mlops/grounding/canary.py exit contract.
-CANARY_OK, CANARY_DRIFT, CANARY_ROLLBACK = 0, 1, 2
+# mlops/grounding/canary.py exit contract. 0 means PROMOTE and nothing else:
+# HOLD used to exit 0 too, and main() counts a 0 as a promotion.
+CANARY_OK, CANARY_DRIFT, CANARY_ROLLBACK, CANARY_HOLD = 0, 1, 2, 3
 
 def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
     if not CANDIDATE_MODEL.exists():
@@ -619,6 +646,8 @@ def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
         _alert("canary", "canary recommends ROLLBACK — see canary output above")
     elif result.returncode == CANARY_DRIFT:
         _alert("canary", "canary drift detected")
+    elif result.returncode == CANARY_HOLD:
+        print("[loop] canary HOLD — the candidate did not beat cosine by the margin")
     elif result.returncode != CANARY_OK:
         _fail("canary", f"canary exited {result.returncode}: "
                         f"{_last_error_line(result.stderr)}")
@@ -628,6 +657,14 @@ def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
 # ── SFT bake ─────────────────────────────────────────────────────────────────
 
 def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
+    """True only when a model was actually baked.
+
+    A dry run runs nothing: collect.py and format_sft.py write their outputs
+    into mlops/finetune/data, and a dry run writes nothing.
+    """
+    if dry_run:
+        print("[loop] dry run: SFT collect/format/bake not run")
+        return False
     collect_out = MLOPS / "finetune" / "data"
     collect_out.mkdir(parents=True, exist_ok=True)
     traces = collect_out / "raw_traces.jsonl"
@@ -648,13 +685,15 @@ def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
         print("[loop] SFT pairs file empty — skipping bake")
         return False
 
-    if not dry_run:
-        bake_cmd = [
-            sys.executable, str(MLOPS / "finetune" / "train_lora.py"),
-            "--sft", str(sft), "--backend", "ollama-modelfile",
-        ]
-        r = _run(bake_cmd)
-        return r.returncode == 0
+    bake_cmd = [
+        sys.executable, str(MLOPS / "finetune" / "train_lora.py"),
+        "--sft", str(sft), "--backend", "ollama-modelfile",
+    ]
+    r = _run(bake_cmd)
+    if r.returncode != 0:
+        _fail("SFT bake", f"train_lora.py bake failed (exit {r.returncode}): "
+                          f"{_last_error_line(r.stderr)}")
+        return False
     return True
 
 
@@ -665,8 +704,14 @@ def _run_decay(db_path: str, dry_run: bool) -> dict:
         sys.path.insert(0, str(MLOPS))
         from memory.decay import apply_decay
         stats = apply_decay(db_path=db_path, dry_run=dry_run)
+        if stats.get("error"):
+            # apply_decay reports a missing DB or table as a dict, not an
+            # exception. Printed as n_rows=0 it read as a clean, empty run.
+            _fail("decay", f"decay step failed: {stats['error']}")
+            return stats
+        retention = stats.get("mean_retention")
         print(f"[loop] decay: n_rows={stats.get('n_rows')} n_decayed={stats.get('n_decayed')} "
-              f"mean_retention={stats.get('mean_retention', 0):.3f}"
+              f"mean_retention={'n/a' if retention is None else format(retention, '.3f')}"
               f"{' (dry run)' if dry_run else ''}")
         before = stats.get("n_grounding_visible_before")
         after = stats.get("n_grounding_visible_after")
@@ -687,7 +732,8 @@ def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
         print("[loop] monitor skipped — no live model yet")
         return {}
     try:
-        sys.path.insert(0, str(MLOPS / "grounding"))
+        # REPO is on sys.path from module import, which is what this absolute
+        # import needs; prepending mlops/grounding here could not satisfy it.
         from mlops.grounding.canary import monitor_live
         result = monitor_live(
             live_model_path=str(LIVE_MODEL),
@@ -698,7 +744,9 @@ def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
         print(f"[loop] monitor: drift={result.get('drift')} "
               f"rollback_recommended={result.get('rollback_recommended')}")
         if result.get("rollback_recommended"):
-            print("[loop] ALERT: rollback recommended — check monitor_history.jsonl")
+            # Through _alert, not a bare print: a print never reached ALERTS, so
+            # the run's summary and history said nothing needed a human.
+            _alert("monitor", "rollback recommended — check monitor_history.jsonl")
         return result
     except Exception as exc:
         _fail("monitor", f"monitor step failed: {exc}")
@@ -713,6 +761,9 @@ def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
     if not drift_script.exists():
         return {}
     if not anchor.exists():
+        if dry_run:
+            print("[loop] dry run: embedding drift has no anchor and would build one — not built")
+            return {}
         print("[loop] embedding drift: no anchor — building anchor set ...")
         cmd = [sys.executable, str(drift_script),
                "--dataset", str(DATASET), "--ollama", ollama,
@@ -724,32 +775,39 @@ def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
             return {"exit_code": result.returncode}
         return {"built_anchor": True}
 
-    out_path = MLOPS / "embedding" / "drift_result.json"
-    # drift.py exits 1 for BOTH "drift exceeded" and "could not measure" (anchor
-    # unreadable, Ollama down). It writes --out only on the measuring path, so a
-    # file this run produced is the discriminator -- without it a down Ollama
-    # read as drift and scheduled a fine-tune.
-    before = out_path.stat().st_mtime if out_path.exists() else -1.0
-    cmd = [sys.executable, str(drift_script),
-           "--dataset", str(DATASET), "--ollama", ollama,
-           "--anchor", str(anchor), "--out", str(out_path)]
-    result = _run(cmd)
-    measured = out_path.exists() and out_path.stat().st_mtime > before
+    # A dry run still measures, but into a scratch file: it writes nothing into
+    # the repo.
+    scratch = tempfile.mkdtemp(prefix="loci-drift-") if dry_run else None
+    out_path = (Path(scratch) if scratch else MLOPS / "embedding") / "drift_result.json"
+    try:
+        # drift.py exits 1 for BOTH "drift exceeded" and "could not measure" (anchor
+        # unreadable, Ollama down). It writes --out only on the measuring path, so a
+        # file this run produced is the discriminator -- without it a down Ollama
+        # read as drift and scheduled a fine-tune.
+        before = out_path.stat().st_mtime if out_path.exists() else -1.0
+        cmd = [sys.executable, str(drift_script),
+               "--dataset", str(DATASET), "--ollama", ollama,
+               "--anchor", str(anchor), "--out", str(out_path)]
+        result = _run(cmd)
+        measured = out_path.exists() and out_path.stat().st_mtime > before
 
-    if result.returncode == 1 and measured:
-        _alert("embedding drift", "embedding drift detected — scheduling embedding fine-tune")
-        if not dry_run:
-            _emit_embedding_trigger()
-    elif result.returncode != 0:
-        _fail("embedding drift", f"drift.py exited {result.returncode} without writing a "
-                                 f"result: {_last_error_line(result.stderr)}")
+        if result.returncode == 1 and measured:
+            _alert("embedding drift", "embedding drift detected — scheduling embedding fine-tune")
+            if not dry_run:
+                _emit_embedding_trigger()
+        elif result.returncode != 0:
+            _fail("embedding drift", f"drift.py exited {result.returncode} without writing a "
+                                     f"result: {_last_error_line(result.stderr)}")
 
-    if measured:
-        try:
-            return json.loads(out_path.read_text())
-        except Exception as exc:
-            _fail("embedding drift", f"drift.py wrote unreadable JSON: {exc}")
-    return {"exit_code": result.returncode}
+        if measured:
+            try:
+                return json.loads(out_path.read_text())
+            except Exception as exc:
+                _fail("embedding drift", f"drift.py wrote unreadable JSON: {exc}")
+        return {"exit_code": result.returncode}
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ── Active learning ───────────────────────────────────────────────────────────
@@ -852,6 +910,21 @@ def _embedding_tune_ran(since_iso: str | None = None) -> bool:
 RUNS_SEEN_MAX = int(os.environ.get("LOCI_RUNS_SEEN_MAX", "1000"))
 
 
+def _positive_int(raw: str) -> int:
+    """argparse type for a cadence. --decay-every 0 reached `loop_count % 0`
+    and killed the run before it persisted anything."""
+    val = int(raw)
+    if val < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {val}")
+    return val
+
+
+def _fmt3(value) -> str:
+    """A metric for a log line. train.py can write null; `None:.3f` raised
+    TypeError out of main() before decay, monitor and the state save."""
+    return "n/a" if value is None else f"{value:.3f}"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Loci MLOps self-closing loop")
     ap.add_argument("--findings", default=DEFAULT_FINDINGS,
@@ -872,7 +945,7 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="Skip new-data thresholds and retrain unconditionally")
     ap.add_argument("--db", default=DEFAULT_DB, help="Path to Mnemosyne SQLite database")
-    ap.add_argument("--decay-every", type=int, default=1,
+    ap.add_argument("--decay-every", type=_positive_int, default=1,
                     help="Evaluate Weibull decay every N loop runs (default: every run)")
     ap.add_argument("--decay-apply", action="store_true",
                     help="Write the decayed importances back. Without this the decay step "
@@ -947,7 +1020,12 @@ def main() -> int:
     should_retrain = should_rebuild
     if should_rebuild:
         # ── 4. Rebuild dataset ────────────────────────────────────────────────
-        rebuilt = _rebuild_dataset(args.findings, args.ollama)
+        if args.dry_run:
+            # The builder rewrites grounding_dataset.jsonl in place.
+            print("[loop] dry run: dataset rebuild not run")
+            rebuilt = None
+        else:
+            rebuilt = _rebuild_dataset(args.findings, args.ollama)
         rebuild_ok = rebuilt is not None
         new_size = rebuilt if rebuild_ok else _current_dataset_size()
         new_pairs = new_size - state["last_dataset_size"]
@@ -977,14 +1055,19 @@ def main() -> int:
             decision = train_metrics.get("decision", "HOLD")
             run_evidence["step_results"]["train"]["decision"] = decision
             print(f"[loop] train decision: {decision}  model={train_metrics.get('model')}  "
-                  f"cv_f1={train_metrics.get('cv_f1_mean', 0):.3f}  "
-                  f"baseline_f1={train_metrics.get('cosine_baseline_cv_f1', 0):.3f}")
+                  f"cv_f1={_fmt3(train_metrics.get('cv_f1_mean', 0))}  "
+                  f"baseline_f1={_fmt3(train_metrics.get('cosine_baseline_cv_f1', 0))}")
 
             # ── 6. Canary ─────────────────────────────────────────────────────
             if decision == "PROMOTE":
                 canary = _run_canary(args.findings, args.ollama, args.dry_run)
                 run_evidence["step_results"]["canary"] = canary or {"attempted": True}
-                if canary and canary.get("exit_code", 1) == 0:
+                passed = bool(canary) and canary.get("exit_code") == CANARY_OK
+                if passed and args.dry_run:
+                    # canary --dry-run evaluates and copies nothing, so nothing
+                    # was promoted and nothing may be counted as one.
+                    print("[loop] dry run: canary passed — would promote; nothing promoted")
+                elif passed:
                     promoted = True
                     state["total_promotions"] = state.get("total_promotions", 0) + 1
                     print(f"[loop] PROMOTED — total promotions: {state['total_promotions']}")
@@ -1001,8 +1084,10 @@ def main() -> int:
             # tail is what matters. It appended forever and was rewritten in full on
             # every tick, so the state file grew without bound and got slower to
             # write as it went.
-            state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
-        else:
+            seen = set(state["runs_seen"])
+            fresh = [r for r in dict.fromkeys(new_runs) if r not in seen]
+            state["runs_seen"] = (state["runs_seen"] + fresh)[-RUNS_SEEN_MAX:]
+        elif not args.dry_run:
             print(f"[loop] holding {len(new_runs)} new run(s) unseen — the rebuild that "
                   "was supposed to ingest them did not complete")
 
@@ -1045,11 +1130,15 @@ def main() -> int:
 
     # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
     sft_days_ago = _days_since(now, state.get("last_sft_bake"))
-    if ollama_ok and sft_days_ago >= args.sft_every:
+    if args.dry_run:
+        run_evidence["step_results"]["sft_bake"] = {"attempted": False, "reason": "dry run"}
+        print("[loop] SFT bake skipped — dry run (it writes mlops/finetune/data and "
+              "creates an Ollama model)")
+    elif ollama_ok and sft_days_ago >= args.sft_every:
         print(f"[loop] SFT bake (last was {sft_days_ago}d ago)")
         ok = _run_sft_bake(args.ollama, args.dry_run)
         run_evidence["step_results"]["sft_bake"] = {"attempted": True, "ok": ok}
-        if ok and not args.dry_run:
+        if ok:
             state["last_sft_bake"] = now_iso
     else:
         run_evidence["step_results"]["sft_bake"] = {
@@ -1062,7 +1151,10 @@ def main() -> int:
     emb_days_ago = _days_since(now, state.get("last_embedding_tune"))
     if emb_days_ago >= args.embedding_every:
         print(f"[loop] embedding trigger (last was {emb_days_ago}d ago)")
-        _emit_embedding_trigger()
+        if args.dry_run:
+            print(f"[loop] dry run: {MLOPS / 'run_contrastive.sh'} not written")
+        else:
+            _emit_embedding_trigger()
         if _embedding_tune_ran(state.get("last_embedding_tune")):
             if not args.dry_run:
                 state["last_embedding_tune"] = now_iso
@@ -1080,11 +1172,15 @@ def main() -> int:
 
     # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
     al_days_ago = _days_since(now, state.get("last_active_learn"))
-    if ollama_ok and al_days_ago >= args.active_learn_every:
+    if args.dry_run:
+        # active_learn.py rewrites active_candidates.jsonl.
+        run_evidence["step_results"]["active_learn"] = {"attempted": False, "reason": "dry run"}
+        print("[loop] active_learn skipped — dry run")
+    elif ollama_ok and al_days_ago >= args.active_learn_every:
         print(f"[loop] active_learn (last was {al_days_ago}d ago)")
         al_result = _run_active_learn(args.ollama)
         run_evidence["step_results"]["active_learn"] = dict(al_result or {})
-        if al_result.get("exit_code", 1) == 0 and not args.dry_run:
+        if al_result.get("exit_code", 1) == 0:
             state["last_active_learn"] = now_iso
     else:
         run_evidence["step_results"]["active_learn"] = {
@@ -1135,7 +1231,9 @@ def _finish(state, args, now_iso, loop_count, new_runs, current_size,
     history_record = {
         "run_at": now_iso,
         "new_runs": len(new_runs),
-        "dataset_size": current_size,
+        # The size this run leaves behind. current_size is the pre-rebuild count,
+        # which under-reported the dataset on exactly the nights that grew it.
+        "dataset_size": evidence["dataset_pairs_after_run"],
         "retrained": should_retrain,
         "promoted": promoted,
         "train_metrics": train_metrics,
@@ -1152,7 +1250,10 @@ def _finish(state, args, now_iso, loop_count, new_runs, current_size,
         _alert("summary honesty", msg[:300])
         history_record["alerts"] = list(ALERTS)
 
-    _append_history(history_record)
+    if args.dry_run:
+        print("[loop] dry run: loop_history.jsonl not appended")
+    else:
+        _append_history(history_record)
 
     print(f"[loop] {_final_status(promoted, state['last_dataset_size'], state['total_promotions'])}")
     return 1 if FAILED_STEPS else 0

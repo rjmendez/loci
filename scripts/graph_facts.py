@@ -22,13 +22,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 
 def _find_graph() -> str | None:
-    import glob
     # Must match what the server actually opens: mcp/server.py creates
-    # MEMORY_DIR / "graph.ladybug". Globbing the historical "graph.kuzu" name
-    # found nothing, so every graph_facts request reported "code graph not
-    # found" while a populated graph sat next to it.
-    for p in glob.glob(os.path.expanduser("~/.hermes/**/graph.ladybug"), recursive=True):
-        return p
+    # MEMORY_DIR / "graph.ladybug", with MEMORY_DIR from legacy_env.memory_dir()
+    # (LOCI_MEMORY_DIR, else ~/.loci/memory-sessions, else the legacy
+    # ~/.hermes/memory-sessions). Globbing ~/.hermes only missed LOCI_MEMORY_DIR
+    # and every ~/.loci install, and could pick up a graph the server never opens.
+    # The literal stays inline in the .exists() receiver so `cg literals` still
+    # pairs this consumer with the server's `MEMORY_DIR / "graph.ladybug"`.
+    from pathlib import Path
+
+    from legacy_env import memory_dir
+
+    root = Path(memory_dir())
+    if (root / "graph.ladybug").exists():
+        return str(root / "graph.ladybug")
     return None
 
 

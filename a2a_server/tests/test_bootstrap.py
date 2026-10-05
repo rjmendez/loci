@@ -79,10 +79,30 @@ class TestBootstrapIssuance(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    def _ttl_of(self, **extra):
+        before = datetime.datetime.now(datetime.timezone.utc)
+        r = _bootstrap(**extra)
+        self.assertEqual(r.status_code, 200, r.text)
+        exp = datetime.datetime.fromisoformat(r.json()["expires_at"])
+        # The server stores the same expiry it reports.
+        self.assertEqual(a2a_server._session_tokens[r.json()["session_token"]], exp)
+        return exp - before
+
     def test_ttl_capped_at_7_days(self):
-        exp = datetime.datetime.fromisoformat(_bootstrap(ttl_hours=9999).json()["expires_at"])
-        ahead = exp - datetime.datetime.now(datetime.timezone.utc)
-        self.assertLessEqual(ahead, datetime.timedelta(hours=168))
+        # Exactly 168h (allowing only request latency), not merely "at most".
+        ahead = self._ttl_of(ttl_hours=9999)
+        self.assertGreaterEqual(ahead, datetime.timedelta(hours=168))
+        self.assertLess(ahead, datetime.timedelta(hours=168, minutes=1))
+
+    def test_ttl_below_the_cap_is_honoured(self):
+        ahead = self._ttl_of(ttl_hours=5)
+        self.assertGreaterEqual(ahead, datetime.timedelta(hours=5))
+        self.assertLess(ahead, datetime.timedelta(hours=5, minutes=1))
+
+    def test_ttl_defaults_to_24h(self):
+        ahead = self._ttl_of()
+        self.assertGreaterEqual(ahead, datetime.timedelta(hours=24))
+        self.assertLess(ahead, datetime.timedelta(hours=24, minutes=1))
 
     def test_response_advertises_no_totp_required(self):
         self.assertFalse(_bootstrap().json()["totp_required"])

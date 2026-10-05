@@ -459,7 +459,11 @@ def test_queue_claimed_enqueue_always_has_a_lease(tmp_path, monkeypatch):
         investigation_id=inv_id, item_id="ghost", state="claimed", owner_session="crashed-session",
     ))
     assert ghost["item"]["state"] == "claimed"
-    assert ghost["item"]["lease_expires_at"]
+    # A finite lease of the default 300 s from now -- not a far-future sentinel.
+    from datetime import datetime, timezone
+    lease = datetime.fromisoformat(ghost["item"]["lease_expires_at"])
+    ahead = (lease - datetime.now(timezone.utc)).total_seconds()
+    assert 290 <= ahead <= 300, ahead
 
     ownerless = _json(server.investigation_queue_enqueue(investigation_id=inv_id, item_id="nobody", state="claimed"))
     assert "requires owner_session" in ownerless["error"]
@@ -558,3 +562,15 @@ def test_queue_status_reports_expired_lease(tmp_path, monkeypatch):
     stored =json.loads((tmp_path / inv_id / "manifest.json").read_text())
     assert "lease_expired" not in stored["coordination"]["items"][0]
     assert "available" not in stored["coordination"]["items"][0]
+
+
+def test_coordination_now_plus_is_now_plus_the_given_seconds():
+    # The smoke flow above stubs this helper for determinism, so it is pinned here.
+    from datetime import datetime, timezone
+    now_plus = server.investigation_queue_claim.__globals__["_coordination_now_plus"]
+    for seconds in (0, 30, 300, 86400):
+        before = datetime.now(timezone.utc).timestamp()
+        got = datetime.fromisoformat(now_plus(seconds))
+        after = datetime.now(timezone.utc).timestamp()
+        assert got.tzinfo is not None
+        assert before + seconds <= got.timestamp() <= after + seconds, (seconds, got)

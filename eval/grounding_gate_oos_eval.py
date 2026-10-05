@@ -98,9 +98,14 @@ def run():
     ma = statistics.mean(m["accuracy"] for _, _, m in folds)
     print(f"[oos] MEAN over {len(folds)} folds: cosine f1={cf:.3f} acc={ca:.3f} | model f1={mf:.3f} acc={ma:.3f}")
     generalizes = mf > cf and ma >= ca
+    # Parenthesised: the conditional used to wrap the whole implicitly
+    # concatenated f-string, so a model that did NOT generalize printed only the
+    # "(consider reverting ...)" tail and never the verdict itself.
+    advice = ("(keep model default)" if generalizes
+              else "(consider reverting gate to cosine default: --no-model)")
     print(f"[oos] VERDICT (out-of-sample): trained model "
           f"{'GENERALIZES — beats cosine' if generalizes else 'does NOT clearly beat cosine'} "
-          f"(keep model default)" if generalizes else "(consider reverting gate to cosine default: --no-model)")
+          f"{advice}")
 
 
 if __name__ == "__main__":

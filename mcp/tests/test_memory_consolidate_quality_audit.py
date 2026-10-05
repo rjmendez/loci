@@ -91,13 +91,13 @@ def test_memory_consolidate_fail_open_when_merge_details_cannot_be_determined(mo
 def test_memory_consolidate_fail_open_when_model_unavailable(monkeypatch):
     monkeypatch.setattr(server, "_load_mnemosyne_class", lambda: _make_fake_mnemosyne())
     monkeypatch.setattr(server, "_find_most_recent_investigation", lambda: (None, []))
-    server._consolidation_quality_audit_gen_fn = (
-        lambda prompt, *, fmt=None, max_tokens=256: {
-            "text": "",
-            "ok": False,
-            "why": "no Ollama endpoint resolved",
-        }
-    )
+    prompts: list[str] = []
+
+    def _unavailable_model(prompt, *, fmt=None, max_tokens=256):
+        prompts.append(prompt)
+        return {"text": "", "ok": False, "why": "no Ollama endpoint resolved"}
+
+    server._consolidation_quality_audit_gen_fn = _unavailable_model
 
     parsed = json.loads(server.memory_consolidate(dry_run=False))
 
@@ -107,6 +107,69 @@ def test_memory_consolidate_fail_open_when_model_unavailable(monkeypatch):
         "flagged": [],
         "degraded": True,
     }
+    # The sampler found the merge and the configured model WAS asked about it:
+    # "degraded" here means the model failed, not that nothing was sampled.
+    assert len(prompts) == 1
+    assert "Alice rotated the AWS key after the incident." in prompts[0]
+    assert "Bob disabled the compromised CI runner pending rebuild." in prompts[0]
+
+
+def _scripted_model(verdict: str, concern: str, calls: list):
+    def _gen(prompt, *, fmt=None, max_tokens=256):
+        calls.append({"prompt": prompt, "fmt": fmt})
+        return {
+            "ok": True,
+            "text": json.dumps({"verdict": verdict, "concern": concern, "confidence": 0.8}),
+        }
+    return _gen
+
+
+def test_memory_consolidate_quality_audit_positive_control_preserved(monkeypatch):
+    """Positive twin of the fail-open tests (same fixture): a working model
+    samples the one real merge and reports it clean, not degraded."""
+    monkeypatch.setattr(server, "_load_mnemosyne_class", lambda: _make_fake_mnemosyne(
+        merged_text="Alice rotated the AWS key; Bob disabled the CI runner."))
+    monkeypatch.setattr(server, "_find_most_recent_investigation", lambda: (None, []))
+    calls: list = []
+    server._consolidation_quality_audit_gen_fn = _scripted_model("preserved", "", calls)
+
+    parsed = json.loads(server.memory_consolidate(dry_run=False))
+
+    assert parsed["consolidation_quality_audit"] == {
+        "sampled": 1,
+        "flagged": [],
+        "degraded": False,
+    }
+    assert len(calls) == 1
+    assert calls[0]["fmt"] == "json"
+    assert "MERGED RESULT:\nAlice rotated the AWS key; Bob disabled the CI runner." in calls[0]["prompt"]
+    stabilize = parsed["sleep_like_consolidation"]["phases"][2]
+    assert stabilize == {"name": "stabilize", "status": "ok",
+                         "details": {"sampled": 1, "flagged_count": 0, "degraded": False}}
+
+
+def test_memory_consolidate_quality_audit_positive_control_flags_lost_merge(monkeypatch):
+    monkeypatch.setattr(server, "_load_mnemosyne_class", lambda: _make_fake_mnemosyne(
+        merged_text="Alice rotated the AWS key."))
+    monkeypatch.setattr(server, "_find_most_recent_investigation", lambda: (None, []))
+    calls: list = []
+    server._consolidation_quality_audit_gen_fn = _scripted_model(
+        "lost_or_conflated", "Drops the CI runner being disabled.", calls)
+
+    parsed = json.loads(server.memory_consolidate(dry_run=False))
+
+    assert parsed["consolidation_quality_audit"] == {
+        "sampled": 1,
+        "flagged": [{
+            "summary": "Alice rotated the AWS key.",
+            "concern": "Drops the CI runner being disabled.",
+            "session_id": "sess-1",
+            "source_entry_ids": ["wm-1", "wm-2"],
+            "source_entry_count": 2,
+        }],
+        "degraded": False,
+    }
+    assert len(calls) == 1
 
 
 def test_memory_consolidate_dry_run_shape_and_behavior_are_unchanged(monkeypatch):

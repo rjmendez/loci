@@ -206,22 +206,37 @@ class MirrorSyncTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(fake.points[mq.stable_num_id("m1")]["payload"]["content"], "new text")
 
+    # The two tests below run with every prune switch ON (--prune, --force-prune,
+    # a host identity), so the missing-source guard is the only thing standing
+    # between an unreadable DB and deleting this host's whole mirror. Without
+    # --prune (as before) pruning was off anyway and the guard was untested.
+    PRUNE_ARGV = ["--prune", "--force-prune"]
+
     def test_missing_db_fails_without_touching_qdrant(self):
-        fake = FakeQdrant([_point("m1", "kept")])
+        fake = FakeQdrant([self._hp("m1", "kept"), self._hp("m2", "kept too")])
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
         missing = os.path.join(tmpdir.name, "mnemosyne.db")
-        rc = self._run(missing, fake)
+        rc = self._run(missing, fake, argv=self.PRUNE_ARGV, **self.HOST)
         self.assertEqual(rc, 1)
         self.assertFalse(os.path.exists(missing), "sync must not create an empty DB")
         self.assertEqual(fake.deletes(), [])
-        self.assertIn(mq.stable_num_id("m1"), fake.points)
+        self.assertEqual(set(fake.points), {mq.stable_num_id("m1"), mq.stable_num_id("m2")})
 
     def test_db_without_memory_tables_does_not_prune(self):
-        fake = FakeQdrant([_point("m1", "kept")])
-        rc = self._run(self._db([], tables=False), fake)
+        fake = FakeQdrant([self._hp("m1", "kept"), self._hp("m2", "kept too")])
+        rc = self._run(self._db([], tables=False), fake, argv=self.PRUNE_ARGV, **self.HOST)
         self.assertEqual(rc, 1)
         self.assertEqual(fake.deletes(), [])
+        self.assertEqual(set(fake.points), {mq.stable_num_id("m1"), mq.stable_num_id("m2")})
+
+    def test_the_same_switches_do_prune_when_the_db_is_readable(self):
+        # Positive twin: identical prune switches and host, readable empty tables:
+        # every point of this host is now an orphan and is deleted.
+        fake = FakeQdrant([self._hp("m1", "gone"), self._hp("m2", "gone too")])
+        rc = self._run(self._db([]), fake, argv=self.PRUNE_ARGV, **self.HOST)
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.points, {})
 
 
 if __name__ == "__main__":

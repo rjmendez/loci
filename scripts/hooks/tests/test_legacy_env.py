@@ -10,7 +10,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import re
+import shutil
+import subprocess
 from unittest import mock
+
+import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 MCP_COPY = REPO / "mcp" / "legacy_env.py"
@@ -31,10 +36,47 @@ def test_the_two_copies_are_byte_identical():
     )
 
 
+INSTALL_SH = REPO / "scripts" / "hooks" / "install.sh"
+
+
+def _install_hooks_array() -> list[str]:
+    """The words of install.sh's HOOKS=( ... ) array -- what it actually copies.
+    Comments inside the array are dropped, as bash drops them."""
+    m = re.search(r"^HOOKS=\((.*?)\)", INSTALL_SH.read_text(), re.M | re.S)
+    assert m, "install.sh no longer declares a HOOKS=( ... ) array"
+    words = []
+    for line in m.group(1).splitlines():
+        words.extend(line.split("#", 1)[0].split())
+    return words
+
+
 def test_install_deploys_the_map_with_the_hooks():
     # Without it a deployed hook reading LOCI_* gets nothing from a wrapper that
     # still exports HERMES_*, and the session sync silently stops working.
-    assert "legacy_env.py" in (REPO / "scripts" / "hooks" / "install.sh").read_text()
+    assert "legacy_env.py" in _install_hooks_array()
+
+
+def test_install_ships_every_hook_that_imports_the_map():
+    hooks_dir = REPO / "scripts" / "hooks"
+    importers = {p.name for p in hooks_dir.glob("*.py")
+                 if "from legacy_env import" in p.read_text()}
+    assert importers >= {"pre_llm_grounding.py", "pre_tool_grounding.py",
+                         "session_end_sync.py"}
+    assert importers <= set(_install_hooks_array())
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="install.sh is a bash script")
+def test_install_run_copies_the_map_next_to_the_hooks(tmp_path):
+    dest = tmp_path / "hooks"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path),
+           "CLAUDE_HOOKS_DIR": str(dest),
+           "CLAUDE_SETTINGS": str(tmp_path / "settings.json")}
+    proc = subprocess.run(["bash", str(INSTALL_SH)], env=env, capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "installed legacy_env.py" in proc.stdout.splitlines()
+    assert (dest / "legacy_env.py").read_bytes() == HOOK_COPY.read_bytes()
+    assert sorted(p.name for p in dest.iterdir()) == sorted(_install_hooks_array())
 
 
 def test_legacy_name_is_mapped_onto_the_current_one():

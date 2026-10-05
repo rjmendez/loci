@@ -95,8 +95,30 @@ def test_retrieval_selftest_default_query_is_not_served_from_cache(monkeypatch, 
     qdrant_ops._embed_cache["system architecture"] = [0.1] * DIM
     monkeypatch.setattr(qdrant_ops, "_OLLAMA_BASE", "http://127.0.0.1:1")  # embedder is down
     out = json.loads(server.retrieval_selftest())
-    assert out["status"] != "ok", out
+    # The live probe ran (not an early error return) and named the down embedder.
+    assert out["status"] == "unhealthy", out
     assert out["embedder_dim"] is None
+    (row,) = out["collections"]
+    assert (row["collection"], row["status"], row["points"]) == ("loci_memory", "error", 1)
+    assert row["detail"] == "no embedder — dense vector unavailable"
+    assert out["remediations"] == [row["remediation"]]
+    assert "configured but returned no vector" in row["remediation"]
+
+
+def test_retrieval_selftest_with_a_live_embedder_retrieves(monkeypatch, fresh_transport):
+    # Positive twin: same collection, the embedder answers -> the probe gets its row back.
+    c = QdrantClient(location=":memory:")
+    c.create_collection("loci_memory",
+                        vectors_config={"dense": VectorParams(size=DIM, distance=Distance.COSINE)})
+    c.upsert("loci_memory", points=[PointStruct(id=1, vector={"dense": [0.1] * DIM})])
+    _patch_client(monkeypatch, c)
+    asked = []
+    monkeypatch.setattr(server, "_embed_uncached", lambda text: asked.append(text) or [0.1] * DIM)
+    out = json.loads(server.retrieval_selftest())
+    assert asked == ["system architecture"]
+    assert (out["status"], out["embedder_dim"], out["remediations"]) == ("ok", DIM, [])
+    (row,) = out["collections"]
+    assert (row["collection"], row["status"], row["hits"]) == ("loci_memory", "ok", 1)
 
 
 def test_selftest_remediation_names_a_down_embedder_not_a_missing_url(monkeypatch):
@@ -249,21 +271,23 @@ def test_search_collection_uses_the_sparse_index_and_keeps_cosine_scores(monkeyp
 # --------------------------------------------------------------------------- #
 # memory_surface fabricated score
 # --------------------------------------------------------------------------- #
-def _docs(n):
-    return json.dumps({"results": [{"title": f"doc{i}", "summary": f"docs guidance {i}"}
-                                   for i in range(n)]})
+def _docs(n, scores=None):
+    rows = [{"title": f"doc{i}", "summary": f"docs guidance {i}"} for i in range(n)]
+    for row, score in zip(rows, scores or []):
+        row["score"] = score
+    return json.dumps({"results": rows})
 
 
 def test_memory_surface_docs_fallback_is_flagged_and_unscored(monkeypatch):
     """memory-surface-fabricated-score (Qdrant down)."""
     monkeypatch.setattr(server, "_get_qdrant", lambda: (None, None))
-    monkeypatch.setattr(server, "docs_search", lambda *a, **k: _docs(2))
+    # docs_search's own lexical score is passed through; an unscored doc stays None.
+    monkeypatch.setattr(server, "docs_search", lambda *a, **k: _docs(2, scores=[0.25]))
     out = json.loads(server.memory_surface("auth token expiry", top_k=5))
     assert out["count"] == 2
     assert out.get("degraded") is True and out.get("fallback") == "docs_search"
-    for hit in out["surfaced"]:
-        assert hit["score"] != 0.95, "fabricated similarity score"
-        assert hit["origin"] == "docs_search"
+    assert [(h["finding_id"], h["score"], h["origin"]) for h in out["surfaced"]] == [
+        ("doc0", 0.25, "docs_search"), ("doc1", None, "docs_search")]
 
 
 def test_memory_surface_docs_hits_do_not_displace_real_findings(monkeypatch):

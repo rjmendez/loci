@@ -253,7 +253,7 @@ def test_pool_reads_active_leases_by_default(world):
 
 
 def test_context_manager_releases_even_when_the_job_fails(world):
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="job crashed"):
         with L.lease("evo-run", 9.0, base_url="http://fake", wait_s=0.0, _sleep=lambda s: None) as grant:
             assert grant["granted"]
             raise RuntimeError("job crashed")

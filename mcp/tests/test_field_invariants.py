@@ -103,12 +103,27 @@ class FieldInvariantsTest(unittest.TestCase):
         findings = [_f(record_type=f"t{i}", confidence=f"c{i}", source=f"s{i}",
                        tags=[f"tag{i}"]) for i in range(500)]
         got = _field_invariants(findings)
-        self.assertEqual(got["n"], 500)
-        for bucket in ("constant", "varies", "distinct_only"):
-            for field, value in got[bucket].items():
-                if bucket == "varies":
-                    self.assertLessEqual(len(value), _INVARIANT_MAX_VALUES, field)
-        self.assertEqual(got["distinct_only"]["record_type"], 500)
+        # Every per-value field and the tag universe collapse to counts: 500 distinct
+        # values of each render as one integer, never as a 500-entry list.
+        self.assertEqual(got, {
+            "n": 500,
+            "constant": {},
+            "varies": {},
+            "distinct_only": {"record_type": 500, "confidence": 500, "source": 500},
+            "tags_on_every_finding": [],
+            "tags_distinct": 500,
+        })
+        import json
+        self.assertLess(len(json.dumps(got)), 300)
+
+    def test_a_small_enumeration_is_listed_with_counts(self):
+        # Positive twin at the class/identifier boundary: exactly _INVARIANT_MAX_VALUES
+        # distinct values are an enumeration, one more is an identifier count.
+        at_cap = [_f(source=f"s{i % _INVARIANT_MAX_VALUES}") for i in range(10)]
+        self.assertEqual(_field_invariants(at_cap)["varies"]["source"],
+                         {f"s{i}": 2 for i in range(_INVARIANT_MAX_VALUES)})
+        over = [_f(source=f"s{i}") for i in range(_INVARIANT_MAX_VALUES + 1)]
+        self.assertEqual(_field_invariants(over)["distinct_only"]["source"], _INVARIANT_MAX_VALUES + 1)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@ Most of these share the `head_build` session fixture (see conftest.py) so
 the corpus is only parsed once per test run; a few need a different
 `--rev` or `--scope` and build independently."""
 from .conftest import VALIDATED_REV, needs_corpus_deps, needs_git_history  # noqa: F401
-from .helpers import called_bare_name_count, global_write_lines, mcp_tool_functions, source_at
+from .helpers import (
+    called_bare_name_count, global_write_lines, mcp_tool_functions, registration_census, source_at,
+)
 from .. import config
 from ..analyze.deadcode import registered_but_dead
 from ..analyze.reach import (
@@ -235,16 +237,31 @@ def test_hard_gate_no_registered_function_is_reported_dead(head_build):
     assert bad == [], [n.id for n in bad]
 
 
+# The registration census the tool was hand-validated against, at VALIDATED_REV.
+VALIDATED_REGISTRY = {"DEC-tool": 41, "DEC-route": 6, "DEC-mcp-route": 1, "MAN-LOOP": 31, "MAN-DICT": 13}
+
+
+@needs_git_history
+def test_registry_counts_at_validated_rev_are_exact(validated_build):
+    """Exact at the fixed revision: only a change to the tool can move these.
+    The plain-ast census must agree too, which is what licenses using it as
+    the HEAD oracle below."""
+    from collections import Counter
+    by_rule = dict(Counter(e.attrs["rule"] for e in validated_build.store.edges_of_kind("REGISTERS")))
+    assert by_rule == VALIDATED_REGISTRY
+    assert registration_census(validated_build.sources) == VALIDATED_REGISTRY
+
+
 def test_registry_counts_match_the_real_corpus(head_build):
+    """HEAD: every rule's count equals an independent plain-ast census of the
+    same source. The old ">= 44 / >= 6 / ..." floors were set at #332 and
+    passed a registrar that lost any tool added since."""
     from collections import Counter
     store = head_build.store
-    by_rule = Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS"))
-    # 43 @mcp.tool() + 1 @mcp.resource(): both make a function externally callable, so both are DEC-tool.
-    assert by_rule["DEC-tool"] >= 44
-    assert by_rule["DEC-route"] >= 6         # a2a_server's @app.get/@app.post
-    assert by_rule["DEC-mcp-route"] >= 1     # mcp/server.py's @mcp.custom_route("/health", ...)
-    assert by_rule["MAN-LOOP"] >= 33         # graph_tools(11) + investigation_tools(11) + llm_tools(10)
-    assert by_rule["MAN-DICT"] >= 13         # a2a_server's _SKILL_MAP
+    by_rule = dict(Counter(e.attrs["rule"] for e in store.edges_of_kind("REGISTERS")))
+    census = registration_census(head_build.sources)
+    assert set(census) == set(VALIDATED_REGISTRY), census  # the oracle saw every rule
+    assert by_rule == census
 
 
 def test_registry_unmatched_is_empty(head_build):

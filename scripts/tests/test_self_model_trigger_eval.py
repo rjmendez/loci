@@ -137,11 +137,27 @@ def test_evaluate_trigger_respects_cooldown(tmp_path):
         "value": 250,
     }
 
-    ev = mod.evaluate_proactive_trigger(trigger, state, config=mod.TriggerConfig(), now=now)
+    config = mod.TriggerConfig(t1_cooldown_minutes=15)
+    ev = mod.evaluate_proactive_trigger(trigger, state, config=config, now=now)
 
     assert ev.fired is False
     assert ev.suppressed is True
-    assert ev.cooldown_until is not None
+    assert ev.cooldown_until == "2026-09-22T15:40:00Z"  # last fired 15:25 + 15 min
+
+    # Expiry: the same trigger fired 16 minutes ago is live again. A cooldown
+    # that never ends ("suppress forever") passed the old test.
+    expired = {"trigger_state": {"reflection_queue_size": {"last_fired_at": "2026-09-22T15:14:00Z"}}}
+    ev = mod.evaluate_proactive_trigger(trigger, expired, config=config, now=now)
+    assert (ev.fired, ev.suppressed, ev.cooldown_until) == (True, False, "2026-09-22T15:29:00Z")
+
+    # Boundary: exactly one cooldown later is no longer suppressed.
+    boundary = {"trigger_state": {"reflection_queue_size": {"last_fired_at": "2026-09-22T15:15:00Z"}}}
+    ev = mod.evaluate_proactive_trigger(trigger, boundary, config=config, now=now)
+    assert (ev.fired, ev.suppressed) == (True, False)
+
+    # Never fired: no cooldown at all.
+    ev = mod.evaluate_proactive_trigger(trigger, {}, config=config, now=now)
+    assert (ev.fired, ev.suppressed, ev.cooldown_until) == (True, False, None)
 
 
 def test_main_writes_state_and_alerts(tmp_path, monkeypatch):

@@ -115,7 +115,8 @@ class ReflectionLoopTests(unittest.TestCase):
             )
 
         self.assertEqual(result["processed_items"], 2)
-        self.assertGreaterEqual(result["stats"]["error_signatures_suppressed"], 5)
+        # Limit 1: the first sighting stays visible, only the second (5 hits) is suppressed.
+        self.assertEqual(result["stats"]["error_signatures_suppressed"], 5)
 
         observed = [c for c in stored_calls if c["finding_type"] == "observed"]
         self.assertEqual(len(observed), 2)
@@ -123,6 +124,8 @@ class ReflectionLoopTests(unittest.TestCase):
             self.assertEqual(call["confidence"], "low")
             self.assertIn("unreceipted-observed", call["tags"])
 
+        self.assertIn("repeat-signature", observed[0]["text"])
+        self.assertNotIn("saturated=", observed[0]["text"])
         self.assertIn("saturated=1 signatures (5 hits)", observed[1]["text"])
 
     def test_tick_prioritizes_process_logs_before_session_events(self):
@@ -316,15 +319,23 @@ class ReflectionLoopTests(unittest.TestCase):
             stored_calls.append(kwargs)
             return json.dumps({"stored": True})
 
+        classifier_calls: list[str] = []
+
+        def _record_and_raise(kind, path, **_kw):
+            classifier_calls.append(path)
+            raise RuntimeError("model endpoint refused")
+
         with patch.object(server, "_load_reflection_state", side_effect=lambda: state), patch.object(
             server, "_save_reflection_state", side_effect=lambda new_state: state.update(new_state)
         ), patch.object(
             server, "_ensure_investigation_exists", side_effect=lambda *args, **kwargs: None
         ), patch.object(
             server, "_process_reflection_item", return_value=summary
-        ), patch.object(
-            server, "_reflection_llm_triage_metadata",
-            return_value={"llm_triage": {"degraded": True}},
+        ), patch(
+            # Stub the classifier (the model-backed dependency), not the unit:
+            # _reflection_llm_triage_metadata's own except branch must fail open.
+            "reflection_triage.classify_reflection_observation",
+            side_effect=_record_and_raise,
         ), patch.object(
             server, "investigation_store", side_effect=fake_store
         ):
@@ -336,8 +347,33 @@ class ReflectionLoopTests(unittest.TestCase):
                 max_llm_items=1,
             )
 
+        self.assertEqual(classifier_calls, ["/tmp/a.log"])
         observed = [c for c in stored_calls if c["finding_type"] == "observed"]
+        self.assertEqual(len(observed), 1)
         self.assertEqual(observed[0]["metadata"], {"llm_triage": {"degraded": True}})
+
+    def test_triage_metadata_carries_the_classifier_verdict(self):
+        """Positive twin: a working classifier's labels reach the metadata."""
+        calls = []
+
+        def _classify(kind, path, **kw):
+            calls.append((kind, path, kw["errors"]))
+            return {"category": "tooling", "novelty": "new", "degraded": False, "ok": True}
+
+        with patch("reflection_triage.classify_reflection_observation", side_effect=_classify):
+            meta = server._reflection_llm_triage_metadata(
+                "process_log", "/tmp/a.log", {"sampling_mode": "full"},
+                {"assertion failed": 1}, {},
+            )
+        self.assertEqual(meta, {"llm_triage": {"category": "tooling", "novelty": "new"}})
+        self.assertEqual(calls, [("process_log", "/tmp/a.log", {"assertion failed": 1})])
+
+    def test_triage_metadata_fails_open_when_the_classifier_raises(self):
+        with patch("reflection_triage.classify_reflection_observation",
+                   side_effect=RuntimeError("boom")):
+            meta = server._reflection_llm_triage_metadata(
+                "process_log", "/tmp/a.log", {}, {"assertion failed": 1}, {})
+        self.assertEqual(meta, {"llm_triage": {"degraded": True}})
 
     def test_tick_respects_max_llm_items_budget(self):
         state = server._reflection_default_state()

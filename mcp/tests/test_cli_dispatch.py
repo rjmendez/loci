@@ -152,41 +152,121 @@ class TestProcessCode(unittest.TestCase):
         self._py_file = os.path.join(self._tmp.name, "example.py")
         with open(self._py_file, "w") as f:
             f.write("def add(a, b):\n    return a + b\n")
+        # A file with exactly one known smell: LH009, asyncio.run() inside an
+        # async function, on line 9.
+        self._smelly = os.path.join(self._tmp.name, "smelly.py")
+        with open(self._smelly, "w") as f:
+            f.write(
+                "import asyncio\n\n\n"
+                "async def g():\n    return 1\n\n\n"
+                "async def f():\n    return asyncio.run(g())\n"
+            )
 
     def tearDown(self):
         os.environ.pop("MEMCHECK_AUDIT_LOG", None)
         os.environ.pop("LOCI_MEMORY_DIR", None)
         self._tmp.cleanup()
 
-    def test_returns_dict_for_py_file(self):
-        payload = {
+    def _payload(self, path):
+        return {
             "hook_event_name": "PostToolUse",
             "tool_name": "Write",
-            "tool_input": {"file_path": self._py_file},
+            "tool_input": {"file_path": path},
         }
-        record = cli.process_code(payload, _engine(), repo_root=self._tmp.name)
-        self.assertIsInstance(record, dict)
-        self.assertIn("event", record)
-        self.assertEqual(record["event"], "code")
+
+    def _audit_lines(self):
+        with open(os.environ["MEMCHECK_AUDIT_LOG"]) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    @staticmethod
+    def _without_ts(record):
+        return {k: v for k, v in record.items() if k != "ts"}
+
+    def _recall_code(self, engine):
+        import asyncio
+
+        return asyncio.run(engine.backend.recall("q", cli.hash_embed("q"), "code", 50))
+
+    def test_returns_dict_for_py_file(self):
+        engine = _engine()
+        record = cli.process_code(self._payload(self._py_file), engine, repo_root=self._tmp.name)
+        # A clean file is checked (not skipped) and reports zero issues.
+        self.assertEqual(self._without_ts(record), {
+            "event": "code", "tool_name": "Write", "file": "example.py",
+            "n_issues": 0, "codes": [], "loci_audit_logged": False, "qdrant": "ok",
+        })
+        self.assertEqual(self._recall_code(engine), [])
+
+    def test_checker_runs_and_records_code_verdicts(self):
+        engine = _engine()
+        record = cli.process_code(self._payload(self._smelly), engine, repo_root=self._tmp.name)
+        self.assertEqual(self._without_ts(record), {
+            "event": "code", "tool_name": "Write", "file": "smelly.py",
+            "n_issues": 1, "codes": ["LH009"], "loci_audit_logged": False, "qdrant": "ok",
+        })
+        (audit,) = self._audit_lines()
+        self.assertEqual(audit, record)
+        (scored,) = self._recall_code(engine)
+        v = scored.verdict
+        self.assertEqual(
+            (v.subject_kind, v.verdict_type, v.decision, v.subject_excerpt),
+            ("code", "LH009", "warn", "smelly.py:9 LH009"),
+        )
 
     def test_skips_non_py_file(self):
-        payload = {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": "/some/file.txt"},
-        }
-        record = cli.process_code(payload, None)
-        self.assertIn("event", record)
-        self.assertEqual(record["event"], "code")
+        engine = _engine()
+        record = cli.process_code(self._payload("/some/file.txt"), engine)
+        self.assertEqual(self._without_ts(record), {
+            "event": "code", "tool_name": "Write", "file": "file.txt",
+            "skipped": True, "loci_audit_logged": False, "qdrant": "ok",
+        })
+        self.assertEqual(self._recall_code(engine), [])
+
+    def test_skips_existing_non_py_file_even_with_python_content(self):
+        txt = os.path.join(self._tmp.name, "notes.txt")
+        with open(self._smelly) as src, open(txt, "w") as dst:
+            dst.write(src.read())
+        engine = _engine()
+        record = cli.process_code(self._payload(txt), engine, repo_root=self._tmp.name)
+        self.assertIs(record["skipped"], True)
+        self.assertNotIn("n_issues", record)
+        self.assertEqual(self._recall_code(engine), [])
+
+    def test_skips_missing_py_file(self):
+        record = cli.process_code(
+            self._payload(os.path.join(self._tmp.name, "gone.py")), None,
+            repo_root=self._tmp.name,
+        )
+        self.assertIs(record["skipped"], True)
+        self.assertNotIn("n_issues", record)
+        self.assertEqual(record["qdrant"], "unavailable")
 
     def test_no_engine_still_returns_record(self):
-        payload = {
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Write",
-            "tool_input": {"file_path": self._py_file},
-        }
-        record = cli.process_code(payload, None, repo_root=self._tmp.name)
-        self.assertIsInstance(record, dict)
+        record = cli.process_code(self._payload(self._smelly), None, repo_root=self._tmp.name)
+        # Without a backend the check still runs; only recording is degraded.
+        self.assertEqual(record["n_issues"], 1)
+        self.assertEqual(record["codes"], ["LH009"])
+        self.assertEqual(record["qdrant"], "unavailable")
+        self.assertNotIn("skipped", record)
+
+    def test_backend_failure_is_reported_as_unavailable(self):
+        class _Raising(InMemoryBackend):
+            def __init__(self):
+                super().__init__()
+                self.attempts = []
+
+            async def record_with_embedding(self, verdict, embedding):
+                self.attempts.append(verdict.verdict_type)
+                raise RuntimeError("qdrant down")
+
+        backend = _Raising()
+        record = cli.process_code(
+            self._payload(self._smelly), VerdictEngine(backend, EmlConfig()),
+            repo_root=self._tmp.name,
+        )
+        self.assertEqual(backend.attempts, ["LH009"])
+        self.assertEqual(record["n_issues"], 1)
+        self.assertEqual(record["qdrant"], "unavailable")
 
     def test_posttooluse_writes_loci_audit_receipt_when_investigation_known(self):
         memory_root = Path(os.environ["LOCI_MEMORY_DIR"])

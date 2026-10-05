@@ -142,8 +142,8 @@ class TestTimestampNormalisation(unittest.TestCase):
 
 
 class TestImportanceAndLimit(unittest.TestCase):
-    def _fetch(self, memories, min_imp=0.5, max_items=20):
-        db = _DB(memories=memories)
+    def _fetch(self, memories, min_imp=0.5, max_items=20, working=()):
+        db = _DB(memories=memories, working=working)
         self.addCleanup(os.unlink, db.path)
         with mock.patch.object(bridge, "MNEMOSYNE_DB", db.path):
             return bridge._fetch_recent_memories("2026-07-01T00:00:00", min_imp, max_items)
@@ -153,9 +153,23 @@ class TestImportanceAndLimit(unittest.TestCase):
         self.assertEqual([m["id"] for m in got], ["hi"])
 
     def test_max_items_is_honoured_across_both_tiers(self):
-        got = self._fetch([row(f"m{i}", created=f"2026-07-27T12:00:{i:02d}")
-                           for i in range(10)], max_items=3)
-        self.assertEqual(len(got), 3)
+        # Interleaved in time across the two tiers: the cap applies to the merged,
+        # newest-first list, not per table.
+        got = self._fetch(
+            [row(f"m{i}", created=f"2026-07-27T12:00:{2 * i:02d}") for i in range(5)],
+            working=[row(f"w{i}", created=f"2026-07-27T12:00:{2 * i + 1:02d}") for i in range(5)],
+            max_items=3)
+        self.assertEqual([m["id"] for m in got], ["w4", "m4", "w3"])
+
+    def test_limit_keeps_the_newest_rows_when_separators_are_mixed(self):
+        # The newest row is space-separated. Ordering on the raw string inside
+        # SQL ranks it below every T row, so LIMIT dropped it before the Python
+        # re-sort ever saw it, and the watermark then advanced past it.
+        got = self._fetch(
+            [row(f"t{i}", created=f"2026-07-27T10:00:0{i}") for i in range(5)]
+            + [row("spaced", created="2026-07-27 18:00:00")],
+            max_items=2)
+        self.assertEqual([m["id"] for m in got], ["spaced", "t4"])
 
     def test_newest_first(self):
         got = self._fetch([row("old", created="2026-07-27T10:00:00"),

@@ -56,8 +56,8 @@ def test_finding_code_context(ks):
 
 def test_related_investigations_via_code(ks):
     rel = A.related_investigations_via_code(ks, "inv1")
-    assert rel and rel[0]["investigation"] == "inv2"
-    assert rel[0]["shared_symbols"] >= 1
+    # inv1 and inv2 share exactly one referenced symbol (ClassA.foo)
+    assert [(r["investigation"], r["shared_symbols"]) for r in rel] == [("inv2", 1)]
 
 
 def test_subsystem_report(ks):

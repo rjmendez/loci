@@ -49,6 +49,10 @@ class GroundGateTests(unittest.TestCase):
         r = ground_gate.gate("query", [{"id": "c", "text": "near"}], threshold=0.85)
         self.assertEqual(r["n_kept"], 0)
         self.assertEqual(r["n_dropped"], 1)
+        # ...and a cosine exactly AT the threshold is kept (the gate is >=, "clears")
+        r = ground_gate.gate("query", [{"id": "c", "text": "near"}], threshold=0.8)
+        self.assertEqual((r["n_kept"], r["n_dropped"]), (1, 0))
+        self.assertEqual(r["mode"], "cosine>=0.8")
 
     def test_empty_input_is_graceful(self):
         r = ground_gate.gate("query", [])

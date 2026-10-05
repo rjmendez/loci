@@ -3,7 +3,7 @@ function_at_line, against real GraphStore output built from fixtures."""
 from ..analyze.reach import (
     entrypoints_reaching, function_at_line, path_confidence, shortest_path,
 )
-from ..model import Confidence
+from ..model import Confidence, Edge, GraphStore, Node
 from ..tests.helpers import build_fixture_store
 
 
@@ -77,13 +77,71 @@ def test_entrypoints_reaching_direct_registration():
     assert entries == {"entry:mcp-tool:registered_tool": Confidence.PROVEN}
 
 
-def test_entrypoints_reaching_through_injected_global_is_probable():
+def test_entrypoints_reaching_injected_global_with_no_entry_is_empty():
     store, _, _ = build_fixture_store([
         "registry_injection.py", "registry_injection_caller.py", "registry_manloop.py",
     ])
     # No `register` here is an entrypoint target, so this pins the absence case.
     entries = entrypoints_reaching(store, "fn:registry_injection.py::use_thing")
     assert entries == {}
+
+
+def _walk_graph() -> GraphStore:
+    """A small graph with every edge kind entrypoints_reaching walks backwards.
+
+        entry:e1 -ENTERS(PROVEN)->   fn:a
+        entry:e2 -ENTERS(PROBABLE)-> reg:r -REGISTERS(PROVEN)-> fn:b
+        entry:e3 -ENTERS(UNPROVEN)-> fn:a
+        fn:a  --site:a1 CALLS(PROVEN)-->        fn:b
+        fn:b  --site:b1 DISPATCHES(PROBABLE)--> fn:c
+        mod:m -REFERENCES(PROVEN)-> fn:c   (mod:m is itself entered by entry:e4, PROVEN)
+
+    No fixture in the corpus has a PROBABLE entry edge or a multi-hop walk, so the
+    graph is built directly; the unit under test is the walk, not the extractor.
+    """
+    g = GraphStore()
+    for nid, kind in (("entry:e1", "ENTRYPOINT"), ("entry:e2", "ENTRYPOINT"),
+                      ("entry:e3", "ENTRYPOINT"), ("entry:e4", "ENTRYPOINT"),
+                      ("reg:r", "REGISTRY"), ("fn:a", "FUNCTION"), ("fn:b", "FUNCTION"),
+                      ("fn:c", "FUNCTION"), ("mod:m", "MODULE")):
+        g.add_node(Node(nid, kind))
+    g.add_node(Node("site:a1", "CALLSITE", attrs={"enclosing_fn": "fn:a"}))
+    g.add_node(Node("site:b1", "CALLSITE", attrs={"enclosing_fn": "fn:b"}))
+    for src, dst, kind, conf in (
+        ("entry:e1", "fn:a", "ENTERS", Confidence.PROVEN),
+        ("entry:e2", "reg:r", "ENTERS", Confidence.PROBABLE),
+        ("entry:e3", "fn:a", "ENTERS", Confidence.UNPROVEN),
+        ("entry:e4", "mod:m", "ENTERS", Confidence.PROVEN),
+        ("reg:r", "fn:b", "REGISTERS", Confidence.PROVEN),
+        ("site:a1", "fn:b", "CALLS", Confidence.PROVEN),
+        ("site:b1", "fn:c", "DISPATCHES", Confidence.PROBABLE),
+        ("mod:m", "fn:c", "REFERENCES", Confidence.PROVEN),
+    ):
+        g.add_edge(Edge(src, dst, kind, conf))
+    return g
+
+
+def test_entrypoints_reaching_walks_back_transitively_over_every_edge_kind():
+    g = _walk_graph()
+    # fn:c <- DISPATCHES from b <- CALLS from a <- e1; <- REGISTERS from r <- e2 (PROBABLE);
+    # <- REFERENCES from mod:m <- e4. e3's UNPROVEN entry is below the default floor.
+    assert entrypoints_reaching(g, "fn:c") == {
+        "entry:e1": Confidence.PROVEN, "entry:e2": Confidence.PROBABLE, "entry:e4": Confidence.PROVEN,
+    }
+    assert entrypoints_reaching(g, "fn:b") == {
+        "entry:e1": Confidence.PROVEN, "entry:e2": Confidence.PROBABLE,
+    }
+
+
+def test_entrypoints_reaching_respects_the_confidence_floor():
+    g = _walk_graph()
+    # PROVEN-only: the PROBABLE dispatch into c and e2's PROBABLE entry both drop out.
+    assert entrypoints_reaching(g, "fn:c", conf_floor=Confidence.PROVEN) == {"entry:e4": Confidence.PROVEN}
+    assert entrypoints_reaching(g, "fn:b", conf_floor=Confidence.PROVEN) == {"entry:e1": Confidence.PROVEN}
+    # UNPROVEN floor admits e3 as well
+    assert entrypoints_reaching(g, "fn:a", conf_floor=Confidence.UNPROVEN) == {
+        "entry:e1": Confidence.PROVEN, "entry:e3": Confidence.UNPROVEN,
+    }
 
 
 def test_entrypoints_reaching_unregistered_function_is_empty():

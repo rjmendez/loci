@@ -105,13 +105,21 @@ class TestRagDecayReadsIsoTimestamps(unittest.TestCase):
         rows = [self._row(created_at_ts=old_epoch), self._row(ts=old_iso)]
         server._rag_apply_decay(rows)
         self.assertEqual(rows[0]["score"], rows[1]["score"])
+        # ...and both are actually decayed by the Ebbinghaus factor for 100 days
+        import math
+        self.assertAlmostEqual(rows[0]["score"], math.exp(-server._MEMORY_DECAY_LAMBDA * 100), places=3)
+        self.assertLess(rows[0]["score"], 1.0)
 
     def test_unreadable_timestamp_still_keeps_the_raw_score(self):
-        rows = [self._row(ts="not a timestamp"), self._row()]
+        # A readable 100-day-old row in the same batch proves decay ran over the batch.
+        old_epoch = int(time.time()) - 100 * 86400
+        rows = [self._row(ts="not a timestamp"), self._row(), self._row(created_at_ts=old_epoch)]
         server._rag_apply_decay(rows)
-        for row in rows:
+        for row in rows[:2]:
             self.assertEqual(row["score"], 1.0)
             self.assertNotIn("decay_applied", row)
+        self.assertIs(rows[2]["decay_applied"], True)
+        self.assertLess(rows[2]["score"], 0.6)
 
 
 if __name__ == "__main__":

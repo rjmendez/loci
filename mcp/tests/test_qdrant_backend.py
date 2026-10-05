@@ -95,8 +95,10 @@ class _FakePoint:
 class _FakeQdrantClient:
     """Dict-backed fake for the QdrantBackend's narrow client interface."""
 
-    def __init__(self):
+    def __init__(self, scores: Optional[dict] = None):
         self._store: dict[str, _FakePoint] = {}
+        # subject_excerpt -> score returned by query_points (default 0.9).
+        self._scores = dict(scores or {})
 
     def retrieve(self, *, collection_name, ids, with_payload=True):
         return [self._store[i] for i in ids if i in self._store]
@@ -112,7 +114,9 @@ class _FakeQdrantClient:
 
     def query_points(self, *, collection_name, query, query_filter=None,
                      limit=10, with_payload=True, using=None):
-        # Fake scoring is a flat 0.9; only subject_kind filtering is honoured.
+        # Fake scoring is a flat 0.9 unless a per-excerpt score was configured;
+        # only subject_kind filtering is honoured. Hits come back in ASCENDING
+        # score order so the backend's own descending sort is what orders them.
         kind_filter = None
         if query_filter is not None:
             for cond in (query_filter.must or []):
@@ -125,10 +129,15 @@ class _FakeQdrantClient:
         for p in self._store.values():
             if kind_filter and p.payload.get("subject_kind") != kind_filter:
                 continue
-            results.append(_FakePoint(id=p.id, payload=dict(p.payload), score=0.9))
+            score = self._scores.get(p.payload.get("subject_excerpt"), 0.9)
+            results.append(_FakePoint(id=p.id, payload=dict(p.payload), score=score))
+        # Like qdrant, keep the top `limit` by score — then hand them back
+        # reversed (ascending).
+        results.sort(key=lambda r: r.score, reverse=True)
+        results = results[:limit][::-1]
 
         class _QueryResult:
-            points = results[:limit]
+            points = results
         return _QueryResult()
 
     def delete(self, *, collection_name, points_selector):
@@ -220,18 +229,37 @@ class TestRecordWithEmbedding(unittest.TestCase):
         _run(b.record_with_embedding(v, _fake_embed("dup action")))
         pid = QdrantBackend.point_id(v.subject_signature)
         stored = b._client._store[pid].payload
-        self.assertGreaterEqual(stored["occurrences"], 2)
+        self.assertEqual(stored["occurrences"], 2)
+        # The original point identity survives the re-upsert.
+        self.assertEqual(stored["id"], v.id)
+        _run(b.record_with_embedding(v, _fake_embed("dup action")))
+        self.assertEqual(b._client._store[pid].payload["occurrences"], 3)
+        self.assertEqual(len(b._client._store), 1)
+
+    def _stored_after(self, first, second):
+        b = _make_backend()
+        _run(b.record_with_embedding(first, _fake_embed("conf action")))
+        _run(b.record_with_embedding(second, _fake_embed("conf action")))
+        pid = QdrantBackend.point_id(first.subject_signature)
+        return b._client._store[pid].payload
 
     def test_confidence_max_kept(self):
-        b = _make_backend()
+        # High first, then low: last-write-wins would overwrite with the low
+        # verdict, so this ordering is the one that proves keep-max.
+        v_high = self._verdict("conf action", confidence=0.95, decision="flag")
+        v_low = self._verdict("conf action", confidence=0.3, decision="warn")
+        stored = self._stored_after(v_high, v_low)
+        self.assertEqual(stored["confidence"], 0.95)
+        self.assertEqual(stored["decision"], "flag")
+        self.assertEqual(stored["occurrences"], 2)
+
+    def test_confidence_higher_incoming_replaces(self):
         v_low = self._verdict("conf action", confidence=0.3, decision="warn")
         v_high = self._verdict("conf action", confidence=0.95, decision="flag")
-        _run(b.record_with_embedding(v_low, _fake_embed("conf action")))
-        _run(b.record_with_embedding(v_high, _fake_embed("conf action")))
-        pid = QdrantBackend.point_id(v_low.subject_signature)
-        stored = b._client._store[pid].payload
-        # The higher confidence verdict's fields should be kept
-        self.assertGreaterEqual(stored["confidence"], 0.95 - 1e-6)
+        stored = self._stored_after(v_low, v_high)
+        self.assertEqual(stored["confidence"], 0.95)
+        self.assertEqual(stored["decision"], "flag")
+        self.assertEqual(stored["occurrences"], 2)
 
     def test_no_embedding_skips_upsert(self):
         """record_with_embedding with embed=None and no precomputed embedding must skip upsert."""
@@ -274,21 +302,31 @@ class TestRecall(unittest.TestCase):
         self.assertNotIn("claim", kinds)
 
     def test_recall_returns_scored_verdicts(self):
-        b = _make_backend()
-        v = new_verdict(
-            subject_kind="action",
-            subject_signature=make_signature("action", "recall test"),
-            subject_excerpt="recall test",
-            verdict_type="observed_action",
-            decision="flag",
-            confidence=1.0,
-            rationale="r",
-            source="rule",
-        )
-        _run(b.record_with_embedding(v, _fake_embed("recall test")))
-        results = _run(b.recall("recall test", _fake_embed("recall test"), "action", 5))
-        self.assertGreater(len(results), 0)
-        self.assertIsNotNone(results[0].verdict)
+        scores = {"low hit": 0.2, "top hit": 0.8, "mid hit": 0.5}
+        b = QdrantBackend(client=_FakeQdrantClient(scores=scores), collection=COLLECTION,
+                          embed=_fake_embed, vector_name=None)
+        recorded = {}
+        for excerpt in scores:
+            v = new_verdict(
+                subject_kind="action",
+                subject_signature=make_signature("action", excerpt),
+                subject_excerpt=excerpt,
+                verdict_type="observed_action",
+                decision="flag",
+                confidence=1.0,
+                rationale="r",
+                source="rule",
+            )
+            recorded[excerpt] = v
+            _run(b.record_with_embedding(v, _fake_embed(excerpt)))
+        results = _run(b.recall("q", _fake_embed("q"), "action", 5))
+        self.assertEqual([sv.verdict.subject_excerpt for sv in results],
+                         ["top hit", "mid hit", "low hit"])
+        self.assertEqual([sv.similarity for sv in results], [0.8, 0.5, 0.2])
+        self.assertEqual(results[0].verdict, recorded["top hit"])
+
+        top2 = _run(b.recall("q", _fake_embed("q"), "action", 2))
+        self.assertEqual([sv.similarity for sv in top2], [0.8, 0.5])
 
     def test_recall_no_embed_returns_empty(self):
         b = QdrantBackend(client=_FakeQdrantClient(), collection=COLLECTION, embed=None, vector_name=None)
@@ -358,8 +396,31 @@ class TestStats(unittest.TestCase):
             )
             _run(b.record_with_embedding(v, _fake_embed(f"action {i}")))
         stats = _run(b.stats())
-        self.assertEqual(stats["total_verdicts"], 3)
-        self.assertIn("recurring_blocks", stats)
+        self.assertEqual(stats, {"total_verdicts": 3, "recurring_blocks": 0})
+
+    def test_stats_counts_only_recurring_blocking_verdicts(self):
+        b = _make_backend()
+
+        def _rec(excerpt, decision):
+            v = new_verdict(
+                subject_kind="action",
+                subject_signature=make_signature("action", excerpt),
+                subject_excerpt=excerpt,
+                verdict_type="observed_action",
+                decision=decision,
+                confidence=0.8,
+                rationale="r",
+                source="rule",
+            )
+            _run(b.record_with_embedding(v, _fake_embed(excerpt)))
+
+        for decision in ("flag", "warn", "quarantine", "allow"):
+            _rec(f"recurring {decision}", decision)
+            _rec(f"recurring {decision}", decision)
+        _rec("single flag", "flag")
+        stats = _run(b.stats())
+        # flag/warn/quarantine recurring = 3; recurring allow and a single flag are not.
+        self.assertEqual(stats, {"total_verdicts": 5, "recurring_blocks": 3})
 
 
 if __name__ == "__main__":

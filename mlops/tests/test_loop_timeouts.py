@@ -36,7 +36,9 @@ def test_no_unbounded_subprocess_run(path):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
         and n.func.attr == "run"
         and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"
-        and not any(k.arg == "timeout" for k in n.keywords)
+        and not any(k.arg == "timeout"
+                    and not (isinstance(k.value, ast.Constant) and k.value.value is None)
+                    for k in n.keywords)
     ]
     assert not bad, f"{path} has subprocess.run with no timeout at lines {bad}"
 
@@ -57,9 +59,24 @@ def test_a_normal_child_is_untouched():
     assert r.returncode == 0 and r.stdout.strip() == "fine"
 
 
-def test_the_bound_is_configurable():
+@pytest.mark.parametrize("raw,expected", [(None, 3600), ("7", 7), ("abc", 3600),
+                                          ("0", 3600), ("-5", 3600)])
+def test_the_bound_is_configurable(monkeypatch, raw, expected):
+    """It only asserted "a positive int", which an env var that was ignored met."""
+    if raw is None:
+        monkeypatch.delenv("LOCI_MLOPS_STEP_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("LOCI_MLOPS_STEP_TIMEOUT", raw)
+    assert _load().STEP_TIMEOUT_S == expected
+
+
+def test_the_configured_bound_is_what_run_enforces(monkeypatch):
+    monkeypatch.setenv("LOCI_MLOPS_STEP_TIMEOUT", "1")
     m = _load()
-    assert isinstance(m.STEP_TIMEOUT_S, int) and m.STEP_TIMEOUT_S > 0
+    started = time.time()
+    r = m._run([sys.executable, "-c", "import time; time.sleep(20)"])
+    assert time.time() - started < 10
+    assert r.returncode == 124 and "timed out after 1s" in r.stderr
 
 
 def test_the_timeout_result_keeps_the_completedprocess_shape():
