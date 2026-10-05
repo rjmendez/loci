@@ -59,6 +59,8 @@ Optional / tunable:
   LOCI_A2A_PROFILE path to a JSON file describing this node: description, hardware, sensors, data.
     The card carries a short public summary; the authenticated extended card carries all of it plus a
     live inventory. See README.md "Agent card and node profile". Default: none
+  LOCI_A2A_BOARD_FILE file holding the board model for device_inventory. Default /proc/device-tree/model;
+    a container cannot read that, so mount the host's /sys/firmware/devicetree/base/model and point this at it.
   LOCI_A2A_INIT_DB 1 creates the Mnemosyne SQLite file and its memories table at startup when
     missing (a fresh node). Default: 0
   PEER_PUBKEYS_JSON / PEER_PUBKEYS_DIR Ed25519 public keys of agents that may sign requests:
@@ -1054,7 +1056,10 @@ _http_session: aiohttp.ClientSession | None = None
 def _get_http_session() -> aiohttp.ClientSession:
     global _http_session
     if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        # aiohttp also advertises Brotli; a Qdrant that answers in Brotli (1.17 does) then fails every call
+        # with ClientPayloadError unless the optional brotli package is installed. Ask for what stdlib decodes.
+        _http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30),
+                                              headers={'Accept-Encoding': 'gzip, deflate'})
     return _http_session
 
 
@@ -2286,6 +2291,22 @@ def _build_card(extended: bool = False, inventory: Optional[dict] = None) -> dic
     return card
 
 
+_TOOL_FALLBACK_DIRS = ('/usr/lib/wsl/lib', '/usr/local/sbin', '/usr/sbin', '/sbin', '/usr/local/bin', '/usr/bin')
+
+
+def _tool_path(name: str) -> str:
+    """PATH lookup, then the places services miss: a systemd unit's PATH has no /usr/lib/wsl/lib, where WSL
+    keeps nvidia-smi, so a GPU workstation reported no GPU. Falls back to the bare name (reported as not installed)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _TOOL_FALLBACK_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return name
+
+
 def _run(cmd: list, timeout: int = 5):
     """(stdout, '') or (None, reason); never raises."""
     try:
@@ -2312,13 +2333,13 @@ def _probe_local() -> dict:
     except Exception:
         pass
     try:
-        with open('/proc/device-tree/model', 'rb') as fh:
+        with open(os.environ.get('LOCI_A2A_BOARD_FILE', '/proc/device-tree/model'), 'rb') as fh:
             host['board'] = fh.read().decode('utf-8', 'replace').strip('\x00 \n')
     except Exception:
         pass
     out['host'] = host
 
-    text, why = _run(['nvidia-smi', '--query-gpu=name,memory.total,memory.used', '--format=csv,noheader'])
+    text, why = _run([_tool_path('nvidia-smi'), '--query-gpu=name,memory.total,memory.used', '--format=csv,noheader'])
     if text is None:
         out['gpus'] = {'available': False, 'reason': why}
     else:
@@ -2329,10 +2350,10 @@ def _probe_local() -> dict:
                                      for p in glob.glob(pat))
         out['video_devices'] = sorted(glob.glob('/dev/video*'))
         out['i2c_spi'] = sorted(glob.glob('/dev/i2c-*') + glob.glob('/dev/spidev*'))
-        text, why = _run(['lsusb'])
+        text, why = _run([_tool_path('lsusb')])
         out['usb'] = ([re.sub(r'^Bus \d+ Device \d+: ID ', '', ln) for ln in text.splitlines() if 'root hub' not in ln]
                       if text is not None else {'available': False, 'reason': why})
-        text, why = _run(['arecord', '-l'])
+        text, why = _run([_tool_path('arecord'), '-l'])
         out['audio_capture'] = ([ln for ln in text.splitlines() if ln.startswith('card')]
                                 if text is not None else {'available': False, 'reason': why})
     else:

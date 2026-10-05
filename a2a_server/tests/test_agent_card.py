@@ -391,5 +391,80 @@ class TestNoSecretsAndFreshNodes(CardBase):
         conn.close()
 
 
+class TestSharedHttpSession(CardBase):
+    """2026-10-05: mrpink's Qdrant 1.17 answers in Brotli; aiohttp advertised it and could not decode it."""
+
+    def test_the_session_asks_for_gzip_and_deflate_only(self):
+        async def echo_accept_encoding():
+            from aiohttp import web
+
+            async def handler(request):
+                return web.Response(text=request.headers.get("Accept-Encoding", "<none>"))
+            app = web.Application()
+            app.router.add_get("/", handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            session = a2a_server._get_http_session()
+            try:
+                async with session.get(f"http://127.0.0.1:{port}/") as resp:
+                    return await resp.text(), session.headers.get("Accept-Encoding")
+            finally:
+                await session.close()
+                await runner.cleanup()
+        with patch.object(a2a_server, "_http_session", None):
+            on_the_wire, configured = _run(echo_accept_encoding())
+        self.assertEqual(on_the_wire, "gzip, deflate")
+        # Set explicitly, not left to aiohttp's default: that default adds Brotli on any host that has the
+        # brotli package, so the wire check alone would pass here and fail on such a machine.
+        self.assertEqual(configured, "gzip, deflate")
+
+
+class TestToolLookup(CardBase):
+    def test_a_tool_on_the_path_is_used_as_found(self):
+        with patch.object(a2a_server.shutil, "which", return_value="/somewhere/nvidia-smi"):
+            self.assertEqual(a2a_server._tool_path("nvidia-smi"), "/somewhere/nvidia-smi")
+
+    def test_a_tool_the_service_path_misses_is_found_in_the_fallback_directories(self):
+        tool = self.dir / "fake-gpu-tool"
+        tool.write_text("#!/bin/sh\n", encoding="utf-8")
+        tool.chmod(0o755)
+        with patch.object(a2a_server.shutil, "which", return_value=None), \
+             patch.object(a2a_server, "_TOOL_FALLBACK_DIRS", (str(self.dir / "empty"), str(self.dir))):
+            self.assertEqual(a2a_server._tool_path("fake-gpu-tool"), str(tool))
+
+    def test_a_tool_found_nowhere_comes_back_as_its_bare_name_and_reports_not_installed(self):
+        with patch.object(a2a_server.shutil, "which", return_value=None), \
+             patch.object(a2a_server, "_TOOL_FALLBACK_DIRS", (str(self.dir),)):
+            self.assertEqual(a2a_server._tool_path("no-such-tool-xyz"), "no-such-tool-xyz")
+            self.assertEqual(a2a_server._run([a2a_server._tool_path("no-such-tool-xyz")]), (None, "not installed"))
+
+    def test_the_inventory_runs_the_tool_it_found_not_the_bare_name(self):
+        ran = []
+
+        def fake_run(cmd, timeout=5):
+            ran.append(cmd[0])
+            return None, "stubbed"
+        with patch.object(a2a_server, "_tool_path", side_effect=lambda n: f"/opt/wsl/lib/{n}"), \
+             patch.object(a2a_server, "_run", side_effect=fake_run):
+            a2a_server._probe_local()
+        self.assertIn("/opt/wsl/lib/nvidia-smi", ran)
+        self.assertNotIn("nvidia-smi", ran)
+
+
+class TestBoardFile(CardBase):
+    def test_the_board_model_comes_from_the_configured_file(self):
+        model = self.dir / "board-model"
+        model.write_bytes(b"NVIDIA Jetson Orin Nano Developer Kit\x00")
+        with patch.dict(os.environ, {"LOCI_A2A_BOARD_FILE": str(model)}):
+            self.assertEqual(a2a_server._probe_local()["host"]["board"], "NVIDIA Jetson Orin Nano Developer Kit")
+
+    def test_a_missing_board_file_leaves_the_board_out_rather_than_guessing(self):
+        with patch.dict(os.environ, {"LOCI_A2A_BOARD_FILE": str(self.dir / "absent")}):
+            self.assertNotIn("board", a2a_server._probe_local()["host"])
+
+
 if __name__ == "__main__":
     unittest.main()
