@@ -36,7 +36,9 @@ v4 change:
     of a regex-evading injection it catches that this hook's regex alone misses).
 
 Wire in:  {"hook_event_name": "pre_tool_call", "tool_name": ..., "tool_input": ..., "extra": {...}}
-Wire out: {} (allow) | {"action":"block","message":"..."} (block)
+Wire out: Hermes ("pre_tool_call"): {} (allow) | {"action":"block","message":"..."} (block)
+          Claude Code ("PreToolUse"): {} (allow) | {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+          "permissionDecision": "deny", "permissionDecisionReason": "..."}} (block)
 """
 from __future__ import annotations
 
@@ -474,6 +476,24 @@ def _check_supply_chain_terminal(tool_input: dict | None) -> str | None:
 
 # ---- Main hook logic ----------------------------------------------------------
 
+# The host that called the hook decides the wire format. Claude Code ignores a top-level
+# {"action":"block"}: a PreToolUse hook must print hookSpecificOutput.permissionDecision "deny"
+# (code.claude.com/docs/en/hooks). Hermes (event "pre_tool_call") reads the legacy shape.
+_HOST_EVENT = ""
+
+
+def _emit_block(decision: dict) -> None:
+    """Print a block decision in the format of the host that invoked this hook."""
+    if _HOST_EVENT == "PreToolUse":
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": str(decision.get("message") or "blocked by pre_tool_grounding"),
+        }}))
+    else:
+        print(json.dumps(decision))
+
+
 def main() -> None:
     _rotate_if_needed()
 
@@ -486,6 +506,8 @@ def main() -> None:
     event = payload.get("hook_event_name", "")
     if event not in ("pre_tool_call", "PreToolUse"):
         sys.exit(0)
+    global _HOST_EVENT
+    _HOST_EVENT = event
 
     tool_name: str = payload.get("tool_name") or ""
     tool_input: dict | None = payload.get("tool_input")
@@ -507,13 +529,13 @@ def main() -> None:
             _audit(tool_name, tool_input, session_id, f"WARN(supply-chain-path:{sc_path})")
             # Block if BLOCK_MODE OR if it's also an agent config file (always dangerous)
             if BLOCK_MODE or is_agent_cfg:
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"SUPPLY CHAIN IOC: Write target matches Hades/Miasma attack vector: "
                         f"{sc_path}. Verify this write is intentional and content is not compromised."
                     ),
-                }))
+                })
                 return
 
         # 2b — Prompt injection content scan
@@ -523,7 +545,7 @@ def main() -> None:
             _audit(tool_name, tool_input, session_id, f"INJECTION-HIGH({high_injection}) paths={paths}")
             # Always block on agent config files; block in BLOCK_MODE for any file
             if BLOCK_MODE or is_agent_cfg:
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"PROMPT INJECTION DETECTED [{high_injection}]: Content being written "
@@ -531,7 +553,7 @@ def main() -> None:
                         "indicate a prompt injection attack via web content, package metadata, "
                         "or tool output. Confirm intent explicitly before writing this content."
                     ),
-                }))
+                })
                 return
 
         elif suspicious_injection:
@@ -539,25 +561,25 @@ def main() -> None:
                    f"INJECTION-SUSPICIOUS({suspicious_injection}) paths={paths}")
             # Suspicious + agent config = always block
             if is_agent_cfg:
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"SUSPICIOUS INJECTION PATTERN [{suspicious_injection}] in agent config "
                         f"path {paths}. Writing injection-like content to agent config files "
                         "requires explicit user confirmation."
                     ),
-                }))
+                })
                 return
             # Suspicious + BLOCK_MODE = block
             if BLOCK_MODE:
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"SUSPICIOUS INJECTION PATTERN [{suspicious_injection}]: "
                         "Content contains patterns consistent with AI-targeted instruction "
                         "injection. Verify this content originates from a trusted source."
                     ),
-                }))
+                })
                 return
             # Neither agent-config nor BLOCK_MODE forced a decision yet, so this
             # SUSPICIOUS hit would otherwise just be logged and silently allowed --
@@ -569,7 +591,7 @@ def main() -> None:
             if guardian_verdict is True:
                 _audit(tool_name, tool_input, session_id,
                        f"INJECTION-GUARDIAN-CONFIRMED({suspicious_injection}) paths={paths}")
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"PROMPT INJECTION CONFIRMED [{suspicious_injection}]: regex flagged this "
@@ -577,7 +599,7 @@ def main() -> None:
                         "as a jailbreak/instruction-injection attempt. Verify this content "
                         "originates from a trusted source before writing it."
                     ),
-                }))
+                })
                 return
             _audit(tool_name, tool_input, session_id,
                    f"INJECTION-GUARDIAN-CLEARED-OR-UNAVAILABLE({suspicious_injection}) "
@@ -586,14 +608,14 @@ def main() -> None:
         # 2c — Standard mutation grounding block
         if BLOCK_MODE:
             _audit(tool_name, tool_input, session_id, "BLOCKED(mutation)")
-            print(json.dumps({
+            _emit_block({
                 "action": "block",
                 "message": (
                     f"GROUNDING CHECK: '{tool_name}' requires prior memory recall. "
                     "Run mcp_mnemosyne_mnemosyne_recall(query=<topic>) first, "
                     "then re-invoke. Set HOOK_BLOCK_MODE=0 to disable."
                 ),
-            }))
+            })
             return
 
         _audit(tool_name, tool_input, session_id, "ALLOW(mutation)")
@@ -606,14 +628,14 @@ def main() -> None:
         if sc_terminal:
             _audit(tool_name, tool_input, session_id, f"WARN(supply-chain:{sc_terminal})")
             if BLOCK_MODE and not _is_subagent(payload):
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"SUPPLY CHAIN IOC: {sc_terminal}. "
                         "Command matches known Hades/Miasma worm execution patterns. "
                         "Confirm this is an intentional, user-directed operation."
                     ),
-                }))
+                })
                 return
 
         # 3b — General dangerous patterns
@@ -621,14 +643,14 @@ def main() -> None:
         if danger:
             if BLOCK_MODE and not _is_subagent(payload):
                 _audit(tool_name, tool_input, session_id, f"BLOCKED(dangerous:{danger})")
-                print(json.dumps({
+                _emit_block({
                     "action": "block",
                     "message": (
                         f"DANGEROUS COMMAND DETECTED: {danger}. "
                         "Confirm intent explicitly before proceeding. "
                         "Set HOOK_BLOCK_MODE=0 to bypass this guard."
                     ),
-                }))
+                })
                 return
             _audit(tool_name, tool_input, session_id, f"WARN(dangerous:{danger})")
         elif not sc_terminal:
