@@ -29,8 +29,8 @@ ENV PYTHONPATH=/app/mcp
 
 # Mnemosyne SQLite path — mount a volume here for persistence across restarts
 ENV MNEMOSYNE_DATA_DIR=/data/mnemosyne
-# A2A identity
-ENV HERMES_AGENT_ID=mrpink
+# A2A identity: set HERMES_AGENT_ID at run time. There is deliberately no default here: an image
+# that names itself after one device would stamp that name on every node it is run as.
 # External services
 ENV QDRANT_URL=http://localhost:6333
 ENV QDRANT_API_KEY=
