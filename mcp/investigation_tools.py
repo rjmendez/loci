@@ -799,7 +799,10 @@ def investigation_start(
         "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
         "closed_at": None,
         "closed_summary": None,
-        "owner": "",
+        # The caller the transport vouches for, else this process's own identity (HERMES_AGENT_ID); "" when neither
+        # exists. Without an owner nobody can be refused an ACL change, so any caller could share a case with itself
+        # and lock the real users out (audit S4-01).
+        "owner": caller_identity.bound_agent_id() or caller_identity.process_agent_id(),
         "acl": [],
         "summary_l1": [],
         "summary_l2": "",
@@ -1898,12 +1901,23 @@ def investigation_share(
                 added.append(agent_id)
 
         manifest["acl"] = current_acl
+        claimed = None
+        if not manifest.get("owner"):
+            # An investigation from before owners were recorded: whoever makes the first ACL change (the transport-bound
+            # caller, else this process; never the self-declared requesting_agent_id) becomes its owner, so a later caller
+            # cannot take it over by sharing it with itself.
+            claimed = caller_identity.bound_agent_id() or caller_identity.process_agent_id() or None
+            if claimed:
+                manifest["owner"] = claimed
         _save_manifest(manifest)
 
-        return json.dumps({
+        out = {
             "shared_with": added,
             "total_acl": len(current_acl),
-        }, indent=2)
+        }
+        if claimed:
+            out["owner_claimed"] = claimed
+        return json.dumps(out, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
