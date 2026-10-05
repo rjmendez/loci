@@ -1264,3 +1264,29 @@ The synthetic cases are too few to rank patches. Real ones come from the reflect
 - `python mcp/hillclimb.py labels` shows counts (labelled, rejected, with notes), per-category and per-novelty totals, and whether the real train and test splits each
   have the 30 cases the guard needs (`enough`).
 - The `triage` suite reads `labels.jsonl` next to the synthetic cases (`LOCI_HILLCLIMB_TRIAGE_SYNTHETIC=0` for real only).
+
+### loci_health: `degraded`, and what it can see
+
+`status` is `ok`, `degraded` or `unhealthy`. `unhealthy` still means a configured backend does not answer. `degraded` means
+everything answers but something the server advertises is not working; `degraded_reasons` names it, and `warnings` lists
+things worth knowing that do not change the status. A reachability probe cannot see these, so they are measured:
+
+| Field | Source | Degrades when |
+|---|---|---|
+| `embed_health` | rolling record of embed calls in this process (15 min window) | 3 or more failures in a row (includes brownout-breaker skips) |
+| `index_write_health` | rolling record of index writes (`investigation_store` reports these as `qdrant_stored=false`, `degraded_reason=rag_index_write_failed`) | the most recent write failed |
+| `main_collection` | does the findings collection resolve, **as a collection or an alias** (60 s cache) | it resolves to neither |
+| `gen_residency` | `/api/ps` on the generation endpoint | the pool's gen model is loaded with `size_vram` 0 (CPU) |
+| `warnings` | D10 shadow errors swallowed since start; failures that recovered; gen model not loaded | never (warning only) |
+
+Counters start empty, so a fresh process reports `ok` until something actually fails. If the assessment itself raises, the
+status is not silently optimistic: a `warnings` entry says the assessment failed.
+
+**Aliases.** On this deployment `loci_memory` is a Qdrant alias of `hermes_memory`, and `GET /collections` does not list aliases.
+`memory_health` and `retrieval_selftest` now resolve aliases (`qdrant_ops.collection_names_with_aliases`) and report
+`main_is_alias_of`; before this they reported the findings collection missing. Resolve `GET /aliases` before any restore,
+create or delete.
+
+**Data home.** `scripts/loci_groom.py`, the model pool, the lease ledger and hillclimb now use the server's own rule
+(`legacy_env.memory_dir()`: `LOCI_MEMORY_DIR`, else `~/.loci/memory-sessions`, else the legacy `~/.hermes` one). The groom
+script used to default to `~/.hermes/memory-sessions` and reported coverage 1.0 over zero findings.

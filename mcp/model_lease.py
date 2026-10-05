@@ -239,7 +239,8 @@ def load(base_url: str, name: str, keep_alive: str = _RESTORE_KEEP_ALIVE) -> boo
 # --------------------------------------------------------------------------------- ledger
 
 def _ledger_path() -> Path:
-    mem = os.environ.get("LOCI_MEMORY_DIR") or str(Path.home() / ".loci" / "memory-sessions")
+    import legacy_env
+    mem = str(legacy_env.memory_dir())
     return Path(mem).parent / "leases" / "model_leases.json"
 
 
