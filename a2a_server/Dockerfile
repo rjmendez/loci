@@ -4,10 +4,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# device_inventory reports USB and audio devices with lsusb and arecord. Run the container with the host's
-# /dev mounted read-only (-v /dev:/dev:ro) for it to see real hardware; without it those sections say so.
+# device_inventory lists USB devices with lsusb. Run the container with the host's /dev mounted read-only
+# (-v /dev:/dev:ro) for it to see real hardware; without it those sections say so. Audio capture devices are
+# read from /proc/asound, which needs no device access.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends usbutils alsa-utils \
+ && apt-get install -y --no-install-recommends usbutils \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \

@@ -391,6 +391,32 @@ class TestNoSecretsAndFreshNodes(CardBase):
         conn.close()
 
 
+class TestAudioCapture(CardBase):
+    """Read from /proc/asound/pcm: `arecord -l` could not open the sound devices from a container."""
+
+    PCM = ("00-00: USB Audio : USB Audio : playback 1 : capture 1\n"
+           "01-00: HDA Analog : ALC285 Analog : playback 1\n"
+           "02-03: ADMAIF4 : ADMAIF4 : capture 1\n")
+
+    def _pcm(self, text):
+        path = self.dir / "pcm"
+        path.write_text(text, encoding="utf-8")
+        return patch.object(a2a_server, "_ASOUND_PCM", str(path))
+
+    def test_only_capture_capable_devices_are_listed_with_their_names(self):
+        with self._pcm(self.PCM):
+            self.assertEqual(a2a_server._probe_audio_capture(), ["00-00: USB Audio", "02-03: ADMAIF4"])
+
+    def test_a_host_with_only_playback_devices_has_an_empty_list_not_an_error(self):
+        with self._pcm("01-00: HDA Analog : ALC285 Analog : playback 1\n"):
+            self.assertEqual(a2a_server._probe_audio_capture(), [])
+
+    def test_a_missing_procfs_file_is_reported_unavailable_with_a_reason(self):
+        with patch.object(a2a_server, "_ASOUND_PCM", str(self.dir / "absent")):
+            self.assertEqual(a2a_server._probe_audio_capture(),
+                             {"available": False, "reason": "no ALSA devices (/proc/asound/pcm is missing)"})
+
+
 class TestSharedHttpSession(CardBase):
     """2026-10-05: mrpink's Qdrant 1.17 answers in Brotli; aiohttp advertised it and could not decode it."""
 

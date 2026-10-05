@@ -2322,6 +2322,26 @@ def _run(cmd: list, timeout: int = 5):
     return done.stdout, ''
 
 
+_ASOUND_PCM = '/proc/asound/pcm'
+
+
+def _probe_audio_capture():
+    """Capture-capable ALSA devices, from procfs. Reading /proc/asound needs no device access, so it works in a
+    container where `arecord -l` cannot open /dev/snd without the container being handed read-write sound devices."""
+    try:
+        with open(_ASOUND_PCM, encoding='utf-8', errors='replace') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {'available': False, 'reason': 'no ALSA devices (/proc/asound/pcm is missing)'}
+    found = []
+    for line in lines:
+        if re.search(r'\bcapture \d+', line):             # '00-00: USB Audio : USB Audio : playback 1 : capture 1'
+            ident, _, rest = line.partition(':')
+            names = [part.strip() for part in rest.split(':')[:2] if part.strip()]
+            found.append(f'{ident.strip()}: {" / ".join(dict.fromkeys(names))}')
+    return found
+
+
 def _probe_local() -> dict:
     """Probes that touch only this host. Each section stands alone: one failing never hides the rest."""
     out: dict = {}
@@ -2353,9 +2373,7 @@ def _probe_local() -> dict:
         text, why = _run([_tool_path('lsusb')])
         out['usb'] = ([re.sub(r'^Bus \d+ Device \d+: ID ', '', ln) for ln in text.splitlines() if 'root hub' not in ln]
                       if text is not None else {'available': False, 'reason': why})
-        text, why = _run([_tool_path('arecord'), '-l'])
-        out['audio_capture'] = ([ln for ln in text.splitlines() if ln.startswith('card')]
-                                if text is not None else {'available': False, 'reason': why})
+        out['audio_capture'] = _probe_audio_capture()
     else:
         for key in ('serial_ports', 'video_devices', 'i2c_spi', 'usb', 'audio_capture'):
             out[key] = {'available': False, 'reason': 'device probes are Linux only'}
