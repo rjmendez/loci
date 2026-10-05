@@ -483,3 +483,16 @@ These also sit in the same investigation/finding workflow and are worth knowing 
 - `procedure_attempt` / `procedure_search`: procedure-memory write and lookup tools adjacent to `verify_finding` and `investigation_store(... finding_type="procedure" ...)`.
 - `audit_log`: append-only capture of tool calls and outputs into global and investigation-scoped audit logs.
 - `memory_retract` / `memory_restore`: lifecycle operations for soft-retracting false findings and later restoring them.
+
+## Access control (ACL) coverage
+
+An investigation with an `owner` or a non-empty `acl` is private: only the owner and ACL members may read or change it. An investigation with neither is open to every caller. The check (`inv_store.acl_denied_json`, built on `_acl_access_denied`) returns `{"error":"permission_denied","detail":...}` and runs, with an optional `requesting_agent_id` that can only narrow access, on:
+
+- load, as_of, share, unshare, export, search, `rag_context_search`, `memory_surface`, `memory_route`, `ground`;
+- `memory_hints`, `investigation_reason`, `memory_promote`, `memory_demote`, `conflict_resolve`, `causal_infer`, `investigation_pre_answer_check`, `investigation_evidence_precheck`;
+- `entity_list`, `entity_timeline`, `investigation_entity_lookup` (with an explicit investigation), `docs_search`, `docs_recall`;
+- all `investigation_queue_*`, `investigation_note`, `investigation_reflect`, `investigation_finding_provenance`, and `investigation_start` when it would resume an existing investigation (resuming returns the whole manifest).
+
+Tools that return rows from many investigations drop the rows of investigations the caller may not read: `investigation_entity_lookup` and `investigation_related_cases` (all tiers), `procedure_search`, `memory_confidence`, `investigation_list`.
+
+Limits: the caller is whatever the transport binds (a per-agent MCP token, or the A2A sender); an unbound local caller is the process itself (`HERMES_AGENT_ID`) and is refused only when a different owner is set and it is not a member. `investigation_start` does not set an owner, so an investigation started locally stays open until it is shared or imported with an owner. That is a design decision, not changed here.

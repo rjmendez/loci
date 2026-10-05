@@ -559,6 +559,36 @@ def _tag_finding_ids(findings: list[dict], investigation_id: str) -> list[dict]:
     return tagged
 
 
+def acl_denied_json(investigation_id: str, requesting_agent_id=None, *, open_when_acl_empty: bool = True):
+    """The JSON ``permission_denied`` payload when this caller may not use the investigation, else None.
+
+    One place for the check the tools share (investigation_load, search and export already did it inline).
+    An investigation with no readable manifest has no ACL, so there is nothing to deny; one with neither an owner
+    nor an ACL is open, exactly as ``_acl_access_denied`` decides."""
+    try:
+        manifest = _load_manifest(investigation_id) if investigation_id else None
+    except Exception:  # noqa: BLE001 - an unreadable or invalid id has no ACL to enforce
+        manifest = None
+    if not isinstance(manifest, dict):
+        return None
+    why = _acl_access_denied(manifest, requesting_agent_id, open_when_acl_empty=open_when_acl_empty)
+    return json.dumps({"error": "permission_denied", "detail": why}) if why else None
+
+
+def acl_drop_denied(rows, requesting_agent_id=None) -> list:
+    """Drop rows from investigations the caller may not read. Checked once per investigation; rows that carry
+    no investigation id are kept (there is no ACL to apply to them)."""
+    verdict: dict = {}
+    out = []
+    for r in rows or []:
+        inv = str(r.get("investigation_id") or "") if isinstance(r, dict) else ""
+        if inv not in verdict:
+            verdict[inv] = bool(inv and acl_denied_json(inv, requesting_agent_id))
+        if not verdict[inv]:
+            out.append(r)
+    return out
+
+
 def _acl_access_denied(manifest: dict, requesting_agent_id=None, *, open_when_acl_empty: bool = True):
     """Return why the caller may not access this investigation, or None.
 
