@@ -72,6 +72,25 @@ class _LLM:
         return '{"contradict": false, "claim": ""}'
 
 
+class TestDefaultJudgeAsksForJsonMode(unittest.TestCase):
+    def test_default_llm_is_called_with_json_mode(self):
+        # The judge prompt asks for a JSON object. Some local models (Gemma 4 on Ollama) never stop without
+        # JSON mode and the call runs to its timeout, so the default backend must request it.
+        from unittest import mock
+
+        seen = []
+
+        def fake_call_llm(prompt, **kw):
+            seen.append(kw)
+            return '{"contradict": false, "claim": ""}'
+
+        findings = [_f(LIMITED, "a"), _f(NOT_LIMITED, "b")]
+        with mock.patch("memcheck.llm.call_llm", fake_call_llm):
+            run_contradiction_llm(findings, embed_fn=_embed)
+        self.assertTrue(seen, "the judge was never called")
+        self.assertTrue(all(kw.get("json_mode") is True for kw in seen))
+
+
 class TestSemanticContradiction(unittest.TestCase):
     def test_catches_semantic_negation_lexical_missed(self):
         llm = _LLM()
