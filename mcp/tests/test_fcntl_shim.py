@@ -3,6 +3,7 @@
 Regression: LOCK_UN used to fall through to a blocking lock (~10 s) and release nothing, so every
 locked store operation on Windows cost ~10 s per release.
 """
+import errno
 import os
 import sys
 import time
@@ -33,8 +34,9 @@ def lockfile(tmp_path):
 def test_unlock_is_fast_and_really_releases(lockfile):
     a, b = lockfile(), lockfile()
     F.flock(a, F.LOCK_EX | F.LOCK_NB)
-    with pytest.raises(OSError):
-        F.flock(b, F.LOCK_EX | F.LOCK_NB)  # held
+    with pytest.raises(OSError) as held:
+        F.flock(b, F.LOCK_EX | F.LOCK_NB)
+    assert held.value.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)  # refused because it is held
     t = time.monotonic()
     F.flock(a, F.LOCK_UN)
     assert time.monotonic() - t < 1.0
@@ -59,3 +61,6 @@ def test_unlock_of_an_unheld_lock_is_harmless(lockfile):
     F.flock(a, F.LOCK_EX | F.LOCK_NB)
     F.flock(a, F.LOCK_UN)
     F.flock(a, F.LOCK_UN)
+    F.flock(a, F.LOCK_EX | F.LOCK_NB)  # still lockable after the extra unlocks
+    F.flock(a, F.LOCK_UN)
+    assert os.fstat(a).st_size >= 0

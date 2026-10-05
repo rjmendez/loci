@@ -179,7 +179,7 @@ def test_failure_message_keeps_the_underlying_error(monkeypatch):
     def boom():
         raise ValueError("Wrong input: Not existing vector name error: dense")
 
-    with pytest.raises(RuntimeError) as err:
+    with pytest.raises(RuntimeError, match="qdrant_query_other") as err:
         Q._query_points_with_retry(boom, attempts=2)
     msg = str(err.value)
     assert msg.startswith("qdrant_query_other")
