@@ -25,7 +25,7 @@ GB = 1024 ** 3
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     M.clear_cache()
-    for var in (M.SHADOW_ENV, M.SELECTOR_ENV, M.EXPLORE_ENV, M.EXPLORE_MODELS_ENV):
+    for var in (M.SHADOW_ENV, M.SELECTOR_ENV, M.EXPLORE_ENV, M.EXPLORE_MODELS_ENV, M.EXPLORE_ROLES_ENV):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
     M._LAST_DECISION.set(None)
@@ -197,6 +197,48 @@ class TestExploration:
         assert (row["explore_p"], row["n_alternatives"], row["propensity"]) == (1.0, 1, 1.0)
         M.record_outcome("b", True, 5.0)
         assert _outcomes(tmp_path)[-1]["explored"] is True
+
+    def _roles(self, monkeypatch, roles, models=""):
+        entries = [M.PoolEntry(n, ("gen", "verify") if n != "c" else ("gen",), rank=float(i + 1))
+                   for i, n in enumerate("abc")]
+        monkeypatch.setattr(M, "entries", lambda: entries)
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {n: GB for n in "abc"})
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: set())
+        monkeypatch.setenv(M.SHADOW_ENV, "1")
+        monkeypatch.setenv(M.EXPLORE_ENV, "1")
+        monkeypatch.setenv(M.EXPLORE_ROLES_ENV, roles)
+        if models:
+            monkeypatch.setenv(M.EXPLORE_MODELS_ENV, models)
+
+    def test_a_role_scope_needs_no_model_list_and_tries_every_eligible_alternative(self, monkeypatch, tmp_path):
+        self._roles(monkeypatch, "gen")
+        assert {M.pick("gen") for _ in range(200)} == {"b", "c"}
+        row = _decisions(tmp_path)[-1]
+        assert (row["n_alternatives"], row["propensity"]) == (2, 0.5)
+
+    def test_a_role_scope_leaves_every_other_role_to_the_rule(self, monkeypatch, tmp_path):
+        self._roles(monkeypatch, "gen")
+        assert {M.pick("verify") for _ in range(100)} == {"a"}
+        assert all("explored" not in row and "explore_p" not in row for row in _decisions(tmp_path))
+
+    def test_the_role_names_ignore_case_and_spaces_and_may_be_several(self, monkeypatch):
+        self._roles(monkeypatch, " GEN , verify ")
+        assert {M.pick("gen") for _ in range(100)} == {"b", "c"}
+        assert {M.pick("verify") for _ in range(100)} == {"b"}
+        assert {M.pick(" Gen ") for _ in range(100)} == {"b", "c"}   # the caller's spelling does not matter either
+
+    def test_a_role_scope_with_a_model_list_uses_only_the_models_in_both(self, monkeypatch):
+        self._roles(monkeypatch, "gen", models="c,ghost")
+        assert {M.pick("gen") for _ in range(100)} == {"c"}
+        assert {M.pick("verify") for _ in range(50)} == {"a"}
+
+    def test_a_role_scope_still_needs_a_probability_and_the_shadow(self, monkeypatch):
+        self._roles(monkeypatch, "gen")
+        monkeypatch.setenv(M.EXPLORE_ENV, "0")
+        assert {M.pick("gen") for _ in range(50)} == {"a"}
+        monkeypatch.setenv(M.EXPLORE_ENV, "1")
+        monkeypatch.delenv(M.SHADOW_ENV)
+        assert {M.pick("gen") for _ in range(50)} == {"a"}
 
     def test_it_never_leaves_the_allow_list_or_the_eligible_set(self, monkeypatch):
         self._on(monkeypatch, models="b,ghost")
