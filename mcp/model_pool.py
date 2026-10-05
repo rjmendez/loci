@@ -36,16 +36,35 @@ to what an optional learned selector (``LOCI_MODEL_POOL_SELECTOR=module:callable
 have chosen. Rows carry model names, ranks and enums only; no prompt or output text. A
 selector that raises, hangs the import or returns junk is ignored. Rollback: unset the
 variables.
+
+Training and testing a selector (a FlyBrain-style brain, or the baseline in ``pool_selectors``):
+
+* Every decision row has a ``decision_id``; the outcome of the call it led to carries the same id
+  (plus ``pool_role`` and a ``prompt_bucket`` size class), so the join is exact, not "the next
+  outcome for that model".
+* ``shadow_status`` says why ``chosen_shadow`` is empty: ``no_selector``, ``abstained``, ``invalid``
+  or ``error``; ``chose`` when it is not.
+* Shadow alone cannot teach anything about an arm the rule never picks: no outcome exists for it.
+  ``LOCI_MODEL_POOL_EXPLORE=<p>`` with ``LOCI_MODEL_POOL_EXPLORE_MODELS=a,b`` is the opt-in way to
+  get that data: with probability ``p`` the call goes to one eligible, allow-listed alternative
+  (uniformly), and ``propensity`` records how likely the arm actually used was. It is off unless
+  both are set and the shadow is on. It changes live routing for that fraction of calls, and a
+  non-resident model has to be loaded, so the allow-list is the operator's safety.
+* ``python model_pool.py report`` joins the logs and says, per role, whether the data can support
+  learning (two or more arms with enough outcomes) or only one arm has ever been observed.
 """
 from __future__ import annotations
 
+import contextvars
 import importlib
 import json
 import logging
 import os
+import random
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -54,10 +73,17 @@ logger = logging.getLogger("loci-mcp.model_pool")
 
 SHADOW_ENV = "LOCI_MODEL_POOL_SHADOW"
 SELECTOR_ENV = "LOCI_MODEL_POOL_SELECTOR"
+EXPLORE_ENV = "LOCI_MODEL_POOL_EXPLORE"
+EXPLORE_MODELS_ENV = "LOCI_MODEL_POOL_EXPLORE_MODELS"
 SHADOW_LOG_NAME = "model_pool_shadow.jsonl"
 SHADOW_SCHEMA = 1
 OUTCOMES_LOG_NAME = "model_pool_outcomes.jsonl"
 OUTCOME_SCHEMA = 1
+
+_LINK_TTL_S = 300.0           # an outcome links to the decision made this recently, in the same thread
+MIN_ARM_N = 30                # outcomes an arm needs before the report counts it as observed
+_LAST_DECISION: contextvars.ContextVar = contextvars.ContextVar("loci_model_pool_last_decision", default=None)
+_rng = random.Random()
 
 DEFAULT_RESIDENT_BONUS = 0.5
 _TAGS_TTL_S = 30.0
@@ -349,8 +375,9 @@ def pick(role: str, hint: str = "") -> str:
         if not pool_entries or not any((role or "").strip().lower() in e.roles for e in pool_entries):
             return ""
         decision = rank_role(role, hint=hint, pool=pool_entries)
-        _shadow(decision)
-        return decision.chosen
+        returned, explore = _explore(decision)
+        _shadow(decision, returned=returned, explore=explore)
+        return returned
     except Exception as exc:  # fail-open: the legacy resolver takes over
         logger.warning("model_pool.pick(%r) failed, using the legacy resolver: %r", role, exc)
         return ""
@@ -403,15 +430,44 @@ def _log_path() -> Path:
     return Path(mem).parent / "instrumentation" / SHADOW_LOG_NAME
 
 
-def _shadow(decision: Decision) -> None:
+def _explore(decision: Decision) -> tuple:
+    """Opt-in exploration: ``(model to use, info)``. Off unless the shadow is on, a probability in (0, 1] is set and
+    an allow-list names models. Only an eligible allow-listed alternative to the rule's choice can be picked."""
+    off = (decision.chosen, {"p": 0.0})
+    try:
+        if not _shadow_enabled() or not decision.chosen:
+            return off
+        p = float(os.environ.get(EXPLORE_ENV) or 0.0)
+        allowed = {n.strip() for n in (os.environ.get(EXPLORE_MODELS_ENV) or "").split(",") if n.strip()}
+        if not (0.0 < p <= 1.0) or not allowed:
+            return off
+        alts = [n for n in decision.ordered() if n != decision.chosen and n in allowed]
+        info: dict = {"p": p, "n_alternatives": len(alts)}
+        if not alts:
+            return decision.chosen, info
+        if _rng.random() < p:
+            info.update(explored=True, propensity=round(p / len(alts), 6))
+            return alts[_rng.randrange(len(alts))], info
+        info.update(explored=False, propensity=round(1.0 - p, 6))
+        return decision.chosen, info
+    except Exception as exc:
+        logger.debug("model_pool: exploration skipped: %r", exc)
+        return off
+
+
+def _shadow(decision: Decision, returned: Optional[str] = None, explore: Optional[dict] = None) -> None:
     """Log the rule decision beside the optional selector's. Never raises, never changes the pick."""
     if not _shadow_enabled():
         return
     try:
         started = time.perf_counter()
+        returned = returned or decision.chosen
+        decision_id = uuid.uuid4().hex[:12]
         alt = ""
+        status = "no_selector"
         selector = _load_selector()
         if selector is not None:
+            status = "abstained"
             features = [{"name": c.name, "rank": c.rank, "effective_rank": c.effective_rank,
                          "resident": c.resident, "eligible": c.eligible} for c in decision.candidates]
             try:
@@ -421,10 +477,16 @@ def _shadow(decision: Decision) -> None:
                     alt = result
                 elif isinstance(result, (list, tuple)) and result and result[0] in names:
                     alt = str(result[0])
+                if alt:
+                    status = "chose"
+                elif result not in (None, "", [], ()):
+                    status = "invalid"          # it answered, but not with an eligible candidate
             except Exception as exc:
+                status = "error"
                 logger.debug("model_pool: shadow selector raised: %r", exc)
         row = {
             "schema": SHADOW_SCHEMA, "ts": time.time(), "role": decision.role,
+            "decision_id": decision_id, "shadow_status": status, "chosen_returned": returned,
             "chosen_rule": decision.chosen, "chosen_shadow": alt or None,
             "agree": (alt == decision.chosen) if alt else None,
             "n_candidates": len(decision.candidates),
@@ -433,19 +495,27 @@ def _shadow(decision: Decision) -> None:
             "candidates": [{"name": c.name, "rank": c.rank, "resident": c.resident,
                             "eligible": c.eligible} for c in decision.candidates],
         }
+        if explore and explore.get("p"):
+            row.update(explore_p=explore["p"], n_alternatives=explore.get("n_alternatives", 0),
+                       explored=bool(explore.get("explored")), propensity=explore.get("propensity"))
         from instrumentation_log import append_rows
         append_rows(_log_path(), [row])
+        _LAST_DECISION.set({"id": decision_id, "role": decision.role, "model": returned, "ts": time.time(),
+                            "explored": bool(explore and explore.get("explored"))})
     except Exception as exc:
         logger.debug("model_pool: shadow log skipped: %r", exc)
 
 
 def record_outcome(model: str, ok: bool, latency_ms: float, *, route_role: str = "",
-                   deadline_exceeded: bool = False, tier: str = "", fmt: str = "") -> None:
+                   deadline_exceeded: bool = False, tier: str = "", fmt: str = "",
+                   decision_id: str = "", prompt_chars: int = 0) -> None:
     """Log how one generate() call went, so a pool decision has a label (D23 in docs/flybrain_brains_eval.md).
 
     Rows hold the model tag, ok, latency and enums only: no prompt, output or error text. Written
-    only under ``LOCI_MODEL_POOL_SHADOW=1``. An offline join takes a decision row (``chosen_rule``)
-    and the next outcome row for that model. Never raises.
+    only under ``LOCI_MODEL_POOL_SHADOW=1``. The row carries the ``decision_id`` of the pool decision that
+    chose this model in the same thread within the last few minutes (each decision labels one call), so the
+    join is exact; with none, the id is absent. ``prompt_bucket`` is the bit length of the prompt size, a
+    size class and never any text. Never raises.
     """
     if not _shadow_enabled():
         return
@@ -456,6 +526,15 @@ def record_outcome(model: str, ok: bool, latency_ms: float, *, route_role: str =
             "deadline_exceeded": bool(deadline_exceeded), "route_role": str(route_role or ""),
             "tier": str(tier or "ollama"), "fmt": "json" if fmt == "json" else "",
         }
+        if decision_id:
+            row["decision_id"] = str(decision_id)
+        else:
+            cur = _LAST_DECISION.get()
+            if cur and cur["model"] == str(model or "") and time.time() - cur["ts"] <= _LINK_TTL_S:
+                row.update(decision_id=cur["id"], pool_role=cur["role"], explored=cur["explored"])
+                _LAST_DECISION.set(None)
+        if prompt_chars and int(prompt_chars) > 0:
+            row["prompt_bucket"] = int(prompt_chars).bit_length()
         from instrumentation_log import append_rows
         append_rows(_log_path().with_name(OUTCOMES_LOG_NAME), [row])
     except Exception as exc:
@@ -493,6 +572,66 @@ def outcomes_summary(path: Optional[Path] = None) -> dict:
             "deadline_exceeded": sum(1 for r in rows if r.get("deadline_exceeded")),
         }
     return out
+
+
+def _read_rows(base: Path) -> list[dict]:
+    rows: list[dict] = []
+    for f in [base] + [base.with_name(f"{base.name}.{i}") for i in range(1, 6)]:
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+        except OSError:
+            continue
+    return rows
+
+
+def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[Path] = None,
+                min_arm_n: int = MIN_ARM_N) -> dict:
+    """Join decisions to outcomes by ``decision_id`` and say, per role, whether a selector could be trained or
+    tested on this data. Rows from before the id existed are counted, not guessed at."""
+    dpath = decisions_path or _log_path()
+    opath = outcomes_path or _log_path().with_name(OUTCOMES_LOG_NAME)
+    decisions, outcomes = _read_rows(dpath), _read_rows(opath)
+    by_id = {r["decision_id"]: r for r in outcomes if r.get("decision_id")}
+    roles: dict[str, dict] = {}
+    legacy = 0
+    for d in decisions:
+        if not d.get("decision_id"):
+            legacy += 1
+            continue
+        info = roles.setdefault(str(d.get("role")), {"decisions": 0, "linked": 0, "status": {}, "explored": 0, "_arms": {}})
+        info["decisions"] += 1
+        status = str(d.get("shadow_status") or "unknown")
+        info["status"][status] = info["status"].get(status, 0) + 1
+        out = by_id.get(d["decision_id"])
+        if out is None:
+            continue
+        info["linked"] += 1
+        info["explored"] += 1 if d.get("explored") else 0
+        arm = info["_arms"].setdefault(str(out.get("model") or d.get("chosen_returned")), [])
+        arm.append(out)
+    for role, info in roles.items():
+        arms = {}
+        for model, rows in info.pop("_arms").items():
+            lat = sorted(float(r.get("latency_ms") or 0.0) for r in rows)
+            arms[model] = {"outcomes": len(rows), "ok_rate": round(sum(1 for r in rows if r.get("ok")) / len(rows), 3),
+                           "p50_ms": round(lat[len(lat) // 2], 1)}
+        info["arms"] = arms
+        enough = sorted(m for m, a in arms.items() if a["outcomes"] >= min_arm_n)
+        info["learnable"] = len(enough) >= 2
+        if info["learnable"]:
+            info["why"] = f"{len(enough)} arms have at least {min_arm_n} outcomes: {', '.join(enough)}"
+        elif len(arms) <= 1:
+            info["why"] = ("only one arm has ever been observed, so no alternative has an outcome to learn from or "
+                           f"to test against; set {EXPLORE_ENV} and {EXPLORE_MODELS_ENV} to collect some")
+        else:
+            info["why"] = f"fewer than two arms have {min_arm_n} outcomes yet"
+    return {"roles": roles, "legacy_rows": legacy, "min_arm_n": min_arm_n, "decisions": len(decisions), "outcomes": len(outcomes)}
 
 
 # ------------------------------------------------------------------ discovery / suggestions
@@ -564,6 +703,16 @@ def _main(argv: list[str]) -> int:
         for model, s_ in summary_.items():
             print(f"{model:55s} n={s_['calls']:5d} ok={s_['ok_rate']:.0%} "
                   f"p50={s_['p50_ms']:.0f}ms p95={s_['p95_ms']:.0f}ms deadline={s_['deadline_exceeded']}")
+        return 0
+    if cmd == "report":
+        rep_ = pool_report()
+        print(f"decisions={rep_['decisions']} outcomes={rep_['outcomes']} rows without a decision_id={rep_['legacy_rows']}")
+        for role, info in sorted(rep_["roles"].items()):
+            print(f"{role:10s} decisions={info['decisions']} linked={info['linked']} explored={info['explored']} "
+                  f"status={info['status']} learnable={info['learnable']}")
+            print(f"           {info['why']}")
+            for model, a in sorted(info["arms"].items()):
+                print(f"           arm {model}: n={a['outcomes']} ok={a['ok_rate']:.0%} p50={a['p50_ms']:.0f}ms")
         return 0
     if cmd == "pick" and len(argv) > 1:
         print(pick(argv[1]) or "(none)")

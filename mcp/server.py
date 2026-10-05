@@ -4417,15 +4417,24 @@ def reflection_loop_seed(
 # ---- Tool: reflection_loop_status ----
 
 @mcp.tool()
-def reflection_loop_status(queue_preview: int = 8) -> str:
+def reflection_loop_status(queue_preview: int = 8, verbose: bool = False) -> str:
     """
     Return current queue and aggregate stats for the self-reflection loop.
+
+    The signature-observation maps in ``stats`` grow without bound (one entry per distinct error
+    or warning line ever seen; 166 KB by 2026-10-05), so by default they are reported as counts
+    only. ``verbose=True`` returns them whole.
     """
     queue_preview = max(0, min(int(queue_preview), 50))
     state = _load_reflection_state()
     queue = list(state.get("queue") or [])
     processed = dict(state.get("processed") or {})
     stats = dict(state.get("stats") or {})
+    if not verbose:
+        for big in ("error_signature_observations", "warning_signature_observations"):
+            if big in stats:
+                stats[big.replace("_observations", "_observation_count")] = len(stats.pop(big) or {})
+        stats = {k: (_reflection_clip(v) if isinstance(v, (list, dict)) else v) for k, v in stats.items()}
     preview = queue[:queue_preview]
     return json.dumps({
         "investigation_id": state.get("investigation_id"),
@@ -4438,6 +4447,21 @@ def reflection_loop_status(queue_preview: int = 8) -> str:
         "queue_preview": preview,
         "state_file": str(REFLECTION_STATE_FILE),
     }, indent=2)
+
+
+def _reflection_clip(value, limit: int = 12, text: int = 160):
+    """A bounded view of a stats value: lists and dicts keep ``limit`` entries, long strings are clipped."""
+    if isinstance(value, dict):
+        out = {str(k)[:text]: _reflection_clip(v, limit, text) for k, v in list(value.items())[:limit]}
+        if len(value) > limit:
+            out["..."] = f"{len(value) - limit} more"
+        return out
+    if isinstance(value, list):
+        out = [_reflection_clip(v, limit, text) for v in value[:limit]]
+        if len(value) > limit:
+            out.append(f"... {len(value) - limit} more")
+        return out
+    return value[:text] if isinstance(value, str) else value
 
 
 def _reflection_filter_signatures(
@@ -4556,8 +4580,9 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
     Mutates `stats` (suppression counters) and `low_signal_session_events` in
     place, matching the original inline behaviour.
     """
-    if kind == "session_event" and not raw_errors and not raw_warnings:
+    def _low_signal() -> bool:
         low_signal_session_events.append({
+            "kind": kind,
             "path": path,
             "lines_scanned": int(summary.get("lines_scanned") or 0),
             "bytes_scanned": int(summary.get("bytes_scanned") or 0),
@@ -4574,6 +4599,12 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
     )
     stats["error_signatures_suppressed"] += suppressed_error_hits
     stats["warning_signatures_suppressed"] += suppressed_warning_hits
+    # 2026-10-05: 92% of this loop's findings were the same sentence ("processed <kind> target=...;
+    # errors={}; warnings={}"): a log line stored as a memory, which then surfaced as a top retrieval hit for
+    # unrelated queries. An item with no errors and no warnings has nothing to say, whatever its kind, and
+    # neither has one whose every signature is already known (suppressed above): counted, not stored.
+    if not visible_errors and not visible_warnings:
+        return _low_signal()
     top_error = _reflection_signature_summary(
         visible_errors, suppressed_error_signatures, suppressed_error_hits
     )
@@ -4605,6 +4636,24 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
     ))
 
 
+def _reflection_store_low_signal() -> bool:
+    """Whether the per-tick low-signal roll-up is stored as a finding. Off: it is the same sentence every tick."""
+    raw = os.environ.get("LOCI_REFLECTION_STORE_LOW_SIGNAL", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _reflection_note_low_signal(stats: dict, entries: list[dict]) -> None:
+    """Keep what the skipped items amount to as counters in the loop state, where a status call can read them."""
+    low = stats.setdefault("low_signal", {"files": 0, "lines": 0, "bytes": 0, "by_kind": {}})
+    low["files"] += len(entries)
+    low["lines"] += sum(int(e.get("lines_scanned") or 0) for e in entries)
+    low["bytes"] += sum(int(e.get("bytes_scanned") or 0) for e in entries)
+    by_kind = low.setdefault("by_kind", {})
+    for e in entries:
+        k = str(e.get("kind") or "?")
+        by_kind[k] = by_kind.get(k, 0) + 1
+
+
 def _reflection_batch_low_signal(investigation_id: str, low_signal_session_events: list[dict]) -> int:
     """Store the batched low-signal session_event roll-up finding.
 
@@ -4618,7 +4667,7 @@ def _reflection_batch_low_signal(investigation_id: str, low_signal_session_event
         tool_counts.update(entry.get("tools") or {})
     sample_paths = [e["path"] for e in low_signal_session_events[:3]]
     low_signal_text = (
-        f"reflection_loop_tick batched low-signal session_event files count={len(low_signal_session_events)}; "
+        f"reflection_loop_tick batched low-signal files count={len(low_signal_session_events)}; "
         f"total_lines={sum(e['lines_scanned'] for e in low_signal_session_events)} "
         f"total_bytes={sum(e['bytes_scanned'] for e in low_signal_session_events)}; "
         f"top_events={dict(event_counts.most_common(8))}; top_tools={dict(tool_counts.most_common(8))}; "
@@ -4806,7 +4855,9 @@ def reflection_loop_tick(
             src_stats["findings_written"] += 1
 
     if store_item_findings and low_signal_session_events:
-        findings_written += _reflection_batch_low_signal(investigation_id, low_signal_session_events)
+        _reflection_note_low_signal(stats, low_signal_session_events)
+        if _reflection_store_low_signal():
+            findings_written += _reflection_batch_low_signal(investigation_id, low_signal_session_events)
 
     if store_item_findings and batch_error_signatures:
         findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures, batch_sources)
