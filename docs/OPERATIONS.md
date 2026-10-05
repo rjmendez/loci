@@ -1251,9 +1251,16 @@ The synthetic cases are too few to rank patches. Real ones come from the reflect
   messages, anything over 120 chars) is dropped, and an item is kept only if a real error or warning
   remains. `hillclimb.py prune` re-applies that filter to rows captured earlier. The scheduled driver calls
   capture after each tick; it never raises.
-- `python mcp/hillclimb.py label [--n 30] [--model] [--skipped]` shows one observation at a time. Answer `r` regression,
-  `f` flaky, `c` config/env, `n` noise, `u` unknown, `s` skip, `q` quit. `--model` prints the classifier's answer
+- `python mcp/hillclimb.py label [--n 30] [--model] [--skipped]` shows one observation at a time. First answer:
+  `r` regression, `f` flaky, `c` config/env, `n` noise, `u` unknown, `x` not a failure, `s` skip, `q` quit. For a
+  category, a second line takes novelty and an optional note: Enter = unclear, `k` known pattern, `w` new,
+  and anything after a colon is the note (`w: first time since the upgrade`). `x` asks why (optional) and records
+  the item's error keys in `rejected.jsonl`: capture then drops later items whose only errors/warnings are keys
+  you rejected, and `prune` applies the same to what is already stored. `--model` prints the classifier's answer
   only after you answer, and tallies agreement. Labels append to `labels.jsonl` and resume where you left off.
-- `python mcp/hillclimb.py labels` shows counts, per-category totals and whether the real train and test splits each
+  Scoring: a label with a novelty of known or new is graded on category and novelty (mean of the two); `unclear`
+  is not graded, and labels without a novelty (synthetic, older) are graded on category alone. Notes are shown to
+  the proposer next to the failing case.
+- `python mcp/hillclimb.py labels` shows counts (labelled, rejected, with notes), per-category and per-novelty totals, and whether the real train and test splits each
   have the 30 cases the guard needs (`enough`).
 - The `triage` suite reads `labels.jsonl` next to the synthetic cases (`LOCI_HILLCLIMB_TRIAGE_SYNTHETIC=0` for real only).

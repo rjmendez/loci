@@ -78,9 +78,20 @@ class TriageSuite:
             return CaseResult(case.id, 0.0, "model unavailable", infra_error=True)
         got = res.get("category")
         hit = got == d["gold"]
+        # A case a person rated for novelty is scored on both outputs (mean of the two); "unclear" is
+        # not graded because it is a valid answer to a thin observation. Cases without a rating
+        # (the synthetic ones, older labels) are scored on category alone, as before.
+        gold_nov = d.get("novelty")
+        graded_nov = gold_nov in ("novel_signal", "known_pattern")
+        nov_hit = graded_nov and res.get("novelty") == gold_nov
+        score = ((1.0 if hit else 0.0) + (1.0 if nov_hit else 0.0)) / 2 if graded_nov else (1.0 if hit else 0.0)
         trace = (f"expected {d['gold']}, got {got}. kind={d['kind']} errors={d.get('errors')} "
                  f"warnings={d.get('warnings')} events={d.get('events')}")
-        return CaseResult(case.id, 1.0 if hit else 0.0, "" if hit else trace)
+        if graded_nov and not nov_hit:
+            trace += f". novelty expected {gold_nov}, got {res.get('novelty')}"
+        if d.get("note"):
+            trace += f". reviewer note: {d['note']}"
+        return CaseResult(case.id, score, "" if score >= 1.0 else trace)
 
 
 BUILTIN = {"triage": TriageSuite}

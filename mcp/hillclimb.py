@@ -498,6 +498,7 @@ def status(suite_name: str) -> dict:
 #   observations.jsonl  captured inputs (id, kind, path tail, counts, short scrubbed error text)
 #   labels.jsonl        case records {id, gold, kind, path, events, tools, errors, warnings}
 #   skipped.json        ids the person passed on
+#   rejected.jsonl      observations marked "not a failure" (ids + error keys); capture drops matching ones
 
 import re as _re
 
@@ -513,7 +514,10 @@ _EXTRA_SECRETS = [
 ]
 
 
-def _scrub_text(s: str) -> str:
+_NOTE_TEXT = 300
+
+
+def _scrub_text(s: str, cap: int = _OBS_TEXT) -> str:
     text = str(s)
     try:
         from llm_local import _sanitize_for_cloud
@@ -522,7 +526,7 @@ def _scrub_text(s: str) -> str:
         pass
     for rx in _EXTRA_SECRETS:
         text = rx.sub("[REDACTED]", text)
-    return text.replace("\n", " ")[:_OBS_TEXT]
+    return text.replace("\n", " ")[:cap]
 
 
 # The tick also reports session message text as "errors" (workflow-harness task prompts, teammate
@@ -576,12 +580,29 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _obs_keys(obs: dict) -> set:
+    return set(obs.get("errors") or {}) | set(obs.get("warnings") or {})
+
+
+def _rejected(suite: str) -> tuple[set, set]:
+    """(ids, keys) the person marked 'not a failure'. A later observation is dropped when its id is
+    rejected, or when every error/warning key it has was rejected before."""
+    rows = _read_jsonl(suite_dir(suite) / "rejected.jsonl")
+    return {r.get("id") for r in rows}, {k for r in rows for k in r.get("keys", [])}
+
+
+def _is_rejected(obs: dict, ids: set, keys: set) -> bool:
+    ks = _obs_keys(obs)
+    return obs.get("id") in ids or (bool(ks) and ks <= keys)
+
+
 def capture_observations(items: list, suite: str = "reflection_triage") -> int:
     """Append new, scrubbed observations from a tick's ``batch``; returns how many were new.
     Only processed items are kept. Never raises (a capture problem must not break the loop)."""
     try:
         path = suite_dir(suite) / "observations.jsonl"
         seen = {r.get("id") for r in _read_jsonl(path)}
+        rej_ids, rej_keys = _rejected(suite)
         new = []
         for it in items or []:
             if not isinstance(it, dict) or it.get("status") != "processed":
@@ -593,7 +614,7 @@ def capture_observations(items: list, suite: str = "reflection_triage") -> int:
             if not (obs["errors"] or obs["warnings"]):   # nothing left that looks like a failure
                 continue
             obs["id"] = observation_id(obs)
-            if obs["id"] in seen:
+            if obs["id"] in seen or _is_rejected(obs, rej_ids, rej_keys):
                 continue
             seen.add(obs["id"])
             obs["ts"] = int(time.time())
@@ -614,6 +635,7 @@ def prune_observations(suite: str = "reflection_triage") -> dict:
     merge duplicates. Labels are untouched. Returns {before, after}."""
     path = suite_dir(suite) / "observations.jsonl"
     rows = _read_jsonl(path)
+    rej_ids, rej_keys = _rejected(suite)
     keep, seen = [], set()
     for r in rows:
         for field in ("errors", "warnings"):
@@ -621,7 +643,7 @@ def prune_observations(suite: str = "reflection_triage") -> dict:
         if not (r["errors"] or r["warnings"]):
             continue
         r["id"] = observation_id(r)
-        if r["id"] in seen:
+        if r["id"] in seen or _is_rejected(r, rej_ids, rej_keys):
             continue
         seen.add(r["id"])
         keep.append(r)
@@ -640,36 +662,67 @@ def _show(obs: dict) -> str:
             f"  warnings: {fmt(obs.get('warnings') or {})}")
 
 
-PROMPT = "[r]egression  [f]laky  [c]onfig/env  [n]oise  [u]nknown  [s]kip  [q]uit > "
+NOVELTY = {"k": "known_pattern", "w": "novel_signal", "": "unclear", "?": "unclear"}
+
+PROMPT = ("[r]egression  [f]laky  [c]onfig/env  [n]oise  [u]nknown  "
+          "[x] not a failure  [s]kip  [q]uit > ")
+DETAIL_PROMPT = "  novelty [k]nown / [w] new / Enter=unclear, optional note after a colon (k: why) > "
+REJECT_PROMPT = "  why is it not a failure? (optional) > "
+
+
+def parse_detail(text: str) -> tuple[str, str]:
+    """``'k: from the wf script'`` -> ("known_pattern", note). The part before the colon is the novelty
+    key (k, w, ? or empty); if it is anything else the whole text is the note and novelty is unclear."""
+    head, sep, tail = str(text).partition(":")
+    key = head.strip().lower()
+    if key in NOVELTY:
+        return NOVELTY[key], _scrub_text(tail.strip(), _NOTE_TEXT)
+    return "unclear", _scrub_text(str(text).strip(), _NOTE_TEXT)
 
 
 def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool = False,
           input_fn: Callable[[str], str] = input, print_fn: Callable[[str], None] = print,
           classify: Optional[Callable[[dict], Optional[str]]] = None) -> dict:
-    """Label up to ``n`` unlabelled observations. ``classify(obs)`` (optional) returns the model's
-    category, shown only AFTER you answer so it cannot bias you; agreement is tallied."""
+    """Label up to ``n`` unlabelled observations. Per item: a category (or ``x`` = not a failure, which
+    also teaches capture to drop that kind of item), then one line for novelty and an optional note.
+    ``classify(obs)`` (optional) returns the model's category, shown only AFTER you answer so it
+    cannot bias you; agreement is tallied."""
     d = suite_dir(suite)
     obs = _read_jsonl(d / "observations.jsonl")
     done = {r.get("id") for r in _read_jsonl(d / "labels.jsonl")}
+    rej_ids, _ = _rejected(suite)
+    done |= rej_ids
     skipped = set(_read_json(d / "skipped.json").get("ids", []))
     todo = [o for o in obs if o["id"] not in done and (include_skipped or o["id"] not in skipped)][:n]
-    tally = {"labelled": 0, "skipped": 0, "compared": 0, "agreed": 0}
-    print_fn(f"{len(todo)} to label ({len(obs)} captured, {len(done)} labelled, {len(skipped)} skipped)")
+    tally = {"labelled": 0, "skipped": 0, "rejected": 0, "compared": 0, "agreed": 0}
+    print_fn(f"{len(todo)} to label ({len(obs)} captured, {len(done)} labelled or rejected, {len(skipped)} skipped)")
     for i, o in enumerate(todo, 1):
         print_fn(f"\n--- {i}/{len(todo)}  {o['id']}\n{_show(o)}")
         while True:
             ans = input_fn(PROMPT).strip().lower()[:1]
-            if ans in LABELS or ans in ("s", "q"):
+            if ans in LABELS or ans in ("s", "q", "x"):
                 break
-            print_fn("  r f c n u s q")
+            print_fn("  r f c n u x s q")
         if ans == "q":
             break
         if ans == "s":
             skipped.add(o["id"])
             tally["skipped"] += 1
             continue
-        case = {"id": o["id"], "gold": LABELS[ans], "kind": o["kind"], "path": o["path"], "events": o["events"],
-                "tools": o["tools"], "errors": o["errors"], "warnings": o["warnings"]}
+        if ans == "x":
+            keys = sorted(_obs_keys(o))
+            row = {"id": o["id"], "keys": keys, "note": _scrub_text(input_fn(REJECT_PROMPT).strip(), _NOTE_TEXT),
+                   "ts": int(time.time())}
+            with (d / "rejected.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+            skipped.discard(o["id"])
+            tally["rejected"] += 1
+            print_fn(f"  will no longer capture items whose only errors/warnings are: {keys}")
+            continue
+        novelty, note = parse_detail(input_fn(DETAIL_PROMPT))
+        case = {"id": o["id"], "gold": LABELS[ans], "novelty": novelty, "note": note, "kind": o["kind"],
+                "path": o["path"], "events": o["events"], "tools": o["tools"], "errors": o["errors"],
+                "warnings": o["warnings"]}
         with (d / "labels.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(case, sort_keys=True) + "\n")
         skipped.discard(o["id"])
@@ -693,13 +746,20 @@ def label_stats(suite: str = "reflection_triage") -> dict:
     obs = _read_jsonl(d / "observations.jsonl")
     labels = _read_jsonl(d / "labels.jsonl")
     skipped = _read_json(d / "skipped.json").get("ids", [])
+    rej_ids, rej_keys = _rejected(suite)
     by_cat: dict[str, int] = {}
+    by_nov: dict[str, int] = {}
     for r in labels:
         by_cat[r["gold"]] = by_cat.get(r["gold"], 0) + 1
+        nov = r.get("novelty") or "unrated"
+        by_nov[nov] = by_nov.get(nov, 0) + 1
     tr, te = split([Case(r["id"]) for r in labels])
+    handled = {r["id"] for r in labels} | rej_ids
     return {"captured": len(obs), "labelled": len(labels), "skipped": len(skipped),
-            "unlabelled": len([o for o in obs if o["id"] not in {r["id"] for r in labels}]),
-            "by_category": by_cat, "real_train": len(tr), "real_test": len(te),
+            "rejected": len(rej_ids), "rejected_keys": len(rej_keys),
+            "with_notes": sum(1 for r in labels if r.get("note")),
+            "unlabelled": len([o for o in obs if o["id"] not in handled]),
+            "by_category": by_cat, "by_novelty": by_nov, "real_train": len(tr), "real_test": len(te),
             "enough": len(tr) >= 30 and len(te) >= 30}
 
 
