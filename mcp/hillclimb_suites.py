@@ -2,7 +2,7 @@
 
 ``triage`` grades ``reflection_triage.classify_reflection_observation`` against hand-labelled
 observations in ``eval/hillclimb/triage_cases.jsonl`` (override with ``LOCI_HILLCLIMB_TRIAGE_CASES``).
-Its one surface is ``guidance``, the extra instruction block the classifier prompt appends.
+Real labels (``hillclimb.py label``) are read from the suite folder next to them. Its one surface is ``guidance``, the extra instruction block the classifier prompt appends.
 The cases are synthetic; replace or extend them with labelled real findings as they accumulate
 (the split is keyed on case id, so adding cases does not reshuffle the old ones).
 
@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 
-from hillclimb import Case, CaseResult, Surface
+from hillclimb import Case, CaseResult, Surface, suite_dir
 
 _DEFAULT_CASES = Path(__file__).resolve().parent.parent / "eval" / "hillclimb" / "triage_cases.jsonl"
 
@@ -37,11 +37,24 @@ class TriageSuite:
         self._gen = gen_fn
 
     def cases(self) -> list[Case]:
-        out = []
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                d = json.loads(line)
-                out.append(Case(str(d["id"]), d))
+        """Synthetic cases (unless LOCI_HILLCLIMB_TRIAGE_SYNTHETIC=0) plus the person's real labels
+        from ``<suite folder>/labels.jsonl`` (see ``hillclimb.py label``)."""
+        paths = []
+        if os.environ.get("LOCI_HILLCLIMB_TRIAGE_SYNTHETIC", "1") != "0":
+            paths.append(self._path)
+        paths.append(suite_dir(self.name) / "labels.jsonl")
+        out, seen = [], set()
+        for path in paths:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if line.strip():
+                    d = json.loads(line)
+                    if str(d["id"]) not in seen:
+                        seen.add(str(d["id"]))
+                        out.append(Case(str(d["id"]), d))
         return out
 
     def run(self, case: Case, overlay: dict) -> CaseResult:
