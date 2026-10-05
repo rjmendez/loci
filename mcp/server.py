@@ -765,6 +765,11 @@ def _drop_retracted(rows: list, investigation_id: Optional[str] = None) -> list:
     return [r for r in rows if not (isinstance(r, dict) and rf.is_retracted(r))]
 
 
+def _drop_acl_denied(rows: list, requesting_agent_id: Optional[str] = None) -> list:
+    """Drop rows from investigations the caller may not read (see inv_store.acl_drop_denied)."""
+    return inv_store.acl_drop_denied(rows, requesting_agent_id)
+
+
 def _entity_lookup_qdrant(
     entity: str,
     entity_type: str,
@@ -843,19 +848,20 @@ def _entity_lookup_cascade(
     entity_type: str,
     investigation_id: Optional[str],
     limit: int,
+    requesting_agent_id: Optional[str] = None,
 ) -> tuple[list[dict], str]:
     """Prefer the LadybugDB graph (primary), then Qdrant (indexed), then JSONL scan.
 
     Returns ``(findings, method)`` where ``method`` names the tier that produced
     the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
     """
-    findings = _drop_retracted(_entity_lookup_ladybug(entity, investigation_id, limit), investigation_id)
+    findings = _drop_acl_denied(_drop_retracted(_entity_lookup_ladybug(entity, investigation_id, limit), investigation_id), requesting_agent_id)
     method = "ladybug"
     if not findings:
-        findings = _drop_retracted(_entity_lookup_qdrant(entity, entity_type, investigation_id, limit), investigation_id)
+        findings = _drop_acl_denied(_drop_retracted(_entity_lookup_qdrant(entity, entity_type, investigation_id, limit), investigation_id), requesting_agent_id)
         method = "qdrant"
     if not findings:
-        findings = _drop_retracted(_entity_lookup_jsonl(entity, entity_type, investigation_id, limit), investigation_id)
+        findings = _drop_acl_denied(_drop_retracted(_entity_lookup_jsonl(entity, entity_type, investigation_id, limit), investigation_id), requesting_agent_id)
         method = "jsonl_fallback"
     return findings, method
 
@@ -3436,8 +3442,12 @@ def docs_search(
     investigation_id: str = "loci-docs-index",
     limit: int = 5,
     include_excerpt: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Search stored markdown/text guidance by query and return concise hits."""
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     q = (query or "").strip()
     if not q:
         return json.dumps({
@@ -3534,8 +3544,12 @@ def docs_recall(
     investigation_id: str = "loci-docs-index",
     limit: int = 5,
     include_excerpt: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Recall indexed docs guidance by query using the existing docs index/search path."""
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     q = (query or "").strip()
     if not q:
         return json.dumps({
@@ -4128,6 +4142,7 @@ def procedure_search(
     query: str,
     investigation_id: Optional[str] = None,
     limit: int = 5,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Search for procedure-type findings matching a query.
@@ -4170,7 +4185,7 @@ def procedure_search(
                     limit=limit,
                     query_filter=qfilter,
                 )
-                hits = _drop_retracted(hits, investigation_id)
+                hits = _drop_acl_denied(_drop_retracted(hits, investigation_id), requesting_agent_id)
                 for h in hits:
                     pm = h.get("procedure_meta", {})
                     attempt_count = pm.get("attempt_count", 0) if pm else 0
@@ -4209,7 +4224,7 @@ def procedure_search(
                 if not findings_path.exists():
                     continue
                 try:
-                    for f in _drop_retracted(_read_jsonl(findings_path), inv_dir_path.name):
+                    for f in _drop_acl_denied(_drop_retracted(_read_jsonl(findings_path), inv_dir_path.name), requesting_agent_id):
                         if f.get("record_type") == "procedure" or f.get("type") == "procedure":
                             text = f.get("text", "")
                             if query_lower in text.lower():
@@ -5389,6 +5404,7 @@ def investigation_pre_answer_check(
     claims: str | list[str],
     min_confidence: str = "medium",
     record: bool = True,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Validate proposed response claims against investigation findings plus recent
@@ -5415,6 +5431,9 @@ def investigation_pre_answer_check(
     If the local verifier is unavailable the field stays fail-open as
     ``available=False`` and deterministic results are unchanged.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -5603,6 +5622,7 @@ def investigation_entity_lookup(
     entity_type: str = "auto",
     investigation_id: Optional[str] = None,
     limit: int = 30,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Find every finding that mentions a specific observable — IP, email, hostname,
@@ -5641,7 +5661,11 @@ def investigation_entity_lookup(
             "error": f"entity_type must be one of: {', '.join(_ENTITY_FIELD_MAP)} or 'auto'"
         })
 
-    findings, method = _entity_lookup_cascade(entity, entity_type, investigation_id, limit)
+    if investigation_id:
+        _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+        if _acl_denied:
+            return _acl_denied
+    findings, method = _entity_lookup_cascade(entity, entity_type, investigation_id, limit, requesting_agent_id)
 
     # Group by investigation and build compact summaries.
     by_inv: dict[str, list[dict]] = {}
@@ -5666,6 +5690,7 @@ def investigation_entity_lookup(
 def entity_list(
     investigation_id: str,
     entity_type: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     List all named entities extracted from findings in an investigation.
@@ -5684,6 +5709,9 @@ def entity_list(
         JSON: {"entities": [{entity_id, name, type, finding_count}], "count": int}
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         inv_path = MEMORY_DIR / investigation_id
         if not inv_path.exists():
@@ -5722,6 +5750,7 @@ def entity_list(
 def entity_timeline(
     investigation_id: str,
     entity_id: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Show a chronological timeline of all findings that mention a specific entity.
@@ -5742,6 +5771,9 @@ def entity_timeline(
         }
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         inv_path = MEMORY_DIR / investigation_id
         if not inv_path.exists():
@@ -5803,6 +5835,7 @@ def investigation_related_cases(
     entities: str | list[str],
     entity_type: str = "auto",
     limit_per_entity: int = 5,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Find prior investigations that dealt with the same entities as a new alert.
@@ -5834,7 +5867,7 @@ def investigation_related_cases(
     results: list[dict] = []
     for entity in entities[:10]:  # cap total entities to avoid runaway queries
         etype = entity_type if entity_type != "auto" else _detect_entity_type(entity)
-        findings, method = _entity_lookup_cascade(entity, etype, None, limit_per_entity * 4)
+        findings, method = _entity_lookup_cascade(entity, etype, None, limit_per_entity * 4, requesting_agent_id)
 
         # Group by investigation, exclude findings with no investigation context
         by_inv: dict[str, list[dict]] = {}
@@ -5876,11 +5909,15 @@ def investigation_evidence_precheck(
     investigation_id: str,
     proposed_query: str,
     min_similarity: float = 0.4,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Lightweight duplicate-call avoidance helper. Checks if similar evidence
     already exists in findings/audit logs (and Qdrant when available).
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -10292,7 +10329,7 @@ def memory_consolidate(dry_run: bool = False) -> str:
 
 
 @mcp.tool()
-def causal_infer(investigation_id: str, limit: int = 200) -> str:
+def causal_infer(investigation_id: str, limit: int = 200, requesting_agent_id: Optional[str] = None) -> str:
     """
     Infer causal edges for an investigation and write them to causal_edges.jsonl.
 
@@ -10313,6 +10350,9 @@ def causal_infer(investigation_id: str, limit: int = 200) -> str:
     Returns JSON: {investigation_id, findings_considered, edges_written,
                    status} — or {error} if the investigation does not exist.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     # _load_manifest, not _inv_dir: _inv_dir mkdirs, so a typo'd id would silently create an empty investigation.
     if not _load_manifest(investigation_id):
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -10672,6 +10712,7 @@ def _confidence_llm_entailment(
 def memory_confidence(
     query: str,
     top_k: int = 8,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Estimate how reliably loci_memory knows about a topic (metamemory).
@@ -10708,7 +10749,7 @@ def memory_confidence(
         field is returned degraded or omitted; the numeric verdict is unchanged.
     """
     results, hard_stop_basis = _confidence_retrieve(query, top_k)
-    results = _drop_retracted(results)
+    results = _drop_acl_denied(_drop_retracted(results), requesting_agent_id)
     if hard_stop_basis is not None:
         return json.dumps({
             "confidence": 0.0, "basis": hard_stop_basis,
@@ -11025,7 +11066,7 @@ def loci_validated_knowledge_promotion(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
+def memory_promote(investigation_id: str, finding_id: str, tier: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Promote a finding to a higher memory tier.
 
@@ -11049,6 +11090,9 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
         memory_promote again with the same tier retries the index write.
         On error: {error: "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         result = _change_finding_tier(investigation_id, finding_id, tier)
         return json.dumps(result, indent=2)
@@ -11061,7 +11105,7 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
+def memory_demote(investigation_id: str, finding_id: str, tier: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Demote a finding to a lower memory tier.
 
@@ -11083,6 +11127,9 @@ def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
         JSON: {finding_id, old_tier, new_tier, ok: true}
         On error: {error: "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         result = _change_finding_tier(investigation_id, finding_id, tier)
         return json.dumps(result, indent=2)
@@ -11155,6 +11202,7 @@ def investigation_reason(
     perspectives: int = 3,
     ground_threshold: float = 0.59,
     persist: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Reason over an investigation with grounded, multi-perspective analysis.
 
@@ -11183,6 +11231,9 @@ def investigation_reason(
         grounded_findings, gate_applied, confidence_score, converged_claims,
         contested_areas, final_answer, persisted_finding_ids}``.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     import grounding_gate as _grounding_gate
     from memcheck import llm as _llm
     from memcheck.checks.contradiction_llm import extract_json as _extract_json
@@ -11336,7 +11387,7 @@ _VALID_VERDICTS = frozenset(["a_wins", "b_wins", "both_valid", "false_positive"]
 
 
 @mcp.tool()
-def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> str:
+def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Resolve a detected conflict by recording a verdict.
 
@@ -11354,6 +11405,9 @@ def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> s
         JSON: {"resolved": true, "conflict_id": "...", "verdict": "..."}
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         if verdict not in _VALID_VERDICTS:
             return json.dumps({
@@ -11486,6 +11540,7 @@ def memory_hints(
     limit: int = 3,
     since_ts: Optional[str] = None,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Return recent findings for an investigation as lightweight hints.
@@ -11510,6 +11565,9 @@ def memory_hints(
         JSON ``{investigation_id, hints:[{finding_id, text, source,
         record_type, recency_score, ts}], count, as_of}``, or ``{"error": ...}``.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         manifest = _load_manifest(investigation_id)
         if not manifest:
