@@ -4430,11 +4430,7 @@ def reflection_loop_status(queue_preview: int = 8, verbose: bool = False) -> str
     queue = list(state.get("queue") or [])
     processed = dict(state.get("processed") or {})
     stats = dict(state.get("stats") or {})
-    if not verbose:
-        for big in ("error_signature_observations", "warning_signature_observations"):
-            if big in stats:
-                stats[big.replace("_observations", "_observation_count")] = len(stats.pop(big) or {})
-        stats = {k: (_reflection_clip(v) if isinstance(v, (list, dict)) else v) for k, v in stats.items()}
+    stats = _reflection_stats_view(stats, verbose)
     preview = queue[:queue_preview]
     return json.dumps({
         "investigation_id": state.get("investigation_id"),
@@ -4447,6 +4443,18 @@ def reflection_loop_status(queue_preview: int = 8, verbose: bool = False) -> str
         "queue_preview": preview,
         "state_file": str(REFLECTION_STATE_FILE),
     }, indent=2)
+
+
+def _reflection_stats_view(stats: dict, verbose: bool = False) -> dict:
+    """``stats`` as a tool result: the unbounded signature-observation maps become counts and every other
+    list or dict is clipped, unless ``verbose``. The stored state is never touched."""
+    if verbose:
+        return stats
+    out = dict(stats)
+    for big in ("error_signature_observations", "warning_signature_observations"):
+        if big in out:
+            out[big.replace("_observations", "_observation_count")] = len(out.pop(big) or {})
+    return {k: (_reflection_clip(v) if isinstance(v, (list, dict)) else v) for k, v in out.items()}
 
 
 def _reflection_clip(value, limit: int = 12, text: int = 160):
@@ -4746,6 +4754,7 @@ def reflection_loop_tick(
     store_item_findings: bool = True,
     enable_llm_triage: bool = False,
     max_llm_items: int = 3,
+    verbose: bool = False,
 ) -> str:
     """
     Process a small queue batch for self-reflection and store findings.
@@ -4755,6 +4764,9 @@ def reflection_loop_tick(
     - deterministic parsing only by default (no LLM pass)
     - optional bounded local-model advisory triage when ``enable_llm_triage=True``
     - writes findings through ``investigation_store`` (JSONL + Mnemosyne + Qdrant)
+
+    The returned ``stats`` are counts-only (the signature-observation maps were 158 KB and overflowed
+    tool-result limits); ``verbose=True`` returns them whole.
     """
     max_items = max(1, min(int(max_items), 20))
     max_lines_per_file = max(50, min(int(max_lines_per_file), 20000))
@@ -4894,7 +4906,7 @@ def reflection_loop_tick(
         "findings_written": findings_written,
         "remaining_queue": len(queue),
         "batch": item_reports,
-        "stats": stats,
+        "stats": _reflection_stats_view(stats, verbose),
     }, indent=2)
 
 
