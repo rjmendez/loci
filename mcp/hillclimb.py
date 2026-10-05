@@ -525,9 +525,26 @@ def _scrub_text(s: str) -> str:
     return text.replace("\n", " ")[:_OBS_TEXT]
 
 
-def _clean_counts(d: Any, text_keys: bool = False) -> dict:
+# The tick also reports session message text as "errors" (workflow-harness task prompts, teammate
+# messages, pasted analysis). That is conversation content, not a failure to triage, and labelling it
+# teaches the classifier nothing. Real tool errors arrive as short normalised templates
+# ("claude tool_result error: exit code <n>"), so anything long or shaped like a message is dropped.
+_PROSE_LEN = 120
+_PROSE_PREFIXES = ("[workflow harness", "<teammate-message", "**")
+
+
+def _is_prose(key: Any) -> bool:
+    k = str(key).lstrip()
+    return len(k) > _PROSE_LEN or k.startswith(_PROSE_PREFIXES)
+
+
+def _clean_counts(d: Any, text_keys: bool = False, drop_prose: bool = False) -> dict:
     out: dict = {}
-    for k, v in list((d or {}).items())[:_OBS_KEYS]:
+    for k, v in (d or {}).items():
+        if drop_prose and _is_prose(k):
+            continue
+        if len(out) >= _OBS_KEYS:
+            break
         key = _scrub_text(k) if text_keys else str(k)[:60]
         out[key] = v if isinstance(v, (int, float)) else _scrub_text(v)
     return out
@@ -571,9 +588,9 @@ def capture_observations(items: list, suite: str = "reflection_triage") -> int:
                 continue
             obs = {"kind": str(it.get("kind") or "")[:40], "path": _path_tail(it.get("path")),
                    "events": _clean_counts(it.get("events")), "tools": _clean_counts(it.get("tools")),
-                   "errors": _clean_counts(it.get("errors"), text_keys=True),
-                   "warnings": _clean_counts(it.get("warnings"), text_keys=True)}
-            if not (obs["errors"] or obs["warnings"] or obs["events"]):
+                   "errors": _clean_counts(it.get("errors"), text_keys=True, drop_prose=True),
+                   "warnings": _clean_counts(it.get("warnings"), text_keys=True, drop_prose=True)}
+            if not (obs["errors"] or obs["warnings"]):   # nothing left that looks like a failure
                 continue
             obs["id"] = observation_id(obs)
             if obs["id"] in seen:
@@ -589,6 +606,30 @@ def capture_observations(items: list, suite: str = "reflection_triage") -> int:
         return len(new)
     except Exception:
         return 0
+
+
+def prune_observations(suite: str = "reflection_triage") -> dict:
+    """Re-apply the prose filter to observations captured before it existed: drop message-text keys
+    (including ones truncated at the cap), drop rows with no error or warning left, re-derive ids and
+    merge duplicates. Labels are untouched. Returns {before, after}."""
+    path = suite_dir(suite) / "observations.jsonl"
+    rows = _read_jsonl(path)
+    keep, seen = [], set()
+    for r in rows:
+        for field in ("errors", "warnings"):
+            r[field] = {k: v for k, v in (r.get(field) or {}).items() if not _is_prose(k) and len(k) < _OBS_TEXT}
+        if not (r["errors"] or r["warnings"]):
+            continue
+        r["id"] = observation_id(r)
+        if r["id"] in seen:
+            continue
+        seen.add(r["id"])
+        keep.append(r)
+    if rows:   # rows were edited in place, so a before/after comparison would see no change: always rewrite
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("".join(json.dumps(o, sort_keys=True) + "\n" for o in keep), encoding="utf-8")
+        os.replace(tmp, path)
+    return {"before": len(rows), "after": len(keep)}
 
 
 def _show(obs: dict) -> str:
@@ -701,6 +742,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     lb.add_argument("--n", type=int, default=30)
     lb.add_argument("--skipped", action="store_true", help="show observations you skipped before")
     lb.add_argument("--model", action="store_true", help="show what the classifier says AFTER you answer")
+    sub.add_parser("prune", help="drop message-text observations captured before the prose filter").add_argument("--suite", default="triage")
     ls = sub.add_parser("labels", help="how many real labels exist and whether they are enough")
     ls.add_argument("--suite", default="triage")
     a = p.parse_args(argv)
@@ -713,6 +755,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
                                                        errors=o["errors"], warnings=o["warnings"]).get("category")
         res = label(suite_name(a.suite), a.n, a.skipped, classify=classify)
         print(json.dumps(res))
+        return 0
+    if a.cmd == "prune":
+        print(json.dumps(prune_observations(suite_name(a.suite))))
         return 0
     if a.cmd == "labels":
         print(json.dumps(label_stats(suite_name(a.suite)), indent=1))

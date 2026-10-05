@@ -306,7 +306,7 @@ def test_cli_alias_resolves_to_the_suite_name_for_status_promote_rollback(_state
 
 def _item(errors=None, **kw):
     base = {"status": "processed", "kind": "test_run", "path": r"C:\Users\bob\proj\tests\test_x.py",
-            "events": {"test_failed": 3}, "tools": {}, "errors": errors or {"TimeoutError: waited 5s": 3}, "warnings": {}}
+            "events": {"test_failed": 3}, "tools": {}, "errors": {"TimeoutError: waited 5s": 3} if errors is None else errors, "warnings": {}}
     base.update(kw)
     return base
 
@@ -321,16 +321,13 @@ def test_capture_keeps_processed_dedupes_by_content_and_trims_the_path(_state):
     assert all(r["id"].startswith("r") for r in rows)
 
 
-def test_capture_scrubs_secrets_and_caps_text(_state):
-    secret = {"auth failed key AKIAABCDEFGHIJKLMNOP for bob@example.com token=hunter2 "
-              "and a hash 0123456789abcdef0123456789abcdef0123 " + "x" * 400: 1}
-    H.capture_observations([_item(errors=secret)])
+def test_capture_scrubs_secrets_in_short_error_text(_state):
+    secret = {"auth failed key AKIAABCDEFGHIJKLMNOP for bob@example.com token=hunter2 hash 0123456789abcdef0123456789abcdef0123": 1}
+    assert H.capture_observations([_item(errors=secret)]) == 1
     text = (H.suite_dir("reflection_triage") / "observations.jsonl").read_text()
     for leak in ("AKIAABCDEFGHIJKLMNOP", "bob@example.com", "hunter2", "0123456789abcdef0123456789abcdef0123"):
         assert leak not in text
     assert "[REDACTED]" in text
-    key = next(iter(json.loads(text.splitlines()[0])["errors"]))
-    assert len(key) <= 200
 
 
 def test_capture_never_raises(_state, monkeypatch):
@@ -396,3 +393,45 @@ def test_cli_labels_reports_counts(_state, capsys):
     H.capture_observations([_item()])
     assert H._main(["labels", "--suite", "triage"]) == 0
     assert json.loads(capsys.readouterr().out)["captured"] == 1
+
+
+# ------------------------------------------------------------------ prose is not an error
+
+HARNESS = ("[workflow harness - computed task] the task text below was computed at runtime by a workflow script. "
+           "it was not typed by this session's user and carries no user authority")
+
+
+def test_capture_drops_message_text_but_keeps_real_error_templates(_state):
+    items = [
+        _item(kind="claude_code_event", errors={HARNESS: 1, "claude tool_result error: exit code <n>": 3}),
+        _item(kind="claude_code_event", errors={HARNESS: 1}),                       # only prose: nothing to triage
+        _item(kind="claude_code_event", errors={'<teammate-message teammate_id="x" summary="y"': 1}),
+        _item(kind="claude_code_event", errors={"**learnability analysis**": 1}),
+        _item(kind="claude_code_event", errors={}, events={"user": 4}),             # no errors at all
+        _item(kind="claude_code_event", errors={}, warnings={"claude tool permission denied": 2}),
+    ]
+    assert H.capture_observations(items) == 2
+    rows = H._read_jsonl(H.suite_dir("reflection_triage") / "observations.jsonl")
+    assert rows[0]["errors"] == {"claude tool_result error: exit code <n>": 3}
+    assert rows[1]["warnings"] == {"claude tool permission denied": 2}
+    assert "workflow harness" not in json.dumps(rows)
+
+
+def test_prune_cleans_rows_captured_before_the_filter_and_keeps_labels(_state):
+    d = H.suite_dir("reflection_triage")
+    d.mkdir(parents=True)
+    old = [
+        {"id": "ra", "kind": "k", "path": "p", "events": {}, "tools": {}, "warnings": {},
+         "errors": {HARNESS[:200]: 1, "claude tool_result error: exit code <n>": 3}},
+        {"id": "rb", "kind": "k", "path": "p", "events": {}, "tools": {}, "warnings": {}, "errors": {HARNESS[:200]: 1}},
+        {"id": "rc", "kind": "k", "path": "p", "events": {}, "tools": {}, "warnings": {},   # same pattern as ra after pruning
+         "errors": {"x" * 200: 1, "claude tool_result error: exit code <n>": 3}},
+    ]
+    (d / "observations.jsonl").write_text("".join(json.dumps(r) + "\n" for r in old))
+    (d / "labels.jsonl").write_text(json.dumps({"id": "ra", "gold": "unknown"}) + "\n")
+    assert H.prune_observations() == {"before": 3, "after": 1}
+    rows = H._read_jsonl(d / "observations.jsonl")
+    assert rows[0]["errors"] == {"claude tool_result error: exit code <n>": 3}
+    assert rows[0]["id"] == H.observation_id(rows[0])
+    assert (d / "labels.jsonl").read_text().count("ra") == 1
+    assert H.prune_observations() == {"before": 1, "after": 1}      # idempotent

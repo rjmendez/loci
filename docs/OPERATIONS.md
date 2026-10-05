@@ -1247,7 +1247,10 @@ The synthetic cases are too few to rank patches. Real ones come from the reflect
 - `hillclimb.capture_observations(batch)` keeps a scrubbed, de-duplicated copy of each processed tick item
   (kind, path tail, event/tool counts, short error and warning text; secrets, emails, long hex redacted) in
   `<data home>/hillclimb/reflection_triage/observations.jsonl`. De-duplication is by content, so one pattern seen in a
-  hundred files is one item. The scheduled driver calls it after each tick; it never raises.
+  hundred files is one item. Message text the tick reports as "errors" (workflow-harness prompts, teammate
+  messages, anything over 120 chars) is dropped, and an item is kept only if a real error or warning
+  remains. `hillclimb.py prune` re-applies that filter to rows captured earlier. The scheduled driver calls
+  capture after each tick; it never raises.
 - `python mcp/hillclimb.py label [--n 30] [--model] [--skipped]` shows one observation at a time. Answer `r` regression,
   `f` flaky, `c` config/env, `n` noise, `u` unknown, `s` skip, `q` quit. `--model` prints the classifier's answer
   only after you answer, and tallies agreement. Labels append to `labels.jsonl` and resume where you left off.
