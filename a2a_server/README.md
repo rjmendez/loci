@@ -28,6 +28,51 @@ Optional env:
 - `LOCI_A2A_IDEMPOTENCY_TTL_S` (default `3600`) sets replay window TTL for
   `(sender, skill_id, idempotency_key)`.
 
+## Signed requests (Ed25519)
+
+A caller can prove who it is with a key instead of a shared token. It sends `X-Agent-ID` and
+`X-Signature`; the server checks the signature against the public key registered for that agent.
+A signed caller is bound to its agent id (the `sender` field cannot name anyone else), skips TOTP,
+and may call a destructive skill only if listed in `LOCI_A2A_PRIVILEGED_SENDERS`. A signature that
+does not verify is refused outright; it never falls back to a bearer token.
+
+Register keys with `PEER_PUBKEYS_DIR` (a directory of `<agent_id>.pub` PEM files) and/or
+`PEER_PUBKEYS_JSON` (`{"agent_id": "<PEM>"}`); a malformed entry is skipped and named in the log.
+`/health` lists `registered_peers`, `signature_required` and `signature_min_version`, never keys.
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `A2A_REQUIRE_SIGNATURE=1` | refuse everything that is not validly signed (the server refuses to start without the `cryptography` package) | off |
+| `A2A_SIGNATURE_MIN_VERSION` | `2` refuses v1 | `1` |
+| `A2A_SIGNATURE_MAX_SKEW_S` | accepted clock skew of `X-Timestamp` | `60` |
+| `A2A_SIGNING_KEY_FILE`, `PEER_A2A_SIGNED_URLS`, `A2A_SIGNING_VERSION` | sign this node's outbound peer calls (instead of bearer + TOTP) for the listed peers | off, version `2` |
+
+Two wire versions:
+
+- **v1** signs the raw body only. This is what the agent-mesh clients (`agent-mesh/a2a/auth.py`)
+  send. Its `X-Timestamp` and `X-Request-ID` are not covered by the signature, so a captured request
+  can be replayed with fresh headers; the server only refuses a byte-identical replay. Kept so the
+  existing fleet keeps working.
+- **v2** (`X-Signature-Version: 2`) signs `a2a-sig-v2`, agent id, timestamp, nonce, method, path and
+  the SHA-256 of the body, joined by newlines. Nothing in it can be changed or replayed. `client.py`
+  signs v2 when `A2A_SIGNING_KEY_FILE` is set. Behind a reverse proxy that rewrites the path, sign the
+  path the server sees.
+
+Move a fleet over by registering keys, switching callers to v2, then setting
+`A2A_SIGNATURE_MIN_VERSION=2` and, when every caller signs, `A2A_REQUIRE_SIGNATURE=1`.
+
+## Docker
+
+The image needs files from `mcp/` (the investigation ACL helpers), so build from the repository root:
+
+```
+docker build -f a2a_server/Dockerfile -t loci-a2a .
+```
+
+`docker compose` does this already (`context: .`). Building with `a2a_server/` as the context fails
+at the `COPY mcp/...` step on purpose: an image without those helpers would withhold every
+investigation hit from `rag_search`.
+
 ## Skills
 
 | skill_id            | What it does |

@@ -7,6 +7,11 @@ Python:
     results = await c.memory_recall("DAMA ant colony telemetry")
     await c.memory_remember("Resolved the k3s issue at 03:00 UTC", sender="hermes-agent")
 
+Signed requests (Ed25519, instead of a bearer token): set A2A_SIGNING_KEY_FILE to a PEM private
+key whose public half the server has registered for HERMES_AGENT_ID (PEER_PUBKEYS_DIR / _JSON).
+A2A_SIGNING_VERSION picks the wire format: 2 (default) binds timestamp, nonce, method, path and
+body so a captured request cannot be replayed; 1 signs the raw body only (older servers).
+
 CLI:
     python3 client.py recall "DAMA"
     python3 client.py stats
@@ -14,7 +19,8 @@ CLI:
     python3 client.py remember "content here" --sender hermes-agent
 """
 
-import os, sys, json, asyncio, uuid
+import os, sys, json, asyncio, uuid, base64, hashlib, time
+from urllib.parse import urlsplit
 
 # Load ~/.hermes/.env if present.
 _ENV = os.path.expanduser('~/.hermes/.env')
@@ -37,6 +43,35 @@ try:
 except ImportError:
     _PYOTP = False
 
+# Optional Ed25519 request signing.
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    _CRYPTO = True
+except ImportError:
+    _CRYPTO = False
+
+
+def _load_signing_key(path: str):
+    """The Ed25519 private key in `path`, or a RuntimeError: a key that was asked for and cannot be
+    used must not quietly turn into an unsigned (bearer) request."""
+    if not _CRYPTO:
+        raise RuntimeError('signing key configured but the cryptography package is not installed')
+    try:
+        with open(os.path.expanduser(path), 'rb') as fh:
+            key = load_pem_private_key(fh.read(), password=None)
+    except Exception as e:
+        raise RuntimeError(f'signing key unusable ({e.__class__.__name__})') from None
+    if not isinstance(key, Ed25519PrivateKey):
+        raise RuntimeError('signing key unusable (not an Ed25519 private key)')
+    return key
+
+
+def _sig_payload_v2(agent_id: str, ts: str, nonce: str, method: str, path: str, body: bytes) -> bytes:
+    # Must match a2a_server/server.py _sig_payload_v2 byte for byte.
+    return '\n'.join(['a2a-sig-v2', agent_id, ts, nonce, method.upper(), path,
+                      hashlib.sha256(body).hexdigest()]).encode('utf-8')
+
 
 class LociClient:
     """Async client for the Loci A2A memory server.
@@ -44,6 +79,7 @@ class LociClient:
     Auth:
       - ****** in Authorization
       - X-TOTP only when a TOTP seed is configured
+      - or, when a signing key is configured, an Ed25519 signature as `sender` (no bearer, no TOTP)
     """
 
     def __init__(
@@ -51,13 +87,20 @@ class LociClient:
         endpoint: str = None,
         token: str = None,
         totp_seed: str = None,
-        sender: str = None
+        sender: str = None,
+        signing_key_file: str = None,
+        signature_version: int = None,
     ):
         self.endpoint  = (endpoint or os.environ.get('LOCI_A2A_URL',
                           'http://127.0.0.1:8201')).rstrip('/')
         self.token     = token or os.environ.get('LOCI_A2A_TOKEN', '')
         self.totp_seed = totp_seed or os.environ.get('LOCI_A2A_TOTP_SEED', '')
         self.sender    = sender or os.environ.get('HERMES_AGENT_ID', 'unknown')
+        key_path       = signing_key_file or os.environ.get('A2A_SIGNING_KEY_FILE', '')
+        self._signing_key = _load_signing_key(key_path) if key_path else None
+        self.signature_version = int(signature_version or os.environ.get('A2A_SIGNING_VERSION', 2))
+        if self.signature_version not in (1, 2):
+            raise ValueError(f'signature_version must be 1 or 2, got {self.signature_version}')
 
     def _headers(self) -> dict:
         h = {
@@ -67,6 +110,23 @@ class LociClient:
         if self.totp_seed and _PYOTP:
             h['X-TOTP'] = pyotp.TOTP(self.totp_seed).now()
         return h
+
+    def _signed_request(self, url: str, payload: dict) -> tuple:
+        """(body bytes, headers) for a request signed as `self.sender`."""
+        body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+        ts, nonce = str(int(time.time())), uuid.uuid4().hex
+        signed = (_sig_payload_v2(self.sender, ts, nonce, 'POST', urlsplit(url).path or '/', body)
+                  if self.signature_version == 2 else body)
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Agent-ID': self.sender,
+            'X-Timestamp': ts,
+            'X-Request-ID': nonce,
+            'X-Signature': base64.urlsafe_b64encode(self._signing_key.sign(signed)).decode('ascii'),
+        }
+        if self.signature_version == 2:
+            headers['X-Signature-Version'] = '2'
+        return body, headers
 
     async def _call(self, skill_id: str, message: str = '', input_data: dict = None) -> dict:
         payload = {
@@ -80,13 +140,15 @@ class LociClient:
                 'sender': self.sender
             }
         }
+        url = f'{self.endpoint}/a2a'
+        if self._signing_key is not None:
+            data, headers = self._signed_request(url, payload)
+            post_kwargs = {'data': data, 'headers': headers}
+        else:
+            post_kwargs = {'json': payload, 'headers': self._headers()}
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
-        ) as sess, sess.post(
-            f'{self.endpoint}/a2a',
-            json=payload,
-            headers=self._headers()
-        ) as resp:
+        ) as sess, sess.post(url, **post_kwargs) as resp:
             data = await resp.json()
             if resp.status != 200:
                 return {'error': f'HTTP {resp.status}', 'detail': data}

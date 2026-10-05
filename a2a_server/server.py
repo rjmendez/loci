@@ -53,6 +53,21 @@ Optional / tunable:
   LOCI_A2A_AGENT_TOKENS per-agent bearer tokens: JSON {"agent": "token"} or
     agent=token,agent2=token2. Each token authenticates (and binds the sender to)
     one agent_id; a peer that fans out memory_remember needs one here. Default: ''
+  PEER_PUBKEYS_JSON / PEER_PUBKEYS_DIR Ed25519 public keys of agents that may sign requests:
+    a JSON object {"agent_id": "<PEM>"} and/or a directory of <agent_id>.pub PEM files
+    (the directory wins on a clash). A signed caller sends X-Agent-ID + X-Signature, is bound
+    to that agent_id like a per-agent token, skips TOTP, and is privileged only if listed in
+    LOCI_A2A_PRIVILEGED_SENDERS. Needs the `cryptography` package. Default: none
+  A2A_REQUIRE_SIGNATURE 1 refuses every request that is not validly signed. Default: 0
+  A2A_SIGNATURE_MIN_VERSION lowest accepted signature version: 1 signs the raw body only (what
+    the agent-mesh clients send; its timestamp and nonce headers are unsigned, so it cannot
+    stop a replay with fresh headers), 2 signs agent, timestamp, nonce, method, path and
+    body hash together. Default: 1
+  A2A_SIGNATURE_MAX_SKEW_S accepted clock skew of X-Timestamp, seconds. Default: 60
+  A2A_SIGNING_KEY_FILE Ed25519 private key (PEM) this node signs outbound peer calls with,
+    as HERMES_AGENT_ID. Only used for peers listed in PEER_A2A_SIGNED_URLS.
+  PEER_A2A_SIGNED_URLS comma-separated peer URLs to sign for instead of sending a bearer token
+    and TOTP code. A2A_SIGNING_VERSION picks the wire version (1 or 2, default 2).
   PEER_A2A_URLS comma-separated peer A2A base URLs for fan-out skills
     (memory_broadcast, memory_prime). Default: ''
   PEER_A2A_TOKEN shared ****** for every peer. Default: ''
@@ -147,6 +162,7 @@ JSON-RPC call shape
 
 import os, sys, asyncio, uuid, json, sqlite3, logging, datetime, hmac, time, collections, secrets, threading, hashlib, re
 from typing import Optional, Any
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 
 # Accept legacy HERMES_* spellings. This server runs standalone and reaches
@@ -303,6 +319,222 @@ def _load_agent_tokens(environ: Optional[dict] = None, primary: str = '') -> dic
 # Per-agent bearer tokens: token -> agent_id. See _load_agent_tokens.
 _AGENT_TOKENS: dict[str, str] = _load_agent_tokens(primary=A2A_TOKEN)
 
+# ── Ed25519 per-agent signature auth ─────────────────────────────────────────────
+# A caller proves its identity by signing the request with its Ed25519 private key and
+# sending X-Agent-ID + X-Signature; the signature is checked against the public key
+# registered for that agent. Two wire versions:
+#   v1  X-Signature over the raw body only. This is what the agent-mesh clients send.
+#       X-Timestamp and X-Request-ID are NOT covered by it, so a captured request can be
+#       replayed with fresh headers: the checks below only stop a byte-identical replay.
+#       Kept for compatibility; A2A_SIGNATURE_MIN_VERSION=2 refuses it.
+#   v2  X-Signature-Version: 2. Signs agent id, timestamp, nonce, method, path and the
+#       body hash together, so none of them can be altered and a replay is refused.
+# A signed caller is bound to its agent_id like a per-agent token, skips TOTP (the key
+# already proves who it is) and is privileged only if listed in LOCI_A2A_PRIVILEGED_SENDERS.
+import base64
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+    _CRYPTO_OK = True
+except Exception:  # cryptography absent: signature auth is off, the other schemes still work
+    _CRYPTO_OK = False
+
+_AGENT_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
+_SIG_NONCE_PER_AGENT_CAP = 2000
+_SIG_NONCE_MAX_LEN = 128
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
+SIGNATURE_REQUIRED = os.environ.get('A2A_REQUIRE_SIGNATURE', '0').strip().lower() in ('1', 'true', 'yes')
+SIGNATURE_MIN_VERSION = _env_int('A2A_SIGNATURE_MIN_VERSION', 1, 1, 2)
+SIGNATURE_MAX_SKEW_S = _env_int('A2A_SIGNATURE_MAX_SKEW_S', 60, 5, 600)
+SIGNING_VERSION = _env_int('A2A_SIGNING_VERSION', 2, 1, 2)
+
+
+def _parse_pubkey(pem: str):
+    pub = load_pem_public_key(pem.encode('utf-8'))
+    if not isinstance(pub, Ed25519PublicKey):
+        raise ValueError('not an Ed25519 public key')
+    return pub
+
+
+def _load_peer_pubkeys(environ: Optional[dict] = None) -> dict:
+    """{agent_id: Ed25519PublicKey} from PEER_PUBKEYS_JSON and PEER_PUBKEYS_DIR.
+
+    A key that does not parse, is not Ed25519, or belongs to a malformed agent id is
+    skipped and named in the log (never its contents), so one bad entry cannot lock out
+    the rest and a typo does not pass silently.
+    """
+    env = os.environ if environ is None else environ
+    entries: dict = {}
+    raw = str(env.get('PEER_PUBKEYS_JSON', '') or '').strip()
+    if raw:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            log.error('PEER_PUBKEYS_JSON is not valid JSON; ignored')
+            obj = {}
+        if isinstance(obj, dict):
+            entries.update({k: v for k, v in obj.items() if isinstance(k, str) and isinstance(v, str)})
+        else:
+            log.error('PEER_PUBKEYS_JSON must be a JSON object {agent_id: PEM}; ignored')
+    d = str(env.get('PEER_PUBKEYS_DIR', '') or '').strip()
+    if d:
+        d = os.path.expanduser(d)
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if fn.endswith('.pub'):
+                    try:
+                        with open(os.path.join(d, fn), encoding='utf-8') as fh:
+                            entries[fn[:-4]] = fh.read()
+                    except OSError as e:
+                        log.error(f'peer key file {fn!r} unreadable ({e.__class__.__name__}); skipped')
+        else:
+            log.error('PEER_PUBKEYS_DIR is not a directory; ignored')
+    keys: dict = {}
+    if not entries:
+        return keys
+    if not _CRYPTO_OK:
+        log.warning('PEER_PUBKEYS_* is set but the cryptography package is not installed; '
+                    'signature auth is OFF')
+        return keys
+    for agent_id, pem in entries.items():
+        if not _AGENT_ID_RE.match(agent_id):
+            log.error(f'peer key for malformed agent id {agent_id[:40]!r} skipped')
+            continue
+        try:
+            keys[agent_id] = _parse_pubkey(pem)
+        except Exception as e:
+            log.error(f'peer key for {agent_id!r} rejected ({e.__class__.__name__}); skipped')
+    return keys
+
+
+_PEER_PUBKEYS: dict = _load_peer_pubkeys()
+if SIGNATURE_REQUIRED and not _CRYPTO_OK:
+    print('ERROR: A2A_REQUIRE_SIGNATURE=1 but the cryptography package is not installed; '
+          'refusing to start (every request would be refused).', file=sys.stderr)
+    sys.exit(1)
+if SIGNATURE_REQUIRED and not _PEER_PUBKEYS:
+    log.warning('A2A_REQUIRE_SIGNATURE=1 but no peer public keys are registered: '
+                'every request will be refused')
+
+# (agent_id -> {nonce: expiry}) so one agent cannot fill the cache for the others.
+_sig_nonces: dict = {}
+_sig_nonces_lock = threading.Lock()
+
+
+def _claim_nonce(agent_id: str, nonce: str, ttl_s: int) -> str:
+    """Record a request id: 'ok', 'replay' (seen inside its window) or 'full' (agent over its cap)."""
+    now = time.monotonic()
+    with _sig_nonces_lock:
+        per = _sig_nonces.setdefault(agent_id, {})
+        expiry = per.get(nonce)
+        if expiry is not None and expiry > now:
+            return 'replay'
+        if len(per) >= _SIG_NONCE_PER_AGENT_CAP:
+            for stale in [n for n, e in per.items() if e <= now]:
+                del per[stale]
+            if len(per) >= _SIG_NONCE_PER_AGENT_CAP:
+                return 'full'
+        per[nonce] = now + ttl_s
+        return 'ok'
+
+
+def _timestamp_fresh(ts: str) -> bool:
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return False
+    return abs(time.time() - value) <= SIGNATURE_MAX_SKEW_S     # False for NaN and infinities
+
+
+def _b64url_decode(text: str) -> bytes:
+    pad = '=' * (-len(text) % 4)
+    try:
+        return base64.urlsafe_b64decode(text + pad)
+    except Exception:
+        return base64.b64decode(text + pad)
+
+
+def _sig_payload_v2(agent_id: str, ts: str, nonce: str, method: str, path: str, body: bytes) -> bytes:
+    return '\n'.join(['a2a-sig-v2', agent_id, ts, nonce, method.upper(), path,
+                      hashlib.sha256(body).hexdigest()]).encode('utf-8')
+
+
+def _verify_ed25519(pub, payload: bytes, sig_b64: str) -> bool:
+    try:
+        pub.verify(_b64url_decode(sig_b64), payload)
+        return True
+    except Exception:
+        return False
+
+
+async def _verify_signature_request(request: Request, agent_id: str, sig_b64: str) -> dict:
+    invalid = HTTPException(status_code=401, detail='Unauthorized — invalid agent signature')
+    pub = _PEER_PUBKEYS.get(agent_id) if _CRYPTO_OK else None
+    if pub is None:                     # unknown agent and bad signature look the same
+        raise invalid
+    version_header = (request.headers.get('x-signature-version') or '1').strip()
+    if version_header not in ('1', '2'):
+        raise HTTPException(status_code=401, detail='Unauthorized — unsupported signature version')
+    version = int(version_header)
+    if version < SIGNATURE_MIN_VERSION:
+        raise HTTPException(status_code=401, detail=(
+            f'Unauthorized — signature version {version} is no longer accepted '
+            f'(minimum {SIGNATURE_MIN_VERSION})'))
+    ts = (request.headers.get('x-timestamp') or '').strip()
+    nonce = (request.headers.get('x-request-id') or '').strip()
+    body = await request.body()
+    if version == 2:
+        if not ts or not nonce:
+            raise HTTPException(status_code=401,
+                                detail='Unauthorized — signature v2 needs X-Timestamp and X-Request-ID')
+        payload = _sig_payload_v2(agent_id, ts, nonce, request.method, request.url.path, body)
+    else:
+        payload = body
+    if ts and not _timestamp_fresh(ts):
+        raise HTTPException(status_code=401, detail='Unauthorized — X-Timestamp outside the allowed window')
+    if not _verify_ed25519(pub, payload, sig_b64):
+        raise invalid
+    if nonce:                           # only after the signature verified: strangers cannot fill the cache
+        if len(nonce) > _SIG_NONCE_MAX_LEN:
+            raise invalid
+        claim = _claim_nonce(agent_id, nonce, 2 * SIGNATURE_MAX_SKEW_S)
+        if claim == 'replay':
+            raise HTTPException(status_code=401, detail='Unauthorized — request id already used')
+        if claim == 'full':
+            raise HTTPException(status_code=429, detail='Too many signed requests in flight for this agent')
+    return {'token_type': 'signature', 'sender': agent_id, 'sig_version': version}
+
+
+def _load_signing_key():
+    path = os.environ.get('A2A_SIGNING_KEY_FILE', '').strip()
+    if not path:
+        return None
+    if not _CRYPTO_OK:
+        log.error('A2A_SIGNING_KEY_FILE is set but the cryptography package is not installed')
+        return None
+    try:
+        with open(os.path.expanduser(path), 'rb') as fh:
+            key = load_pem_private_key(fh.read(), password=None)
+        if not isinstance(key, Ed25519PrivateKey):
+            raise ValueError('not an Ed25519 private key')
+        return key
+    except Exception as e:
+        log.error(f'A2A_SIGNING_KEY_FILE unusable ({e.__class__.__name__}); outbound signing is off')
+        return None
+
+
+_SIGNING_KEY = _load_signing_key()
+
+
 # ── agent card (RFC-002 schema) ─────────────────────────────────────────────────
 AGENT_CARD = {
     'name': AGENT_ID,
@@ -425,9 +657,13 @@ AGENT_CARD = {
         'push_notifications': False
     },
     'authentication': {
-        'schemes': ['bearer'],
+        'schemes': ['bearer'] + (['ed25519-signature'] if _CRYPTO_OK and _PEER_PUBKEYS else []),
         'totp_enabled': bool(TOTP_SEED),
-        'totp_header': 'X-TOTP'
+        'totp_header': 'X-TOTP',
+        'signature': {
+            'headers': ['X-Agent-ID', 'X-Signature', 'X-Signature-Version', 'X-Timestamp', 'X-Request-ID'],
+            'versions': [v for v in (1, 2) if v >= SIGNATURE_MIN_VERSION],
+        },
     }
 }
 
@@ -652,14 +888,22 @@ def _authenticated_agent(auth: dict) -> Optional[str]:
     token proves this node's operator, i.e. the local agent (HERMES_AGENT_ID),
     never a sender it merely declares.
     """
-    if auth.get('token_type') in ('session', 'agent'):
+    if auth.get('token_type') in ('session', 'agent', 'signature'):
         return auth.get('sender') or None
     if auth.get('token_type') == 'primary':
         return AGENT_ID
     return None
 
 
-def _verify_bearer(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
+async def _verify_bearer(request: Request,
+                         creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
+    agent_id = (request.headers.get('x-agent-id') or '').strip()
+    sig = (request.headers.get('x-signature') or '').strip()
+    if agent_id and sig:
+        # A signature that does not verify is final: it never falls back to a bearer token.
+        return await _verify_signature_request(request, agent_id, sig)
+    if SIGNATURE_REQUIRED:
+        raise HTTPException(status_code=401, detail='Unauthorized — X-Agent-ID and X-Signature required')
     if not creds:
         raise HTTPException(status_code=401, detail='Unauthorized — missing bearer token')
     tok = creds.credentials
@@ -692,7 +936,7 @@ _bootstrap_attempts_lock = threading.Lock()
 
 @contextmanager
 def _bind_authenticated_caller(auth: dict):
-    if auth.get('token_type') in ('session', 'agent') and _caller_identity is not None:
+    if auth.get('token_type') in ('session', 'agent', 'signature') and _caller_identity is not None:
         with _caller_identity.bound(auth.get('sender') or None):
             yield
     else:
@@ -701,7 +945,7 @@ def _bind_authenticated_caller(auth: dict):
 
 def _bound_sender(requested_sender: Optional[str], auth: dict) -> str:
     """Bind session and per-agent tokens to the agent_id they authenticate."""
-    if auth.get('token_type') in ('session', 'agent'):
+    if auth.get('token_type') in ('session', 'agent', 'signature'):
         sender = auth.get('sender') or 'unknown'
         if requested_sender and requested_sender != sender:
             raise HTTPException(
@@ -714,7 +958,12 @@ def _bound_sender(requested_sender: Optional[str], auth: dict) -> str:
 
 def _verify_totp(request: Request,
                  x_totp: Optional[str] = Header(default=None),
-                 creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme)):
+                 creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+                 auth: dict = Depends(_verify_bearer)):
+    # Skipped only when _verify_bearer verified a signature for this request: the header
+    # alone proves nothing, and the key already proves who the caller is.
+    if auth.get('token_type') == 'signature':
+        return
     # A /bootstrap session token already proves possession of the pre-shared
     # bootstrap key and carries its own expiry, so it stands alone as a bearer —
     # that is the entire point of issuing one. Without this, enabling TOTP makes
@@ -1363,6 +1612,39 @@ def _peer_credentials() -> tuple[dict, str, dict, str]:
     return token_map, default_token, seed_map, default_seed
 
 
+def _peer_is_signed(peer_url: str) -> bool:
+    """True if PEER_A2A_SIGNED_URLS lists this peer (compared by base URL)."""
+    wanted = {_peer_base_url(u.strip()) for u in os.environ.get('PEER_A2A_SIGNED_URLS', '').split(',')
+              if u.strip()}
+    return _peer_base_url(peer_url) in wanted
+
+
+def _peer_post_kwargs(peer_url: str, headers: dict, payload: dict) -> dict:
+    """Keyword arguments for the aiohttp POST to a peer.
+
+    Unsigned peers get the JSON body and headers exactly as before. A signed peer gets the
+    serialized bytes that were signed, so the receiver hashes what this node hashed.
+    """
+    if not _peer_is_signed(peer_url) or _SIGNING_KEY is None:
+        return {'json': payload, 'headers': headers}
+    body = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+    ts, nonce = str(int(time.time())), uuid.uuid4().hex
+    path = urlsplit(peer_url).path or '/'
+    signed = (_sig_payload_v2(AGENT_ID, ts, nonce, 'POST', path, body)
+              if SIGNING_VERSION == 2 else body)
+    out = dict(headers)
+    out.update({
+        'Content-Type': 'application/json',
+        'X-Agent-ID': AGENT_ID,
+        'X-Timestamp': ts,
+        'X-Request-ID': nonce,
+        'X-Signature': base64.urlsafe_b64encode(_SIGNING_KEY.sign(signed)).decode('ascii'),
+    })
+    if SIGNING_VERSION == 2:
+        out['X-Signature-Version'] = '2'
+    return {'data': body, 'headers': out}
+
+
 def _peer_headers(peer_url: str, token_map: dict, default_token: str,
                   seed_map: dict, default_seed: str):
     """Build outbound headers for one peer.
@@ -1372,6 +1654,10 @@ def _peer_headers(peer_url: str, token_map: dict, default_token: str,
     so attach `X-TOTP` whenever a seed is configured.
     """
     base  = _peer_base_url(peer_url)
+    if _peer_is_signed(peer_url):
+        if _SIGNING_KEY is None:
+            return None, 'signing key not configured'
+        return {'Content-Type': 'application/json'}, None
     token = token_map.get(peer_url) or token_map.get(base) or default_token
     if not token:
         return None, 'no token configured'
@@ -1497,7 +1783,7 @@ async def skill_context_broadcast(task: dict) -> dict:
         )
         try:
             sess = _get_http_session()
-            async with sess.post(peer_url, json=payload, headers=headers) as r:
+            async with sess.post(peer_url, **_peer_post_kwargs(peer_url, headers, payload)) as r:
                 if r.status == 200:
                     data = await r.json()
                     return {'peer': peer_url, 'status': 'ok',
@@ -1832,8 +2118,7 @@ async def skill_memory_prime(task: dict) -> dict:
             try:
                 sess = _get_http_session()
                 async with sess.post(
-                    peer_url, json=payload,
-                    headers=headers,
+                    peer_url, **_peer_post_kwargs(peer_url, headers, payload),
                 ) as resp:
                     return {'peer': peer_url, 'status': resp.status}
             except Exception as e:
@@ -1905,6 +2190,11 @@ async def health():
         'totp_enabled': bool(TOTP_SEED),
         'bootstrap_configured': bool(BOOTSTRAP_KEY),
         'active_sessions': len(_session_tokens),
+        'signature_auth': _CRYPTO_OK and bool(_PEER_PUBKEYS),
+        'registered_peers': sorted(_PEER_PUBKEYS),
+        'signature_required': SIGNATURE_REQUIRED,
+        'signature_min_version': SIGNATURE_MIN_VERSION,
+        'outbound_signing': _SIGNING_KEY is not None,
     })
 
 

@@ -42,8 +42,8 @@ services:
 
   hermes-a2a:
     build:
-      context: ./a2a_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: a2a_server/Dockerfile
     env_file:
       - path: .env
         required: false

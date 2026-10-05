@@ -1,3 +1,5 @@
+# Build from the repository ROOT (the image needs files from mcp/ as well as a2a_server/):
+#   docker build -f a2a_server/Dockerfile -t loci-a2a .
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -8,9 +10,18 @@ RUN pip install --no-cache-dir \
     "starlette==1.0.1" \
     "pydantic==2.13.4" \
     "aiohttp==3.13.4" \
-    "pyotp==2.9.0"
+    "pyotp==2.9.0" \
+    "cryptography==46.0.7"
 
-COPY server.py client.py ./
+COPY a2a_server/server.py a2a_server/client.py ./
+
+# server.py imports these by module name. caller_identity, inv_store and provenance_firewall are
+# the investigation ACL and retraction filter on rag_search: without them every investigation hit
+# is withheld (fails closed, but the feature is dead). legacy_env maps the old HERMES_A2A_* names
+# to LOCI_A2A_*: without it an image configured the old way starts with no token. PYTHONPATH is
+# how server.py finds them.
+COPY mcp/caller_identity.py mcp/inv_store.py mcp/provenance_firewall.py mcp/legacy_env.py /app/mcp/
+ENV PYTHONPATH=/app/mcp
 
 # LOCI_A2A_TOKEN is required — server exits at startup if unset.
 # Provide it via .env file or environment injection.
