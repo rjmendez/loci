@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/github-copilot-cli-hooks.json",
+  "description": "Enforce Loci RAG grounding before tool use and on each prompt (main agent + subagents). Fail-open. Rendered by scripts/hooks/copilot/install.sh.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "@CMD_LLM@", "timeout": 30 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "@CMD_TOOL@", "timeout": 30 } ] }
+    ]
+  }
+}

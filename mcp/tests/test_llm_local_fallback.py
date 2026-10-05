@@ -4,8 +4,7 @@ generate() targeted Ollama only, with a hardcoded model tag, and swallowed the
 exception on failure — returning {'text':'','ok':False} with nothing to act on.
 
 Measured on this host: Ollama serves ONLY nomic-embed-text (an embedding model,
-no generation model at all) while vLLM serves the generation model under a
-different name — Qwen/Qwen2.5-3B-Instruct, not the Ollama-style qwen2.5:3b.
+no generation model at all), so a hardcoded generation tag cannot work.
 Asking either server for the other's name fails, and the reason was discarded.
 
 Consequence: verify_finding returned degraded=True with empty reasoning for every
@@ -36,7 +35,6 @@ class FailuresAreExplainedTest(unittest.TestCase):
     def test_a_transport_failure_carries_the_exception(self):
         """The regression: this used to return ok=False with no reason at all."""
         with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch("requests.post", side_effect=OSError("connection refused")):
             r = llm_local.generate("hello")
         self.assertFalse(r["ok"])
@@ -51,67 +49,6 @@ class FailuresAreExplainedTest(unittest.TestCase):
             r = llm_local.generate("hello", fmt="json")
         self.assertFalse(r["ok"])
         self.assertIn("not valid JSON", r["why"])
-
-
-class VllmFallbackTest(unittest.TestCase):
-
-    def test_ollama_failure_falls_through_to_vllm(self):
-        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
-             mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm",
-                               return_value={"text": "OK", "ok": True,
-                                             "model": "Qwen/Qwen2.5-3B-Instruct",
-                                             "tier": "vllm"}):
-            r = llm_local.generate("hello")
-        self.assertTrue(r["ok"])
-        self.assertEqual(r["tier"], "vllm")
-
-    def test_a_successful_ollama_call_does_not_reach_vllm(self):
-        resp = mock.MagicMock()
-        resp.json.return_value = {"response": "hi"}
-        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
-             mock.patch("requests.post", return_value=resp), \
-             mock.patch.object(llm_local, "_try_vllm") as vllm:
-            r = llm_local.generate("hello")
-        self.assertTrue(r["ok"])
-        vllm.assert_not_called()
-
-    def test_vllm_declining_leaves_the_ollama_reason_intact(self):
-        """Both tiers down must not hide WHICH failed or why."""
-        with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
-             mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None):
-            r = llm_local.generate("hello")
-        self.assertFalse(r["ok"])
-        self.assertIn("ollama", r["why"])
-
-    def _try(self, batch_result, opt_in="1"):
-        # The hermetic conftest deletes LOCI_VLLM_FALLBACK, and with it unset _try_vllm
-        # returns None before looking at the result -- set the opt-in so the result
-        # handling under test actually runs.
-        fake = mock.MagicMock()
-        fake.generate_batch.return_value = batch_result
-        fake._resolve_vllm_model.return_value = "served-model"
-        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": opt_in}), \
-                mock.patch.dict("sys.modules", {"batched_gen": fake}):
-            out = llm_local._try_vllm("hi", fmt="json", max_tokens=8, temperature=0.0)
-        return out, fake
-
-    def test_a_vllm_result_that_is_not_ok_is_not_returned_as_success(self):
-        out, fake = self._try([{"text": "junk", "ok": False}])
-        self.assertIsNone(out)
-        fake.generate_batch.assert_called_once_with(["hi"], max_tokens=8, fmt="json",
-                                                    think=False, endpoint_role=None)
-
-    def test_an_ok_vllm_result_is_returned_as_the_vllm_tier(self):
-        # Positive twin with the same opt-in: an ok result comes back, tagged.
-        out, _ = self._try([{"text": "answer", "ok": True}])
-        self.assertEqual(out, {"text": "answer", "ok": True, "model": "served-model", "tier": "vllm"})
-
-    def test_without_the_opt_in_vllm_is_never_called(self):
-        out, fake = self._try([{"text": "answer", "ok": True}], opt_in="0")
-        self.assertIsNone(out)
-        fake.generate_batch.assert_not_called()
 
 
 if __name__ == "__main__":
@@ -165,56 +102,11 @@ class GenerationEndpointResolutionTest(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["model"], "some-model:7b")
 
 
-class VllmFallbackIsOptInTest(unittest.TestCase):
-    """The fallback must not borrow a service Loci does not own.
-
-    backends resolves vLLM to 127.0.0.1:18000, which is
-    /home/rjmendez/dama-vllm/vllm_tailscale_forward.py — another project's
-    process, serving Qwen2.5-3B-Instruct at max_model_len=4096. Grounded verify
-    prompts exceed that, so firing into it both 400s and consumes capacity Loci
-    has no claim on. It was added when Ollama generation was broken; Ollama works
-    now, so the default is off.
-    """
-
-    def test_disabled_by_default(self):
-        with mock.patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("LOCI_VLLM_FALLBACK", None)
-            self.assertIsNone(
-                llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0))
-
-    def test_zero_is_also_disabled(self):
-        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": "0"}):
-            self.assertIsNone(
-                llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0))
-
-    def test_opt_in_reaches_batched_gen(self):
-        fake = mock.MagicMock()
-        fake.generate_batch.return_value = [{"text": "OK", "ok": True}]
-        with mock.patch.dict("os.environ", {"LOCI_VLLM_FALLBACK": "1"}), \
-             mock.patch.dict("sys.modules", {"batched_gen": fake}):
-            out = llm_local._try_vllm("hi", fmt=None, max_tokens=8, temperature=0.0)
-        self.assertEqual(out["ok"], True)
-        fake.generate_batch.assert_called_once()
-
-    def test_an_ollama_failure_no_longer_silently_reaches_vllm(self):
-        """The whole point: a failed generate must report why, not reroute."""
-        with mock.patch.dict("os.environ", {}, clear=False):
-            import os
-            os.environ.pop("LOCI_VLLM_FALLBACK", None)
-            with mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
-                 mock.patch("requests.post", side_effect=OSError("refused")):
-                r = llm_local.generate("hello")
-        self.assertFalse(r["ok"])
-        self.assertIn("ollama", r["why"])
-
-
 class CloudTierFallbackTest(unittest.TestCase):
     def test_cloud_tier_openrouter_fallback_returns_success(self):
         with mock.patch.dict("os.environ", {"LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1"}), \
              mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch.object(llm_local, "_supervisor_route",
                                return_value={"provider": "openrouter", "role": "triage"}), \
              mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -230,7 +122,6 @@ class CloudTierFallbackTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT": "1"}), \
              mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch.object(llm_local, "_supervisor_route",
                                return_value={"provider": "abliteration", "role": "redteam"}), \
              mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -246,7 +137,6 @@ class CloudTierFallbackTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=False), \
              mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch.object(llm_local, "_supervisor_route",
                                return_value={"provider": "openrouter", "role": "triage"}), \
              mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -264,7 +154,6 @@ class CloudTierFallbackTest(unittest.TestCase):
         }), \
              mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch.object(llm_local, "_supervisor_route",
                                return_value={"provider": "openrouter", "role": "triage"}), \
              mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -284,7 +173,6 @@ class CloudTierFallbackTest(unittest.TestCase):
         }), \
              mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
              mock.patch("requests.post", side_effect=OSError("refused")), \
-             mock.patch.object(llm_local, "_try_vllm", return_value=None), \
              mock.patch.object(llm_local, "_supervisor_route",
                                return_value={"provider": "abliteration", "role": "redteam"}), \
              mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -311,7 +199,6 @@ class CloudTierFallbackTest(unittest.TestCase):
             }), \
                  mock.patch.object(llm_local, "_gen_env", lambda: "http://x"), \
                  mock.patch("requests.post", side_effect=OSError("refused")), \
-                 mock.patch.object(llm_local, "_try_vllm", return_value=None), \
                  mock.patch.object(llm_local, "_supervisor_route",
                                    return_value={"provider": "openrouter", "role": "triage"}), \
                  mock.patch("backends.cloud_tier_enabled", return_value=True), \
@@ -338,8 +225,8 @@ class GenerationEnvPrecedenceTest(unittest.TestCase):
     as the highest-precedence generation override. scripts/loci_groom.load_env(),
     which every groom pass calls, sets OLLAMA_BASE_URL to the in-cluster host that
     serves only nomic-embed-text — so under cron, 100% of generation went to a
-    host with no generation model. The vLLM fallback was silently rescuing it;
-    once #224 made that opt-in, the groom pass went from 9/100 to 100/100 degraded.
+    host with no generation model (a fallback tier that has since been removed had been
+    silently rescuing it; without it the groom pass went from 9/100 to 100/100 degraded).
 
     Read at CALL time so load_env() — which runs after import — is respected, and
     so these tests need no importlib.reload (which made the first version of them

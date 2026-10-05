@@ -5,7 +5,7 @@
 Settings resolve through a chain (`mcp/backends.py`):
 
 1. the environment variable
-2. a local probe — `http://localhost:11434` for Ollama, `:8000` for vLLM
+2. a local probe — `http://localhost:11434` for Ollama
 3. `~/.loci/backends.toml`, or `$LOCI_CONFIG` — gitignored, machine-specific
 4. the code default
 
@@ -26,7 +26,6 @@ not live in the repo.
 | `LOCI_OLLAMA_GEN_MODEL` | auto (`qwen2.5:3b` if present, else first local non-embedding tag, else `qwen2.5:3b`) | the generation model tag on `gen_url` (`mcp/backends.py:ollama_gen_model`). Explicit env/config still wins. This auto-fallback prevents hardcoded defaults from silently pointing at missing local tags. |
 | `LOCI_OLLAMA_AUTO_MAX_GB` | `10` | size cap (decimal GB, as `ollama list` reports) for models the `mcp/backends.py` resolvers pick *automatically* from the local inventory. Larger installed tags are skipped: Ollama splits a model bigger than one GPU across cards, and on 11-12 GB cards those loads time out and stall its scheduler for every other model, embeddings included. Explicit env/config model names are never filtered. |
 | `LOCI_OLLAMA_REDTEAM_MODEL` | auto (preferred: `heretic-llama31-8b-instruct:latest`, then a local heretic/abliterated tag that fits one GPU, else that default string) | explicit adversarial model for `scripts/local_deep_think.py --red-team`. This intentionally biases toward heretic/abliterated models because aligned models often refuse or soften adversarial critique prompts; only the opt-in red-team tier uses it. The same script now also auto-promotes confirmed high-confidence action-shaped findings into procedure memory unless you pass `--no-learn-procedures`. |
-| `LOCI_VLLM_FALLBACK` | `0` (off) | opt-in fallback from Ollama generation to a batched vLLM endpoint (`mcp/llm_local.py`, `mcp/batched_gen.py`). Worth enabling whenever the Ollama generation tier is anything other than fully verified working — it is a real, independent tier, not just a stub |
 | `LOCI_TMUX_COMPANION_REQUIRED` | `0` (off) | if set truthy (`1/true/yes/on`), `loci_health` fails loud when required tmux companion sessions are missing. Use this when Copilot/Claude tmux loops are part of required runtime posture |
 | `LOCI_TMUX_COMPANION_SESSIONS` | `claude,copilot` | comma-separated tmux session names checked by `loci_health` when companion monitoring is enabled |
 | `LOCI_TMUX_ROLE_SESSION_MAP` | _(empty)_ | optional `role=session` mappings for offload telemetry attribution (example: `triage=copilot,code=claude`) |
@@ -274,8 +273,11 @@ owns (claim-scope and provenance validation for FlyBrain-derived findings).
 | `EXIF_GEN_MODEL` | `llama3.2:latest` | Ollama model for skill gap analysis |
 | `TOP_K_PER_LEVEL` | `3` | Results per level in MemGAS search; used by memgas_hierarchy.py |
 | `LOCI_TOOL_WORKERS` | `1` | Worker threads that run sync MCP tools off the event loop (`mcp/tool_offload.py`). `1` keeps tools serial on one thread, as they were on the loop; raise only after checking the tools you call are thread-safe. The loop itself always stays free for `/health` and handshakes |
-| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route, vLLM and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
+| `LOCI_LLM_DEADLINE_S` | `150` | Total budget for one `llm_local.generate()` call across the configured model, the discovered-model retry, the supervisor route and cloud. Each attempt gets `min(OLLAMA_GEN_TIMEOUT, remaining)`; a tier starts only with >=5 s left. Exhausted calls return `ok: false, deadline_exceeded: true` |
 | `LOCI_TRANSPORT_DEADLINE_S` | `30` | Total budget for one retried Qdrant/embed call. A retry starts only if another attempt of the same cost still fits, so a hung backend (20 s `LOCI_QDRANT_TIMEOUT` per attempt) fails after one attempt instead of three; fast failures such as connection refused keep every retry. Exhausted calls raise `<op>_deadline` |
+| `LOCI_MODEL_POOL_SHADOW` | unset | `1` logs each model-pool decision to `<data home>/instrumentation/model_pool_shadow.jsonl` and each `llm_local.generate` outcome to `model_pool_outcomes.jsonl` (model, ok, latency, enums; no text). Never changes the pick or the result |
+| `LOCI_MODEL_POOL_SELECTOR` | unset | `module:callable` called as `f(role, features) -> name or [names]` in shadow mode only; its answer is logged beside the rule's. Errors are ignored |
+| `LOCI_DOCS_INGEST_BUDGET_S` | `120` | Wall-clock budget for one `docs_ingest_indexer` call. Past it the call stops, returns `partial: true` with `files_remaining`, and a re-run resumes (indexed files are skipped as unchanged); at least one changed file is stored per call. Stops a big tree from holding a tool worker for tens of minutes (#418) |
 | `LOCI_LOG_FILE` | unset | When set, the server also writes a size-rotated log to this path (stderr logging is unchanged). `LOCI_LOG_MAX_BYTES` (default 10485760) and `LOCI_LOG_BACKUPS` (default 5) tune rotation. An unwritable path logs a warning and falls back to stderr only |
 
 ---
@@ -341,6 +343,81 @@ Loci now supports a durable investigation-scoped coordination queue so parallel 
 Queue state is persisted on the investigation manifest under `coordination.items`; treat that manifest as the source of truth for item state, ownership, and lease expiry.
 
 ---
+## Model pool and ranked role resolution
+
+`mcp/model_pool.py` lets one declared list decide which model serves each role, instead of a
+hardcoded preference per resolver. Off unless `[[models.pool]]` exists in `~/.loci/backends.toml`;
+with no pool every resolver behaves as before.
+
+```toml
+[models]
+resident_bonus = 0.5     # rank credit for a model Ollama already holds in memory
+# max_vram_gb = 10       # prefer entries that fit one GPU (declared vram_gb, else the size /api/tags reports)
+# over_cap_fallback = true  # when NO installed candidate fits, relax the cap and use the best-ranked one
+
+[[models.pool]]
+name = "gemma4-e4b-hermes:64k"
+roles = ["gen", "verify", "compress"]
+rank = 1                 # lower is preferred
+# vram_gb = 5.0
+# pinned = true          # never evicted by a model lease (use it for the embedder); evictable = false does the same
+# role_rank = { verify = 3 }  # rank differently for one role
+```
+
+For a role the pool keeps the entries that list it and are installed at the generation endpoint,
+then orders them by `rank - resident_bonus` (`role_rank` overrides `rank` for one role). With
+`max_vram_gb`, a model that fits always beats one that does not. With `over_cap_fallback = true`
+the cap only binds while some installed candidate fits: when none does, the over-cap candidates
+become eligible and the best-ranked (the strongest, by your ranking) is used. `model_pool.py show`
+and the `model_pool` health block mark such a pick `OVER-CAP` / `over_cap`. The operator's own tag (`[ollama].gen_model`,
+`verify_model`, `guardian_model`, `redteam_model`, `compress_model`, `classify_model`) joins as rank 0:
+it still wins while installed and the pool takes over when it is not, which is the failure a missing
+`gen_model` used to cause. Env overrides (`LOCI_OLLAMA_*_MODEL`) beat everything. A role the pool
+does not list keeps its legacy resolver.
+
+- `python mcp/model_pool.py init` prints a draft pool from what the generation endpoint has
+  installed (specialists recognised by name: code, math, guardian/safety, tool, vision, embed,
+  redteam; `-cpu` variants and models over 10 GB are kept out). Rank is size-descending: a
+  starting point to edit.
+- `python mcp/model_pool.py show` prints the chosen model per role and flags `DEGRADED` when the top
+  rank is unavailable. `loci_health` carries the same as `model_pool` and checks the pool's gen
+  pick, not just the configured tag.
+- Shadow mode follows the D10 shape in `docs/flybrain_brains_eval.md`: the rule always decides;
+  `LOCI_MODEL_POOL_SHADOW=1` logs the decision, and `LOCI_MODEL_POOL_SELECTOR` can name a learned
+  selector whose choice is logged beside it. Unset both to roll back.
+- The same flag logs how each `llm_local.generate` call went (`model_pool_outcomes.jsonl`: model tag,
+  `ok`, end-to-end `latency_ms`, `deadline_exceeded`, `route_role`, `tier`, `fmt`; never prompt, output
+  or error text). That is the label a decision needs: join a decision row's `chosen_rule` to the next
+  outcome row for that model. `python mcp/model_pool.py outcomes` prints per-model calls, success rate
+  and p50/p95 latency. The latency is the whole call, so it includes any fallback tier it fell through to.
+
+## Model leases (borrowing GPU headroom)
+
+`mcp/model_lease.py` lets a special job (a FlyBrain run, a batch on a bigger model) take a card for
+itself by evicting resident Ollama models, then give it back. It builds on the model pool.
+
+- **Ask:** `model_lease_acquire(job, need_gb, priority="normal", ttl_s=1800)` (MCP tool; also
+  `python mcp/model_lease.py acquire JOB NEED_GB [priority]` and `with model_lease.lease(...)`). It makes
+  `need_gb` free on **one** GPU, unloading models worst-first, and returns a lease id.
+- **Who can be evicted:** never a pool entry with `pinned = true` or `evictable = false`, never a model a
+  Loci call is using right now, and with `priority = "normal"` never the current primary for a pooled
+  role. `priority = "critical"` lets primaries go too. Order: models outside the pool, then the worst pool
+  rank, larger first on ties. A CPU-resident model (no VRAM) is skipped: unloading it frees nothing.
+- **Verified, not assumed:** after each eviction it waits for the model to leave `/api/ps` and for
+  `nvidia-smi` to show the memory back (`LOCI_LEASE_GPU_CMD` overrides the command), stopping as soon as
+  one GPU has the room. If everything allowed is gone and it still does not fit, it **puts the models
+  back** and returns `granted: false` with the shortfall. Without `nvidia-smi` it evicts every eligible
+  model and reports `verified: false`.
+- **While held:** the pool treats evicted models as unavailable, so a Loci call does not reload one into
+  the headroom the job reserved.
+- **Giving back:** `model_lease_release(lease_id)` loads the evicted models back (`[models].restore_keep_alive`,
+  default `30m`; `restore=false` skips it). Leases expire after `ttl_s` and are reaped on the next lease
+  call, so a crashed job cannot hold the GPU forever. `model_lease_status` lists leases, resident models
+  with their VRAM, and free VRAM per GPU.
+- **State:** `<data home>/leases/model_leases.json` (ids, model names, sizes, times; no text).
+- **Limits:** it governs the Ollama this server talks to and needs `nvidia-smi` on the same host to verify.
+  Other clients using the same Ollama are not tracked as in-flight, so keep their models `pinned`.
+
 ## Cron jobs
 
 `cron/jobs.json` defines seven jobs; the six enabled ones are below.
@@ -433,7 +510,7 @@ ever actually run" has an answer.
 Per-run ceilings: `LOCI_GROOM_VERIFY_INVESTIGATIONS` (5),
 `LOCI_GROOM_VERIFY_FINDINGS` (10), `LOCI_GROOM_SUMMARY_INVESTIGATIONS` (12),
 `LOCI_GROOM_REFLECT_ITEMS` (3), `LOCI_GROOM_BATCH` (16). `LOCI_GROOM_MODEL` is
-unset on purpose — the vLLM and Ollama tiers name the same model differently, so
+unset on purpose — each backend names the same model differently, so
 each tier resolves its own.
 
 ---
@@ -637,8 +714,7 @@ well-formed JSON instead of raising across the MCP boundary.
 
 1. Ensure local generation lane is reachable (`LOCI_OLLAMA_GEN_URL`/`OLLAMA_GEN_URL`)
    and all configured tags resolve (`ollama show <tag>` for cheap/escalate/synthesize).
-2. Optional batched lane: set `VLLM_BASE_URL` (and role-specific `VLLM_MODEL_*` if used).
-3. Set explicit swarm defaults in env/backends config as needed:
+2. Set explicit swarm defaults in env/backends config as needed:
    - `LOCI_SWARM_CHEAP_MODEL`
    - `LOCI_SWARM_ESCALATE_MODEL`
    - `LOCI_SWARM_SYNTHESIZE_MODEL`
@@ -719,7 +795,6 @@ python3 -m pytest scripts/tests/test_model_catalog.py -q
 |---|---|---|
 | `degraded: true` with summary "Swarm reasoning degraded..." | wrapper/import/runtime failure in `swarm_reason` | Keep artifact, treat as non-authoritative, rerun CLI `swarm_escalate.py` directly to isolate |
 | `swarm_reason busy: global inflight limit ... reached` | `LOCI_SWARM_MAX_INFLIGHT` saturated | Retry after queue drains, or temporarily raise `LOCI_SWARM_MAX_INFLIGHT` |
-| Multi-seed run becomes slower than baseline | vLLM probe inconclusive or batched lane missing requested model | Pin `--seeds 1` or set `LOCI_SWARM_AUTO_PARALLEL=0`; verify `/v1/models` serves requested tags |
 | Many escalations with low confidence | cheap tier underpowered for workload | raise `self_consistency_samples`, enable `--escalate-with-prior-context`, or temporarily pin stronger `--cheap-model` |
 | Empty/unparseable synthesis in think mode | reasoning consumed synthesis budget | keep `--synthesize-think` optional; built-in fallback already retries with normal synthesis |
 
@@ -902,7 +977,7 @@ into `.git/hooks`.
 No infra address or path is hardcoded. To stand up on a new machine:
 
 1. `cp backends.toml.example ~/.loci/backends.toml` and fill in the endpoints and
-   keys for this machine — Ollama, vLLM, Qdrant, embed/rerank models, memory dir.
+   keys for this machine — Ollama, Qdrant, embed/rerank models, memory dir.
    This is the durable channel: it needs no third-party import and no launcher
    that remembers to export anything. Leave a section blank on a laptop that
    runs its own Ollama; the local probe finds it.
@@ -1139,3 +1214,79 @@ Run these through an MCP client connected to the service:
 | Hermes cron jobs can fast-forward forever if a stale `next_run_at` is never persisted | MED | Use `scripts/hermes_cron_runner.py`, which executes one catch-up run and writes the future `next_run_at` on the same tick (#205) |
 | `backends.toml.example` has no `[qdrant] retention_days` key | LOW | The key is read (`qdrant_ops._retention_days`) but not shown in the example; the code default of 0 applies |
 | SCoRe `corrections=0` until sessions accumulate overlap | INFO | Corrections require same-session failure→success pairs; grow naturally |
+
+
+## Hillclimb (graded self-improvement)
+
+`mcp/hillclimb.py` improves one graded surface at a time. A suite supplies graded cases and an allow-list
+of surfaces (a prompt guidance block, a numeric knob, a choice). Each round the proposer sees the
+failing train cases and proposes ONE change. It is accepted only when train improves by `--margin`
+(default 0.02) and the held-out test split improves by `--test-gain` (default 0.01); train up with
+test flat is reverted as overfitting. The split is by case-id hash, so adding cases never moves old ones.
+
+Before climbing it checks the grader: re-scoring must agree, each split should have at least 5 cases,
+and a baseline at or above 0.95 (train or test) means no headroom, so the run stops (`--force` overrides).
+Infrastructure failures (model down) are excluded from the mean; over 20% aborts the run.
+
+    python mcp/hillclimb.py run --suite triage --rounds 6
+    python mcp/hillclimb.py status --suite triage
+    python mcp/hillclimb.py promote --suite triage     # candidate_overlay.json -> overlay.json
+    python mcp/hillclimb.py rollback --suite triage    # previous overlay, else built-in defaults
+
+A run never changes production. Consumers read `overlay_get(suite, key, default)`, which returns the default
+when nothing has been promoted. State is under `<data home>/hillclimb/<suite>/` (`runs.jsonl` ledger with
+patches, rationales, scores and case ids only; no case text). Built-in suite: `triage` (reflection
+triage classifier, surface `guidance`, cases in `eval/hillclimb/triage_cases.jsonl`, override with
+`LOCI_HILLCLIMB_TRIAGE_CASES`). Another suite plugs in as `--suite module:factory`. The proposer model
+is the gen model, or `LOCI_HILLCLIMB_MODEL`.
+
+### Hillclimb: real labels for the triage suite
+
+The synthetic cases are too few to rank patches. Real ones come from the reflection loop:
+
+- `hillclimb.capture_observations(batch)` keeps a scrubbed, de-duplicated copy of each processed tick item
+  (kind, path tail, event/tool counts, short error and warning text; secrets, emails, long hex redacted) in
+  `<data home>/hillclimb/reflection_triage/observations.jsonl`. De-duplication is by content, so one pattern seen in a
+  hundred files is one item. Message text the tick reports as "errors" (workflow-harness prompts, teammate
+  messages, anything over 120 chars) is dropped, and an item is kept only if a real error or warning
+  remains. `hillclimb.py prune` re-applies that filter to rows captured earlier. The scheduled driver calls
+  capture after each tick; it never raises.
+- `python mcp/hillclimb.py label [--n 30] [--model] [--skipped]` shows one observation at a time. First answer:
+  `r` regression, `f` flaky, `c` config/env, `n` noise, `u` unknown, `x` not a failure, `s` skip, `q` quit. For a
+  category, a second line takes novelty and an optional note: Enter = unclear, `k` known pattern, `w` new,
+  and anything after a colon is the note (`w: first time since the upgrade`). `x` asks why (optional) and records
+  the item's error keys in `rejected.jsonl`: capture then drops later items whose only errors/warnings are keys
+  you rejected, and `prune` applies the same to what is already stored. `--model` prints the classifier's answer
+  only after you answer, and tallies agreement. Labels append to `labels.jsonl` and resume where you left off.
+  Scoring: a label with a novelty of known or new is graded on category and novelty (mean of the two); `unclear`
+  is not graded, and labels without a novelty (synthetic, older) are graded on category alone. Notes are shown to
+  the proposer next to the failing case.
+- `python mcp/hillclimb.py labels` shows counts (labelled, rejected, with notes), per-category and per-novelty totals, and whether the real train and test splits each
+  have the 30 cases the guard needs (`enough`).
+- The `triage` suite reads `labels.jsonl` next to the synthetic cases (`LOCI_HILLCLIMB_TRIAGE_SYNTHETIC=0` for real only).
+
+### loci_health: `degraded`, and what it can see
+
+`status` is `ok`, `degraded` or `unhealthy`. `unhealthy` still means a configured backend does not answer. `degraded` means
+everything answers but something the server advertises is not working; `degraded_reasons` names it, and `warnings` lists
+things worth knowing that do not change the status. A reachability probe cannot see these, so they are measured:
+
+| Field | Source | Degrades when |
+|---|---|---|
+| `embed_health` | rolling record of embed calls in this process (15 min window) | 3 or more failures in a row (includes brownout-breaker skips) |
+| `index_write_health` | rolling record of index writes (`investigation_store` reports these as `qdrant_stored=false`, `degraded_reason=rag_index_write_failed`) | the most recent write failed |
+| `main_collection` | does the findings collection resolve, **as a collection or an alias** (60 s cache) | it resolves to neither |
+| `gen_residency` | `/api/ps` on the generation endpoint | the pool's gen model is loaded with `size_vram` 0 (CPU) |
+| `warnings` | D10 shadow errors swallowed since start; failures that recovered; gen model not loaded | never (warning only) |
+
+Counters start empty, so a fresh process reports `ok` until something actually fails. If the assessment itself raises, the
+status is not silently optimistic: a `warnings` entry says the assessment failed.
+
+**Aliases.** On this deployment `loci_memory` is a Qdrant alias of `hermes_memory`, and `GET /collections` does not list aliases.
+`memory_health` and `retrieval_selftest` now resolve aliases (`qdrant_ops.collection_names_with_aliases`) and report
+`main_is_alias_of`; before this they reported the findings collection missing. Resolve `GET /aliases` before any restore,
+create or delete.
+
+**Data home.** `scripts/loci_groom.py`, the model pool, the lease ledger and hillclimb now use the server's own rule
+(`legacy_env.memory_dir()`: `LOCI_MEMORY_DIR`, else `~/.loci/memory-sessions`, else the legacy `~/.hermes` one). The groom
+script used to default to `~/.hermes/memory-sessions` and reported coverage 1.0 over zero findings.

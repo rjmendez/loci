@@ -31,7 +31,6 @@ def _install_fake_backends(monkeypatch):
     monkeypatch.setattr(embed_ops, "_resolve", lambda: ("http://fake-ollama:11434", "nomic-embed-text"))
     monkeypatch.setattr(llm_local, "_gen_env", lambda: "http://fake-ollama:11434")
     monkeypatch.setattr(llm_local, "_resolve_ollama", lambda: "http://fake-ollama:11434")
-    monkeypatch.setattr(llm_local, "_try_vllm", lambda *a, **k: None)
     import backends
 
     monkeypatch.setattr(backends, "ollama_gen_model", lambda: "qwen2.5:3b")

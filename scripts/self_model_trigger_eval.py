@@ -302,7 +302,6 @@ def build_self_model(
     backends = {
         "qdrant": bool(health_data.get("qdrant_reachable", True)),
         "ollama": bool(health_data.get("ollama_reachable", True)),
-        "vllm": bool(health_data.get("vllm_reachable", True)),
         "ladybug": health_data.get("ladybug", "unknown"),
     }
 

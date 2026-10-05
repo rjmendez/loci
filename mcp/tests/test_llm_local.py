@@ -53,16 +53,8 @@ def _ensure_base(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_vllm_fallback(monkeypatch):
-    """Keep these tests on the Ollama path and off the network.
-
-    generate() now falls through to the vLLM tier when Ollama fails, so every
-    fail-open test below would otherwise attempt a real request to whatever
-    backends resolves. The fallback has its own tests in
-    test_llm_local_fallback.py; here it is disabled so a failure means what the
-    test name says it means.
-    """
-    monkeypatch.setattr(L, "_try_vllm", lambda *a, **k: None)
+def _pin_gen_model(monkeypatch):
+    """Keep these tests on the Ollama path and off the network."""
     # Pin the model: generate() otherwise resolves it from ~/.loci/backends.toml.
     import backends
     monkeypatch.setattr(backends, "ollama_gen_model", lambda: "qwen2.5:3b")
@@ -191,7 +183,7 @@ def test_embedding_model_config_is_replaced_by_local_generation_model(monkeypatc
             return None
 
         def json(self):
-            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b", "size": 2 * 10**9}]}
 
     def fake_post(url, json=None, timeout=None):  # noqa: A002
         cap["model"] = json.get("model")
@@ -219,7 +211,7 @@ def test_generate_retries_with_discovered_model_after_initial_model_failure(monk
             return None
 
         def json(self):
-            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b"}]}
+            return {"models": [{"name": "nomic-embed-text:latest"}, {"name": "qwen2.5:3b", "size": 2 * 10**9}]}
 
     def fake_post(url, json=None, timeout=None):  # noqa: A002
         calls["post"].append(json.get("model"))

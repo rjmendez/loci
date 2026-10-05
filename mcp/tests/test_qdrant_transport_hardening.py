@@ -170,3 +170,29 @@ def test_fast_connection_failures_still_use_every_retry(monkeypatch):
     with pytest.raises(RuntimeError, match="qdrant_query_connection"):
         Q._query_points_with_retry(refused, attempts=3)
     assert len(calls) == 3
+
+
+def test_failure_message_keeps_the_underlying_error(monkeypatch):
+    """"qdrant_query_other" alone hid why a search failed (#421)."""
+    monkeypatch.setattr(Q.time, "sleep", lambda s: None)
+
+    def boom():
+        raise ValueError("Wrong input: Not existing vector name error: dense")
+
+    with pytest.raises(RuntimeError) as err:
+        Q._query_points_with_retry(boom, attempts=2)
+    msg = str(err.value)
+    assert msg.startswith("qdrant_query_other")
+    assert "ValueError" in msg and "Not existing vector name" in msg
+
+
+def test_client_http_errors_are_classified_http_not_other():
+    class UnexpectedResponse(Exception):
+        pass
+
+    class WithStatus(Exception):
+        status_code = 400
+
+    assert Q._taxonomy(UnexpectedResponse("Unexpected Response: 400 (Bad Request)")) == "http"
+    assert Q._taxonomy(WithStatus("bad vector name")) == "http"
+    assert Q._taxonomy(ValueError("boom")) == "other"

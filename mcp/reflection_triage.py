@@ -74,6 +74,7 @@ _PROMPT_TMPL = (
     "top_tools: {tools}\n"
     "visible_errors: {errors}\n"
     "visible_warnings: {warnings}\n"
+    "{guidance}"
 )
 
 
@@ -117,12 +118,25 @@ def classify_reflection_observation(
     errors: Optional[dict] = None,
     warnings: Optional[dict] = None,
     gen_fn: Optional[GenFn] = None,
+    guidance: Optional[str] = None,
 ) -> dict:
     """Classify one reflection-loop observation; never raises.
 
+    ``guidance`` is an optional extra instruction block. None reads the promoted hillclimb
+    overlay (``reflection_triage``/``guidance``); with no overlay it is empty and the prompt
+    is unchanged.
+
     Returns ``{"category", "novelty", "degraded", "ok", "error"}``.
     """
+    if guidance is None:
+        try:
+            from hillclimb import overlay_get
+            guidance = str(overlay_get("reflection_triage", "guidance", "") or "")
+        except Exception:
+            guidance = ""
+    guidance = guidance.strip()[:1200]
     prompt = _PROMPT_TMPL.format(
+        guidance=(f"Guidance: {guidance}\n" if guidance else ""),
         kind=str(kind or ""),
         path=str(path or "")[:400],
         sampling=str(sampling_mode or "full"),

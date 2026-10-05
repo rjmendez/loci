@@ -10,6 +10,7 @@ functions, not the state, so there is exactly one latch per process.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import socket
@@ -68,6 +69,64 @@ _transport_breakers = {
     "embed": {"timeouts": 0, "opened_until": 0.0},
     "qdrant_query": {"timeouts": 0, "opened_until": 0.0},
 }
+
+# Rolling success/failure record for the two operations whose silent failure looked healthy in loci_health:
+# embedding (every search and every index write needs one) and the index write itself (investigation_store
+# returns stored=true with qdrant_stored=false and nothing read that field). In-process only; read by loci_health.
+_HEALTH_WINDOW_S = 900.0
+_health_events = {
+    "embed": collections.deque(maxlen=200),
+    "index_write": collections.deque(maxlen=200),
+}
+
+
+def _health_note(kind: str, ok: bool) -> None:
+    with _transport_lock:
+        _health_events[kind].append((time.monotonic(), bool(ok)))
+
+
+def transport_health(window_s: float = _HEALTH_WINDOW_S) -> dict:
+    """Recent embed / index-write outcomes: counts in the window, the current run of consecutive failures,
+    and how long ago the last success and failure were (None = never seen in this process)."""
+    now = time.monotonic()
+    out: dict = {}
+    with _transport_lock:
+        for kind, events in _health_events.items():
+            evs = list(events)
+            recent = [(t, ok) for t, ok in evs if now - t <= window_s]
+            consecutive = 0
+            for t, ok in reversed(evs):
+                if ok or now - t > window_s:
+                    break
+                consecutive += 1
+            last_ok = max((t for t, ok in evs if ok), default=None)
+            last_fail = max((t for t, ok in evs if not ok), default=None)
+            out[kind] = {
+                "window_s": int(window_s),
+                "ok": sum(1 for _, ok in recent if ok),
+                "failed": sum(1 for _, ok in recent if not ok),
+                "consecutive_failures": consecutive,
+                "last_ok_age_s": None if last_ok is None else round(now - last_ok, 1),
+                "last_failure_age_s": None if last_fail is None else round(now - last_fail, 1),
+            }
+    open_now, remaining = _breaker_is_open("embed")
+    out["embed"]["breaker_open_s"] = round(remaining, 1) if open_now else 0.0
+    return out
+
+
+def collection_names_with_aliases(client) -> tuple:
+    """(names, aliases): every name that resolves to a collection, and the alias -> collection map.
+
+    ``GET /collections`` does not list aliases, so an existence check built on it reports an aliased
+    collection as missing (loci_memory is an alias of hermes_memory on this deployment), and a restore
+    or create trusting it can overwrite the real collection."""
+    names = {c.name for c in client.get_collections().collections}
+    aliases: dict = {}
+    try:
+        aliases = {a.alias_name: a.collection_name for a in client.get_aliases().aliases}
+    except Exception as exc:
+        logger.debug("collection_names_with_aliases: alias lookup failed: %r", exc)
+    return names | set(aliases), aliases
 _endpoint_ready_cache: dict[str, tuple[float, bool]] = {}
 
 
@@ -78,7 +137,8 @@ def _taxonomy(exc: Exception) -> str:
         return "timeout"
     if ("connection" in name) or ("connection" in low) or ("refused" in low) or ("reset" in low):
         return "connection"
-    if "http" in name or "status" in low:
+    # qdrant-client raises UnexpectedResponse / ResponseHandlingException (no "http" in the name) for 4xx/5xx.
+    if "http" in name or "status" in low or "response" in name or isinstance(getattr(exc, "status_code", None), int):
         return "http"
     return "other"
 
@@ -179,7 +239,9 @@ def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
                 waited = _backoff_sleep(attempt - 1)
                 logger.info("transport retry op=%s next_attempt=%d backoff_s=%.2f", op, attempt + 1, waited)
                 continue
-            raise RuntimeError(f"{op}_{kind}") from exc
+            # Keep the cause in the message: callers surface str(exc) (rag_context_search puts it in
+            # collection_errors), and "<op>_other" alone says nothing about what actually failed.
+            raise RuntimeError(f"{op}_{kind}: {type(exc).__name__}: {' '.join(str(exc).split())[:200]}") from exc
     raise RuntimeError(f"{op}_failed") from last_exc
 
 
@@ -541,9 +603,11 @@ def _embed(text: str, use_cache: bool = True) -> list[float] | None:
     open_now, remaining = _breaker_is_open("embed")
     if open_now:
         logger.warning("embed brownout active; skipping request for %.2fs", remaining)
+        _health_note("embed", False)
         return None
     if not _endpoint_ready(_OLLAMA_BASE):
         logger.warning("embed readiness gate blocked request: endpoint unreachable (%s)", _OLLAMA_BASE)
+        _health_note("embed", False)
         return None
     try:
         import requests as _req
@@ -566,7 +630,9 @@ def _embed(text: str, use_cache: bool = True) -> list[float] | None:
         result = _query_points_with_retry(_one_attempt, attempts=_EMBED_RETRY_ATTEMPTS, op="embed")
     except Exception as exc:
         logger.warning("embed failed: %s", exc)
+        _health_note("embed", False)
         return None
+    _health_note("embed", result is not None)
     if result is not None and use_cache:
         with _embed_cache_lock:
             if len(_embed_cache) >= _EMBED_CACHE_MAXSIZE:
@@ -593,6 +659,7 @@ def _qdrant_upsert(point_id: str, text: str, payload: dict) -> bool:
         return False
     dense_vec = _embed(text)
     if dense_vec is None:
+        _health_note("index_write", False)
         return False
     sparse_vec = _embed_sparse(text)
     # Stamp multi-tenancy fields if not already set by the caller.
@@ -613,7 +680,9 @@ def _qdrant_upsert(point_id: str, text: str, payload: dict) -> bool:
         )
     except Exception as exc:
         logger.warning("Qdrant upsert failed — finding stored in JSONL but not indexed: %s", exc)
+        _health_note("index_write", False)
         return False
+    _health_note("index_write", True)
     return True
 
 

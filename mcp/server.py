@@ -39,7 +39,7 @@ Tools:
     memory_health                — substrate self-check (qdrant / embedders / mirror / integrity)
     code_memory_correlate        — link code-hallucination flags to contaminated investigation findings
     wiring_obligation_scan       — advisory-only scan for implicit obligations that may merit manual declaration
-    reflection_loop_seed         — enqueue Copilot artifacts for bounded self-reflection
+    reflection_loop_seed         — enqueue Claude Code / Copilot / Hermes logs for bounded self-reflection
     reflection_loop_tick         — process small queued batches and store findings
     reflection_loop_status       — inspect reflection queue and aggregate loop stats
 """
@@ -65,7 +65,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Collection, Literal, Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -312,11 +312,21 @@ def _busy_result(exc: StoreBusyError, *, investigation_id: Optional[str] = None,
 _ladybug_store = None                     # LadybugStore singleton once initialized
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
+_ladybug_last_error = ""                  # why the store last failed to open (truncated); "" while healthy
+_ladybug_since = ""                       # UTC ISO time of the first failure in the current run of failures
 _ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
 _ladybug_backfill_lock = threading.Lock()  # own lock: _ladybug_lock is non-reentrant and already held on one path
 _LADYBUG_RETRY_SECONDS = 30               # backoff before retrying after a transient failure
 _ladybug_lock = threading.Lock()
 
+
+
+def _ladybug_note_failure(reason: str) -> None:
+    """Remember why the graph store failed and since when, so loci_health can say it (#422)."""
+    global _ladybug_last_error, _ladybug_since
+    _ladybug_last_error = str(reason)[:200]
+    if not _ladybug_since:
+        _ladybug_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def _get_ladybug(backfill: bool = True):
     """Lazy, fail-open LadybugStore singleton. Returns None if unavailable.
@@ -333,6 +343,7 @@ def _get_ladybug(backfill: bool = True):
     use the graph.
     """
     global _ladybug_store, _ladybug_failed, _ladybug_last_attempt, _ladybug_backfilled
+    global _ladybug_last_error, _ladybug_since
     if _ladybug_store is not None:
         return _ladybug_backfill_once(backfill)
     if _ladybug_failed:
@@ -350,6 +361,7 @@ def _get_ladybug(backfill: bool = True):
             if not getattr(_kz, "_HAS_LADYBUG", True):
                 # ladybug itself isn't importable — unrecoverable, latch permanently.
                 _ladybug_failed = True
+                _ladybug_note_failure("ladybug not importable")
                 logger.warning("LadybugDB not importable — graph features disabled (permanent).")
                 return None
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
@@ -357,19 +369,24 @@ def _get_ladybug(backfill: bool = True):
             if not ks.available():
                 # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
+                _ladybug_note_failure("store open failed (lock contention or transient IO)")
                 logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
                                "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
                 return None
             _ladybug_store = ks
             _ladybug_last_attempt = 0.0
+            _ladybug_last_error = ""
+            _ladybug_since = ""
         except ImportError as exc:
             # graph module / ladybug genuinely missing — unrecoverable, latch permanently.
             _ladybug_failed = True
+            _ladybug_note_failure(f"graph module missing: {exc!r}")
             logger.warning("LadybugDB graph module missing (%r) — graph features disabled (permanent).", exc)
             return None
         except Exception as exc:  # fail-open — never break the server on graph init
             # Unknown/transient error (e.g. IO on mkdir/open) — do NOT latch; retry later.
             _ladybug_last_attempt = time.monotonic()
+            _ladybug_note_failure(f"graph init failed: {exc!r}")
             logger.warning("LadybugDB graph init failed (%r) — will retry after %ss.", exc, _LADYBUG_RETRY_SECONDS)
             return None
     return _ladybug_backfill_once(backfill)
@@ -737,6 +754,22 @@ def _detect_entity_type(entity: str) -> str:
     return "hostname"
 
 
+def _drop_retracted(rows: list, investigation_id: Optional[str] = None) -> list:
+    """Drop rows that name a retracted finding (the retraction log folded per investigation, plus any row whose
+    index payload carries retracted=true). The read paths below once returned retracted findings as live because
+    they scanned findings.jsonl or the index directly; investigation_search and rag_context_search already
+    filtered, these use the same RecallFilter. Per-directory fail-safe inside build_recall_filter."""
+    if not rows:
+        return rows
+    rf = build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+    return [r for r in rows if not (isinstance(r, dict) and rf.is_retracted(r))]
+
+
+def _drop_acl_denied(rows: list, requesting_agent_id: Optional[str] = None) -> list:
+    """Drop rows from investigations the caller may not read (see inv_store.acl_drop_denied)."""
+    return inv_store.acl_drop_denied(rows, requesting_agent_id)
+
+
 def _entity_lookup_qdrant(
     entity: str,
     entity_type: str,
@@ -815,19 +848,20 @@ def _entity_lookup_cascade(
     entity_type: str,
     investigation_id: Optional[str],
     limit: int,
+    requesting_agent_id: Optional[str] = None,
 ) -> tuple[list[dict], str]:
     """Prefer the LadybugDB graph (primary), then Qdrant (indexed), then JSONL scan.
 
     Returns ``(findings, method)`` where ``method`` names the tier that produced
     the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
     """
-    findings = _entity_lookup_ladybug(entity, investigation_id, limit)
+    findings = _drop_acl_denied(_drop_retracted(_entity_lookup_ladybug(entity, investigation_id, limit), investigation_id), requesting_agent_id)
     method = "ladybug"
     if not findings:
-        findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
+        findings = _drop_acl_denied(_drop_retracted(_entity_lookup_qdrant(entity, entity_type, investigation_id, limit), investigation_id), requesting_agent_id)
         method = "qdrant"
     if not findings:
-        findings = _entity_lookup_jsonl(entity, entity_type, investigation_id, limit)
+        findings = _drop_acl_denied(_drop_retracted(_entity_lookup_jsonl(entity, entity_type, investigation_id, limit), investigation_id), requesting_agent_id)
         method = "jsonl_fallback"
     return findings, method
 
@@ -1100,6 +1134,7 @@ def _reflection_default_state() -> dict:
             "warning_signature_observations": {},
             "last_error_signatures": [],
             "last_warning_signatures": [],
+            "by_source": {},
         },
         "created_at": now,
         "updated_at": now,
@@ -1161,9 +1196,82 @@ def _reflection_queue_priority(kind: str) -> int:
     # Lower = higher priority.
     return {
         "process_log": 0,
+        "hermes_log": 0,
         "temp_ingest": 1,
         "session_event": 2,
     }.get(str(kind or ""), 3)
+
+
+REFLECTION_SOURCES = ("claude", "copilot", "hermes")
+_REFLECTION_KIND_SOURCE = {
+    "temp_ingest": "copilot",
+    "session_event": "copilot",
+    "process_log": "copilot",
+    "claude_code_event": "claude",
+    "hermes_log": "hermes",
+}
+# High-signal Hermes runtime logs, relative to <hermes root>/logs. ".1" is the first rotation.
+REFLECTION_HERMES_LOG_NAMES = (
+    "errors.log", "agent.log", "tool-audit.log", "gateway.log", "mcp-stderr.log",
+)
+REFLECTION_HERMES_TAIL_LINES = 2000
+
+
+def _reflection_source(kind: str, item: Optional[dict] = None) -> str:
+    """Source (claude|copilot|hermes) of a queue item; ``unknown`` for foreign kinds."""
+    if isinstance(item, dict) and item.get("source") in REFLECTION_SOURCES:
+        return str(item["source"])
+    return _REFLECTION_KIND_SOURCE.get(str(kind or ""), "unknown")
+
+
+def _reflection_roots(env_name: str, default: Path) -> list[Path]:
+    """Roots for one source: ``env_name`` as an os.pathsep list, else ``default``."""
+    raw = os.environ.get(env_name, "")
+    roots = [Path(part).expanduser() for part in raw.split(os.pathsep) if part.strip()]
+    return roots or [default]
+
+
+def _reflection_root_status(root: Path) -> str:
+    try:
+        if not root.exists():
+            return "missing"
+        if not root.is_dir():
+            return "not_a_directory"
+        next(iter(root.iterdir()), None)
+        return "ok"
+    except OSError:
+        return "unreadable"
+
+
+def _reflection_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+_REFLECTION_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S)
+_REFLECTION_BEARER_RE = re.compile(
+    r"\b(bearer|basic|token)(\s+)[A-Za-z0-9._~+/=-]{8,}", re.I)
+# key=value, key: value, "key": "value", 'key': 'value' and -H "Header: value" forms.
+_REFLECTION_SECRET_KV_RE = re.compile(
+    r"""(?P<key>["']?[A-Za-z0-9_.-]*(?:authorization|api[_-]?key|apikey|secret|passw(?:or)?d|passwd|token|credential|private[_-]?key|x-api-key)[A-Za-z0-9_.-]*["']?)"""
+    r"""(?P<sep>\s*[:=]\s*)(?P<q>["']?)(?:(?:bearer|basic)\s+)?[^\s"',;&}]+""",
+    re.I,
+)
+_REFLECTION_LONG_BLOB_RE = re.compile(r"\b(?:[0-9a-fA-F]{32,}|[A-Za-z0-9+/_-]{40,}={0,2})\b")
+
+
+def _reflection_scrub(text: str) -> str:
+    """Redact credentials from one excerpt. Applied before anything is stored or returned."""
+    out = str(text or "")
+    out = _REFLECTION_PRIVATE_KEY_RE.sub("<redacted:private-key>", out)
+    out = _REFLECTION_BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", out)
+    out = _REFLECTION_SECRET_KV_RE.sub(
+        lambda m: f"{m.group('key')}{m.group('sep')}{m.group('q')}<redacted>", out)
+    out = _REFLECTION_LONG_BLOB_RE.sub("<redacted:blob>", out)
+    return out
 
 
 def _read_tail_lines(path: Path, *, max_lines: int, max_bytes: int) -> list[str]:
@@ -1228,9 +1336,10 @@ class _ReflectionScan:
     bytes_scanned: int = 0
     sampling_mode: str = "full"
 
-    def scan_line(self, line: str) -> None:
+    def scan_line(self, line: str, severity: str | None = None) -> None:
+        line = _reflection_scrub(line)
         canon = _canonicalize_reflection_signature(line)
-        severity = _reflection_line_severity(line)
+        severity = severity or _reflection_line_severity(line)
         if severity == "error":
             self.error_counts[canon] += 1
         elif severity == "warning":
@@ -1279,6 +1388,71 @@ def _scan_session_event(file_path: Path, scan: "_ReflectionScan", max_lines: int
             scan.scan_line(joined)
 
 
+_CLAUDE_INTERRUPT_RE = re.compile(r"\[request interrupted by user", re.I)
+_CLAUDE_PERMISSION_DENIED_RE = re.compile(
+    r"permission (?:for this|to use).{0,80}(?:denied|rejected)|permission denied|was denied|doesn.t want to proceed|user rejected",
+    re.I,
+)
+
+
+def _reflection_text_of(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
+
+
+def _scan_claude_blocks(blocks: list, scan: "_ReflectionScan") -> None:
+    """Signal that lives in non-text blocks: failed tool results and permission denials."""
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        text = _reflection_text_of(block.get("content"))[:600]
+        if _CLAUDE_PERMISSION_DENIED_RE.search(text):
+            scan.event_counts["permission_denied"] += 1
+            scan.scan_line("claude tool permission denied", severity="warning")
+        elif block.get("is_error"):
+            scan.event_counts["tool_result_error"] += 1
+            first = next((ln for ln in text.splitlines() if ln.strip()), "")
+            scan.scan_line(f"claude tool_result error: {first[:160]}", severity="error")
+
+
+def _scan_hermes_log_line(raw: str, scan: "_ReflectionScan") -> None:
+    scan.lines_scanned += 1
+    scan.bytes_scanned += len(raw.encode("utf-8", errors="ignore"))
+    level = _HERMES_LEVEL_RE.search(raw[:80])
+    if level:
+        lv = level.group(1).upper()
+        if lv in ("ERROR", "CRITICAL", "FATAL"):
+            scan.scan_line(raw, severity="error")
+        elif lv.startswith("WARN"):
+            scan.scan_line(raw, severity="warning")
+        # DEBUG/INFO lines are not signal, whatever words they contain.
+    elif raw.startswith("Traceback (most recent call last)"):
+        scan.scan_line(raw, severity="error")
+    else:
+        scan.scan_line(raw)
+    m = re.search(r"\btool(?:Name|_name)?[=:\"]+\s*([a-zA-Z0-9_.:-]+)", raw)
+    if m:
+        scan.tool_counts[m.group(1)] += 1
+
+
+_HERMES_LEVEL_RE = re.compile(r"\b(DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)\b")
+
+
+def _scan_hermes_log(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
+    """Tail-bounded scan of one Hermes runtime log (plain text, timestamped, levelled)."""
+    scan.sampling_mode = "tail"
+    for raw in _read_tail_lines(
+        file_path,
+        max_lines=min(max_lines, REFLECTION_HERMES_TAIL_LINES),
+        max_bytes=REFLECTION_LOG_TAIL_READ_BYTES,
+    ):
+        _scan_hermes_log_line(raw, scan)
+
+
 def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
     with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
         for raw in fh:
@@ -1309,6 +1483,7 @@ def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines:
                 content = message.get("content") or ""
                 if isinstance(content, list):
                     # content may be a list of blocks: [{"type": "text", "text": "..."}]
+                    _scan_claude_blocks(content, scan)
                     content = " ".join(
                         str(block.get("text") or "") for block in content
                         if isinstance(block, dict)
@@ -1316,7 +1491,15 @@ def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines:
                 joined = str(content)
             else:
                 joined = str(message)
+            if _CLAUDE_INTERRUPT_RE.search(joined[:400]):
+                scan.event_counts["interrupted_turn"] += 1
+                scan.scan_line("claude turn interrupted", severity="warning")
             scan.scan_line(joined)
+            # API error entries: assistant message flagged isApiErrorMessage, or a system api_error.
+            if event.get("isApiErrorMessage") or event.get("subtype") == "api_error" or event.get("error"):
+                scan.event_counts["api_error"] += 1
+                scan.scan_line(f"claude api error: {_reflection_text_of(event.get('error') or joined)[:160]}",
+                               severity="error")
 
 
 def _scan_process_log(file_path: Path, scan: "_ReflectionScan", max_lines: int) -> None:
@@ -1372,6 +1555,8 @@ def _process_reflection_item(kind: str, path: str, max_lines: int) -> dict:
         _scan_claude_code_event(file_path, scan, max_lines)
     elif kind == "process_log":
         _scan_process_log(file_path, scan, max_lines)
+    elif kind == "hermes_log":
+        _scan_hermes_log(file_path, scan, max_lines)
     else:
         return {
             "status": "unsupported_kind",
@@ -3043,6 +3228,10 @@ def _docs_ingest_state_for_path(investigation_id: str, document_path: Path, cont
 
 
 _DOCS_INGEST_MAX_FILES = 500
+# Wall-clock budget for one docs_ingest_indexer call. Each changed file costs a store + index write, so a big
+# tree can hold a tool worker for many minutes; past the budget the call returns partial progress and a re-run
+# resumes (unchanged files are skipped). At least one changed file is always stored per call, so repeated calls always progress.
+_DOCS_INGEST_BUDGET_S = max(0.0, float(os.environ.get("LOCI_DOCS_INGEST_BUDGET_S", "120") or 120))
 _DOCS_INGEST_EXTS = frozenset({".md", ".markdown", ".txt"})
 
 
@@ -3136,7 +3325,10 @@ def docs_ingest_indexer(
     )
 
     records: list[dict] = []
-    for doc_path in targets:
+    started = time.monotonic()
+    deferred = 0
+    stored_now = 0
+    for idx, doc_path in enumerate(targets):
         text = doc_path.read_text(encoding="utf-8", errors="replace")
         raw = text.strip()
         doc_title = doc_path.stem.replace("-", " ").replace("_", " ").strip() or doc_path.name
@@ -3180,6 +3372,9 @@ def docs_ingest_indexer(
             })
             continue
 
+        if stored_now > 0 and time.monotonic() - started > _DOCS_INGEST_BUDGET_S:
+            deferred = len(targets) - idx
+            break
         finding_text = f"{doc_title}: {summary}"
         store_result = json.loads(investigation_store(
             investigation_id=investigation_id,
@@ -3191,6 +3386,7 @@ def docs_ingest_indexer(
             metadata=metadata,
             evidence_provenance_tier=MODEL_ASSERTED,
         ))
+        stored_now += 1
         records.append({
             "path": str(doc_path),
             "stored": bool(store_result.get("stored")),
@@ -3207,6 +3403,10 @@ def docs_ingest_indexer(
         "investigation_id": investigation_id,
         "records": records,
     }
+    if deferred:
+        # Out of time, not out of files: call again to continue (indexed files are skipped as unchanged).
+        out.update(partial=True, files_remaining=deferred + (len(all_targets) - len(targets)),
+                   budget_s=_DOCS_INGEST_BUDGET_S)
     if len(all_targets) > len(targets):
         # The file cap cut the tree short: say so rather than read as complete.
         out.update(truncated=True, files_found=len(all_targets),
@@ -3242,8 +3442,12 @@ def docs_search(
     investigation_id: str = "loci-docs-index",
     limit: int = 5,
     include_excerpt: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Search stored markdown/text guidance by query and return concise hits."""
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     q = (query or "").strip()
     if not q:
         return json.dumps({
@@ -3283,7 +3487,7 @@ def docs_search(
         })
 
     results: list[dict] = []
-    for finding in _read_jsonl(findings_path):
+    for finding in _drop_retracted(_read_jsonl(findings_path), investigation_id):
         tags = {str(tag).lower() for tag in finding.get("tags", [])}
         metadata = finding.get("metadata") or {}
         if "docs" not in tags and not metadata.get("source_path"):
@@ -3340,8 +3544,12 @@ def docs_recall(
     investigation_id: str = "loci-docs-index",
     limit: int = 5,
     include_excerpt: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Recall indexed docs guidance by query using the existing docs index/search path."""
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     q = (query or "").strip()
     if not q:
         return json.dumps({
@@ -3934,6 +4142,7 @@ def procedure_search(
     query: str,
     investigation_id: Optional[str] = None,
     limit: int = 5,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Search for procedure-type findings matching a query.
@@ -3976,6 +4185,7 @@ def procedure_search(
                     limit=limit,
                     query_filter=qfilter,
                 )
+                hits = _drop_acl_denied(_drop_retracted(hits, investigation_id), requesting_agent_id)
                 for h in hits:
                     pm = h.get("procedure_meta", {})
                     attempt_count = pm.get("attempt_count", 0) if pm else 0
@@ -4014,7 +4224,7 @@ def procedure_search(
                 if not findings_path.exists():
                     continue
                 try:
-                    for f in _read_jsonl(findings_path):
+                    for f in _drop_acl_denied(_drop_retracted(_read_jsonl(findings_path), inv_dir_path.name), requesting_agent_id):
                         if f.get("record_type") == "procedure" or f.get("type") == "procedure":
                             text = f.get("text", "")
                             if query_lower in text.lower():
@@ -4056,30 +4266,37 @@ def reflection_loop_seed(
     session_events_limit: int = 250,
     process_logs_limit: int = 120,
     reset_queue: bool = False,
+    dry_run: bool = False,
 ) -> str:
     """
-    Seed the bounded self-reflection queue from Copilot local artifacts.
+    Seed the bounded self-reflection queue from Claude Code, Copilot and Hermes logs.
 
     The queue is persisted under ``$LOCI_MEMORY_DIR/_reflection-loop/state.json``.
     This call only enqueues file targets — it does not parse files or write findings.
     Use ``reflection_loop_tick`` to process queued items in small batches.
+
+    Roots per source are ``LOCI_REFLECT_CLAUDE_ROOTS`` (default ``~/.claude/projects``),
+    ``LOCI_REFLECT_COPILOT_ROOTS`` (default ``~/.copilot``) and ``LOCI_REFLECT_HERMES_ROOTS``
+    (default ``~/.hermes``), each an ``os.pathsep``-separated list. The result reports
+    candidates / enqueued / duplicates and the status of every root per source.
+    ``dry_run=True`` enqueues and persists nothing and only returns those counts.
     """
     session_events_limit = max(1, min(int(session_events_limit), 2000))
     process_logs_limit = max(1, min(int(process_logs_limit), 2000))
 
-    _ensure_investigation_exists(
-        investigation_id,
-        title="Copilot self-reflection loop",
-        context=(
-            "Continuous bounded mining of ~/.copilot/temp_ingest, "
-            "~/.copilot/session-state/*/events.jsonl, ~/.copilot/logs/process-*.log, "
-            "and ~/.claude/projects/**/*.jsonl (Claude Code)"
-        ),
-    )
+    if not dry_run:
+        _ensure_investigation_exists(
+            investigation_id,
+            title="Agent self-reflection loop",
+            context=(
+                "Continuous bounded mining of Copilot (temp_ingest, session-state events, "
+                "process logs), Claude Code (projects/**/*.jsonl) and Hermes runtime logs"
+            ),
+        )
 
     state = _load_reflection_state()
     state["investigation_id"] = investigation_id
-    if reset_queue:
+    if reset_queue and not dry_run:
         state["queue"] = []
         state["processed"] = {}
 
@@ -4091,56 +4308,108 @@ def reflection_loop_seed(
     }
     existing_keys.update(processed.keys())
 
+    per_source: dict[str, dict] = {
+        src: {"roots": [], "candidates": 0, "enqueued": 0, "skipped_duplicate": 0, "skipped_missing_root": 0}
+        for src in REFLECTION_SOURCES
+    }
+    root_lists = {
+        "claude": _reflection_roots("LOCI_REFLECT_CLAUDE_ROOTS", Path.home() / ".claude" / "projects"),
+        "copilot": _reflection_roots("LOCI_REFLECT_COPILOT_ROOTS", Path.home() / ".copilot"),
+        "hermes": _reflection_roots("LOCI_REFLECT_HERMES_ROOTS", Path.home() / ".hermes"),
+    }
+    usable: dict[str, list[Path]] = {}
+    for src, roots in root_lists.items():
+        usable[src] = []
+        for root in roots:
+            status = _reflection_root_status(root)
+            per_source[src]["roots"].append({"root": str(root), "status": status})
+            if status == "ok":
+                usable[src].append(root)
+            else:
+                per_source[src]["skipped_missing_root"] += 1
+
+    def _newest(paths, limit):
+        uniq = {str(p): p for p in paths}.values()
+        return sorted(uniq, key=_reflection_mtime, reverse=True)[:limit]
+
+    def _glob(root: Path, pattern: str, src: str) -> list[Path]:
+        try:
+            return list(root.glob(pattern))
+        except OSError:
+            per_source[src]["skipped_missing_root"] += 1
+            return []
+
     candidates: list[dict] = []
-    temp_ingest = Path.home() / ".copilot" / "temp_ingest" / "payload.json"
-    if temp_ingest.exists():
-        candidates.append({"kind": "temp_ingest", "path": str(temp_ingest)})
+    temp_ingest_found = 0
+    session_files: list[Path] = []
+    process_logs: list[Path] = []
+    claude_code_files: list[Path] = []
+    for root in usable["copilot"]:
+        temp_ingest = root / "temp_ingest" / "payload.json"
+        if temp_ingest.exists():
+            temp_ingest_found += 1
+            candidates.append({"kind": "temp_ingest", "path": str(temp_ingest), "source": "copilot"})
+    session_files = _newest(
+        (p for root in usable["copilot"] for p in _glob(root, "session-state/*/events.jsonl", "copilot")),
+        session_events_limit,
+    )
+    candidates.extend({"kind": "session_event", "path": str(p), "source": "copilot"} for p in session_files)
+    process_logs = _newest(
+        (p for root in usable["copilot"] for p in _glob(root, "logs/process-*.log", "copilot")),
+        process_logs_limit,
+    )
+    candidates.extend({"kind": "process_log", "path": str(p), "source": "copilot"} for p in process_logs)
 
-    session_files = sorted(
-        (Path.home() / ".copilot" / "session-state").glob("*/events.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:session_events_limit]
-    candidates.extend({"kind": "session_event", "path": str(p)} for p in session_files)
+    # Claude Code source paths: <claude root>/**/*.jsonl (default ~/.claude/projects)
+    claude_code_files = _newest(
+        (p for root in usable["claude"] for p in _glob(root, "**/*.jsonl", "claude")),
+        session_events_limit,
+    )
+    candidates.extend({"kind": "claude_code_event", "path": str(p), "source": "claude"} for p in claude_code_files)
 
-    process_logs = sorted(
-        (Path.home() / ".copilot" / "logs").glob("process-*.log"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:process_logs_limit]
-    candidates.extend({"kind": "process_log", "path": str(p)} for p in process_logs)
-
-    # Claude Code source paths: ~/.claude/projects/**/*.jsonl
-    claude_code_files = sorted(
-        (Path.home() / ".claude" / "projects").glob("**/*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[:session_events_limit]
-    candidates.extend({"kind": "claude_code_event", "path": str(p)} for p in claude_code_files)
+    # Hermes runtime logs: <hermes root>/logs/<name> and its first rotation.
+    hermes_files: list[Path] = []
+    for root in usable["hermes"]:
+        for name in REFLECTION_HERMES_LOG_NAMES:
+            for suffix in ("", ".1"):
+                f = root / "logs" / f"{name}{suffix}"
+                if f.is_file():
+                    hermes_files.append(f)
+    hermes_files = _newest(hermes_files, process_logs_limit)
+    candidates.extend({"kind": "hermes_log", "path": str(p), "source": "hermes"} for p in hermes_files)
 
     candidates.sort(key=lambda item: _reflection_queue_priority(item.get("kind")))
 
     added = 0
     for item in candidates:
+        rep_ = per_source[item["source"]]
+        rep_["candidates"] += 1
         key = f"{item['kind']}|{item['path']}"
         if key in existing_keys:
+            rep_["skipped_duplicate"] += 1
             continue
-        queue.append(item)
         existing_keys.add(key)
+        rep_["enqueued"] += 1
         added += 1
+        if not dry_run:
+            queue.append(item)
 
-    state["queue"] = queue
-    _save_reflection_state(state)
+    if not dry_run:
+        state["queue"] = queue
+        _save_reflection_state(state)
     return json.dumps({
+        "dry_run": bool(dry_run),
         "queued_added": added,
         "queue_size": len(queue),
         "investigation_id": investigation_id,
         "sources": {
-            "temp_ingest": int(temp_ingest.exists()),
+            "temp_ingest": temp_ingest_found,
             "session_events_candidates": len(session_files),
             "process_logs_candidates": len(process_logs),
             "claude_code_events_candidates": len(claude_code_files),
+            "hermes_logs_candidates": len(hermes_files),
         },
+        "per_source": per_source,
         "state_file": str(REFLECTION_STATE_FILE),
     }, indent=2)
 
@@ -4161,6 +4430,7 @@ def reflection_loop_status(queue_preview: int = 8) -> str:
     return json.dumps({
         "investigation_id": state.get("investigation_id"),
         "queue_size": len(queue),
+        "queue_by_source": dict(Counter(_reflection_source(i.get("kind"), i) for i in queue)),
         "processed_count": len(processed),
         "stats": stats,
         "last_tick": state.get("last_tick"),
@@ -4330,7 +4600,7 @@ def _reflection_item_finding(kind, path, summary, raw_errors, raw_warnings,
         finding_type="observed",
         text=finding_text,
         confidence="low",
-        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed",
+        tags=f"self-reflection,loop-tick,artifact-mining,unreceipted-observed,source-{_reflection_source(kind)}",
         metadata=finding_metadata,
     ))
 
@@ -4359,13 +4629,15 @@ def _reflection_batch_low_signal(investigation_id: str, low_signal_session_event
         finding_type="observed",
         text=low_signal_text,
         confidence="low",
-        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal",
+        tags="self-reflection,loop-tick,artifact-mining,unreceipted-observed,batched-low-signal,source-copilot",
     ):
         return 1
     return 0
 
 
-def _reflection_batch_error_signature(investigation_id: str, batch_error_signatures: Counter) -> int:
+def _reflection_batch_error_signature(
+    investigation_id: str, batch_error_signatures: Counter, sources: Collection[str] = (),
+) -> int:
     """Store the batch dominant-error-signature inference finding.
 
     Returns the number to add to ``findings_written`` (0 or 1). Caller must
@@ -4381,7 +4653,8 @@ def _reflection_batch_error_signature(investigation_id: str, batch_error_signatu
         finding_type="inferred",
         text=infer_text,
         confidence="medium",
-        tags="self-reflection,error-cluster,inference",
+        tags="self-reflection,error-cluster,inference"
+        + "".join(f",source-{s_}" for s_ in sorted(set(sources))),
     ):
         return 1
     return 0
@@ -4411,7 +4684,7 @@ def _reflection_requeue_dropped(
                 finding_type="gap",
                 text=gap_text,
                 confidence="low",
-                tags="self-reflection,loop-tick,dropped-item,re-queued",
+                tags=f"self-reflection,loop-tick,dropped-item,re-queued,source-{_reflection_source(d_kind, dropped)}",
             ):
                 added += 1
     return added
@@ -4450,8 +4723,8 @@ def reflection_loop_tick(
     investigation_id = str(state.get("investigation_id") or REFLECTION_DEFAULT_INVESTIGATION)
     _ensure_investigation_exists(
         investigation_id,
-        title="Copilot self-reflection loop",
-        context="Bounded deterministic queue-based Copilot artifact reflection.",
+        title="Agent self-reflection loop",
+        context="Bounded deterministic queue-based Claude Code / Copilot / Hermes log reflection.",
     )
 
     processed = dict(state.get("processed") or {})
@@ -4463,6 +4736,8 @@ def reflection_loop_tick(
     stats.setdefault("bytes_scanned", 0)
     stats.setdefault("error_signatures_suppressed", 0)
     stats.setdefault("warning_signatures_suppressed", 0)
+    by_source = stats.setdefault("by_source", {})
+    batch_sources: set[str] = set()
     stats.setdefault("error_signature_observations", {})
     stats.setdefault("warning_signature_observations", {})
     error_observations = _prune_signature_observations(stats.get("error_signature_observations") or {})
@@ -4484,10 +4759,18 @@ def reflection_loop_tick(
         kind = str(item.get("kind") or "")
         path = str(item.get("path") or "")
         summary = _process_reflection_item(kind, path, max_lines=max_lines_per_file)
+        src = _reflection_source(kind, item)
+        summary["source"] = src
+        src_stats = by_source.setdefault(src, {})
+        for k_ in ("files_processed", "dropped", "errors_seen", "warnings_seen", "findings_written"):
+            src_stats.setdefault(k_, 0)
         item_reports.append(summary)
         if summary.get("status") != "processed":
+            src_stats["dropped"] += 1
             dropped_items.append(item)
             continue
+        batch_sources.add(src)
+        src_stats["files_processed"] += 1
 
         key = f"{kind}|{path}"
         stats["files_processed"] += 1
@@ -4497,6 +4780,8 @@ def reflection_loop_tick(
         raw_warnings = {str(k): int(v) for k, v in (summary.get("warnings") or {}).items()}
         stats["errors_seen"] += sum(raw_errors.values())
         stats["warnings_seen"] += sum(raw_warnings.values())
+        src_stats["errors_seen"] += sum(raw_errors.values())
+        src_stats["warnings_seen"] += sum(raw_warnings.values())
         if store_item_findings:
             # Only a tick that could store findings may mark an item done:
             # reflection_loop_seed permanently excludes every key in processed, so a
@@ -4518,12 +4803,13 @@ def reflection_loop_tick(
             llm_triage_budget=llm_triage_budget,
         ):
             findings_written += 1
+            src_stats["findings_written"] += 1
 
     if store_item_findings and low_signal_session_events:
         findings_written += _reflection_batch_low_signal(investigation_id, low_signal_session_events)
 
     if store_item_findings and batch_error_signatures:
-        findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures)
+        findings_written += _reflection_batch_error_signature(investigation_id, batch_error_signatures, batch_sources)
 
     stats["last_error_signatures"] = [
         {"signature": sig, "count": count}
@@ -5118,6 +5404,7 @@ def investigation_pre_answer_check(
     claims: str | list[str],
     min_confidence: str = "medium",
     record: bool = True,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Validate proposed response claims against investigation findings plus recent
@@ -5144,6 +5431,9 @@ def investigation_pre_answer_check(
     If the local verifier is unavailable the field stays fail-open as
     ``available=False`` and deterministic results are unchanged.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -5332,6 +5622,7 @@ def investigation_entity_lookup(
     entity_type: str = "auto",
     investigation_id: Optional[str] = None,
     limit: int = 30,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Find every finding that mentions a specific observable — IP, email, hostname,
@@ -5370,7 +5661,11 @@ def investigation_entity_lookup(
             "error": f"entity_type must be one of: {', '.join(_ENTITY_FIELD_MAP)} or 'auto'"
         })
 
-    findings, method = _entity_lookup_cascade(entity, entity_type, investigation_id, limit)
+    if investigation_id:
+        _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+        if _acl_denied:
+            return _acl_denied
+    findings, method = _entity_lookup_cascade(entity, entity_type, investigation_id, limit, requesting_agent_id)
 
     # Group by investigation and build compact summaries.
     by_inv: dict[str, list[dict]] = {}
@@ -5395,6 +5690,7 @@ def investigation_entity_lookup(
 def entity_list(
     investigation_id: str,
     entity_type: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     List all named entities extracted from findings in an investigation.
@@ -5413,6 +5709,9 @@ def entity_list(
         JSON: {"entities": [{entity_id, name, type, finding_count}], "count": int}
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         inv_path = MEMORY_DIR / investigation_id
         if not inv_path.exists():
@@ -5420,16 +5719,21 @@ def entity_list(
 
         entities_path = inv_path / "entities.jsonl"
         raw_entities = _read_jsonl(entities_path)
+        retracted = build_recall_filter(MEMORY_DIR, [investigation_id]).retracted.get(investigation_id, set())
 
         results = []
         for ent in raw_entities:
             if entity_type and ent.get("type") != entity_type:
                 continue
+            refs = ent.get("finding_refs", [])
+            live = [r for r in refs if r not in retracted]
+            if refs and not live:      # every finding that mentioned it was retracted
+                continue
             results.append({
                 "entity_id": ent.get("entity_id"),
                 "name": ent.get("name"),
                 "type": ent.get("type"),
-                "finding_count": len(ent.get("finding_refs", [])),
+                "finding_count": len(live),
             })
 
         # Sort by finding_count descending for relevance
@@ -5446,6 +5750,7 @@ def entity_list(
 def entity_timeline(
     investigation_id: str,
     entity_id: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Show a chronological timeline of all findings that mention a specific entity.
@@ -5466,6 +5771,9 @@ def entity_timeline(
         }
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         inv_path = MEMORY_DIR / investigation_id
         if not inv_path.exists():
@@ -5483,7 +5791,8 @@ def entity_timeline(
         if target_entity is None:
             return json.dumps({"error": f"Entity '{entity_id}' not found in investigation '{investigation_id}'."})
 
-        finding_refs = set(target_entity.get("finding_refs", []))
+        retracted = build_recall_filter(MEMORY_DIR, [investigation_id]).retracted.get(investigation_id, set())
+        finding_refs = {r for r in target_entity.get("finding_refs", []) if r not in retracted}
 
         findings_path = inv_path / "findings.jsonl"
         all_findings = _read_jsonl(findings_path)
@@ -5526,6 +5835,7 @@ def investigation_related_cases(
     entities: str | list[str],
     entity_type: str = "auto",
     limit_per_entity: int = 5,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Find prior investigations that dealt with the same entities as a new alert.
@@ -5557,7 +5867,7 @@ def investigation_related_cases(
     results: list[dict] = []
     for entity in entities[:10]:  # cap total entities to avoid runaway queries
         etype = entity_type if entity_type != "auto" else _detect_entity_type(entity)
-        findings, method = _entity_lookup_cascade(entity, etype, None, limit_per_entity * 4)
+        findings, method = _entity_lookup_cascade(entity, etype, None, limit_per_entity * 4, requesting_agent_id)
 
         # Group by investigation, exclude findings with no investigation context
         by_inv: dict[str, list[dict]] = {}
@@ -5599,11 +5909,15 @@ def investigation_evidence_precheck(
     investigation_id: str,
     proposed_query: str,
     min_similarity: float = 0.4,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Lightweight duplicate-call avoidance helper. Checks if similar evidence
     already exists in findings/audit logs (and Qdrant when available).
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -6518,10 +6832,12 @@ def _health_probe_qdrant_collections(client, main_col, collection_dims: dict) ->
     from memcheck.vectors import COLLECTION as VERDICTS_COLLECTION
     from memcheck.vectors import EMBED_DIM as VERDICTS_DIM
 
-    existing = {c.name for c in client.get_collections().collections}
+    existing, aliases = qdrant_ops.collection_names_with_aliases(client)
     report: dict = {}
     main = main_col or QDRANT_COLLECTION_PREFIX
     main_present = main in existing
+    if main in aliases:
+        report["main_is_alias_of"] = aliases[main]
     verdicts_present = VERDICTS_COLLECTION in existing
     verdicts_dim = None
     if main_present:
@@ -6845,7 +7161,7 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
         }, indent=2)
 
     try:
-        present = sorted(c.name for c in client.get_collections().collections)
+        present = sorted(qdrant_ops.collection_names_with_aliases(client)[0])
         queried = [QDRANT_COLLECTION_PREFIX] + (
             [_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
         if collections:
@@ -8125,6 +8441,83 @@ def _embed_probe_headers() -> dict:
         return {}
 
 
+_main_state_cache: dict = {"t": 0.0, "v": None}
+
+
+def _main_collection_state() -> dict | None:
+    """Does the main findings collection resolve (as a collection or an alias)? Cached 60 s; None when Qdrant
+    cannot be asked (qdrant_reachable already reports that)."""
+    now = time.monotonic()
+    if _main_state_cache["v"] is not None and now - _main_state_cache["t"] < 60.0:
+        return _main_state_cache["v"]
+    try:
+        client, main_col = _qdrant_client_readonly()
+        if client is None:
+            return None
+        main = main_col or QDRANT_COLLECTION_PREFIX
+        names, aliases = qdrant_ops.collection_names_with_aliases(client)
+        state = {"name": main, "present": main in names, "alias_of": aliases.get(main)}
+    except Exception as exc:
+        logger.debug("loci_health: main collection probe failed: %r", exc)
+        return None
+    _main_state_cache.update(t=now, v=state)
+    return state
+
+
+def _assess_degradation(transport: dict | None, main_state: dict | None, gen: dict | None,
+                        d10_errors: int = 0) -> tuple:
+    """(reasons, warnings) from signals that a reachability probe cannot see.
+
+    reasons make loci_health ``degraded``: a feature the server advertises is currently not working.
+    warnings are worth knowing but do not change the status. Every input may be None (not measured)."""
+    reasons: list = []
+    warnings: list = []
+    for kind, label, consec_limit in (("embed", "embedding", 3), ("index_write", "index writes", 1)):
+        t = (transport or {}).get(kind) or {}
+        consec = int(t.get("consecutive_failures") or 0)
+        if consec >= consec_limit:
+            extra = ""
+            if kind == "embed" and t.get("breaker_open_s"):
+                extra = f"; brownout breaker open for another {t['breaker_open_s']:.0f}s"
+            if kind == "index_write":
+                extra = "; findings are stored on disk but have no vector (investigation_store qdrant_stored=false)"
+            last_ok = t.get("last_ok_age_s")
+            reasons.append(
+                f"{label}: {consec} consecutive failures"
+                + (f", last success {last_ok:.0f}s ago" if last_ok is not None else ", no success seen since start")
+                + extra)
+        elif int(t.get("failed") or 0) > 0:
+            warnings.append(f"{label}: {t['failed']} failure(s) in the last {t.get('window_s', 900)}s, recovered")
+    if main_state is not None and not main_state.get("present"):
+        reasons.append(f"main memory collection '{main_state.get('name')}' does not resolve (neither a collection nor an alias)")
+    if gen:
+        if gen.get("resident") and gen.get("on_gpu") is False:
+            reasons.append(f"generation model {gen.get('model')!r} is resident but running on CPU (size_vram 0)")
+        elif gen.get("resident") is False:
+            warnings.append(f"generation model {gen.get('model')!r} is not loaded right now (first call will pay a load)")
+    if d10_errors:
+        warnings.append(f"D10 shadow gate has swallowed {d10_errors} error(s) since start; its log may be empty or short")
+    return reasons, warnings
+
+
+def _gen_residency(url: str, model: str) -> dict | None:
+    """Is the generation model loaded, and on the GPU? One bounded GET of /api/ps; None when it cannot be read."""
+    try:
+        import backends
+        ok, body = backends._http_probe(url, "/api/ps", timeout=1.0)
+        if not ok or not isinstance(body, dict):
+            return None
+        for m in body.get("models") or []:
+            if str(m.get("name") or m.get("model") or "") == model:
+                size, vram = float(m.get("size") or 0), float(m.get("size_vram") or 0)
+                return {"model": model, "resident": True, "size_gb": round(size / 1e9, 2),
+                        "size_vram_gb": round(vram / 1e9, 2), "on_gpu": (vram >= 0.9 * size) if size else None}
+        return {"model": model, "resident": False, "on_gpu": None}
+    except Exception as exc:
+        logger.debug("loci_health: /api/ps probe failed: %r", exc)
+        return None
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -8147,12 +8540,18 @@ def loci_health() -> str:
                          counts when it answers that GET with a 4xx
       ollama_gen_reachable: the generation endpoint (ollama_gen_url), same rule
       ollama_gen_model_present: (optional) the configured gen model is listed there
-      vllm_reachable:    the resolved vLLM endpoint answers GET /health
       qdrant_reachable:  the resolved Qdrant endpoint answers GET /readyz
                          (each is a short TCP gate followed by a bounded HTTP request)
       embed_model:       configured embedding model
       rerank_model:      configured cross-encoder rerank model
       warm:              whether the embed warm-ping has been fired this process
+      status:            'ok' | 'degraded' | 'unhealthy'. 'unhealthy' = a configured backend is
+                         down; 'degraded' = everything answers but a feature is not working
+                         (see degraded_reasons: embeds failing, index writes failing, main
+                         collection not resolving, generation model on CPU)
+      embed_health / index_write_health: rolling in-process success and failure counts
+      main_collection:   whether the findings collection resolves, and the alias target if aliased
+      gen_residency:     whether the generation model is loaded and on the GPU
     """
     out: dict = {
         "status": "ok",
@@ -8160,7 +8559,6 @@ def loci_health() -> str:
         "ladybug": "unavailable",
         "ollama_reachable": False,
         "ollama_gen_reachable": False,
-        "vllm_reachable": False,
         "qdrant_reachable": False,
         "embed_model": "",
         "rerank_model": "",
@@ -8176,6 +8574,9 @@ def loci_health() -> str:
         pid = _ladybug_writer_pid()
         if pid is not None:
             out["ladybug_writer_pid"] = pid
+        if _ladybug_last_error:
+            out["ladybug_last_error"] = _ladybug_last_error
+            out["ladybug_failing_since"] = _ladybug_since
     except Exception as exc:
         logger.debug("loci_health: ladybug health-state probe failed: %r", exc)
         pass
@@ -8187,8 +8588,6 @@ def loci_health() -> str:
             "ollama": bool(os.environ.get("OLLAMA_BASE_URL")
                            or os.environ.get("OLLAMA_URL")
                            or backends._cfg("ollama", "url", "")),
-            "vllm": bool(os.environ.get("VLLM_BASE_URL")
-                         or backends._cfg("vllm", "url", "")),
             "qdrant": bool(os.environ.get("QDRANT_URL")
                            or backends._cfg("qdrant", "url", "")),
         }
@@ -8208,7 +8607,6 @@ def loci_health() -> str:
         for key, resolver, path, headers in (
             ("ollama_reachable", lambda: backends.ollama_url(_PROBE_T), "/api/tags", None),
             ("ollama_gen_reachable", lambda: backends.ollama_gen_url(_PROBE_T), "/api/tags", None),
-            ("vllm_reachable", lambda: backends.vllm_url(probe_timeout=_PROBE_T), "/health", None),
             ("qdrant_reachable", lambda: backends.qdrant()[0], "/readyz",
              {"api-key": _qdrant_key} if _qdrant_key else None),
         ):
@@ -8231,6 +8629,13 @@ def loci_health() -> str:
                 pass
         # When a generation model is configured, the gen endpoint must actually carry it.
         _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        try:   # a model pool, when declared, decides which tag the gen endpoint must carry
+            import model_pool
+            if model_pool.configured():
+                _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends.ollama_gen_model()
+                out["model_pool"] = model_pool.summary()
+        except Exception as exc:
+            logger.debug("loci_health: model pool probe failed: %r", exc)
         _tags = http_answers.get("ollama_gen_reachable")
         if (out.get("ollama_gen_reachable") and _gen_model and isinstance(_tags, dict)
                 and isinstance(_tags.get("models"), list)):
@@ -8253,7 +8658,6 @@ def loci_health() -> str:
         optional_down = []
         for label, key in (("ollama", "ollama_reachable"),
                            ("ollama_gen", "ollama_gen_reachable"),
-                           ("vllm", "vllm_reachable"),
                            ("qdrant", "qdrant_reachable")):
             if out.get(key):
                 continue
@@ -8261,6 +8665,13 @@ def loci_health() -> str:
                 failures.append(f"{label}: configured/enabled but unreachable")
             else:
                 optional_down.append(label)
+        if out.get("ladybug") == "latched":
+            failures.append(
+                "ladybug: graph store latched (permanent init failure"
+                + (f" since {_ladybug_since}" if _ladybug_since else "")
+                + (f": {_ladybug_last_error}" if _ladybug_last_error else "")
+                + "); code-graph and code-to-memory tools are unavailable until the server restarts"
+            )
         if out.get("ollama_gen_model_present") is False:
             failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
         if failures:
@@ -8280,6 +8691,40 @@ def loci_health() -> str:
     except Exception as exc:
         logger.debug("loci_health: embed warm-state probe failed: %r", exc)
         pass
+
+    # Signals a reachability probe cannot see: a hung embedder, index writes that fail while stores report success,
+    # a main collection that does not resolve, a generation model stuck on CPU. They turn "ok" into "degraded".
+    try:
+        import qdrant_ops as _qops   # not `qdrant_ops`: a later import in this function makes that name local to all of it
+        transport = _qops.transport_health()
+        out["embed_health"] = transport.get("embed")
+        out["index_write_health"] = transport.get("index_write")
+        main_state = _main_collection_state()
+        if main_state is not None:
+            out["main_collection"] = main_state
+        gen = None
+        if out.get("ollama_gen_reachable"):
+            import backends
+            gen = _gen_residency(backends.ollama_gen_url(0.5), backends.ollama_gen_model())
+            if gen is not None:
+                out["gen_residency"] = gen
+        d10_errors = 0
+        try:
+            import d10_gate
+            d10_errors = int(d10_gate.shadow_error_count())
+        except Exception as exc:
+            logger.debug("loci_health: d10 error count unavailable: %r", exc)
+        reasons, warnings = _assess_degradation(transport, main_state, gen, d10_errors)
+        if reasons:
+            out["degraded_reasons"] = reasons
+            if out.get("status") == "ok":
+                out["status"] = "degraded"
+        if warnings:
+            out["warnings"] = warnings
+    except Exception as exc:
+        # Not debug-only: a silently failed assessment reads as "nothing wrong", the failure this block exists to end.
+        logger.warning("loci_health: degradation assessment failed: %r", exc)
+        out.setdefault("warnings", []).append(f"degradation assessment failed, status may be too optimistic: {exc!r}")
 
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
@@ -9884,7 +10329,7 @@ def memory_consolidate(dry_run: bool = False) -> str:
 
 
 @mcp.tool()
-def causal_infer(investigation_id: str, limit: int = 200) -> str:
+def causal_infer(investigation_id: str, limit: int = 200, requesting_agent_id: Optional[str] = None) -> str:
     """
     Infer causal edges for an investigation and write them to causal_edges.jsonl.
 
@@ -9905,6 +10350,9 @@ def causal_infer(investigation_id: str, limit: int = 200) -> str:
     Returns JSON: {investigation_id, findings_considered, edges_written,
                    status} — or {error} if the investigation does not exist.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     # _load_manifest, not _inv_dir: _inv_dir mkdirs, so a typo'd id would silently create an empty investigation.
     if not _load_manifest(investigation_id):
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -10264,6 +10712,7 @@ def _confidence_llm_entailment(
 def memory_confidence(
     query: str,
     top_k: int = 8,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Estimate how reliably loci_memory knows about a topic (metamemory).
@@ -10300,6 +10749,7 @@ def memory_confidence(
         field is returned degraded or omitted; the numeric verdict is unchanged.
     """
     results, hard_stop_basis = _confidence_retrieve(query, top_k)
+    results = _drop_acl_denied(_drop_retracted(results), requesting_agent_id)
     if hard_stop_basis is not None:
         return json.dumps({
             "confidence": 0.0, "basis": hard_stop_basis,
@@ -10616,7 +11066,7 @@ def loci_validated_knowledge_promotion(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
+def memory_promote(investigation_id: str, finding_id: str, tier: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Promote a finding to a higher memory tier.
 
@@ -10640,6 +11090,9 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
         memory_promote again with the same tier retries the index write.
         On error: {error: "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         result = _change_finding_tier(investigation_id, finding_id, tier)
         return json.dumps(result, indent=2)
@@ -10652,7 +11105,7 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
+def memory_demote(investigation_id: str, finding_id: str, tier: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Demote a finding to a lower memory tier.
 
@@ -10674,6 +11127,9 @@ def memory_demote(investigation_id: str, finding_id: str, tier: str) -> str:
         JSON: {finding_id, old_tier, new_tier, ok: true}
         On error: {error: "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         result = _change_finding_tier(investigation_id, finding_id, tier)
         return json.dumps(result, indent=2)
@@ -10746,6 +11202,7 @@ def investigation_reason(
     perspectives: int = 3,
     ground_threshold: float = 0.59,
     persist: bool = False,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Reason over an investigation with grounded, multi-perspective analysis.
 
@@ -10774,6 +11231,9 @@ def investigation_reason(
         grounded_findings, gate_applied, confidence_score, converged_claims,
         contested_areas, final_answer, persisted_finding_ids}``.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     import grounding_gate as _grounding_gate
     from memcheck import llm as _llm
     from memcheck.checks.contradiction_llm import extract_json as _extract_json
@@ -10927,7 +11387,7 @@ _VALID_VERDICTS = frozenset(["a_wins", "b_wins", "both_valid", "false_positive"]
 
 
 @mcp.tool()
-def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> str:
+def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Resolve a detected conflict by recording a verdict.
 
@@ -10945,6 +11405,9 @@ def conflict_resolve(investigation_id: str, conflict_id: str, verdict: str) -> s
         JSON: {"resolved": true, "conflict_id": "...", "verdict": "..."}
         On error: {"error": "<message>"}
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         if verdict not in _VALID_VERDICTS:
             return json.dumps({
@@ -11031,6 +11494,12 @@ def _compute_hints(investigation_id: str, limit: int, since_ts: Optional[str]) -
             if isinstance(f, dict)
         ]
 
+    # A retracted finding is not a hint, whichever path produced it.
+    _rf = build_recall_filter(MEMORY_DIR, [investigation_id])
+    candidates = [h for h in candidates
+                  if not _rf.is_retracted({"investigation_id": investigation_id,
+                                           "finding_id": h.get("finding_id", ""), "text": h.get("text", "")})]
+
     # Apply since_ts filter if requested
     if since_ts:
         candidates = [h for h in candidates if str(h.get("ts", "")) > since_ts]
@@ -11071,6 +11540,7 @@ def memory_hints(
     limit: int = 3,
     since_ts: Optional[str] = None,
     mode: Literal["normal", "compact"] = "normal",
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Return recent findings for an investigation as lightweight hints.
@@ -11095,6 +11565,9 @@ def memory_hints(
         JSON ``{investigation_id, hints:[{finding_id, text, source,
         record_type, recency_score, ts}], count, as_of}``, or ``{"error": ...}``.
     """
+    _acl_denied = inv_store.acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     try:
         manifest = _load_manifest(investigation_id)
         if not manifest:

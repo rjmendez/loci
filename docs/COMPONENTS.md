@@ -165,7 +165,7 @@ A non-integer value disables the purge rather than guessing a window.
 | `backends.py` | portable backend resolution (`~/.loci/backends.toml`) so an install works unchanged on another machine |
 | `qdrant_ops.py` | embedding + vector-store helpers, retention window, quantized-search params (#220) |
 | `embed_ops.py` | the embedding tier (Ollama nomic, 768d) — the offload that works today |
-| `llm_local.py` | local-GPU generation primitive; vLLM fallback is opt-in via `LOCI_VLLM_FALLBACK`, default OFF (#222/#224/#225) |
+| `llm_local.py` | local-GPU generation primitive over Ollama (#222/#224/#225) |
 | `batched_gen.py` | concurrent fan-out generation with Ollama fallback |
 | `openrouter.py` | generation tier whose availability is not this node's |
 | `grounding.py` | `ground(task)` — run ONCE in the main loop before a fan-out; the gate corroborates the semantic lane rather than trusting a bare 0.55 (#221) |

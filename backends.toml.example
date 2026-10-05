@@ -77,9 +77,20 @@
 [embed]
 # model = "nomic-embed-text"
 
-[vllm]
-# url = "http://gpu-host:8000"         # batched OpenAI-compatible server (omit -> Ollama fallback)
-# model = "Qwen/Qwen2.5-3B-Instruct"
+[models]
+# Optional ranked model pool (docs/OPERATIONS.md, "Model pool"). `python mcp/model_pool.py init`
+# prints a draft from what your generation endpoint has installed.
+# resident_bonus = 0.5
+# max_vram_gb = 10            # prefer models that fit one GPU
+# over_cap_fallback = true    # ...but when none fits, use the best-ranked one anyway
+# [[models.pool]]
+# name = "your-main-model:tag"
+# roles = ["gen", "verify"]
+# rank = 1
+# [[models.pool]]
+# name = "your-fallback-model:tag"
+# roles = ["gen"]
+# rank = 2
 
 [cloud]
 # enabled = true                        # enable third-tier cloud fallback after local tiers fail

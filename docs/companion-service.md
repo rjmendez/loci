@@ -79,15 +79,14 @@ reliable thing in the system.
 
 ## The shape: a router, not a server
 
-`mcp/batched_gen.py` already has the right idea — vLLM primary, Ollama fallback,
-never raises. Generalise it into a small companion service that owns three tiers
+`mcp/batched_gen.py` already has the right idea — concurrent Ollama fan-out that
+never raises. Generalise it into a small companion service that owns two tiers
 and demotes on health rather than on hope:
 
 | tier | what it is | when it is chosen |
 |---|---|---|
-| **local batched** | vLLM on the GPU node | healthy, and the batch is large enough to be worth continuous batching |
-| **local serial** | Ollama, `keep_alive`-pinned | vLLM absent or the device plugin is mid-flap |
-| **remote** | OpenRouter | both local tiers are down, or the pass is explicitly marked remote-eligible |
+| **local** | Ollama, `keep_alive`-pinned | healthy |
+| **remote** | OpenRouter | the local tier is down, or the pass is explicitly marked remote-eligible |
 
 The service's job is small and worth stating precisely, because scope creep here
 is how the previous attempts got heavy:

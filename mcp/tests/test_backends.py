@@ -21,22 +21,6 @@ def _no_ollama_env(mp):
     mp.delenv("OLLAMA_URL", raising=False)
 
 
-def _no_vllm_env(mp):
-    for key in (
-        "VLLM_BASE_URL",
-        "VLLM_MODEL",
-        "VLLM_BASE_URL_CODE",
-        "VLLM_MODEL_CODE",
-        "VLLM_BASE_URL_MATH",
-        "VLLM_MODEL_MATH",
-        "VLLM_BASE_URL_SAFETY",
-        "VLLM_MODEL_SAFETY",
-        "VLLM_BASE_URL_TOOL_CALLING",
-        "VLLM_MODEL_TOOL_CALLING",
-    ):
-        mp.delenv(key, raising=False)
-
-
 def test_env_wins(monkeypatch):
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://envhost:11434")
     B._reset_cache()
@@ -73,13 +57,12 @@ def test_models_qdrant_memory_from_config(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
               "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR"):
         monkeypatch.delenv(k, raising=False)
-    _no_vllm_env(monkeypatch)
     cfg = tmp_path / "b.toml"
-    cfg.write_text('[embed]\nmodel="e"\n[vllm]\nmodel="v"\n[rerank]\nmodel="r"\n'
+    cfg.write_text('[embed]\nmodel="e"\n[rerank]\nmodel="r"\n'
                    '[qdrant]\nurl="q"\napi_key="k"\n[memory]\ndir="/m"\n')
     monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
     B._reset_cache()
-    assert B.embed_model() == "e" and B.vllm_model() == "v" and B.rerank_model() == "r"
+    assert B.embed_model() == "e" and B.rerank_model() == "r"
     assert B.qdrant() == ("q", "k") and B.memory_dir() == "/m"
 
 
@@ -478,7 +461,6 @@ def test_redteam_model_env_wins_over_config(tmp_path, monkeypatch):
 def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     for k in ("EMBED_MODEL", "OLLAMA_BASE_URL", "OLLAMA_URL"):
         monkeypatch.delenv(k, raising=False)
-    _no_vllm_env(monkeypatch)
     cfg = tmp_path / "bad.toml"
     cfg.write_text("this is [not valid toml")
     monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
@@ -488,52 +470,10 @@ def test_broken_config_is_fail_open(tmp_path, monkeypatch):
     assert B.ollama_url() == ""
 
 
-def test_vllm_role_env_wins_over_role_config_and_shared(tmp_path, monkeypatch):
-    _no_vllm_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text(
-        '[vllm]\nurl = "http://shared:8000"\nmodel = "shared-model"\n'
-        '[vllm.code]\nurl = "http://cfg-code:8001"\nmodel = "cfg-code-model"\n'
-    )
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    monkeypatch.setenv("VLLM_BASE_URL_CODE", "http://env-code:8001")
-    monkeypatch.setenv("VLLM_MODEL_CODE", "env-code-model")
-    B._reset_cache()
-    assert B.vllm_url("code") == "http://env-code:8001"
-    assert B.vllm_model("code") == "env-code-model"
-
-
-def test_vllm_role_config_wins_over_shared_without_local_probe(tmp_path, monkeypatch):
-    _no_vllm_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text(
-        '[vllm]\nurl = "http://shared:8000"\nmodel = "shared-model"\n'
-        '[vllm.code]\nurl = "http://cfg-code:8001"\nmodel = "cfg-code-model"\n'
-    )
-    probes = []
-    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: probes.append((url, timeout)) or False)
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    assert B.vllm_url("code") == "http://cfg-code:8001"
-    assert B.vllm_model("code") == "cfg-code-model"
-    assert probes == []
-
-
-def test_vllm_role_falls_back_to_shared_resolver(monkeypatch):
-    _no_vllm_env(monkeypatch)
-    probes = []
-    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: probes.append((url, timeout)) or (url == B._LOCAL_VLLM))
-    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
-    B._reset_cache()
-    assert B.vllm_url("code") == B._LOCAL_VLLM
-    assert B.vllm_model("code") == "Qwen2.5-3B-Instruct"
-    assert probes == [(B._LOCAL_VLLM, 1.0)]
-
-
 # --- Fresh install: all backends together, so the resolution chain is guarded as one unit ---
 
-_ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "VLLM_BASE_URL", "EMBED_MODEL",
-                    "VLLM_MODEL", "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
+_ALL_BACKEND_ENV = ("OLLAMA_BASE_URL", "OLLAMA_URL", "EMBED_MODEL",
+                    "RERANK_MODEL", "QDRANT_URL", "QDRANT_API_KEY",
                     "LOCI_MEMORY_MD_DIR", "LOCI_MEMORY_DIR")
 
 
@@ -550,40 +490,21 @@ def test_fresh_install_full_config_resolves_all_backends(tmp_path, monkeypatch):
     cfg = tmp_path / "backends.toml"
     cfg.write_text('[ollama]\nurl = "http://cfg-gpu:11434"\n'
                    '[embed]\nmodel = "cfg-embed"\n'
-                   '[vllm]\nurl = "http://cfg-gpu:8000"\nmodel = "cfg-vllm"\n'
                    '[rerank]\nmodel = "cfg-rerank"\n'
                    '[qdrant]\nurl = "http://cfg-qdrant:6333"\napi_key = "cfg-key"\n'
                    '[memory]\ndir = "/cfg/mem"\n')
     _fresh_install(monkeypatch, cfg)
     assert B.ollama_url() == "http://cfg-gpu:11434"
-    assert B.vllm_url() == "http://cfg-gpu:8000"
     assert B.embed_model() == "cfg-embed"
-    assert B.vllm_model() == "cfg-vllm"
     assert B.rerank_model() == "cfg-rerank"
     assert B.qdrant() == ("http://cfg-qdrant:6333", "cfg-key")
     assert B.memory_dir() == "/cfg/mem"
 
 
-def test_vllm_config_wins_over_local_probe(tmp_path, monkeypatch):
-    """Configured vLLM URL must outrank localhost probing.
-
-    Prevents accidental self-targeting when localhost:8000 is the MCP server,
-    not an OpenAI-compatible vLLM endpoint.
-    """
-    _no_vllm_env(monkeypatch)
-    cfg = tmp_path / "backends.toml"
-    cfg.write_text('[vllm]\nurl = "http://cfg-vllm:18000"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    monkeypatch.setattr(B, "_alive", lambda url, timeout=1.0: True)
-    B._reset_cache()
-    assert B.vllm_url() == "http://cfg-vllm:18000"
-
-
 def test_fresh_install_bare_defaults(monkeypatch):
     _fresh_install(monkeypatch, "/nonexistent/no.toml")
-    assert B.ollama_url() == "" and B.vllm_url() == ""        # urls empty -> tiers fail-open
+    assert B.ollama_url() == ""                               # url empty -> tiers fail-open
     assert B.embed_model() == "nomic-embed-text"
-    assert B.vllm_model() == "Qwen2.5-3B-Instruct"
     assert B.rerank_model() == "BAAI/bge-reranker-v2-m3"      # bge is the flipped fresh default
     assert B.qdrant() == ("", "")
     assert B.memory_dir() == ""

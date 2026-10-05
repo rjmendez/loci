@@ -2,7 +2,7 @@
 """Resolve workflow tasks on the cheap tiers, so no Claude agent has to.
 
 A Workflow `agent()` is always a Claude subagent — there is no hook that points
-one at vLLM or OpenRouter. Offloading therefore cannot mean changing the model an
+one at a local model or OpenRouter. Offloading therefore cannot mean changing the model an
 agent runs on; it means doing the work BEFORE the workflow and injecting the
 answer, the way `loci-native.js` already does with `args.ground` and
 `args.graphFacts` (a `tier:'graph'` task resolves from an injected fact with no
@@ -28,7 +28,7 @@ Usage:
               args: {ground: block, cheapFacts: facts, tasks: [
                   {id: "k", title: "...", tier: "cheap"}]}})
 
-Tier order is local-first: vLLM and Ollama cost nothing per call and keep the
+Tier order is local-first: Ollama costs nothing per call and keep the
 corpus on the box. --remote adds the OpenRouter ladder for whatever the local
 tiers could not serve, which on a flaky GPU node is the difference between a
 stalled batch and a slower one.

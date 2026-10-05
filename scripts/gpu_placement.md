@@ -2,7 +2,7 @@
 
 When a machine has more than one GPU, place the Loci tiers so the **latency-sensitive retrieval
 tier** (reranker + embeddings) never queues behind the **throughput/heavy generation tier**. All
-endpoints are resolved through `backends` (`ollama_url()` / `vllm_url()`), so this is purely about
+endpoints are resolved through `backends` (`ollama_url()`), so this is purely about
 which physical card each backend lands on — no host is hardcoded.
 
 ## The tiers
@@ -11,8 +11,8 @@ which physical card each backend lands on — no host is hardcoded.
   (default `BAAI/bge-reranker-v2-m3`), loaded on torch `cuda:0` when available and used by
   `rag_context_search`. It's a small model on the critical path of **every** retrieval call.
 - **[embed]** Embeddings via Ollama (`nomic-embed-text`), warm on GPU.
-- **[gen]** Local generation via Ollama (`qwen2.5:3b`, pinned via `keep_alive`), with an optional
-  vLLM batched-gen server as the higher-throughput primary path (`mcp/batched_gen.py`).
+- **[gen]** Local generation via Ollama (`qwen2.5:3b`, pinned via `keep_alive`), with
+  concurrent fan-out through `mcp/batched_gen.py`.
 
 ## The contention problem
 
@@ -25,7 +25,7 @@ placement is to keep the latency-sensitive retrieval tier off the heavy generati
 | Tier | Workload | Target GPU |
 |------|----------|-----------|
 | Retrieval (latency-sensitive) | CrossEncoder rerank (torch) + warm Ollama embeddings | the **inference GPU** (`cuda:0`) |
-| Generation (throughput / batched) | vLLM/TGI batched-gen + heavy Ollama gen | a **separate GPU**, if available |
+| Generation (throughput / batched) | batched/heavy Ollama gen | a **separate GPU**, if available |
 
 Rerank stays on the inference GPU and must never queue behind a multi-second generation. A
 batched-gen server is heavier and belongs on a second card when one exists. If a card is shared
@@ -63,6 +63,10 @@ host**, not in this venv:
   parallel requests so a batched gen model doesn't evict the warm `nomic-embed-text`.
 - **`OLLAMA_KEEP_ALIVE`** (or per-request `keep_alive`) — keep hot models resident so a warm stream
   never re-pays the cold load.
+- **`WARM_EXTRA_MODELS` / `--extra-model`** — keep a configurable panel of specialized expert
+  models resident alongside the hot pair when evolution or analysis needs them.
+- **`keep_alive=0` / `scripts/gpu_warm.py --drop`** — unload the hot Ollama models before a test
+  or sim run when you need to claw back VRAM for FlyBrain evolution work.
 
 A clean split is **two Ollama endpoints**, each with its own `CUDA_VISIBLE_DEVICES`: one on the
 inference GPU for embeddings, one on a second card for the heavy gen model. A single Ollama over
@@ -75,6 +79,10 @@ both cards works too — keep `OLLAMA_SCHED_SPREAD` off and rely on `keep_alive`
 choose a card. Placement is decided by the env vars above on the Ollama host; `gpu_warm.py` then
 keeps the chosen models warm so the cold load is paid once. Run the keeper (`--loop`) pointed at
 each Ollama endpoint you stand up.
+
+For test windows, flip the same helper around with `--drop` so the resident models are released
+and the sim/evolution lane can use the freed VRAM. That keeps the Ollama lane warm when needed
+and makes it preemptible when GPU headroom matters more than latency.
 
 ## Design principles
 

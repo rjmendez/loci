@@ -124,8 +124,14 @@ def run_main(hook, payload, env=None):
 
 
 def context_of(stdout: str) -> str:
-    """main() emits exactly one JSON object with a single 'context' key."""
+    """main() emits exactly one JSON object: Claude Code's hookSpecificOutput.additionalContext for a Claude
+    Code event (UserPromptSubmit, SubagentStart), or the legacy Hermes {"context": ...} for pre_llm_call."""
     obj = json.loads(stdout)
+    if "hookSpecificOutput" in obj:
+        assert list(obj) == ["hookSpecificOutput"]
+        hso = obj["hookSpecificOutput"]
+        assert set(hso) == {"hookEventName", "additionalContext"}
+        return hso["additionalContext"]
     assert list(obj) == ["context"]
     return obj["context"]
 
@@ -1591,8 +1597,9 @@ def test_output_is_a_single_json_line_on_stdout(hook):
     hook._load_rules_summary = lambda: ""
     _, out = run_main(hook, _prompt())
     assert out.endswith("\n") and out.count("\n") == 1
-    assert list(json.loads(out)) == ["context"]
-    assert isinstance(json.loads(out)["context"], str)
+    obj = json.loads(out)
+    assert list(obj) == ["hookSpecificOutput"]          # _prompt() is a UserPromptSubmit event
+    assert isinstance(obj["hookSpecificOutput"]["additionalContext"], str)
 
 
 # ---------------------------------------------------------------------------
@@ -1708,3 +1715,47 @@ def test_fanout_keeps_hits_when_only_some_collections_fail(hook):
 
 def _raise(hook, col):
     raise hook._SearchFailed(col)
+
+
+
+# ---------------------------------------------------------------------------
+# wire format per host (Claude Code reads only hookSpecificOutput.additionalContext)
+# ---------------------------------------------------------------------------
+
+def _stub(hook):
+    hook._embed = lambda t: None
+    hook._beam_fallback = lambda q: []
+    hook._load_rules_summary = lambda: ""
+
+
+@pytest.mark.parametrize("event", ["UserPromptSubmit", "SubagentStart"])
+def test_claude_code_events_get_additional_context_not_a_top_level_context(hook, event):
+    _stub(hook)
+    payload = _prompt()
+    payload["hook_event_name"] = event
+    payload["prompt"] = "tell me about the grounding hook"
+    _, out = run_main(hook, payload)
+    obj = json.loads(out)
+    assert "context" not in obj, "a top-level context key is ignored by Claude Code"
+    assert obj["hookSpecificOutput"]["hookEventName"] == event
+    assert isinstance(obj["hookSpecificOutput"]["additionalContext"], str)
+
+
+def test_hermes_event_keeps_the_legacy_context_shape(hook):
+    _stub(hook)
+    payload = _prompt()
+    payload["hook_event_name"] = "pre_llm_call"
+    payload["extra"] = {"user_message": "tell me about the grounding hook"}
+    _, out = run_main(hook, payload)
+    obj = json.loads(out)
+    assert list(obj) == ["context"] and "hookSpecificOutput" not in obj
+
+
+def test_claude_context_is_clipped_to_the_documented_limit(hook, capsys):
+    hook._HOST_EVENT = "UserPromptSubmit"
+    try:
+        hook._emit_context("x" * 20000)
+    finally:
+        hook._HOST_EVENT = ""
+    obj = json.loads(capsys.readouterr().out)
+    assert len(obj["hookSpecificOutput"]["additionalContext"]) <= 9500   # Claude Code caps a string at 10,000

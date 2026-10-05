@@ -11,11 +11,17 @@ Why this exists (session grounding):
 
 What it does: issue a minimal /api/generate (qwen2.5:3b) and /api/embed (nomic-embed-text)
 call with keep_alive set to a long TTL (-1 = never unload, or a configurable duration),
-which forces Ollama to load + hold each model resident. Then report /api/ps residency and
-basic GPU state.
+which forces Ollama to load + hold each model resident. A configurable specialized-model
+set can be pinned alongside them for evolution/test windows. A drop/release mode also exists:
+set keep_alive=0 to unload the hot models after test runs so sim/evolution work can reclaim
+VRAM. Then report /api/ps residency and basic GPU state.
 
 Modes:
   - one-shot (default): pin both models once, print residency + GPU state, exit.
+  - extra resident set: `WARM_EXTRA_MODELS` / `--extra-model` can add specialized models
+    to the resident set (see parser below).
+  - --drop: send both models with keep_alive=0 so Ollama releases them after the request
+    and then print residency + GPU state. This also unloads any configured extra models.
   - --loop: re-pin every N seconds forever (a lightweight keeper). With keep_alive=-1 a
     re-pin is cheap (models already resident) but the loop also re-loads anything that was
     evicted (e.g. another job grabbed VRAM), so it self-heals.
@@ -80,8 +86,39 @@ _TIMEOUT = float(os.environ.get("OLLAMA_WARM_TIMEOUT", "120"))
 # keep_alive: -1 = never unload. Configurable via env; accepts "-1", "30m", "2h", etc.
 _KEEP_ALIVE = os.environ.get("WARM_KEEP_ALIVE", "-1")
 
+
+def _parse_model_spec(spec: str) -> tuple[str, str]:
+    """Parse a model spec.
+
+    Supported forms:
+    - ``model`` -> treated as a generation-model pin
+    - ``gen:model`` / ``embed:model`` -> explicit kind
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("empty model spec")
+    lowered = spec.lower()
+    for prefix, kind in (("gen:", "gen"), ("generate:", "gen"),
+                         ("embed:", "embed"), ("embedding:", "embed")):
+        if lowered.startswith(prefix):
+            return (kind, spec[len(prefix):].strip())
+    return ("gen", spec)
+
+
+def _parse_extra_models(value: Optional[str]) -> list[tuple[str, str]]:
+    if not value:
+        return []
+    out: list[tuple[str, str]] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        out.append(_parse_model_spec(raw))
+    return out
+
 # Default re-pin cadence for --loop (grounding silent; 240s is a light keeper).
 _DEFAULT_INTERVAL = float(os.environ.get("WARM_INTERVAL", "240"))
+_EXTRA_MODELS = _parse_extra_models(os.environ.get("WARM_EXTRA_MODELS", ""))
 
 
 def _resolve_post(post_fn: Optional[Callable]) -> Optional[Callable]:
@@ -101,6 +138,8 @@ def _coerce_keep_alive(value):
     strings like "30m" pass through untouched."""
     if value in ("-1", -1):
         return -1
+    if value in ("0", 0):
+        return 0
     return value
 
 
@@ -210,16 +249,25 @@ def gpu_state() -> dict:
 
 
 def warm_once(keep_alive=_KEEP_ALIVE, post_fn: Optional[Callable] = None,
-              include_gpu: bool = True) -> dict:
+              include_gpu: bool = True, extra_models: Optional[list[tuple[str, str]]] = None) -> dict:
     """Pin both hot models once and gather residency + GPU state.
 
     Returns a well-formed report dict. degraded=True if either pin failed or Ollama is
     unreachable. NEVER raises [pattern:fail-open].
     """
-    pins = [
+    resident_specs = [
         pin_model(_GEN_MODEL, "gen", keep_alive=keep_alive, post_fn=post_fn),
         pin_model(_EMBED_MODEL, "embed", keep_alive=keep_alive, post_fn=post_fn),
     ]
+    extras = _EXTRA_MODELS if extra_models is None else extra_models
+    seen = {("gen", _GEN_MODEL), ("embed", _EMBED_MODEL)}
+    for kind, model in extras:
+        spec = (kind, model)
+        if spec in seen:
+            continue
+        seen.add(spec)
+        resident_specs.append(pin_model(model, kind, keep_alive=keep_alive, post_fn=post_fn))
+    pins = resident_specs
     ps = ollama_ps(post_fn=post_fn)
     degraded = (not all(p["ok"] for p in pins)) or (not ps["ok"])
     report = {
@@ -232,6 +280,12 @@ def warm_once(keep_alive=_KEEP_ALIVE, post_fn: Optional[Callable] = None,
     if include_gpu:
         report["gpu"] = gpu_state()
     return report
+
+
+def drop_once(post_fn: Optional[Callable] = None, include_gpu: bool = True,
+              extra_models: Optional[list[tuple[str, str]]] = None) -> dict:
+    """Release the hot models from Ollama by pinning them with keep_alive=0."""
+    return warm_once(keep_alive=0, post_fn=post_fn, include_gpu=include_gpu, extra_models=extra_models)
 
 
 def _print_report(report: dict) -> None:
@@ -265,6 +319,10 @@ def _print_report(report: dict) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Keep hot Ollama models warm on GPU.")
+    ap.add_argument("--extra-model", action="append", default=[],
+                    help="additional resident model spec: model or kind:model (repeatable)")
+    ap.add_argument("--drop", action="store_true",
+                    help="unload the hot Ollama models after the request (keep_alive=0)")
     ap.add_argument("--loop", action="store_true",
                     help="re-pin forever (lightweight keeper) instead of one-shot")
     ap.add_argument("--interval", type=float, default=_DEFAULT_INTERVAL,
@@ -275,8 +333,15 @@ def main(argv=None) -> int:
     ap.add_argument("--no-gpu", action="store_true", help="skip the nvidia-smi probe")
     args = ap.parse_args(argv)
 
+    extra_models = list(_EXTRA_MODELS)
+    for item in args.extra_model or []:
+        extra_models.append(_parse_model_spec(item))
+
     def _tick():
-        report = warm_once(keep_alive=args.keep_alive, include_gpu=not args.no_gpu)
+        if args.drop:
+            report = drop_once(include_gpu=not args.no_gpu, extra_models=extra_models)
+        else:
+            report = warm_once(keep_alive=args.keep_alive, include_gpu=not args.no_gpu, extra_models=extra_models)
         if args.json:
             print(json.dumps(report))
         else:

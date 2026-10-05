@@ -80,7 +80,10 @@ def _wire(embed_fn, llm_fn, cosine_fn):
         from .. import llm as _llm
 
         embed_fn = embed_fn or _llm.embed_texts
-        llm_fn = llm_fn or _llm.call_llm
+        # The judge prompt asks for a JSON object, so ask the server for JSON mode. Without it some local
+        # models (Gemma 4 on Ollama) do not stop and the call runs to its timeout: measured 41 s with no
+        # answer versus 4 s with JSON mode, which made every pair look like "the judge returned nothing".
+        llm_fn = llm_fn or (lambda prompt: _llm.call_llm(prompt, json_mode=True))
         cosine_fn = cosine_fn or _llm.cosine
     return embed_fn, llm_fn, cosine_fn
 
