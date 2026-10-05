@@ -227,7 +227,7 @@ def run_spreading_activation(
 
             # Next frontier: targets that were not already in the frontier set
             frontier = [
-                t for (_, t, _) in edges
+                t for (_src, t, _w, _etype) in edges
                 if t not in seed_set
             ]
             # Deduplicate frontier

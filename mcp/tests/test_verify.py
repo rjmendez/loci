@@ -4,7 +4,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest  # noqa: E402
+
 import verify as V  # noqa: E402
+from provenance_firewall import assert_evidence_firewall  # noqa: E402
 
 
 # --- stub gen_fn factories: match the shared contract gen_fn(prompt, *, fmt, max_tokens) ---
@@ -103,7 +106,7 @@ def test_confirmation_yields_confirmed():
     r = V.verify_finding("The log shows a decode", context="AcGg rx_ok=3", gen_fn=_ok(_CONFIRMED))
     assert r["verdict"] == "confirmed"
     assert r["degraded"] is False
-    assert 0.0 <= r["confidence"] <= 1.0
+    assert r["confidence"] == 0.8
 
 
 def test_model_asserted_claim_with_only_model_asserted_evidence_is_unverified():
@@ -147,19 +150,44 @@ def test_legacy_untagged_evidence_is_not_independent_support():
     assert r["provenance_firewall"]["defaulted_evidence_count"] == 1
 
 
-def test_provenance_firewall_fails_open(monkeypatch):
-    monkeypatch.setattr(
-        V,
-        "assert_evidence_firewall",
-        lambda *args, **kwargs: {"allowed": True, "degraded": True, "reason": "failed-open"},
-    )
+class _RaisingRow(dict):
+    """An evidence row whose lookups blow up, as a corrupt store object would."""
+
+    def get(self, *args, **kwargs):
+        raise RuntimeError("corrupt evidence row")
+
+
+def test_provenance_firewall_fails_open_through_its_real_except_branch():
+    # The real firewall, forced into its except branch by a row it cannot read.
+    fw = assert_evidence_firewall({"evidence_provenance_tier": "model_asserted"}, [_RaisingRow()],
+                                  phase="verify_finding")
+    assert fw == {
+        "allowed": True,
+        "phase": "verify_finding",
+        "candidate_tier": "tool_verified",
+        "evidence_tiers": [],
+        "independent_evidence_tiers": [],
+        "reason": "provenance_firewall_failed_open:RuntimeError",
+        "degraded": True,
+    }
+
+
+def test_provenance_firewall_failure_lets_verification_run():
+    calls = []
+
+    def _fn(prompt, *, fmt=None, max_tokens=256):
+        calls.append(prompt)
+        return {"text": _CONFIRMED, "ok": True}
+
     r = V.verify_finding(
         "Firewall failure does not crash callers.",
         candidate_provenance_tier="model_asserted",
-        evidence_rows=[{"evidence_provenance_tier": "model_asserted"}],
-        gen_fn=_ok(_CONFIRMED),
+        evidence_rows=[_RaisingRow()],
+        gen_fn=_fn,
     )
-    assert r["verdict"] == "confirmed"
+    assert len(calls) == 1          # the firewall failed open, so the skeptic ran
+    assert r == {"verdict": "confirmed", "refutation": "Tried to break it; the log lines directly support the claim.",
+                 "reasoning": _CONFIRMED, "confidence": 0.8, "degraded": False}
 
 
 def test_confirmed_embedded_in_prose_with_fences():
@@ -173,6 +201,32 @@ def test_gen_not_ok_fails_open_to_uncertain():
     assert r["verdict"] == "uncertain"
     assert r["degraded"] is True
     assert r["confidence"] == 0.0
+
+
+def test_not_ok_response_carrying_a_confirmed_body_is_not_trusted():
+    # ok=False means the call failed; a verdict-shaped body must not be read as a verdict.
+    r = V.verify_finding("some claim", gen_fn=lambda p, **k: {"text": _CONFIRMED, "ok": False})
+    assert r == {"verdict": "uncertain", "refutation": "", "reasoning": _CONFIRMED,
+                 "confidence": 0.0, "degraded": True}
+
+
+@pytest.mark.parametrize("raw_conf", ["NaN", "Infinity", "-Infinity", '"nan"', '"inf"', "1e999", "1" + "0" * 400],
+                         ids=["NaN", "Infinity", "-Infinity", "str-nan", "str-inf", "1e999", "int-10e400"])
+def test_nonfinite_confidence_makes_the_verdict_uncertain(raw_conf):
+    raw = '{"verdict": "confirmed", "refutation": "cannot refute", "confidence": %s}' % raw_conf
+    r = V.verify_finding("some claim", gen_fn=_ok(raw))
+    assert r == {"verdict": "uncertain", "refutation": "", "reasoning": raw,
+                 "confidence": 0.0, "degraded": True}
+
+
+@pytest.mark.parametrize("raw", [float("nan"), float("inf"), float("-inf"), "nan", "inf", 10 ** 400],
+                         ids=["nan", "inf", "-inf", "str-nan", "str-inf", "int-10e400"])
+def test_coerce_confidence_rejects_nonfinite(raw):
+    assert V._coerce_confidence(raw) == 0.0
+
+
+def test_coerce_confidence_keeps_finite_values():
+    assert [V._coerce_confidence(x) for x in (0.25, "0.5", 1, -2, 7.5)] == [0.25, 0.5, 1.0, 0.0, 1.0]
 
 
 def test_gen_error_fails_open_to_uncertain():
@@ -496,9 +550,10 @@ def test_default_gen_fn_is_lazy_and_fails_open(monkeypatch):
         return real_import(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", _blocked)
+    monkeypatch.delitem(sys.modules, "llm_local", raising=False)
+    assert V._lazy_generate("p", fmt="json", max_tokens=8) == {"text": "", "ok": False}
     r = V.verify_finding("some claim")   # no gen_fn -> lazy import path
-    assert r["verdict"] == "uncertain"
-    assert r["degraded"] is True
+    assert r == {"verdict": "uncertain", "refutation": "", "reasoning": "", "confidence": 0.0, "degraded": True}
 
 
 # --- MULTI-REPO code grounding: many checkouts of many repos, one right revision ---

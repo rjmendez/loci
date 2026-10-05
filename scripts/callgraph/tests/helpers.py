@@ -137,3 +137,76 @@ def called_bare_name_count(source: str, name: str) -> int:
         1 for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
     )
+
+
+def _dotted(node: ast.expr) -> str | None:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+_DEC_RULES = {
+    "mcp.tool": "DEC-tool", "mcp.resource": "DEC-tool",
+    "mcp.custom_route": "DEC-mcp-route",
+    "app.get": "DEC-route", "app.post": "DEC-route", "app.put": "DEC-route",
+    "app.delete": "DEC-route", "app.patch": "DEC-route",
+}
+
+
+def registration_census(sources) -> dict[str, int]:
+    """REGISTERS counts per rule, computed with plain `ast` and no pipeline code.
+
+    * DEC-*: functions decorated with the FastMCP / FastAPI registrars above.
+    * MAN-LOOP: names in a `for fn in (a, b, ...):` tuple whose body calls
+      `mcp.tool()(fn)`, counted when the name is a module-level function.
+    * MAN-DICT: bare-name values of a module-level `_SKILL_MAP = {...}` that are
+      module-level functions.
+
+    Used to gate HEAD exactly without pinning a number that every new tool
+    moves, and itself checked against the hand-validated counts at
+    VALIDATED_REV (tests/test_pipeline_real_corpus.py).
+    """
+    counts: dict[str, int] = {}
+
+    def bump(rule: str, n: int = 1) -> None:
+        counts[rule] = counts.get(rule, 0) + n
+
+    for sf in sources:
+        if sf.tree is None:
+            continue
+        tree = ast.parse(sf.source)
+        top_level_fns = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    rule = _DEC_RULES.get(_dotted(_decorator_target(dec)) or "")
+                    if rule:
+                        bump(rule)
+                        break
+            elif (isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                  and isinstance(node.iter, (ast.Tuple, ast.List))
+                  and node.iter.elts and all(isinstance(e, ast.Name) for e in node.iter.elts)):
+                var = node.target.id
+                registers = any(
+                    isinstance(c, ast.Call) and isinstance(c.func, ast.Call)
+                    and _dotted(c.func.func) == "mcp.tool"
+                    and len(c.args) == 1 and isinstance(c.args[0], ast.Name) and c.args[0].id == var
+                    for stmt in node.body for c in ast.walk(stmt)
+                )
+                if registers:
+                    bump("MAN-LOOP", sum(1 for e in node.iter.elts if e.id in top_level_fns))
+        for stmt in tree.body:
+            target = value = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target, value = stmt.targets[0], stmt.value
+            elif isinstance(stmt, ast.AnnAssign):
+                target, value = stmt.target, stmt.value
+            if isinstance(target, ast.Name) and target.id == "_SKILL_MAP" and isinstance(value, ast.Dict):
+                bump("MAN-DICT", sum(1 for v in value.values
+                                     if isinstance(v, ast.Name) and v.id in top_level_fns))
+    return counts

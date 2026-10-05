@@ -44,8 +44,6 @@ def test_every_fit_announces_itself_before_it_starts_and_flushes():
         )
 
 
-def test_cv_results_record_how_long_each_model_took():
-    """Without a per-model duration nobody can tell which candidate costs the hour."""
-    src = TRAIN.read_text()
-    assert "fit_seconds" in src, "cv_results must carry a per-model fit duration"
-    assert "time.monotonic()" in src, "duration must come from a monotonic clock"
+# test_cv_results_record_how_long_each_model_took (a grep for "fit_seconds" in the
+# source) was replaced by test_each_model_reports_how_long_its_cross_validation_took
+# in test_train_parallel_folds.py, which runs train.main and reads the value.

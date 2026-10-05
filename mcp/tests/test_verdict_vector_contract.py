@@ -303,11 +303,23 @@ def _params(size):
 
 def test_an_unreachable_qdrant_is_not_treated_as_absent():
     from memcheck import vectors as V
-    c = _Client(_Err(500))
-    with pytest.raises(Exception) as exc:
+    err = _Err(500)
+    c = _Client(err)
+    # The original error propagates unchanged: not wrapped, not replaced.
+    with pytest.raises(_Err, match="status 500") as exc:
         V.ensure_collection(c)
-    assert not isinstance(exc.value, V.VerdictDimensionMismatch)
+    assert exc.value is err
     assert c.calls == ["get"], "must not follow an unreachable get with a create"
+
+
+def test_a_refused_connection_without_a_status_code_is_reraised():
+    from memcheck import vectors as V
+    err = ConnectionRefusedError("connection refused")
+    c = _Client(err)
+    with pytest.raises(ConnectionRefusedError, match="connection refused") as exc:
+        V.ensure_collection(c)
+    assert exc.value is err
+    assert c.calls == ["get"]
 
 
 def test_a_404_still_creates_the_collection():

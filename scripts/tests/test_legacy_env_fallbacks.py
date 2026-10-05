@@ -51,15 +51,34 @@ def test_backends_memory_dir_accepts_the_legacy_variable():
         assert "/tmp/legacy-mem" in str(backends.memory_dir())
 
 
-def test_the_settings_json_legacy_registration_name_is_hermes_memory():
-    """It names files that already exist on disk, so it cannot be renamed."""
-    for f in ("ebbinghaus_consolidation.py", "reembed_daemon.py",
-              "qdrant_payload_indexes.py", "memgas_hierarchy.py"):
-        src = (REPO / "scripts" / f).read_text()
-        if "mcpServers" not in src and "servers" not in src:
-            continue
-        assert "loci_memory" not in src or "hermes_memory" in src, (
-            f"{f} looks up a legacy MCP registration name that never existed")
+def _memgas_key_from_settings(tmp_path, monkeypatch, servers):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text(
+        __import__("json").dumps({"mcpServers": servers}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("QDRANT_API_KEY", raising=False)
+    return _fresh("memgas_hierarchy")._read_qdrant_api_key()
+
+
+@pytest.mark.parametrize("name", ["loci", "hermes_memory"])
+def test_memgas_reads_the_key_from_the_real_registration_names(name, tmp_path, monkeypatch):
+    """settings.json registers the server as "loci" (current) or "hermes_memory"
+    (older installs; it names files already on disk, so it cannot be renamed)."""
+    servers = {name: {"env": {"QDRANT_API_KEY": f"key-from-{name}"}}}
+    assert _memgas_key_from_settings(tmp_path, monkeypatch, servers) == f"key-from-{name}"
+
+
+def test_memgas_current_registration_wins_over_the_legacy_one(tmp_path, monkeypatch):
+    servers = {"hermes_memory": {"env": {"QDRANT_API_KEY": "legacy"}},
+               "loci": {"env": {"QDRANT_API_KEY": "current"}}}
+    assert _memgas_key_from_settings(tmp_path, monkeypatch, servers) == "current"
+
+
+def test_memgas_ignores_the_never_registered_loci_memory_name(tmp_path, monkeypatch):
+    # "loci_memory" is a collection name, never an MCP registration name.
+    servers = {"loci_memory": {"env": {"QDRANT_API_KEY": "wrong"}}}
+    assert _memgas_key_from_settings(tmp_path, monkeypatch, servers) == ""
 
 
 @pytest.mark.parametrize("attr, legacy", [

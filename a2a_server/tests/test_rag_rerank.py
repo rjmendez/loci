@@ -59,8 +59,10 @@ class _Session:
     def __init__(self, resp=None, raise_on_post=None):
         self._resp = resp
         self._raise = raise_on_post
+        self.posts = []
 
     def post(self, *a, **kw):
+        self.posts.append((a, kw))
         if self._raise:
             raise self._raise
         return self._resp
@@ -101,15 +103,43 @@ class TestRerankDisabled(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": "   "}):
             self.assertFalse(run(a2a._rerank("q", hits())))
 
+    # The guards are checked with a session that WOULD succeed (a full, valid
+    # score list) and records posts. A refusing/raising stub cannot tell a guard
+    # from the fail-open path: both return False.
+    @staticmethod
+    def _willing_session(n):
+        return _Session(_Resp(200, {"results": [
+            {"index": i, "relevance_score": float(i)} for i in range(n)]}))
+
     def test_single_hit_is_not_sent(self):
-        with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": URL}):
-            self.assertFalse(run(a2a._rerank("q", hits(1))))
+        h = hits(1)
+        with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": URL}), \
+             with_session(self._willing_session(1)) as sess:
+            self.assertFalse(run(a2a._rerank("q", h)))
+        self.assertEqual(sess.posts, [])
+        self.assertNotIn("rerank_score", h[0])
 
     def test_all_empty_content_is_not_sent(self):
         h = [{"collection": "c", "id": "0", "score": 0.5, "content": "  "},
              {"collection": "c", "id": "1", "score": 0.4, "content": ""}]
-        with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": URL}):
+        with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": URL}), \
+             with_session(self._willing_session(2)) as sess:
             self.assertFalse(run(a2a._rerank("q", h)))
+        self.assertEqual(sess.posts, [])
+        self.assertEqual([x["id"] for x in h], ["0", "1"])
+
+    def test_two_hits_with_content_are_sent(self):
+        # Positive twin of the guards: the same session IS used once there is
+        # something to rerank.
+        h = hits(2)
+        with mock.patch.dict(os.environ, {"RERANK_HTTP_URL": URL}), \
+             with_session(self._willing_session(2)) as sess:
+            self.assertTrue(run(a2a._rerank("q", h)))
+        self.assertEqual(len(sess.posts), 1)
+        (url,), kw = sess.posts[0]
+        self.assertEqual(url, URL)
+        self.assertEqual(kw["json"], {"query": "q", "documents": ["doc 0", "doc 1"]})
+        self.assertEqual([x["id"] for x in h], ["1", "0"])
 
 
 class TestRerankApplies(unittest.TestCase):
@@ -138,9 +168,14 @@ class TestRerankApplies(unittest.TestCase):
         self.assertEqual(sorted(x["id"] for x in h), ["0", "1", "2"])
 
     def test_already_correct_order_is_stable(self):
+        # Contract (docstring of _rerank): True means the cross-encoder ordering
+        # was APPLIED, whether or not it moved anything. rag_search reports it as
+        # `reranked`, and each hit carries its rerank_score either way.
         ok, h = self._reranked([(0, -1.0), (1, -3.0), (2, -9.0)])
         self.assertTrue(ok)
         self.assertEqual([x["id"] for x in h], ["0", "1", "2"])
+        self.assertEqual([x["rerank_score"] for x in h], [-1.0, -3.0, -9.0])
+        self.assertEqual([x["cosine_score"] for x in h], [0.9, 0.8, 0.7])
 
 
 class TestRerankFailsOpen(unittest.TestCase):

@@ -28,11 +28,24 @@ def test_empty_findings_short_circuit_without_calling_gen_fn():
     assert calls == []
 
 
+def _recording_gen_fn(text):
+    """Stub gen_fn that records every call so the test can check what was judged."""
+    calls = []
+
+    def _fn(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return {"text": text, "ok": True}
+    return _fn, calls
+
+
 def test_contradict_verdict_is_reported():
+    fn, calls = _recording_gen_fn('{"verdict":"contradict","reason":"same port, opposite polarity"}')
     result = C.judge_conflict(
         "the port is open",
         "the port is not open",
-        gen_fn=_gen_fn('{"verdict":"contradict","reason":"same port, opposite polarity"}'),
+        type_a="observed",
+        type_b="gap",
+        gen_fn=fn,
     )
     assert result == {
         "verdict": "contradict",
@@ -40,6 +53,23 @@ def test_contradict_verdict_is_reported():
         "ok": True,
         "error": None,
     }
+    # The model must judge A against B: each text under its own heading and type.
+    assert len(calls) == 1
+    assert calls[0]["fmt"] == "json" and calls[0]["max_tokens"] == 120
+    prompt = calls[0]["prompt"]
+    assert prompt.endswith(
+        "FINDING A (type=observed):\nthe port is open\n\n"
+        "FINDING B (type=gap):\nthe port is not open\n"
+    ), prompt
+
+
+def test_prompt_clips_each_finding_and_defaults_the_type():
+    fn, calls = _recording_gen_fn('{"verdict":"agree","reason":"x"}')
+    long_b = "b" * (C._MAX_TEXT_CHARS + 50)
+    C.judge_conflict("  alpha  ", long_b, gen_fn=fn)
+    prompt = calls[0]["prompt"]
+    assert "FINDING A (type=unknown):\nalpha\n\n" in prompt
+    assert prompt.endswith("FINDING B (type=unknown):\n" + "b" * C._MAX_TEXT_CHARS + "\n")
 
 
 def test_agree_and_same_topic_verdicts_are_accepted():

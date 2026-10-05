@@ -33,6 +33,23 @@ class FakeClock:
         self.t += dt
 
 
+_SCRIPTS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _no_script_overrun():
+    """Every scripted model must not be called past its script.
+
+    run_loop never raises (it catches everything into an envelope), so raising
+    from the model stub would only turn into a quiet non-"done" status. The stub
+    records the overrun instead and this check fails the test after the run.
+    """
+    _SCRIPTS.clear()
+    yield
+    overruns = [len(fn.overflow) for fn in _SCRIPTS if fn.overflow]
+    assert overruns == [], f"model called past its script ({overruns} extra calls)"
+
+
 def scripted(*texts, then=None):
     """model_fn popping replies; after they run out, ``then(n)`` (if given) supplies more."""
     queue = list(texts)
@@ -44,10 +61,13 @@ def scripted(*texts, then=None):
         elif then is not None:
             text = then(len(fn.calls))
         else:
-            raise AssertionError("model script exhausted")
+            fn.overflow.append(prompt)
+            return {"text": "", "ok": False, "model": "fake", "why": "model script exhausted"}
         return {"text": text, "ok": True, "model": "fake"}
 
     fn.calls = []
+    fn.overflow = []
+    _SCRIPTS.append(fn)
     return fn
 
 
@@ -188,15 +208,11 @@ def test_registry_all_readonly_and_bound(monkeypatch):
     banned = {"llm_local", "generate_batch", "swarm_reason", "offload_tool_loop",
               "audit_log", "investigation_store", "memory_retract", "code_graph_ingest"}
     assert not banned & set(ol.TOOL_SPECS)
-    try:
-        import server  # noqa: F401  (server.py binds the real tools on import)
-        bound = set(ol._TOOLS)
-    except Exception:
-        monkeypatch.setattr(ol, "_TOOLS", ol._TOOLS)
-        monkeypatch.setattr(ol, "_MEMORY_DIR_FN", ol._MEMORY_DIR_FN)
-        ol.bind_tools({n: Tool() for n in ol.TOOL_SPECS}, lambda: Path("."))
-        bound = set(ol._TOOLS)
-    assert bound == set(ol.TOOL_SPECS)
+    import server  # server.py binds the real tools on import; a failed import must fail here
+    assert set(ol._TOOLS) == set(ol.TOOL_SPECS)
+    # bound to the real server functions, not stand-ins
+    for name, fn in ol._TOOLS.items():
+        assert fn is getattr(server, name), name
 
 
 def test_bind_tools_filters_unknown(monkeypatch):

@@ -110,11 +110,9 @@ def test_related_investigations(tmp_path):
     store.upsert_finding({"id": "f2", "text": f"mention {URL}", "investigation": "invB",
                           "ftype": "note", "confidence": "high", "source": "t", "ts": 1})
     related = store.related_investigations("invA")
-    ids = [r["id"] for r in related]
-    assert "invB" in ids
-    b = next(r for r in related if r["id"] == "invB")
-    assert b["shared"] >= 1
-    assert b["title"] == "Investigation B"
+    # one shared distinctive entity (the URL) + one derivation link (f3 -> f2), counted once each
+    assert related == [{"id": "invB", "title": "Investigation B", "shared_entities": 1,
+                        "derivation_links": 1, "related": 0, "shared": 2}]
 
 
 def test_ingest_code_and_reads(tmp_path):
@@ -483,7 +481,7 @@ def test_reingest_replace_is_idempotent(tmp_path):
         graph_tools.code_graph_ingest(str(src))
         files_1 = store.code_query("MATCH (c:CodeFile) RETURN count(c)")[0][0]
         syms_1 = store.code_query("MATCH (s:CodeSymbol) RETURN count(s)")[0][0]
-        assert files_1 >= 2 and syms_1 >= 2
+        assert (files_1, syms_1) == (2, 2)
 
         # Remove one file, then re-ingest with replace=True.
         drop.unlink()
@@ -493,9 +491,10 @@ def test_reingest_replace_is_idempotent(tmp_path):
         syms_2 = store.code_query("MATCH (s:CodeSymbol) RETURN count(s)")[0][0]
     finally:
         graph_tools._get_ladybug = _orig
-    # Counts did not double (idempotent) and the removed file's symbol is gone.
-    assert files_2 <= files_1
-    assert syms_2 < syms_1
+    # Counts did not double (idempotent); the removed file AND its symbol are pruned.
+    assert (files_2, syms_2) == (1, 1)
+    paths = [row[0] for row in store.code_query("MATCH (c:CodeFile) RETURN c.path")]
+    assert [p.endswith("pkg/keep.py") for p in paths] == [True]
     assert store.callers_of("dropped") == []  # nothing references it; symbol pruned
     assert store.code_query("MATCH (s:CodeSymbol {name:'dropped'}) RETURN s.id") == []
     assert ["kept"] in store.code_query("MATCH (s:CodeSymbol) RETURN s.name")

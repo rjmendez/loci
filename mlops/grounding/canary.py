@@ -14,7 +14,11 @@ Importable as a module or run as a CLI:
       [--min-margin 0.02] \
       [--dry-run]
 
-Exit 0 = success (HOLD or PROMOTE). Exit 1 = drift detected.
+Exit contract (pre-promote mode), read by mlops/loop.py:
+  0 = PROMOTE (the candidate beat cosine by the margin; promoted unless --dry-run)
+  1 = SLO drift detected
+  3 = HOLD (evaluated cleanly; the candidate did not beat cosine by the margin)
+Monitor mode: 0 clean, 1 drift, 2 ROLLBACK RECOMMENDED.
 """
 import argparse
 import glob
@@ -49,6 +53,10 @@ DEFAULT_THRESHOLD = float(os.environ.get("DTL_GROUND_THRESHOLD", "0.59"))
 DEFAULT_MIN_MARGIN = 0.02
 HISTORY_WINDOW = 10
 MIN_FINDINGS_PER_RUN = 10
+
+# Exit codes. HOLD has its own code: it used to exit 0 like PROMOTE, and
+# mlops/loop.py counts a 0 as a promotion, so every HOLD was recorded as one.
+EXIT_PROMOTE, EXIT_DRIFT, EXIT_ROLLBACK, EXIT_HOLD = 0, 1, 2, 3
 
 
 # ---------------------------------------------------------------------------
@@ -302,8 +310,13 @@ def zscore_drift_check(current_metrics, history_path=None):
             return 0.0
         return float((current_val - mu) / sigma)
 
-    hist_cos = [r.get("cosine_f1", float("nan")) for r in recent]
-    hist_model = [r.get("model_f1", float("nan")) for r in recent]
+    def _num(v):
+        # A null (json NaN has no literal) is a missing value, not a crash:
+        # np.isnan(None) raised TypeError out of the drift check.
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else float("nan")
+
+    hist_cos = [_num(r.get("cosine_f1")) for r in recent]
+    hist_model = [_num(r.get("model_f1")) for r in recent]
 
     cos_z = _zscore(current_metrics.get("cosine_f1", float("nan")), hist_cos)
     model_z = _zscore(current_metrics.get("model_f1", float("nan")), hist_model)
@@ -351,12 +364,17 @@ def monitor_live(
     import joblib
 
     clf = joblib.load(live_model_path) if os.path.exists(str(live_model_path)) else None
+    # The degraded returns carry the same keys as the measured one: main()'s
+    # monitor mode formats cosine_f1/model_f1 and raised KeyError on them.
+    nan = float("nan")
     if clf is None:
-        return {"drift": False, "rollback_recommended": False, "reason": "no live model found"}
+        return {"drift": False, "rollback_recommended": False, "cosine_f1": nan,
+                "model_f1": nan, "reason": "no live model found"}
 
     runs = _load_runs(findings_glob)
     if not runs:
-        return {"drift": False, "rollback_recommended": False, "reason": "no findings to evaluate"}
+        return {"drift": False, "rollback_recommended": False, "cosine_f1": nan,
+                "model_f1": nan, "reason": "no findings to evaluate"}
 
     cos_f1s, model_f1s = [], []
     for _, findings in sorted(runs.items()):
@@ -451,10 +469,10 @@ def main():
               f"drift={mon['drift']} rollback_recommended={mon['rollback_recommended']}")
         if mon["rollback_recommended"]:
             print(f"[canary] ROLLBACK RECOMMENDED: {mon['reason']}", file=sys.stderr)
-            sys.exit(2)
+            sys.exit(EXIT_ROLLBACK)
         if mon["drift"]:
             print(f"[canary] ALERT: drift detected — {mon['reason']}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_DRIFT)
         sys.exit(0)
 
     if not a.candidate:
@@ -504,9 +522,9 @@ def main():
 
     if drift_result["drift"]:
         print(f"[canary] ALERT: SLO drift detected — {drift_result['reason']}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_DRIFT)
 
-    sys.exit(0)
+    sys.exit(EXIT_PROMOTE if result["decision"] == "PROMOTE" else EXIT_HOLD)
 
 
 if __name__ == "__main__":

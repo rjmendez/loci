@@ -1,9 +1,10 @@
 """
-Characterization tests for eval/ (harness.py, tasks.py, grounding_gate_eval.py,
+Contract tests for eval/ (harness.py, tasks.py, grounding_gate_eval.py,
 grounding_gate_qf_eval.py, grounding_gate_oos_eval.py).
 
-These pin the behaviour AS IT IS TODAY -- including a genuine defect that is
-deliberately NOT fixed here (see test_oos_verdict_else_branch_drops_the_verdict_text).
+These used to pin the behaviour of the day, including the OOS verdict line that
+dropped its own verdict and a dry-run eval that scored a missing cosine as 0.0.
+Those pins are replaced by the contract the evals now meet.
 
 No network / Qdrant / Ollama / GPU is used: every outbound call goes through
 harness._http / harness.embed / subprocess.run, all of which are monkeypatched.
@@ -337,14 +338,23 @@ def test_stable_point_id_is_deterministic_and_bounded():
     assert harness.stable_point_id("abc", "2026-01-01") == 771649595245321683
     assert harness.stable_point_id("abc", "2026-01-01") == harness.stable_point_id("abc", "2026-01-01")
     assert harness.stable_point_id("abc", "2026-01-02") != harness.stable_point_id("abc", "2026-01-01")
-    assert harness.stable_point_id("ab", "c") != harness.stable_point_id("a", "bc") or True
+    # Every real task id on every real date is its own point: run_date is a
+    # fixed-width ISO date, so task_id + run_date cannot collide across them.
+    task_ids = [t["id"] for t in tasks.TASKS] + ["dtl.grounding_gate.f1",
+                                                 "dtl.grounding_gate.auc"]
+    ids = {harness.stable_point_id(t, d) for t in task_ids
+           for d in ("2026-01-01", "2026-01-02", "2026-12-31")}
+    assert len(ids) == 3 * len(task_ids)
     # 15 hex chars -> always fits in 60 bits (safe as a Qdrant unsigned point id)
     assert 0 <= harness.stable_point_id("x", "y") < 16 ** 15
 
 
-def test_stable_point_id_concatenation_is_ambiguous():
-    """id is derived from task_id + run_date with no separator, so these collide."""
-    assert harness.stable_point_id("ab", "c") == harness.stable_point_id("a", "bc")
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
+    "follow-up: stable_point_id concatenates task_id + run_date with no separator, "
+    "so ('ab','c') and ('a','bc') collide. Only reachable with a non-ISO run_date; "
+    "adding a separator changes every existing Qdrant point id, so it needs a migration"))
+def test_stable_point_id_does_not_collide_on_the_concatenation_boundary():
+    assert harness.stable_point_id("ab", "c") != harness.stable_point_id("a", "bc")
 
 
 def test_upsert_score_payload_shape_and_preview_truncation(monkeypatch):
@@ -771,18 +781,36 @@ def test_gge_run_dry_uses_stored_cosines(tmp_path, monkeypatch, capsys):
     assert "persisted" not in out
 
 
-def test_gge_run_dry_treats_missing_cos_as_zero(tmp_path, monkeypatch, capsys):
+def test_gge_run_dry_excludes_rows_with_no_stored_cosine(tmp_path, monkeypatch, capsys):
+    """A row with no stored cosine was scored as cosine 0.0 -- a guaranteed miss
+    for a positive -- which dragged recall and AUC down on every dry run."""
     ds = _write_dataset(tmp_path, [
         {"claim": "a", "evidence": "b", "label": 1, "signal": "topical"},  # no cos
+        {"claim": "a", "evidence": "d", "label": 1, "signal": "topical", "cos": 0.8},
         {"claim": "a", "evidence": "c", "label": 0, "signal": "topical", "cos": 0.9},
+        {"claim": "a", "evidence": "e", "label": 0, "signal": "topical", "cos": 0.1},
     ])
     monkeypatch.setattr(gge, "DATASET", ds)
     monkeypatch.setattr(harness, "DRY_RUN", True)
     gge.run()
     out = capsys.readouterr().out
-    assert "  recall           0.000" in out       # the 1-label pair defaulted to cos 0.0
-    assert "  bleed_rejection  0.000" in out
-    assert "  auc              0.000" in out
+    assert "1 topical pairs carry no stored cosine and are excluded" in out
+    assert "pairs=3 " in out
+    assert "  recall           1.000" in out     # was 0.500 with the 0.0 default
+    assert "  bleed_rejection  0.500" in out
+    assert "  auc              0.500" in out     # was 0.250
+
+
+def test_gge_run_dry_with_no_measured_rows_says_so(tmp_path, monkeypatch, capsys):
+    ds = _write_dataset(tmp_path, [
+        {"claim": "a", "evidence": "b", "label": 1, "signal": "topical"},
+    ])
+    monkeypatch.setattr(gge, "DATASET", ds)
+    monkeypatch.setattr(harness, "DRY_RUN", True)
+    gge.run()
+    out = capsys.readouterr().out
+    assert "no topical pairs in dataset" in out
+    assert "recall" not in out
 
 
 def test_gge_run_live_reembeds_and_persists_one_score_per_metric(tmp_path, monkeypatch, capsys):
@@ -1253,11 +1281,40 @@ def test_oos_leave_one_run_out_reports_per_fold_and_mean(tmp_path, monkeypatch, 
     assert "| model f1=" in out
 
 
-def test_oos_verdict_else_branch_drops_the_verdict_text(tmp_path, monkeypatch, capsys):
-    """BUG (pinned, not fixed): the conditional expression wraps the whole
-    implicitly-concatenated f-string, so when the model does NOT generalize the
-    program prints only the parenthetical and the phrase
-    'does NOT clearly beat cosine' is unreachable dead text."""
+class _CosCut:
+    """Stand-in pair classifier: P(same target) = 1 when the pair cosine (the last
+    feature) clears `cut`. Fitting is a no-op, so the verdict is decided here."""
+
+    def __init__(self, cut):
+        self.cut = cut
+
+    def __call__(self, **kwargs):
+        return self
+
+    def fit(self, X, y):
+        return self
+
+    def predict_proba(self, X):
+        import numpy as np
+        p = (np.asarray(X)[:, -1] > self.cut).astype(float)
+        return np.stack([1 - p, p], axis=1)
+
+
+@pytest.mark.parametrize("cut,verdict", [
+    (0.7, "[oos] VERDICT (out-of-sample): trained model GENERALIZES — beats cosine "
+          "(keep model default)"),
+    (-1.0, "[oos] VERDICT (out-of-sample): trained model does NOT clearly beat cosine "
+           "(consider reverting gate to cosine default: --no-model)"),
+])
+def test_oos_verdict_line_names_the_verdict_in_both_branches(tmp_path, monkeypatch, capsys,
+                                                              cut, verdict):
+    """The conditional wrapped the whole implicitly concatenated f-string, so a
+    model that did NOT generalize printed only '(consider reverting ...)' -- the
+    verdict itself was unreachable. The model is stubbed (sklearn's class) so
+    each branch is reached on purpose: cut 0.7 separates the held-out pairs
+    perfectly (f1 1.0 > cosine 0.8); cut -1.0 accepts every pair (f1 0.667)."""
+    import sklearn.linear_model
+    monkeypatch.setattr(sklearn.linear_model, "LogisticRegression", _CosCut(cut))
     _write_corpus(tmp_path, QF_ROWS, run="dt-loci-r1")
     _write_corpus(tmp_path, [
         {"text": "a3", "tags": ["dt_target:alpha"]},
@@ -1270,16 +1327,12 @@ def test_oos_verdict_else_branch_drops_the_verdict_text(tmp_path, monkeypatch, c
     monkeypatch.setattr(harness, "OLLAMA_URL", "http://o")
     monkeypatch.setattr(harness, "embed", unit_embedder(vecs))
     monkeypatch.setattr(oos, "CORPUS", str(tmp_path / "dt-loci-*" / "findings.jsonl"))
+    monkeypatch.delenv("DTL_TARGET_FOCUS", raising=False)
 
     oos.run()
-    out = capsys.readouterr().out
-
-    assert "does NOT clearly beat cosine" not in out  # dead branch, never printed
-    verdict = "[oos] VERDICT" in out
-    revert = "(consider reverting gate to cosine default: --no-model)" in out
-    assert verdict != revert  # exactly one of the two, never a combined line
-    if verdict:
-        assert "GENERALIZES — beats cosine (keep model default)" in out
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == verdict
+    assert sum(1 for ln in lines if "VERDICT" in ln or "reverting" in ln) == 1
 
 
 def test_oos_never_persists(tmp_path, monkeypatch):

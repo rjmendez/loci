@@ -96,20 +96,31 @@ class TestInMemoryBackend(unittest.TestCase):
         self.assertEqual(results[0].verdict.subject_kind, "claim")
 
     def test_recall_returns_top_k(self):
-        for i in range(5):
-            run(self.backend.record_with_embedding(
-                _verdict(kind="claim", text=f"finding {i}"),
-                [float(i), 0.0]
-            ))
+        # Record the least similar first so an insertion-order (or ascending)
+        # slice would return the wrong two. No pair clears the 0.97 coalesce bar.
+        vecs = {"far": [0.0, 1.0], "mid": [1.0, 1.0], "near": [1.0, 0.0],
+                "near2": [1.0, 0.5], "opp": [-1.0, 0.0]}
+        for text, vec in vecs.items():
+            run(self.backend.record_with_embedding(_verdict(kind="claim", text=text), vec))
+        self.assertEqual(run(self.backend.stats())["total_verdicts"], 5)
         results = run(self.backend.recall("query", [1.0, 0.0], "claim", top_k=2))
-        self.assertEqual(len(results), 2)
+        self.assertEqual([r.verdict.subject_excerpt for r in results], ["near", "near2"])
+        self.assertAlmostEqual(results[0].similarity, 1.0)
+        self.assertAlmostEqual(results[1].similarity, 1.0 / (1.25 ** 0.5))
 
     def test_recall_sorted_by_similarity_desc(self):
-        run(self.backend.record_with_embedding(_verdict(kind="m", text="a"), [1.0, 0.0]))
+        # Orthogonal is a real cosine of 0.0 and must not be confused with the
+        # -1.0 "uncomparable" sentinel reserved for a verdict with no embedding.
         run(self.backend.record_with_embedding(_verdict(kind="m", text="b"), [0.0, 1.0]))
-        # Query is [1, 0] — "a" (same direction) should rank higher than "b" (orthogonal)
+        run(self.backend.record(_verdict(kind="m", text="c")))  # no embedding
+        run(self.backend.record_with_embedding(_verdict(kind="m", text="a"), [1.0, 0.0]))
+        run(self.backend.record_with_embedding(_verdict(kind="m", text="d"), [1.0, 1.0]))
         results = run(self.backend.recall("q", [1.0, 0.0], "m", top_k=5))
-        self.assertGreater(results[0].similarity, results[1].similarity)
+        self.assertEqual([r.verdict.subject_excerpt for r in results], ["a", "d", "b", "c"])
+        self.assertAlmostEqual(results[0].similarity, 1.0)
+        self.assertAlmostEqual(results[1].similarity, 0.5 ** 0.5)
+        self.assertEqual(results[2].similarity, 0.0)
+        self.assertEqual(results[3].similarity, -1.0)
 
     def test_coalesce_near_duplicate_increments_occurrences(self):
         embedding = [1.0, 0.0, 0.0]
@@ -118,6 +129,16 @@ class TestInMemoryBackend(unittest.TestCase):
         stats = run(self.backend.stats())
         # Should coalesce (similarity == 1.0 >= 0.97) → still just 1 stored verdict
         self.assertEqual(stats["total_verdicts"], 1)
+        results = run(self.backend.recall("q", embedding, "claim", top_k=5))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].verdict.occurrences, 2)
+
+    def test_below_coalesce_threshold_stays_separate(self):
+        # cos([1,0],[0.9,0.44]) ~= 0.898 < 0.97 -> two verdicts, one occurrence each.
+        run(self.backend.record_with_embedding(_verdict(text="x"), [1.0, 0.0]))
+        run(self.backend.record_with_embedding(_verdict(text="y"), [0.9, 0.44]))
+        results = run(self.backend.recall("q", [1.0, 0.0], "claim", top_k=5))
+        self.assertEqual([r.verdict.occurrences for r in results], [1, 1])
 
     def test_different_kind_no_coalesce(self):
         embedding = [1.0, 0.0]
@@ -164,6 +185,16 @@ class TestInMemoryBackend(unittest.TestCase):
         ))
         stats = run(self.backend.stats())
         self.assertEqual(stats["recurring_blocks"], 1)
+
+    def test_recurring_blocks_ignores_allow_and_single_occurrences(self):
+        # Recurring "allow" is not a block; a single "flag" is not recurring.
+        run(self.backend.record_with_embedding(_verdict(decision="allow", text="ok"), [1.0, 0.0]))
+        run(self.backend.record_with_embedding(_verdict(decision="allow", text="ok"), [1.0, 0.0]))
+        run(self.backend.record_with_embedding(_verdict(decision="flag", text="once"), [0.0, 1.0]))
+        run(self.backend.record_with_embedding(_verdict(decision="warn", text="w"), [-1.0, 0.0]))
+        run(self.backend.record_with_embedding(_verdict(decision="warn", text="w"), [-1.0, 0.0]))
+        stats = run(self.backend.stats())
+        self.assertEqual(stats, {"total_verdicts": 3, "recurring_blocks": 1})
 
 
 if __name__ == "__main__":

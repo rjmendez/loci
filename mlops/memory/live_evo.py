@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -120,11 +121,26 @@ def adapt(
         correlated = _find_correlated_entries(conn, normalized_failures)
         updates = []
         for mem_id, current_importance, event in correlated:
-            penalized = max(importance_floor, current_importance * (1.0 - penalty))
+            # A floor for the penalty, not a raise: an entry already below it
+            # stays where it is.
+            penalized = min(current_importance,
+                            max(importance_floor, current_importance * (1.0 - penalty)))
             if abs(penalized - current_importance) > 1e-6:
                 updates.append((penalized, mem_id))
         if not dry_run and updates:
             conn.executemany("UPDATE working_memory SET importance = ? WHERE id = ?", updates)
+        # decay.py recomputes importance from base_importance, so a penalty that
+        # only touched `importance` was erased by the next decay run. Apply the
+        # same penalty to the baseline wherever decay has created one.
+        has_base = "base_importance" in {
+            r[1] for r in conn.execute("PRAGMA table_info(working_memory)")}
+        if not dry_run and has_base and correlated and penalty > 0:
+            conn.executemany(
+                "UPDATE working_memory SET base_importance = "
+                "MIN(base_importance, MAX(?, base_importance * ?)) "
+                "WHERE id = ? AND base_importance IS NOT NULL",
+                [(importance_floor, 1.0 - penalty, mem_id) for mem_id, _, _ in correlated])
+        if not dry_run:
             conn.commit()
     finally:
         conn.close()
@@ -153,6 +169,11 @@ def main() -> None:
     a = ap.parse_args()
     stats = adapt(db_path=a.db, failures=load_failures_jsonl(a.failures_jsonl),
                   penalty=a.penalty, importance_floor=a.floor, dry_run=a.dry_run)
+    if stats.get("error"):
+        # The error stub has no n_penalized, so this printed "penalized=None"
+        # and exited 0 for a database that does not exist.
+        print(f"[live_evo] ERROR: {stats['error']}", file=sys.stderr)
+        sys.exit(1)
     print(f"[live_evo] failures={stats.get('n_failures')} correlated={stats.get('n_correlated')} "
           f"penalized={stats.get('n_penalized')} dry_run={a.dry_run}")
 

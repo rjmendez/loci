@@ -78,5 +78,69 @@ class VerificationSummaryTest(unittest.TestCase):
             self.assertIsNone(IT._verification_summary("inv"))
 
 
+class VerificationReachesInvestigationLoadTest(unittest.TestCase):
+    """End to end: investigation_verify_all -> finding_verifications.jsonl ->
+    investigation_load(). Only the model verifier (a dependency) is scripted."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        import server
+        self.server = server
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = server.MEMORY_DIR
+        server.MEMORY_DIR = Path(self._tmp.name)
+
+    def tearDown(self):
+        self.server.MEMORY_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _seed(self):
+        s = self.server
+        s.investigation_start(investigation_id="verify-e2e", title="verify surfacing")
+        ids = {}
+        for text in ("The cron job runs hourly.", "The queue is backed by Redis."):
+            ids[text] = json.loads(s.investigation_store(
+                investigation_id="verify-e2e", finding_type="observed", text=text,
+                source="test", confidence="high"))["finding_id"]
+        return ids
+
+    def test_refuted_verdict_is_attached_to_investigation_load(self):
+        import verify
+
+        ids = self._seed()
+        verdicts = {"The cron job runs hourly.": ("refuted", 0.95),
+                    "The queue is backed by Redis.": ("confirmed", 0.8)}
+        seen = []
+
+        def _fake_verify(text, **_kw):
+            seen.append(text)
+            verdict, conf = verdicts[text]
+            return {"verdict": verdict, "confidence": conf, "degraded": False}
+
+        with mock.patch.object(verify, "verify_finding", _fake_verify):
+            out = json.loads(self.server.investigation_verify_all(investigation_id="verify-e2e"))
+        self.assertEqual(out["verified"], 2)
+        self.assertEqual(sorted(seen), sorted(verdicts))
+
+        loaded = json.loads(self.server.investigation_load(investigation_id="verify-e2e"))
+        v = loaded["verifications"]
+        self.assertEqual(v["verified_findings"], 2)
+        self.assertEqual(v["counts"]["refuted"], 1)
+        self.assertEqual(v["counts"]["confirmed"], 1)
+        self.assertEqual([r["finding_id"] for r in v["refuted"]],
+                         [ids["The cron job runs hourly."]])
+        # Advisory: the refuted finding is still open, not resolved.
+        by_id = {f["id"]: f for f in loaded["recent_findings"]}
+        self.assertEqual(by_id[ids["The cron job runs hourly."]]["resolution"], "open")
+
+    def test_load_without_verdicts_has_no_verifications_block(self):
+        """Negative twin on the same investigation shape."""
+        self._seed()
+        loaded = json.loads(self.server.investigation_load(investigation_id="verify-e2e"))
+        self.assertNotIn("verifications", loaded)
+
+
 if __name__ == "__main__":
     unittest.main()

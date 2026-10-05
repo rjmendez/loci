@@ -64,37 +64,85 @@ def test_the_job_count_is_configurable():
         del os.environ["LOCI_TRAIN_CV_JOBS"]
 
 
-def test_parallel_folds_are_actually_faster():
-    """Measured, not assumed — the speedup is the entire justification. Kept small
-    so it costs a couple of seconds; the real matrix is 30x wider."""
-    import time
+def _run_train_main(tmp_path, monkeypatch, jobs):
+    """train.main() on a small separable corpus, with the embedder (network) and
+    the backend resolution (config) stubbed and cross_val_predict spied on."""
+    import types
+
     import numpy as np
-    from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    import sklearn.model_selection as ms
 
-    if (os.cpu_count() or 1) < 4:
-        pytest.skip("needs at least 4 cores to show a difference")
+    sys.path.insert(0, str(REPO))
+    try:
+        from mlops.grounding import train
+    finally:
+        sys.path.remove(str(REPO))
 
-    rng = np.random.default_rng(0)
-    X = rng.normal(size=(400, 200)).astype(np.float32)
-    y = (X[:, 0] + rng.normal(scale=0.5, size=400) > 0).astype(int)
-    clf = GradientBoostingClassifier(n_estimators=60, max_depth=3, random_state=42)
-    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    def embed(texts, base, cache):
+        out = []
+        for t in texts:
+            v = np.full(4, 0.05, dtype=np.float32)
+            v[0 if "alpha" in t else 1] = 1.0
+            out.append(v / np.linalg.norm(v))
+        return np.array(out, dtype=np.float32)
 
-    def run(jobs):
-        t = time.monotonic()
-        cross_val_predict(clf, X, y, cv=cv, method="predict_proba", n_jobs=jobs)
-        return time.monotonic() - t
+    calls = []
+    real_cvp = ms.cross_val_predict
 
-    # os.cpu_count() over-reports under cgroup or affinity limits, so a strict
-    # parallel < serial is flaky in a container that only has one core to give.
-    # Assert it does not get materially SLOWER; the real speedup is recorded in
-    # docs/grounding-corpus-limits.md and measured on the actual matrix.
-    serial, parallel = run(None), run(-1)
-    assert parallel < serial * 2.0, (
-        f"parallel {parallel:.1f}s vs serial {serial:.1f}s — n_jobs is hurting, "
-        "not helping"
-    )
+    def spy(estimator, X, y, **kw):
+        calls.append({"estimator": type(estimator).__name__, "n_jobs": kw.get("n_jobs"),
+                      "cv": kw.get("cv")})
+        return real_cvp(estimator, X, y, **kw)
+
+    clock = iter(range(0, 10_000, 7))
+    monkeypatch.setattr(ms, "cross_val_predict", spy)
+    monkeypatch.setattr(train, "embed_texts", embed)
+    monkeypatch.setattr(train, "_resolve_backends", lambda: None)
+    monkeypatch.setattr(train, "CACHE_PATH", str(tmp_path / "cache.npz"))
+    monkeypatch.setattr(train, "CV_JOBS", jobs)
+    # Only train's own reference: patching time.monotonic itself would move
+    # every other clock in the process.
+    monkeypatch.setattr(train, "time", types.SimpleNamespace(
+        monotonic=lambda: float(next(clock))))
+    rows = []
+    for i in range(30):
+        a, b = ("alpha", "beta") if i % 2 else ("beta", "alpha")
+        rows.append({"claim": f"{a} claim {i}", "evidence": f"{a} ev {i}", "label": 1,
+                     "cos": 0.9 - 0.001 * i})
+        rows.append({"claim": f"{a} claim {i}", "evidence": f"{b} ev {i}", "label": 0,
+                     "cos": 0.1 + 0.001 * i})
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text("".join(__import__("json").dumps(r) + "\n" for r in rows))
+    out = tmp_path / "metrics.json"
+    monkeypatch.setattr(sys, "argv", ["train.py", "--dataset", str(ds), "--out", str(out),
+                                      "--ollama", "http://h"])
+    train.main()
+    return calls, __import__("json").loads(out.read_text())
+
+
+@pytest.mark.parametrize("jobs", [3, 2])  # <= 4 workers: a shared, loaded box
+def test_every_candidate_is_cross_validated_with_the_configured_jobs(tmp_path, monkeypatch,
+                                                                     jobs):
+    """The AST check only saw an n_jobs keyword; a trainer that passed n_jobs=1
+    (serial again, >45 min on the real matrix) passed it. This runs train.main
+    and records what cross_val_predict was actually given."""
+    calls, _ = _run_train_main(tmp_path, monkeypatch, jobs)
+    assert [c["estimator"] for c in calls] == ["LogisticRegression",
+                                               "GradientBoostingClassifier",
+                                               "RandomForestClassifier"]
+    assert [c["n_jobs"] for c in calls] == [jobs] * 3
+    # and the same explicit folds each time -- the ones per_fold_f1 then scores
+    assert all(isinstance(c["cv"], list) and len(c["cv"]) == 10 for c in calls)
+    assert all(c["cv"] is calls[0]["cv"] for c in calls)
+
+
+def test_each_model_reports_how_long_its_cross_validation_took(tmp_path, monkeypatch):
+    """fit_seconds was measured and then dropped from the output; with a clock
+    that advances 7s per reading it is exactly 7.0 for every model."""
+    _, metrics = _run_train_main(tmp_path, monkeypatch, 1)
+    assert {name: m["fit_seconds"] for name, m in metrics["all_models"].items()} == {
+        "LogisticRegression": 7.0, "GradientBoostingClassifier": 7.0,
+        "RandomForestClassifier": 7.0}
 
 
 def test_the_scored_folds_are_the_folds_that_made_the_predictions():

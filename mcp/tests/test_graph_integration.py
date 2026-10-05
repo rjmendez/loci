@@ -16,6 +16,11 @@ def srv(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "MEMORY_DIR", tmp_path / "mem")
     monkeypatch.setattr(S, "_ladybug_store", None, raising=False)
     monkeypatch.setattr(S, "_ladybug_failed", False, raising=False)
+    # The one-time backfill flag and the transient-failure backoff are process
+    # globals too: left set by an earlier test, the backfill never ran again and
+    # a failed open blocked every later test's graph for 30s.
+    monkeypatch.setattr(S, "_ladybug_backfilled", False, raising=False)
+    monkeypatch.setattr(S, "_ladybug_last_attempt", 0.0, raising=False)
     return S
 
 
@@ -78,7 +83,11 @@ def test_contamination_via_graph_matches_reference(srv):
 
 def test_code_graph_ingest_and_query(srv):
     S = srv
-    ing = json.loads(S.code_graph_ingest("graph/ladybug_store.py"))
+    # Absolute, not "graph/ladybug_store.py": the relative path only resolved
+    # when pytest ran from mcp/, so the test failed from the repo root.
+    from pathlib import Path
+    source = Path(S.__file__).resolve().parent / "graph" / "ladybug_store.py"
+    ing = json.loads(S.code_graph_ingest(str(source)))
     assert ing["ingested"]["symbols"] > 0 and ing["ingested"]["calls"] > 0
     q = json.loads(S.code_graph_query(
         "MATCH (c:CodeSymbol)-[:CALLS]->(t:CodeSymbol) RETURN c.name, t.name LIMIT 3"))
@@ -95,17 +104,44 @@ def test_backfill_of_preexisting_findings(srv, tmp_path):
     S.investigation_start("inv-old", "Old case")
     _store(S, "inv-old", "observed", "old beacon 203.0.113.99", "edr", "high")
     _store(S, "inv-old", "observed", "old beacon 203.0.113.99 again", "edr", "high")
-    # drop the graph + its file, reset singleton -> next _get_ladybug triggers backfill
+    # drop the graph + its files, reset singleton -> next _get_ladybug triggers backfill
     import shutil
     ks = S._get_ladybug()
-    graph_path = tmp_path / "mem" / "graph.ladybug"
+    assert ks.code_query("MATCH (f:Finding) RETURN count(f)")[0][0] == 2  # mirrored at store time
     del ks
-    S._ladybug_store = None
+    removed = []
+    for path in (tmp_path / "mem").glob("graph.ladybug*"):
+        # The store is a single FILE (plus sidecars); rmtree on it did nothing, so
+        # the old graph survived and the "backfill" was never exercised.
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+        removed.append(path.name)
+    assert "graph.ladybug" in removed
+    S._ladybug_store = None          # monkeypatched by srv, restored after the test
     S._ladybug_failed = False
-    if graph_path.exists():
-        shutil.rmtree(graph_path, ignore_errors=True)
+    S._ladybug_backfilled = False
     ks2 = S._get_ladybug()  # empty graph -> backfill runs
     assert ks2.code_query("MATCH (f:Finding) RETURN count(f)")[0][0] == 2
+    assert ks2.code_query(
+        "MATCH (:Finding)-[:MENTIONS]->(e:Entity {name:'203.0.113.99'}) RETURN count(*)")[0][0] == 2
+
+
+def test_backfill_is_attempted_once_per_process(srv, tmp_path, monkeypatch):
+    # The flag gates the one-time backfill: the first open attempts it, and a
+    # later re-open of a fresh graph in the same process does not.
+    import shutil
+    S = srv
+    calls = []
+    monkeypatch.setattr(S, "_ladybug_backfill_if_empty", lambda ks: calls.append(ks))
+    S.investigation_start("inv-old", "Old case")
+    _store(S, "inv-old", "observed", "old beacon 203.0.113.99", "edr", "high")
+    first = S._get_ladybug()
+    assert calls == [first]
+    for path in (tmp_path / "mem").glob("graph.ladybug*"):
+        shutil.rmtree(path) if path.is_dir() else path.unlink()
+    S._ladybug_store = None
+    assert S._ladybug_backfilled is True
+    assert S._get_ladybug() is not None
+    assert calls == [first]
 
 
 def test_relink_invalidates_the_symbol_index_cache(tmp_path, monkeypatch):

@@ -122,3 +122,37 @@ def test_offset_aware_created_at_still_parses(sweep, host_tz, tmp_path, monkeypa
     monkeypatch.setattr(sweep, "ORPHAN_TTL_DAYS", 7.0)
 
     assert sweep.sweep_orphans(dry_run=False) == 1
+
+
+def test_offset_aware_created_at_uses_its_own_offset_near_the_ttl(sweep, host_tz, tmp_path, monkeypatch):
+    # The row above is 30 days old against a 7-day TTL, so it is deleted however
+    # its offset is read, including when the offset is overwritten with UTC.
+    # These two sit 5 hours either side of the TTL with a 10-hour offset, so
+    # reading the wall-clock as UTC flips both verdicts.
+    host_tz("XXX-10")
+    now = datetime.now(timezone.utc)
+    ttl = timedelta(days=7)
+    minus10 = timezone(timedelta(hours=-10))
+    plus10 = timezone(timedelta(hours=10))
+    young = (now - ttl + timedelta(hours=5)).astimezone(minus10)   # 6d19h old: keep
+    old = (now - ttl - timedelta(hours=5)).astimezone(plus10)      # 7d5h old: delete
+    db = tmp_path / "near-ttl.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE working_memory ("
+        " id TEXT PRIMARY KEY, content TEXT, importance REAL,"
+        " created_at TEXT, recall_count INTEGER)"
+    )
+    conn.execute("CREATE TABLE graph_edges (source TEXT, target TEXT)")
+    conn.executemany("INSERT INTO working_memory VALUES (?,?,?,?,?)", [
+        ("young-minus10", "c", 0.5, young.isoformat(), 0),
+        ("old-plus10", "c", 0.5, old.isoformat(), 0),
+    ])
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(sweep, "DB_PATH", str(db))
+    monkeypatch.setattr(sweep, "ORPHAN_TTL_DAYS", 7.0)
+
+    assert sweep.sweep_orphans(dry_run=False) == 1
+    assert _surviving_ids(db) == ["young-minus10"]

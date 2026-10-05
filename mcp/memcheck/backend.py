@@ -168,20 +168,20 @@ class InMemoryBackend(VerdictBackend):
         top_k: int,
     ) -> list[ScoredVerdict]:
         async with self._lock:
-            scored = [
-                ScoredVerdict(
-                    verdict=v,
-                    # A verdict stored without an embedding is not similar to
-                    # the query — it is uncomparable, and used to score 0.0 and
-                    # sort to the bottom as though it had been ranked. -1.0 keeps
-                    # the sort total while staying outside the [-1, 1] a real
-                    # cosine can produce, so it is distinguishable downstream.
-                    similarity=(cosine_similarity(self._embeddings.get(v.id, []),
-                                                  embedding) or -1.0),
+            scored = []
+            for v in self._verdicts:
+                if v.subject_kind != kind:
+                    continue
+                sim = cosine_similarity(self._embeddings.get(v.id, []), embedding)
+                # A verdict stored without an embedding is not similar to the
+                # query — it is uncomparable, and used to score 0.0 and sort to
+                # the bottom as though it had been ranked. -1.0 keeps the sort
+                # total and sorts it last. Test for None explicitly: an
+                # orthogonal vector is a real cosine of 0.0, and `sim or -1.0`
+                # used to turn it into the sentinel.
+                scored.append(
+                    ScoredVerdict(verdict=v, similarity=-1.0 if sim is None else sim)
                 )
-                for v in self._verdicts
-                if v.subject_kind == kind
-            ]
         scored.sort(key=lambda s: s.similarity, reverse=True)
         return scored[:top_k]
 

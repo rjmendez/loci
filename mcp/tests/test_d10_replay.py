@@ -479,7 +479,7 @@ def test_sheet_text_cannot_break_out_of_its_script_element():
     # "<!--" + "<script" changes its state: no "<" may reach the payload at all.
     assert "<" not in payload and ">" not in payload
     assert json.loads(payload)[0]["question"] == q and json.loads(payload)[0]["finding"] == "<!-- <script> & -->"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="may carry only id, question and finding"):
         R.render_sheet([{"id": "a", "question": "q", "finding": "f", "category": "cos_only"}], "abc")
 
 
@@ -622,9 +622,9 @@ def test_bootstrap_resamples_investigations_not_pairs():
 
 def test_labels_for_another_sheet_are_refused(tmp_path):
     key = _key({"x": {"cos_only": 1}}, {"i": ("x", "cos_only", None)})
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="labels belong to sheet other"):
         A.analyse(key, {"i": "relevant"}, sheet_id="other")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="1 labelled ids are not in the key"):
         A.analyse(key, {"zz": "relevant"})
     p = tmp_path / "l.json"
     p.write_text(json.dumps({"sheet_id": "s", "labels": {"i": {"label": "relevant", "ts": "t"}, "j": {"label": "bogus"}}}))

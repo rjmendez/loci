@@ -119,18 +119,15 @@ def test_investigation_footprint_lists_referenced_symbols(tmp_path):
 def test_symbol_impact_includes_transitive_caller_and_finding(tmp_path):
     store = _build_store(tmp_path)
     imp = Q.symbol_impact(store, SH, hops=3)
-    caller_ids = {c["id"] for c in imp["callers"]}
-    # direct caller g, transitive callers f and x (x -> f -> g -> h)
-    assert SG in caller_ids
-    assert SF in caller_ids  # transitive
-    assert SX in caller_ids  # transitive across files
-    assert SH not in caller_ids  # target itself excluded from callers
-    # findings referencing the symbol (fC references h)
-    finding_ids = {f["id"] for f in imp["findings"]}
-    assert "fC" in finding_ids
-    # investigations of those findings
-    inv_ids = {i["id"] for i in imp["investigations"]}
-    assert "inv2" in inv_ids
+    # direct caller g, transitive callers f and x (x -> f -> g -> h); h itself excluded
+    assert sorted(c["id"] for c in imp["callers"]) == sorted([SG, SF, SX])
+    # findings on the target (fC -> h) AND on every caller (fB -> g, fA/fD -> f)
+    assert sorted(f["id"] for f in imp["findings"]) == ["fA", "fB", "fC", "fD"]
+    assert sorted(i["id"] for i in imp["investigations"]) == ["inv1", "inv2"]
+    # hop bound: with hops=1 only the direct caller g (and its finding fB) is reached
+    one = Q.symbol_impact(store, SH, hops=1)
+    assert [c["id"] for c in one["callers"]] == [SG]
+    assert sorted(f["id"] for f in one["findings"]) == ["fB", "fC"]
 
 
 def test_related_findings_via_code_finds_coreferencer(tmp_path):
@@ -142,20 +139,39 @@ def test_related_findings_via_code_finds_coreferencer(tmp_path):
     assert rel[0]["shared"] == 1
 
 
+class _RecordingStore:
+    """Store double that records every query (never raises into the fail-open code)."""
+
+    def __init__(self, available):
+        self._available = available
+        self.queries = []
+
+    def available(self):
+        return self._available
+
+    def code_query(self, cypher, params=None):
+        self.queries.append(cypher)
+        return []
+
+
 def test_primitives_fail_open_on_unavailable_store():
-    class _Dead:
-        def available(self):
-            return False
-
-        def code_query(self, *a, **k):
-            raise AssertionError("should not be reached when unavailable")
-
-    ks = _Dead()
+    ks = _RecordingStore(available=False)
     assert Q.subgraph(ks, "CodeSymbol", SG) == {"nodes": [], "edges": []}
     assert Q.symbol_findings(ks, SF) == []
     assert Q.finding_symbols(ks, "fA") == []
     assert Q.investigation_footprint(ks, "inv1") == {"symbols": [], "files": [], "finding_count": 0}
     assert Q.symbol_impact(ks, SH) == {"callers": [], "findings": [], "investigations": []}
     assert Q.related_findings_via_code(ks, "fA") == []
-    # unknown anchor label is rejected fail-open even if the store were live
-    assert Q.subgraph(ks, "Bogus", "x") == {"nodes": [], "edges": []}
+    assert ks.queries == []          # an unavailable store is never queried
+
+
+def test_subgraph_rejects_an_unknown_anchor_label_before_querying():
+    # The label is interpolated into the Cypher text, so only whitelisted labels
+    # may reach the store; a live store must not see the query at all.
+    ks = _RecordingStore(available=True)
+    for label in ("Bogus", "CodeSymbol) DETACH DELETE (n", ""):
+        assert Q.subgraph(ks, label, "x") == {"nodes": [], "edges": []}
+    assert ks.queries == []
+    # positive twin: a whitelisted label is queried, with the label in the MATCH
+    Q.subgraph(ks, "CodeSymbol", SG)
+    assert len(ks.queries) == 1 and ks.queries[0].startswith("MATCH (a:CodeSymbol {id:$k})")

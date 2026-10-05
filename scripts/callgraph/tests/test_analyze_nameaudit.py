@@ -50,6 +50,11 @@ def test_dangling_global_scope_filter():
     store, _, _ = build_fixture_store(["dangling_global.py", "dangling_global_real_slot.py"])
     findings = dangling_globals(store, scope_prefixes=["dangling_global_real_slot.py"])
     assert findings == []
+    # Positive twin: the in-scope file keeps its findings ("drop everything"
+    # passed the empty-scope half alone).
+    kept = {f.slot.id for f in dangling_globals(store, scope_prefixes=["dangling_global.py"])}
+    assert {"name:dangling_global.py::_symbol_index_cache",
+            "name:dangling_global.py::_symbol_index_count"} <= kept
 
 
 def test_write_no_read_flags_write_only_slot():
@@ -71,6 +76,12 @@ def test_write_no_read_scope_filter():
     findings = write_no_read(store, scope_prefixes=["reexport.py"])
     assert all(f.slot.path == "reexport.py" for f in findings)
     assert not any(f.slot.id == "name:reexport_source.py::_INTERNAL_STATE" for f in findings)
+    # Positive twin: scoping to the other file keeps exactly its unscoped
+    # findings, including the known write-only slot.
+    full = write_no_read(store)
+    scoped = {f.slot.id for f in write_no_read(store, scope_prefixes=["reexport_source.py"])}
+    assert scoped == {f.slot.id for f in full if f.slot.path == "reexport_source.py"}
+    assert "name:reexport_source.py::_INTERNAL_STATE" in scoped
 
 
 def test_read_by_tests_matches_whole_word_token():

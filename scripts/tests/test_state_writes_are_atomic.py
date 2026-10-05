@@ -75,7 +75,7 @@ def test_bridge_state_survives_a_crash_mid_save(tmp_path, monkeypatch):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(pathlib.Path, "write_text", _half_write_text)
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="simulated crash mid-write"):
             bridge._save_state({"last_run": "2026-08-30T12:10:00+00:00",
                                 "sent_ids": ["a", "b", "c", "d", "e"]})
 
@@ -96,7 +96,7 @@ def test_ua_watch_state_survives_a_crash_mid_save(tmp_path, monkeypatch):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(pathlib.Path, "write_text", _half_write_text)
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="simulated crash mid-write"):
             ua.save_state({"/repo/one": {"git_hash": "abc123", "fg_mtime": 1.0},
                            "/repo/two": {"git_hash": "def456", "fg_mtime": 2.0}})
 
@@ -123,7 +123,7 @@ def test_compact_leaves_the_log_intact_when_the_rewrite_dies(tmp_path, monkeypat
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ev, "open", crashing_open, raising=False)
-        with pytest.raises(OSError):
+        with pytest.raises(OSError, match="simulated crash mid-write"):
             ev.compact(before_ts=now - 86400,
                        archive_dir=str(tmp_path / "archive"),
                        log_path=str(log))

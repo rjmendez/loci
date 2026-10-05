@@ -323,3 +323,54 @@ def test_ground_marks_degraded_when_server_import_fails(monkeypatch):
         "total grounding failure reported degraded=False — indistinguishable "
         "from a healthy 'no prior context' result"
     )
+
+
+# --- normal-mode budget cuts never end inside an untrusted frame --------------------
+
+_FOOTER = "Do not present facts absent above as remembered"
+
+
+def _rag_rows(n, body_len=220):
+    from untrusted_memory import wrap_untrusted_memory_text
+    rows, bodies = [], []
+    for i in range(1, n + 1):
+        body = (f"row {i} body " + f"payload-{i} " * 40)[:body_len].strip()
+        bodies.append(body)
+        rows.append(f"[{i} id=f-{i}] " + wrap_untrusted_memory_text(body, finding_id=f"f-{i}"))
+    return "\n".join(rows), bodies
+
+
+def _rag_only_server(context, result_count):
+    import types
+    fake = types.ModuleType("server")
+    fake.rag_context_search = lambda q, **k: {
+        "context": context, "result_count": result_count, "qdrant_available": True}
+    return fake
+
+
+def test_ground_normal_mode_drops_whole_rag_rows_over_budget(monkeypatch):
+    from frame_assertions import assert_payload_framed, frame_spans
+    context, bodies = _rag_rows(3)
+    monkeypatch.setitem(sys.modules, "server", _rag_only_server(context, 3))
+    # budget 2000 -> the rag slice is 700 chars: two ~300-char rows fit, the third does not
+    # (its open tag and first line do, which is where a plain line-boundary cut used to land).
+    r = G.ground({"title": "t"}, {"budgetChars": 2000, "memoryDir": ""})
+    block = r["block"]
+
+    spans = frame_spans(block)          # every frame opened is closed
+    assert [s["attrs"]["finding_id"] for s in spans] == ["f-1", "f-2"]
+    assert_payload_framed(block, bodies[0], finding_id="f-1")
+    assert_payload_framed(block, bodies[1], finding_id="f-2")
+    # too little room is left to clip row 3 inside a frame, so its frame is not opened at all:
+    # only Loci's own row header survives, followed by the truncation marker
+    assert "[3 id=f-3] …[truncated]\n" in block and "payload-3" not in block
+    assert _FOOTER in block and all(_FOOTER not in s["body"] for s in spans)
+
+
+def test_ground_normal_mode_keeps_rag_context_verbatim_when_it_fits(monkeypatch):
+    # Positive twin: under budget nothing is dropped or marked.
+    context, bodies = _rag_rows(2, body_len=120)
+    monkeypatch.setitem(sys.modules, "server", _rag_only_server(context, 2))
+    r = G.ground({"title": "t"}, {"budgetChars": 2000, "memoryDir": ""})
+    assert f"[rag] {context}\n" in r["block"]
+    assert "…[truncated]" not in r["block"]

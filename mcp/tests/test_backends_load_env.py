@@ -92,10 +92,9 @@ def test_the_loop_resolves_at_run_time_not_import_time(monkeypatch, tmp_path):
     assert os.environ.get("OLLAMA_BASE_URL") is None, (
         "importing mlops.loop must not write to the environment"
     )
-    src = (repo / "mlops" / "loop.py").read_text()
-    assert 'ap.add_argument("--ollama", default=None' in src, (
-        "--ollama must default to None so the config file gets a say"
-    )
+    # Run-time resolution itself (env, then backends.toml, then localhost) is tested
+    # behaviourally in mlops/tests/test_loop.py::test_main_resolves_ollama_at_run_time;
+    # the source grep that stood here passed with a hard-coded localhost.
 
 
 def test_dotenv_override_does_not_beat_the_callers_environment(monkeypatch, tmp_path):

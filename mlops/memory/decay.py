@@ -5,9 +5,13 @@ Implements the decay function from Human-Inspired Memory Architecture (arXiv:260
 Microsoft, May 2026): importance × exp(-((age_days / λ)^k))
 
 With λ=30, k=0.8:
-  7 days  → 80% retention
+  7 days  → 73% retention
   30 days → 37% retention
-  90 days → 10% retention
+  90 days →  9% retention
+
+The floor (min_importance) stops decay at that value; it never raises a row that
+already sits below it. A penalty applied by live_evo.py is applied to
+``base_importance`` as well, so recomputing from the baseline keeps it.
 
 Decay is computed from ``base_importance`` -- a snapshot of the authored value
 taken the first time this runs -- and NOT from the live ``importance``. Reading
@@ -121,7 +125,8 @@ def apply_decay(
             # From the baseline, never from `current` -- see the module docstring.
             base = row["base_importance"]
             base = float(base) if base is not None else current
-            decayed = max(min_importance, base * retention)
+            # A floor for decay, not a raise: a row authored below it stays put.
+            decayed = min(base, max(min_importance, base * retention))
             if decayed >= GROUNDING_MIN_IMPORTANCE:
                 n_visible += 1
             if current >= GROUNDING_MIN_IMPORTANCE:
@@ -161,6 +166,11 @@ def main() -> None:
 
     stats = apply_decay(db_path=a.db, lambda_days=a.lambda_days, k=a.k,
                         min_importance=a.min_importance, dry_run=a.dry_run)
+    if stats.get("error"):
+        # Printed through the summary line this read "mean_retention=0.000",
+        # i.e. total loss, for a database that does not exist.
+        print(f"[decay] ERROR: {stats['error']}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[decay] n_rows={stats.get('n_rows')} n_decayed={stats.get('n_decayed')} "
           f"mean_retention={stats.get('mean_retention', 0):.3f} "
