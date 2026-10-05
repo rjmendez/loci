@@ -20,6 +20,7 @@ import caller_identity
 from ladybug_ops import _ladybug_upsert_investigation
 from inv_store import (
     _acl_access_denied,
+    acl_denied_json,
     _append_jsonl,
     _inv_dir,
     _load_manifest,
@@ -399,8 +400,12 @@ def investigation_queue_enqueue(
     dependencies: Optional[list | str] = None,
     state: Optional[str] = None,
     owner_session: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Enqueue a deterministic work item into an investigation's coordination queue."""
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     return _queue_locked(
         investigation_id,
         lambda manifest: _queue_enqueue_locked(
@@ -479,8 +484,12 @@ def investigation_queue_claim(
     item_id: str,
     owner_session: str,
     lease_seconds: float | int = 300,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Claim / renew a queue item for a specific session with a lease TTL."""
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     return _queue_locked(
         investigation_id,
         lambda manifest: _queue_claim_locked(
@@ -551,8 +560,12 @@ def investigation_queue_complete(
     owner_session: Optional[str] = None,
     state: str = 'done',
     notes: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Finalize a queue item as done, blocked, or cancelled."""
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     return _queue_locked(
         investigation_id,
         lambda manifest: _queue_complete_locked(
@@ -614,12 +627,16 @@ def investigation_queue_release(
     item_id: str,
     owner_session: Optional[str] = None,
     notes: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Give up a claim: return the item to ``queued`` with no owner or lease.
 
     Release is not terminal; any session may claim the item again. To stop the line use
     ``investigation_queue_complete(state='blocked')``.
     """
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     return _queue_locked(
         investigation_id,
         lambda manifest: _queue_release_locked(
@@ -669,8 +686,12 @@ def investigation_queue_status(
     investigation_id: str,
     item_id: Optional[str] = None,
     state: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Return the queue snapshot or a single item's status."""
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return _coordination_error(f"Investigation '{investigation_id}' not found.")
@@ -712,8 +733,12 @@ def investigation_queue_list(
     investigation_id: str,
     item_id: Optional[str] = None,
     state: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """Alias for queue status."""
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     return investigation_queue_status(investigation_id=investigation_id, item_id=item_id, state=state)
 
 
@@ -721,6 +746,7 @@ def investigation_start(
     investigation_id: str,
     title: str,
     context: Optional[str] = None,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Create or resume an investigation manifest. Idempotent: an existing ID
@@ -752,6 +778,9 @@ def investigation_start(
         })
     existing = _load_manifest(investigation_id)
     if existing:
+        denied = _acl_access_denied(existing, requesting_agent_id)
+        if denied:
+            return json.dumps({"error": "permission_denied", "detail": denied})
         existing = _coordination_migrate_manifest(existing)
         _ladybug_upsert_investigation(investigation_id, existing.get("title", ""))
         return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
@@ -1289,6 +1318,7 @@ def investigation_note(
     investigation_id: str,
     field: str,
     value: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Update a manifest field for the investigation. Use to track the working
@@ -1310,6 +1340,9 @@ def investigation_note(
     Returns:
         JSON with the updated manifest.
     """
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -1365,7 +1398,7 @@ def investigation_note(
     return json.dumps({"updated": field, "manifest": manifest}, indent=2)
 
 
-def investigation_reflect(investigation_id: str) -> str:
+def investigation_reflect(investigation_id: str, requesting_agent_id: Optional[str] = None) -> str:
     """
     Synthesize the current state of an investigation. Returns a structured
     summary of what has been established, what is still open, and what has
@@ -1381,6 +1414,9 @@ def investigation_reflect(investigation_id: str) -> str:
         summary_l1/summary_l2, and an optional plain-text ``self_critique``
         skeptical pass when the local model is available.
     """
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     manifest = _load_manifest(investigation_id)
     if not manifest:
         return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
@@ -1582,6 +1618,7 @@ def investigation_reflect(investigation_id: str) -> str:
 def investigation_finding_provenance(
     finding_id: str,
     investigation_id: str,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     Trace a finding back through its derivation chain to root observed evidence.
@@ -1603,6 +1640,9 @@ def investigation_finding_provenance(
         JSON with the chain from the target finding to its root evidence,
         each node annotated with its type, confidence, source, and text.
     """
+    _acl_denied = acl_denied_json(investigation_id, requesting_agent_id)
+    if _acl_denied:
+        return _acl_denied
     # Not _inv_dir(): it creates the directory, so a bad id would silently leave an empty investigation behind.
     inv_path = _root() / _validated_investigation_id(investigation_id)
     if not inv_path.is_dir():
@@ -1688,6 +1728,7 @@ def investigation_list(
     limit: int = 30,
     offset: int = 0,
     summary: bool = True,
+    requesting_agent_id: Optional[str] = None,
 ) -> str:
     """
     List investigations, newest-updated first.
@@ -1764,6 +1805,8 @@ def investigation_list(
         if not isinstance(manifest, dict):
             skipped.append({"investigation_id": d.name, "reason": "manifest.json is not a JSON object"})
             continue
+        if _acl_access_denied(manifest, requesting_agent_id):
+            continue          # titles, hypotheses and visibility of a private investigation are not listed to a non-member
         entries.append((d, manifest))
 
     total = len(entries)
