@@ -532,6 +532,26 @@ def _format_results(hits: list[dict], query: str, used_fallback: bool,
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+# The host that called the hook decides the wire format. Claude Code reads only
+# hookSpecificOutput.additionalContext for UserPromptSubmit and SubagentStart (a top-level "context"
+# is ignored, and plain stdout does not inject for these events; max 10,000 chars per string).
+# Hermes ("pre_llm_call") reads the legacy {"context": ...}.
+_HOST_EVENT = ""
+_CLAUDE_CONTEXT_EVENTS = ("UserPromptSubmit", "SubagentStart")
+_CLAUDE_CONTEXT_MAX = 9500
+
+
+def _emit_context(context: str) -> None:
+    """Print the context block in the format of the host that invoked this hook."""
+    if _HOST_EVENT in _CLAUDE_CONTEXT_EVENTS:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": _HOST_EVENT,
+            "additionalContext": context[:_CLAUDE_CONTEXT_MAX],
+        }}))
+    else:
+        print(json.dumps({"context": context}))
+
+
 def main() -> None:
     try:
         raw = sys.stdin.read()
@@ -544,6 +564,8 @@ def main() -> None:
         "UserPromptSubmit", "SubagentStart", # Claude Code native names
     ):
         sys.exit(0)
+    global _HOST_EVENT
+    _HOST_EVENT = payload.get("hook_event_name", "")
 
     extra = payload.get("extra") or {}
 
@@ -605,7 +627,7 @@ def main() -> None:
             )
         rules_summary = _load_rules_summary()
         context = (recall_block + "\n\n" + rules_summary) if rules_summary else recall_block
-        print(json.dumps({"context": context}))
+        _emit_context(context)
         return
 
     # ── v3: embed → parallel Qdrant fan-out (main session) ───────────────────
@@ -627,7 +649,7 @@ def main() -> None:
             )
             rules_summary = _load_rules_summary()
             context = (warning + "\n\n" + rules_summary) if rules_summary else warning
-            print(json.dumps({"context": context}))
+            _emit_context(context)
             return
     else:
         all_hits: list[dict] = []
@@ -720,7 +742,7 @@ def main() -> None:
     rules_summary = _load_rules_summary()
     context = (recall_block + "\n\n" + rules_summary) if rules_summary else recall_block
 
-    print(json.dumps({"context": context}))
+    _emit_context(context)
 
 
 if __name__ == "__main__":
