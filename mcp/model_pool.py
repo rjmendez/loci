@@ -45,11 +45,13 @@ Training and testing a selector (a FlyBrain-style brain, or the baseline in ``po
 * ``shadow_status`` says why ``chosen_shadow`` is empty: ``no_selector``, ``abstained``, ``invalid``
   or ``error``; ``chose`` when it is not.
 * Shadow alone cannot teach anything about an arm the rule never picks: no outcome exists for it.
-  ``LOCI_MODEL_POOL_EXPLORE=<p>`` with ``LOCI_MODEL_POOL_EXPLORE_MODELS=a,b`` is the opt-in way to
-  get that data: with probability ``p`` the call goes to one eligible, allow-listed alternative
-  (uniformly), and ``propensity`` records how likely the arm actually used was. It is off unless
-  both are set and the shadow is on. It changes live routing for that fraction of calls, and a
-  non-resident model has to be loaded, so the allow-list is the operator's safety.
+  ``LOCI_MODEL_POOL_EXPLORE=<p>`` with ``LOCI_MODEL_POOL_EXPLORE_ROLES=gen`` is the opt-in way to
+  get that data: with probability ``p`` a call for one of those roles goes to one eligible
+  alternative (uniformly; eligible already means installed and within the VRAM cap), and
+  ``propensity`` records how likely the arm actually used was. No model list is needed;
+  ``LOCI_MODEL_POOL_EXPLORE_MODELS=a,b`` optionally narrows the alternatives, and on its own it
+  applies to every role. It is off unless ``p``, roles or models are set and the shadow is on. It
+  changes live routing for that fraction of calls, and a non-resident model has to be loaded.
 * ``python model_pool.py report`` joins the logs and says, per role, whether the data can support
   learning (two or more arms with enough outcomes) or only one arm has ever been observed.
 """
@@ -75,6 +77,7 @@ SHADOW_ENV = "LOCI_MODEL_POOL_SHADOW"
 SELECTOR_ENV = "LOCI_MODEL_POOL_SELECTOR"
 EXPLORE_ENV = "LOCI_MODEL_POOL_EXPLORE"
 EXPLORE_MODELS_ENV = "LOCI_MODEL_POOL_EXPLORE_MODELS"
+EXPLORE_ROLES_ENV = "LOCI_MODEL_POOL_EXPLORE_ROLES"
 SHADOW_LOG_NAME = "model_pool_shadow.jsonl"
 SHADOW_SCHEMA = 1
 OUTCOMES_LOG_NAME = "model_pool_outcomes.jsonl"
@@ -432,16 +435,20 @@ def _log_path() -> Path:
 
 def _explore(decision: Decision) -> tuple:
     """Opt-in exploration: ``(model to use, info)``. Off unless the shadow is on, a probability in (0, 1] is set and
-    an allow-list names models. Only an eligible allow-listed alternative to the rule's choice can be picked."""
+    roles or models are named. Only an eligible alternative to the rule's choice can be picked, from the model list
+    when there is one, from every eligible candidate when there is not."""
     off = (decision.chosen, {"p": 0.0})
     try:
         if not _shadow_enabled() or not decision.chosen:
             return off
         p = float(os.environ.get(EXPLORE_ENV) or 0.0)
         allowed = {n.strip() for n in (os.environ.get(EXPLORE_MODELS_ENV) or "").split(",") if n.strip()}
-        if not (0.0 < p <= 1.0) or not allowed:
+        roles = {n.strip().lower() for n in (os.environ.get(EXPLORE_ROLES_ENV) or "").split(",") if n.strip()}
+        if not (0.0 < p <= 1.0) or not (allowed or roles):
             return off
-        alts = [n for n in decision.ordered() if n != decision.chosen and n in allowed]
+        if roles and decision.role not in roles:   # rank_role has already normalized the role
+            return off
+        alts = [n for n in decision.ordered() if n != decision.chosen and (not allowed or n in allowed)]
         info: dict = {"p": p, "n_alternatives": len(alts)}
         if not alts:
             return decision.chosen, info
@@ -628,7 +635,7 @@ def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[P
             info["why"] = f"{len(enough)} arms have at least {min_arm_n} outcomes: {', '.join(enough)}"
         elif len(arms) <= 1:
             info["why"] = ("only one arm has ever been observed, so no alternative has an outcome to learn from or "
-                           f"to test against; set {EXPLORE_ENV} and {EXPLORE_MODELS_ENV} to collect some")
+                           f"to test against; set {EXPLORE_ENV} and {EXPLORE_ROLES_ENV} to collect some")
         else:
             info["why"] = f"fewer than two arms have {min_arm_n} outcomes yet"
     return {"roles": roles, "legacy_rows": legacy, "min_arm_n": min_arm_n, "decisions": len(decisions), "outcomes": len(outcomes)}
