@@ -591,11 +591,12 @@ def generate(prompt: str,
     started = time.monotonic()
     out = _generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
                     keep_alive=keep_alive, think=think, role=role, timeout=timeout)
-    _log_outcome(out, model, fmt, role, started)
+    _log_outcome(out, model, fmt, role, started, prompt_chars=len(prompt or ""))
     return out
 
 
-def _log_outcome(out: object, model: str, fmt: Optional[str], role: Optional[str], started: float) -> None:
+def _log_outcome(out: object, model: str, fmt: Optional[str], role: Optional[str], started: float,
+                 prompt_chars: int = 0) -> None:
     """Record how the call went for the model pool's decision log (off unless LOCI_MODEL_POOL_SHADOW=1)."""
     try:
         import model_pool
@@ -605,7 +606,7 @@ def _log_outcome(out: object, model: str, fmt: Optional[str], role: Optional[str
             str(out.get("model") or model or ""), bool(out.get("ok")),
             (time.monotonic() - started) * 1000.0, route_role=str(role or out.get("route_role") or ""),
             deadline_exceeded=bool(out.get("deadline_exceeded")), tier=str(out.get("tier") or "ollama"),
-            fmt=fmt or "")
+            fmt=fmt or "", prompt_chars=prompt_chars)
     except Exception as exc:
         _LOG.debug("llm_local: outcome log skipped: %r", exc)
 
