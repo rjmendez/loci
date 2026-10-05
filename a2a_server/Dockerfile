@@ -4,6 +4,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# device_inventory reports USB and audio devices with lsusb and arecord. Run the container with the host's
+# /dev mounted read-only (-v /dev:/dev:ro) for it to see real hardware; without it those sections say so.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends usbutils alsa-utils \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir \
     "fastapi==0.133.1" \
     "uvicorn[standard]==0.41.0" \
