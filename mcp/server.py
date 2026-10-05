@@ -754,6 +754,17 @@ def _detect_entity_type(entity: str) -> str:
     return "hostname"
 
 
+def _drop_retracted(rows: list, investigation_id: Optional[str] = None) -> list:
+    """Drop rows that name a retracted finding (the retraction log folded per investigation, plus any row whose
+    index payload carries retracted=true). The read paths below once returned retracted findings as live because
+    they scanned findings.jsonl or the index directly; investigation_search and rag_context_search already
+    filtered, these use the same RecallFilter. Per-directory fail-safe inside build_recall_filter."""
+    if not rows:
+        return rows
+    rf = build_recall_filter(MEMORY_DIR, [investigation_id] if investigation_id else None)
+    return [r for r in rows if not (isinstance(r, dict) and rf.is_retracted(r))]
+
+
 def _entity_lookup_qdrant(
     entity: str,
     entity_type: str,
@@ -838,13 +849,13 @@ def _entity_lookup_cascade(
     Returns ``(findings, method)`` where ``method`` names the tier that produced
     the findings.  A total miss reports the last tier tried (``jsonl_fallback``).
     """
-    findings = _entity_lookup_ladybug(entity, investigation_id, limit)
+    findings = _drop_retracted(_entity_lookup_ladybug(entity, investigation_id, limit), investigation_id)
     method = "ladybug"
     if not findings:
-        findings = _entity_lookup_qdrant(entity, entity_type, investigation_id, limit)
+        findings = _drop_retracted(_entity_lookup_qdrant(entity, entity_type, investigation_id, limit), investigation_id)
         method = "qdrant"
     if not findings:
-        findings = _entity_lookup_jsonl(entity, entity_type, investigation_id, limit)
+        findings = _drop_retracted(_entity_lookup_jsonl(entity, entity_type, investigation_id, limit), investigation_id)
         method = "jsonl_fallback"
     return findings, method
 
@@ -3466,7 +3477,7 @@ def docs_search(
         })
 
     results: list[dict] = []
-    for finding in _read_jsonl(findings_path):
+    for finding in _drop_retracted(_read_jsonl(findings_path), investigation_id):
         tags = {str(tag).lower() for tag in finding.get("tags", [])}
         metadata = finding.get("metadata") or {}
         if "docs" not in tags and not metadata.get("source_path"):
@@ -4159,6 +4170,7 @@ def procedure_search(
                     limit=limit,
                     query_filter=qfilter,
                 )
+                hits = _drop_retracted(hits, investigation_id)
                 for h in hits:
                     pm = h.get("procedure_meta", {})
                     attempt_count = pm.get("attempt_count", 0) if pm else 0
@@ -4197,7 +4209,7 @@ def procedure_search(
                 if not findings_path.exists():
                     continue
                 try:
-                    for f in _read_jsonl(findings_path):
+                    for f in _drop_retracted(_read_jsonl(findings_path), inv_dir_path.name):
                         if f.get("record_type") == "procedure" or f.get("type") == "procedure":
                             text = f.get("text", "")
                             if query_lower in text.lower():
@@ -5679,16 +5691,21 @@ def entity_list(
 
         entities_path = inv_path / "entities.jsonl"
         raw_entities = _read_jsonl(entities_path)
+        retracted = build_recall_filter(MEMORY_DIR, [investigation_id]).retracted.get(investigation_id, set())
 
         results = []
         for ent in raw_entities:
             if entity_type and ent.get("type") != entity_type:
                 continue
+            refs = ent.get("finding_refs", [])
+            live = [r for r in refs if r not in retracted]
+            if refs and not live:      # every finding that mentioned it was retracted
+                continue
             results.append({
                 "entity_id": ent.get("entity_id"),
                 "name": ent.get("name"),
                 "type": ent.get("type"),
-                "finding_count": len(ent.get("finding_refs", [])),
+                "finding_count": len(live),
             })
 
         # Sort by finding_count descending for relevance
@@ -5742,7 +5759,8 @@ def entity_timeline(
         if target_entity is None:
             return json.dumps({"error": f"Entity '{entity_id}' not found in investigation '{investigation_id}'."})
 
-        finding_refs = set(target_entity.get("finding_refs", []))
+        retracted = build_recall_filter(MEMORY_DIR, [investigation_id]).retracted.get(investigation_id, set())
+        finding_refs = {r for r in target_entity.get("finding_refs", []) if r not in retracted}
 
         findings_path = inv_path / "findings.jsonl"
         all_findings = _read_jsonl(findings_path)
@@ -10690,6 +10708,7 @@ def memory_confidence(
         field is returned degraded or omitted; the numeric verdict is unchanged.
     """
     results, hard_stop_basis = _confidence_retrieve(query, top_k)
+    results = _drop_retracted(results)
     if hard_stop_basis is not None:
         return json.dumps({
             "confidence": 0.0, "basis": hard_stop_basis,
@@ -11420,6 +11439,12 @@ def _compute_hints(investigation_id: str, limit: int, since_ts: Optional[str]) -
             for f in raw
             if isinstance(f, dict)
         ]
+
+    # A retracted finding is not a hint, whichever path produced it.
+    _rf = build_recall_filter(MEMORY_DIR, [investigation_id])
+    candidates = [h for h in candidates
+                  if not _rf.is_retracted({"investigation_id": investigation_id,
+                                           "finding_id": h.get("finding_id", ""), "text": h.get("text", "")})]
 
     # Apply since_ts filter if requested
     if since_ts:
