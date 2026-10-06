@@ -33,6 +33,7 @@ import functools
 import os
 import socket
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,17 +47,49 @@ _LOCAL_OLLAMA = os.environ.get("LOCI_LOCAL_OLLAMA", "http://localhost:11434")
 _OLLAMA_LIST_TIMEOUT = float(os.environ.get("LOCI_OLLAMA_LIST_TIMEOUT", "2.0"))
 
 
-@functools.lru_cache(maxsize=1)
+# The parsed config, re-read when the file changes. It used to be parsed once per process (lru_cache), so an edit
+# reached only the processes started after it: the MCP server, the CLI tools and the scheduled tasks each held their
+# own copy. Pinning a model to a GPU (``model_pool`` ``gpu = n``) makes every Ollama request carry ``main_gpu``, and
+# Ollama reloads a loaded model whenever two callers disagree on it, so processes holding different copies of the
+# config reloaded the same model back and forth (2026-10-06: ~15 s per call, in pairs).
+_CONFIG_CACHE: dict = {"path": None, "stamp": None, "value": {}, "checked": 0.0}
+_CONFIG_RECHECK_S = 2.0      # stat the file at most this often
+
+
 def _config() -> dict:
-    """Parse the gitignored TOML config. Fail-open: missing/broken file -> {}."""
+    """Parse the gitignored TOML config; re-read it when its mtime or size changes (checked every 2 s).
+
+    Fail-open: a missing or broken file is ``{}``, and a broken file is not re-parsed until it changes again."""
+    c = _CONFIG_CACHE
+    now = time.monotonic()
+    path = _CONFIG_PATH
+    if c["path"] == path and now - c["checked"] < _CONFIG_RECHECK_S:
+        return c["value"]
     try:
-        import tomllib
-        p = Path(_CONFIG_PATH)
-        if p.exists():
-            return tomllib.loads(p.read_text())
-    except Exception as exc:
-        logger.debug("_config: fail-open swallow: %r", exc)
-    return {}
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    c["checked"] = now
+    if c["path"] == path and c["stamp"] == stamp:
+        return c["value"]
+    value: dict = {}
+    if stamp is not None:
+        try:
+            import tomllib
+            value = tomllib.loads(Path(path).read_text())
+        except Exception as exc:
+            logger.debug("_config: fail-open swallow: %r", exc)
+            value = {}
+    c.update(path=path, stamp=stamp, value=value)
+    return value
+
+
+def _config_cache_clear() -> None:
+    _CONFIG_CACHE.update(path=None, stamp=None, value={})      # no path: the next call is a miss whatever "checked" says
+
+
+_config.cache_clear = _config_cache_clear  # type: ignore[attr-defined]  # the hook _reset_cache() and tests use
 
 
 def _cfg(section: str, key: str, default=None):
