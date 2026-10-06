@@ -145,21 +145,61 @@ class TestGradeOne:
 
     def test_the_default_judge_is_a_pool_pick_other_than_the_answerer(self, monkeypatch):
         calls, asked = [], []
-        monkeypatch.setattr(M, "pick_other", lambda role, exclude: asked.append((role, exclude)) or "pool-judge:4b")
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude, resident_only=False:
+                            asked.append((role, exclude, resident_only)) or "pool-judge:4b")
         monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: calls.append(k) or {"text": '{"correct": true}', "ok": True, "model": "pool-judge:4b"})
         assert G._judge("classify", "p", "a", "answerer:4b")["ok"] is True
-        assert asked == [("verify", "answerer:4b")]
+        assert asked == [("verify", "answerer:4b", True)]                      # resident only: never a cold load
         assert (calls[0]["model"], calls[0]["fmt"], calls[0]["task"], "role" in calls[0]) == ("pool-judge:4b", "json", "judge", False)
         monkeypatch.setenv(G.ROLE_ENV, "gen_large")
         G._judge("classify", "p", "a", "answerer:4b")
-        assert asked[1] == ("gen_large", "answerer:4b")
+        assert asked[1] == ("gen_large", "answerer:4b", True)
+        monkeypatch.setenv(G.COLD_ENV, "1")
+        G._judge("classify", "p", "a", "answerer:4b")
+        assert asked[2] == ("gen_large", "answerer:4b", False)                 # cold loads only when asked for
 
     def test_no_other_model_is_a_loud_skip_and_no_call(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(M, "pick_other", lambda role, exclude: "")
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude, resident_only=False: "")
         monkeypatch.setattr(llm_local, "generate", lambda *a, **k: pytest.fail("the judge must not be called"))
         assert G.grade_one(_item()) is None
         row = _grades(tmp_path)[0]
         assert row["skipped"] == "no_other_model" and "correct" not in row
+
+    def test_a_judge_that_exists_but_is_not_loaded_is_a_loud_skip_and_no_call(self, monkeypatch, tmp_path):
+        """The pool has another model, but loading it mid-traffic stalled a live answer 58 s: skip, do not load."""
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude, resident_only=False: "" if resident_only else "cold:4b")
+        monkeypatch.setattr(llm_local, "generate", lambda *a, **k: pytest.fail("the judge must not be called"))
+        assert G.grade_one(_item()) is None
+        row = _grades(tmp_path)[0]
+        assert row["skipped"] == "no_resident_judge" and "correct" not in row
+
+    @pytest.mark.parametrize("value", ["0", "", "no", "off", "false"])
+    def test_anything_but_a_yes_keeps_the_judge_resident_only(self, monkeypatch, value):
+        monkeypatch.setenv(G.COLD_ENV, value)
+        asked = []
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude, resident_only=False: asked.append(resident_only) or "j:4b")
+        monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: {"text": "{}", "ok": True, "model": k["model"]})
+        G._judge("classify", "p", "a", "answerer:4b")
+        assert asked == [True]
+
+    def test_a_pool_whose_only_model_is_the_answerer_has_no_other_model_not_no_resident(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(M, "entries", lambda: [M.PoolEntry("m1", ("verify",), rank=1.0)])
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {"m1": 10 ** 9})
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: {"m1"})
+        monkeypatch.setattr(llm_local, "generate", lambda *a, **k: pytest.fail("the judge must not be called"))
+        assert G.grade_one(_item(model="m1")) is None
+        assert _grades(tmp_path)[0]["skipped"] == "no_other_model"
+
+    def test_an_unknown_judge_failure_reason_is_reported_as_judge_failed(self, tmp_path):
+        assert G.grade_one(_item(), lambda *a: {"ok": False, "why": "weird"}) is None
+        assert _grades(tmp_path)[0]["skipped"] == "judge_failed"
+
+    def test_with_cold_loads_allowed_the_same_judge_is_used(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(G.COLD_ENV, "1")
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude, resident_only=False: "" if resident_only else "cold:4b")
+        monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: {"text": '{"correct": false}', "ok": True, "model": k["model"]})
+        assert G.grade_one(_item()) is False
+        assert _grades(tmp_path)[0]["correct"] is False
 
 
 class TestReportSkips:

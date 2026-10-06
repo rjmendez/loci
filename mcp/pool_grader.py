@@ -7,8 +7,11 @@ writes the verdict with ``model_pool.record_grade(..., grader="judge")``. Only t
 
 Rules that keep it honest and cheap:
 * the judge is a different model from the one that answered, chosen by the pool (``model_pool.pick_other``, role
-  ``LOCI_MODEL_POOL_GRADE_ROLE``, default ``verify``): ``no_other_model`` when the pool has none and ``same_model``
-  when the call came back from the answerer anyway are skipped, never self-graded;
+  ``LOCI_MODEL_POOL_GRADE_ROLE``, default ``verify``) and already loaded: judging never loads a model while traffic
+  is being served (a cold judge load stalled a live answer 58 s on 2026-10-06), so with none resident the call is
+  skipped as ``no_resident_judge`` (``LOCI_MODEL_POOL_GRADE_COLD=1`` allows cold loads). ``no_other_model`` when the
+  pool has none at all and ``same_model`` when the call came back from the answerer anyway are skipped too, never
+  self-graded;
 * one worker and a short queue: when the judge is busy a sampled call is skipped (``queue_full``), never waited for;
 * every skip is written to the grades log with its reason (``model_pool.record_grade_skip``), so the report shows it;
 * judge calls carry ``task="judge"`` and are never graded themselves.
@@ -31,6 +34,7 @@ import model_pool
 logger = logging.getLogger(__name__)
 
 GRADE_ENV = "LOCI_MODEL_POOL_GRADE"
+COLD_ENV = "LOCI_MODEL_POOL_GRADE_COLD"
 ROLE_ENV = "LOCI_MODEL_POOL_GRADE_ROLE"
 TASKS = ("classify", "compress")
 QUEUE_MAX = 8
@@ -63,9 +67,12 @@ def judge_prompt(task: str, prompt: str, answer: str) -> str:
 
 
 def _judge(task: str, prompt: str, answer: str, answerer: str) -> dict:
-    other = model_pool.pick_other(os.environ.get(ROLE_ENV) or "verify", answerer)
+    role = os.environ.get(ROLE_ENV) or "verify"
+    cold_ok = (os.environ.get(COLD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+    other = model_pool.pick_other(role, answerer, resident_only=not cold_ok)
     if not other:
-        return {"ok": False, "why": "no_other_model"}
+        anywhere = model_pool.pick_other(role, answerer)
+        return {"ok": False, "why": "no_resident_judge" if anywhere else "no_other_model"}
     import llm_local
     return llm_local.generate(judge_prompt(task, prompt, answer), model=other, fmt="json", max_tokens=24,
                               task="judge", timeout=60)
@@ -81,7 +88,7 @@ def grade_one(item: dict, judge: Optional[Callable[[str, str, str, str], dict]] 
         res = {}
     if not isinstance(res, dict) or not res.get("ok"):
         why = res.get("why") if isinstance(res, dict) else ""
-        model_pool.record_grade_skip(did, "no_other_model" if why == "no_other_model" else "judge_failed",
+        model_pool.record_grade_skip(did, why if why in ("no_other_model", "no_resident_judge") else "judge_failed",
                                      model=model, task=task)
         return None
     if str(res.get("model") or "") == model:
