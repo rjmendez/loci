@@ -256,3 +256,45 @@ class TestGenerateWiring:
     def test_judge_calls_are_never_graded(self, monkeypatch):
         self._fake(monkeypatch)
         assert G.maybe_submit("judge", "p", "a", "m", "dX") is False
+
+
+class TestJudgeRoles:
+    """The judge looks in the verify role, then gen: a loaded generation model that is not a verifier can judge."""
+
+    def _roles(self, monkeypatch, answers):
+        asked = []
+
+        def pick_other(role, exclude, resident_only=False):
+            asked.append((role, resident_only))
+            return answers.get((role, resident_only), "")
+        monkeypatch.setattr(M, "pick_other", pick_other)
+        monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: {"text": '{"correct": true}', "ok": True, "model": k["model"]})
+        return asked
+
+    def test_a_resident_verify_model_is_preferred(self, monkeypatch):
+        asked = self._roles(monkeypatch, {("verify", True): "v:4b", ("gen", True): "g:4b"})
+        assert G._judge("classify", "p", "a", "ans")["model"] == "v:4b"
+        assert asked == [("verify", True)]
+
+    def test_with_no_resident_verifier_a_resident_gen_model_judges(self, monkeypatch):
+        asked = self._roles(monkeypatch, {("gen", True): "g:4b"})
+        assert G._judge("classify", "p", "a", "ans")["model"] == "g:4b"
+        assert asked == [("verify", True), ("gen", True)]
+
+    def test_the_skip_reason_looks_in_both_roles(self, monkeypatch):
+        self._roles(monkeypatch, {("gen", False): "cold:4b"})
+        assert G._judge("classify", "p", "a", "ans") == {"ok": False, "why": "no_resident_judge"}
+        self._roles(monkeypatch, {})
+        assert G._judge("classify", "p", "a", "ans") == {"ok": False, "why": "no_other_model"}
+
+    def test_an_explicit_role_is_the_only_role_asked(self, monkeypatch):
+        monkeypatch.setenv(G.ROLE_ENV, "gen_large")
+        asked = self._roles(monkeypatch, {("verify", True): "v:4b", ("gen_large", True): "big:30b"})
+        assert G._judge("classify", "p", "a", "ans")["model"] == "big:30b"
+        assert asked == [("gen_large", True)]
+
+    def test_an_explicit_role_with_no_judge_does_not_fall_back_to_the_default_roles(self, monkeypatch):
+        monkeypatch.setenv(G.ROLE_ENV, "gen_large")
+        asked = self._roles(monkeypatch, {("verify", True): "v:4b", ("gen", True): "g:4b"})
+        assert G._judge("classify", "p", "a", "ans") == {"ok": False, "why": "no_other_model"}
+        assert asked == [("gen_large", True), ("gen_large", False)]
