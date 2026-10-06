@@ -529,6 +529,17 @@ def rank_role(role: str, *, hint: str = "", pool: Optional[Iterable[PoolEntry]] 
     return Decision(role=role, chosen=chosen, candidates=cands, resident_bonus=bonus_)
 
 
+def pick_other(role: str, exclude: str) -> str:
+    """Best eligible model for ``role`` that is not ``exclude`` (the answering model, for a judge that must not
+    grade its own work), or "" when the pool has no other. Not a decision: nothing is logged or explored. Never raises."""
+    try:
+        skip = {exclude, f"{exclude}:latest", exclude.removesuffix(":latest")}
+        return next((c.name for c in rank_role(role).candidates if c.eligible and c.name not in skip), "")
+    except Exception as exc:
+        logger.debug("model_pool.pick_other(%r) failed: %r", role, exc)
+        return ""
+
+
 def pick(role: str, hint: str = "") -> str:
     """Best eligible model for ``role``, or "" (no pool configured, role not pooled, or none installed)."""
     try:

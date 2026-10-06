@@ -6,7 +6,9 @@ memory. ``llm_local.generate`` offers each logged call here; with ``LOCI_MODEL_P
 writes the verdict with ``model_pool.record_grade(..., grader="judge")``. Only the verdict is stored.
 
 Rules that keep it honest and cheap:
-* the judge is a different model from the one that answered (``same_model`` is skipped, never self-graded);
+* the judge is a different model from the one that answered, chosen by the pool (``model_pool.pick_other``, role
+  ``LOCI_MODEL_POOL_GRADE_ROLE``, default ``verify``): ``no_other_model`` when the pool has none and ``same_model``
+  when the call came back from the answerer anyway are skipped, never self-graded;
 * one worker and a short queue: when the judge is busy a sampled call is skipped (``queue_full``), never waited for;
 * every skip is written to the grades log with its reason (``model_pool.record_grade_skip``), so the report shows it;
 * judge calls carry ``task="judge"`` and are never graded themselves.
@@ -60,22 +62,27 @@ def judge_prompt(task: str, prompt: str, answer: str) -> str:
             'Reply with JSON only: {"correct": true} or {"correct": false}.')
 
 
-def _judge(task: str, prompt: str, answer: str) -> dict:
+def _judge(task: str, prompt: str, answer: str, answerer: str) -> dict:
+    other = model_pool.pick_other(os.environ.get(ROLE_ENV) or "verify", answerer)
+    if not other:
+        return {"ok": False, "why": "no_other_model"}
     import llm_local
-    return llm_local.generate(judge_prompt(task, prompt, answer), fmt="json", max_tokens=24,
-                              role=os.environ.get(ROLE_ENV) or "verify", task="judge", timeout=60)
+    return llm_local.generate(judge_prompt(task, prompt, answer), model=other, fmt="json", max_tokens=24,
+                              task="judge", timeout=60)
 
 
-def grade_one(item: dict, judge: Optional[Callable[[str, str, str], dict]] = None) -> Optional[bool]:
+def grade_one(item: dict, judge: Optional[Callable[[str, str, str, str], dict]] = None) -> Optional[bool]:
     """Judge one queued answer and record the verdict or the reason it was skipped. Never raises."""
     did, task, model = item["decision_id"], item["task"], item["model"]
     try:
-        res = (judge or _judge)(task, item["prompt"], item["answer"])
+        res = (judge or _judge)(task, item["prompt"], item["answer"], model)
     except Exception as exc:
         logger.debug("pool_grader: judge raised: %r", exc)
         res = {}
     if not isinstance(res, dict) or not res.get("ok"):
-        model_pool.record_grade_skip(did, "judge_failed", model=model, task=task)
+        why = res.get("why") if isinstance(res, dict) else ""
+        model_pool.record_grade_skip(did, "no_other_model" if why == "no_other_model" else "judge_failed",
+                                     model=model, task=task)
         return None
     if str(res.get("model") or "") == model:
         model_pool.record_grade_skip(did, "same_model", model=model, task=task)

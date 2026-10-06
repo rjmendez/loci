@@ -227,3 +227,52 @@ class TestCallSites:
         text_ops.compress("x" * 700, max_chars=100, gen_fn=gen)
         assert seen == ["classify", "compress"]
         assert M.current_task() == ""
+
+
+class TestPickOther:
+    def _pool(self, monkeypatch, names=("a", "b", "c"), resident=()):
+        monkeypatch.setattr(M, "entries", lambda: [M.PoolEntry(n, ("verify",), rank=float(i + 1)) for i, n in enumerate(names)])
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {n: GB for n in names})
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: set(resident))
+
+    def test_it_returns_the_best_eligible_model_that_is_not_the_answerer(self, monkeypatch):
+        self._pool(monkeypatch)
+        assert M.pick_other("verify", "a") == "b"
+        assert M.pick_other("verify", "b") == "a"                                # positive twin: the best, when allowed
+
+    def test_the_pool_order_decides_including_residency(self, monkeypatch):
+        self._pool(monkeypatch, resident=("c",))
+        monkeypatch.setattr(M, "resident_bonus", lambda: 5.0)
+        assert M.pick_other("verify", "a") == "c"
+        monkeypatch.setattr(M, "resident_bonus", lambda: 0.0)
+        assert M.pick_other("verify", "a") == "b"                                # without the bonus the rank order wins
+
+    def test_a_latest_suffix_does_not_defeat_the_exclusion(self, monkeypatch):
+        self._pool(monkeypatch, names=("a:latest", "b"))
+        assert M.pick_other("verify", "a") == "b"
+        assert M.pick_other("verify", "a:latest") == "b"
+
+    def test_an_answerer_named_with_latest_excludes_the_untagged_pool_entry(self, monkeypatch):
+        self._pool(monkeypatch, names=("a", "b"))
+        assert M.pick_other("verify", "a:latest") == "b"
+
+    def test_a_model_that_is_not_installed_is_never_the_judge(self, monkeypatch):
+        names = ("a", "b", "c")
+        monkeypatch.setattr(M, "entries", lambda: [M.PoolEntry(n, ("verify",), rank=float(i + 1)) for i, n in enumerate(names)])
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {"a": GB, "c": GB})        # b ranks second but is absent
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: set())
+        assert M.pick_other("verify", "a") == "c"
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {"a": GB})                 # only the answerer is installed
+        assert M.pick_other("verify", "a") == ""
+
+    def test_a_pool_with_no_other_model_returns_empty(self, monkeypatch):
+        self._pool(monkeypatch, names=("a",))
+        assert M.pick_other("verify", "a") == ""
+        assert M.pick_other("nonexistent-role", "a") == ""
+
+    def test_it_logs_no_decision_and_never_raises(self, monkeypatch, tmp_path):
+        self._pool(monkeypatch)
+        assert M.pick_other("verify", "a") == "b"
+        assert not (tmp_path / "instrumentation" / M.SHADOW_LOG_NAME).exists()
+        monkeypatch.setattr(M, "rank_role", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+        assert M.pick_other("verify", "a") == ""

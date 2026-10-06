@@ -41,7 +41,7 @@ def _item(**kw):
 
 
 def _judge(text, model="judge-model", ok=True):
-    return lambda task, prompt, answer: {"text": text, "ok": ok, "model": model}
+    return lambda task, prompt, answer, answerer: {"text": text, "ok": ok, "model": model}
 
 
 class TestRate:
@@ -103,11 +103,11 @@ class TestGradeOne:
     def test_the_judge_sees_the_task_and_the_answer(self):
         seen = []
 
-        def judge(task, prompt, answer):
-            seen.append((task, prompt, answer))
+        def judge(task, prompt, answer, answerer):
+            seen.append((task, prompt, answer, answerer))
             return {"text": '{"correct": true}', "ok": True, "model": "j"}
         G.grade_one(_item(task="compress", prompt="P", answer="A"), judge)
-        assert seen == [("compress", "P", "A")]
+        assert seen == [("compress", "P", "A", "m1")]
 
     def test_the_prompt_names_the_rule_and_carries_both_texts(self):
         text = G.judge_prompt("classify", "PROMPT-TEXT", "ANSWER-TEXT")
@@ -143,14 +143,23 @@ class TestGradeOne:
         assert G.grade_one(_item(), boom) is None
         assert _grades(tmp_path)[0]["skipped"] == "judge_failed"
 
-    def test_the_default_judge_asks_for_json_under_the_task_judge(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: calls.append(k) or {"text": '{"correct": true}', "ok": True, "model": "j"})
-        assert G._judge("classify", "p", "a")["ok"] is True
-        assert (calls[0]["fmt"], calls[0]["role"], calls[0]["task"]) == ("json", "verify", "judge")
+    def test_the_default_judge_is_a_pool_pick_other_than_the_answerer(self, monkeypatch):
+        calls, asked = [], []
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude: asked.append((role, exclude)) or "pool-judge:4b")
+        monkeypatch.setattr(llm_local, "generate", lambda prompt, **k: calls.append(k) or {"text": '{"correct": true}', "ok": True, "model": "pool-judge:4b"})
+        assert G._judge("classify", "p", "a", "answerer:4b")["ok"] is True
+        assert asked == [("verify", "answerer:4b")]
+        assert (calls[0]["model"], calls[0]["fmt"], calls[0]["task"], "role" in calls[0]) == ("pool-judge:4b", "json", "judge", False)
         monkeypatch.setenv(G.ROLE_ENV, "gen_large")
-        G._judge("classify", "p", "a")
-        assert calls[1]["role"] == "gen_large"
+        G._judge("classify", "p", "a", "answerer:4b")
+        assert asked[1] == ("gen_large", "answerer:4b")
+
+    def test_no_other_model_is_a_loud_skip_and_no_call(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(M, "pick_other", lambda role, exclude: "")
+        monkeypatch.setattr(llm_local, "generate", lambda *a, **k: pytest.fail("the judge must not be called"))
+        assert G.grade_one(_item()) is None
+        row = _grades(tmp_path)[0]
+        assert row["skipped"] == "no_other_model" and "correct" not in row
 
 
 class TestReportSkips:
