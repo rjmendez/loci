@@ -214,6 +214,14 @@ def _is_embed(name: str) -> bool:
         return "embed" in name.lower()
 
 
+def _placement(name: str) -> dict:
+    try:
+        import model_pool
+        return model_pool.options_for(name)
+    except Exception:
+        return {}
+
+
 def unload(base_url: str, name: str) -> bool:
     """Ask Ollama to drop ``name`` now (keep_alive 0). True when the request was accepted."""
     if _is_embed(name):
@@ -230,9 +238,10 @@ def load(base_url: str, name: str, keep_alive: str = _RESTORE_KEEP_ALIVE) -> boo
         r = _http_json(base_url + "/api/embed", {"model": name, "input": "warm", "keep_alive": keep_alive},
                        _LOAD_TIMEOUT_S)
     else:
+        # Same options as the model's normal calls, or Ollama would reload it on the first one.
         r = _http_json(base_url + "/api/generate", {"model": name, "prompt": "", "stream": False,
                                                     "keep_alive": keep_alive,
-                                                    "options": {"num_predict": 0}}, _LOAD_TIMEOUT_S)
+                                                    "options": {"num_predict": 0, **_placement(name)}}, _LOAD_TIMEOUT_S)
     return r is not None
 
 

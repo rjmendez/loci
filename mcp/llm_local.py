@@ -64,6 +64,16 @@ _MIN_ATTEMPT_S = 5.0
 _GPU_LOADED_OLLAMA_TIMEOUT_S = float(os.environ.get("LOCI_GPU_LOADED_OLLAMA_TIMEOUT_S", "30"))
 
 
+def _placement(model: str) -> dict:
+    """Request options that put ``model`` on its pool home card (``main_gpu``), or {}. Fail-open."""
+    try:
+        import model_pool
+        return model_pool.options_for(model)
+    except Exception as exc:
+        _LOG.debug("llm_local: placement skipped: %r", exc)
+        return {}
+
+
 def _lease_inflight(model: str):
     """Mark ``model`` busy so a model lease will not evict it mid-request. A no-op if unavailable."""
     try:
@@ -493,6 +503,7 @@ def _generate(prompt: str,
         "options": {
             "num_predict": max_tokens,
             "temperature": temperature,
+            **_placement(model),
         },
     }
     if fmt == "json":
@@ -639,7 +650,7 @@ def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
         "keep_alive": "30m",
         "think": False,
         "format": "json",
-        "options": {"num_predict": min(max_tokens, 220), "temperature": 0.0},
+        "options": {"num_predict": min(max_tokens, 220), "temperature": 0.0, **_placement(supervisor_model)},
     }
     try:
         import requests
