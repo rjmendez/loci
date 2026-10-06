@@ -1395,6 +1395,16 @@ _CLAUDE_PERMISSION_DENIED_RE = re.compile(
 )
 
 
+# Tool results the harness itself refuses or rejects: the agent was told no, nothing failed. A sleep-then-poll
+# block, a worktree-isolation notice, a structured-output schema mismatch and a "write your findings as text"
+# reminder made up 8% of stored findings on 2026-10-05 and drowned the real failures.
+_CLAUDE_HARNESS_GUARD_RE = re.compile(
+    r"^\s*(?:<tool_use_error>\s*)?(?:blocked:|this session is isolated in the worktree|"
+    r"subagents should return findings as text|output does not match required schema)",
+    re.I,
+)
+
+
 def _reflection_text_of(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -1414,8 +1424,11 @@ def _scan_claude_blocks(blocks: list, scan: "_ReflectionScan") -> None:
             scan.event_counts["permission_denied"] += 1
             scan.scan_line("claude tool permission denied", severity="warning")
         elif block.get("is_error"):
-            scan.event_counts["tool_result_error"] += 1
             first = next((ln for ln in text.splitlines() if ln.strip()), "")
+            if _CLAUDE_HARNESS_GUARD_RE.search(first):
+                scan.event_counts["harness_guard"] += 1
+                continue
+            scan.event_counts["tool_result_error"] += 1
             scan.scan_line(f"claude tool_result error: {first[:160]}", severity="error")
 
 
@@ -1494,7 +1507,11 @@ def _scan_claude_code_event(file_path: Path, scan: "_ReflectionScan", max_lines:
             if _CLAUDE_INTERRUPT_RE.search(joined[:400]):
                 scan.event_counts["interrupted_turn"] += 1
                 scan.scan_line("claude turn interrupted", severity="warning")
-            scan.scan_line(joined)
+            # A user-role message is a prompt, a pasted report or a harness notice (workflow task text, teammate
+            # messages, system notifications), never a runtime failure. Failed tool results arrive in user-role
+            # events too, but as blocks, and _scan_claude_blocks has already read those.
+            if event_type != "user":
+                scan.scan_line(joined)
             # API error entries: assistant message flagged isApiErrorMessage, or a system api_error.
             if event.get("isApiErrorMessage") or event.get("subtype") == "api_error" or event.get("error"):
                 scan.event_counts["api_error"] += 1
