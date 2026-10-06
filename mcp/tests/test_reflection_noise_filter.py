@@ -45,6 +45,35 @@ class TestHarnessGuardResults(_Scan):
         "blocked: sleep 5 followed by: ls",
         "<tool_use_error>This subagent's parent bg session hasn't isolated yet, so writes to the shared checkout are blocked. Re-spawn",
         "<tool_use_error>This subagent’s parent bg session hasn’t isolated yet, so writes are blocked.",
+        # found 2026-10-06 by scoring every stored tool-error string with a small decision model, then read by hand
+        r"This agent is isolated in the worktree C:\x\wt, but this command runs wsl inside the main checkout",
+        "<tool_use_error>This write was blocked because the path is spelled in a form that cannot be safely resolved",
+        "<tool_use_error>File has not been read yet. Read it first before writing to it.</tool_use_error>",
+        "File has not been read yet. Read it first before writing to it.",
+        "Not run: the response that made this tool call was stopped by a safety classifier.",
+        "Teammates cannot spawn other teammates — the team roster is flat. To spawn a subagent instead, omit the `name` parameter.",
+        "Remove-Item on system path '/tmp' is blocked. This path is protected from removal.",
+        "Remove-Item on system path '~' is blocked. This path is protected from removal.",
+        r"Refusing to write \\wsl.localhost\ubuntu\mnt\f\job.sh: where it leads on disk could not be determined",
+        r"Refusing to read \\wsl$\ubuntu\root\docs\world_v2.md: where it leads on disk could not be determined",
+        "The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of write.",
+    )
+
+    # Failures that read like refusals to a model and are not: they must stay errors.
+    REAL_FAILURES = (
+        r"EPERM: operation not permitted, mkdir '\\wsl.localhost\ubuntu\home\tmp'",
+        r"EISDIR: illegal operation on a directory, read '\\wsl$\ubuntu\home'",
+        r"path does not exist: /tmp/ug.md. Note: your current working directory is C:\x",
+        "String not found in file. Failed to apply edit.",
+        "timeout of 60000ms exceeded",
+        "The operation timed out.",
+        "socket hang up",
+        "Remove-Item on system path '/tmp/x' exists but could not be removed: access denied",
+        "Refusal to proceed: the build needs a clean tree",
+        "Task behoryove is not running (status: completed)",
+        "pdftoppm is not installed. Install poppler-utils to enable PDF parsing",
+        "Search failed — ripgrep rejected the pattern, glob, or file type without searching:",
+        "Ripgrep search timed out after 20 seconds. The search may have matched files but did not complete in time.",
     )
 
     def test_a_harness_refusal_is_counted_as_a_guard_not_as_an_error(self):
@@ -66,6 +95,15 @@ class TestHarnessGuardResults(_Scan):
                 self.assertNotIn("harness_guard", out["events"])
                 self.assertEqual(len(out["errors"]), 1)
                 self.assertTrue(next(iter(out["errors"])).startswith("claude tool_result error: "))
+
+    def test_failures_that_merely_sound_like_refusals_stay_errors(self):
+        """Positive twin for every guard above: same block shape, the tool or the OS really failed."""
+        for text in self.REAL_FAILURES:
+            with self.subTest(text=text[:50]):
+                out = self.scan(_result_event(text))
+                self.assertEqual(out["events"].get("tool_result_error"), 1)
+                self.assertNotIn("harness_guard", out["events"])
+                self.assertEqual(len(out["errors"]), 1)
 
     def test_a_guard_phrase_that_is_not_the_first_line_is_not_a_guard(self):
         out = self.scan(_result_event("Exit code 2\nblocked: the build step was blocked by a lock"))
