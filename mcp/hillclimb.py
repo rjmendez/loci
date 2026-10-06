@@ -755,6 +755,99 @@ def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool =
     return tally
 
 
+REVIEW_PROMPT = "[Enter]=accept proposed  [r]egression [f]laky [c]onfig/env [n]oise [u]nknown = change  [x] not a failure  [s]kip  [q]uit > "
+PROPOSALS_FILE = "labels_claude.jsonl"
+
+
+def _stratified(items: list, key: Callable[[Any], str], seed: int = 7) -> list:
+    """Round-robin over the groups of ``key``, largest group first, each group shuffled with ``seed``: the first N
+    items cover as many groups as possible instead of N from the biggest one. Deterministic."""
+    import random
+    rng = random.Random(seed)
+    groups: dict[str, list] = {}
+    for it in items:
+        groups.setdefault(key(it), []).append(it)
+    for g in groups.values():
+        rng.shuffle(g)
+    order = sorted(groups, key=lambda k: (-len(groups[k]), k))
+    out = []
+    while any(groups[k] for k in order):
+        for k in order:
+            if groups[k]:
+                out.append(groups[k].pop())
+    return out
+
+
+def review(suite: str = "reflection_triage", n: int = 30, input_fn: Callable[[str], str] = input,
+           print_fn: Callable[[str], None] = print, proposals_file: str = PROPOSALS_FILE, seed: int = 7) -> dict:
+    """Review a model's proposed labels instead of labelling from scratch.
+
+    Proposals (``labels_claude.jsonl``: ``{id, gold, rule, note, labeler}``) are shown one per observation, rule by
+    rule (``_stratified``) so a few reviews test every rule, not just the biggest. Enter accepts the proposal; a letter
+    changes it; ``x`` rejects the observation as not a failure; ``s`` skips (remembered separately from ``label``'s
+    skips); ``q`` stops. Accepted and changed labels join ``labels.jsonl`` with ``labeler`` ending in ``+human-review``
+    and the original ``proposed`` category, so a reviewed label can always be told from a hand label. A proposal is
+    never a label until a person has answered it. The result says, per rule, how many proposals you accepted:
+    that is the model's measured accuracy on the rule, and the number to look at before trusting the rest.
+    """
+    d = suite_dir(suite)
+    obs = {o["id"]: o for o in _read_jsonl(d / "observations.jsonl")}
+    proposals = [p for p in _read_jsonl(d / proposals_file) if p.get("id") in obs]
+    done = {r.get("id") for r in _read_jsonl(d / "labels.jsonl")}
+    rej_ids, _ = _rejected(suite)
+    done |= rej_ids
+    skipped = set(_read_json(d / "review_skipped.json").get("ids", []))
+    pending = [p for p in proposals if p["id"] not in done and p["id"] not in skipped]
+    todo = _stratified(pending, lambda p: str(p.get("rule") or "?"), seed)[:n]
+    tally: dict = {"accepted": 0, "changed": 0, "rejected": 0, "skipped": 0, "by_rule": {}}
+    print_fn(f"{len(todo)} to review ({len(proposals)} proposed, {len(done)} already labelled or rejected, "
+             f"{len(skipped)} skipped in review)")
+    for i, p in enumerate(todo, 1):
+        o = obs[p["id"]]
+        rule = str(p.get("rule") or "?")
+        print_fn(f"\n--- {i}/{len(todo)}  {o['id']}\n{_show(o)}\n  proposed: {p.get('gold')}   rule: {rule}\n  evidence: {p.get('note') or '-'}")
+        while True:
+            raw = input_fn(REVIEW_PROMPT).strip().lower()
+            ans = raw[:1]
+            if ans == "" or ans in LABELS or ans in ("s", "q", "x"):
+                break
+            print_fn("  Enter r f c n u x s q")
+        if ans == "q":
+            break
+        if ans == "s":
+            skipped.add(o["id"])
+            tally["skipped"] += 1
+            continue
+        stat = tally["by_rule"].setdefault(rule, {"shown": 0, "accepted": 0})
+        stat["shown"] += 1
+        if ans == "x":
+            keys = sorted(_obs_keys(o))
+            row = {"id": o["id"], "keys": keys, "note": _scrub_text(input_fn(REJECT_PROMPT).strip(), _NOTE_TEXT),
+                   "ts": int(time.time())}
+            with (d / "rejected.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, sort_keys=True) + "\n")
+            tally["rejected"] += 1
+            print_fn(f"  will no longer capture items whose only errors/warnings are: {keys}")
+            continue
+        gold = p.get("gold") if ans == "" else LABELS[ans]
+        accepted = gold == p.get("gold")
+        case = {"id": o["id"], "gold": gold, "novelty": "unclear", "note": _scrub_text(str(p.get("note") or ""), _NOTE_TEXT),
+                "kind": o["kind"], "path": o["path"], "events": o["events"], "tools": o["tools"], "errors": o["errors"],
+                "warnings": o["warnings"], "labeler": f"{p.get('labeler') or 'model'}+human-review",
+                "proposed": p.get("gold"), "rule": rule}
+        with (d / "labels.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(case, sort_keys=True) + "\n")
+        tally["accepted" if accepted else "changed"] += 1
+        stat["accepted"] += int(accepted)
+    _atomic_write(d / "review_skipped.json", {"ids": sorted(skipped)})
+    shown = tally["accepted"] + tally["changed"] + tally["rejected"]      # a rejection disagrees with the proposal too
+    if shown:
+        print_fn(f"\naccepted {tally['accepted']}/{shown} reviewed proposals ({tally['accepted'] / shown:.0%}); by rule:")
+        for rule, s in sorted(tally["by_rule"].items(), key=lambda kv: -kv[1]["shown"]):
+            print_fn(f"  {s['accepted']}/{s['shown']}  {rule}")
+    return tally
+
+
 def label_stats(suite: str = "reflection_triage") -> dict:
     """How far the real label set is from being useful: counts, per-category, and split sizes."""
     d = suite_dir(suite)
@@ -817,12 +910,19 @@ def _main(argv: Optional[list[str]] = None) -> int:
     lb.add_argument("--n", type=int, default=30)
     lb.add_argument("--skipped", action="store_true", help="show observations you skipped before")
     lb.add_argument("--model", action="store_true", help="show what the classifier says AFTER you answer")
+    lb.add_argument("--review", action="store_true",
+                    help="review a model's proposed labels (labels_claude.jsonl) instead of labelling from scratch: "
+                         "Enter accepts, a letter changes; shows per-rule how often you accepted")
+    lb.add_argument("--proposals", default=PROPOSALS_FILE, help="proposals file for --review (in the suite directory)")
     lb.add_argument("--decide", action="store_true",
                     help="show what the decision model (decide.py) says AFTER you answer, with its confidence")
     sub.add_parser("prune", help="drop message-text observations captured before the prose filter").add_argument("--suite", default="triage")
     ls = sub.add_parser("labels", help="how many real labels exist and whether they are enough")
     ls.add_argument("--suite", default="triage")
     a = p.parse_args(argv)
+    if a.cmd == "label" and a.review:
+        print(json.dumps(review(suite_name(a.suite), a.n, proposals_file=a.proposals)))
+        return 0
     if a.cmd == "label":
         classify = None
         if a.model:

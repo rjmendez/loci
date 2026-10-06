@@ -1258,6 +1258,14 @@ The synthetic cases are too few to rank patches. Real ones come from the reflect
   the item's error keys in `rejected.jsonl`: capture then drops later items whose only errors/warnings are keys
   you rejected, and `prune` applies the same to what is already stored. `--model` prints the classifier's answer
   only after you answer, and tallies agreement. Labels append to `labels.jsonl` and resume where you left off.
+  `--decide` does the same with the decision model (`docs/decision_model.md`), with its confidence.
+  `label --review [--n 30] [--proposals FILE]` reviews a model's proposals (`labels_claude.jsonl`: `{id, gold, rule,
+  note, labeler}`) instead of labelling from scratch: Enter accepts, a letter changes, `x` rejects, `s` skips (kept
+  in `review_skipped.json`), `q` quits. Proposals are shown rule by rule, largest first, so a few reviews test every
+  rule. Reviewed labels join `labels.jsonl` with `labeler` ending in `+human-review` and the original `proposed`
+  category; an unreviewed proposal is never a label. It ends with how often you accepted each rule, which is the
+  proposer's measured accuracy on that rule. Enter is easy to press: read the evidence line, and distrust a run of
+  accepts on a big rule.
   Scoring: a label with a novelty of known or new is graded on category and novelty (mean of the two); `unclear`
   is not graded, and labels without a novelty (synthetic, older) are graded on category alone. Notes are shown to
   the proposer next to the failing case.
