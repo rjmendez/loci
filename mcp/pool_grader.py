@@ -7,7 +7,8 @@ writes the verdict with ``model_pool.record_grade(..., grader="judge")``. Only t
 
 Rules that keep it honest and cheap:
 * the judge is a different model from the one that answered, chosen by the pool (``model_pool.pick_other``, role
-  ``LOCI_MODEL_POOL_GRADE_ROLE``, default ``verify``) and already loaded: judging never loads a model while traffic
+  ``LOCI_MODEL_POOL_GRADE_ROLE``; by default ``verify`` first, then ``gen``, so a loaded generation model
+  that is not a verifier can still judge) and already loaded: judging never loads a model while traffic
   is being served (a cold judge load stalled a live answer 58 s on 2026-10-06), so with none resident the call is
   skipped as ``no_resident_judge`` (``LOCI_MODEL_POOL_GRADE_COLD=1`` allows cold loads). ``no_other_model`` when the
   pool has none at all and ``same_model`` when the call came back from the answerer anyway are skipped too, never
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 GRADE_ENV = "LOCI_MODEL_POOL_GRADE"
 COLD_ENV = "LOCI_MODEL_POOL_GRADE_COLD"
+DEFAULT_ROLES = ("verify", "gen")
 ROLE_ENV = "LOCI_MODEL_POOL_GRADE_ROLE"
 TASKS = ("classify", "compress")
 QUEUE_MAX = 8
@@ -67,11 +69,11 @@ def judge_prompt(task: str, prompt: str, answer: str) -> str:
 
 
 def _judge(task: str, prompt: str, answer: str, answerer: str) -> dict:
-    role = os.environ.get(ROLE_ENV) or "verify"
+    roles = (os.environ.get(ROLE_ENV),) if os.environ.get(ROLE_ENV) else DEFAULT_ROLES
     cold_ok = (os.environ.get(COLD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
-    other = model_pool.pick_other(role, answerer, resident_only=not cold_ok)
+    other = next((m for m in (model_pool.pick_other(r, answerer, resident_only=not cold_ok) for r in roles) if m), "")
     if not other:
-        anywhere = model_pool.pick_other(role, answerer)
+        anywhere = any(model_pool.pick_other(r, answerer) for r in roles)
         return {"ok": False, "why": "no_resident_judge" if anywhere else "no_other_model"}
     import llm_local
     return llm_local.generate(judge_prompt(task, prompt, answer), model=other, fmt="json", max_tokens=24,
