@@ -380,7 +380,7 @@ class TestReport:
 
     def test_no_logs_is_an_empty_report_not_an_error(self, tmp_path):
         assert M.pool_report() == {"roles": {}, "legacy_rows": 0, "min_arm_n": M.MIN_ARM_N, "decisions": 0, "outcomes": 0,
-                                  "grades": 0}
+                                  "grades": 0, "grade_skips": {}}
 
     def test_the_cli_prints_the_verdict(self, tmp_path, capsys):
         self._logs(tmp_path, *self._rows([("a", 40, 40)]))
