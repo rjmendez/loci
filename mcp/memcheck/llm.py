@@ -271,6 +271,15 @@ def call_llm(
     return None
 
 
+def _placement(model: str) -> dict:
+    """Request options that put ``model`` on its pool home card, or {} (a different option set reloads a loaded model)."""
+    try:
+        import model_pool
+        return model_pool.options_for(model)
+    except Exception:
+        return {}
+
+
 def _call_ollama(prompt: str, json_mode: bool, timeout: float,
                  model: str | None = None, options: dict | None = None) -> str | None:
     model = model or _llm_model()
@@ -280,8 +289,9 @@ def _call_ollama(prompt: str, json_mode: bool, timeout: float,
     # qwen extended-thinking is noisy for a yes/no judge — disable when present.
     if "qwen" in model.lower():
         payload["think"] = False
-    if options:
-        payload["options"] = options
+    placement = _placement(model)
+    if options or placement:
+        payload["options"] = {**(options or {}), **placement}
     data = _post_json(f"{_ollama_gen_base()}/api/generate", payload, {}, timeout)
     if not data:
         return None

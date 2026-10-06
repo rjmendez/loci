@@ -52,6 +52,11 @@ Training and testing a selector (a FlyBrain-style brain, or the baseline in ``po
   ``LOCI_MODEL_POOL_EXPLORE_MODELS=a,b`` optionally narrows the alternatives, and on its own it
   applies to every role. It is off unless ``p``, roles or models are set and the shadow is on. It
   changes live routing for that fraction of calls, and a non-resident model has to be loaded.
+* A ``[[models.pool]]`` entry may set ``gpu = <n>``, the model's home card by Ollama's index (on the
+  Windows host 0 is the RTX 4070 Ti and 1 the RTX 2080 Ti, the reverse of nvidia-smi). ``options_for(model)``
+  turns that into ``{"main_gpu": n}``, which ``llm_local``, ``memcheck`` and the lease reload merge into
+  their Ollama options. Ollama reloads a loaded model when a request's options differ, so give a model one
+  home and do not pin one that other clients also call without it.
 * ``python model_pool.py report`` joins the logs and says, per role, whether the data can support
   learning (two or more arms with enough outcomes) or only one arm has ever been observed.
 """
@@ -116,6 +121,7 @@ class PoolEntry:
     pinned: bool = False
     role_rank: tuple[tuple[str, float], ...] = ()
     evictable: bool = True        # False (or pinned) keeps a model resident through a lease (model_lease)
+    gpu: Optional[int] = None     # home card, Ollama's index (NOT nvidia-smi's); None = let the scheduler place it
 
     def rank_for(self, role: str) -> float:
         for r, value in self.role_rank:
@@ -197,12 +203,48 @@ def entries() -> list[PoolEntry]:
             vram_gb=_num(vram, None) if vram is not None else None,
             pinned=bool(item.get("pinned", False)), role_rank=role_rank,
             evictable=bool(item.get("evictable", True)),
+            gpu=_gpu_index(item.get("gpu")),
         ))
     return out
 
 
+def _gpu_index(value) -> Optional[int]:
+    """A whole number >= 0 (an int or a digit string); anything else (a bool, a float, text, a negative) is no pin."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def configured() -> bool:
     return bool(entries())
+
+
+def home_gpu(model: str) -> Optional[int]:
+    """The pool's home card for ``model`` (Ollama's GPU index), or None. ``name`` and ``name:latest`` are one model."""
+    name = (model or "").strip()
+    if not name:
+        return None
+    try:
+        for e in entries():
+            if e.gpu is not None and (e.name == name or e.name == f"{name}:latest" or f"{e.name}:latest" == name):
+                return e.gpu
+    except Exception as exc:
+        logger.debug("model_pool: home_gpu skipped: %r", exc)
+    return None
+
+
+def options_for(model: str) -> dict:
+    """Ollama request options that place ``model`` on its home card: ``{"main_gpu": n}`` or ``{}``.
+
+    Ollama reloads a loaded model whenever a request's options differ from the ones it was loaded with
+    (measured: ~9 s), so every caller of a pinned model has to send these, and a model other clients also
+    use should not be pinned. Never raises."""
+    gpu = home_gpu(model)
+    return {} if gpu is None else {"main_gpu": gpu}
 
 
 def resident_bonus() -> float:
