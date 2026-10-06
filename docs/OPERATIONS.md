@@ -192,33 +192,9 @@ python3 scripts/bench_model_catalog_quality.py \
   --output artifacts/model_catalog/quality_<date>.json
 ```
 
-2. Derive role assignments from that JSON and currently installed local tags:
+2. Do not copy winners into `backends.toml`. Models are never named in config: put the winners in `[[models.pool]]` with the `rank` they earned, and read `python mcp/model_pool.py report` (per-arm `correct_rate` once answers are graded, see `model_pool.record_grade`) to confirm them on live traffic.
 
-```bash
-python3 scripts/assign_models_from_benchmark.py \
-  --benchmark-json artifacts/model_catalog/quality_<date>.json
-```
-
-This prints an `[ollama]` TOML block mapping:
-- `synthesis` winner -> `gen_model`
-- `escalation` winner -> `verify_model`
-- `cheap_fanout` winner -> `compress_model`
-- `guardian` winner -> `guardian_model`
-- best available local heretic/abliterated -> `redteam_model`
-
-If the script exits non-zero, at least one selected winner is not installed locally.
-Fix the local model inventory first, then rerun.
-
-3. Copy the emitted block into `~/.loci/backends.toml` (or the file pointed to by
-`$LOCI_CONFIG`) and validate every assigned tag resolves:
-
-```bash
-ollama show <gen_model>
-ollama show <verify_model>
-ollama show <compress_model>
-ollama show <guardian_model>
-ollama show <redteam_model>
-```
+3. Check that every pooled tag resolves: `ollama show <tag>`.
 
 4. If you update additive catalog recommendations in `scripts/model_catalog.py`, keep
 the benchmark and catalog tests green:
@@ -233,7 +209,7 @@ python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py scripts/test
 See [docs/IMPLEMENTATION_VERIFICATION_AND_ROLLOUT.md](./IMPLEMENTATION_VERIFICATION_AND_ROLLOUT.md) for the end-to-end verification path that ties the benchmark harness, queue guardrails, acceptance gates, and audit-trace design together. The operational summary is:
 
 1. Run the benchmark harness and persist the JSON summary from `scripts/bench_model_catalog_quality.py`.
-2. Derive local role assignments with `scripts/assign_models_from_benchmark.py` and fail closed if a selected winner is not installed.
+2. Put the winners into the pool ranking (`[[models.pool]]`), never into named `[ollama].*_model` config keys, and fail closed if a pooled tag is not installed.
 3. Gate rollout with the phases below: dry-run -> shadow -> canary -> default-on -> rollback-ready.
 4. Verify each phase with the relevant pytest targets plus `ollama show` checks for the selected tags.
 5. Keep an immutable decision record in the audit lane: router inputs, model choice, verification outcome, memory writes, and any rollback reason.
@@ -369,11 +345,8 @@ then orders them by `rank - resident_bonus` (`role_rank` overrides `rank` for on
 `max_vram_gb`, a model that fits always beats one that does not. With `over_cap_fallback = true`
 the cap only binds while some installed candidate fits: when none does, the over-cap candidates
 become eligible and the best-ranked (the strongest, by your ranking) is used. `model_pool.py show`
-and the `model_pool` health block mark such a pick `OVER-CAP` / `over_cap`. The operator's own tag (`[ollama].gen_model`,
-`verify_model`, `guardian_model`, `redteam_model`, `compress_model`, `classify_model`) joins as rank 0:
-it still wins while installed and the pool takes over when it is not, which is the failure a missing
-`gen_model` used to cause. Env overrides (`LOCI_OLLAMA_*_MODEL`) beat everything. A role the pool
-does not list keeps its legacy resolver.
+and the `model_pool` health block mark such a pick `OVER-CAP` / `over_cap`. Models are never named in config: `[ollama].gen_model`, `verify_model`, `guardian_model`, `redteam_model`, `compress_model`, `classify_model` and the swarm keys are ignored, with a warning in the log, and the pool decides. Env overrides (`LOCI_OLLAMA_*_MODEL`) are per-process escape hatches and beat the pool. A role the pool
+does not list falls back to an installed model that fits one GPU, never to a named one.
 
 - `python mcp/model_pool.py init` prints a draft pool from what the generation endpoint has
   installed (specialists recognised by name: code, math, guardian/safety, tool, vision, embed,

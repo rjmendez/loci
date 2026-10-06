@@ -225,14 +225,6 @@ def _fits_one_gpu(tag: str) -> bool:
     return size is None or size <= _auto_pick_max_bytes()
 
 
-def _first_installed(candidates: tuple[str, ...]) -> str:
-    tags = _ollama_local_tags()
-    for c in candidates:
-        if c in tags and _fits_one_gpu(c):
-            return c
-    return ""
-
-
 def _first_non_embedding_local() -> str:
     tags = sorted(_ollama_local_tags())
     for t in tags:
@@ -293,135 +285,88 @@ def ollama_gen_url(probe_timeout: float = 1.0) -> str:
     return ollama_url(probe_timeout)
 
 
-def _pool_pick(role: str, hint: str = "") -> str:
+_PINNED_MODEL_KEYS = ("gen_model", "verify_model", "classify_model", "compress_model", "guardian_model",
+                      "redteam_model", "swarm_escalate_model", "swarm_synthesize_model")
+_warned_pinned = False
+
+
+def _warn_pinned_models() -> None:
+    """Models are chosen by the pool ([[models.pool]]), never named in config. A leftover ``[ollama].*_model`` key
+    is ignored, loudly and once, so nobody believes it still pins anything."""
+    global _warned_pinned
+    if _warned_pinned:
+        return
+    _warned_pinned = True
+    try:
+        pinned = [k for k in _PINNED_MODEL_KEYS if _cfg("ollama", k, "")]
+    except Exception:
+        return
+    if pinned:
+        logger.warning("backends: [ollama].%s ignored: models come from the pool ([[models.pool]]), never from "
+                       "named config; remove the key(s)", ", ".join(pinned))
+
+
+def _pool_pick(role: str) -> str:
     """Ranked pick from the model pool ([[models.pool]]), or "" when no pool is configured,
-    the role is not pooled, or nothing pooled is installed. ``hint`` is the operator's own
-    tag for the role: it joins as rank 0, so it still wins while installed and the pool
-    takes over when it is not. Never raises."""
+    the role is not pooled, or nothing pooled is installed. Never raises."""
     try:
         import model_pool
-        return model_pool.pick(role, hint)
+        return model_pool.pick(role)
     except Exception as exc:
         logger.debug("_pool_pick(%r): fail-open swallow: %r", role, exc)
         return ""
 
 
 def ollama_gen_model() -> str:
-    """Generation model tag. Env -> model pool ('gen', with [ollama].gen_model as its
-    top candidate) -> [ollama].gen_model -> installed local -> default."""
+    """Generation model tag. Env LOCI_OLLAMA_GEN_MODEL (a per-process override, never config) -> the model pool
+    ('gen') -> an installed local non-embedding model under the one-GPU cap -> a last-resort default."""
+    _warn_pinned_models()
     env = os.environ.get("LOCI_OLLAMA_GEN_MODEL")
     if env:
         return env
-    cfg = _cfg("ollama", "gen_model", "")
-    pooled = _pool_pick("gen", cfg)
-    if pooled:
-        return pooled
-    env_or_cfg = cfg
-    if env_or_cfg:
-        return env_or_cfg
-    preferred = (ONE_GPU_FALLBACK_MODEL, "heretic-llama31-8b-instruct:latest")
-    return _first_installed(preferred) or _first_non_embedding_local() or ONE_GPU_FALLBACK_MODEL
-
-
-def _task_model(env_var: str, cfg_key: str) -> str:
-    """Per-task model override, falling back to the shared ollama_gen_model().
-
-    Adversarial live benchmarking (ab_eval_local_model.py --difficulty hard) showed the
-    single shared gen_model is not equally good at every task: classify is high-volume and
-    low-stakes, but verify_finding and dense compress_text calls need real reasoning under
-    a tighter budget, where a slower/stronger model measurably scores higher. This lets an
-    operator opt specific call sites into a different model without changing the default
-    that classify_text (and anything else unspecified) keeps using.
-    """
-    env = os.environ.get(env_var)
-    if env:
-        return env
-    cfg = _cfg("ollama", cfg_key, "")
-    pooled = _pool_pick(cfg_key.removesuffix("_model"), cfg)
-    return pooled or cfg or ollama_gen_model()
+    return _pool_pick("gen") or _first_non_embedding_local() or ONE_GPU_FALLBACK_MODEL
 
 
 def ollama_verify_model() -> str:
-    """Model for verify_finding's adversarial reasoning. Env -> [ollama].verify_model -> gen_model."""
-    return _task_model("LOCI_OLLAMA_VERIFY_MODEL", "verify_model")
+    """Model for verify_finding's adversarial reasoning. Env -> the model pool ('verify') -> ollama_gen_model()."""
+    env = os.environ.get("LOCI_OLLAMA_VERIFY_MODEL")
+    return env or _pool_pick("verify") or ollama_gen_model()
 
 
 def swarm_escalate_model() -> str:
-    """swarm_escalate's escalation tier. Env LOCI_SWARM_ESCALATE_MODEL ->
-    [ollama].swarm_escalate_model -> verify_model (the same stronger reasoning tier)."""
-    return (os.environ.get("LOCI_SWARM_ESCALATE_MODEL")
-            or _cfg("ollama", "swarm_escalate_model", "")
-            or ollama_verify_model())
+    """swarm_escalate's escalation tier. Env LOCI_SWARM_ESCALATE_MODEL -> the verify tier."""
+    return os.environ.get("LOCI_SWARM_ESCALATE_MODEL") or ollama_verify_model()
 
 
 def swarm_synthesize_model() -> str:
-    """swarm_escalate's synthesis tier. Env LOCI_SWARM_SYNTHESIZE_MODEL ->
-    [ollama].swarm_synthesize_model -> verify_model."""
-    return (os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL")
-            or _cfg("ollama", "swarm_synthesize_model", "")
-            or ollama_verify_model())
-
-
-def ollama_classify_model() -> str:
-    """Model for classify_text's short-label routing. Env -> [ollama].classify_model -> gen_model."""
-    return _task_model("LOCI_OLLAMA_CLASSIFY_MODEL", "classify_model")
-
-
-def ollama_compress_model() -> str:
-    """Model for compress_text's summarization. Env -> [ollama].compress_model -> gen_model."""
-    return _task_model("LOCI_OLLAMA_COMPRESS_MODEL", "compress_model")
+    """swarm_escalate's synthesis tier. Env LOCI_SWARM_SYNTHESIZE_MODEL -> the verify tier."""
+    return os.environ.get("LOCI_SWARM_SYNTHESIZE_MODEL") or ollama_verify_model()
 
 
 def ollama_guardian_model() -> str:
     """Model for guardian.check_injection_risk's safety classification.
 
-    Deliberately does NOT fall back to ollama_gen_model() like the other per-task
-    resolvers: Granite Guardian is a purpose-built safety classifier tuned on a
-    specific risk-definition prompt shape, not a general chat/reasoning model.
-    Routing this check to an arbitrary general model would produce meaningless
-    Yes/No output rather than a degraded-but-sane answer, so the default is the
-    verified-good granite3-guardian tag itself.
-
-    Env -> [ollama].guardian_model -> "granite3-guardian:2b".
+    Deliberately does NOT fall back to ollama_gen_model(): a safety classifier is a purpose-built model tuned on
+    a risk-definition prompt, and an arbitrary general model would give meaningless Yes/No output. Env
+    LOCI_OLLAMA_GUARDIAN_MODEL -> the model pool ('guardian') -> an installed tag with "guard" in its name ->
+    a last-resort default.
     """
+    _warn_pinned_models()
     env = os.environ.get("LOCI_OLLAMA_GUARDIAN_MODEL")
     if env:
         return env
-    cfg = _cfg("ollama", "guardian_model", "")
-    pooled = _pool_pick("guardian", cfg)
-    if pooled:
-        return pooled
-    env_or_cfg = cfg
-    if env_or_cfg:
-        return env_or_cfg
-    preferred = ("llama-guard3:8b", "granite3-guardian:2b",
-                 "heretic-llama31-8b-instruct:latest", ONE_GPU_FALLBACK_MODEL)
-    return _first_installed(preferred) or _first_non_embedding_local() or "granite3-guardian:2b"
+    return _pool_pick("guardian") or _first_matching_local(("guard",)) or "granite3-guardian:2b"
 
 
 def ollama_redteam_model() -> str:
-    """Model for explicitly adversarial red-team critique.
-
-    Unlike the normal generation/verify tiers, this one is deliberately biased toward an
-    uncensored or abliterated local model. The point of the red-team phase is to phrase
-    attacks the way an adversary would, without the softening/refusal behavior aligned
-    instruct models often introduce on "attack this" prompts. Resolution stays portable:
-    env -> [ollama].redteam_model -> an installed heretic/abliterated tag that fits one
-    GPU -> a one-GPU heretic default.
-    """
+    """Model for explicitly adversarial red-team critique, biased toward an uncensored or abliterated model so the
+    attacks are phrased the way an adversary would. Env LOCI_OLLAMA_REDTEAM_MODEL -> the model pool ('redteam') ->
+    an installed heretic/abliterated tag -> a last-resort default."""
+    _warn_pinned_models()
     env = os.environ.get("LOCI_OLLAMA_REDTEAM_MODEL")
     if env:
         return env
-    cfg = _cfg("ollama", "redteam_model", "")
-    pooled = _pool_pick("redteam", cfg)
-    if pooled:
-        return pooled
-    env_or_cfg = cfg
-    if env_or_cfg:
-        return env_or_cfg
-    return (_first_installed((ONE_GPU_REDTEAM_FALLBACK_MODEL,))
-            or _first_matching_local(("heretic", "abliterated"))
-            or ONE_GPU_REDTEAM_FALLBACK_MODEL)
+    return _pool_pick("redteam") or _first_matching_local(("heretic", "abliterated")) or ONE_GPU_REDTEAM_FALLBACK_MODEL
 
 
 def _role_env(prefix: str, role: str) -> str:

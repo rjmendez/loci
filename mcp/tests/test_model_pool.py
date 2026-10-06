@@ -165,14 +165,12 @@ def _pooled(monkeypatch, cfg_ollama=None):
         monkeypatch.delenv(var, raising=False)
 
 
-def test_gen_model_falls_through_to_the_pool_when_the_configured_tag_is_missing(monkeypatch):
+def test_a_named_gen_model_in_config_is_ignored_missing_or_installed(monkeypatch):
+    """The pool decides; a config tag no longer outranks it, whether or not it is installed."""
     _pooled(monkeypatch, {"gen_model": "qwen3-4b-instruct-heretic-agent:latest"})
     assert backends.ollama_gen_model() == "gemma4-e4b-hermes:64k"
-
-
-def test_a_configured_gen_model_still_wins_while_installed(monkeypatch):
     _pooled(monkeypatch, {"gen_model": "qwen2.5:3b"})
-    assert backends.ollama_gen_model() == "qwen2.5:3b"
+    assert backends.ollama_gen_model() == "gemma4-e4b-hermes:64k"
 
 
 def test_env_beats_the_pool(monkeypatch):
@@ -187,15 +185,11 @@ def test_task_and_guardian_resolvers_use_the_pool(monkeypatch):
     assert backends.ollama_guardian_model() == "llama-guard3:8b"
 
 
-def test_unpooled_role_keeps_legacy_behaviour(monkeypatch):
-    _pooled(monkeypatch, {"compress_model": "my-compressor:3b"})
-    assert backends.ollama_compress_model() == "my-compressor:3b"       # no pooled 'compress' role
-
-
-def test_without_a_pool_the_legacy_resolvers_are_unchanged(monkeypatch):
+def test_without_a_pool_the_gen_model_is_an_installed_one_never_a_config_name(monkeypatch):
     monkeypatch.setattr(backends, "_config", lambda: {"ollama": {"gen_model": "legacy:7b"}})
+    monkeypatch.setattr(backends, "_ollama_local_tags", lambda: {"nomic-embed-text:latest", "installed:3b"})
     monkeypatch.delenv("LOCI_OLLAMA_GEN_MODEL", raising=False)
-    assert backends.ollama_gen_model() == "legacy:7b"                   # returned even if not installed
+    assert backends.ollama_gen_model() == "installed:3b"
 
 
 # ---- discovery ----------------------------------------------------------------------

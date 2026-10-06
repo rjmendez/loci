@@ -1,6 +1,6 @@
 # Loci implementation verification and rollout
 
-This document ties the implemented Loci changes into one verification and rollout path. It is meant to be read alongside `scripts/bench_model_catalog_quality.py`, `scripts/assign_models_from_benchmark.py`, `docs/REASONING_POLICY_SPEC.md`, `mcp/tests/test_openrouter.py`, and the audit-lane tests in `mcp/tests/test_audit_lane_status.py` / `mcp/tests/test_audit_log_is_isolated.py`.
+This document ties the implemented Loci changes into one verification and rollout path. It is meant to be read alongside `scripts/bench_model_catalog_quality.py`, `docs/REASONING_POLICY_SPEC.md`, `mcp/tests/test_openrouter.py`, and the audit-lane tests in `mcp/tests/test_audit_lane_status.py` / `mcp/tests/test_audit_log_is_isolated.py`.
 
 ## 1) Benchmark harness spec
 
@@ -23,19 +23,13 @@ python3 scripts/bench_model_catalog_quality.py \
 
 This emits a JSON summary with `summary[*].quality_winners` per role. The winner list is used as the source of truth for role assignment, not a human guess.
 
-`scripts/assign_models_from_benchmark.py` turns the winning models into a TOML fragment for `~/.loci/backends.toml`:
-
-```bash
-python3 scripts/assign_models_from_benchmark.py \
-  --benchmark-json artifacts/model_catalog/quality_<date>.json
-```
+The winners do not go into `backends.toml`: models are never named in config. They inform `rank` in `[[models.pool]]`, and the pool's graded log (`model_pool.py report`) is what confirms them on live traffic.
 
 Required acceptance gates:
 
 - `bench_model_catalog_quality.py` returns the expected role coverage and no duplicate IDs
-- `assign_models_from_benchmark.py` exits `0` only when each selected winner is installed locally
 - `ollama show <selected-tag>` resolves for all model roles before rollout
-- `python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py scripts/tests/test_assign_models_from_benchmark.py -q` passes
+- `python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py -q` passes
 
 ## 2) Phased rollout plan
 
@@ -85,7 +79,7 @@ cp ~/.loci/backends.toml ~/.loci/backends.toml.bak.$(date +%Y%m%d-%H%M%S)
 The implementation is ready to ship only when all of the following checks are green. These are the current repo gates that should be run before enabling a new model assignment or routing change:
 
 ```bash
-python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py scripts/tests/test_assign_models_from_benchmark.py -q
+python3 -m pytest scripts/tests/test_bench_model_catalog_quality.py -q
 python3 -m pytest mcp/tests/test_openrouter.py -q
 python3 -m pytest mcp/tests/test_audit_lane_status.py mcp/tests/test_audit_log_is_isolated.py -q
 python3 -m pytest deep_think_loci/tests/test_deep_think_loci_workflow_guards.py -q

@@ -213,60 +213,128 @@ def test_env_overrides_config_for_models(tmp_path, monkeypatch):
 
 
 def _no_task_model_env(mp):
-    for k in ("LOCI_OLLAMA_GEN_MODEL", "LOCI_OLLAMA_VERIFY_MODEL",
-              "LOCI_OLLAMA_CLASSIFY_MODEL", "LOCI_OLLAMA_COMPRESS_MODEL"):
+    for k in ("LOCI_OLLAMA_GEN_MODEL", "LOCI_OLLAMA_VERIFY_MODEL"):
         mp.delenv(k, raising=False)
 
 
-def test_verify_classify_and_compress_model_fall_back_to_gen_model_when_unset(monkeypatch):
+def _no_pool(mp, roles=None):
+    """The model pool, replaced by a fixed answer per role ('' = the pool has no opinion)."""
+    mp.setattr(B, "_pool_pick", lambda role: (roles or {}).get(role, ""))
+
+
+@pytest.fixture(autouse=True)
+def _no_pool_by_default(monkeypatch):
+    _no_pool(monkeypatch)
+    monkeypatch.setattr(B, "_warned_pinned", False)
+
+
+def test_verify_model_falls_back_to_gen_model_when_the_pool_has_no_opinion(monkeypatch):
     _no_task_model_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
-    # no env, no config, nothing installed: the documented default, for all four
+    # no env, no pool, nothing installed: the last-resort default, for both
     assert B.ollama_gen_model() == "qwen2.5:3b"
     assert B.ollama_verify_model() == "qwen2.5:3b"
-    assert B.ollama_classify_model() == "qwen2.5:3b"
-    assert B.ollama_compress_model() == "qwen2.5:3b"
-    # and they follow gen_model when only that is set
     monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "only-gen:7b")
-    assert (B.ollama_verify_model(), B.ollama_classify_model(), B.ollama_compress_model()) == \
-        ("only-gen:7b",) * 3
+    assert B.ollama_verify_model() == "only-gen:7b"
 
 
-def test_verify_model_config_key_overrides_gen_model(tmp_path, monkeypatch):
+def test_the_pool_decides_every_role(monkeypatch):
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: {"installed-heretic:4b", "installed-guard:2b", "other:1b"})
+    B._reset_cache()
+    _no_pool(monkeypatch, {"gen": "pool-gen:4b", "verify": "pool-verify:4b", "guardian": "pool-guard:2b",
+                           "redteam": "pool-red:4b"})
+    assert B.ollama_gen_model() == "pool-gen:4b"
+    assert B.ollama_verify_model() == "pool-verify:4b"
+    assert B.ollama_guardian_model() == "pool-guard:2b"
+    assert B.ollama_redteam_model() == "pool-red:4b"
+    assert B.swarm_escalate_model() == "pool-verify:4b"
+    assert B.swarm_synthesize_model() == "pool-verify:4b"
+
+
+def test_a_per_process_env_override_beats_the_pool(monkeypatch):
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    B._reset_cache()
+    _no_pool(monkeypatch, {"gen": "pool-gen:4b", "verify": "pool-verify:4b", "guardian": "pool-guard:2b",
+                           "redteam": "pool-red:4b"})
+    for var, resolver, want in (("LOCI_OLLAMA_GEN_MODEL", B.ollama_gen_model, "env-gen:1b"),
+                                ("LOCI_OLLAMA_VERIFY_MODEL", B.ollama_verify_model, "env-verify:1b"),
+                                ("LOCI_OLLAMA_GUARDIAN_MODEL", B.ollama_guardian_model, "env-guard:1b"),
+                                ("LOCI_OLLAMA_REDTEAM_MODEL", B.ollama_redteam_model, "env-red:1b"),
+                                ("LOCI_SWARM_ESCALATE_MODEL", B.swarm_escalate_model, "env-esc:1b"),
+                                ("LOCI_SWARM_SYNTHESIZE_MODEL", B.swarm_synthesize_model, "env-syn:1b")):
+        monkeypatch.setenv(var, want)
+        assert resolver() == want
+
+
+def test_named_models_in_config_are_ignored_and_say_so_once(tmp_path, monkeypatch, caplog):
+    """Models come from the pool; a leftover [ollama].*_model key pins nothing and is reported."""
+    _no_task_model_env(monkeypatch)
+    _no_swarm_env(monkeypatch)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\ngen_model = "cfg-gen:1b"\nverify_model = "cfg-verify:1b"\n'
+                   'classify_model = "cfg-classify:1b"\ncompress_model = "cfg-compress:1b"\n'
+                   'guardian_model = "cfg-guard:1b"\nredteam_model = "cfg-red:1b"\n'
+                   'swarm_escalate_model = "cfg-esc:1b"\nswarm_synthesize_model = "cfg-syn:1b"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
+    B._reset_cache()
+    _no_pool(monkeypatch, {"gen": "pool-gen:4b", "verify": "pool-verify:4b"})
+    with caplog.at_level("WARNING", logger=B.logger.name):
+        assert B.ollama_gen_model() == "pool-gen:4b"
+        assert B.ollama_verify_model() == "pool-verify:4b"
+        assert B.swarm_escalate_model() == "pool-verify:4b"
+        assert B.ollama_guardian_model() == "granite3-guardian:2b"
+        assert B.ollama_redteam_model() == B.ONE_GPU_REDTEAM_FALLBACK_MODEL
+    warnings = [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
+    assert warnings == ["backends: [ollama].gen_model, verify_model, classify_model, compress_model, "
+                        "guardian_model, redteam_model, swarm_escalate_model, swarm_synthesize_model ignored: "
+                        "models come from the pool ([[models.pool]]), never from named config; remove the key(s)"]
+
+
+@pytest.mark.parametrize("resolver_name", ["ollama_gen_model", "ollama_guardian_model", "ollama_redteam_model"])
+def test_each_pooled_resolver_reports_a_pinned_config_key_on_its_own(tmp_path, monkeypatch, caplog, resolver_name):
+    """The first resolver anyone calls must warn, not only gen: guardian and redteam can run first."""
+    for var in ("LOCI_OLLAMA_GEN_MODEL", "LOCI_OLLAMA_GUARDIAN_MODEL", "LOCI_OLLAMA_REDTEAM_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = tmp_path / "b.toml"
+    cfg.write_text('[ollama]\nguardian_model = "cfg-guard:1b"\n')
+    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
+    B._reset_cache()
+    with caplog.at_level("WARNING", logger=B.logger.name):
+        getattr(B, resolver_name)()
+    assert [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()] == [
+        "backends: [ollama].guardian_model ignored: models come from the pool ([[models.pool]]), "
+        "never from named config; remove the key(s)"]
+
+
+def test_a_config_without_named_models_warns_nothing(tmp_path, monkeypatch, caplog):
     _no_task_model_env(monkeypatch)
     cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\ngen_model = "fast:1b"\nverify_model = "strong:27b"\n')
+    cfg.write_text('[ollama]\nurl = "http://x:11434"\n')
     monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
-    assert B.ollama_gen_model() == "fast:1b"
-    assert B.ollama_verify_model() == "strong:27b"
-    assert B.ollama_compress_model() == "fast:1b"    # unset -> still falls back
+    with caplog.at_level("WARNING", logger=B.logger.name):
+        B.ollama_gen_model()
+    assert [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()] == []
 
 
-def test_compress_model_env_wins_over_config(tmp_path, monkeypatch):
-    _no_task_model_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\ncompress_model = "cfg-model:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    monkeypatch.setenv("LOCI_OLLAMA_COMPRESS_MODEL", "env-model:latest")
-    assert B.ollama_compress_model() == "env-model:latest"
-
-
-def test_classify_model_env_wins_over_config(tmp_path, monkeypatch):
-    _no_task_model_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\nclassify_model = "cfg-classify:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    monkeypatch.setenv("LOCI_OLLAMA_CLASSIFY_MODEL", "env-classify:latest")
-    assert B.ollama_classify_model() == "env-classify:latest"
+def test_there_is_no_per_task_classify_or_compress_model():
+    """classify and compress go through the pool like everything else; a knob for them would bypass it."""
+    assert not hasattr(B, "ollama_classify_model") and not hasattr(B, "ollama_compress_model")
+    assert not hasattr(B, "_task_model")
 
 
 def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, monkeypatch):
-    # Unlike verify/compress, guardian must NOT fall back to a general gen_model:
+    # Unlike verify, guardian must NOT fall back to a general gen_model:
     # routing a safety classification through an arbitrary chat model would produce
     # meaningless Yes/No output rather than a degraded-but-sane answer.
     monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
@@ -275,24 +343,6 @@ def test_guardian_model_defaults_to_granite_guardian_not_gen_model(tmp_path, mon
     B._reset_cache()
     monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "some-other-chat-model:latest")
     assert B.ollama_guardian_model() == "granite3-guardian:2b"
-
-
-def test_guardian_model_config_key_overrides_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\nguardian_model = "granite3-guardian:8b"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    assert B.ollama_guardian_model() == "granite3-guardian:8b"
-
-
-def test_guardian_model_env_wins_over_config(tmp_path, monkeypatch):
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\nguardian_model = "cfg-guardian:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    monkeypatch.setenv("LOCI_OLLAMA_GUARDIAN_MODEL", "env-guardian:latest")
-    assert B.ollama_guardian_model() == "env-guardian:latest"
 
 
 def test_redteam_model_defaults_to_one_gpu_heretic(monkeypatch):
@@ -305,7 +355,7 @@ def test_redteam_model_defaults_to_one_gpu_heretic(monkeypatch):
     )
 
 
-# Tags that do not fit one 11-12 GB GPU and must never be picked without env/config.
+# Tags that do not fit one 11-12 GB GPU and must never be picked without an env override.
 _OVERSIZED = ("qwen3.8", "gemma4:26b", "27b")
 
 
@@ -319,16 +369,14 @@ def _no_swarm_env(mp):
         mp.delenv(k, raising=False)
 
 
-def test_no_default_resolves_to_an_oversized_model_without_config(monkeypatch):
+def test_no_default_resolves_to_an_oversized_model_without_an_override(monkeypatch):
     _no_task_model_env(monkeypatch)
     _no_swarm_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set())
     B._reset_cache()
-    for resolver in (B.ollama_gen_model, B.ollama_verify_model, B.ollama_classify_model,
-                     B.ollama_compress_model, B.ollama_guardian_model,
-                     B.ollama_redteam_model, B.swarm_escalate_model,
-                     B.swarm_synthesize_model):
+    for resolver in (B.ollama_gen_model, B.ollama_verify_model, B.ollama_guardian_model,
+                     B.ollama_redteam_model, B.swarm_escalate_model, B.swarm_synthesize_model):
         _assert_one_gpu(resolver())
     assert B.swarm_escalate_model() == B.ONE_GPU_FALLBACK_MODEL
     assert B.swarm_synthesize_model() == B.ONE_GPU_FALLBACK_MODEL
@@ -352,41 +400,32 @@ def test_auto_pick_skips_installed_models_too_big_for_one_gpu(monkeypatch):
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: set(inventory))
     assert B.ollama_gen_model() == "small-chat:1b"
     assert B.ollama_redteam_model() == "tiny-heretic:4b"
-    assert B.ollama_guardian_model() == "small-chat:1b"
+    assert B.ollama_guardian_model() == "granite3-guardian:2b"     # nothing guard-like installed: the last resort
     # The cap is an operator knob: raising it lets the big tags back into auto-pick.
     monkeypatch.setenv("LOCI_OLLAMA_AUTO_MAX_GB", "40")
     assert B.ollama_gen_model() == "gemma4:26b"
 
 
-def test_explicit_config_is_never_size_filtered(tmp_path, monkeypatch):
+def test_an_env_override_is_never_size_filtered(monkeypatch):
     _no_task_model_env(monkeypatch)
     _no_swarm_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\ngen_model = "gemma4:26b"\nredteam_model = "qwen3.8:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_list", lambda: {"gemma4:26b": 18_600_000_000})
     B._reset_cache()
+    monkeypatch.setenv("LOCI_OLLAMA_GEN_MODEL", "gemma4:26b")
+    monkeypatch.setenv("LOCI_OLLAMA_REDTEAM_MODEL", "qwen3.8:latest")
     assert B.ollama_gen_model() == "gemma4:26b"
     assert B.ollama_redteam_model() == "qwen3.8:latest"
 
 
-def test_swarm_models_resolve_env_then_config_then_verify_model(tmp_path, monkeypatch):
+def test_swarm_models_resolve_env_then_the_verify_tier(monkeypatch):
     _no_task_model_env(monkeypatch)
     _no_swarm_env(monkeypatch)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\ngen_model = "gemma4-e4b-hermes:64k"\n'
-                   'verify_model = "gemma4-e4b-hermes:64k"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     B._reset_cache()
-    assert B.swarm_escalate_model() == "gemma4-e4b-hermes:64k"
-    assert B.swarm_synthesize_model() == "gemma4-e4b-hermes:64k"
-
-    cfg.write_text('[ollama]\nverify_model = "v:1b"\nswarm_escalate_model = "esc:4b"\n'
-                   'swarm_synthesize_model = "syn:4b"\n')
-    B._reset_cache()
-    assert B.swarm_escalate_model() == "esc:4b"
-    assert B.swarm_synthesize_model() == "syn:4b"
-
+    _no_pool(monkeypatch, {"verify": "pool-verify:4b"})
+    assert B.swarm_escalate_model() == "pool-verify:4b"
+    assert B.swarm_synthesize_model() == "pool-verify:4b"
     monkeypatch.setenv("LOCI_SWARM_ESCALATE_MODEL", "env-esc:latest")
     monkeypatch.setenv("LOCI_SWARM_SYNTHESIZE_MODEL", "env-syn:latest")
     assert B.swarm_escalate_model() == "env-esc:latest"
@@ -414,7 +453,7 @@ def test_ollama_list_parses_sizes(monkeypatch):
         B._reset_cache()
 
 
-def test_gen_model_auto_selects_local_non_embedding_when_default_missing(monkeypatch):
+def test_gen_model_auto_selects_local_non_embedding_when_the_pool_is_silent(monkeypatch):
     _no_task_model_env(monkeypatch)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags",
@@ -423,39 +462,32 @@ def test_gen_model_auto_selects_local_non_embedding_when_default_missing(monkeyp
     assert B.ollama_gen_model() == "local-heretic-llama31-8b:q4km"
 
 
-def test_guardian_model_auto_selects_local_when_granite_unavailable(monkeypatch):
+def test_guardian_model_auto_selects_an_installed_guard_tag(monkeypatch):
     monkeypatch.delenv("LOCI_OLLAMA_GUARDIAN_MODEL", raising=False)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags",
-                        lambda: {"nomic-embed-text:latest", "local-heretic-llama31-8b:q4km"})
+                        lambda: {"nomic-embed-text:latest", "local-heretic-llama31-8b:q4km", "llama-guard3:8b"})
     B._reset_cache()
-    assert B.ollama_guardian_model() == "local-heretic-llama31-8b:q4km"
+    assert B.ollama_guardian_model() == "llama-guard3:8b"
+    # a general chat model is never taken for a safety classifier
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: {"nomic-embed-text:latest", "local-heretic-llama31-8b:q4km"})
+    assert B.ollama_guardian_model() == "granite3-guardian:2b"
 
 
-def test_redteam_model_auto_selects_local_heretic_when_default_tag_unavailable(monkeypatch):
+def test_redteam_model_auto_selects_an_abliterated_tag_too(monkeypatch):
+    monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
+    monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
+    monkeypatch.setattr(B, "_ollama_local_tags", lambda: {"plain-chat:3b", "some-abliterated:4b"})
+    B._reset_cache()
+    assert B.ollama_redteam_model() == "some-abliterated:4b"
+
+
+def test_redteam_model_auto_selects_local_heretic_when_the_pool_is_silent(monkeypatch):
     monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
     monkeypatch.setattr(B, "_CONFIG_PATH", "/nonexistent")
     monkeypatch.setattr(B, "_ollama_local_tags", lambda: {"local-heretic-qwen38-27b:q4km"})
     B._reset_cache()
     assert B.ollama_redteam_model() == "local-heretic-qwen38-27b:q4km"
-
-
-def test_redteam_model_config_key_overrides_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("LOCI_OLLAMA_REDTEAM_MODEL", raising=False)
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\nredteam_model = "heretic-gemma3-4b-it:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    assert B.ollama_redteam_model() == "heretic-gemma3-4b-it:latest"
-
-
-def test_redteam_model_env_wins_over_config(tmp_path, monkeypatch):
-    cfg = tmp_path / "b.toml"
-    cfg.write_text('[ollama]\nredteam_model = "cfg-heretic:latest"\n')
-    monkeypatch.setattr(B, "_CONFIG_PATH", str(cfg))
-    B._reset_cache()
-    monkeypatch.setenv("LOCI_OLLAMA_REDTEAM_MODEL", "env-heretic:latest")
-    assert B.ollama_redteam_model() == "env-heretic:latest"
 
 
 def test_broken_config_is_fail_open(tmp_path, monkeypatch):
