@@ -51,7 +51,11 @@ Training and testing a selector (a FlyBrain-style brain, or the baseline in ``po
   ``propensity`` records how likely the arm actually used was. No model list is needed;
   ``LOCI_MODEL_POOL_EXPLORE_MODELS=a,b`` optionally narrows the alternatives, and on its own it
   applies to every role. It is off unless ``p``, roles or models are set and the shadow is on. It
-  changes live routing for that fraction of calls, and a non-resident model has to be loaded.
+  changes live routing for that fraction of calls. By default it only tries alternatives that are already
+  resident in Ollama (a cold load takes 25-70 s and queues every other request behind it);
+  ``LOCI_MODEL_POOL_EXPLORE_COLD=1`` allows cold loads. ``warm = true`` on a pool entry marks a model that
+  ``python model_pool.py warm`` keeps resident, within the per-card budget (``[models] gpu_vram_gb``), so
+  resident-only exploration has something to try.
 * A ``[[models.pool]]`` entry may set ``gpu = <n>``, the model's home card by Ollama's index (on the
   Windows host 0 is the RTX 4070 Ti and 1 the RTX 2080 Ti, the reverse of nvidia-smi). ``options_for(model)``
   turns that into ``{"main_gpu": n}``, which ``llm_local``, ``memcheck`` and the lease reload merge into
@@ -83,6 +87,7 @@ SELECTOR_ENV = "LOCI_MODEL_POOL_SELECTOR"
 EXPLORE_ENV = "LOCI_MODEL_POOL_EXPLORE"
 EXPLORE_MODELS_ENV = "LOCI_MODEL_POOL_EXPLORE_MODELS"
 EXPLORE_ROLES_ENV = "LOCI_MODEL_POOL_EXPLORE_ROLES"
+EXPLORE_COLD_ENV = "LOCI_MODEL_POOL_EXPLORE_COLD"
 SHADOW_LOG_NAME = "model_pool_shadow.jsonl"
 SHADOW_SCHEMA = 1
 OUTCOMES_LOG_NAME = "model_pool_outcomes.jsonl"
@@ -122,6 +127,7 @@ class PoolEntry:
     role_rank: tuple[tuple[str, float], ...] = ()
     evictable: bool = True        # False (or pinned) keeps a model resident through a lease (model_lease)
     gpu: Optional[int] = None     # home card, Ollama's index (NOT nvidia-smi's); None = let the scheduler place it
+    warm: bool = False            # `model_pool.py warm` keeps it resident (so resident-only exploration can try it)
 
     def rank_for(self, role: str) -> float:
         for r, value in self.role_rank:
@@ -204,6 +210,7 @@ def entries() -> list[PoolEntry]:
             pinned=bool(item.get("pinned", False)), role_rank=role_rank,
             evictable=bool(item.get("evictable", True)),
             gpu=_gpu_index(item.get("gpu")),
+            warm=item.get("warm") is True,
         ))
     return out
 
@@ -221,6 +228,88 @@ def _gpu_index(value) -> Optional[int]:
 
 def configured() -> bool:
     return bool(entries())
+
+
+def gpu_vram_gb() -> dict[int, float]:
+    """``[models] gpu_vram_gb = {0 = 12.0, 1 = 11.0}``: usable VRAM per card by Ollama's index. Bad rows are dropped."""
+    raw = _models_cfg().get("gpu_vram_gb")
+    out: dict[int, float] = {}
+    for key, value in (raw.items() if isinstance(raw, dict) else []):
+        idx = _gpu_index(key)
+        size = _num(value, None)
+        if idx is not None and size is not None and size > 0:
+            out[idx] = size
+    return out
+
+
+def _is_resident(name: str, resident: set) -> bool:
+    return name in resident or f"{name}:latest" in resident or (name.endswith(":latest") and name[:-7] in resident)
+
+
+def warm_plan(*, pool: Optional[Iterable[PoolEntry]] = None, resident: Optional[set] = None,
+              inv: Optional[dict] = None, gpu_gb: Optional[dict] = None, held_out: Optional[set] = None,
+              headroom_gb: float = 1.0) -> list[dict]:
+    """What ``warm`` would do for each ``warm = true`` entry: ``{"model", "gpu", "action": "load"|"skip", "why"}``.
+
+    A model is loaded only when it is installed, not resident, not held out by a lease, has a home card and a
+    ``vram_gb``, and that card's budget (``gpu_vram_gb`` minus ``headroom_gb``) still has room for it beside the
+    pool models already resident there, including the ones this plan has already decided to load. Without a
+    home card Ollama could put it anywhere, including on the card the production model needs."""
+    pool_entries = list(entries() if pool is None else pool)
+    resident_ = set(resident_models() if resident is None else resident)
+    inventory_ = inventory() if inv is None else inv
+    budget = gpu_vram_gb() if gpu_gb is None else gpu_gb
+    if held_out is None:
+        try:
+            import model_lease
+            held_out = model_lease.held_out()
+        except Exception:
+            held_out = set()
+    plan: list[dict] = []
+    for e in pool_entries:
+        if not e.warm:
+            continue
+        row = {"model": e.name, "gpu": e.gpu}
+
+        def skip(why: str, row=row) -> None:
+            plan.append({**row, "action": "skip", "why": why})
+        if not _installed(e.name, inventory_):
+            skip("not installed")
+        elif _is_resident(e.name, resident_):
+            skip("already resident")
+        elif _is_resident(e.name, held_out):
+            skip("evicted by an active lease")
+        elif e.gpu is None:
+            skip("no home gpu: Ollama could place it on the production model's card")
+        elif e.vram_gb is None:
+            skip("no vram_gb to budget with")
+        elif e.gpu not in budget:
+            skip(f"no gpu_vram_gb for card {e.gpu}")
+        else:
+            used = sum(o.vram_gb or 0.0 for o in pool_entries
+                       if o.gpu == e.gpu and o.name != e.name and _is_resident(o.name, resident_))
+            room = budget[e.gpu] - headroom_gb - used
+            if e.vram_gb > room:
+                skip(f"{e.vram_gb:g} GB does not fit card {e.gpu}: {used:g} of {budget[e.gpu] - headroom_gb:g} GB used")
+            else:
+                plan.append({**row, "action": "load", "why": f"needs {e.vram_gb:g} of {room:g} GB free on card {e.gpu}"})
+                resident_.add(e.name)
+    return plan
+
+
+def warm(*, dry_run: bool = False, base_url: Optional[str] = None) -> list[dict]:
+    """Load the planned models (``model_lease.load``, which sends their home card), return the plan with results."""
+    plan = warm_plan()
+    if dry_run:
+        return plan
+    import model_lease
+    url = (base_url if base_url is not None else _gen_url()).rstrip("/")
+    keep = str(_models_cfg().get("warm_keep_alive") or "2h")
+    for row in plan:
+        if row["action"] == "load":
+            row["loaded"] = bool(url) and model_lease.load(url, row["model"], keep_alive=keep)
+    clear_cache()
+    return plan
 
 
 def home_gpu(model: str) -> Optional[int]:
@@ -490,7 +579,10 @@ def _explore(decision: Decision) -> tuple:
             return off
         if roles and decision.role not in roles:   # rank_role has already normalized the role
             return off
-        alts = [n for n in decision.ordered() if n != decision.chosen and (not allowed or n in allowed)]
+        cold_ok = (os.environ.get(EXPLORE_COLD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+        alts = [c.name for c in decision.candidates
+                if c.eligible and c.name != decision.chosen and (cold_ok or c.resident)
+                and (not allowed or c.name in allowed)]
         info: dict = {"p": p, "n_alternatives": len(alts)}
         if not alts:
             return decision.chosen, info
@@ -762,6 +854,14 @@ def _main(argv: list[str]) -> int:
             print(f"           {info['why']}")
             for model, a in sorted(info["arms"].items()):
                 print(f"           arm {model}: n={a['outcomes']} ok={a['ok_rate']:.0%} p50={a['p50_ms']:.0f}ms")
+        return 0
+    if cmd == "warm":
+        rows = warm(dry_run="--dry-run" in argv)
+        if not rows:
+            print("no pool entry has warm = true")
+        for r_ in rows:
+            done = "" if "loaded" not in r_ else (" -> loaded" if r_["loaded"] else " -> FAILED")
+            print(f"{r_['action']:5s} {r_['model']:50s} gpu={r_['gpu']}  {r_['why']}{done}")
         return 0
     if cmd == "pick" and len(argv) > 1:
         print(pick(argv[1]) or "(none)")
