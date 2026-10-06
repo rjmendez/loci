@@ -15,88 +15,41 @@ def _gen_returns(value, ok=True):
     return _stub
 
 
-def test_compress_routes_through_compress_model_when_no_gen_fn_given(monkeypatch):
-    """compress()'s default gen_fn (no explicit gen_fn passed) must resolve
-    backends.ollama_compress_model() and pass it to llm_local.generate explicitly."""
-    calls = {}
+def _recording_generate(monkeypatch, text):
+    """llm_local.generate stub that records exactly which keyword arguments it was called with."""
+    calls = []
 
-    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
-        calls["model"] = model
-        return {"text": "condensed", "ok": True}
+    def fake_generate(prompt, **kw):
+        calls.append(kw)
+        return {"text": text, "ok": True}
 
     import llm_local
     monkeypatch.setattr(llm_local, "generate", fake_generate)
+    return calls
+
+
+def test_compress_never_names_a_model_so_the_pool_picks(monkeypatch):
+    """A call that names a model bypasses the pool: it is never logged, tagged or graded. Not even a leftover
+    env var or config key may put a model on the call."""
+    calls = _recording_generate(monkeypatch, "condensed")
+    monkeypatch.setenv("LOCI_OLLAMA_COMPRESS_MODEL", "strong-compress-model:27b")
     import backends
-    monkeypatch.setattr(backends, "ollama_compress_model", lambda: "strong-compress-model:27b")
+    monkeypatch.setattr(backends, "_config", lambda: {"ollama": {"compress_model": "cfg-compress:7b"}})
 
     result = T.compress("x" * 50, max_chars=10)
-    assert result["degraded"] is False
-    assert calls["model"] == "strong-compress-model:27b"
+    assert result == {"text": "condensed", "degraded": False}
+    assert calls == [{"fmt": None, "max_tokens": 32}]
 
 
-def test_compress_falls_back_to_shared_generate_when_backends_unresolvable(monkeypatch):
-    """If backends.ollama_compress_model() itself errors, compress() must still call
-    generate() with an empty model (shared gen_model fallback), not raise or no-op."""
-    calls = {}
-
-    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
-        calls["model"] = model
-        return {"text": "condensed", "ok": True}
-
-    import llm_local
-    monkeypatch.setattr(llm_local, "generate", fake_generate)
-
-    def _boom():
-        raise RuntimeError("no backends module")
-
+def test_classify_never_names_a_model_so_the_pool_picks(monkeypatch):
+    calls = _recording_generate(monkeypatch, "bug")
+    monkeypatch.setenv("LOCI_OLLAMA_CLASSIFY_MODEL", "tiny-classifier:1b")
     import backends
-    monkeypatch.setattr(backends, "ollama_compress_model", _boom)
-
-    result = T.compress("x" * 50, max_chars=10)
-    assert result["degraded"] is False
-    assert calls["model"] == ""
-
-
-def test_classify_routes_through_classify_model_when_no_gen_fn_given(monkeypatch):
-    """classify() should resolve backends.ollama_classify_model() for model selection
-    when no explicit gen_fn is provided."""
-    calls = {}
-
-    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
-        calls["model"] = model
-        return {"text": "bug", "ok": True}
-
-    import llm_local
-    monkeypatch.setattr(llm_local, "generate", fake_generate)
-    import backends
-    monkeypatch.setattr(backends, "ollama_classify_model", lambda: "tiny-classifier:1b")
+    monkeypatch.setattr(backends, "_config", lambda: {"ollama": {"classify_model": "cfg-classify:1b"}})
 
     result = T.classify("App crashes on launch after update.", ["bug", "feature"])
-    assert result["label"] == "bug"
-    assert result["degraded"] is False
-    assert calls["model"] == "tiny-classifier:1b"
-
-
-def test_classify_does_not_consult_compress_model(monkeypatch):
-    """classify() must stay on the shared gen_model -- it must not call
-    ollama_compress_model at all, confirming the two ops route independently."""
-    calls = {"compress_model_called": False}
-
-    def fake_generate(prompt, model="", fmt=None, max_tokens=256):
-        return {"text": "bug", "ok": True}
-
-    def _spy():
-        calls["compress_model_called"] = True
-        return "should-not-be-used:1b"
-
-    import llm_local
-    monkeypatch.setattr(llm_local, "generate", fake_generate)
-    import backends
-    monkeypatch.setattr(backends, "ollama_compress_model", _spy)
-
-    result = T.classify("some bug report", ["bug", "feature"])
-    assert result["label"] == "bug"
-    assert calls["compress_model_called"] is False
+    assert result == {"label": "bug", "degraded": False}
+    assert calls == [{"fmt": None, "max_tokens": 32}]
 
 
 def test_classify_explicit_single_label_mention_skips_generation():
