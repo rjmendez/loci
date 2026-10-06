@@ -1,17 +1,15 @@
 """Generation-tier basic text ops for Loci-native workflows — the local-GPU offload.
 
 Two cheap generation-backed ops that trim what has to reach Claude, running on the
-local Ollama GPU (default qwen2.5:3b, or backends.ollama_gen_model()) at ~zero token cost:
+local Ollama GPU, on whichever model the model pool picks, at ~zero token cost:
 
 - classify(text, labels): pick the single best label from a caller-supplied set —
-  replaces a one-shot classifier/router agent. Always uses the shared gen_model:
-  high call volume + low per-call stakes, so the fast default is the right tradeoff.
+  replaces a one-shot classifier/router agent. High call volume + low per-call stakes.
 - compress(text, max_chars): semantically condense text under a hard char budget —
-  shrink a bulky finding/context before it is forwarded. Independently routable via
-  backends.ollama_compress_model() (LOCI_OLLAMA_COMPRESS_MODEL / [ollama].compress_model)
-  since live adversarial benchmarking showed compress correctness varies far more across
-  models than classify does — an operator can opt this one call site into a
-  stronger/slower model without touching the shared default.
+  shrink a bulky finding/context before it is forwarded.
+
+Neither op names a model: the pool picks one per call, and the pool's graded log (task=classify /
+compress, see model_pool.record_grade) is how a better model earns the call.
 
 Both fail-open (NEVER raise): on timeout / HTTP error / bad-JSON / not-ok generation,
 they return a well-formed degraded result. classify -> label=None, degraded=True;
@@ -35,16 +33,15 @@ from typing import Callable, Optional
 GenFn = Callable[..., dict]
 
 
-def _resolve_gen_fn(gen_fn: Optional[GenFn], model: str = "") -> Optional[GenFn]:
+def _resolve_gen_fn(gen_fn: Optional[GenFn]) -> Optional[GenFn]:
     """Return the injected gen_fn, else lazily import llm_local.generate.
 
     Lazy so that importing text_ops never requires llm_local to exist yet
     (it is written by a sibling agent in parallel). Returns None if it cannot
     be imported — callers treat that as the degraded path, never an exception.
 
-    `model`, when set, is bound into the returned callable so a specific op (e.g.
-    compress) can route to a model different from the shared gen_model without
-    changing the gen_fn contract callers/tests rely on.
+    The model is never chosen here: the pool picks it for the call (a call that names a model bypasses the pool,
+    so it is never logged, tagged or graded).
     """
     if gen_fn is not None:
         return gen_fn
@@ -52,13 +49,7 @@ def _resolve_gen_fn(gen_fn: Optional[GenFn], model: str = "") -> Optional[GenFn]
         from llm_local import generate  # type: ignore
     except Exception:
         return None
-    if not model:
-        return generate
-
-    def _bound(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 256) -> dict:
-        return generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens)
-
-    return _bound
+    return generate
 
 
 def _task_scope(task: str):
@@ -96,7 +87,7 @@ def classify(text: str, labels: list, gen_fn: Optional[GenFn] = None) -> dict:
     mapped back to the canonical spelling). Fast path: if exactly one label is
     explicitly present in the input text, return it directly (no model call). This
     keeps short semantic routing tasks off the general generation path. Otherwise,
-    classify uses a dedicated classify model override when configured. If generation
+    classify uses whichever model the pool picks. If generation
     is unavailable / not-ok / returns an out-of-set label, ->
     {'label': None, 'degraded': True}. Never raises.
     """
@@ -109,7 +100,7 @@ def classify(text: str, labels: list, gen_fn: Optional[GenFn] = None) -> dict:
     if mentioned is not None:
         return {"label": mentioned, "degraded": False}
 
-    gf = _resolve_gen_fn(gen_fn, model=_classify_model())
+    gf = _resolve_gen_fn(gen_fn)
     if gf is None:
         return {"label": None, "degraded": True}
 
@@ -157,7 +148,7 @@ def compress(text: str, max_chars: int = 600, gen_fn: Optional[GenFn] = None) ->
     if len(text) <= max_chars:
         return {"text": text, "degraded": False}
 
-    gf = _resolve_gen_fn(gen_fn, model=_compress_model())
+    gf = _resolve_gen_fn(gen_fn)
     if gf is None:
         return {"text": text[:max_chars], "degraded": True}
 
@@ -181,35 +172,6 @@ def compress(text: str, max_chars: int = 600, gen_fn: Optional[GenFn] = None) ->
         return {"text": condensed, "degraded": False}
     # Model overran the budget -> clamp and flag degraded.
     return {"text": condensed[:max_chars], "degraded": True}
-
-
-def _compress_model() -> str:
-    """Best-effort model override for compress; "" means "use the shared gen_model".
-
-    Live adversarial benchmarking (ab_eval_local_model.py --difficulty hard) showed
-    compress correctness varies a lot more across models than classify does, so this is
-    independently configurable via LOCI_OLLAMA_COMPRESS_MODEL / [ollama].compress_model.
-    Never raises — any resolution failure just keeps the caller on the shared default.
-    """
-    try:
-        import backends
-        return backends.ollama_compress_model()
-    except Exception:
-        return ""
-
-
-def _classify_model() -> str:
-    """Best-effort model override for classify; "" means "use the shared gen_model".
-
-    Classify is intentionally cheap/high-volume, but this knob allows operators to pin
-    short semantic-routing tasks to a tiny specialist model without changing the shared
-    generation tier used by unrelated call sites.
-    """
-    try:
-        import backends
-        return backends.ollama_classify_model()
-    except Exception:
-        return ""
 
 
 def _single_explicit_label_mention(text: str, labels: list[str]) -> Optional[str]:

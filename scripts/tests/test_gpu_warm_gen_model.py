@@ -23,17 +23,31 @@ def _fresh_gpu_warm():
     return importlib.import_module("gpu_warm")
 
 
-def test_gen_model_follows_backends_config(tmp_path):
-    """No WARM_GEN_MODEL override -> resolve via backends.ollama_gen_model(),
-    which itself reads [ollama].gen_model from ~/.loci/backends.toml."""
+def test_gen_model_follows_backends(tmp_path):
+    """No WARM_GEN_MODEL override -> resolve via backends.ollama_gen_model() (here through its per-process
+    env override; in service the model pool decides)."""
     cfg = tmp_path / "backends.toml"
-    cfg.write_text('[ollama]\ngen_model = "heretic-llama31-8b-instruct:latest"\n')
+    cfg.write_text("[ollama]\n")
     env = dict(os.environ)
     env.pop("WARM_GEN_MODEL", None)
     env["LOCI_CONFIG"] = str(cfg)
+    env["LOCI_OLLAMA_GEN_MODEL"] = "heretic-llama31-8b-instruct:latest"
     with mock.patch.dict(os.environ, env, clear=True):
         mod = _fresh_gpu_warm()
         assert mod._GEN_MODEL == "heretic-llama31-8b-instruct:latest"
+
+
+def test_a_gen_model_named_in_config_is_not_warmed(tmp_path):
+    """Models are never named in config: a [ollama].gen_model key pins nothing, so gpu_warm cannot warm it."""
+    cfg = tmp_path / "backends.toml"
+    cfg.write_text('[ollama]\ngen_model = "cfg-only-tag-that-is-not-installed:1b"\n')
+    env = dict(os.environ)
+    env.pop("WARM_GEN_MODEL", None)
+    env.pop("LOCI_OLLAMA_GEN_MODEL", None)
+    env["LOCI_CONFIG"] = str(cfg)
+    with mock.patch.dict(os.environ, env, clear=True):
+        mod = _fresh_gpu_warm()
+        assert mod._GEN_MODEL != "cfg-only-tag-that-is-not-installed:1b"
 
 
 def test_explicit_warm_gen_model_env_still_wins(tmp_path):

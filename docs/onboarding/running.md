@@ -30,11 +30,8 @@ Key `[ollama]` endpoints:
 |-----|------|
 | `url` | Embedding endpoint (`nomic-embed-text`, 768-dim). Probes `http://localhost:11434` by default. |
 | `gen_url` | Generation endpoint — resolved **separately** from embeddings. Often a different host (shared cluster embeds, local GPU generates). |
-| `gen_model` | Generation model tag (e.g. `qwen2.5:3b`). Must be a tag `ollama list` actually shows. |
-| `verify_model` | Optional adversarial model for claim validation; falls back to `gen_model`. |
-| `compress_model` | Optional summarization model; falls back to `gen_model`. |
-| `guardian_model` | Prompt-injection classifier; defaults to `granite3-guardian:2b`. |
-| `redteam_model` | Optional heretic/abliterated model for adversarial red-team analysis. |
+
+Models are not named in config: `[[models.pool]]` lists what is available and the pool picks per call (`python mcp/model_pool.py init` drafts it). `gen_model`, `verify_model`, `compress_model`, `guardian_model` and `redteam_model` keys are ignored.
 
 ### Embedding API options
 

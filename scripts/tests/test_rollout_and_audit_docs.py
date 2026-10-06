@@ -11,7 +11,6 @@ def test_rollout_doc_covers_benchmark_rollout_and_audit_requirements():
         'Acceptance and verification checks',
         'Audit-trace architecture',
         'scripts/bench_model_catalog_quality.py',
-        'scripts/assign_models_from_benchmark.py',
     ]:
         assert needle in text
 

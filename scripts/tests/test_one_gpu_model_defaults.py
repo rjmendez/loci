@@ -32,12 +32,14 @@ _OVERSIZED = ("qwen3.8", "gemma4:26b", "27b")
 def reload_scripts(monkeypatch, tmp_path):
     """Reload the scripts against a given backends.toml (None = no config at all)."""
 
-    def _reload(config_text):
+    def _reload(config_text, env=None):
         # Look backends up at call time: other tests pop it from sys.modules, and the
         # scripts import whichever module object is current.
         backends = importlib.import_module("backends")
         for name in _MODEL_ENV:
             monkeypatch.delenv(name, raising=False)
+        for name, value in (env or {}).items():
+            monkeypatch.setenv(name, value)
         cfg = tmp_path / "backends.toml"
         if config_text is not None:
             cfg.write_text(config_text)
@@ -60,11 +62,11 @@ def _assert_one_gpu(model: str) -> None:
     assert model and not any(marker in model.lower() for marker in _OVERSIZED), model
 
 
-def test_script_defaults_follow_backends_config(reload_scripts):
+def test_script_defaults_follow_backends(reload_scripts):
+    """The script defaults are whatever backends resolves (here via the per-process env override; in service
+    the model pool decides)."""
     swarm, deep, catalog = reload_scripts(
-        '[ollama]\ngen_model = "gemma4-e4b-hermes:64k"\n'
-        'verify_model = "gemma4-e4b-hermes:64k"\n'
-    )
+        None, env={"LOCI_OLLAMA_GEN_MODEL": "gemma4-e4b-hermes:64k", "LOCI_OLLAMA_VERIFY_MODEL": "gemma4-e4b-hermes:64k"})
     assert swarm._DEFAULT_ESCALATE_MODEL == "gemma4-e4b-hermes:64k"
     assert swarm._DEFAULT_SYNTHESIZE_MODEL == "gemma4-e4b-hermes:64k"
     assert deep._DEFAULT_VERIFY_MODEL == "gemma4-e4b-hermes:64k"
@@ -85,13 +87,22 @@ def test_script_defaults_follow_backends_config(reload_scripts):
     assert chain.self_reflect_model == "gemma4-e4b-hermes:64k"
 
 
-def test_swarm_specific_config_keys_win_over_verify_model(reload_scripts):
-    swarm, _, catalog = reload_scripts(
-        '[ollama]\nverify_model = "v:4b"\n'
-        'swarm_escalate_model = "esc:4b"\nswarm_synthesize_model = "syn:4b"\n'
-    )
+def test_swarm_specific_env_wins_over_the_verify_tier(reload_scripts):
+    swarm, _, catalog = reload_scripts(None, env={
+        "LOCI_OLLAMA_VERIFY_MODEL": "v:4b",
+        "LOCI_SWARM_ESCALATE_MODEL": "esc:4b", "LOCI_SWARM_SYNTHESIZE_MODEL": "syn:4b"})
     assert swarm._DEFAULT_ESCALATE_MODEL == catalog.SWARM_ESCALATION_MODEL == "esc:4b"
     assert swarm._DEFAULT_SYNTHESIZE_MODEL == catalog.SWARM_SYNTHESIS_MODEL == "syn:4b"
+
+
+def test_swarm_models_named_in_config_are_ignored(reload_scripts):
+    """Config pins nothing: the swarm tiers follow the verify tier, which with no pool and nothing installed is
+    the last-resort default."""
+    swarm, _, catalog = reload_scripts(
+        '[ollama]\nverify_model = "v:4b"\nswarm_escalate_model = "esc:4b"\nswarm_synthesize_model = "syn:4b"\n')
+    backends = importlib.import_module("backends")
+    assert swarm._DEFAULT_ESCALATE_MODEL == catalog.SWARM_ESCALATION_MODEL == backends.ONE_GPU_FALLBACK_MODEL
+    assert swarm._DEFAULT_SYNTHESIZE_MODEL == catalog.SWARM_SYNTHESIS_MODEL == backends.ONE_GPU_FALLBACK_MODEL
 
 
 def test_swarm_env_still_wins_over_config(reload_scripts, monkeypatch):

@@ -8721,8 +8721,8 @@ def loci_health() -> str:
             except Exception as exc:
                 logger.debug("loci_health: reachability probe %s failed: %r", key, exc)
                 pass
-        # When a generation model is configured, the gen endpoint must actually carry it.
-        _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or backends._cfg("ollama", "gen_model", "")
+        # The gen endpoint must actually carry the model the pool (or a per-process override) names.
+        _gen_model = os.environ.get("LOCI_OLLAMA_GEN_MODEL") or ""
         try:   # a model pool, when declared, decides which tag the gen endpoint must carry
             import model_pool
             if model_pool.configured():
