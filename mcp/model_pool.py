@@ -66,12 +66,14 @@ Training and testing a selector (a FlyBrain-style brain, or the baseline in ``po
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import importlib
 import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import urllib.request
@@ -96,6 +98,31 @@ OUTCOME_SCHEMA = 1
 _LINK_TTL_S = 300.0           # an outcome links to the decision made this recently, in the same thread
 MIN_ARM_N = 30                # outcomes an arm needs before the report counts it as observed
 _LAST_DECISION: contextvars.ContextVar = contextvars.ContextVar("loci_model_pool_last_decision", default=None)
+GRADES_LOG_NAME = "model_pool_grades.jsonl"
+GRADE_SCHEMA = 1
+_TASK: contextvars.ContextVar = contextvars.ContextVar("loci_model_pool_task", default="")
+_TASK_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
+
+
+def clean_task(task) -> str:
+    """A task tag is an identifier (``classify``, ``compress``, ``verify``), never text: anything else becomes ``""``,
+    because the pool's log rows hold names, numbers and enums only."""
+    t = str(task or "").strip().lower()
+    return t if _TASK_RE.fullmatch(t) else ""
+
+
+@contextlib.contextmanager
+def task_scope(task):
+    """Pool decisions made inside the block are logged with this task, so a selector can use it as a feature."""
+    token = _TASK.set(clean_task(task))
+    try:
+        yield
+    finally:
+        _TASK.reset(token)
+
+
+def current_task() -> str:
+    return _TASK.get()
 _rng = random.Random()
 
 DEFAULT_RESIDENT_BONUS = 0.5
@@ -639,27 +666,33 @@ def _shadow(decision: Decision, returned: Optional[str] = None, explore: Optiona
         if explore and explore.get("p"):
             row.update(explore_p=explore["p"], n_alternatives=explore.get("n_alternatives", 0),
                        explored=bool(explore.get("explored")), propensity=explore.get("propensity"))
+        task = current_task()
+        if task:
+            row["task"] = task
         from instrumentation_log import append_rows
         append_rows(_log_path(), [row])
         _LAST_DECISION.set({"id": decision_id, "role": decision.role, "model": returned, "ts": time.time(),
-                            "explored": bool(explore and explore.get("explored"))})
+                            "explored": bool(explore and explore.get("explored")), "task": task})
     except Exception as exc:
         logger.debug("model_pool: shadow log skipped: %r", exc)
 
 
 def record_outcome(model: str, ok: bool, latency_ms: float, *, route_role: str = "",
                    deadline_exceeded: bool = False, tier: str = "", fmt: str = "",
-                   decision_id: str = "", prompt_chars: int = 0) -> None:
+                   decision_id: str = "", prompt_chars: int = 0, task: str = "") -> str:
     """Log how one generate() call went, so a pool decision has a label (D23 in docs/flybrain_brains_eval.md).
 
     Rows hold the model tag, ok, latency and enums only: no prompt, output or error text. Written
     only under ``LOCI_MODEL_POOL_SHADOW=1``. The row carries the ``decision_id`` of the pool decision that
     chose this model in the same thread within the last few minutes (each decision labels one call), so the
     join is exact; with none, the id is absent. ``prompt_bucket`` is the bit length of the prompt size, a
-    size class and never any text. Never raises.
+    size class and never any text. ``ok`` only says the call returned: whether the answer was right is
+    ``record_grade``'s business. ``task`` (``classify``, ``compress``, ...) is the kind of work, an identifier
+    and never text; it defaults to the surrounding ``task_scope``. Returns the ``decision_id`` the row carries,
+    ``""`` when it carries none or nothing was written. Never raises.
     """
     if not _shadow_enabled():
-        return
+        return ""
     try:
         row = {
             "schema": OUTCOME_SCHEMA, "ts": time.time(), "model": str(model or ""),
@@ -667,19 +700,68 @@ def record_outcome(model: str, ok: bool, latency_ms: float, *, route_role: str =
             "deadline_exceeded": bool(deadline_exceeded), "route_role": str(route_role or ""),
             "tier": str(tier or "ollama"), "fmt": "json" if fmt == "json" else "",
         }
+        linked_task = ""
         if decision_id:
             row["decision_id"] = str(decision_id)
         else:
             cur = _LAST_DECISION.get()
             if cur and cur["model"] == str(model or "") and time.time() - cur["ts"] <= _LINK_TTL_S:
                 row.update(decision_id=cur["id"], pool_role=cur["role"], explored=cur["explored"])
+                linked_task = cur.get("task") or ""
                 _LAST_DECISION.set(None)
         if prompt_chars and int(prompt_chars) > 0:
             row["prompt_bucket"] = int(prompt_chars).bit_length()
+        tag = clean_task(task) or linked_task or current_task()
+        if tag:
+            row["task"] = tag
         from instrumentation_log import append_rows
         append_rows(_log_path().with_name(OUTCOMES_LOG_NAME), [row])
+        return str(row.get("decision_id") or "")
     except Exception as exc:
         logger.debug("model_pool: outcome log skipped: %r", exc)
+        return ""
+
+
+def record_grade(decision_id: str, correct: bool, *, model: str = "", task: str = "", grader: str = "") -> bool:
+    """Say whether the answer a pool decision led to was RIGHT, which ``record_outcome`` cannot know.
+
+    The caller grades (a gold set, a verifier, a person), then calls this with the ``decision_id`` that
+    ``llm_local.generate`` puts in its result. Rows go to their own log (``model_pool_grades.jsonl``) so the
+    outcome counts stay what they were: ``decision_id``, ``correct`` (a real bool), ``model``, ``task`` and
+    ``grader`` (identifiers, ``gold`` / ``decide`` / ``human``) and nothing else. Written only under
+    ``LOCI_MODEL_POOL_SHADOW=1``. Returns whether a row was written; never raises.
+    """
+    if not _shadow_enabled() or not decision_id or not isinstance(correct, bool):
+        return False
+    try:
+        row = {"schema": GRADE_SCHEMA, "ts": time.time(), "decision_id": str(decision_id), "correct": correct}
+        for key, value in (("model", str(model or "")), ("task", clean_task(task)), ("grader", clean_task(grader))):
+            if value:
+                row[key] = value
+        from instrumentation_log import append_rows
+        append_rows(_log_path().with_name(GRADES_LOG_NAME), [row])
+        return True
+    except Exception as exc:
+        logger.debug("model_pool: grade log skipped: %r", exc)
+        return False
+
+
+def grades_summary(path: Optional[Path] = None) -> dict:
+    """``{model: {"graded": n, "correct": k, "correct_rate": k/n}}`` from the grades log. The latest grade of a
+    decision wins, so a re-graded answer is counted once."""
+    rows = _read_rows(path or _log_path().with_name(GRADES_LOG_NAME))
+    latest: dict[str, dict] = {}
+    for r in rows:
+        if r.get("decision_id") and r.get("model") and isinstance(r.get("correct"), bool):
+            latest[str(r["decision_id"])] = r
+    out: dict[str, dict] = {}
+    for r in latest.values():
+        s = out.setdefault(str(r["model"]), {"graded": 0, "correct": 0})
+        s["graded"] += 1
+        s["correct"] += 1 if r["correct"] else 0
+    for s in out.values():
+        s["correct_rate"] = round(s["correct"] / s["graded"], 3)
+    return out
 
 
 def outcomes_summary(path: Optional[Path] = None) -> dict:
@@ -732,20 +814,30 @@ def _read_rows(base: Path) -> list[dict]:
 
 
 def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[Path] = None,
-                min_arm_n: int = MIN_ARM_N) -> dict:
+                min_arm_n: int = MIN_ARM_N, grades_path: Optional[Path] = None) -> dict:
     """Join decisions to outcomes by ``decision_id`` and say, per role, whether a selector could be trained or
-    tested on this data. Rows from before the id existed are counted, not guessed at."""
+    tested on this data. Rows from before the id existed are counted, not guessed at.
+
+    ``ok`` only says a call returned. Where ``record_grade`` rows exist each arm also reports ``graded`` and
+    ``correct_rate`` (the share of graded answers that were right), ``by_task`` repeats that per task tag, and
+    ``quality_learnable`` says whether two arms have ``min_arm_n`` graded answers: the condition for training or
+    testing a selector on QUALITY rather than on not erroring."""
     dpath = decisions_path or _log_path()
     opath = outcomes_path or _log_path().with_name(OUTCOMES_LOG_NAME)
+    gpath = grades_path or _log_path().with_name(GRADES_LOG_NAME)
     decisions, outcomes = _read_rows(dpath), _read_rows(opath)
     by_id = {r["decision_id"]: r for r in outcomes if r.get("decision_id")}
+    graded_rows = _read_rows(gpath)
+    grade_of = {str(g["decision_id"]): g["correct"] for g in graded_rows
+                if g.get("decision_id") and isinstance(g.get("correct"), bool)}       # the latest grade wins
     roles: dict[str, dict] = {}
     legacy = 0
     for d in decisions:
         if not d.get("decision_id"):
             legacy += 1
             continue
-        info = roles.setdefault(str(d.get("role")), {"decisions": 0, "linked": 0, "status": {}, "explored": 0, "_arms": {}})
+        info = roles.setdefault(str(d.get("role")), {"decisions": 0, "linked": 0, "status": {}, "explored": 0, "_arms": {},
+                                                     "_tasks": {}})
         info["decisions"] += 1
         status = str(d.get("shadow_status") or "unknown")
         info["status"][status] = info["status"].get(status, 0) + 1
@@ -754,15 +846,29 @@ def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[P
             continue
         info["linked"] += 1
         info["explored"] += 1 if d.get("explored") else 0
-        arm = info["_arms"].setdefault(str(out.get("model") or d.get("chosen_returned")), [])
-        arm.append(out)
+        model_name = str(out.get("model") or d.get("chosen_returned"))
+        arm = info["_arms"].setdefault(model_name, [])
+        arm.append(dict(out, _correct=grade_of.get(d["decision_id"])))
+        task = str(d.get("task") or out.get("task") or "")
+        info["_tasks"].setdefault(task or "(untagged)", {}).setdefault(model_name, []).append(arm[-1])
     for role, info in roles.items():
-        arms = {}
-        for model, rows in info.pop("_arms").items():
+        def stats(rows):
             lat = sorted(float(r.get("latency_ms") or 0.0) for r in rows)
-            arms[model] = {"outcomes": len(rows), "ok_rate": round(sum(1 for r in rows if r.get("ok")) / len(rows), 3),
-                           "p50_ms": round(lat[len(lat) // 2], 1)}
+            graded = [r["_correct"] for r in rows if r.get("_correct") is not None]
+            return {"outcomes": len(rows), "ok_rate": round(sum(1 for r in rows if r.get("ok")) / len(rows), 3),
+                    "p50_ms": round(lat[len(lat) // 2], 1), "graded": len(graded),
+                    "correct_rate": round(sum(graded) / len(graded), 3) if graded else None}
+        arms = {model: stats(rows) for model, rows in info.pop("_arms").items()}
         info["arms"] = arms
+        info["by_task"] = {task: {m: stats(rows) for m, rows in per.items()} for task, per in info.pop("_tasks").items()}
+        graded_enough = sorted(m for m, a in arms.items() if a["graded"] >= min_arm_n)
+        info["quality_learnable"] = len(graded_enough) >= 2
+        total_graded = sum(a["graded"] for a in arms.values())
+        info["quality_why"] = (
+            f"{len(graded_enough)} arms have at least {min_arm_n} graded answers: {', '.join(graded_enough)}"
+            if info["quality_learnable"] else
+            "no answer has been graded, so correctness is unknown; see record_grade" if not total_graded else
+            f"fewer than two arms have {min_arm_n} graded answers yet ({total_graded} graded in all)")
         enough = sorted(m for m, a in arms.items() if a["outcomes"] >= min_arm_n)
         info["learnable"] = len(enough) >= 2
         if info["learnable"]:
@@ -772,7 +878,8 @@ def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[P
                            f"to test against; set {EXPLORE_ENV} and {EXPLORE_ROLES_ENV} to collect some")
         else:
             info["why"] = f"fewer than two arms have {min_arm_n} outcomes yet"
-    return {"roles": roles, "legacy_rows": legacy, "min_arm_n": min_arm_n, "decisions": len(decisions), "outcomes": len(outcomes)}
+    return {"roles": roles, "legacy_rows": legacy, "min_arm_n": min_arm_n, "decisions": len(decisions),
+            "outcomes": len(outcomes), "grades": len(grade_of)}
 
 
 # ------------------------------------------------------------------ discovery / suggestions
@@ -853,7 +960,9 @@ def _main(argv: list[str]) -> int:
                   f"status={info['status']} learnable={info['learnable']}")
             print(f"           {info['why']}")
             for model, a in sorted(info["arms"].items()):
-                print(f"           arm {model}: n={a['outcomes']} ok={a['ok_rate']:.0%} p50={a['p50_ms']:.0f}ms")
+                graded = f" correct={a['correct_rate']:.0%} (n={a['graded']} graded)" if a["graded"] else ""
+                print(f"           arm {model}: n={a['outcomes']} ok={a['ok_rate']:.0%} p50={a['p50_ms']:.0f}ms{graded}")
+            print(f"           quality: {info['quality_why']}")
         return 0
     if cmd == "warm":
         rows = warm(dry_run="--dry-run" in argv)

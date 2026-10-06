@@ -354,7 +354,8 @@ class TestReport:
         self._logs(tmp_path, *self._rows([("a", 40, 40), ("b", 35, 30)]))
         gen = M.pool_report()["roles"]["gen"]
         assert gen["learnable"] is True and "2 arms" in gen["why"]
-        assert gen["arms"]["b"] == {"outcomes": 35, "ok_rate": round(30 / 35, 3), "p50_ms": 117.0}
+        assert gen["arms"]["b"] == {"outcomes": 35, "ok_rate": round(30 / 35, 3), "p50_ms": 117.0,
+                                      "graded": 0, "correct_rate": None}
         assert gen["explored"] == 35
 
     def test_an_arm_below_the_minimum_does_not_count(self, tmp_path):
@@ -378,7 +379,8 @@ class TestReport:
         assert gen["status"] == {"no_selector": 3, "abstained": 1}
 
     def test_no_logs_is_an_empty_report_not_an_error(self, tmp_path):
-        assert M.pool_report() == {"roles": {}, "legacy_rows": 0, "min_arm_n": M.MIN_ARM_N, "decisions": 0, "outcomes": 0}
+        assert M.pool_report() == {"roles": {}, "legacy_rows": 0, "min_arm_n": M.MIN_ARM_N, "decisions": 0, "outcomes": 0,
+                                  "grades": 0}
 
     def test_the_cli_prints_the_verdict(self, tmp_path, capsys):
         self._logs(tmp_path, *self._rows([("a", 40, 40)]))
