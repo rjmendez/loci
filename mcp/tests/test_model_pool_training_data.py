@@ -25,7 +25,8 @@ GB = 1024 ** 3
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     M.clear_cache()
-    for var in (M.SHADOW_ENV, M.SELECTOR_ENV, M.EXPLORE_ENV, M.EXPLORE_MODELS_ENV, M.EXPLORE_ROLES_ENV):
+    for var in (M.SHADOW_ENV, M.SELECTOR_ENV, M.EXPLORE_ENV, M.EXPLORE_MODELS_ENV, M.EXPLORE_ROLES_ENV,
+                M.EXPLORE_COLD_ENV):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "memory-sessions"))
     M._LAST_DECISION.set(None)
@@ -170,6 +171,7 @@ class TestExploration:
         monkeypatch.setenv(M.SHADOW_ENV, "1")
         monkeypatch.setenv(M.EXPLORE_ENV, p)
         monkeypatch.setenv(M.EXPLORE_MODELS_ENV, models)
+        monkeypatch.setenv(M.EXPLORE_COLD_ENV, "1")      # these tests are about which models, not about residency
 
     def test_it_is_off_by_default_and_the_rule_always_decides(self, monkeypatch, tmp_path):
         _pool(monkeypatch)
@@ -206,6 +208,7 @@ class TestExploration:
         monkeypatch.setattr(M, "resident_models", lambda base_url=None: set())
         monkeypatch.setenv(M.SHADOW_ENV, "1")
         monkeypatch.setenv(M.EXPLORE_ENV, "1")
+        monkeypatch.setenv(M.EXPLORE_COLD_ENV, "1")
         monkeypatch.setenv(M.EXPLORE_ROLES_ENV, roles)
         if models:
             monkeypatch.setenv(M.EXPLORE_MODELS_ENV, models)
@@ -239,6 +242,54 @@ class TestExploration:
         monkeypatch.setenv(M.EXPLORE_ENV, "1")
         monkeypatch.delenv(M.SHADOW_ENV)
         assert {M.pick("gen") for _ in range(50)} == {"a"}
+
+    def _resident(self, monkeypatch, resident, **kw):
+        self._on(monkeypatch, **kw)
+        monkeypatch.delenv(M.EXPLORE_COLD_ENV)
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: set(resident))
+
+    def test_by_default_only_a_model_already_resident_is_tried(self, monkeypatch, tmp_path):
+        self._resident(monkeypatch, {"a", "c"}, models="")
+        monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+        assert {M.pick("gen") for _ in range(100)} == {"c"}          # b is installed and eligible but cold
+        row = _decisions(tmp_path)[-1]
+        assert (row["n_alternatives"], row["propensity"]) == (1, 1.0)
+
+    def test_with_no_resident_alternative_it_keeps_the_rules_choice_and_says_so(self, monkeypatch, tmp_path):
+        self._resident(monkeypatch, {"a"}, models="")
+        monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+        assert {M.pick("gen") for _ in range(50)} == {"a"}
+        row = _decisions(tmp_path)[-1]
+        assert (row["n_alternatives"], row["explored"]) == (0, False)
+
+    def test_cold_loads_are_allowed_only_when_asked_for(self, monkeypatch):
+        """Positive twin: same setup, cold models allowed."""
+        self._resident(monkeypatch, {"a"}, models="")
+        monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+        monkeypatch.setenv(M.EXPLORE_COLD_ENV, "1")
+        assert {M.pick("gen") for _ in range(200)} == {"b", "c"}
+
+    def test_each_truthy_value_allows_cold_loads_and_each_other_value_does_not(self, monkeypatch):
+        for value in ("1", "true", "YES", "On"):
+            self._resident(monkeypatch, {"a"}, models="")
+            monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+            monkeypatch.setenv(M.EXPLORE_COLD_ENV, value)
+            assert {M.pick("gen") for _ in range(100)} == {"b", "c"}, value
+        for value in ("", "0", "no", "off"):
+            self._resident(monkeypatch, {"a"}, models="")
+            monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+            monkeypatch.setenv(M.EXPLORE_COLD_ENV, value)
+            assert {M.pick("gen") for _ in range(50)} == {"a"}, value
+
+    def test_a_resident_model_that_is_not_eligible_is_never_tried(self, monkeypatch):
+        self._resident(monkeypatch, {"a", "b", "c"}, models="")
+        monkeypatch.setenv(M.EXPLORE_ROLES_ENV, "gen")
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {"a": GB, "b": GB})     # c is resident but gone
+        assert {M.pick("gen") for _ in range(100)} == {"b"}
+
+    def test_resident_only_still_respects_the_model_list(self, monkeypatch):
+        self._resident(monkeypatch, {"a", "b", "c"}, models="b")
+        assert {M.pick("gen") for _ in range(100)} == {"b"}
 
     def test_it_never_leaves_the_allow_list_or_the_eligible_set(self, monkeypatch):
         self._on(monkeypatch, models="b,ghost")
