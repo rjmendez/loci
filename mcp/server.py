@@ -1397,10 +1397,23 @@ _CLAUDE_PERMISSION_DENIED_RE = re.compile(
 
 # Tool results the harness itself refuses or rejects: the agent was told no, nothing failed. A sleep-then-poll
 # block, a worktree-isolation notice, a structured-output schema mismatch and a "write your findings as text"
-# reminder made up 8% of stored findings on 2026-10-05 and drowned the real failures.
+# reminder made up 8% of stored findings on 2026-10-05 and drowned the real failures. The second group was found
+# the next day by scoring every distinct stored tool-error string with a small decision model and reading what
+# it flagged: protected-path refusals, a read-before-write rule, the safety classifier, the roster rule. A real
+# failure (EPERM, EISDIR, "path does not exist", "string not found", a timeout, a bad ripgrep pattern) is not one.
 _CLAUDE_HARNESS_GUARD_RE = re.compile(
-    r"^\s*(?:<tool_use_error>\s*)?(?:blocked:|this session is isolated in the worktree|"
-    r"subagents should return findings as text|this subagent.s parent bg session hasn.t isolated yet|"
+    r"^\s*(?:<tool_use_error>\s*)?(?:"
+    r"blocked:|"
+    r"this (?:session|agent) is isolated in the worktree|"
+    r"this subagent.s parent bg session hasn.t isolated yet|"
+    r"this write was blocked because|"
+    r"subagents should return findings as text|"
+    r"teammates cannot spawn other teammates|"
+    r"file has not been read yet|"
+    r"not run: the response that made this tool call was stopped by a safety classifier|"
+    r"remove-item on system path .{0,200}? is blocked|"
+    r"refusing to (?:read|write) |"
+    r"the server-side auto mode classifier gave no verdict|"
     r"output does not match required schema)",
     re.I,
 )
