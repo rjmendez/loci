@@ -92,6 +92,25 @@ def _lazy_generate(prompt: str, *, fmt: Optional[str] = None, max_tokens: int = 
         return {"text": "", "ok": False}
 
 
+_DECIDE_CATEGORY = {
+    "real_regression": "a change broke behaviour that used to work",
+    "flaky_or_nondeterministic": "fails intermittently for no clear cause",
+    "config_or_environment": "a setup, permission, path or environment problem",
+    "noise_or_benign": "expected, harmless, or not a failure at all (for example the harness refusing an action)",
+    "unknown": "cannot tell from this",
+}
+_DECIDE_NOVELTY = {
+    "novel_signal": "a new kind of problem",
+    "known_pattern": "a repeat of a familiar problem",
+    "unclear": "cannot tell",
+}
+
+
+def _lazy_decide(state: dict, questions: dict) -> dict:
+    from decide import decide
+    return decide(state, questions)
+
+
 def _normalize_label(raw: object, mapping: dict[str, str]) -> Optional[str]:
     key = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
     return mapping.get(key)
@@ -171,3 +190,60 @@ def classify_reflection_observation(
         "ok": True,
         "error": None,
     }
+
+
+def classify_reflection_observation_decide(
+    kind: str,
+    path: str,
+    *,
+    sampling_mode: str = "full",
+    events: Optional[dict] = None,
+    tools: Optional[dict] = None,
+    errors: Optional[dict] = None,
+    warnings: Optional[dict] = None,
+    decide_fn: Optional[Callable[[dict, dict], dict]] = None,
+) -> dict:
+    """Classify one observation with the decision model (``decide.py``) instead of a generated JSON reply.
+
+    Same labels as ``classify_reflection_observation``, so the two can be compared on the same observation;
+    adds ``confidence`` / ``novelty_confidence`` (concentration of the answer, a ranking signal and not the
+    chance of being right) and the category ``probabilities``. Never raises; a model that could not answer
+    returns the same degraded shape as the generating classifier.
+    """
+    state = {
+        "kind": str(kind or ""),
+        "path": str(path or "")[:400],
+        "sampling": str(sampling_mode or "full"),
+        "top_events": dict(list((events or {}).items())[:6]),
+        "top_tools": dict(list((tools or {}).items())[:6]),
+        "visible_errors": dict(list((errors or {}).items())[:4]),
+        "visible_warnings": dict(list((warnings or {}).items())[:4]),
+    }
+    questions = {
+        "category": {"type": "choice", "criteria": _DECIDE_CATEGORY,
+                     "instructions": "What is the likely root-cause category of this self-reflection finding "
+                                     "mined from local agent artifacts?"},
+        "novelty": {"type": "choice", "criteria": _DECIDE_NOVELTY,
+                    "instructions": "Does this signal look novel or a known pattern?"},
+    }
+    try:
+        res = (decide_fn or _lazy_decide)(state, questions)
+    except Exception as exc:
+        return _degraded(f"decide() raised: {exc}")
+    if not isinstance(res, dict) or not res.get("ok"):
+        return _degraded(str((res or {}).get("error") if isinstance(res, dict) else "not ok") or "empty response")
+    try:
+        cat, nov = res["answers"]["category"], res["answers"]["novelty"]
+        return {
+            "category": _normalize_label(cat["choice"], _CATEGORIES),
+            "novelty": _normalize_label(nov["choice"], _NOVELTY),
+            "confidence": cat["confidence"],
+            "novelty_confidence": nov["confidence"],
+            "probabilities": cat["probabilities"],
+            "degraded": False,
+            "ok": True,
+            "error": None,
+            "source": "decide",
+        }
+    except (KeyError, TypeError) as exc:
+        return _degraded(f"unexpected decide() answer: {exc}")

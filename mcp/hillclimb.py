@@ -683,11 +683,13 @@ def parse_detail(text: str) -> tuple[str, str]:
 
 def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool = False,
           input_fn: Callable[[str], str] = input, print_fn: Callable[[str], None] = print,
-          classify: Optional[Callable[[dict], Optional[str]]] = None) -> dict:
+          classify: Optional[Callable[[dict], Optional[str]]] = None,
+          decide: Optional[Callable[[dict], Optional[tuple]]] = None) -> dict:
     """Label up to ``n`` unlabelled observations. Per item: a category (or ``x`` = not a failure, which
     also teaches capture to drop that kind of item), then one line for novelty and an optional note.
     ``classify(obs)`` (optional) returns the model's category, shown only AFTER you answer so it
-    cannot bias you; agreement is tallied."""
+    cannot bias you; agreement is tallied. ``decide(obs)`` (optional) is the same for the decision model and
+    returns ``(category, confidence)``; it is tallied separately, so both can be compared with your answers."""
     d = suite_dir(suite)
     obs = _read_jsonl(d / "observations.jsonl")
     done = {r.get("id") for r in _read_jsonl(d / "labels.jsonl")}
@@ -696,6 +698,8 @@ def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool =
     skipped = set(_read_json(d / "skipped.json").get("ids", []))
     todo = [o for o in obs if o["id"] not in done and (include_skipped or o["id"] not in skipped)][:n]
     tally = {"labelled": 0, "skipped": 0, "rejected": 0, "compared": 0, "agreed": 0}
+    if decide is not None:
+        tally.update(decide_compared=0, decide_agreed=0)
     print_fn(f"{len(todo)} to label ({len(obs)} captured, {len(done)} labelled or rejected, {len(skipped)} skipped)")
     for i, o in enumerate(todo, 1):
         print_fn(f"\n--- {i}/{len(todo)}  {o['id']}\n{_show(o)}")
@@ -737,6 +741,16 @@ def label(suite: str = "reflection_triage", n: int = 30, include_skipped: bool =
                 tally["compared"] += 1
                 tally["agreed"] += int(got == case["gold"])
                 print_fn(f"  model said {got} ({'agrees' if got == case['gold'] else 'differs'})")
+        if decide is not None:
+            try:
+                got_d = decide(o)
+            except Exception:
+                got_d = None
+            if got_d and got_d[0]:
+                tally["decide_compared"] += 1
+                tally["decide_agreed"] += int(got_d[0] == case["gold"])
+                print_fn(f"  decision model said {got_d[0]} (confidence {got_d[1]:.2f}) "
+                         f"({'agrees' if got_d[0] == case['gold'] else 'differs'})")
     _atomic_write(d / "skipped.json", {"ids": sorted(skipped)})
     return tally
 
@@ -803,6 +817,8 @@ def _main(argv: Optional[list[str]] = None) -> int:
     lb.add_argument("--n", type=int, default=30)
     lb.add_argument("--skipped", action="store_true", help="show observations you skipped before")
     lb.add_argument("--model", action="store_true", help="show what the classifier says AFTER you answer")
+    lb.add_argument("--decide", action="store_true",
+                    help="show what the decision model (decide.py) says AFTER you answer, with its confidence")
     sub.add_parser("prune", help="drop message-text observations captured before the prose filter").add_argument("--suite", default="triage")
     ls = sub.add_parser("labels", help="how many real labels exist and whether they are enough")
     ls.add_argument("--suite", default="triage")
@@ -814,7 +830,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
                 from reflection_triage import classify_reflection_observation
                 return classify_reflection_observation(o["kind"], o["path"], events=o["events"], tools=o["tools"],
                                                        errors=o["errors"], warnings=o["warnings"]).get("category")
-        res = label(suite_name(a.suite), a.n, a.skipped, classify=classify)
+        decide_cb = None
+        if a.decide:
+            def decide_cb(o):
+                from reflection_triage import classify_reflection_observation_decide
+                r = classify_reflection_observation_decide(o["kind"], o["path"], events=o["events"], tools=o["tools"],
+                                                           errors=o["errors"], warnings=o["warnings"])
+                return (r.get("category"), r.get("confidence") or 0.0) if r.get("ok") else None
+        res = label(suite_name(a.suite), a.n, a.skipped, classify=classify, decide=decide_cb)
         print(json.dumps(res))
         return 0
     if a.cmd == "prune":
