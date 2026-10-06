@@ -28,6 +28,7 @@ ok=False signals the caller (here: classify/compress) to fall back to the degrad
 """
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import Callable, Optional
 
@@ -58,6 +59,15 @@ def _resolve_gen_fn(gen_fn: Optional[GenFn], model: str = "") -> Optional[GenFn]
         return generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens)
 
     return _bound
+
+
+def _task_scope(task: str):
+    """Tag pool decisions made inside the block with the call site; a no-op where model_pool is unavailable."""
+    try:
+        import model_pool  # type: ignore
+        return model_pool.task_scope(task)
+    except Exception:
+        return contextlib.nullcontext()
 
 
 def _call_gen(gen_fn: GenFn, prompt: str, *, fmt: Optional[str] = None,
@@ -112,7 +122,8 @@ def classify(text: str, labels: list, gen_fn: Optional[GenFn] = None) -> dict:
         f"Text: {text}\n"
         "Label:"
     )
-    res = _call_gen(gf, prompt, fmt=None, max_tokens=32)
+    with _task_scope("classify"):
+        res = _call_gen(gf, prompt, fmt=None, max_tokens=32)
     if not res["ok"]:
         return {"label": None, "degraded": True}
 
@@ -158,7 +169,8 @@ def compress(text: str, max_chars: int = 600, gen_fn: Optional[GenFn] = None) ->
     )
     # Rough token budget: ~4 chars/token, with headroom, floored so tiny budgets still work.
     max_tokens = max(32, (max_chars // 3) + 16)
-    res = _call_gen(gf, prompt, fmt=None, max_tokens=max_tokens)
+    with _task_scope("compress"):
+        res = _call_gen(gf, prompt, fmt=None, max_tokens=max_tokens)
     if not res["ok"]:
         return {"text": text[:max_chars], "degraded": True}
 

@@ -21,6 +21,7 @@ temperature/keep_alive), so it can be passed directly as a gen_fn.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -598,28 +599,45 @@ def generate(prompt: str,
              keep_alive: str = "30m",
              think: bool = False,
              role: Optional[str] = None,
-             timeout: Optional[float] = None) -> dict:
+             timeout: Optional[float] = None,
+             task: str = "") -> dict:
+    """``task`` names the call site ("classify", "compress", ...) so the pool's decision and outcome rows say
+    what the call was for. When the call was logged the result carries ``decision_id``, the handle that
+    ``model_pool.record_grade`` takes to say whether the answer was right."""
     started = time.monotonic()
-    out = _generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
-                    keep_alive=keep_alive, think=think, role=role, timeout=timeout)
-    _log_outcome(out, model, fmt, role, started, prompt_chars=len(prompt or ""))
+    with _task_scope(task):
+        out = _generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
+                        keep_alive=keep_alive, think=think, role=role, timeout=timeout)
+        decision_id = _log_outcome(out, model, fmt, role, started, prompt_chars=len(prompt or ""))
+    if decision_id and isinstance(out, dict):
+        out["decision_id"] = decision_id
     return out
 
 
+def _task_scope(task: str):
+    try:
+        import model_pool
+        return model_pool.task_scope(task)
+    except Exception:
+        return contextlib.nullcontext()
+
+
 def _log_outcome(out: object, model: str, fmt: Optional[str], role: Optional[str], started: float,
-                 prompt_chars: int = 0) -> None:
-    """Record how the call went for the model pool's decision log (off unless LOCI_MODEL_POOL_SHADOW=1)."""
+                 prompt_chars: int = 0) -> str:
+    """Record how the call went for the model pool's decision log (off unless LOCI_MODEL_POOL_SHADOW=1).
+    Returns the linked decision_id, or "" when nothing was logged or the outcome has no decision."""
     try:
         import model_pool
         if not model_pool._shadow_enabled() or not isinstance(out, dict):
-            return
-        model_pool.record_outcome(
+            return ""
+        return model_pool.record_outcome(
             str(out.get("model") or model or ""), bool(out.get("ok")),
             (time.monotonic() - started) * 1000.0, route_role=str(role or out.get("route_role") or ""),
             deadline_exceeded=bool(out.get("deadline_exceeded")), tier=str(out.get("tier") or "ollama"),
             fmt=fmt or "", prompt_chars=prompt_chars)
     except Exception as exc:
         _LOG.debug("llm_local: outcome log skipped: %r", exc)
+        return ""
 
 
 def _supervisor_route(prompt: str, *, fmt: Optional[str], max_tokens: int,
