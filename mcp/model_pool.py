@@ -746,6 +746,25 @@ def record_grade(decision_id: str, correct: bool, *, model: str = "", task: str 
         return False
 
 
+def record_grade_skip(decision_id: str, reason: str, *, model: str = "", task: str = "") -> bool:
+    """Say that a sampled call was NOT graded and why (``same_model``, ``queue_full``, ``judge_failed`` ...), in the
+    grades log, so a grader that quietly skips is visible: ``pool_report`` counts these as ``grade_skips``."""
+    reason = clean_task(reason)
+    if not _shadow_enabled() or not decision_id or not reason:
+        return False
+    try:
+        row = {"schema": GRADE_SCHEMA, "ts": time.time(), "decision_id": str(decision_id), "skipped": reason}
+        for key, value in (("model", str(model or "")), ("task", clean_task(task))):
+            if value:
+                row[key] = value
+        from instrumentation_log import append_rows
+        append_rows(_log_path().with_name(GRADES_LOG_NAME), [row])
+        return True
+    except Exception as exc:
+        logger.debug("model_pool: grade skip log skipped: %r", exc)
+        return False
+
+
 def grades_summary(path: Optional[Path] = None) -> dict:
     """``{model: {"graded": n, "correct": k, "correct_rate": k/n}}`` from the grades log. The latest grade of a
     decision wins, so a re-graded answer is counted once."""
@@ -878,8 +897,12 @@ def pool_report(decisions_path: Optional[Path] = None, outcomes_path: Optional[P
                            f"to test against; set {EXPLORE_ENV} and {EXPLORE_ROLES_ENV} to collect some")
         else:
             info["why"] = f"fewer than two arms have {min_arm_n} outcomes yet"
+    skips: dict[str, int] = {}
+    for g in graded_rows:
+        if g.get("skipped"):
+            skips[str(g["skipped"])] = skips.get(str(g["skipped"]), 0) + 1
     return {"roles": roles, "legacy_rows": legacy, "min_arm_n": min_arm_n, "decisions": len(decisions),
-            "outcomes": len(outcomes), "grades": len(grade_of)}
+            "outcomes": len(outcomes), "grades": len(grade_of), "grade_skips": skips}
 
 
 # ------------------------------------------------------------------ discovery / suggestions
@@ -954,7 +977,8 @@ def _main(argv: list[str]) -> int:
         return 0
     if cmd == "report":
         rep_ = pool_report()
-        print(f"decisions={rep_['decisions']} outcomes={rep_['outcomes']} rows without a decision_id={rep_['legacy_rows']}")
+        print(f"decisions={rep_['decisions']} outcomes={rep_['outcomes']} rows without a decision_id={rep_['legacy_rows']} "
+              f"grades={rep_['grades']} grade_skips={rep_['grade_skips']}")
         for role, info in sorted(rep_["roles"].items()):
             print(f"{role:10s} decisions={info['decisions']} linked={info['linked']} explored={info['explored']} "
                   f"status={info['status']} learnable={info['learnable']}")

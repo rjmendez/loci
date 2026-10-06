@@ -605,13 +605,32 @@ def generate(prompt: str,
     what the call was for. When the call was logged the result carries ``decision_id``, the handle that
     ``model_pool.record_grade`` takes to say whether the answer was right."""
     started = time.monotonic()
+    task = _effective_task(task)
     with _task_scope(task):
         out = _generate(prompt, model=model, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
                         keep_alive=keep_alive, think=think, role=role, timeout=timeout)
         decision_id = _log_outcome(out, model, fmt, role, started, prompt_chars=len(prompt or ""))
     if decision_id and isinstance(out, dict):
         out["decision_id"] = decision_id
+        _offer_for_grading(task, prompt, out, decision_id)
     return out
+
+
+def _effective_task(task: str) -> str:
+    """The explicit tag, else the surrounding ``task_scope`` (text_ops tags its calls that way and never passes ``task``)."""
+    try:
+        import model_pool
+        return model_pool.clean_task(task) or model_pool.current_task()
+    except Exception:
+        return ""
+
+
+def _offer_for_grading(task: str, prompt: str, out: dict, decision_id: str) -> None:
+    try:
+        import pool_grader
+        pool_grader.maybe_submit(task, prompt, str(out.get("text") or ""), str(out.get("model") or ""), decision_id, ok=bool(out.get("ok")))
+    except Exception as exc:
+        _LOG.debug("llm_local: grading offer skipped: %r", exc)
 
 
 def _task_scope(task: str):
