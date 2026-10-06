@@ -276,3 +276,22 @@ class TestPickOther:
         assert not (tmp_path / "instrumentation" / M.SHADOW_LOG_NAME).exists()
         monkeypatch.setattr(M, "rank_role", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
         assert M.pick_other("verify", "a") == ""
+
+
+class TestPickOtherResidentOnly:
+    def _pool(self, monkeypatch, resident):
+        names = ("a", "b", "c")
+        monkeypatch.setattr(M, "entries", lambda: [M.PoolEntry(n, ("verify",), rank=float(i + 1)) for i, n in enumerate(names)])
+        monkeypatch.setattr(M, "inventory", lambda base_url=None: {n: GB for n in names})
+        monkeypatch.setattr(M, "resident_models", lambda base_url=None: set(resident))
+        monkeypatch.setattr(M, "resident_bonus", lambda: 0.0)
+
+    def test_it_skips_a_better_ranked_model_that_is_not_loaded(self, monkeypatch):
+        self._pool(monkeypatch, resident=("a", "c"))
+        assert M.pick_other("verify", "a") == "b"                                # rank order, loaded or not
+        assert M.pick_other("verify", "a", resident_only=True) == "c"            # b is not loaded
+
+    def test_with_nothing_else_loaded_it_returns_empty(self, monkeypatch):
+        self._pool(monkeypatch, resident=("a",))
+        assert M.pick_other("verify", "a", resident_only=True) == ""
+        assert M.pick_other("verify", "a") == "b"                                # positive twin
