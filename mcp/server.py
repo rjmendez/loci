@@ -1400,7 +1400,8 @@ _CLAUDE_PERMISSION_DENIED_RE = re.compile(
 # reminder made up 8% of stored findings on 2026-10-05 and drowned the real failures.
 _CLAUDE_HARNESS_GUARD_RE = re.compile(
     r"^\s*(?:<tool_use_error>\s*)?(?:blocked:|this session is isolated in the worktree|"
-    r"subagents should return findings as text|output does not match required schema)",
+    r"subagents should return findings as text|this subagent.s parent bg session hasn.t isolated yet|"
+    r"output does not match required schema)",
     re.I,
 )
 

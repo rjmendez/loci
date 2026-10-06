@@ -43,6 +43,8 @@ class TestHarnessGuardResults(_Scan):
         "<tool_use_error>Subagents should return findings as text, not write report files.",
         "Output does not match required schema: root: must have required property 'findings'",
         "blocked: sleep 5 followed by: ls",
+        "<tool_use_error>This subagent's parent bg session hasn't isolated yet, so writes to the shared checkout are blocked. Re-spawn",
+        "<tool_use_error>This subagent’s parent bg session hasn’t isolated yet, so writes are blocked.",
     )
 
     def test_a_harness_refusal_is_counted_as_a_guard_not_as_an_error(self):
