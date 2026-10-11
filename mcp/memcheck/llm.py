@@ -130,11 +130,22 @@ def _copilot_token() -> str:
     return ""
 
 
+def _gateway_enabled() -> bool:
+    """True when an OpenAI-compatible LLM gateway is configured (LOCI_LLM_GATEWAY_URL / [llm_gateway])."""
+    try:
+        import llm_gateway
+        return llm_gateway.enabled()
+    except Exception:
+        return False
+
+
 def _provider() -> str:
     """Resolve the active LLM provider. Override with MEMCHECK_LLM_PROVIDER."""
     forced = os.environ.get("MEMCHECK_LLM_PROVIDER", "").strip().lower()
     if forced:
         return forced
+    if _gateway_enabled():
+        return "gateway"
     if _anthropic_key():
         return "anthropic"
     if _copilot_token():
@@ -144,7 +155,7 @@ def _provider() -> str:
 
 def llm_available() -> bool:
     """True if some LLM endpoint should be reachable (a key is set, or Ollama)."""
-    return _provider() in ("anthropic", "copilot", "ollama")
+    return _provider() in ("gateway", "anthropic", "copilot", "ollama")
 
 
 def embeddings_available() -> bool:
@@ -197,6 +208,12 @@ def _provider_order() -> list:
     """
     forced = os.environ.get("MEMCHECK_LLM_PROVIDER", "").strip().lower()
     order = [forced] if forced else []
+    if _gateway_enabled() and not forced:
+        # The gateway already walks cloud-first with its own fallbacks; raw providers only when asked for.
+        import llm_gateway
+        order = ["gateway"]
+        if not llm_gateway.fallback_raw():
+            return order
     for p in _DEFAULT_PROVIDER_ORDER:
         if p not in order:
             order.append(p)
@@ -252,7 +269,9 @@ def call_llm(
         if provider == "openrouter" and not _openrouter_enabled():
             continue
         try:
-            if provider == "anthropic":
+            if provider == "gateway":
+                out = _call_gateway(prompt, json_mode, timeout, max_tokens)
+            elif provider == "anthropic":
                 out = _call_anthropic(prompt, timeout, max_tokens)
             elif provider == "copilot":
                 out = _call_copilot(prompt, timeout, max_tokens)
@@ -269,6 +288,16 @@ def call_llm(
         _log.warning("call_llm provider=%s returned nothing, trying next", provider)
     _log.warning("call_llm: every provider failed (tried %s)", ", ".join(order))
     return None
+
+
+def _call_gateway(prompt: str, json_mode: bool, timeout: float, max_tokens: int) -> str | None:
+    """Through the LLM gateway, which owns model choice, cloud-first ordering and fallbacks."""
+    import llm_gateway
+    res = llm_gateway.chat(prompt, max_tokens=max_tokens, json_mode=json_mode, timeout=timeout)
+    if not res.get("ok"):
+        _log.warning("gateway declined: %s", str(res.get("why") or "")[:160])
+        return None
+    return str(res.get("text") or "").strip() or None
 
 
 def _placement(model: str) -> dict:
@@ -397,6 +426,15 @@ def embed_texts(texts: list[str], *, timeout: float = 60.0, batch: int = 16) -> 
     """
     if not texts:
         return []
+    if _gateway_enabled():
+        import llm_gateway
+        gathered: list[list[float]] = []
+        for i in range(0, len(texts), batch):
+            vectors = llm_gateway.embed([t[:2000] for t in texts[i : i + batch]], timeout=timeout)
+            if not vectors:
+                return []         # partial embeds are useless for pairwise cosine
+            gathered.extend(vectors)
+        return gathered
     url = f"{_ollama_base()}/v1/embeddings"
     out: list[list[float]] = []
     for i in range(0, len(texts), batch):
