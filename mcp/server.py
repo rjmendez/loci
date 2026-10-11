@@ -13214,6 +13214,15 @@ def main() -> None:
                 "— or bind 127.0.0.1."
             )
 
+        if not _is_loopback(mcp.settings.host):
+            from mcp.server.transport_security import TransportSecuritySettings
+            _extra = [h.strip() for h in os.environ.get("LOCI_MCP_ALLOWED_HOSTS","").split(",") if h.strip()]
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=["127.0.0.1:*","localhost:*","[::1]:*"] + _extra,
+                allowed_origins=["http://127.0.0.1:*","http://localhost:*","http://[::1]:*"]
+                + [f"http://{h.split(':')[0]}:*" for h in _extra],
+            )
         app = (mcp.streamable_http_app() if transport == "streamable-http"
                else mcp.sse_app())
         if token or agent_tokens:
