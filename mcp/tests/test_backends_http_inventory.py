@@ -80,10 +80,10 @@ def _tag(name, size):
 
 
 def test_inventory_comes_from_api_tags_without_shelling_out(ollama):
-    ollama.tags = [_tag("gemma4-e4b-hermes:64k", 3_200_000_000), _tag("nomic-embed-text:latest", 274_000_000)]
+    ollama.tags = [_tag("resident-chat:4b", 3_200_000_000), _tag("nomic-embed-text:latest", 274_000_000)]
 
-    assert B._ollama_list() == {"gemma4-e4b-hermes:64k": 3_200_000_000, "nomic-embed-text:latest": 274_000_000}
-    assert B._ollama_local_tags() == {"gemma4-e4b-hermes:64k", "nomic-embed-text:latest"}
+    assert B._ollama_list() == {"resident-chat:4b": 3_200_000_000, "nomic-embed-text:latest": 274_000_000}
+    assert B._ollama_local_tags() == {"resident-chat:4b", "nomic-embed-text:latest"}
     assert ollama.cli_calls == []
 
 
@@ -97,16 +97,16 @@ def test_the_cli_is_used_when_the_endpoint_does_not_answer(ollama, monkeypatch):
 
 
 def test_the_resident_model_beats_an_alphabetically_earlier_installed_one(ollama):
-    ollama.tags = [_tag("aaa-small:1b", 1_300_000_000), _tag("gemma4-e4b-hermes:64k", 3_200_000_000),
+    ollama.tags = [_tag("aaa-small:1b", 1_300_000_000), _tag("resident-chat:4b", 3_200_000_000),
                    _tag("zzz-other:3b", 2_000_000_000)]
-    ollama.ps = [{"name": "gemma4-e4b-hermes:64k", "size_vram": 3_200_000_000}]
+    ollama.ps = [{"name": "resident-chat:4b", "size_vram": 3_200_000_000}]
 
-    assert B.ollama_gen_model() == "gemma4-e4b-hermes:64k"
-    assert B.ollama_verify_model() == "gemma4-e4b-hermes:64k"
+    assert B.ollama_gen_model() == "resident-chat:4b"
+    assert B.ollama_verify_model() == "resident-chat:4b"
 
 
 def test_with_nothing_resident_the_first_installed_generation_model_is_used(ollama):
-    ollama.tags = [_tag("aaa-small:1b", 1_300_000_000), _tag("gemma4-e4b-hermes:64k", 3_200_000_000),
+    ollama.tags = [_tag("aaa-small:1b", 1_300_000_000), _tag("resident-chat:4b", 3_200_000_000),
                    _tag("nomic-embed-text:latest", 274_000_000)]
     ollama.ps = []
 
@@ -132,8 +132,8 @@ def test_a_resident_model_over_the_one_gpu_cap_is_skipped(ollama, monkeypatch):
 
 
 def test_the_pool_and_an_env_pin_both_outrank_the_resident_model(ollama, monkeypatch):
-    ollama.tags = [_tag("gemma4-e4b-hermes:64k", 3_200_000_000)]
-    ollama.ps = [{"name": "gemma4-e4b-hermes:64k", "size_vram": 3_200_000_000}]
+    ollama.tags = [_tag("resident-chat:4b", 3_200_000_000)]
+    ollama.ps = [{"name": "resident-chat:4b", "size_vram": 3_200_000_000}]
     monkeypatch.setattr(B, "_pool_pick", lambda role: "pool-gen:4b")
 
     assert B.ollama_gen_model() == "pool-gen:4b"
