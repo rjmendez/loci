@@ -280,6 +280,85 @@ def _consume_cloud_daily_budget(*, max_tokens: int) -> Optional[str]:
     return None
 
 
+def _cloud_egress_refusal(*, role: str, max_tokens: int) -> Optional[str]:
+    """Why a prompt may NOT leave for a cloud-capable route, or None when allowed.
+
+    Mirrors the gate in _try_cloud_tier (opt-in flag, per-call cap, role lists,
+    daily budget). The LiteLLM auto-router can answer from a cloud tier, so
+    routing through it must pass the same policy as the direct cloud fallback.
+    The daily budget is consumed last, and only when every other check passed.
+    """
+    try:
+        import backends
+        if not backends.cloud_tier_enabled():
+            return "cloud tier disabled"
+        if not _flag_on("LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT"):
+            return "prompt export disabled (LOCI_CLOUD_TIER_ALLOW_PROMPT_EXPORT)"
+        max_per_call = backends.cloud_max_tokens_per_call()
+        deny_roles = backends.cloud_deny_roles()
+        allowed_roles = backends.cloud_allowed_roles()
+    except Exception as exc:
+        return f"cloud policy unavailable: {type(exc).__name__}: {exc}"[:200]
+    if max_per_call > 0 and max_tokens > max_per_call:
+        return f"max_tokens={max_tokens} exceeds per-call cap={max_per_call}"
+    if role in deny_roles:
+        return f"role '{role}' is denied by policy"
+    if allowed_roles and role not in allowed_roles:
+        return f"role '{role}' is not in allowed set"
+    return _consume_cloud_daily_budget(max_tokens=max_tokens)
+
+
+def _try_litellm_tier(prompt: str, *, fmt: Optional[str], max_tokens: int,
+                      temperature: float, role: str, timeout: float) -> Optional[dict]:
+    """Route one generation through the LiteLLM proxy (auto-router). Fail-open.
+
+    Opt-in via LOCI_LLM_VIA_LITELLM. Returns None whenever the caller should use
+    the direct Ollama path instead: flag off, egress policy refuses, proxy
+    unreachable, non-2xx, or an empty / non-JSON answer. Never raises.
+
+    Env: LOCI_LITELLM_URL (default http://127.0.0.1:4000/v1),
+         LOCI_LITELLM_MODEL (default auto-router),
+         LOCI_LITELLM_API_KEY or LITELLM_API_KEY.
+    """
+    if not _flag_on("LOCI_LLM_VIA_LITELLM"):
+        return None
+    refusal = _cloud_egress_refusal(role=role, max_tokens=max_tokens)
+    if refusal:
+        _LOG.info("llm_local litellm tier skipped: %s", refusal)
+        return None
+    url = (os.environ.get("LOCI_LITELLM_URL") or "http://127.0.0.1:4000/v1").rstrip("/")
+    group = os.environ.get("LOCI_LITELLM_MODEL") or "auto-router"
+    key = os.environ.get("LOCI_LITELLM_API_KEY") or os.environ.get("LITELLM_API_KEY") or ""
+    body = {
+        "model": group,
+        "messages": [{"role": "user", "content": _sanitize_for_cloud(prompt)}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": False,
+    }
+    if fmt == "json":
+        body["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        import requests
+        r = requests.post(f"{url}/chat/completions", json=body, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        payload = r.json()
+        message = (payload.get("choices") or [{}])[0].get("message") or {}
+        text = message.get("content") or ""
+        if not text.strip():
+            _LOG.warning("llm_local litellm tier returned an empty answer; using direct path")
+            return None
+        if fmt == "json":
+            json.loads(text)
+    except Exception as exc:
+        _LOG.warning("llm_local litellm tier failed (%s: %s); using direct path",
+                     type(exc).__name__, exc)
+        return None
+    return {"text": text, "ok": True, "model": payload.get("model") or group,
+            "tier": "litellm", "route_role": role}
+
+
 def _normalize_role(role: Optional[str]) -> str:
     if role is None:
         return ""
@@ -450,13 +529,26 @@ def _generate(prompt: str,
     base = _gen_env() or _resolve_ollama()   # gen env wins; else backends
     if not prompt:
         return fail("empty prompt")
-    if not base:
-        return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
-                    "returned nothing)")
 
     started = time.monotonic()
     budget = _deadline_s()
     per_request = _TIMEOUT if timeout is None else float(timeout)
+
+    # LiteLLM tier: only when the caller left model choice to the system (an
+    # explicit model tag, e.g. a redteam or guardian pin, always stays direct) and
+    # not for think=True, whose budget semantics differ. Falls through to the
+    # direct Ollama path below on any refusal or failure.
+    if model_was_unspecified and not think and _flag_on("LOCI_LLM_VIA_LITELLM"):
+        routed = _try_litellm_tier(
+            prompt, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
+            role=normalized_role or _heuristic_route(prompt).get("role") or "triage",
+            timeout=max(0.1, min(per_request, budget - (time.monotonic() - started))))
+        if routed is not None:
+            return routed
+
+    if not base:
+        return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
+                    "returned nothing)")
 
     def remaining() -> float:
         return budget - (time.monotonic() - started)
