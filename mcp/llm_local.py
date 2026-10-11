@@ -546,6 +546,27 @@ def _generate(prompt: str,
         if routed is not None:
             return routed
 
+    # Measured-health routing (opt-in, LOCI_LOCAL_HEALTH_ROUTING): when the cost-ledger snapshot says local is
+    # failing right now on organic traffic, give the cloud tier (egress policy, budget and redaction intact)
+    # the first attempt instead of spending a full timeout on a local model that is known to be failing.
+    # Local is still tried afterwards: this never refuses a request on health alone.
+    if model_was_unspecified and not think and _flag_on("LOCI_LOCAL_HEALTH_ROUTING"):
+        try:
+            import local_health
+            degraded, why, _group = local_health.check()
+        except Exception as exc:                      # a broken signal must not break generation
+            degraded, why = False, f"health check failed: {type(exc).__name__}: {exc}"
+            _LOG.warning("llm_local health routing: %s", why)
+        if degraded:
+            _LOG.warning("llm_local: local deployment degraded (%s); trying the cloud tier first", why)
+            cloud = _try_cloud_tier(prompt, fmt=fmt, max_tokens=max_tokens, temperature=temperature,
+                                    route=_heuristic_route(prompt), model=model)
+            if cloud is not None and cloud.get("ok"):
+                cloud["health_routed"] = True
+                return cloud
+            _LOG.warning("llm_local: health-routed cloud attempt did not answer (%s); falling back to local",
+                         (cloud or {}).get("why") or "cloud tier unavailable")
+
     if not base:
         return fail("no Ollama endpoint resolved (OLLAMA_BASE_URL unset and backends "
                     "returned nothing)")
