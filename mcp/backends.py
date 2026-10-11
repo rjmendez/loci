@@ -166,9 +166,59 @@ def _http_status(url: str, path: str = "", timeout: float = 1.0,
 _SIZE_UNITS = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
 
 
-@functools.lru_cache(maxsize=1)
+_INVENTORY_TTL_S = float(os.environ.get("LOCI_OLLAMA_INVENTORY_TTL", "30"))
+_RESIDENT_TTL_S = 5.0
+
+
+def _ttl_memo(ttl_s: float):
+    """Memoize a no-argument function for ``ttl_s`` seconds, with ``cache_clear`` like ``lru_cache``.
+
+    The model inventory used to be an ``lru_cache``: the first answer, including an empty one from an Ollama that
+    was still starting, was pinned for the life of the process, so a model pulled or evicted later was never seen."""
+    def decorate(fn):
+        slot: dict = {}
+
+        @functools.wraps(fn)
+        def wrapper():
+            hit = slot.get("hit")
+            now = time.monotonic()
+            if hit is not None and now - hit[0] < ttl_s:
+                return hit[1]
+            value = fn()
+            slot["hit"] = (now, value)
+            return value
+
+        wrapper.cache_clear = slot.clear  # type: ignore[attr-defined]
+        return wrapper
+    return decorate
+
+
+def _ollama_http_inventory() -> dict[str, "int | None"]:
+    """Installed models from the generation endpoint's ``/api/tags``: tag -> size in bytes (None if absent).
+
+    This is the only inventory that works when Ollama is remote (WSL talking to a Windows host has no ``ollama``
+    binary). ``{}`` when the endpoint does not answer. Never raises."""
+    ok, body = _http_probe(ollama_gen_url(_OLLAMA_LIST_TIMEOUT), "/api/tags", timeout=_OLLAMA_LIST_TIMEOUT)
+    if not ok or not isinstance(body, dict):
+        return {}
+    models: dict[str, "int | None"] = {}
+    for row in body.get("models") or []:
+        name = row.get("name") if isinstance(row, dict) else None
+        if isinstance(name, str) and name:
+            size = row.get("size")
+            models[name] = size if isinstance(size, int) else None
+    return models
+
+
+@_ttl_memo(_INVENTORY_TTL_S)
 def _ollama_list() -> dict[str, "int | None"]:
-    """Best-effort local Ollama inventory: tag -> size in bytes (None if unparsed). Never raises."""
+    """Best-effort Ollama inventory: tag -> size in bytes (None if unparsed). HTTP first, the CLI as fallback.
+    Never raises."""
+    return _ollama_http_inventory() or _ollama_cli_inventory()
+
+
+def _ollama_cli_inventory() -> dict[str, "int | None"]:
+    """The ``ollama list`` inventory of a local install, {} when the binary is missing or fails."""
     try:
         p = subprocess.run(["ollama", "list"], capture_output=True, text=True,
                            timeout=_OLLAMA_LIST_TIMEOUT, check=False)
@@ -193,10 +243,26 @@ def _ollama_list() -> dict[str, "int | None"]:
     return models
 
 
-@functools.lru_cache(maxsize=1)
+@_ttl_memo(_INVENTORY_TTL_S)
 def _ollama_local_tags() -> set[str]:
-    """Best-effort local Ollama tag inventory. Never raises."""
+    """Best-effort Ollama tag inventory. Never raises."""
     return set(_ollama_list())
+
+
+@_ttl_memo(_RESIDENT_TTL_S)
+def _resident_generation_model() -> str:
+    """The generation model Ollama already holds in VRAM (``/api/ps``, largest first), or ''.
+
+    Embedding models and anything over the one-GPU cap are skipped. Using what is loaded costs nothing; naming
+    another tag makes Ollama evict it and load the new one (25-70 s, queueing every other request)."""
+    ok, body = _http_probe(ollama_gen_url(_OLLAMA_LIST_TIMEOUT), "/api/ps", timeout=_OLLAMA_LIST_TIMEOUT)
+    if not ok or not isinstance(body, dict):
+        return ""
+    rows = [m for m in body.get("models") or []
+            if isinstance(m, dict) and isinstance(m.get("name"), str) and m["name"]
+            and "embed" not in m["name"].lower() and _fits_one_gpu(m["name"])]
+    rows.sort(key=lambda m: m.get("size_vram") or 0, reverse=True)
+    return rows[0]["name"] if rows else ""
 
 
 # Built-in last resort when neither env nor config names a model: small enough to load
@@ -319,12 +385,14 @@ def _pool_pick(role: str) -> str:
 
 def ollama_gen_model() -> str:
     """Generation model tag. Env LOCI_OLLAMA_GEN_MODEL (a per-process override, never config) -> the model pool
-    ('gen') -> an installed local non-embedding model under the one-GPU cap -> a last-resort default."""
+    ('gen') -> the model Ollama already holds in VRAM -> an installed non-embedding model under the one-GPU cap
+    -> a last-resort default (a call to it fails and llm_local moves on to discovery and the cloud tier)."""
     _warn_pinned_models()
     env = os.environ.get("LOCI_OLLAMA_GEN_MODEL")
     if env:
         return env
-    return _pool_pick("gen") or _first_non_embedding_local() or ONE_GPU_FALLBACK_MODEL
+    return (_pool_pick("gen") or _resident_generation_model() or _first_non_embedding_local()
+            or ONE_GPU_FALLBACK_MODEL)
 
 
 def ollama_verify_model() -> str:
@@ -693,7 +761,7 @@ def load_env(repo: "Path | None" = None) -> dict:
 
 def _reset_cache() -> None:
     """Test hook: clear memoized resolutions (env/config may have changed)."""
-    for fn in (_config, _ollama_list, _ollama_local_tags, ollama_url):
+    for fn in (_config, _ollama_list, _ollama_local_tags, _resident_generation_model, ollama_url):
         clear = getattr(fn, "cache_clear", None)
         if clear:
             clear()
