@@ -32,6 +32,27 @@ Deploy: `cp scripts/ollama_lab_relay.py ~/ollama_relay_daemon.py`, kill the pid 
 `/tmp/ollama_relay.pid`, `nohup python3 ~/ollama_relay_daemon.py &`. Verify:
 `curl -s http://127.0.0.1:11434/api/tags | head -c 80`.
 
+## Boot order (Windows)
+
+A reboot on 2026-10-11 left the lab names down for several minutes: Caddy started before Tailscale had
+assigned the tailnet address and exited, and the resident proxy's boot trigger never fired.
+
+| Service | Task | How it is kept honest |
+|---|---|---|
+| Front door (Caddy) | `Lab-TLS-FrontDoor` | Runs `run-front-door.ps1`, a supervisor: waits for every `bind` address in the Caddyfile to exist, checks the cert files, runs caddy in a job object (dies with the supervisor), restarts it with backoff. Deployed copy `F:\services\tls\run-front-door.ps1`; source `scripts/run-front-door.ps1`. Log `F:\services\tls\logs\front-door-wrapper.log`. |
+| Resident proxy | `Ollama_Resident_Proxy` | S4U principal with boot **and** logon triggers. It was an interactive-token task with only a boot trigger, which cannot start before a user is logged on. |
+
+Notes:
+- The task scheduler's own restart-on-failure did **not** restart Caddy (exit code 1, task left `Ready`), so
+  nothing relies on it. The resident proxy has no supervisor of its own yet.
+- `renew.ps1` (daily 04:15) does `Stop-ScheduledTask` then `Start-ScheduledTask` on the front door. That is
+  why Caddy runs in a job object: without it the stop orphaned Caddy and the renewed cert was never loaded.
+- Not tested by a real reboot. Verified by: stop and hard-kill of the supervisor (caddy dies with it), kill of
+  caddy alone (supervisor restarts it in about 12 s), a Caddyfile binding an unassigned address (waits, exit
+  2 in `-Check`), a missing cert file (exit 3), and a restart of the proxy as an S4U task (session 0).
+  After the next reboot, check `LastRunTime` on both tasks and `front-door-wrapper.log`.
+- Rollback: `F:\services\tls\task-backups\*.before-20261011.xml` (`Register-ScheduledTask -Xml ... -Force`).
+
 ## Failure signatures
 
 | Symptom | Cause |
