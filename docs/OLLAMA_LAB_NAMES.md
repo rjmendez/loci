@@ -40,16 +40,19 @@ assigned the tailnet address and exited, and the resident proxy's boot trigger n
 | Service | Task | How it is kept honest |
 |---|---|---|
 | Front door (Caddy) | `Lab-TLS-FrontDoor` | Runs `run-front-door.ps1`, a supervisor: waits for every `bind` address in the Caddyfile to exist, checks the cert files, runs caddy in a job object (dies with the supervisor), restarts it with backoff. Deployed copy `F:\services\tls\run-front-door.ps1`; source `scripts/run-front-door.ps1`. Log `F:\services\tls\logs\front-door-wrapper.log`. |
-| Resident proxy | `Ollama_Resident_Proxy` | S4U principal with boot **and** logon triggers. It was an interactive-token task with only a boot trigger, which cannot start before a user is logged on. |
+| Resident proxy | `Ollama_Resident_Proxy` | S4U principal with boot **and** logon triggers (it was an interactive-token task with only a boot trigger, which cannot start before a user is logged on). Runs `run-proxy.ps1`, a supervisor: start.bat inside a kill-on-close job object; restarts on process exit **or** when `/health/models` fails 3 probes in a row (a proxy that listens but does not answer); backoff; clears a stray proxy holding the port. Deployed copy `F:\services\ollama-resident-proxyun-proxy.ps1`; source `scripts/run-proxy.ps1`; log `supervisor.log` beside it. |
 
 Notes:
 - The task scheduler's own restart-on-failure did **not** restart Caddy (exit code 1, task left `Ready`), so
-  nothing relies on it. The resident proxy has no supervisor of its own yet.
+  nothing relies on it: both services are supervised by their own script.
 - `renew.ps1` (daily 04:15) does `Stop-ScheduledTask` then `Start-ScheduledTask` on the front door. That is
   why Caddy runs in a job object: without it the stop orphaned Caddy and the renewed cert was never loaded.
 - Not tested by a real reboot. Verified by: stop and hard-kill of the supervisor (caddy dies with it), kill of
   caddy alone (supervisor restarts it in about 12 s), a Caddyfile binding an unassigned address (waits, exit
   2 in `-Check`), a missing cert file (exit 3), and a restart of the proxy as an S4U task (session 0).
+  The proxy supervisor was tested on a throwaway port for crash, hang (process suspended: the port stays
+  open, health fails, replaced after 3 probes) and supervisor kill (whole tree dies), then on the live
+  task for stop (nothing left behind) and crash (back in about 12 s).
   After the next reboot, check `LastRunTime` on both tasks and `front-door-wrapper.log`.
 - Rollback: `F:\services\tls\task-backups\*.before-20261011.xml` (`Register-ScheduledTask -Xml ... -Force`).
 
