@@ -429,7 +429,8 @@ def _generate(prompt: str,
             tmux_policy.get("priority"),
         )
     if prompt and _gateway_enabled():
-        via = _via_gateway(prompt, fmt=fmt, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
+        via = _via_gateway(prompt, fmt=fmt, max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+                           role=role or "")
         if via["ok"] or not _gateway_fallback_raw():
             return _finish(via, fmt, role, prompt)
         _LOG.warning("llm_local gateway failed, falling back to raw Ollama (fallback_raw): %s", via.get("why"))
@@ -598,14 +599,14 @@ def _gateway_fallback_raw() -> bool:
 
 
 def _via_gateway(prompt: str, *, fmt: Optional[str], max_tokens: int, temperature: float,
-                 timeout: Optional[float]) -> dict:
+                 timeout: Optional[float], role: str = "") -> dict:
     """One chat completion through the LLM gateway. The gateway owns model choice, cloud-first ordering and
     fallbacks, so the caller's local model tag and keep_alive/placement hints do not apply."""
     import llm_gateway
     per_request = _TIMEOUT if timeout is None else float(timeout)
-    _LOG.info("llm_local request tier=gateway model=%s fmt=%s max_tokens=%s",
-              llm_gateway.chat_model(), fmt or "", max_tokens)
-    return llm_gateway.chat(prompt, max_tokens=max_tokens, temperature=temperature,
+    _LOG.info("llm_local request tier=gateway model=%s role=%s fmt=%s max_tokens=%s",
+              llm_gateway.role_group(role) or llm_gateway.chat_model(), role or "-", fmt or "", max_tokens)
+    return llm_gateway.chat(prompt, max_tokens=max_tokens, temperature=temperature, role=role,
                             json_mode=(fmt == "json"), timeout=max(0.1, min(per_request, _deadline_s())))
 
 

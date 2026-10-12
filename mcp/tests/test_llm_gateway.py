@@ -189,3 +189,37 @@ def test_memcheck_keeps_the_raw_chain_behind_the_explicit_fallback_switch(gatewa
     _configure(monkeypatch, gateway, LOCI_LLM_GATEWAY_FALLBACK_RAW="1")
 
     assert memllm._provider_order()[:2] == ["gateway", "ollama"]
+
+
+def test_a_mapped_role_uses_its_own_group_and_never_the_default_one(gateway, monkeypatch, tmp_path):
+    cfg = tmp_path / "backends.toml"
+    cfg.write_text('[llm_gateway.roles]\nredteam = "redteam-group"\ncoding = "code-group"\n')
+    monkeypatch.setattr(backends, "_CONFIG_PATH", str(cfg))
+    backends._reset_cache()
+    _configure(monkeypatch, gateway)
+
+    assert G.role_group("RedTeam") == "redteam-group" and G.role_group("coding") == "code-group"
+    assert G.role_group("triage") == "" and G.role_group("") == ""
+
+    out = G.chat("find the overflow", role="redteam")
+    assert out["ok"] and gateway.requests[-1]["body"]["model"] == "redteam-group"
+
+    plain = G.chat("hello", role="triage")
+    assert gateway.requests[-1]["body"]["model"] == "chat-group"      # unmapped role: the default group
+
+    gateway.chat_status = 500
+    failed = G.chat("find the overflow", role="redteam")
+    assert failed["ok"] is False and failed["model"] == "redteam-group"
+    assert gateway.requests[-1]["body"]["model"] == "redteam-group"  # no retry against the default group
+
+
+def test_llm_local_passes_the_role_to_the_gateway(gateway, monkeypatch, tmp_path):
+    cfg = tmp_path / "backends.toml"
+    cfg.write_text('[llm_gateway.roles]\nredteam = "redteam-group"\n')
+    monkeypatch.setattr(backends, "_CONFIG_PATH", str(cfg))
+    backends._reset_cache()
+    _configure(monkeypatch, gateway)
+
+    out = llm_local._generate("analyse this crash", role="redteam")
+
+    assert out["ok"] and gateway.requests[-1]["body"]["model"] == "redteam-group"

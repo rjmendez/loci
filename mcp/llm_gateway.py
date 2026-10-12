@@ -66,6 +66,18 @@ def chat_model() -> str:
     return _setting("LOCI_LLM_GATEWAY_MODEL", "model")
 
 
+def role_group(role: str) -> str:
+    """Gateway model group for a role, from `[llm_gateway.roles]` in the private config ('' when the role is unmapped).
+
+    A mapped role is served by its own group, never by the default one: those groups hold the abliterated and
+    specialist models and are local-only on purpose, so a failure is returned, not rerouted to a cloud model."""
+    key = (role or "").strip().lower()
+    roles = _cfg("roles", {})
+    if not key or not isinstance(roles, dict):
+        return ""
+    return str(roles.get(key) or "").strip()
+
+
 def embed_model() -> str:
     return _setting("LOCI_LLM_GATEWAY_EMBED_MODEL", "embed_model")
 
@@ -114,9 +126,9 @@ def _http_reason(exc: Exception) -> str:
 
 
 def chat(prompt: str, *, max_tokens: int = 256, temperature: float = 0.2, json_mode: bool = False,
-         timeout: Optional[float] = None) -> dict:
+         timeout: Optional[float] = None, role: str = "") -> dict:
     """One chat completion. Returns {'text', 'ok', 'model', 'tier': 'gateway', 'why'?}; never raises."""
-    model = chat_model()
+    model = role_group(role) or chat_model()
     out = {"text": "", "ok": False, "model": model, "tier": "gateway"}
     if not enabled():
         out["why"] = "no LLM gateway configured"
