@@ -218,65 +218,62 @@ async def tier_router_surface(
     logger_arg: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    Surfaces policy tier constraints in routing decisions.
-    
-    If a policy is in effect and the model/tier combination violates constraints,
-    downgrades to appropriate tier or logs violation.
-    
+    Rewrites the model field to enforce policy tier cost constraints.
+
+    If a policy is in effect, resolves the requested model against the policy
+    tier's allowed list and downgrades to the first allowed model when the
+    requested model exceeds the tier budget.
+
     Returns:
     {
         "tier_decision": str,
         "downgraded": bool,
+        "model": str,
+        "original_model": str or None,
         "violations": [...]
     }
     """
+    from policy import resolve_model_for_tier  # avoid circular import
+
     violations: List[PolicyViolation] = []
     policy_id = kwargs.get("policy_id")
-    
+
     if not policy_id:
         return {
             "tier_decision": "default",
             "downgraded": False,
+            "model": model,
+            "original_model": None,
             "violations": [],
         }
-    
-    # Load policy
+
     backend = PolicyBackend()
     policy = backend.load(policy_id)
-    
+
     if not policy:
         return {
             "tier_decision": "default",
             "downgraded": False,
+            "model": model,
+            "original_model": None,
             "violations": [{"type": "policy_not_found", "message": f"Policy {policy_id} not found"}],
         }
-    
-    # Check if current routing tier matches policy tier
-    current_tier = kwargs.get("tier", "medium")
-    policy_tier = policy.tier.value
-    
-    # Tier precedence: light < medium < heavy
-    tier_order = {"light": 0, "medium": 1, "heavy": 2}
-    current_order = tier_order.get(current_tier, 1)
-    policy_order = tier_order.get(policy_tier, 1)
-    
-    if current_order > policy_order:
-        # Current tier exceeds policy tier
+
+    resolved_model, was_rewritten = resolve_model_for_tier(model, policy.tier)
+
+    if was_rewritten:
         violations.append(PolicyViolation(
-            "tier_exceeded",
-            f"Routing tier '{current_tier}' exceeds policy tier '{policy_tier}'",
+            "model_downgraded",
+            f"Model '{model}' downgraded to '{resolved_model}' per {policy.tier.value} tier policy",
             severity="warning",
         ))
-        return {
-            "tier_decision": policy_tier,
-            "downgraded": True,
-            "violations": [v.to_dict() for v in violations],
-        }
-    
+
     return {
-        "tier_decision": current_tier,
-        "downgraded": False,
-        "violations": [],
+        "tier_decision": policy.tier.value,
+        "downgraded": was_rewritten,
+        "model": resolved_model,
+        "original_model": model if was_rewritten else None,
+        "violations": [v.to_dict() for v in violations],
     }
 
 
