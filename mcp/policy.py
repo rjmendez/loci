@@ -50,9 +50,10 @@ class PolicyTier(str, Enum):
 
 class PolicyRegion(str, Enum):
     """Policy region/scope definitions."""
-    MEMORY = "memory"      # Affects grounding_hook retrieval strategy
-    CONTEXT = "context"    # Affects system message injection
-    ROUTING = "routing"    # Affects tier_router circuit-breaker decisions
+    MEMORY = "memory"         # Affects grounding_hook retrieval strategy
+    CONTEXT = "context"       # Affects system message injection
+    ROUTING = "routing"       # Affects tier_router circuit-breaker decisions
+    TOOL_CALL = "tool_call"   # Affects MCP tool invocation gating
 
 
 @dataclass
@@ -226,7 +227,7 @@ def validate_policy(policy_dict: Dict[str, Any]) -> List[Dict[str, str]]:
     except ValueError:
         errors.append({
             "code": "invalid_region",
-            "message": f"Region must be one of: memory, context, routing. Got: {region_str}"
+            "message": f"Region must be one of: memory, context, routing, tool_call. Got: {region_str}"
         })
     
     # Check tier/config consistency

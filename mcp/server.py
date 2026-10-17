@@ -13228,6 +13228,58 @@ def policy_load(policy_id: str) -> str:
     return json.dumps(policy.to_dict())
 
 
+try:
+    from drpg_evolution import (
+        TrajectoryStore as _TrajectoryStore,
+        evolve_policy as _evolve_policy,
+        _default_trajectory_store,
+    )
+    _DRPG_AVAILABLE = True
+except ImportError:  # pragma: no cover - drpg_evolution module optional at import time
+    _DRPG_AVAILABLE = False
+    _TrajectoryStore = _evolve_policy = _default_trajectory_store = None  # type: ignore
+
+
+@mcp.tool()
+def policy_evolve(policy_id: str) -> str:
+    """Run DRPG evolution loop for a policy: score trajectory, promote/demote, return decision."""
+    if not _DRPG_AVAILABLE:
+        return json.dumps({"error": "drpg_evolution module unavailable"})
+    if PolicyBackend is None:
+        return json.dumps({"error": "policy module unavailable"})
+    try:
+        backend = PolicyBackend()
+        store = _default_trajectory_store()
+        result = _evolve_policy(policy_id, backend, store)
+        return json.dumps(result)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_trajectory_push(
+    policy_id: str,
+    step: int,
+    action: str,
+    reward_vector: dict,
+) -> str:
+    """Push a reward step to the trajectory store for a given policy_id."""
+    if not _DRPG_AVAILABLE:
+        return json.dumps({"error": "drpg_evolution module unavailable"})
+    try:
+        store = _default_trajectory_store()
+        step_dict = {
+            "step": step,
+            "action": action,
+            "reward": reward_vector,
+            "policy_id": policy_id,
+        }
+        store.push(policy_id, step_dict)
+        return json.dumps({"pushed": True, "policy_id": policy_id, "step": step})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:
