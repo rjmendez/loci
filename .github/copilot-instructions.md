@@ -7,7 +7,8 @@
 
 ## Testing
 - All tests: `cd mcp && python -m pytest tests/ -v`
-- Policy tests only: `python -m pytest tests/test_policy_backend.py tests/test_drpg_evolution.py -v`
+- Policy backend tests: `python -m pytest tests/test_policy_backend.py -v`
+- DRPG evolution tests (available after PR #483 merges): `python -m pytest tests/test_drpg_evolution.py -v`
 
 ## Code Conventions
 - Policy objects are dataclasses with `to_dict()`/`from_dict()` roundtrip

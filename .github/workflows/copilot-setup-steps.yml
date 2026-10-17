@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -28,7 +28,8 @@ jobs:
       - name: Install MCP and policy dependencies
         run: |
           cd mcp
-          pip install -r requirements.txt || pip install pytest qdrant-client python-dotenv
+          pip install -r requirements.txt || pip install qdrant-client python-dotenv
+          pip install pytest  # guarantee pytest is available regardless of requirements.txt
 
       - name: Create Loci directories
         run: |

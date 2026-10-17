@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -31,19 +31,19 @@ jobs:
         env:
           LOCI_TRAJECTORY_DIR: ${{ vars.LOCI_TRAJECTORY_DIR || '/tmp/loci/trajectories' }}
           LOCI_POLICY_DIR: ${{ vars.LOCI_POLICY_DIR || '/tmp/loci/policies' }}
+          LOCI_TARGET_POLICY_ID: ${{ inputs.policy_id }}
         run: |
           python - <<'PYEOF'
-          import sys, json
+          import sys, json, os
           sys.path.insert(0, 'mcp')
           try:
               from drpg_evolution import TrajectoryStore, evolve_policy
               from policy import PolicyBackend
               from pathlib import Path
-              import os
 
               policy_dir = Path(os.environ.get("LOCI_POLICY_DIR", "/tmp/loci/policies"))
               traj_dir = Path(os.environ.get("LOCI_TRAJECTORY_DIR", "/tmp/loci/trajectories"))
-              target_id = "${{ inputs.policy_id }}"
+              target_id = os.environ.get("LOCI_TARGET_POLICY_ID", "").strip()
 
               backend = PolicyBackend(policy_dir)
               store = TrajectoryStore(traj_dir)
