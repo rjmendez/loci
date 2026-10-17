@@ -312,55 +312,55 @@ class TestLociMCPTools(unittest.TestCase):
         self.assertIn("Reward Vector", result["messages"][0]["content"])
 
     async def async_tier_router_tests(self):
-        """Test: tier_router respects policy tier when tiers match and doesn't downgrade."""
+        """Test: tier_router with a LIGHT-tier model and LIGHT policy — no downgrade."""
         backend = PolicyBackend()
         policy = Policy(
             title="Tier Constraint Test",
-            tier=PolicyTier.LIGHT,  # Here policy is LIGHT (order 0)
+            tier=PolicyTier.LIGHT,
             region=PolicyRegion.ROUTING
         )
         backend.store(policy)
-        
+
         messages = []
-        # Current tier is LIGHT (order 0), same as policy - should NOT downgrade
-        kwargs = {"policy_id": policy.policy_id, "tier": "light"}
-        
+        # claude-haiku-4.5 is a LIGHT-tier model; policy is also LIGHT → no rewrite
+        kwargs = {"policy_id": policy.policy_id}
+
         result = await tier_router_surface(
-            model="gpt-4",
+            model="claude-haiku-4.5",
             messages=messages,
             kwargs=kwargs,
             litellm_params={}
         )
-        
-        # Should NOT downgrade because current tier matches policy
+
         self.assertFalse(result["downgraded"])
         self.assertEqual(result["tier_decision"], "light")
+        self.assertEqual(result["model"], "claude-haiku-4.5")
 
     async def async_tier_router_downgrade_tests(self):
-        """Test: tier_router downgrades when current tier exceeds policy tier."""
+        """Test: tier_router downgrades a HEAVY model against a LIGHT policy."""
         backend = PolicyBackend()
         policy = Policy(
             title="Tier Constraint Test",
-            tier=PolicyTier.LIGHT,  # Policy is LIGHT
+            tier=PolicyTier.LIGHT,
             region=PolicyRegion.ROUTING
         )
         backend.store(policy)
-        
+
         messages = []
-        # Current tier is MEDIUM (order 1), exceeds policy LIGHT - should downgrade
-        kwargs = {"policy_id": policy.policy_id, "tier": "medium"}
-        
+        # claude-opus-4.8 is HEAVY; policy is LIGHT → must downgrade
+        kwargs = {"policy_id": policy.policy_id}
+
         result = await tier_router_surface(
-            model="gpt-4",
+            model="claude-opus-4.8",
             messages=messages,
             kwargs=kwargs,
             litellm_params={}
         )
-        
-        # Should downgrade to policy tier
+
         self.assertTrue(result["downgraded"])
         self.assertEqual(result["tier_decision"], "light")
-        self.assertIn("tier_exceeded", [v["type"] for v in result["violations"]])
+        self.assertEqual(result["model"], "claude-haiku-4.5")
+        self.assertIn("model_downgraded", [v["type"] for v in result["violations"]])
 
     def test_tier_router_surfaces_policy_constraints(self):
         """Test wrapper for async test."""
