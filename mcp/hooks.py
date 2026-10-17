@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from policy import Policy, PolicyBackend, PolicyRegion, get_policy_config
+from cache import check_memory_cache, format_cache_response
 
 
 logger = logging.getLogger(__name__)
@@ -155,13 +156,37 @@ async def grounding_hook_augmented(
     # Get policy if one is specified
     policy_id = kwargs.get("policy_id")
     policy: Optional[Policy] = None
-    
+
     if policy_id:
         backend = PolicyBackend()
         policy = backend.load(policy_id)
-    
+
+    # Check for cache hit before model call
+    context = kwargs.get("grounding_context", {})
+    findings = context.get("findings", [])
+    policy_config = get_policy_config()
+
+    if policy_config.enabled and findings:
+        cache_hit = check_memory_cache(
+            findings,
+            confidence_threshold=policy_config.cache_confidence_threshold,
+            ttl_hours=policy_config.cache_ttl_hours,
+        )
+        if cache_hit:
+            logger.info(
+                "LOCI cache hit: score=%.2f id=%s", cache_hit.score, cache_hit.finding_id
+            )
+            return {
+                "messages": messages,  # unchanged — no injection needed
+                "policy_id": policy_id,
+                "augmented": False,
+                "cache_hit": True,
+                "cache_response": format_cache_response(cache_hit),
+                "r_mem": cache_hit.score,  # reward signal for trajectory
+            }
+
     # Build augmented system message
-    augmented_system = _build_augmented_system_message(policy, kwargs.get("grounding_context", {}))
+    augmented_system = _build_augmented_system_message(policy, context)
     
     # Inject or update system message
     updated_messages = list(messages)
