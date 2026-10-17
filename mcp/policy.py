@@ -1,0 +1,345 @@
+"""
+Loci policy.md backend — policy storage, validation, and tier-aware tracking.
+
+Provides:
+1. PolicyTier: enum for light/medium/heavy tiers
+2. PolicyScope: region definitions (memory, context, routing)
+3. Policy: main policy document class
+4. PolicyBackend: storage and retrieval
+5. get_policy_config(): environment variable resolution
+6. validate_policy(): constraint checking
+"""
+
+import json
+import os
+import re
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class PolicyTier(str, Enum):
+    """Policy tier constraints for retrieval and context limits."""
+    LIGHT = "light"       # 2K context, 3 hops, 2 refinement steps
+    MEDIUM = "medium"     # 8K context, 7 hops, 4 refinement steps
+    HEAVY = "heavy"       # 64K context, 15 hops, 10 refinement steps
+
+    def constraints(self) -> dict[str, int]:
+        """Return constraint values for this tier."""
+        tiers = {
+            PolicyTier.LIGHT: {
+                "max_context_chars": 2048,
+                "max_retrieval_hops": 3,
+                "max_refinement_steps": 2,
+            },
+            PolicyTier.MEDIUM: {
+                "max_context_chars": 8192,
+                "max_retrieval_hops": 7,
+                "max_refinement_steps": 4,
+            },
+            PolicyTier.HEAVY: {
+                "max_context_chars": 65536,
+                "max_retrieval_hops": 15,
+                "max_refinement_steps": 10,
+            },
+        }
+        return tiers.get(self, {})
+
+
+class PolicyRegion(str, Enum):
+    """Policy region/scope definitions."""
+    MEMORY = "memory"      # Affects grounding_hook retrieval strategy
+    CONTEXT = "context"    # Affects system message injection
+    ROUTING = "routing"    # Affects tier_router circuit-breaker decisions
+
+
+@dataclass
+class PolicyMetadata:
+    """Policy metadata: creation, modification, provenance."""
+    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_by: str = "loci-system"
+    version: int = 1
+    source: str | None = None  # e.g., "REA_HERMES_ENHMENT", "DRPG-evolution"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Policy:
+    """Policy.md object: defines retrieval strategy, tier constraints, and evidence backing."""
+    
+    policy_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    title: str = ""
+    type: str = "policy.md"
+    tier: PolicyTier = PolicyTier.MEDIUM
+    region: PolicyRegion = PolicyRegion.MEMORY
+    labels: list[str] = field(default_factory=list)
+    config: dict[str, Any] = field(default_factory=dict)
+    metadata: PolicyMetadata = field(default_factory=PolicyMetadata)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Policy":
+        """Deserialize policy from dict."""
+        tier_str = data.get("tier", "medium")
+        region_str = data.get("region", "memory")
+        
+        try:
+            tier = PolicyTier(tier_str) if isinstance(tier_str, str) else tier_str
+        except ValueError:
+            tier = PolicyTier.MEDIUM
+        
+        try:
+            region = PolicyRegion(region_str) if isinstance(region_str, str) else region_str
+        except ValueError:
+            region = PolicyRegion.MEMORY
+        
+        metadata_dict = data.get("metadata", {})
+        metadata = PolicyMetadata(**metadata_dict) if metadata_dict else PolicyMetadata()
+        
+        return cls(
+            policy_id=data.get("policy_id", str(uuid.uuid4())),
+            title=data.get("title", ""),
+            type=data.get("type", "policy.md"),
+            tier=tier,
+            region=region,
+            labels=data.get("labels", []),
+            config=data.get("config", {}),
+            metadata=metadata,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize policy to dict."""
+        return {
+            "policy_id": self.policy_id,
+            "title": self.title,
+            "type": self.type,
+            "tier": self.tier.value,
+            "region": self.region.value,
+            "labels": self.labels,
+            "config": self.config,
+            "metadata": self.metadata.to_dict(),
+        }
+
+    def get_constraints(self) -> dict[str, int]:
+        """Get tier-based constraints for this policy."""
+        return self.tier.constraints()
+
+    def get_reward_vector_weights(self) -> dict[str, float]:
+        """
+        Get 7D reward vector weights based on policy phase.
+        
+        From EVO-RAG research:
+        - r_ret: Retrieval_Bonus
+        - r_rem: Retrieval_Action_Penalty
+        - r_ovp: Subquery_Overlap_Penalty
+        - r_bkp: Backtrack_Penalty
+        - r_ref: Refusal_Reward
+        - r_step: Step_Penalty
+        - r_cor: Answer_Correctness
+        """
+        is_discovery = self.config.get("discovery_mode", True)
+        
+        if is_discovery:
+            # Discovery phase: high retrieval incentive, low search penalty
+            return {
+                "r_ret": 1.0,      # High incentive to retrieve
+                "r_rem": -0.05,    # Low search penalty
+                "r_ovp": -0.1,     # Moderate overlap penalty
+                "r_bkp": -0.2,     # Moderate backtrack penalty
+                "r_ref": -0.5,     # Discourage refusal during discovery
+                "r_step": -0.02,   # Low step penalty
+                "r_cor": 0.5,      # Moderate correctness reward
+            }
+        else:
+            # Refinement phase: efficiency focus, high refusal reward when evidence insufficient
+            return {
+                "r_ret": 0.5,      # Moderate retrieval reward
+                "r_rem": -0.2,     # Higher search penalty
+                "r_ovp": -0.15,    # Higher overlap penalty
+                "r_bkp": -0.3,     # Higher backtrack penalty
+                "r_ref": 1.0,      # High reward for refusal with insufficient evidence
+                "r_step": -0.1,    # Higher step penalty
+                "r_cor": 1.0,      # High correctness reward
+            }
+
+
+@dataclass
+class PolicyConfig:
+    """Environment-derived policy configuration."""
+    enabled: bool = False
+    max_chars: int = 8192
+    allowed_models: list[str] | None = None
+
+    @classmethod
+    def from_env(cls) -> "PolicyConfig":
+        """Load policy config from environment variables."""
+        enabled = os.getenv("LOCI_POLICY_ENABLE", "0").lower() in ("1", "true", "yes")
+        max_chars = int(os.getenv("LOCI_POLICY_MAX_CHARS", "8192"))
+        
+        allowed_models_str = os.getenv("LOCI_POLICY_ALLOWED_MODELS", None)
+        allowed_models = None
+        if allowed_models_str:
+            allowed_models = [m.strip() for m in allowed_models_str.split(",")]
+        
+        return cls(
+            enabled=enabled,
+            max_chars=max_chars,
+            allowed_models=allowed_models,
+        )
+
+
+def get_policy_config() -> PolicyConfig:
+    """Get policy configuration from environment."""
+    return PolicyConfig.from_env()
+
+
+def validate_policy(policy_dict: dict[str, Any]) -> list[dict[str, str]]:
+    """
+    Validate policy document against constraints.
+    
+    Returns list of errors (empty if valid).
+    """
+    errors = []
+    
+    # Check required fields
+    if not policy_dict.get("title"):
+        errors.append({"code": "missing_title", "message": "Policy must have a title"})
+    
+    # Check tier
+    tier_str = policy_dict.get("tier", "")
+    try:
+        PolicyTier(tier_str)
+    except ValueError:
+        errors.append({
+            "code": "invalid_tier",
+            "message": f"Tier must be one of: light, medium, heavy. Got: {tier_str}"
+        })
+    
+    # Check region
+    region_str = policy_dict.get("region", "")
+    try:
+        PolicyRegion(region_str)
+    except ValueError:
+        errors.append({
+            "code": "invalid_region",
+            "message": f"Region must be one of: memory, context, routing. Got: {region_str}"
+        })
+    
+    # Check tier/config consistency
+    if policy_dict.get("tier") and policy_dict.get("config"):
+        try:
+            tier = PolicyTier(policy_dict["tier"])
+            constraints = tier.constraints()
+            config = policy_dict["config"]
+            
+            max_chars = config.get("max_context_chars")
+            if max_chars and max_chars > constraints.get("max_context_chars", max_chars):
+                errors.append({
+                    "code": "tier_config_mismatch",
+                    "message": f"max_context_chars ({max_chars}) exceeds {tier.value} tier limit ({constraints['max_context_chars']})"
+                })
+            
+            max_hops = config.get("max_retrieval_hops")
+            if max_hops and max_hops > constraints.get("max_retrieval_hops", max_hops):
+                errors.append({
+                    "code": "tier_config_mismatch",
+                    "message": f"max_retrieval_hops ({max_hops}) exceeds {tier.value} tier limit ({constraints['max_retrieval_hops']})"
+                })
+        except ValueError:
+            pass  # Already reported in tier validation
+    
+    return errors
+
+
+class PolicyBackend:
+    """Backend for storing and retrieving policies."""
+    
+    def __init__(self, policy_dir: Path | None = None):
+        """Initialize backend with optional policy directory."""
+        if policy_dir is None:
+            policy_dir = Path.home() / ".loci" / "policies"
+        
+        self.policy_dir = Path(policy_dir)
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
+    
+    def store(self, policy: Policy) -> dict[str, Any]:
+        """
+        Store a policy document.
+        
+        Returns: {"policy_id": "...", "status": "stored"}
+        Raises: ValueError if policy validation fails
+        """
+        # Validate
+        errors = validate_policy(policy.to_dict())
+        if errors:
+            raise ValueError(f"Policy validation failed: {errors}")
+        
+        # Save to file
+        policy_file = self.policy_dir / f"{policy.policy_id}.json"
+        with open(policy_file, "w") as f:
+            json.dump(policy.to_dict(), f, indent=2)
+        
+        return {
+            "policy_id": policy.policy_id,
+            "status": "stored",
+        }
+    
+    def load(self, policy_id: str) -> Policy | None:
+            """
+            Load a policy by ID with path-traversal-safe base64path handling.
+            policy_id is treated as a base64-encoded path component; we validate it
+            to ensure it does not escape the policy directory. No path traversal allowed.
+            Returns: Policy object or None if not found
+            """
+            # Strict name validation to reject path traversal attempts (e.g., "../../../etc/passwd")
+            if not re.match(r'^[A-Za-z0-9_\-]+$', policy_id):
+                return None
+
+            policy_file = self.policy_dir / f"{policy_id}.json"
+
+            # Verify the file path is inside the policy directory (tree-root check)
+            try:
+                policy_file = policy_file.resolve()
+                policy_dir_resolved = self.policy_dir.resolve()
+                if not str(policy_file).startswith(str(policy_dir_resolved)):
+                    # Path escapes the policy directory
+                    return None
+            except (TypeError, AttributeError):
+                return None
+
+            if not policy_file.exists():
+                return None
+
+            with open(policy_file, "r") as f:
+                data = json.load(f)
+
+            return Policy.from_dict(data)
+    
+    def list_policies(self, labels: list[str] | None = None, region: str | None = None) -> list[Policy]:
+        """
+        List policies, optionally filtered by labels or region.
+        
+        Returns: List of Policy objects
+        """
+        policies = []
+        
+        for policy_file in self.policy_dir.glob("*.json"):
+            with open(policy_file, "r") as f:
+                data = json.load(f)
+            
+            policy = Policy.from_dict(data)
+            
+            # Apply filters
+            if labels and not any(label in policy.labels for label in labels):
+                continue
+            if region and policy.region.value != region:
+                continue
+            
+            policies.append(policy)
+        
+        return policies

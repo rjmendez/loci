@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Grounding gate — drop RAG-bleed evidence before a model reasons over it.
+
+Given a query (the topic/claim being grounded) and candidate findings, keep only
+those whose nomic-embedding cosine to the query clears a threshold (~0.65), which
+filters the cross-target similarity-bleed (cosine 0.35–0.55) that produced the
+v1/v2 hallucinations. Runs locally against Ollama — ~$0 marginal, no extra agent.
+
+v0 is a cosine threshold (competitive on current data). A trained pair-feature
+classifier (grounding_bleed_clf.joblib) can be dropped in via --model once it
+beats cosine on a larger corpus.
+
+Usage:
+  python3 ground_gate.py --query "<topic/focus>" [--threshold 0.65] [--model clf.joblib] \
+      --in candidates.json [--out kept.json]
+  # candidates.json: [{"id": "...", "text": "..."}, ...]  (or {"findings": [...]})
+  # also reads candidates from stdin if --in is omitted.
+Exit: prints JSON {kept:[...], dropped:[...], threshold, mode} to --out or stdout.
+"""
+import argparse, json, os, sys, urllib.request
+import numpy as np
+
+# features.py sits beside this file; the gate is run as a script, so its own
+# directory is not otherwise importable when invoked from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Loci convention: OLLAMA_BASE_URL has no /v1 suffix; EMBED_MODEL names the embedder.
+_BASE = (os.environ.get("OLLAMA_BASE_URL") or "http://ollama.internal:11434").rstrip("/")
+OLLAMA = _BASE + "/v1/embeddings"
+EMB_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+# The trained bleed-detector, co-located. Beats cosine IN-SAMPLE (qf-eval f1 0.94
+# vs 0.82) but OVERFITS — out-of-sample (eval/grounding_gate_oos_eval.py) it does
+# NOT generalize yet (leave-one-run-out mean f1 0.79 vs cosine 0.81). So cosine is
+# the default; enable the model explicitly with --model once OOS validation favors it.
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grounding_bleed_clf.joblib")
+
+
+def embed(texts):
+    out = []
+    for i in range(0, len(texts), 16):
+        body = json.dumps({"model": EMB_MODEL, "input": [t[:2000] for t in texts[i:i + 16]]}).encode()
+        req = urllib.request.Request(OLLAMA, data=body, headers={"Content-Type": "application/json"})
+        out += [d["embedding"] for d in json.loads(urllib.request.urlopen(req, timeout=60).read())["data"]]
+    v = np.array(out, dtype=np.float32)
+    return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+
+
+def gate(query, cands, threshold=0.59, model=None):
+    """Filter candidate findings against a query. Returns the result dict.
+
+    cands: list of {"id","text"} dicts (or bare strings). Pure logic + embed();
+    patch embed() to unit-test without a network call.
+    """
+    cands = [c if isinstance(c, dict) else {"text": str(c)} for c in cands]
+    if not cands:
+        return {"kept": [], "dropped": [], "threshold": threshold, "mode": "empty",
+                "n_in": 0, "n_kept": 0, "n_dropped": 0}
+
+    qv = embed([query])[0]
+    cv = embed([c.get("text", "") for c in cands])
+    cos = (cv @ qv).tolist()
+
+    if model:
+        import joblib
+        import features as _feat
+        clf = joblib.load(model)
+        # Build exactly what THIS model was trained on. The trainer and this gate
+        # drifted to different widths (1540 vs 1537) and nothing caught it, because
+        # no model has ever been promoted — the first promotion would have raised
+        # here, inside the live grounding path.
+        dim = int(getattr(clf, "n_features_in_", _feat.LEGACY_DIM))
+        if dim not in _feat.supported_dims():
+            raise ValueError(
+                f"{model} expects {dim} features; this gate builds "
+                f"{_feat.supported_dims()}. Refusing to score with a model whose "
+                "feature contract is unknown."
+            )
+        texts = [c.get("text", "") for c in cands]
+        feats = _feat.make_features(texts, [query] * len(cands), cv,
+                                    np.tile(qv, (len(cands), 1)), dim=dim)
+        score = clf.predict_proba(feats)[:, 1].tolist()
+        keep = [s >= 0.5 for s in score]
+        mode = f"model:{model.split('/')[-1]}:{dim}f"
+    else:
+        score = cos
+        keep = [c >= threshold for c in cos]
+        mode = f"cosine>={threshold}"
+
+    kept, dropped = [], []
+    for c, cs, sc, k in zip(cands, cos, score, keep):
+        rec = {**c, "cos": round(float(cs), 3), "score": round(float(sc), 3)}
+        (kept if k else dropped).append(rec)
+    return {"kept": kept, "dropped": dropped, "threshold": threshold, "mode": mode,
+            "n_in": len(cands), "n_kept": len(kept), "n_dropped": len(dropped)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--query", required=True)
+    ap.add_argument("--threshold", type=float, default=0.59)
+    ap.add_argument("--model", default=None,
+                    help="opt-in joblib classifier (default is cosine — the model overfits out-of-sample; see eval/grounding_gate_oos_eval.py)")
+    ap.add_argument("--in", dest="infile", default=None)
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+
+    if a.infile:
+        with open(a.infile) as fh:
+            raw = json.load(fh)
+    else:
+        raw = json.load(sys.stdin)
+    cands = raw.get("findings", raw) if isinstance(raw, dict) else raw
+    # Cosine threshold is the default; the model is opt-in via --model until OOS validation favors it.
+    model = a.model
+    try:
+        result = gate(a.query, cands, a.threshold, model)
+    except Exception as exc:
+        if model is None:
+            raise
+        print(f"[ground_gate] model path failed ({exc}); falling back to cosine", file=sys.stderr)
+        result = gate(a.query, cands, a.threshold, None)
+    out = json.dumps(result, indent=1)
+    if a.out:
+        with open(a.out, "w") as fh:
+            fh.write(out + "\n")
+    else:
+        print(out)
+
+
+if __name__ == "__main__":
+    main()

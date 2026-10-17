@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 210" width="860" height="210">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    </style>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#6B7280"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="210" fill="#F9FAFB" rx="12"/>
+  <text x="430" y="28" text-anchor="middle" fill="#1F2937" font-size="14" font-weight="700">How memory lookup works (RAG in plain English)</text>
+
+  <!-- Step colours -->
+  <!-- Step 1: Ask -->
+  <rect x="20" y="50" width="140" height="120" rx="10" fill="#EFF6FF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="90" y="78" text-anchor="middle" font-size="24">💬</text>
+  <text x="90" y="102" text-anchor="middle" fill="#1D4ED8" font-size="11" font-weight="700">1. You ask</text>
+  <text x="90" y="120" text-anchor="middle" fill="#4B5563" font-size="10">"What did we</text>
+  <text x="90" y="135" text-anchor="middle" fill="#4B5563" font-size="10">decide about</text>
+  <text x="90" y="150" text-anchor="middle" fill="#4B5563" font-size="10">the auth system?"</text>
+
+  <!-- Arrow 1→2 -->
+  <path d="M 160 110 L 185 110" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Step 2: Embed -->
+  <rect x="185" y="50" width="140" height="120" rx="10" fill="#F5F3FF" stroke="#C4B5FD" stroke-width="1.5"/>
+  <text x="255" y="78" text-anchor="middle" font-size="24">🔢</text>
+  <text x="255" y="102" text-anchor="middle" fill="#6D28D9" font-size="11" font-weight="700">2. Vectorise</text>
+  <text x="255" y="120" text-anchor="middle" fill="#4B5563" font-size="10">Convert your words</text>
+  <text x="255" y="135" text-anchor="middle" fill="#4B5563" font-size="10">into numbers that</text>
+  <text x="255" y="150" text-anchor="middle" fill="#4B5563" font-size="10">capture meaning</text>
+
+  <!-- Arrow 2→3 -->
+  <path d="M 325 110 L 350 110" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Step 3: Search -->
+  <rect x="350" y="50" width="140" height="120" rx="10" fill="#FFF7ED" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="420" y="78" text-anchor="middle" font-size="24">🔍</text>
+  <text x="420" y="102" text-anchor="middle" fill="#92400E" font-size="11" font-weight="700">3. Search</text>
+  <text x="420" y="120" text-anchor="middle" fill="#4B5563" font-size="10">Find memories with</text>
+  <text x="420" y="135" text-anchor="middle" fill="#4B5563" font-size="10">similar meaning,</text>
+  <text x="420" y="150" text-anchor="middle" fill="#4B5563" font-size="10">not just keywords</text>
+
+  <!-- Arrow 3→4 -->
+  <path d="M 490 110 L 515 110" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Step 4: Retrieve -->
+  <rect x="515" y="50" width="140" height="120" rx="10" fill="#ECFDF5" stroke="#6EE7B7" stroke-width="1.5"/>
+  <text x="585" y="78" text-anchor="middle" font-size="24">📚</text>
+  <text x="585" y="102" text-anchor="middle" fill="#065F46" font-size="11" font-weight="700">4. Retrieve</text>
+  <text x="585" y="120" text-anchor="middle" fill="#4B5563" font-size="10">Top matches returned:</text>
+  <text x="585" y="135" text-anchor="middle" fill="#4B5563" font-size="10">"3 months ago you</text>
+  <text x="585" y="150" text-anchor="middle" fill="#4B5563" font-size="10">chose JWT because…"</text>
+
+  <!-- Arrow 4→5 -->
+  <path d="M 655 110 L 680 110" stroke="#6B7280" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Step 5: Answer -->
+  <rect x="680" y="50" width="158" height="120" rx="10" fill="#FFF1F2" stroke="#FDA4AF" stroke-width="1.5"/>
+  <text x="759" y="78" text-anchor="middle" font-size="24">✨</text>
+  <text x="759" y="102" text-anchor="middle" fill="#9F1239" font-size="11" font-weight="700">5. Grounded answer</text>
+  <text x="759" y="120" text-anchor="middle" fill="#4B5563" font-size="10">Claude answers with</text>
+  <text x="759" y="135" text-anchor="middle" fill="#4B5563" font-size="10">your actual history,</text>
+  <text x="759" y="150" text-anchor="middle" fill="#4B5563" font-size="10">not hallucination</text>
+
+  <!-- Step numbers at bottom -->
+  <text x="90" y="185" text-anchor="middle" fill="#9CA3AF" font-size="9">you</text>
+  <text x="255" y="185" text-anchor="middle" fill="#9CA3AF" font-size="9">Ollama embedding model</text>
+  <text x="420" y="185" text-anchor="middle" fill="#9CA3AF" font-size="9">Qdrant vector search</text>
+  <text x="585" y="185" text-anchor="middle" fill="#9CA3AF" font-size="9">Loci MCP tool</text>
+  <text x="759" y="185" text-anchor="middle" fill="#9CA3AF" font-size="9">Claude Code</text>
+</svg>

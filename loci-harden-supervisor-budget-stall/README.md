@@ -1,0 +1,339 @@
+# Loci — Persistent Memory for AI Agents
+
+**Loci gives AI agents like Claude a long-term memory that survives across sessions.**
+
+Without it, every conversation starts from zero: no history, accumulated knowledge, or
+memory of what you tried and why. With Loci, sessions build on each other. Decisions,
+findings, and context persist in a searchable memory store Claude can read and write like notes.
+
+![The memory problem Loci solves](docs/img/loci-problem.svg)
+
+---
+
+## What it unlocks
+
+- **Continuity** — Session 7 knows what happened in Sessions 1–6, without you re-explaining
+- **Grounded answers** — Claude checks stored history before answering, reducing hallucinations
+- **Claim validation** — Verify a proposed answer against stored evidence before asserting it
+- **Accumulated knowledge** — Your project context grows richer with every session
+- **Multi-agent memory** — Multiple AI agents can share a common memory pool via the A2A server
+- **Supply chain security** — An opt-in Claude Code hook scans file-writing tool calls
+  for prompt-injection and supply-chain IOC patterns
+
+---
+
+## How it works
+
+![Loci architecture](docs/img/loci-overview.svg)
+
+Loci runs as an MCP server alongside Claude Code. When Claude needs to remember or recall
+something, it calls one of Loci's 73 tools — the same way it calls any other tool. Your
+data stays on your own infrastructure: Qdrant and Ollama run locally or on your own server.
+
+> **New to terms like "vector search", "RAG", or "MCP"?**
+> Start with **[docs/CONCEPTS.md](docs/CONCEPTS.md)** — a plain-English guide that explains
+> everything from scratch with no assumed knowledge.
+
+---
+
+## Quick start
+
+![Three-step setup](docs/img/loci-quickstart.svg)
+
+```bash
+git clone https://github.com/rjmendez/loci
+cd loci/mcp
+python3 -m venv .venv && .venv/bin/pip install -e "."
+cp ../.env.example .env   # fill in QDRANT_URL and OLLAMA_BASE_URL at minimum
+.venv/bin/python server.py
+```
+
+Inside this checkout, Claude Code picks the server up from the checked-in `.mcp.json`
+once the venv above exists. From anywhere else, add absolute paths to `~/.claude/settings.json`:
+
+```json
+"loci": {
+  "type": "stdio",
+  "command": "/path/to/.venv/bin/python3",
+  "args": ["/path/to/loci/mcp/server.py"],
+  "env": {
+    "QDRANT_URL": "http://localhost:6333",
+    "OLLAMA_BASE_URL": "http://localhost:11434"
+  }
+}
+```
+
+Grounding and injection-scanning hooks are a separate, opt-in install:
+`scripts/hooks/install.sh` copies the three hooks into `~/.claude/hooks`, and
+`install.sh --check` reports drift between the repo copy and the deployed one.
+
+See [mcp/README.md](mcp/README.md) for the full tool reference and wiring guide, and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for Docker and systemd deployment.
+
+---
+
+## Quick orientation
+
+| What you want | Where to look |
+|---|---|
+| New to all of this — start here | [docs/CONCEPTS.md](docs/CONCEPTS.md) |
+| How the system works (technical) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Why it's designed this way | [docs/COGNITIVE_FOUNDATIONS.md](docs/COGNITIVE_FOUNDATIONS.md) |
+| What each script does | [docs/COMPONENTS.md](docs/COMPONENTS.md) |
+| How to run / configure (scripts) | [docs/OPERATIONS.md](docs/OPERATIONS.md) |
+| How to deploy (Docker / systemd) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+| What the grounding corpus is worth | [docs/grounding-corpus-limits.md](docs/grounding-corpus-limits.md) |
+
+---
+
+## MCP tools (74)
+
+![Tool groups](docs/img/loci-tools.svg)
+
+*This diagram groups an earlier 24-tool snapshot by purpose. The grouping still holds,
+but the surface is now 74 tools: 43 in `mcp/server.py`, plus 11 investigation tools
+from `mcp/investigation_tools.py`, 11 code-graph tools from `mcp/graph_tools.py`,
+and 9 local-model tools from `mcp/llm_tools.py`, all registered onto the shared
+FastMCP instance at import time. See the table below for the current inventory.*
+
+| Tool | Purpose |
+|---|---|
+| `investigation_start` | Open a new investigation session |
+| `investigation_load` | Load an existing investigation by ID |
+| `investigation_as_of` | Return findings as they were believed at a point in time |
+| `investigation_store` | Persist findings to the investigation |
+| `finding_resolve` | Mark a finding's lifecycle state — fixed / intentional / wontfix / superseded, or back to open |
+| `procedure_attempt` | Record a pass/fail attempt against a procedure-type finding |
+| `procedure_search` | Search for procedure-type findings matching a query |
+| `investigation_note` | Update a manifest field — hypothesis, next step, context, open questions, checked sources, closing summary |
+| `investigation_reflect` | Run reflection over current findings |
+| `investigation_reason` | Reason over findings with grounded, multi-perspective analysis |
+| `investigation_search` | Search within an investigation |
+| `investigation_pre_answer_check` | Validate a claim against stored evidence before answering |
+| `investigation_evidence_precheck` | Pre-screen evidence before ingestion |
+| `investigation_entity_lookup` | Look up an entity by name across stored findings |
+| `entity_list` | List all named entities extracted from an investigation's findings |
+| `entity_timeline` | Chronological timeline of every finding mentioning an entity |
+| `investigation_related_cases` | Find related prior investigations |
+| `investigation_finding_provenance` | Trace source provenance for a finding |
+| `causal_infer` | Infer causal edges for an investigation and write them to `causal_edges.jsonl` |
+| `causal_edges_list` | List causal edges inferred for an investigation |
+| `conflict_list` | List detected conflicts for an investigation |
+| `conflict_resolve` | Resolve a detected conflict by recording a verdict |
+| `investigation_list` | List investigations, most-recent first. Paginated (`limit=30`, `offset=0`) and compact by default (`summary=True`); pass `summary=False` for full records and `limit=0` (or any value `<=0`) for all — note `offset` still applies in no-limit mode, returning all *remaining* records starting at `offset`. Response includes `total`/`limit`/`offset`. |
+| `investigation_share` | Grant read/write access to an investigation for one or more agents |
+| `investigation_unshare` | Revoke access to an investigation for one or more agents |
+| `investigation_export` | Export an investigation as a portable JSON bundle |
+| `investigation_import` | Import an investigation bundle produced by `investigation_export` |
+| `audit_log` | Append to the audit trail |
+| `memory_self_check` | Cross-check stored memories for consistency |
+| `code_memory_correlate` | Link a detected code hallucination to the memories it contaminated (advisory, read-only) |
+| `memory_health` | Report memory system health |
+| `loci_health` | Read-only self-diagnosis of the MCP server as a JSON snapshot |
+| `retrieval_selftest` | Query every Qdrant collection in the store and report which ones actually return rows |
+| `memory_retract` | Soft-retract an incorrect or stale memory |
+| `memory_restore` | Restore a previously retracted memory |
+| `memory_promote` | Promote a finding to a higher memory tier |
+| `memory_demote` | Demote a finding to a lower memory tier |
+| `memory_hints` | Return the most recent findings as lightweight hints |
+| `memory_surface` | Proactively surface prior findings relevant to the current working context |
+| `memory_route` | Mesh-aware search across all investigations — no `investigation_id` filter |
+| `reflection_loop_seed` | Seed the reflection loop with new material |
+| `reflection_loop_tick` | Advance the reflection loop one step |
+| `reflection_loop_status` | Report reflection loop queue status |
+| `rag_context_search` | Fan-out semantic search across all configured Qdrant collections |
+| `ground` | Assemble a provenance-tagged, character-budgeted grounding block for a task |
+| `memory_consolidate` | Trigger memory consolidation (dedup + merge) |
+| `memory_confidence` | Estimate confidence in a memory-derived claim before asserting it |
+| `contract_declare` | Store a cross-boundary contract declaration for an entity |
+| `contract_query` | Query stored contract declarations for an entity |
+| `contract_check` | Check whether a field name conflicts with stored contract declarations |
+| `wiring_obligation_scan` | Advisory-only scan for implicit obligations that may merit manual declaration |
+| `wiring_obligation_declare` | Declare a wiring obligation — a method that should integrate but is unverified |
+| `wiring_obligation_list` | List wiring obligations for an investigation |
+| `wiring_obligation_resolve` | Resolve a wiring obligation with evidence of fulfilment |
+| `llm_local` | Generate with a local Ollama model — the generation tier of the offload path |
+| `generate_batch` | Generate for many prompts at once, for high-concurrency fan-out |
+| `query_expand` | Expand a search query (HyDE-lite) using the local model |
+| `verify_finding` | Adversarially verify a claim with the local model |
+| `investigation_verify_all` | Batch adversarial-verify an investigation's open findings |
+| `classify_text` | Pick the single best label for a text using the local model |
+| `compress_text` | Semantically condense text to a character budget using the local model |
+| `semantic_dedup` | Cluster near-duplicate items by embedding cosine similarity |
+| `semantic_relevance` | Score each text's cosine relevance to a topic on the local embedding path |
+| `code_graph_ingest` | Parse source with tree-sitter and ingest its symbol graph |
+| `code_graph_query` | Run a read-only Cypher query over the code + memory graph |
+| `code_memory_relink` | Rebuild every finding → code-symbol `REFERENCES` edge |
+| `code_memory_map` | Map the code/memory neighbourhood around an anchor node |
+| `symbol_impact` | Blast radius of a code symbol across code and memory |
+| `impact_report` | Change blast radius for a symbol or class, with the findings that reference it |
+| `finding_code_context` | The code a finding references, each symbol with its callers/callees |
+| `investigation_code_briefing` | The code story of an investigation in a single call |
+| `subsystem_report` | Full picture of a subsystem: code, call boundary, memory hotspots |
+| `related_investigations_via_code` | Other investigations that reference the same code symbols |
+| `dead_code_candidates` | Functions with no code caller and no finding reference |
+
+---
+
+## A2A skills (13)
+
+The A2A server exposes 13 skills via JSON-RPC 2.0 over HTTP, letting peer agents share
+memory without requiring the MCP stack. Twelve are advertised in the agent card;
+`memory_prime` is callable but not listed in discovery.
+
+| Skill | Advertised |
+|---|---|
+| `memory_recall` | Yes |
+| `memory_remember` | Yes |
+| `memory_stats` | Yes |
+| `session_search` | Yes |
+| `memory_sleep` | Yes |
+| `rag_search` | Yes |
+| `context_broadcast` | Yes |
+| `mnemosyne_triple_add` | Yes |
+| `mnemosyne_triple_query` | Yes |
+| `gpu_inference` | Yes |
+| `docker_status` | Yes |
+| `ua_search` | Yes |
+| `memory_prime` | No |
+
+---
+
+## Infrastructure
+
+| Resource | Default | Env var(s) |
+|---|---|---|
+| Qdrant | `http://localhost:6333` | `QDRANT_URL`, `QDRANT_API_KEY` |
+| Ollama — embeddings (MCP server) | `http://localhost:11434` | `OLLAMA_BASE_URL` |
+| Ollama — generation (MCP server) | resolved by `mcp/backends.py` | `LOCI_OLLAMA_GEN_URL`, `OLLAMA_GEN_URL` |
+| Ollama (standalone scripts) | `http://localhost:11434` | `OLLAMA_URL` |
+| Ollama (A2A server) | `http://localhost:11434/v1` | `MNEMOSYNE_EMBEDDING_API_URL` |
+| Embedding model (MCP) | `nomic-embed-text` | `EMBED_MODEL` |
+| Embedding model (A2A) | `nomic-embed-text` | `MNEMOSYNE_EMBEDDING_MODEL` |
+| Embedding dimensions | `768` | `MNEMOSYNE_EMBEDDING_DIM` |
+| Mnemosyne DB | `~/.hermes/mnemosyne/data/mnemosyne.db` | `MNEMOSYNE_DATA_DIR` |
+| Memory session dir (MCP) | `~/.hermes/memory-sessions` | `LOCI_MEMORY_DIR` |
+| Code graph store | `$LOCI_MEMORY_DIR/graph.ladybug` | — |
+| Qdrant collection prefix | `loci_memory` | `QDRANT_COLLECTION_PREFIX` |
+| Backend config file | `~/.loci/backends.toml` | `LOCI_CONFIG` |
+| Hook state | `~/.claude/hook-state/` | — |
+
+`OLLAMA_BASE_URL` is the **embedding** endpoint only. Generation resolves separately
+(`backends.ollama_gen_url()`, `mcp/backends.py:101`), so an Ollama that serves only
+`nomic-embed-text` cannot absorb generation calls. `OLLAMA_URL` is the standalone-script
+fallback. Set all three when the components run against different hosts.
+
+Unset values fall through `mcp/backends.py`: explicit env var, localhost probe,
+`~/.loci/backends.toml`, then empty; the offload tiers fail open on empty.
+`backends.toml.example` is the template. See [docs/OPERATIONS.md](docs/OPERATIONS.md)
+for the full env var reference.
+
+Two `.env.example` files are provided:
+
+- **`.env.example`** (repo root) — complete reference covering all components
+- **`mcp/.env.example`** — minimal file for MCP-server-only deployments
+
+---
+
+## Key env vars
+
+### MCP server
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QDRANT_URL` | _(required)_ | Qdrant instance URL |
+| `QDRANT_API_KEY` | `""` | Qdrant auth key (blank for no-auth) |
+| `QDRANT_COLLECTION_PREFIX` | `loci_memory` | Main Qdrant collection name |
+| `OLLAMA_BASE_URL` | _(required for embeddings)_ | Ollama base URL (no trailing `/v1`) |
+| `EMBED_MODEL` | `nomic-embed-text` | Embedding model for MCP server |
+| `EMBED_API_KEY` | `""` | Cloud embedding provider API key |
+| `EMBED_API_KEY_HEADER` | `Authorization` | Auth header name for cloud embeddings |
+| `LOCI_MEMORY_DIR` | `~/.hermes/memory-sessions` | Investigation session storage root |
+| `MNEMOSYNE_EMBEDDING_DIM` | `768` | Vector dimension — must match your model |
+| `CODE_CHUNKS_COLLECTION` | _(unset)_ | Qdrant collection for `code_memory_correlate` |
+| `LOCI_MCP_TRANSPORT` | `stdio` | Transport mode: `stdio`, `sse`, or `streamable-http` |
+| `LOCI_MCP_HOST` | `127.0.0.1` | Bind host for SSE/HTTP transport |
+| `LOCI_MCP_PORT` | `8000` | Bind port for SSE/HTTP transport |
+| `LOCI_MCP_TOKEN` | `""` | Bearer token for SSE/HTTP. Required for any non-loopback bind — the server exits rather than serve unauthenticated |
+| `LOCI_OLLAMA_GEN_URL` | _(resolved by `backends.py`)_ | Generation endpoint override (`OLLAMA_GEN_URL` also read) |
+| `LOCI_VLLM_FALLBACK` | `0` | Allow generation to fall back to vLLM (`VLLM_BASE_URL`) when Ollama fails |
+| `LOCI_CONFIG` | `~/.loci/backends.toml` | Backend resolution config file |
+
+### A2A server
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MNEMOSYNE_EMBEDDING_API_URL` | `http://localhost:11434/v1` | OpenAI-compat embedding endpoint |
+| `MNEMOSYNE_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model for A2A server |
+| `MNEMOSYNE_DATA_DIR` | `~/.hermes/mnemosyne/data` | Mnemosyne SQLite data directory |
+| `LOCI_A2A_TOKEN` | _(required)_ | Bearer token callers must present |
+| `LOCI_A2A_TOTP_SEED` | `""` | TOTP base32 seed (blank to disable) |
+| `LOCI_A2A_URL` | `http://127.0.0.1:8201` | Public URL injected into the agent card |
+| `HERMES_AGENT_ID` | `hermes-agent` | Agent identity stamped on all writes |
+| `EXTRA_RAG_COLLECTIONS` | `""` | Comma-separated extra Qdrant collections for fan-out RAG |
+| `PEER_A2A_URLS` | `""` | Comma-separated peer A2A endpoints for context broadcast |
+
+---
+
+## Qdrant collections
+
+| Collection | Purpose |
+|---|---|
+| `loci_memory` (configurable via `QDRANT_COLLECTION_PREFIX`) | Primary long-term memory store |
+| `loci_sessions` | Session history embeddings |
+| `loci_verdicts` | Claim verdict history for `investigation_pre_answer_check` and `memory_self_check` |
+| `mnemosyne` | Synced Mnemosyne SQLite vectors |
+
+---
+
+## MCP transport modes
+
+Default transport is `stdio` for Claude Code subprocess use. For Docker or remote
+deployments set `LOCI_MCP_TRANSPORT=sse` (or `streamable-http`) and configure
+`LOCI_MCP_HOST` / `LOCI_MCP_PORT`.
+
+Loopback is default. Wider binds require `LOCI_MCP_TOKEN`; without one the server
+exits (`mcp/server.py:8144`). With a token set, callers present
+`Authorization: ******; `/health` stays open for liveness probes. `docker-compose.yml`
+sets `LOCI_MCP_HOST=0.0.0.0`, so `.env` must also set a token before
+`docker compose up`.
+
+```bash
+# loopback — no token needed
+LOCI_MCP_TRANSPORT=sse LOCI_MCP_PORT=8000 \
+  .venv/bin/python server.py
+
+# wide bind — token required, or the server refuses to start
+LOCI_MCP_TRANSPORT=sse LOCI_MCP_HOST=0.0.0.0 LOCI_MCP_PORT=8000 \
+  LOCI_MCP_TOKEN="$(python3 -c 'import secrets;print(secrets.token_hex(32))')" \
+  .venv/bin/python server.py
+```
+
+---
+
+## Repo layout
+
+```
+loci/
+├── mcp/                   MCP server — 73 tools: investigation memory, RAG, claim validation, code graph
+│   ├── server.py          FastMCP server entry point
+│   ├── backends.py        Endpoint resolution: env var -> localhost probe -> ~/.loci/backends.toml
+│   ├── memcheck/          Standalone claim-validation + code-hallucination module
+│   ├── pyproject.toml     Package definition (pip install -e .)
+│   └── README.md          MCP setup and tool reference
+├── docs/                  Architecture, theory, component reference, ops guide
+│   ├── CONCEPTS.md        Plain-English guide for beginners
+│   └── img/               SVG diagrams
+├── scripts/               Python scripts (run standalone or via cron)
+│   ├── loci_groom.py      Passive grooming passes: index, knn_tags, codelink, summaries, ...
+│   └── hooks/             Claude Code / agent hook adapters + install.sh
+├── mlops/                 Embedding, routing, grounding and finetune experiments
+├── eval/                  Grounding-gate and skeptic-verification benchmarks
+├── deep_think_loci/       Multi-tier reasoning engine — Workflow over the Loci corpus (beta)
+├── a2a_server/            A2A RAG broadcast server (mesh-wide context sharing)
+├── rules/                 Agent behavioral rules (loaded at session start)
+├── cron/jobs.json         Hermes cron job list — tick with scripts/hermes_cron_runner.py
+│                          on a 1-minute user timer/crontab; grooming stays separate
+├── backends.toml.example  Template for ~/.loci/backends.toml
+└── .env.example           Full environment variable reference for all components
+```

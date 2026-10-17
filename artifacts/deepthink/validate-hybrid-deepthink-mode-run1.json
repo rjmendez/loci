@@ -1,0 +1,271 @@
+{
+  "run_started_utc": "2026-09-19T22:28:48.787461+00:00",
+  "run_finished_utc": "2026-09-19T22:32:30.955548+00:00",
+  "routing_inputs": {
+    "LOCI_CONFIG": "C:\\Users\\rjmendez-admin\\.loci\\backends.toml",
+    "OLLAMA_BASE_URL": "http://localhost:11434",
+    "LOCI_OLLAMA_GEN_URL": "",
+    "OLLAMA_GEN_URL": "",
+    "LOCI_VLLM_FALLBACK": "",
+    "QDRANT_URL": "",
+    "resolved_ollama_url": "http://localhost:11434",
+    "resolved_ollama_gen_url": "http://localhost:11434",
+    "resolved_vllm_url": "http://localhost:18000",
+    "resolved_vllm_model": "Qwen/Qwen3-4B-Instruct-2507",
+    "resolved_qdrant_url": ""
+  },
+  "deep_think_config": {
+    "collections": [
+      "loci_memory"
+    ],
+    "ideate_models": [
+      "llama3.1-agent:latest",
+      "qwen3.8:latest"
+    ],
+    "verify_model": "qwen3.8:latest",
+    "synthesize_model": "qwen3.8:latest",
+    "self_reflect_model": "qwen3.8:latest",
+    "redteam_model": "local-heretic-qwen38-27b:q4km",
+    "strict_grounding": true,
+    "red_team": true,
+    "retrieval_limit": 8,
+    "evidence_chars": 4200,
+    "ideas_per_model": 2
+  },
+  "generation_observed": {
+    "calls": 5,
+    "by_tier": {
+      "ollama": 5
+    },
+    "by_ok": {
+      "ok": 4,
+      "not_ok": 1
+    },
+    "calls_detail": [
+      {
+        "requested_model": "llama3.1-agent:latest",
+        "fmt": "json",
+        "max_tokens": 900,
+        "ok": true,
+        "served_model": "llama3.1-agent:latest",
+        "tier": "ollama",
+        "why": null,
+        "text_len": 666
+      },
+      {
+        "requested_model": "qwen3.8:latest",
+        "fmt": "json",
+        "max_tokens": 900,
+        "ok": false,
+        "served_model": "qwen3.8:latest",
+        "tier": "ollama",
+        "why": "ollama ReadTimeout: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=120.0)",
+        "text_len": 0
+      },
+      {
+        "requested_model": "qwen3.8:latest",
+        "fmt": "json",
+        "max_tokens": 1400,
+        "ok": true,
+        "served_model": "qwen3.8:latest",
+        "tier": "ollama",
+        "why": null,
+        "text_len": 703
+      },
+      {
+        "requested_model": "qwen3.8:latest",
+        "fmt": "text",
+        "max_tokens": 500,
+        "ok": true,
+        "served_model": "qwen3.8:latest",
+        "tier": "ollama",
+        "why": null,
+        "text_len": 507
+      },
+      {
+        "requested_model": "qwen3.8:latest",
+        "fmt": "json",
+        "max_tokens": 1400,
+        "ok": true,
+        "served_model": "qwen3.8:latest",
+        "tier": "ollama",
+        "why": null,
+        "text_len": 897
+      }
+    ]
+  },
+  "result": {
+    "investigation_id": "validate-hybrid-deepthink-mode-20260919",
+    "title": "Hybrid deep-think routing validation 2026-09-19",
+    "topic": "Assess fleet queue saturation governance controls and likely root causes from prior memory.",
+    "collections": [
+      "loci_memory"
+    ],
+    "start_status": "created",
+    "retrieval": {
+      "collections": [
+        {
+          "name": "loci_memory",
+          "hits": 0
+        }
+      ],
+      "errors": [],
+      "hits": 0
+    },
+    "ground_gate": {
+      "mode": "empty",
+      "kept": 0,
+      "dropped": 0
+    },
+    "ideate": {
+      "reports": [
+        {
+          "model": "llama3.1-agent:latest",
+          "ok": true,
+          "ideas": 2
+        },
+        {
+          "model": "qwen3.8:latest",
+          "ok": false,
+          "ideas": 0,
+          "error": "ollama ReadTimeout: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=120.0)"
+        }
+      ],
+      "idea_count": 2,
+      "stored_count": 2,
+      "stored_finding_ids": [
+        "9307ef29-00ec-42ef-87a5-526c4b53fb17",
+        "2b597018-4103-4794-9c19-8546e5c12c73"
+      ]
+    },
+    "verify": {
+      "model": "qwen3.8:latest",
+      "reports": [
+        {
+          "finding_id": "9307ef29-00ec-42ef-87a5-526c4b53fb17",
+          "claim": "Fleet queue saturation is caused by a lack of adequate server resources to handle the demand, leading to a bottleneck in the system.",
+          "verdict": "uncertain",
+          "degraded": false,
+          "retrieval": {
+            "collections": [
+              {
+                "name": "loci_memory",
+                "hits": 0
+              }
+            ],
+            "errors": [],
+            "hits": 0
+          },
+          "gate": {
+            "mode": "empty",
+            "kept": 0,
+            "dropped": 0
+          },
+          "context_ids": [],
+          "provenance_firewall": {
+            "allowed": false,
+            "phase": "local_deep_think.verify_findings",
+            "candidate_tier": "model_asserted",
+            "evidence_tiers": [],
+            "independent_evidence_tiers": [],
+            "reason": "model_asserted_requires_independent_human_tool_or_deterministic_evidence",
+            "degraded": false
+          },
+          "procedure_learning": {
+            "enabled": false,
+            "eligible": false,
+            "attempted": false,
+            "verdict": "uncertain",
+            "confidence": 0.0,
+            "threshold": 0.75,
+            "degraded": false,
+            "reason": "disabled"
+          }
+        },
+        {
+          "finding_id": "2b597018-4103-4794-9c19-8546e5c12c73",
+          "claim": "Fleet queue saturation is caused by a flawed algorithm or logic in the system, leading to inefficient use of resources and a buildup of requests in the queue.",
+          "verdict": "uncertain",
+          "degraded": false,
+          "retrieval": {
+            "collections": [
+              {
+                "name": "loci_memory",
+                "hits": 0
+              }
+            ],
+            "errors": [],
+            "hits": 0
+          },
+          "gate": {
+            "mode": "empty",
+            "kept": 0,
+            "dropped": 0
+          },
+          "context_ids": [],
+          "provenance_firewall": {
+            "allowed": false,
+            "phase": "local_deep_think.verify_findings",
+            "candidate_tier": "model_asserted",
+            "evidence_tiers": [],
+            "independent_evidence_tiers": [],
+            "reason": "model_asserted_requires_independent_human_tool_or_deterministic_evidence",
+            "degraded": false
+          },
+          "procedure_learning": {
+            "enabled": false,
+            "eligible": false,
+            "attempted": false,
+            "verdict": "uncertain",
+            "confidence": 0.0,
+            "threshold": 0.75,
+            "degraded": false,
+            "reason": "disabled"
+          }
+        }
+      ],
+      "survivor_count": 0,
+      "survivor_finding_ids": [],
+      "procedure_learning_enabled": false
+    },
+    "red_team": {
+      "enabled": true,
+      "stored": 0,
+      "skipped": "no surviving findings"
+    },
+    "synthesis": {
+      "summary": "\u26a0 UNGROUNDED (strict mode): no retrieved evidence passed the similarity gate at any tier of this chain. Treat the following as an unverified local-model hypothesis, not a grounded finding.\n\nThe assessment of fleet queue saturation governance controls and root causes cannot be performed because the available evidence array is empty. No finding_id, tier, or model data exists to support any specific claims about controls or causes. The previous synthesis was a tautology; this revision confirms the absence of data as the sole factual state, without inferring operational risks or assuming data availability for re-runs.",
+      "supporting_finding_ids": [],
+      "key_findings": [],
+      "risks": [
+        "Absence of evidence prevents verification of governance controls.",
+        "No root causes can be identified due to lack of prior memory or findings."
+      ],
+      "next_steps": [
+        "Confirm whether the data source is permanently unavailable or if the query scope was incorrect.",
+        "If data is confirmed missing, escalate to data engineering to verify ingestion pipelines."
+      ],
+      "grounding_status": "ungrounded",
+      "finding_id": "0a5edf63-65f4-49d2-8e44-21a121fcde8b",
+      "self_reflection": {
+        "enabled": true,
+        "model": "qwen3.8:latest",
+        "iterations": 1,
+        "revised": true,
+        "critique": "- The claim that the evidence array is empty is a factual observation of the input, not a synthesized finding, making the \"assessment\" a tautology rather than an analysis.\n- The assertion that \"uninformed decision-making\" is a risk is a generic logical inference unsupported by any specific operational context or finding_id.\n- The next step to \"re-run the assessment\" assumes the data source is accessible and functional, ignoring the possibility that the data does not exist or is permanently unavailable."
+      },
+      "tags": [
+        "local-deep-think",
+        "synthesize",
+        "model:qwen3-8-latest",
+        "self-reflect",
+        "ungrounded"
+      ]
+    },
+    "ground_truth_found": [
+      "2b597018-4103-4794-9c19-8546e5c12c73",
+      "9307ef29-00ec-42ef-87a5-526c4b53fb17"
+    ],
+    "lineage": []
+  }
+}

@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+Sync Hermes state.db sessions -> Qdrant `loci_sessions` collection.
+
+Each Qdrant point = one session (unit of search), containing a
+concatenation of its user+assistant messages as the embedded text.
+Chunked at 4000 chars to keep embedding quality high and avoid
+Ollama stall on huge inputs.
+
+Uses embedding-worker (NodePort 30888) -> agent_core_chunks -> copy
+vector -> loci_sessions (named vector "dense", MNEMOSYNE_EMBEDDING_DIM Cosine).
+
+Incremental: tracks synced sessions by session_id in payload.
+Run standalone or from cron (no_agent=True).
+"""
+import sqlite3, json, hashlib, sys, os, time, subprocess, datetime
+
+STATE_DB     = (os.environ.get("LOCI_STATE_DB") or os.environ.get("HERMES_STATE_DB")
+                or os.path.expanduser("~/.hermes/state.db"))
+QDRANT       = os.environ.get("QDRANT_URL")
+EMBED_WORKER = os.environ.get("EMBED_WORKER_URL")
+COLLECTION   = "loci_sessions"
+SRC_COLL     = "agent_core_chunks"
+MAX_CHARS    = 4000   # per-session content cap before embedding
+BATCH_SIZE   = 4      # sessions per embed round-trip (keep under 32-chunk Ollama limit)
+
+# One source for the vector width. The validator below used a 768 literal while
+# the collection was created from this env, so a deployment on 1536-dim embeddings
+# dropped every chunk as "malformed" and still exited 0.
+VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
+
+AGENT_ID = os.environ.get("HERMES_AGENT_ID", "")
+PROFILE  = os.environ.get("HERMES_PROFILE", "")
+
+def get_key():
+    # Primary: QDRANT_API_KEY environment variable.
+    # k8s deployments: set this via a secretKeyRef in your pod spec.
+    key = os.environ.get("QDRANT_API_KEY") or os.environ.get("QDRANT_KEY", "")
+    return key
+
+def curl_json(method, url, data=None, key=""):
+    cmd = ["curl", "-s", "-X", method, url,
+           "-H", f"api-key: {key}",
+           "-H", "Content-Type: application/json"]
+    if data is not None:
+        cmd += ["-d", json.dumps(data)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if not r.stdout.strip():
+        return {}
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {"_raw": r.stdout[:200]}
+
+def ensure_collection(key, name=None, dim=None):
+    """Create the collection if it does not exist.
+
+    Same gap as mnemosyne_qdrant_sync: this script only ever upserts points, and
+    a2a_server's _qdrant_search turns a 404 into [], so a `loci_sessions` collection that
+    was never created reads as "session_search found nothing" on every call.
+
+    curl_json returns {} rather than raising, so probe by response shape.
+    """
+    name = name or COLLECTION
+    dim  = int(dim or VECTOR_DIM)
+    if curl_json("GET", f"{QDRANT}/collections/{name}", key=key).get("result"):
+        return False
+    curl_json("PUT", f"{QDRANT}/collections/{name}",
+              {"vectors": {"dense": {"size": dim, "distance": "Cosine"}}}, key=key)
+    if not curl_json("GET", f"{QDRANT}/collections/{name}", key=key).get("result"):
+        print(f"[state_db->qdrant] WARNING: {name} still missing after create attempt",
+              file=sys.stderr)
+        return False
+    print(f"[state_db->qdrant] created missing collection {name} (dense {dim}d Cosine)")
+    return True
+
+def stable_id(s: str) -> int:
+    return int(hashlib.sha256(s.encode()).hexdigest()[:15], 16)
+
+def load_sessions_with_messages(conn):
+    """Return list of dicts: session metadata + concatenated message text."""
+    sessions = conn.execute(
+        "SELECT id, title, started_at, source, model FROM sessions ORDER BY started_at ASC"
+    ).fetchall()
+    results = []
+    for s in sessions:
+        msgs = conn.execute(
+            """SELECT role, content FROM messages
+               WHERE session_id=? AND role IN ('user','assistant')
+                 AND content IS NOT NULL AND length(content) > 20
+               ORDER BY timestamp ASC""",
+            (s["id"],)
+        ).fetchall()
+        if not msgs:
+            continue
+        # Build embedded text: role-prefixed lines, capped
+        parts = []
+        total = 0
+        for m in msgs:
+            line = f"{m['role'].upper()}: {(m['content'] or '').strip()}"
+            if total + len(line) > MAX_CHARS:
+                parts.append(line[:MAX_CHARS - total])
+                break
+            parts.append(line)
+            total += len(line)
+        text = "\n\n".join(parts)
+        if not text.strip():
+            continue
+        # started_at is a float (unix epoch) in state.db
+        try:
+            dt = datetime.datetime.utcfromtimestamp(float(s["started_at"])).isoformat()
+        except Exception:
+            dt = str(s["started_at"])
+        results.append({
+            "session_id": s["id"],
+            "title": s["title"] or "",
+            "started_at": dt,
+            "source": s["source"] or "cli",
+            "model": s["model"] or "",
+            "msg_count": len(msgs),
+            "text": text,
+        })
+    return results
+
+def get_synced_ids(key):
+    """Return set of session_ids already in loci_sessions."""
+    synced = set()
+    offset = None
+    while True:
+        body = {"limit": 1000, "with_payload": ["session_id"], "with_vector": False}
+        if offset:
+            body["offset"] = offset
+        data = curl_json("POST", f"{QDRANT}/collections/{COLLECTION}/points/scroll",
+                         body, key)
+        pts = data.get("result", {}).get("points", [])
+        for p in pts:
+            sid = (p.get("payload") or {}).get("session_id")
+            if sid:
+                synced.add(sid)
+        offset = data.get("result", {}).get("next_page_offset")
+        if not offset:
+            break
+    return synced
+
+def embed_batch(chunks, key):
+    """Embed via worker, return ({chunk_id: vector}, dropped_count) for successfully embedded chunks."""
+    r = subprocess.run(
+        ["curl", "-s", "-X", "POST", f"{EMBED_WORKER}/embed",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps({"chunks": chunks})],
+        capture_output=True, text=True, timeout=90
+    )
+    if not r.stdout.strip():
+        return {}, 0
+    try:
+        edata = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}, 0
+    if edata.get("status") != "ok":
+        print(f"  [embed] error: {edata}", file=sys.stderr)
+        return {}, 0
+    vectors_map = edata.get("vectors", {})   # {chunk_id: qdrant_uuid in agent_core_chunks}
+    if not vectors_map:
+        return {}, 0
+    # Fetch vectors back from agent_core_chunks
+    uuids = list(vectors_map.values())
+    fr = curl_json("POST", f"{QDRANT}/collections/{SRC_COLL}/points",
+                   {"ids": uuids, "with_vector": True}, key)
+    uuid_to_vec = {p["id"]: p.get("vector")
+                   for p in fr.get("result", []) if p.get("vector")}
+    id_to_vec = {}
+    dropped = 0
+    for chunk_id, uuid in vectors_map.items():
+        vec = uuid_to_vec.get(uuid)
+        if vec is None:
+            print(f"  [embed] dropped chunk_id={chunk_id}: no vector returned", file=sys.stderr)
+            dropped += 1
+            continue
+        # Handle both unnamed (list) and named (dict) vector shapes
+        if isinstance(vec, list):
+            resolved = vec
+        elif isinstance(vec, dict):
+            resolved = vec.get("dense") or next(iter(vec.values()), None)
+        else:
+            resolved = None
+        if not isinstance(resolved, list) or len(resolved) != VECTOR_DIM:
+            print(
+                f"  [embed] dropped chunk_id={chunk_id}: malformed vector "
+                f"(type={type(resolved).__name__}, "
+                f"dim={len(resolved) if isinstance(resolved, list) else 'n/a'})",
+                file=sys.stderr,
+            )
+            dropped += 1
+            continue
+        id_to_vec[chunk_id] = resolved
+    return id_to_vec, dropped
+
+def upsert_points(points, key):
+    """Upsert a batch of points into loci_sessions."""
+    r = curl_json("PUT", f"{QDRANT}/collections/{COLLECTION}/points",
+                  {"points": points}, key)
+    return r.get("status") == "ok"
+
+def main():
+    key = get_key()
+    if not key:
+        print("ERROR: could not retrieve Qdrant API key", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_collection(key)
+
+    conn = sqlite3.connect(STATE_DB)
+    conn.row_factory = sqlite3.Row
+    sessions = load_sessions_with_messages(conn)
+    conn.close()
+    print(f"[state_db->qdrant] {len(sessions)} sessions with messages in state.db")
+
+    synced = get_synced_ids(key)
+    print(f"[state_db->qdrant] {len(synced)} already synced in Qdrant")
+
+    to_sync = [s for s in sessions if s["session_id"] not in synced]
+    print(f"[state_db->qdrant] {len(to_sync)} sessions to embed and upsert")
+
+    if not to_sync:
+        print("[state_db->qdrant] nothing to do, exiting")
+        return
+
+    ok = 0
+    err = 0
+    for i in range(0, len(to_sync), BATCH_SIZE):
+        batch = to_sync[i : i + BATCH_SIZE]
+        chunks = [{"id": s["session_id"], "text": s["text"]} for s in batch]
+        id_to_vec, dropped = embed_batch(chunks, key)
+        err += dropped
+
+        points = []
+        for s in batch:
+            vec = id_to_vec.get(s["session_id"])
+            if vec is None:
+                print(f"  [skip] no vector for {s['session_id'][:20]}", file=sys.stderr)
+                err += 1
+                continue
+            points.append({
+                "id": stable_id(s["session_id"]),
+                "vector": {"dense": vec},
+                "payload": {
+                    "session_id": s["session_id"],
+                    "title":      s["title"],
+                    "started_at": s["started_at"],
+                    "source":     s["source"],
+                    "model":      s["model"],
+                    "agent_id":   AGENT_ID,
+                    "profile":    PROFILE,
+                    "msg_count":  s.get("msg_count", 0),
+                    "last_synced": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "content_preview": s["text"][:500],
+                }
+            })
+
+        if points and upsert_points(points, key):
+            ok += len(points)
+            print(f"  upserted {ok}/{len(to_sync)} ...", end="\r", flush=True)
+        else:
+            err += len(points)
+
+        time.sleep(0.1)  # gentle rate limit
+
+    print(f"\n[state_db->qdrant] done — {ok} upserted, {err} errors")
+
+if __name__ == "__main__":
+    main()

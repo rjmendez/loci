@@ -1,0 +1,72 @@
+Hybrid Swarm Routing Validation — 2026-09-19
+Repo: C:\Users\rjmendez-admin\development\loci
+Script: scripts\swarm_escalate.py
+
+Goal
+- Validate tier routing inputs and runtime model selection in hybrid cloud/local swarm mode.
+
+Routing inputs identified (from scripts\swarm_escalate.py)
+- Cheap tier default: qwen2.5:3b via LOCI_SWARM_CHEAP_MODEL
+- Legacy defaults (no tier knobs active):
+  - Escalate: qwen3.8:latest via LOCI_SWARM_ESCALATE_MODEL
+  - Synthesize: qwen3.8:latest via LOCI_SWARM_SYNTHESIZE_MODEL
+- Tier-active defaults (when any of: seeds>1, synthesize_think, safety_check, self_consistency_samples>1, reduce_group_size>0, escalate_with_prior_context):
+  - Escalate: heretic-llama31-8b-instruct:latest
+  - Synthesize: hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M
+- Explicit --escalate-model / --synthesize-model always override both default sets.
+- Seeds auto-parallel logic:
+  - Explicit --seeds uses provided value.
+  - If omitted and auto_parallel enabled, effective seeds may increase (default target 3) when a compatible batched vLLM endpoint is detected.
+
+Env snapshot used for runs
+- No LOCI_SWARM_* env vars were set in shell.
+
+Repro commands
+1) Baseline (no tier knobs)
+python scripts/swarm_escalate.py "Assess auth/cache/logging controls in loci" \
+  --subtask "Check whether auth paths enforce MFA for privileged actions" \
+  --subtask "Check cache and session expiry defaults across runtime paths" \
+  --subtask "Check logging/audit coverage for security-sensitive operations" \
+  --fanout-count 3 --pretty
+
+Observed key outputs:
+- synthesis.model: qwen3.8:latest
+- tiers.cheap.model: qwen2.5:3b
+- tiers.escalate.model: qwen3.8:latest
+- stats.escalated_count: 0
+- degraded: false
+
+2) Tier-active run (advanced flags)
+python scripts/swarm_escalate.py "Assess auth/cache/logging controls in loci" \
+  --subtask "Check whether auth paths enforce MFA for privileged actions" \
+  --subtask "Check cache and session expiry defaults across runtime paths" \
+  --subtask "Check logging/audit coverage for security-sensitive operations" \
+  --fanout-count 3 --seeds 2 --synthesize-think --safety-check --pretty
+
+Observed key outputs:
+- synthesis.model: hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M
+- synthesis.think: true
+- tiers.cheap.model: qwen2.5:3b
+- tiers.escalate.model: heretic-llama31-8b-instruct:latest
+- multi_seed.enabled: true
+- multi_seed.seed_count: 2
+- stats.seed_count: 2
+- degraded: false
+
+Degraded/fallback behavior observed
+- safety_flag.why: guardian failed open due HTTP 404 from local Ollama /api/generate
+- safety_flag.flagged remained false (advisory check fail-open, no hard failure)
+- Swarm run still completed with valid schema and summary.
+
+Context/token budget signals
+- multi_seed.synthesis_input.prompt_chars: 505
+- multi_seed.synthesis_input.max_prompt_chars: 18000
+- multi_seed.synthesis_input.dropped_count: 0
+- No synthesis input truncation surfaced in this run.
+
+Interpretation
+- Tier routing behaved as designed:
+  - Baseline used legacy escalate/synthesize defaults.
+  - Enabling seeds + synthesize-think + safety-check switched escalate/synthesize to tier-active defaults without explicit model flags.
+- Fail-open behavior is operational for guardian/safety annotation failures.
+- No char-budget pressure in tested workload.

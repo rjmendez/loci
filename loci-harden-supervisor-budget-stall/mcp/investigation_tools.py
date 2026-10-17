@@ -1,0 +1,1307 @@
+"""Investigation lifecycle MCP tools, split from server.py.
+
+Storage primitives come from ``inv_store``. Server-side collaborators still
+needed here are injected through ``register()`` so this module never imports
+``server`` and avoids an import cycle. The memory root is injected the same
+way, so tests that rebind it still steer these tools.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from ladybug_ops import _ladybug_upsert_investigation
+from inv_store import (
+    _append_jsonl,
+    _inv_dir,
+    _load_manifest,
+    _load_retracted_ids,
+    _now,
+    _read_jsonl,
+    _save_manifest,
+    _validated_investigation_id,
+    _node_numeric_confidence,
+    _NEUTRAL_NUMERIC_CONFIDENCE,
+)
+from untrusted_memory import wrap_untrusted_memory_text
+
+logger = logging.getLogger("loci-mcp")
+
+# --- injected by register() -------------------------------------------------
+_get_memory_dir = None
+_apply_lifecycle = None
+_compute_self_check = None
+_event_log_append = None
+_qdrant_upsert = None
+
+
+def _root():
+    """The investigation memory root, resolved through the injected accessor."""
+    return _get_memory_dir()
+
+
+def _wrap_finding_text(finding: dict, *, text_key: str = "text") -> dict:
+    """Return a shallow copy with the primary free-text field wrapped for LLM safety."""
+    wrapped = dict(finding or {})
+    text = str(wrapped.get(text_key) or "").strip()
+    if not text:
+        return wrapped
+    wrapped[text_key] = wrap_untrusted_memory_text(
+        text,
+        origin="loci_memory",
+        investigation_id=wrapped.get("investigation_id"),
+        finding_id=wrapped.get("id") or wrapped.get("finding_id"),
+        kind=wrapped.get("record_type") or wrapped.get("type") or "finding",
+        source=wrapped.get("source"),
+    )
+    return wrapped
+
+
+def _reflect_context_bullets(findings: list, investigation_id: str) -> str:
+    """Bounded, wrapped finding context shared by reflect's model-authored passes."""
+    return "\n".join(
+        f"- [{f.get('type', '?')}] "
+        f"{wrap_untrusted_memory_text(str(f.get('text', ''))[:300], origin='loci_memory', investigation_id=investigation_id, finding_id=str(f.get('id') or ''), kind=str(f.get('type') or f.get('record_type') or 'finding'), source=str(f.get('source') or 'investigation_reflect'))}"
+        for f in findings
+    )
+
+
+def investigation_start(
+    investigation_id: str,
+    title: str,
+    context: Optional[str] = None,
+) -> str:
+    """
+    Create or resume an investigation manifest. Idempotent: an existing ID
+    returns the current manifest unchanged.
+
+    Args:
+        investigation_id: Short identifier — ticket number, case ID, or a
+                          descriptive slug (e.g. "RQ41919026", "pww-actor-2026").
+        title: One-line description of the investigation.
+        context: Optional background to record on first creation only.
+
+    Returns:
+        JSON ``{"status":"created"|"resumed","manifest":{...}}``. The
+        investigation ID is at ``result["manifest"]["id"]``, not
+        ``result["investigation_id"]``.
+    """
+    existing = _load_manifest(investigation_id)
+    if existing:
+        _ladybug_upsert_investigation(investigation_id, existing.get("title", ""))
+        return json.dumps({"status": "resumed", "manifest": existing}, indent=2)
+
+    manifest = {
+        "id": investigation_id,
+        "title": title,
+        "context": context or "",
+        "status": "active",
+        "created_at": _now(),
+        "updated_at": _now(),
+        "hypothesis": None,
+        "open_questions": [],
+        "next_step": None,
+        "checked_sources": {},
+        "finding_counts": {"observed": 0, "inferred": 0, "assumed": 0, "gap": 0},
+        "closed_at": None,
+        "closed_summary": None,
+        "owner": "",
+        "acl": [],
+        "summary_l1": [],
+        "summary_l2": "",
+    }
+    _save_manifest(manifest)
+    _ladybug_upsert_investigation(investigation_id, title)
+    logger.info("Created investigation %s", investigation_id)
+    return json.dumps({"status": "created", "manifest": manifest}, indent=2)
+
+
+# Access rows are text-less AND the newest rows, so any findings[-N:] slice fills up with them.
+_NON_FINDING_RECORD_TYPES = frozenset({"access"})
+
+
+def _only_findings(records: list) -> list:
+    """Drop the non-finding rows from a raw findings.jsonl read."""
+    return [r for r in records
+            if isinstance(r, dict)
+            and (r.get("record_type") or r.get("type") or "") not in _NON_FINDING_RECORD_TYPES]
+
+
+# Structured, low-cardinality metadata only. Free text is deliberately excluded:
+# these are facts about the SET, and a prose field has no class to report.
+_INVARIANT_FIELDS = ("record_type", "confidence", "resolution", "tier",
+                     "authored_by", "agent_id", "source")
+# Past this many distinct values a field is an identifier, not a class. Listing it
+# restates the data instead of describing it, so only the count is reported.
+_INVARIANT_MAX_VALUES = 5
+_INVARIANT_ABSENT = "(absent)"
+
+
+def _field_invariants(findings: list) -> dict:
+    """Describe a finding SET by the structured fields its members share.
+
+    This is the deterministic floor under model-authored summaries. At
+    ``fidelity="summary"`` or ``"brief"``, it preserves structured facts the
+    model could omit or invent, such as every finding sharing one confidence
+    tier or one record being a gap.
+
+    Each field is reported as one of three shapes: constant across the set,
+    a counted small enumeration, or a distinct-count-only identifier. The
+    output is bounded by construction, so nothing is silently shed.
+    """
+    n = len(findings)
+    out: dict = {"n": n, "constant": {}, "varies": {}, "distinct_only": {}}
+    if not n:
+        return out
+
+    for field in _INVARIANT_FIELDS:
+        counts: dict = {}
+        for f in findings:
+            raw = f.get(field)
+            # Older records carry "type" where newer ones carry "record_type".
+            if raw in (None, "") and field == "record_type":
+                raw = f.get("type")
+            value = _INVARIANT_ABSENT if raw in (None, "") else str(raw)
+            counts[value] = counts.get(value, 0) + 1
+        if not counts or list(counts) == [_INVARIANT_ABSENT]:
+            continue  # no finding carried it; say nothing rather than "(absent)×n"
+        if len(counts) == 1:
+            out["constant"][field] = next(iter(counts))
+        elif len(counts) <= _INVARIANT_MAX_VALUES:
+            out["varies"][field] = dict(
+                sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        else:
+            out["distinct_only"][field] = len(counts)
+
+    # Tags are a list per finding, so they get set semantics rather than a class:
+    # which tags EVERY finding carries, and how many distinct ones exist at all.
+    tag_sets = [{str(t) for t in (f.get("tags") or [])} for f in findings]
+    universe: set = set()
+    for s in tag_sets:
+        universe |= s
+    if universe:
+        shared = set.intersection(*tag_sets) if all(tag_sets) else set()
+        out["tags_on_every_finding"] = sorted(shared)
+        out["tags_distinct"] = len(universe)
+    return out
+
+
+# A gap is something that should be checked and has not been; an assumption is a
+# working hypothesis carrying no evidence. Both are open obligations, and both are
+# most dangerous exactly when they have aged out of the recent window — the older a
+# gap is, the more likely everyone has forgotten it is still open. Recency is the
+# wrong axis to drop them on.
+_PROTECTED_RECORD_TYPES = frozenset({"gap", "assumed"})
+# Promotion is off for windows below this. Two reasons. A caller asking for a
+# handful of findings wants a tight recent view, and spending half of it on
+# promotions distorts a small sample far more than a large one. And concretely:
+# grounding.py loads a case with last_n_findings=6 and then takes [:3], which —
+# since selection is chronological and promoted records are older than the window
+# — would have handed it three gaps and no recent findings at all. Measured on
+# dama-gunshot-2026-08-25, which has four gaps among 51 findings, that is exactly
+# what happened. The default window of 20 is unaffected.
+_MIN_WINDOW_FOR_PROMOTION = 10
+
+
+def _record_type(finding: dict) -> str:
+    return str(finding.get("record_type") or finding.get("type") or "")
+
+
+def _select_findings(findings: list, limit: int) -> tuple:
+    """Pick which findings ``last_n_findings`` returns, and say what it dropped.
+
+    Pure recency silently dropped early ``gap`` and ``assumed`` records from
+    long investigations. This selector lets those protected types claim up to
+    half the window, newest first, while the rest stay recency-based.
+
+    Whatever does not fit is reported in ``omitted`` instead of disappearing.
+    Small windows below ``_MIN_WINDOW_FOR_PROMOTION`` never promote protected
+    records, so tight recent views stay recent.
+
+    Returns ``(selected, omitted)`` where selected stays in chronological order.
+    """
+    total = len(findings)
+    if limit <= 0 or total <= limit:
+        return list(findings), {}
+
+    kept = list(range(total - limit, total))
+    older = range(0, total - limit)
+    promotable = ([i for i in older if _record_type(findings[i]) in _PROTECTED_RECORD_TYPES]
+                  if limit >= _MIN_WINDOW_FOR_PROMOTION else [])
+    max_promoted = max(1, limit // 2)
+
+    promoted = 0
+    for i in reversed(promotable):  # newest-first: an older gap loses to a newer one
+        if promoted >= max_promoted:
+            break
+        victim = next((j for j in kept
+                       if _record_type(findings[j]) not in _PROTECTED_RECORD_TYPES), None)
+        if victim is None:
+            break  # every slot already holds a protected finding
+        kept.remove(victim)
+        kept.append(i)
+        promoted += 1
+    kept.sort()
+
+    keptset = set(kept)
+    by_type: dict = {}
+    for i in range(total):
+        if i in keptset:
+            continue
+        rt = _record_type(findings[i]) or "(untyped)"
+        by_type[rt] = by_type.get(rt, 0) + 1
+    omitted = {
+        "count": total - len(kept),
+        "by_record_type": dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "promoted_past_the_window": promoted,
+        "note": ("Selection is recency plus protected types "
+                 f"({', '.join(sorted(_PROTECTED_RECORD_TYPES))}); raise "
+                 "last_n_findings or use investigation_search to see the rest."),
+    }
+    return [findings[i] for i in kept], omitted
+
+
+def investigation_load(
+    investigation_id: str,
+    last_n_findings: int = 20,
+    include_retracted: bool = False,
+    requesting_agent_id: Optional[str] = None,
+    fidelity: str = "full",
+) -> str:
+    """
+    Load an investigation manifest plus a recent-finding view for resuming work.
+
+    Retracted findings are excluded by default so known hallucinations and their
+    contaminated lineage do not re-enter recall. They are not lost: set
+    ``include_retracted=True`` to include them, and the excluded count is always
+    reported as ``excluded_retracted``.
+
+    Args:
+        investigation_id: Investigation identifier.
+        last_n_findings: Window size (default 20). Mostly recency-based, except
+            older ``gap`` and ``assumed`` records may claim up to half the
+            window so open obligations do not age out silently. Anything left
+            out is reported as ``findings_omitted``.
+        include_retracted: Include soft-retracted findings (default False).
+        requesting_agent_id: Optional agent_id of the requesting agent. When
+                             provided and the investigation has a non-empty ACL,
+                             findings are filtered to those authored by agents
+                             in the ACL or by the requesting agent itself.
+        fidelity: Controls how much detail is returned. One of:
+                  "full"    — manifest plus recent findings.
+                  "summary" — manifest plus ``summary_l1`` and ``summary_l2``
+                              instead of the full finding list.
+                  "brief"   — manifest plus ``summary_l2`` only.
+
+    Returns:
+        JSON with the manifest, total-finding counts, and the view selected by
+        ``fidelity``. ``summary`` and ``full`` also include deterministic
+        ``field_invariants`` computed over the whole surviving finding set, not
+        just the visible window. ``full`` adds ``findings_omitted`` only when
+        the window was partial; its presence is the signal that the list is not
+        complete.
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({
+            "error": f"Investigation '{investigation_id}' not found. Call investigation_start first."
+        })
+
+    # Ensure summary fields exist (backwards-compatible with manifests created before this feature)
+    summary_l1 = manifest.get("summary_l1") or []
+    summary_l2 = manifest.get("summary_l2") or ""
+
+    if fidelity == "brief":
+        return json.dumps({
+            "manifest": manifest,
+            "fidelity": "brief",
+            "summary_l2": summary_l2,
+        }, indent=2)
+
+    if fidelity == "summary":
+        findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
+        all_retracted = _load_retracted_ids(investigation_id)
+        total_retracted = len(all_retracted)
+        retracted = set() if include_retracted else all_retracted
+        excluded_retracted = 0
+        if retracted:
+            kept = [f for f in findings if str(f.get("id", "")) not in retracted]
+            excluded_retracted = len(findings) - len(kept)
+            findings = kept
+        return json.dumps({
+            "manifest": manifest,
+            "fidelity": "summary",
+            "total_findings": len(findings),
+            "summary_l1": summary_l1,
+            "summary_l2": summary_l2,
+            # summary_l1/l2 are model-authored; this is not. At this fidelity the
+            # findings themselves are withheld, so without it every word the
+            # caller reads about them is generated.
+            "field_invariants": _field_invariants(findings),
+            "excluded_retracted": excluded_retracted,
+            "total_retracted": total_retracted,
+            "include_retracted": include_retracted,
+        }, indent=2)
+
+    findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
+    all_retracted = _load_retracted_ids(investigation_id)
+    total_retracted = len(all_retracted)
+    retracted = set() if include_retracted else all_retracted
+    excluded_retracted = 0
+    if retracted:
+        kept = [f for f in findings if str(f.get("id", "")) not in retracted]
+        excluded_retracted = len(findings) - len(kept)
+        findings = kept
+
+    acl = manifest.get("acl") or []
+    if requesting_agent_id and acl:
+        acl_set = set(acl)
+        findings = [
+            f for f in findings
+            if f.get("authored_by", "") == requesting_agent_id
+            or f.get("authored_by", "") in acl_set
+        ]
+
+    recent, findings_omitted = _select_findings(findings, last_n_findings)
+    # Append-log overrides win, else stored/default "open"; findings without these fields read open and not-stale.
+    _apply_lifecycle(recent, investigation_id)
+
+    payload = {
+        "manifest": manifest,
+        "fidelity": "full",
+        "total_findings": len(findings),
+        "recent_findings": [_wrap_finding_text(f) for f in recent],
+        # Computed over every finding that survived filtering, not over the
+        # last_n_findings slice: its job is to describe the set the caller is
+        # being given a count of, including the part the slice left out.
+        "field_invariants": _field_invariants(findings),
+        "excluded_retracted": excluded_retracted,
+        # Present only when the window actually left something out, so a load that
+        # returned everything does not carry a paragraph saying it dropped nothing.
+        **({"findings_omitted": findings_omitted} if findings_omitted else {}),
+        "total_retracted": total_retracted,
+        "include_retracted": include_retracted,
+    }
+    verifications = _verification_summary(investigation_id)
+    if verifications:
+        payload["verifications"] = verifications
+    return json.dumps(payload, indent=2)
+
+
+def _verification_summary(investigation_id: str) -> Optional[dict]:
+    """Fold finding_verifications.jsonl into something a reader will actually see.
+
+    ``investigation_verify_all`` writes adversarial verdicts to a separate log.
+    This surfaces them where readers already look: investigation loads.
+
+    Returns ``None`` when there are no verdicts, so unaffected investigations are
+    unchanged. ``degraded`` verdicts are counted separately and never as
+    refutations: they mean no model was reached, not that the finding was judged
+    false.
+    """
+    try:
+        rows = _read_jsonl(_inv_dir(investigation_id) / "finding_verifications.jsonl")
+    except Exception as exc:
+        logger.debug("verification summary unreadable for %s: %r", investigation_id, exc)
+        return None
+    if not rows:
+        return None
+
+    # Append-only: last verdict per finding wins, same rule as finding_updates.
+    latest: dict = {}
+    for r in rows:
+        if isinstance(r, dict) and r.get("finding_id"):
+            latest[str(r["finding_id"])] = r
+
+    counts = {"refuted": 0, "confirmed": 0, "uncertain": 0, "degraded": 0}
+    refuted: list[dict] = []
+    for fid, r in latest.items():
+        if r.get("degraded"):
+            counts["degraded"] += 1
+            continue
+        verdict = str(r.get("verdict") or "uncertain")
+        counts[verdict] = counts.get(verdict, 0) + 1
+        if verdict == "refuted":
+            try:
+                conf = float(r.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            refuted.append({"finding_id": fid, "confidence": conf, "ts": r.get("ts")})
+
+    refuted.sort(key=lambda x: -x["confidence"])
+    out = {"counts": counts, "verified_findings": len(latest)}
+    if refuted:
+        out["refuted"] = refuted
+        out["hint"] = ("adversarial verdicts, advisory only — they do NOT change a "
+                       "finding's resolution. Review, then finding_resolve if warranted.")
+    return out
+
+
+def investigation_as_of(
+    investigation_id: str,
+    as_of_timestamp: str,
+) -> str:
+    """
+    Return findings as they were believed at a specific time.
+
+    A finding is included only if it already existed
+    (``created_at_ts <= as_of_epoch``) and either has no ``valid_until`` or
+    stays valid through ``as_of_timestamp``. This enables bi-temporal
+    reconstruction even after later supersession or retraction.
+
+    Args:
+        investigation_id: Investigation identifier.
+        as_of_timestamp: ISO8601 timestamp (e.g. "2024-01-15T10:30:00+00:00").
+                         Findings created after this moment are excluded, and
+                         findings whose valid_until is before this moment are
+                         also excluded.
+
+    Returns:
+        JSON ``{"investigation_id","as_of","findings","count"}``, or
+        ``{"error": ...}``.
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        try:
+            as_of_dt = datetime.fromisoformat(as_of_timestamp)
+            # Make timezone-aware if naive (assume UTC)
+            if as_of_dt.tzinfo is None:
+                as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
+            as_of_epoch = int(as_of_dt.timestamp())
+        except (ValueError, TypeError) as exc:
+            return json.dumps({"error": f"Invalid as_of_timestamp: {exc}"})
+
+        findings_path = _inv_dir(investigation_id) / "findings.jsonl"
+        all_findings = _read_jsonl(findings_path)
+
+        result_findings = []
+        for f in all_findings:
+            created_at_ts = f.get("created_at_ts")
+            if created_at_ts is None:
+                # Older findings without created_at_ts: include them (fail-open)
+                pass
+            elif int(created_at_ts) > as_of_epoch:
+                continue
+
+            valid_until = f.get("valid_until")
+            if valid_until is not None:
+                try:
+                    vu_dt = datetime.fromisoformat(str(valid_until))
+                    if vu_dt.tzinfo is None:
+                        vu_dt = vu_dt.replace(tzinfo=timezone.utc)
+                    if vu_dt < as_of_dt:
+                        continue
+                except (ValueError, TypeError) as exc:
+                    logger.debug("investigation_as_of: valid_until parse failed (fail-open): %r", exc)
+                    pass  # fail-open: include if valid_until can't be parsed
+
+            result_findings.append(f)
+
+        return json.dumps({
+            "investigation_id": investigation_id,
+            "as_of": as_of_timestamp,
+            "findings": [_wrap_finding_text(f) for f in result_findings],
+            "count": len(result_findings),
+        }, indent=2)
+    except Exception as exc:
+        logger.exception("investigation_as_of failed")
+        return json.dumps({"error": f"investigation_as_of failed: {exc}"})
+
+
+def investigation_note(
+    investigation_id: str,
+    field: str,
+    value: str,
+) -> str:
+    """
+    Update a manifest field for the investigation. Use to track the working
+    hypothesis, next action, open questions, and which sources have been checked.
+
+    Args:
+        investigation_id: Investigation identifier.
+        field: One of:
+               context             — overwrite the investigation context (corrects stale
+                                     framing set at creation time).
+               hypothesis          — current working hypothesis (overwrite).
+               next_step           — recommended next action (overwrite).
+               open_question_add   — append a question to the open list.
+               open_question_remove — remove a question from the open list.
+               checked_source      — mark a source as checked; format as
+                                     "tool_name: one-line summary of what was found".
+               closed_summary      — close the investigation with a final summary.
+
+    Returns:
+        JSON with the updated manifest.
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    raw_value = value if isinstance(value, str) else ("" if value is None else str(value))
+    if field in ("context", "hypothesis", "next_step"):
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": f"Field '{field}' must not be empty or whitespace-only."})
+        manifest[field] = stripped
+        manifest[f"{field}_ts"] = _now()
+    elif field == "open_question_add":
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "open_question_add value must not be empty"})
+        if stripped not in manifest["open_questions"]:
+            manifest["open_questions"].append(stripped)
+    elif field == "open_question_remove":
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "open_question_remove value must not be empty"})
+        manifest["open_questions"] = [q for q in manifest["open_questions"] if q != stripped]
+    elif field == "checked_source":
+        parts = raw_value.rsplit(":", 1)
+        tool = parts[0].strip()
+        summary = parts[1].strip() if len(parts) > 1 else ""
+        if not tool:
+            return json.dumps({"error": "checked_source tool name must not be empty"})
+        if not summary:
+            return json.dumps({"error": "checked_source summary must not be empty"})
+        manifest["checked_sources"].setdefault(tool, []).append({"summary": summary, "ts": _now()})
+    elif field == "closed_summary":
+        stripped = raw_value.strip()
+        if not stripped:
+            return json.dumps({"error": "closed_summary must not be empty or whitespace-only."})
+        manifest["closed_summary"] = stripped
+        manifest["status"] = "closed"
+        manifest["closed_at"] = _now()
+    else:
+        return json.dumps({
+            "error": (
+                f"Unknown field '{field}'. Valid: context, hypothesis, next_step, "
+                "open_question_add, open_question_remove, checked_source, closed_summary"
+            )
+        })
+
+    _save_manifest(manifest)
+    _event_log_append({
+        "op": "note",
+        "investigation_id": investigation_id,
+        "field": field,
+    })
+    return json.dumps({"updated": field, "manifest": manifest}, indent=2)
+
+
+def investigation_reflect(investigation_id: str) -> str:
+    """
+    Synthesize the current state of an investigation. Returns a structured
+    summary of what has been established, what is still open, and what has
+    not been checked. Call before write actions, at handoff points, or when
+    context is growing long.
+
+    Args:
+        investigation_id: Investigation identifier.
+
+    Returns:
+        JSON reflection: finding breakdown, open questions, gaps, hypothesis,
+        checked vs unchecked sources, most recent findings per type,
+        summary_l1/summary_l2, and an optional plain-text ``self_critique``
+        skeptical pass when the local model is available.
+    """
+    manifest = _load_manifest(investigation_id)
+    if not manifest:
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    findings = _only_findings(_read_jsonl(_inv_dir(investigation_id) / "findings.jsonl"))
+    retracted = _load_retracted_ids(investigation_id)
+    excluded_retracted = 0
+    if retracted:
+        kept = [f for f in findings if str(f.get("id", "")) not in retracted]
+        excluded_retracted = len(findings) - len(kept)
+        findings = kept
+
+    by_type: dict[str, list] = {"observed": [], "inferred": [], "assumed": [], "gap": []}
+    for f in findings:
+        by_type.setdefault(f.get("type", "observed"), []).append(f)
+
+    # Fail-open: degrades to empty lists, never blocks reflect.
+    checks = _compute_self_check(investigation_id)
+    self_check = {
+        "unsupported_observed": [
+            {
+                "refs": v.refs,
+                "excerpt": v.subject_excerpt,
+                "rationale": v.rationale,
+                "decision": v.decision,
+                "confidence": v.confidence,
+            }
+            for v in checks["unsupported_observed"]
+        ],
+        "contradictions": [
+            {
+                "refs": v.refs,
+                "excerpt": v.subject_excerpt,
+                "rationale": v.rationale,
+                "decision": v.decision,
+                "confidence": v.confidence,
+            }
+            for v in checks["contradictions"]
+        ],
+        "hallucination_candidates": checks.get("hallucination_candidates", []),
+    }
+
+    entity_counts: dict[str, dict[str, int]] = {
+        "ips": {}, "emails": {}, "hostnames": {}, "hashes": {}, "cves": {}
+    }
+    for f in findings:
+        for etype, vals in (f.get("entities") or {}).items():
+            if etype in entity_counts:
+                for v in (vals or []):
+                    v = str(v).lower()
+                    if v:
+                        entity_counts[etype][v] = entity_counts[etype].get(v, 0) + 1
+    key_entities = {
+        etype: sorted(freq.items(), key=lambda x: x[1], reverse=True)[:5]
+        for etype, freq in entity_counts.items()
+        if freq
+    }
+
+    # Persisted to the manifest so investigation_load need not re-read findings; fail-open to the deterministic summary.
+    summary_l1: list[str] = []
+    summary_l2: str = ""
+    self_critique: Optional[str] = None
+    try:
+        last_20 = findings[-20:]
+        try:
+            from memcheck import llm as _llm
+            if _llm.llm_available() and last_20:
+                context_bullets = _reflect_context_bullets(last_20, investigation_id)
+                l1_prompt = (
+                    f"Investigation: {manifest['title']}\n"
+                    f"Recent findings (up to 20):\n{context_bullets}\n\n"
+                    "Produce exactly 5-7 concise key-point bullet strings that capture "
+                    "the most important things known so far. Each bullet should be a "
+                    "single sentence under 120 characters. Reply with ONLY a JSON array "
+                    "of strings, no other text. Example: [\"First point.\", \"Second point.\"]"
+                )
+                # json_mode=False on purpose: Ollama's format=json coerces the reply to an OBJECT, and this prompt needs a bare ARRAY.
+                l1_raw = _llm.call_llm(l1_prompt, timeout=60.0)
+                if l1_raw:
+                    try:
+                        parsed = json.loads(l1_raw)
+                        # Accept a bare array, or one wrapped in a single-key object.
+                        if isinstance(parsed, dict):
+                            for _v in parsed.values():
+                                if isinstance(_v, list):
+                                    parsed = _v
+                                    break
+                        if isinstance(parsed, list):
+                            summary_l1 = [str(b) for b in parsed if str(b).strip()][:7]
+                    except Exception as _l1_exc:
+                        logger.debug("investigation_reflect: L1 summary JSON parse failed (fail-open): %r", _l1_exc)
+
+                if summary_l1:
+                    l2_prompt = (
+                        f"Investigation: {manifest['title']}\n"
+                        f"Key points:\n" + "\n".join(f"- {b}" for b in summary_l1) + "\n\n"
+                        "Write a 2-3 sentence 'state of knowledge' paragraph summarising "
+                        "what is established, what is uncertain, and what remains to check. "
+                        "Be direct and concise. Reply with only the paragraph text."
+                    )
+                    l2_raw = _llm.call_llm(l2_prompt, timeout=60.0)
+                    if l2_raw:
+                        summary_l2 = l2_raw.strip()
+
+                critique_prompt = (
+                    f"Investigation: {manifest['title']}\n"
+                    f"Recent findings (up to 20):\n{context_bullets}\n\n"
+                    "What in this investigation's current state is weakest, least verified, "
+                    "most likely to be an unfounded assumption, or most likely to be wrong? "
+                    "Be specific and cite which findings/claims are weakest by finding id when visible. "
+                    "Reply with ONLY 2-4 short bullet lines of plain text, one concern per line."
+                )
+                critique_raw = _llm.call_llm(critique_prompt, timeout=60.0)
+                if critique_raw:
+                    critique_lines = [line.strip() for line in str(critique_raw).splitlines() if line.strip()]
+                    bullet_lines = [line for line in critique_lines if line.lstrip().startswith(("-", "*"))]
+                    if bullet_lines:
+                        critique_lines = bullet_lines
+                    if critique_lines:
+                        self_critique = "\n".join(critique_lines[:4])
+        except Exception as exc:
+            logger.debug("investigation_reflect: LLM summary ladder failed (fail-open): %r", exc)
+
+        # Deterministic fallback when LLM is unavailable or failed to produce output
+        if not summary_l1:
+            summary_l1 = [
+                str(f.get("text", ""))[:100]
+                for f in findings[-5:]
+                if str(f.get("text", "")).strip()
+            ]
+        if not summary_l2:
+            n = len(findings)
+            latest_text = str(findings[-1].get("text", "")) if findings else ""
+            summary_l2 = (
+                f"Investigation with {n} finding{'s' if n != 1 else ''}."
+                + (f" Latest: {latest_text[:200]}" if latest_text else "")
+            )
+
+        # Persist to manifest (write-through cache via _save_manifest)
+        manifest["summary_l1"] = summary_l1
+        manifest["summary_l2"] = summary_l2
+        _save_manifest(manifest)
+    except Exception as exc:
+        logger.debug("investigation_reflect: summary ladder persist failed (fail-open): %r", exc)  # fail-open: summary generation never breaks reflect
+
+    result = {
+        "investigation_id": investigation_id,
+        "title": manifest["title"],
+        "status": manifest["status"],
+        "hypothesis": manifest["hypothesis"],
+        "next_step": manifest["next_step"],
+        "finding_counts": {t: len(v) for t, v in by_type.items()},
+        "open_questions": manifest["open_questions"],
+        "checked_sources": manifest["checked_sources"],
+        "gaps": [
+            wrap_untrusted_memory_text(
+                f["text"],
+                origin="loci_memory",
+                investigation_id=investigation_id,
+                finding_id=f.get("id", ""),
+                kind=f.get("type") or f.get("record_type") or "gap",
+                source=f.get("source", ""),
+            )
+            for f in by_type.get("gap", [])
+        ],
+        "recent_per_type": {
+            t: [_wrap_finding_text(entry) for entry in entries[-3:]]
+            for t, entries in by_type.items() if entries
+        },
+        "key_entities": key_entities,
+        "excluded_retracted": excluded_retracted,
+        "self_check": self_check,
+        "summary_l1": summary_l1,
+        "summary_l2": summary_l2,
+    }
+    if self_critique:
+        result["self_critique"] = self_critique
+    return json.dumps(result, indent=2)
+
+
+def investigation_finding_provenance(
+    finding_id: str,
+    investigation_id: str,
+) -> str:
+    """
+    Trace a finding back through its derivation chain to root observed evidence.
+
+    Follows the ``derived_from`` links stored on each finding, walking up the
+    chain until it reaches findings with no parent (root observations) or a
+    cycle is detected. Returns the full chain so the analyst can verify that
+    an inference is actually grounded in observed data and not built on top of
+    another inference or assumption.
+
+    A chain that terminates in an ``assumed`` finding — rather than ``observed``
+    data — means the conclusion is a hypothesis chain, not an evidence chain.
+
+    Args:
+        finding_id: The ID of the finding to trace.
+        investigation_id: The investigation containing the finding.
+
+    Returns:
+        JSON with the chain from the target finding to its root evidence,
+        each node annotated with its type, confidence, source, and text.
+    """
+    # Not _inv_dir(): it creates the directory, so a bad id would silently leave an empty investigation behind.
+    inv_path = _root() / _validated_investigation_id(investigation_id)
+    if not inv_path.is_dir():
+        return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+    findings_by_id: dict[str, dict] = {
+        str(f.get("id", "")): f
+        for f in _read_jsonl(inv_path / "findings.jsonl")
+        if f.get("id")
+    }
+
+    target = findings_by_id.get(finding_id)
+    if not target:
+        return json.dumps({"error": f"Finding '{finding_id}' not found in '{investigation_id}'"})
+
+    chain: list[dict] = []
+    visited: set[str] = set()
+    current_id = finding_id
+    _MAX_CHAIN_DEPTH = 5
+
+    while current_id and current_id not in visited and len(chain) < _MAX_CHAIN_DEPTH:
+        visited.add(current_id)
+        node = findings_by_id.get(current_id)
+        if not node:
+            chain.append({"finding_id": current_id, "error": "not_found"})
+            break
+        chain.append({
+            "finding_id": current_id,
+            "ts": node.get("ts"),
+            "record_type": node.get("record_type") or node.get("type"),
+            "confidence": node.get("confidence"),
+            "numeric_confidence": _node_numeric_confidence(node),
+            "source": node.get("source"),
+            "text": wrap_untrusted_memory_text(
+                str(node.get("text", ""))[:400],
+                origin="loci_memory",
+                investigation_id=investigation_id,
+                finding_id=current_id,
+                kind=node.get("record_type") or node.get("type") or "finding",
+                source=node.get("source"),
+            ),
+            "derived_from": node.get("derived_from", []),
+        })
+        # Only the first parent is followed: grounded_in_observed reflects the first-listed branch only.
+        parents = node.get("derived_from") or []
+        if not parents:
+            break
+        current_id = str(parents[0]) if parents else None
+
+    root = chain[-1] if chain else None
+    root_type = root.get("record_type") if root else None
+    grounded = root_type == "observed"
+
+    # A finding without numeric_confidence resolves from its own confidence label
+    # (_node_numeric_confidence); an unstamped record is not worth 1.0.
+    try:
+        aggregate_confidence = 1.0
+        for node_entry in chain:
+            if "error" not in node_entry:
+                nc = node_entry.get("numeric_confidence", _NEUTRAL_NUMERIC_CONFIDENCE)
+                try:
+                    aggregate_confidence *= float(nc)
+                except (TypeError, ValueError) as exc:
+                    logger.debug("investigation_finding_provenance: fail-open swallow: %r", exc)
+        aggregate_confidence = round(aggregate_confidence, 6)
+    except Exception:
+        aggregate_confidence = None
+
+    return json.dumps({
+        "investigation_id": investigation_id,
+        "chain_length": len(chain),
+        "grounded_in_observed": grounded,
+        "grounding_assessment": (
+            "fully grounded" if grounded
+            else f"chain terminates in '{root_type}' — not directly observed evidence"
+        ),
+        "aggregate_confidence": aggregate_confidence,
+        "chain": chain,
+    }, indent=2, default=str)
+
+
+def investigation_list(
+    limit: int = 30,
+    offset: int = 0,
+    summary: bool = True,
+) -> str:
+    """
+    List investigations, newest-updated first.
+
+    The default is bounded to avoid tool-result overflow: return ``limit``
+    investigations starting at ``offset``. ``summary=True`` returns compact
+    rows; ``summary=False`` adds ``created_at``, ``open_questions_count``,
+    ``hypothesis``, ``visibility``, and ``tier_counts``.
+
+    Args:
+        limit: Max investigations to return (default 30). Use 0 or a negative
+            value for no limit. ``offset`` is still honored, so limit<=0 means
+            "everything starting at offset", not the entire list.
+        offset: Number of investigations to skip from the front (default 0).
+            Always applied, including when limit<=0.
+        summary: If True (default), return only compact fields; if False,
+            return the full record including tier counts.
+
+    Returns:
+        JSON: {"investigations": [...], "total": N, "limit": ..., "offset": ...}
+    """
+    # Coerce BEFORE any early return, so the empty-root path and the normal path echo the same normalized ints.
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    # None collapses into the documented limit<=0 no-limit case; garbage falls back to the default.
+    if limit is None:
+        limit = 0
+    else:
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 30
+
+    # None and '' must preserve summary=True: only 'false'/'0'/'no' may select the overflow-prone full mode.
+    if summary is None:
+        summary = True
+    elif isinstance(summary, str):
+        summary = summary.strip().lower() not in ("false", "0", "no")
+    else:
+        summary = bool(summary)
+
+    if not _root().exists():
+        return json.dumps({"investigations": [], "total": 0, "limit": limit, "offset": offset})
+
+    # Filter to real investigation dirs first: pagination is over investigations, and the findings scan only runs for the page returned.
+    entries = []
+    for d in sorted(_root().iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        manifest = _load_manifest(d.name)
+        if manifest:
+            entries.append((d, manifest))
+
+    total = len(entries)
+
+    if limit <= 0:
+        page = entries[offset:]
+    else:
+        page = entries[offset:offset + limit]
+
+    investigations = []
+    for d, manifest in page:
+        record = {
+            "id": manifest["id"],
+            "title": manifest["title"],
+            "status": manifest["status"],
+            "updated_at": manifest["updated_at"],
+            "finding_counts": manifest["finding_counts"],
+        }
+        if not summary:
+            tier_counts = {"hot": 0, "warm": 0, "cold": 0}
+            try:
+                findings_path = d / "findings.jsonl"
+                for f in _read_jsonl(findings_path):
+                    t = f.get("tier", "warm")
+                    if t in tier_counts:
+                        tier_counts[t] += 1
+                    else:
+                        tier_counts["warm"] += 1  # default for legacy findings
+            except Exception as exc:
+                logger.debug("investigation_list: tier count scan failed (fail-open): %r", exc)
+                pass  # fail-open
+            # acl only feeds visibility, a full-mode-only field, so the summary path skips the lookup.
+            acl = manifest.get("acl") or []
+            record.update({
+                "created_at": manifest["created_at"],
+                "open_questions_count": len(manifest["open_questions"]),
+                "hypothesis": manifest["hypothesis"],
+                "visibility": "shared" if acl else "private",
+                "tier_counts": tier_counts,
+            })
+        investigations.append(record)
+
+    return json.dumps({
+        "investigations": investigations,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }, indent=2)
+
+
+def investigation_share(
+    investigation_id: str,
+    agent_ids: list,
+) -> str:
+    """
+    Grant investigation access to one or more agents.
+
+    Adds ``agent_ids`` to the investigation ACL. Idempotent: already-present
+    agents are left as-is.
+
+    Args:
+        investigation_id: Investigation identifier.
+        agent_ids: List of agent_id strings to add to the ACL.
+
+    Returns:
+        JSON: {"shared_with": [...], "total_acl": N}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        current_acl = list(manifest.get("acl") or [])
+        current_set = set(current_acl)
+        added = []
+        for agent_id in (agent_ids or []):
+            if agent_id and agent_id not in current_set:
+                current_acl.append(agent_id)
+                current_set.add(agent_id)
+                added.append(agent_id)
+
+        manifest["acl"] = current_acl
+        _save_manifest(manifest)
+
+        return json.dumps({
+            "shared_with": added,
+            "total_acl": len(current_acl),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def investigation_unshare(
+    investigation_id: str,
+    agent_ids: list,
+) -> str:
+    """
+    Revoke investigation access from one or more agents.
+
+    Removes ``agent_ids`` from the ACL. Idempotent: missing agents are ignored.
+
+    Args:
+        investigation_id: Investigation identifier.
+        agent_ids: List of agent_id strings to remove from the ACL.
+
+    Returns:
+        JSON: {"removed": [...], "total_acl": N}
+        On error: {"error": "<message>"}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        current_acl = list(manifest.get("acl") or [])
+        remove_set = set(agent_ids or [])
+        removed = [a for a in current_acl if a in remove_set]
+        current_acl = [a for a in current_acl if a not in remove_set]
+
+        manifest["acl"] = current_acl
+        _save_manifest(manifest)
+
+        return json.dumps({
+            "removed": removed,
+            "total_acl": len(current_acl),
+        }, indent=2)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def investigation_export(
+    investigation_id: str,
+    include_embeddings: bool = False,
+) -> str:
+    """
+    Export an investigation as a portable JSON bundle.
+
+    The bundle includes the manifest, findings, conflicts, and entities.
+    ``include_embeddings`` is accepted for forward compatibility, but embeddings
+    are not yet exported.
+
+    Args:
+        investigation_id: Investigation identifier to export.
+        include_embeddings: Reserved for future use — embeddings are not yet
+                            included.  Pass ``True`` to opt-in once supported.
+
+    Returns:
+        JSON: {"exported": true, "investigation_id": str, "bundle": {...},
+               "finding_count": int, "size_bytes": int}
+        On error: {"error": str}
+    """
+    try:
+        manifest = _load_manifest(investigation_id)
+        if not manifest:
+            return json.dumps({"error": f"Investigation '{investigation_id}' not found."})
+
+        inv_dir = _inv_dir(investigation_id)
+
+        findings = _read_jsonl(inv_dir / "findings.jsonl")
+        conflicts = _read_jsonl(inv_dir / "conflicts.jsonl")
+        entities = _read_jsonl(inv_dir / "entities.jsonl")
+
+        bundle = {
+            "schema_version": "1.0",
+            "exported_at": _now(),
+            "manifest": manifest,
+            "findings": findings,
+            "conflicts": conflicts,
+            "entities": entities,
+        }
+
+        bundle_str = json.dumps(bundle)
+        size_bytes = len(bundle_str.encode("utf-8"))
+
+        return json.dumps({
+            "exported": True,
+            "investigation_id": investigation_id,
+            "bundle": bundle,
+            "finding_count": len(findings),
+            "size_bytes": size_bytes,
+        })
+    except Exception as exc:
+        logger.warning("investigation_export failed: %s", exc)
+        return json.dumps({"error": f"Export failed: {exc}"})
+
+
+def investigation_import(
+    bundle_json: str,
+    new_title: Optional[str] = None,
+) -> str:
+    """
+    Import an ``investigation_export`` bundle under a new investigation ID.
+
+    A fresh UUID is always assigned; the original ID is preserved as
+    ``imported_from``. Findings are re-indexed into Qdrant on a best-effort,
+    fail-open basis.
+
+    Args:
+        bundle_json: The JSON string produced by ``investigation_export`` (the
+                     value of the ``bundle`` key, or the whole export response).
+        new_title: Optional override for the investigation title.  When omitted
+                   the original title from the bundle is used.
+
+    Returns:
+        JSON: {"imported": true, "new_investigation_id": str,
+               "original_investigation_id": str, "findings_imported": int,
+               "qdrant_indexed": int}
+        On error: {"error": str}
+    """
+    _MAX_BUNDLE_BYTES = 10 * 1024 * 1024  # 10 MB
+    try:
+        raw_bytes = bundle_json.encode("utf-8") if isinstance(bundle_json, str) else bundle_json
+        if len(raw_bytes) > _MAX_BUNDLE_BYTES:
+            return json.dumps({"error": "bundle too large"})
+
+        try:
+            data = json.loads(bundle_json)
+        except Exception as exc:
+            return json.dumps({"error": f"Invalid JSON in bundle_json: {exc}"})
+
+        # Accept either the raw bundle or the whole export response.
+        if "bundle" in data and isinstance(data.get("bundle"), dict):
+            data = data["bundle"]
+
+        schema_version = data.get("schema_version")
+        if schema_version != "1.0":
+            return json.dumps({"error": f"Unsupported schema_version: {schema_version!r}. Expected '1.0'."})
+
+        required_keys = {"manifest", "findings"}
+        missing = required_keys - set(data.keys())
+        if missing:
+            return json.dumps({"error": f"Bundle is missing required keys: {sorted(missing)}"})
+
+        src_manifest = data["manifest"]
+        if not isinstance(src_manifest, dict):
+            return json.dumps({"error": "Bundle manifest is not a dict."})
+
+        original_id = src_manifest.get("id", "unknown")
+
+        new_id = str(uuid.uuid4())
+
+        now = _now()
+        new_manifest = dict(src_manifest)
+        new_manifest["id"] = new_id
+        new_manifest["created_at"] = now
+        new_manifest["updated_at"] = now
+        new_manifest["imported_from"] = original_id
+        if new_title:
+            new_manifest["title"] = new_title
+
+        inv_dir = _inv_dir(new_id)
+        _save_manifest(new_manifest)
+
+        findings = data.get("findings") or []
+        if not isinstance(findings, list):
+            findings = []
+
+        findings_path = inv_dir / "findings.jsonl"
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            f = dict(finding)
+            f["investigation_id"] = new_id
+            _append_jsonl(findings_path, f)
+
+        conflicts = data.get("conflicts")
+        if conflicts and isinstance(conflicts, list):
+            conflicts_path = inv_dir / "conflicts.jsonl"
+            for entry in conflicts:
+                if isinstance(entry, dict):
+                    _append_jsonl(conflicts_path, entry)
+
+        entities = data.get("entities")
+        if entities and isinstance(entities, list):
+            entities_path = inv_dir / "entities.jsonl"
+            for entry in entities:
+                if isinstance(entry, dict):
+                    _append_jsonl(entities_path, entry)
+
+        # Re-index findings into Qdrant (fail-open).
+        qdrant_indexed = 0
+        import_ts = int(datetime.now(timezone.utc).timestamp())
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            text = str(finding.get("text") or "").strip()
+            finding_id = str(finding.get("id") or "")
+            if not text or not finding_id:
+                continue
+            try:
+                # Index the whole finding, as the native store path does
+                # (server._store_finding). A hand-built payload dropped
+                # created_at_ts, and every age check reads that key: ranking
+                # decay skipped the row and the retention purge could not match
+                # it, so imported findings outranked native ones forever.
+                payload = dict(finding)
+                payload.update({
+                    "investigation_id": new_id,
+                    "type": finding.get("type") or finding.get("record_type") or "observed",
+                    "source": finding.get("source") or "",
+                    "confidence": finding.get("confidence") or "medium",
+                    "tags": finding.get("tags") or [],
+                })
+                if not payload.get("created_at_ts"):
+                    # A bundle with no age at all: substitute import time and say so,
+                    # so a reader can tell a real age from a stand-in.
+                    payload["created_at_ts"] = import_ts
+                    payload["age_source"] = "imported"
+                _qdrant_upsert(finding_id, text, payload)
+                qdrant_indexed += 1
+            except Exception as exc:
+                logger.debug("investigation_import: qdrant upsert skipped for %s: %s", finding_id, exc)
+
+        return json.dumps({
+            "imported": True,
+            "new_investigation_id": new_id,
+            "original_investigation_id": original_id,
+            "findings_imported": len(findings),
+            "qdrant_indexed": qdrant_indexed,
+        })
+    except Exception as exc:
+        logger.warning("investigation_import failed: %s", exc)
+        return json.dumps({"error": f"Import failed: {exc}"})
+
+
+def register(mcp, get_memory_dir, deps):
+    """Inject deps and register every investigation tool on the shared FastMCP instance.
+
+    ``deps`` supplies the server-side collaborators that stayed in server.py; passing
+    them explicitly (rather than importing server) is what keeps this module acyclic.
+    """
+    global _get_memory_dir, _apply_lifecycle, _compute_self_check
+    global _event_log_append, _qdrant_upsert
+    _get_memory_dir = get_memory_dir
+    _apply_lifecycle = deps["_apply_lifecycle"]
+    _compute_self_check = deps["_compute_self_check"]
+    _event_log_append = deps["_event_log_append"]
+    _qdrant_upsert = deps["_qdrant_upsert"]
+    for fn in (
+        investigation_start,
+        investigation_load,
+        investigation_as_of,
+        investigation_note,
+        investigation_reflect,
+        investigation_finding_provenance,
+        investigation_list,
+        investigation_share,
+        investigation_unshare,
+        investigation_export,
+        investigation_import,
+    ):
+        mcp.tool()(fn)

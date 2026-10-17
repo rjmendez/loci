@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Branch-independent launcher for the MLOps nightly.
+#
+# The crontab used to invoke scripts/mlops_loop_cron.sh straight out of the
+# working tree. 38 of the repo's 39 branches do not contain that file, so the
+# job silently no-opped for two nights with nothing in the log but an ENOENT
+# from flock — indistinguishable from "ran and found nothing to do".
+#
+# This resolves the script from origin/main instead, so it does not matter what
+# the working tree is checked out on, and it is loud about every way it can fail.
+set -uo pipefail
+
+LOCK="${LOCI_MLOPS_LOCK:-/tmp/loci-mlops.lock}"
+REPO="${LOCI_REPO:-/home/rjmendez/development/loci}"
+STAGE="${LOCI_MLOPS_STAGE:-$HOME/.loci/mlops/stage}"
+SCRIPT="scripts/mlops_loop_cron.sh"
+stamp() { date -Is; }
+
+# Take the lock HERE rather than in the crontab. `flock -n` in the crontab exits
+# 1 with no output, so a stuck run makes every following night a silent no-op --
+# indistinguishable from "ran and found nothing to do". On 2026-09-01 a loop.py
+# deadlocked for 19h holding this lock and two nightlies vanished without a line.
+# Who holds it, asked BEFORE we open our own descriptor -- otherwise fuser
+# reports this process too and the age below is our own.
+holders="$(fuser "$LOCK" 2>/dev/null | tr -s ' ' | sed 's/^ *//')"
+exec 9>"$LOCK" || { echo "$(stamp) mlops-cron: cannot open $LOCK" >&2; exit 1; }
+if ! flock -n 9; then
+  oldest="${holders%% *}"
+  age="$(ps -o etime= -p "${oldest:-0}" 2>/dev/null | tr -d ' ')"
+  what="$(ps -o args= -p "${oldest:-0}" 2>/dev/null | cut -c1-70)"
+  echo "$(stamp) mlops-cron: SKIPPED — another run holds $LOCK" >&2
+  echo "$(stamp) mlops-cron:   pid ${oldest:-?} running for ${age:-unknown}: ${what:-unknown}" >&2
+  echo "$(stamp) mlops-cron:   a run older than a day is stuck; kill it and the next tick recovers" >&2
+  exit 75   # EX_TEMPFAIL: not an error in this run, but not a run either
+fi
+
+[ -d "$REPO/.git" ] || { echo "$(stamp) mlops-cron: no git repo at $REPO" >&2; exit 1; }
+
+git -C "$REPO" fetch -q origin main 2>/dev/null \
+  || echo "$(stamp) mlops-cron: fetch failed, using the last known origin/main" >&2
+
+mkdir -p "$STAGE"
+if ! git -C "$REPO" show "origin/main:$SCRIPT" > "$STAGE/mlops_loop_cron.sh" 2>/dev/null; then
+  echo "$(stamp) mlops-cron: origin/main has no $SCRIPT — nothing ran" >&2
+  exit 1
+fi
+[ -s "$STAGE/mlops_loop_cron.sh" ] || { echo "$(stamp) mlops-cron: extracted an empty $SCRIPT" >&2; exit 1; }
+chmod +x "$STAGE/mlops_loop_cron.sh"
+
+echo "$(stamp) mlops-cron: running $SCRIPT from origin/main $(git -C "$REPO" rev-parse --short origin/main)"
+exec "$STAGE/mlops_loop_cron.sh" "$@"

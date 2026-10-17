@@ -1,0 +1,1162 @@
+"""mlops/loop.py — self-closing MLOps loop for Loci grounding gate and fine-tuning.
+
+Cycle:
+  1. Discover new investigation runs since last loop tick
+  2. Rebuild grounding dataset with new findings (appends pairs, preserves old)
+  3. Retrain classifier ensemble (mlops/grounding/train.py logic)
+  4. Canary evaluation — auto-promote if candidate beats cosine baseline
+  5. SFT data collection + Ollama model bake (on separate cadence)
+  6. Embedding fine-tune trigger (weekly, emits run_contrastive.sh)
+
+State persisted in mlops/loop_state.json. All decisions logged to mlops/loop_history.jsonl.
+Designed to run as a cron/systemd timer locally (needs Ollama) or via GitHub Actions
+with a self-hosted runner. Gracefully skips embedding steps when Ollama is unreachable.
+"""
+
+import argparse
+import glob
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
+
+
+def _env_int(name: str, default: int) -> int:
+    """Env-parsed int that refuses to crash the nightly at import. A typo in a
+    cron line should not take the job down with a traceback and no context."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        print(f"[loop] {name}={raw!r} is not an integer — using {default}")
+        return default
+    if val <= 0:
+        print(f"[loop] {name}={val} is not positive — using {default}")
+        return default
+    return val
+
+
+STEP_TIMEOUT_S = _env_int("LOCI_MLOPS_STEP_TIMEOUT", 3600)
+
+
+CHILD_ENV: dict[str, str] = {}
+
+
+def _child_label(cmd) -> str:
+    """The script being run, for prefixing its output in a merged log."""
+    for part in cmd[1:]:
+        if isinstance(part, str) and part.endswith(".py"):
+            return Path(part).stem
+    return Path(str(cmd[0])).stem
+
+
+# How long to wait for a child's output readers after the child itself has gone.
+# Only reached when a grandchild inherited the pipe; the drains are daemons and
+# a hung loop is far worse than a truncated log.
+DRAIN_JOIN_SECONDS = float(os.environ.get("LOCI_MLOPS_DRAIN_JOIN", "10"))
+
+
+def _run(cmd, timeout: int | None = None, stream: bool = True):
+    """Run a child with a bound, resolved backends, and its output echoed live.
+
+    Three things a nightly needs and subprocess.run does not give together.
+
+    A hung child stalls the whole run, so every call is bounded and a timeout
+    comes back as returncode 124 rather than an exception.
+
+    A child that cannot see OLLAMA_BASE_URL falls back to a localhost nothing
+    listens on, so CHILD_ENV carries what backends resolved. It is handed over
+    here rather than written into this process's own environment, so importing
+    this module changes nothing for anyone else.
+
+    And capture_output alone buffers everything until the child exits: train.py
+    prints which model it is fitting, and none of that reached this log until the
+    step was already over — 17 minutes of silence in the log cron actually mails
+    you. Output is streamed as it arrives AND captured, so callers that parse
+    result.stdout keep working. PYTHONUNBUFFERED is set because a child writing
+    to a pipe block-buffers by default, which would make the streaming a no-op.
+    """
+    limit = timeout or STEP_TIMEOUT_S
+    env = {**os.environ, **CHILD_ENV}
+    env["PYTHONUNBUFFERED"] = "1"
+    if not stream:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=limit, env=env)
+        except subprocess.TimeoutExpired as exc:
+            out = exc.stdout if isinstance(exc.stdout, str) else ""
+            return subprocess.CompletedProcess(cmd, 124, out,
+                                               f"timed out after {limit}s")
+
+    label = _child_label(cmd)
+    captured: dict[str, list[str]] = {"out": [], "err": []}
+
+    def drain(pipe, key, echo):
+        try:
+            for line in pipe:
+                captured[key].append(line)
+                if echo:
+                    print(f"  [{label}] {line.rstrip()}", flush=True)
+        finally:
+            pipe.close()
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, bufsize=1, env=env)
+    threads = [
+        threading.Thread(target=drain, args=(proc.stdout, "out", True), daemon=True),
+        threading.Thread(target=drain, args=(proc.stderr, "err", False), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    try:
+        code = proc.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        code = 124
+    # Bounded. Joining without a timeout assumed reaping the child closes the
+    # pipes, and that is only true if the child had no grandchild: a grandchild
+    # inherits the pipe fds and holds the write end open after its parent dies,
+    # so `for line in pipe` never returns and this join never comes back.
+    # Measured 2026-09-01: a loop.py sat in futex_wait_queue for 19h07m with two
+    # threads in pipe_read, holding /tmp/loci-mlops.lock, which made every
+    # subsequent `flock -n` nightly exit silently. The threads are daemons, so
+    # abandoning them costs nothing but a few interleaved log lines.
+    for t in threads:
+        t.join(timeout=DRAIN_JOIN_SECONDS)
+    stuck = [t for t in threads if t.is_alive()]
+    err = "".join(captured["err"])
+    if stuck:
+        msg = (f"{len(stuck)} output reader(s) still blocked {DRAIN_JOIN_SECONDS}s after "
+               f"{label} exited — a grandchild is holding the pipe open. "
+               "Output past this point is lost; the step's result is not.")
+        print(f"  [{label}] {msg}", flush=True)
+        err = (err + "\n" + msg).strip()
+    if code == 124:
+        err = (err + f"\ntimed out after {limit}s").strip()
+    return subprocess.CompletedProcess(cmd, code, "".join(captured["out"]), err)
+
+
+REPO = Path(__file__).parent.parent
+MLOPS = REPO / "mlops"
+
+# Run as a script, sys.path[0] is mlops/, not the repo root, so `import mlops.*`
+# fails. The monitor step did exactly that and had never once run.
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+# Steps that failed outright, as opposed to steps deliberately skipped. A run
+# that reports "done" after every step errored is the failure mode this loop
+# spent 67 nights in.
+FAILED_STEPS: list[str] = []
+
+# A step that did its job and found something a human has to act on. Distinct
+# from FAILED_STEPS on purpose: "the canary recommends a rollback" is not a
+# broken step, and burying it in the failure list would make both mean less.
+ALERTS: list[str] = []
+
+# Whole-run wall clock. LOCI_MLOPS_STEP_TIMEOUT bounds each child; nothing
+# bounded the run, so one slow-but-not-hung step could push the nightly into the
+# next day and hold the lock the whole time.
+DEADLINE_SECONDS = float(os.environ.get("LOCI_MLOPS_DEADLINE", "10800"))
+
+
+
+def _last_error_line(stderr: str) -> str:
+    """The exception line out of a traceback. Slicing the last N chars of stderr
+    lands mid-frame and prints a row of carets instead of the actual error."""
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    if not lines:
+        return "no stderr"
+    for ln in reversed(lines):
+        if not ln.lstrip().startswith(("File \"", "^", "~", "|")) and not ln.startswith("    "):
+            return ln[:300]
+    return lines[-1][:300]
+
+
+def _fail(step: str, line: str) -> None:
+    """Record a step as failed and print its message. The step name is the ledger
+    key; the message stays whatever the call site already said."""
+    FAILED_STEPS.append(step)
+    print(f"[loop] {line}")
+
+
+def _over_deadline(started: float, next_step: str) -> bool:
+    """True once the run has used its whole wall clock.
+
+    Checked BETWEEN steps only. A step already running is bounded by its own
+    LOCI_MLOPS_STEP_TIMEOUT and by _run's drain-join bound; this stops the loop
+    from starting more work after the night is gone, and from holding the lock
+    into the next day's tick.
+    """
+    used = time.monotonic() - started
+    if used < DEADLINE_SECONDS:
+        return False
+    _fail("deadline", f"run deadline reached after {used / 60:.0f}m "
+                      f"(LOCI_MLOPS_DEADLINE={DEADLINE_SECONDS:.0f}s) — "
+                      f"stopping before {next_step}")
+    return True
+
+
+def _alert(step: str, line: str) -> None:
+    """The step worked and the answer needs someone. Reported, never silent."""
+    ALERTS.append(step)
+    print(f"[loop] ALERT: {line}")
+
+
+def _days_since(now: datetime, iso_ts, default: int = 999) -> int:
+    """Whole days between a loop_state.json timestamp and ``now``.
+
+    Flooring is fine — for an integer cadence ``floor(x) >= n`` and ``x >= n``
+    agree. Raising is not: a naive or hand-edited timestamp threw out of the
+    cadence gate, which sits AFTER the retrain and canary and BEFORE _save_state,
+    so the tick did its work and then lost its state. A naive stamp is read as
+    UTC; an unreadable one falls back to the same ``default`` a missing key gets
+    (ancient, so run), and says so.
+    """
+    if not iso_ts:
+        return default
+    try:
+        then = datetime.fromisoformat(str(iso_ts))
+    except (TypeError, ValueError):
+        print(f"[loop] unreadable timestamp {iso_ts!r} in loop_state.json — treating as {default}d ago")
+        return default
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return (now - then).days
+
+
+def _skip_reason(ollama_ok: bool, days_ago: int, cadence: int, ollama: str) -> str:
+    """Why a cadence-gated step did not run. These gates are also Ollama-gated, so
+    reciting only the cadence blames the schedule for an unreachable backend."""
+    if not ollama_ok:
+        return f"Ollama unreachable at {ollama}"
+    return f"not due ({days_ago}d ago, cadence {cadence}d)"
+GROUNDING_DIR = REPO / "deep_think_loci" / "grounding"
+STATE_FILE = MLOPS / "loop_state.json"
+HISTORY_FILE = MLOPS / "loop_history.jsonl"
+CANDIDATE_MODEL = MLOPS / "grounding" / "candidate.joblib"
+LIVE_MODEL = GROUNDING_DIR / "grounding_bleed_clf.joblib"
+DATASET = GROUNDING_DIR / "grounding_dataset.jsonl"
+ACTIVE_CANDIDATES = MLOPS / "grounding" / "active_candidates.jsonl"
+
+def _resolve_backends() -> dict:
+    """Fill OLLAMA_BASE_URL and friends from ~/.loci/backends.toml at run time.
+
+    Nothing listens on localhost:11434 on a scheduled host — the endpoint is
+    recorded in the config file that backends.py already reads, and until now
+    only the MCP launcher's own process environment carried it. Without this the
+    loop resolves the localhost default, every embedding step fails or skips, and
+    the log blames the cadence.
+
+    backends.load_env writes into os.environ, which is right for a real run and
+    wrong for a test process, so the values are captured, this process is put
+    back the way it was, and CHILD_ENV carries them to the children instead.
+    """
+    before = dict(os.environ)
+    try:
+        sys.path.insert(0, str(REPO / "mcp"))
+        import backends
+        resolved = backends.load_env(REPO)
+    except Exception as exc:  # never block a run on config resolution
+        print(f"[loop] backend resolution unavailable: {exc}")
+        resolved = {}
+    for key in resolved:
+        if key in before:
+            os.environ[key] = before[key]
+        else:
+            os.environ.pop(key, None)
+    CHILD_ENV.clear()
+    CHILD_ENV.update(resolved)
+    return resolved
+
+
+DEFAULT_OLLAMA = (os.environ.get("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+DEFAULT_FINDINGS = os.path.expanduser("~/.hermes/memory-sessions/dt-loci-*/findings.jsonl")
+DEFAULT_DB = os.path.expanduser(
+    os.environ.get("MNEMOSYNE_DB", "~/.hermes/mnemosyne/data/mnemosyne.db")
+)
+
+_HONESTY_SUMMARY_MAX_CHARS = 600
+_HONESTY_UNSUPPORTED_MAX = 5
+_HONESTY_PROMPT = (
+    "You are checking whether an automated MLOps loop summary overclaims what the "
+    "structured evidence supports.\n"
+    "Use ONLY the JSON payload below. Treat omitted details as intentionally redacted, "
+    "not as evidence. Focus only on factual support/consistency, not wording.\n"
+    "The summary may use key=value tokens (for example promoted=False or "
+    "total_promotions=3); compare those directly against final_summary_facts when present.\n"
+    "Return ONLY valid JSON of this exact shape:\n"
+    '{{"consistent": true, "unsupported_claims": ["..."]}}\n'
+    "- consistent=true when every concrete claim in the summary is supported by the evidence.\n"
+    "- consistent=false when the summary makes a concrete claim that the evidence does not "
+    "support or directly contradicts.\n"
+    "- unsupported_claims must quote or paraphrase only the unsupported parts of the summary.\n\n"
+    "PAYLOAD:\n{payload}\n"
+)
+
+
+# ── State I/O ─────────────────────────────────────────────────────────────────
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {
+        "last_run": None,
+        "last_dataset_size": 0,
+        "runs_seen": [],
+        "last_sft_bake": None,
+        "last_embedding_tune": None,
+        "total_promotions": 0,
+    }
+
+
+def _save_state(state: dict) -> None:
+    """Same-directory temp + os.replace. Truncate-in-place loses the loop's only
+    cross-run state if the process dies mid-write, and _load_state cannot tell an
+    empty file from a first run: it returns the defaults, which re-discovers every
+    historical run as new and opens every cadence gate at once."""
+    tmp = STATE_FILE.parent / (STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, STATE_FILE)
+
+
+def _append_history(record: dict) -> None:
+    with HISTORY_FILE.open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def _final_status(promoted: bool, dataset_size: int, total_promotions: int) -> str:
+    """The loop's final prose summary line."""
+    parts = []
+    if FAILED_STEPS:
+        parts.append(f"{len(FAILED_STEPS)} failed step(s): " + ", ".join(FAILED_STEPS))
+    if ALERTS:
+        parts.append(f"{len(ALERTS)} alert(s): " + ", ".join(ALERTS))
+    status = "done" if not parts else "done with " + "; ".join(parts)
+    return (f"{status}. promoted={promoted} dataset={dataset_size} "
+            f"total_promotions={total_promotions}")
+
+
+def _artifact_fact(path: Path) -> dict:
+    """Compact existence/mtime evidence for honesty checks. Never raises."""
+    try:
+        if not path.exists():
+            return {"exists": False, "mtime": None}
+        return {"exists": True, "mtime": int(path.stat().st_mtime)}
+    except Exception:
+        return {"exists": False, "mtime": None}
+
+
+def _compact_train_metrics(metrics) -> dict | None:
+    """Only the scalar train-metric facts the summary could reasonably cite."""
+    if not isinstance(metrics, dict):
+        return None
+    out = {}
+    for key in ("decision", "model", "cv_f1_mean", "cosine_baseline_cv_f1"):
+        if key in metrics:
+            out[key] = metrics.get(key)
+    return out or None
+
+
+def _compact_jsonish(value, *, max_chars: int = 120):
+    """Bound arbitrary evidence to a compact JSON-ish structure."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:max_chars]
+    if isinstance(value, (list, tuple)):
+        return [_compact_jsonish(v, max_chars=max_chars) for v in value[:8]]
+    if isinstance(value, dict):
+        out = {}
+        for key, item in list(value.items())[:12]:
+            k = str(key)
+            if k in {"stdout", "stderr", "text", "findings", "run_ids", "rows"}:
+                continue
+            out[k[:40]] = _compact_jsonish(item, max_chars=max_chars)
+        return out
+    return str(value)[:max_chars]
+
+
+def _redacted_honesty_payload(summary_text: str, history_record: dict,
+                              run_evidence: Optional[dict] = None) -> dict:
+    """Bounded, redacted facts for the additive summary-consistency check.
+
+    Included:
+      - the final generated summary line/prose (truncated);
+      - the loop_history fields already persisted by this run, with train_metrics reduced
+        to a few scalar facts;
+      - compact run evidence: before/after dataset counts, step outcomes/return codes,
+        failure/alert ledgers, and relevant artifact existence/mtime facts.
+
+    Deliberately excluded:
+      - investigation contents, findings text, run ids, stdout/stderr bodies, and any
+        dataset rows or trace payloads. This keeps the request small and avoids sending
+        secrets or full findings to the model.
+    """
+    record = history_record if isinstance(history_record, dict) else {}
+    evidence = run_evidence if isinstance(run_evidence, dict) else {}
+    return {
+        "summary": (summary_text or "")[:_HONESTY_SUMMARY_MAX_CHARS],
+        "history": {
+            "run_at": record.get("run_at"),
+            "new_runs": record.get("new_runs"),
+            "dataset_size": record.get("dataset_size"),
+            "retrained": record.get("retrained"),
+            "promoted": record.get("promoted"),
+            "train_metrics": _compact_train_metrics(record.get("train_metrics")),
+            "dry_run": record.get("dry_run"),
+            "failed_steps": list(record.get("failed_steps") or []),
+            "alerts": list(record.get("alerts") or []),
+        },
+        "evidence": {
+            "ollama_reachable": evidence.get("ollama_reachable"),
+            "dataset_pairs_before_rebuild": evidence.get("dataset_pairs_before_rebuild"),
+            "dataset_pairs_after_run": evidence.get("dataset_pairs_after_run"),
+            "final_summary_facts": _compact_jsonish(evidence.get("final_summary_facts") or {}),
+            "step_results": _compact_jsonish(evidence.get("step_results") or {}),
+            "artifacts": _compact_jsonish(evidence.get("artifacts") or {}),
+        },
+    }
+
+
+def check_summary_consistency(summary_text: str, history_record: dict,
+                              run_evidence: Optional[dict] = None,
+                              *, gen_fn: Optional[Callable] = None) -> dict:
+    """Fail-open local-model corroboration for the loop's final prose summary.
+
+    This is additive only: callers must never change promotion, state, or exit-code
+    decisions based on this result. On any import/generation/parse failure it returns a
+    degraded result (ok=False, consistent=None) and never raises.
+    """
+    payload = _redacted_honesty_payload(summary_text, history_record, run_evidence)
+    mcp_dir = str(REPO / "mcp")
+    if gen_fn is None:
+        try:
+            if mcp_dir not in sys.path:
+                sys.path.insert(0, mcp_dir)
+            import backends
+            import llm_local
+            gen_fn = llm_local.generate
+            model = backends.ollama_verify_model()
+        except Exception as exc:
+            return {"consistent": None, "unsupported_claims": [], "ok": False,
+                    "error": f"local model import failed: {exc}"[:200]}
+    else:
+        try:
+            if mcp_dir not in sys.path:
+                sys.path.insert(0, mcp_dir)
+            import backends
+            model = backends.ollama_verify_model()
+        except Exception:
+            model = ""
+
+    prompt = _HONESTY_PROMPT.format(payload=json.dumps(payload, sort_keys=True))
+    try:
+        result = gen_fn(prompt, model=model, fmt="json", max_tokens=192, temperature=0.0)
+    except Exception as exc:
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": f"generate() raised: {exc}"[:200]}
+
+    raw = str((result or {}).get("text", "")).strip()
+    if not raw:
+        why = (result or {}).get("why") if isinstance(result, dict) else "empty response"
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": str(why or "empty response")[:200]}
+    if not isinstance(result, dict) or not result.get("ok"):
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": str(result.get("why") or "degraded response")[:200]}
+
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": f"bad JSON: {exc}"[:200]}
+
+    consistent = obj.get("consistent")
+    claims = obj.get("unsupported_claims")
+    if not isinstance(consistent, bool) or not isinstance(claims, list):
+        return {"consistent": None, "unsupported_claims": [], "ok": False,
+                "error": "response missing consistent/bool or unsupported_claims/list"}
+
+    cleaned = []
+    for item in claims:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text:
+            cleaned.append(text[:200])
+        if len(cleaned) >= _HONESTY_UNSUPPORTED_MAX:
+            break
+    return {"consistent": consistent, "unsupported_claims": cleaned, "ok": True, "error": None}
+
+
+# ── Ollama probe ───────────────────────────────────────────────────────────────
+
+def _ollama_ok(base: str) -> bool:
+    try:
+        urllib.request.urlopen(f"{base}/api/tags", timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+# ── New-run discovery ─────────────────────────────────────────────────────────
+
+def _discover_runs(findings_glob: str, seen: list[str]) -> list[str]:
+    seen_set = set(seen)
+    new = []
+    for path in glob.glob(findings_glob):
+        run_id = Path(path).parent.name
+        if run_id not in seen_set:
+            new.append(run_id)
+    return sorted(new)
+
+
+# ── Dataset rebuild ───────────────────────────────────────────────────────────
+
+def _rebuild_dataset(findings_glob: str, ollama: str) -> int | None:
+    """Run build_grounding_dataset.py to refresh the dataset. Returns new pair count.
+
+    Returns None when the rebuild did not run to completion. The size on disk is the
+    same shape on both paths, so returning it for a failed build tells the caller
+    nothing happened while looking exactly like a build that produced that count —
+    and the caller uses the return to mark the runs it was supposed to ingest as seen.
+    """
+    builder = REPO / "deep_think_loci" / "grounding" / "build_grounding_dataset.py"
+    if not builder.exists():
+        print("[loop] build_grounding_dataset.py not found — skipping rebuild")
+        return None
+
+    result = _run(
+        [sys.executable, str(builder),
+         "--findings", findings_glob,
+         "--out", str(GROUNDING_DIR),
+         "--ollama", f"{ollama}/v1/embeddings"],
+    )
+    if result.returncode != 0:
+        _fail("dataset rebuild", f"dataset rebuild failed: {_last_error_line(result.stderr)}")
+        return None
+
+    size = _current_dataset_size()
+    print(f"[loop] dataset rebuilt → {size} pairs")
+    return size
+
+
+def _current_dataset_size() -> int:
+    if not DATASET.exists():
+        return 0
+    return sum(1 for _ in DATASET.open())
+
+
+# ── Grounding gate retrain ────────────────────────────────────────────────────
+
+def _retrain(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
+    """Run mlops/grounding/train.py. Returns metrics dict or None on failure."""
+    metrics_path = MLOPS / "grounding" / "train_metrics.json"
+    cmd = [
+        sys.executable, str(MLOPS / "grounding" / "train.py"),
+        "--dataset", str(DATASET),
+        "--out", str(metrics_path),
+        "--ollama", ollama,
+        "--candidate-out", str(CANDIDATE_MODEL),
+    ]
+    if findings_glob:
+        cmd += ["--findings-glob", findings_glob]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    result = _run(cmd)
+    if result.returncode != 0:
+        _fail("train.py", f"train.py failed: {_last_error_line(result.stderr)}")
+        return None
+
+    if metrics_path.exists():
+        return json.loads(metrics_path.read_text())
+    return None
+
+
+# ── Canary evaluation ─────────────────────────────────────────────────────────
+
+# mlops/grounding/canary.py exit contract.
+CANARY_OK, CANARY_DRIFT, CANARY_ROLLBACK = 0, 1, 2
+
+def _run_canary(findings_glob: str, ollama: str, dry_run: bool) -> dict | None:
+    if not CANDIDATE_MODEL.exists():
+        print("[loop] no candidate model to evaluate")
+        return None
+
+    cmd = [
+        sys.executable, str(MLOPS / "grounding" / "canary.py"),
+        "--candidate", str(CANDIDATE_MODEL),
+        "--target", str(LIVE_MODEL),
+        "--findings", findings_glob,
+        "--ollama", ollama,
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    # canary.py's contract: 0 clean, 1 drift, 2 ROLLBACK RECOMMENDED. Only 1 was
+    # read, so a rollback recommendation -- the loudest thing it can say -- was
+    # discarded, and any other exit looked like a clean run.
+    result = _run(cmd)
+    if result.returncode == CANARY_ROLLBACK:
+        _alert("canary", "canary recommends ROLLBACK — see canary output above")
+    elif result.returncode == CANARY_DRIFT:
+        _alert("canary", "canary drift detected")
+    elif result.returncode != CANARY_OK:
+        _fail("canary", f"canary exited {result.returncode}: "
+                        f"{_last_error_line(result.stderr)}")
+    return {"exit_code": result.returncode, "stdout": result.stdout[-500:]}
+
+
+# ── SFT bake ─────────────────────────────────────────────────────────────────
+
+def _run_sft_bake(ollama: str, dry_run: bool) -> bool:
+    collect_out = MLOPS / "finetune" / "data"
+    collect_out.mkdir(parents=True, exist_ok=True)
+    traces = collect_out / "raw_traces.jsonl"
+    sft = collect_out / "sft_pairs.jsonl"
+
+    for cmd in [
+        [sys.executable, str(MLOPS / "finetune" / "collect.py"),
+         "--out", str(collect_out)],
+        [sys.executable, str(MLOPS / "finetune" / "format_sft.py"),
+         "--traces", str(traces), "--out", str(sft), "--mode", "both"],
+    ]:
+        r = _run(cmd)
+        if r.returncode != 0:
+            _fail("SFT bake", f"SFT step failed: {_last_error_line(r.stderr)}")
+            return False
+
+    if not sft.exists() or sft.stat().st_size < 100:
+        print("[loop] SFT pairs file empty — skipping bake")
+        return False
+
+    if not dry_run:
+        bake_cmd = [
+            sys.executable, str(MLOPS / "finetune" / "train_lora.py"),
+            "--sft", str(sft), "--backend", "ollama-modelfile",
+        ]
+        r = _run(bake_cmd)
+        return r.returncode == 0
+    return True
+
+
+# ── Weibull memory decay ──────────────────────────────────────────────────────
+
+def _run_decay(db_path: str, dry_run: bool) -> dict:
+    try:
+        sys.path.insert(0, str(MLOPS))
+        from memory.decay import apply_decay
+        stats = apply_decay(db_path=db_path, dry_run=dry_run)
+        print(f"[loop] decay: n_rows={stats.get('n_rows')} n_decayed={stats.get('n_decayed')} "
+              f"mean_retention={stats.get('mean_retention', 0):.3f}"
+              f"{' (dry run)' if dry_run else ''}")
+        before = stats.get("n_grounding_visible_before")
+        after = stats.get("n_grounding_visible_after")
+        if before is not None:
+            print(f"[loop] decay: rows visible to the grounding hook "
+                  f"(importance >= {stats.get('grounding_min_importance')}): "
+                  f"{before} -> {after}")
+        return stats
+    except Exception as exc:
+        _fail("decay", f"decay step failed: {exc}")
+        return {}
+
+
+# ── Post-promotion monitoring ─────────────────────────────────────────────────
+
+def _run_monitor(findings_glob: str, ollama: str, dry_run: bool) -> dict:
+    if not LIVE_MODEL.exists():
+        print("[loop] monitor skipped — no live model yet")
+        return {}
+    try:
+        sys.path.insert(0, str(MLOPS / "grounding"))
+        from mlops.grounding.canary import monitor_live
+        result = monitor_live(
+            live_model_path=str(LIVE_MODEL),
+            findings_glob=findings_glob,
+            ollama_url=ollama,
+            dry_run=dry_run,
+        )
+        print(f"[loop] monitor: drift={result.get('drift')} "
+              f"rollback_recommended={result.get('rollback_recommended')}")
+        if result.get("rollback_recommended"):
+            print("[loop] ALERT: rollback recommended — check monitor_history.jsonl")
+        return result
+    except Exception as exc:
+        _fail("monitor", f"monitor step failed: {exc}")
+        return {}
+
+
+# ── Embedding drift detection ─────────────────────────────────────────────────
+
+def _run_embedding_drift(ollama: str, dry_run: bool) -> dict:
+    anchor = MLOPS / "embedding" / "anchor.npz"
+    drift_script = MLOPS / "embedding" / "drift.py"
+    if not drift_script.exists():
+        return {}
+    if not anchor.exists():
+        print("[loop] embedding drift: no anchor — building anchor set ...")
+        cmd = [sys.executable, str(drift_script),
+               "--dataset", str(DATASET), "--ollama", ollama,
+               "--anchor", str(anchor), "--build-anchor"]
+        result = _run(cmd)
+        if result.returncode != 0:
+            _fail("embedding drift", "anchor build failed: "
+                                     f"{_last_error_line(result.stderr)}")
+            return {"exit_code": result.returncode}
+        return {"built_anchor": True}
+
+    out_path = MLOPS / "embedding" / "drift_result.json"
+    # drift.py exits 1 for BOTH "drift exceeded" and "could not measure" (anchor
+    # unreadable, Ollama down). It writes --out only on the measuring path, so a
+    # file this run produced is the discriminator -- without it a down Ollama
+    # read as drift and scheduled a fine-tune.
+    before = out_path.stat().st_mtime if out_path.exists() else -1.0
+    cmd = [sys.executable, str(drift_script),
+           "--dataset", str(DATASET), "--ollama", ollama,
+           "--anchor", str(anchor), "--out", str(out_path)]
+    result = _run(cmd)
+    measured = out_path.exists() and out_path.stat().st_mtime > before
+
+    if result.returncode == 1 and measured:
+        _alert("embedding drift", "embedding drift detected — scheduling embedding fine-tune")
+        if not dry_run:
+            _emit_embedding_trigger()
+    elif result.returncode != 0:
+        _fail("embedding drift", f"drift.py exited {result.returncode} without writing a "
+                                 f"result: {_last_error_line(result.stderr)}")
+
+    if measured:
+        try:
+            return json.loads(out_path.read_text())
+        except Exception as exc:
+            _fail("embedding drift", f"drift.py wrote unreadable JSON: {exc}")
+    return {"exit_code": result.returncode}
+
+
+# ── Active learning ───────────────────────────────────────────────────────────
+
+def _run_active_learn(ollama: str) -> dict:
+    if not LIVE_MODEL.exists() or not DATASET.exists():
+        return {}
+    script = MLOPS / "grounding" / "active_learn.py"
+    if not script.exists():
+        return {}
+    result = _run(
+        [sys.executable, str(script),
+         "--model", str(LIVE_MODEL),
+         "--dataset", str(DATASET),
+         "--out", str(ACTIVE_CANDIDATES),
+         "--ollama", ollama],
+    )
+    if result.returncode != 0:
+        # _run drains child stderr with echo=False, so without this a crash in
+        # the sampler is a silent step that leaves the previous candidates file
+        # in place. Same treatment the dataset-rebuild and train.py steps get.
+        _fail("active_learn", f"active_learn failed: {_last_error_line(result.stderr)}")
+    return {"exit_code": result.returncode}
+
+
+# ── Embedding tune trigger ────────────────────────────────────────────────────
+
+def _emit_embedding_trigger() -> None:
+    """Emit a shell script to run contrastive fine-tuning. Doesn't run it inline
+    since it may need GPU and takes ~20 min even on CPU.
+
+    Rewritten only when the body differs. _embedding_tune_ran() dates a tune
+    against this file's mtime, and touching it on every tick would make a
+    finished fine-tune look stale forever.
+
+    Runs the interpreter this loop is running under, not `python3`. contrastive.py
+    imports sentence_transformers, which the system python3 does not have, so the
+    emitted command died on import and the nag it produces was permanent.
+    """
+    script = MLOPS / "run_contrastive.sh"
+    body = (
+        "#!/bin/bash\n"
+        "# Auto-generated by mlops/loop.py — run when GPU is available\n"
+        f"set -e\n"
+        f"cd {REPO}\n"
+        f"{sys.executable} mlops/embedding/contrastive.py \\\n"
+        f"  --dataset deep_think_loci/grounding/grounding_dataset.jsonl \\\n"
+        f"  --model-size small \\\n"
+        f"  --out mlops/embedding/\n"
+        f"echo 'Done. Load mlops/embedding/loci-embed-small/ as your embedding model.'\n"
+    )
+    try:
+        if not script.exists() or script.read_text() != body:
+            script.write_text(body)
+        script.chmod(0o755)
+    except OSError as exc:
+        # The nag that follows tells the operator to run this file. If it was not
+        # written, that instruction is wrong and the tune can never happen.
+        _fail("embedding trigger", f"could not write {script}: {exc}")
+        return
+    print(f"[loop] embedding trigger written to {script}")
+
+
+def _embedding_tune_ran(since_iso: str | None = None) -> bool:
+    """True when a fine-tune newer than BOTH the trigger and the last recorded
+    tune exists.
+
+    The trigger is only ever a file: nothing in the repo runs
+    run_contrastive.sh. Stamping last_embedding_tune on emission therefore
+    bought 30 days of silence for work that had not happened, so the cadence is
+    stamped against the fine-tune's own output directory instead.
+
+    `since_iso` is the load-bearing half. The script's body is stable, so it is
+    written once and its mtime freezes there; a tune done once is newer than that
+    frozen mtime for the rest of time. Dating against the last recorded tune as
+    well turns the 30-day cadence back into a cadence -- without it the second
+    tick re-stamps last_embedding_tune for a tune that never happened, which is
+    the same false stamp this function was written to remove.
+    """
+    script = MLOPS / "run_contrastive.sh"
+    floor = script.stat().st_mtime if script.exists() else 0.0
+    if since_iso:
+        try:
+            stamped = datetime.fromisoformat(since_iso)
+        except ValueError:
+            stamped = None
+        if stamped is not None:
+            # The loop writes an aware UTC stamp, but a hand-edited or older
+            # state file may be naive, and .timestamp() would read that as local
+            # time -- hours of skew against an mtime, silently.
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=timezone.utc)
+            floor = max(floor, stamped.timestamp())
+    return any(d.is_dir() and d.stat().st_mtime > floor
+               for d in (MLOPS / "embedding").glob("loci-embed-*"))
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+RUNS_SEEN_MAX = int(os.environ.get("LOCI_RUNS_SEEN_MAX", "1000"))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Loci MLOps self-closing loop")
+    ap.add_argument("--findings", default=DEFAULT_FINDINGS,
+                    help="Glob for investigation findings.jsonl files")
+    ap.add_argument("--ollama", default=None,
+                    help="Ollama base URL. Default: $OLLAMA_BASE_URL, else ~/.loci/backends.toml, "
+                         "else http://localhost:11434")
+    ap.add_argument("--min-new-runs", type=int, default=2,
+                    help="Minimum new investigation runs before retraining (default: 2)")
+    ap.add_argument("--min-new-pairs", type=int, default=200,
+                    help="Minimum new dataset pairs before retraining (default: 200)")
+    ap.add_argument("--sft-every", type=int, default=7,
+                    help="SFT bake cadence in days (default: 7)")
+    ap.add_argument("--embedding-every", type=int, default=30,
+                    help="Embedding fine-tune trigger cadence in days (default: 30)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Plan only — no model writes, no Ollama model creates")
+    ap.add_argument("--force", action="store_true",
+                    help="Skip new-data thresholds and retrain unconditionally")
+    ap.add_argument("--db", default=DEFAULT_DB, help="Path to Mnemosyne SQLite database")
+    ap.add_argument("--decay-every", type=int, default=1,
+                    help="Evaluate Weibull decay every N loop runs (default: every run)")
+    ap.add_argument("--decay-apply", action="store_true",
+                    help="Write the decayed importances back. Without this the decay step "
+                         "reports what it would do and changes nothing -- decay has never "
+                         "actually run against a real corpus, and the first write is large "
+                         "and not something a nightly cron should do unasked.")
+    ap.add_argument("--active-learn-every", type=int, default=7,
+                    help="Generate active learning candidates every N days (default: 7)")
+    args = ap.parse_args()
+
+    FAILED_STEPS.clear()  # module-global; a second main() in one process must start clean
+    ALERTS.clear()
+    started = time.monotonic()
+    resolved = _resolve_backends()
+    if args.ollama is None:
+        args.ollama = (os.environ.get("OLLAMA_BASE_URL")
+                       or resolved.get("OLLAMA_BASE_URL")
+                       or "http://localhost:11434").rstrip("/")
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    state = _load_state()
+
+    print(f"[loop] starting at {now_iso}")
+    if resolved:
+        print("[loop] resolved from backends.toml: " + ", ".join(sorted(resolved)))
+    print(f"[loop] state: last_run={state['last_run']} dataset={state['last_dataset_size']} promotions={state['total_promotions']}")
+
+    # ── 1. Ollama probe ────────────────────────────────────────────────────────
+    ollama_ok = _ollama_ok(args.ollama)
+    if not ollama_ok:
+        print(f"[loop] Ollama not reachable at {args.ollama} — embedding/training steps will be skipped")
+
+    # ── 2. New-run discovery ───────────────────────────────────────────────────
+    new_runs = _discover_runs(args.findings, state["runs_seen"])
+    print(f"[loop] new investigation runs: {len(new_runs)} {new_runs}")
+
+    # ── 3. Decide whether to rebuild ──────────────────────────────────────────
+    #
+    # Each threshold is applied where its input is actually knowable.
+    # min_new_runs gates the REBUILD and is decidable now: discovery has just run.
+    # min_new_pairs gates the TRAINING and is not — grounding_dataset.jsonl is an
+    # OUTPUT of the rebuild, so its size here is last run's result. Under the cron
+    # wrapper it is not even that: that wrapper resets its worktree to origin/main
+    # nightly, restoring the committed 5,418-row file while loop_state.json outside
+    # the worktree still holds the previous run's 12,684. The delta came out at
+    # -7,266 and vetoed everything on the night three new investigations carrying
+    # 1,139 findings had just been found.
+    current_size = _current_dataset_size()
+    stale_delta = current_size - state["last_dataset_size"]
+
+    should_rebuild = args.force or (ollama_ok and len(new_runs) >= args.min_new_runs)
+    why = ("forced" if args.force
+           else f"Ollama unreachable at {args.ollama}" if not ollama_ok
+           else f"{len(new_runs)} new runs >= {args.min_new_runs}" if should_rebuild
+           else f"{len(new_runs)} new runs < {args.min_new_runs}")
+    print(f"[loop] dataset on disk: {current_size} pairs "
+          f"({stale_delta:+d} vs last run, pre-rebuild) | rebuild={should_rebuild} ({why})")
+
+    promoted = False
+    train_metrics = None
+    run_evidence = {
+        "ollama_reachable": ollama_ok,
+        "dataset_pairs_before_rebuild": current_size,
+        "dataset_pairs_after_run": current_size,
+        "step_results": {
+            "dataset_rebuild": {"attempted": should_rebuild, "reason": why},
+        },
+        "artifacts": {},
+    }
+
+    should_retrain = should_rebuild
+    if should_rebuild:
+        # ── 4. Rebuild dataset ────────────────────────────────────────────────
+        rebuilt = _rebuild_dataset(args.findings, args.ollama)
+        rebuild_ok = rebuilt is not None
+        new_size = rebuilt if rebuild_ok else _current_dataset_size()
+        new_pairs = new_size - state["last_dataset_size"]
+        run_evidence["dataset_pairs_after_run"] = new_size
+        run_evidence["step_results"]["dataset_rebuild"] = {
+            "attempted": True,
+            "completed": rebuild_ok,
+            "dataset_pairs_after_rebuild": new_size,
+        }
+        print(f"[loop] dataset after rebuild: {new_size} pairs ({new_pairs:+d})")
+
+        # NOW the pair delta is real, so min_new_pairs can be applied to it.
+        if not args.force and new_pairs < args.min_new_pairs:
+            should_retrain = False
+            print(f"[loop] rebuild produced {new_pairs:+d} pairs, under the "
+                  f"{args.min_new_pairs} needed to justify training — skipping the "
+                  "retrain. The dataset is still refreshed and the counts below "
+                  "are current.")
+
+        # ── 5. Retrain ────────────────────────────────────────────────────────
+        train_metrics = _retrain(args.findings, args.ollama, args.dry_run) if should_retrain else None
+        run_evidence["step_results"]["train"] = {
+            "attempted": should_retrain,
+            "train_metrics": _compact_train_metrics(train_metrics),
+        }
+        if train_metrics:
+            decision = train_metrics.get("decision", "HOLD")
+            run_evidence["step_results"]["train"]["decision"] = decision
+            print(f"[loop] train decision: {decision}  model={train_metrics.get('model')}  "
+                  f"cv_f1={train_metrics.get('cv_f1_mean', 0):.3f}  "
+                  f"baseline_f1={train_metrics.get('cosine_baseline_cv_f1', 0):.3f}")
+
+            # ── 6. Canary ─────────────────────────────────────────────────────
+            if decision == "PROMOTE":
+                canary = _run_canary(args.findings, args.ollama, args.dry_run)
+                run_evidence["step_results"]["canary"] = canary or {"attempted": True}
+                if canary and canary.get("exit_code", 1) == 0:
+                    promoted = True
+                    state["total_promotions"] = state.get("total_promotions", 0) + 1
+                    print(f"[loop] PROMOTED — total promotions: {state['total_promotions']}")
+                else:
+                    print("[loop] canary held back or drift detected — keeping current model")
+
+        # Only a rebuild that completed may mark these runs seen: _discover_runs
+        # excludes anything in runs_seen, so stamping them after a failed build
+        # hides them from every later tick and the next rebuild waits for
+        # --min-new-runs FRESH investigations instead of retrying these.
+        if rebuild_ok:
+            state["last_dataset_size"] = new_size
+            # Truncate: runs_seen only exists to skip runs already ingested, so the
+            # tail is what matters. It appended forever and was rewritten in full on
+            # every tick, so the state file grew without bound and got slower to
+            # write as it went.
+            state["runs_seen"] = (state["runs_seen"] + new_runs)[-RUNS_SEEN_MAX:]
+        else:
+            print(f"[loop] holding {len(new_runs)} new run(s) unseen — the rebuild that "
+                  "was supposed to ingest them did not complete")
+
+    loop_count = state.get("total_loop_runs", 0) + 1
+    if _over_deadline(started, "decay"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics, run_evidence)
+
+    # ── 7a. Weibull memory decay (runs every loop tick) ──────────────────────
+    if loop_count % args.decay_every == 0:
+        decay_result = _run_decay(args.db, args.dry_run or not args.decay_apply)
+        run_evidence["step_results"]["decay"] = {
+            "attempted": True,
+            "n_rows": decay_result.get("n_rows"),
+            "n_decayed": decay_result.get("n_decayed"),
+        }
+    else:
+        run_evidence["step_results"]["decay"] = {
+            "attempted": False,
+            "reason": f"run {loop_count}, cadence={args.decay_every}",
+        }
+        print(f"[loop] decay skipped (run {loop_count}, cadence={args.decay_every})")
+
+    # ── 7b. Post-promotion online monitoring ──────────────────────────────────
+    monitor_result = _run_monitor(args.findings, args.ollama, args.dry_run)
+    run_evidence["step_results"]["monitor"] = {
+        "attempted": True,
+        "drift": monitor_result.get("drift"),
+        "rollback_recommended": monitor_result.get("rollback_recommended"),
+    }
+
+    # ── 7d. Embedding drift detection ─────────────────────────────────────────
+    if ollama_ok:
+        drift_result = _run_embedding_drift(args.ollama, args.dry_run)
+        run_evidence["step_results"]["embedding_drift"] = dict(drift_result or {})
+
+    if _over_deadline(started, "the SFT bake"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics, run_evidence)
+
+    # ── 7. SFT bake (cadence-gated) ───────────────────────────────────────────
+    sft_days_ago = _days_since(now, state.get("last_sft_bake"))
+    if ollama_ok and sft_days_ago >= args.sft_every:
+        print(f"[loop] SFT bake (last was {sft_days_ago}d ago)")
+        ok = _run_sft_bake(args.ollama, args.dry_run)
+        run_evidence["step_results"]["sft_bake"] = {"attempted": True, "ok": ok}
+        if ok and not args.dry_run:
+            state["last_sft_bake"] = now_iso
+    else:
+        run_evidence["step_results"]["sft_bake"] = {
+            "attempted": False,
+            "reason": _skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama),
+        }
+        print(f"[loop] SFT bake skipped — {_skip_reason(ollama_ok, sft_days_ago, args.sft_every, args.ollama)}")
+
+    # ── 8. Embedding trigger (cadence-gated) ──────────────────────────────────
+    emb_days_ago = _days_since(now, state.get("last_embedding_tune"))
+    if emb_days_ago >= args.embedding_every:
+        print(f"[loop] embedding trigger (last was {emb_days_ago}d ago)")
+        _emit_embedding_trigger()
+        if _embedding_tune_ran(state.get("last_embedding_tune")):
+            if not args.dry_run:
+                state["last_embedding_tune"] = now_iso
+        else:
+            # An emitted script is not a completed tune, and nothing executes it
+            # for us. Say so every run rather than sleeping on it for 30 days.
+            print("[loop] embedding fine-tune pending — run: "
+                  f"bash {MLOPS / 'run_contrastive.sh'}")
+    else:
+        print(f"[loop] embedding trigger skipped ({emb_days_ago}d ago, cadence={args.embedding_every}d)")
+
+    if _over_deadline(started, "active learning"):
+        return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                       should_retrain, promoted, train_metrics, run_evidence)
+
+    # ── 8a. Active learning candidates (cadence-gated) ────────────────────────
+    al_days_ago = _days_since(now, state.get("last_active_learn"))
+    if ollama_ok and al_days_ago >= args.active_learn_every:
+        print(f"[loop] active_learn (last was {al_days_ago}d ago)")
+        al_result = _run_active_learn(args.ollama)
+        run_evidence["step_results"]["active_learn"] = dict(al_result or {})
+        if al_result.get("exit_code", 1) == 0 and not args.dry_run:
+            state["last_active_learn"] = now_iso
+    else:
+        run_evidence["step_results"]["active_learn"] = {
+            "attempted": False,
+            "reason": _skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama),
+        }
+        print(f"[loop] active_learn skipped — {_skip_reason(ollama_ok, al_days_ago, args.active_learn_every, args.ollama)}")
+
+    # ── 9. Persist state + history ────────────────────────────────────────────
+    return _finish(state, args, now_iso, loop_count, new_runs, current_size,
+                   should_retrain, promoted, train_metrics, run_evidence)
+
+
+def _finish(state, args, now_iso, loop_count, new_runs, current_size,
+            should_retrain, promoted, train_metrics, run_evidence: Optional[dict] = None) -> int:
+    """Persist, report, and return the exit code.
+
+    Its own function because the deadline check returns here from the middle of
+    the run: a loop that stops early still has to write its state and say why,
+    or the early exit looks exactly like a clean one.
+    """
+    state["last_run"] = now_iso
+    state["total_loop_runs"] = loop_count
+    if not args.dry_run:
+        _save_state(state)
+
+    final_line = _final_status(promoted, state["last_dataset_size"], state["total_promotions"])
+
+    evidence = dict(run_evidence or {})
+    evidence["dataset_pairs_after_run"] = evidence.get("dataset_pairs_after_run", _current_dataset_size())
+    evidence["final_summary_facts"] = {
+        "promoted": promoted,
+        "dataset_size": state["last_dataset_size"],
+        "total_promotions": state["total_promotions"],
+        "failed_steps": list(FAILED_STEPS),
+        "alerts": list(ALERTS),
+    }
+    evidence["artifacts"] = {
+        "dataset": _artifact_fact(DATASET),
+        "train_metrics": _artifact_fact(MLOPS / "grounding" / "train_metrics.json"),
+        "candidate_model": _artifact_fact(CANDIDATE_MODEL),
+        "live_model": _artifact_fact(LIVE_MODEL),
+        "active_candidates": _artifact_fact(ACTIVE_CANDIDATES),
+        "drift_result": _artifact_fact(MLOPS / "embedding" / "drift_result.json"),
+        "sft_pairs": _artifact_fact(MLOPS / "finetune" / "data" / "sft_pairs.jsonl"),
+        "embedding_trigger": _artifact_fact(MLOPS / "run_contrastive.sh"),
+    }
+    history_record = {
+        "run_at": now_iso,
+        "new_runs": len(new_runs),
+        "dataset_size": current_size,
+        "retrained": should_retrain,
+        "promoted": promoted,
+        "train_metrics": train_metrics,
+        "dry_run": args.dry_run,
+        "failed_steps": list(FAILED_STEPS),
+        "alerts": list(ALERTS),
+    }
+    honesty = check_summary_consistency(final_line, history_record, evidence)
+    if honesty.get("ok") and honesty.get("consistent") is False:
+        claims = honesty.get("unsupported_claims") or []
+        msg = "summary consistency check found unsupported claim(s)"
+        if claims:
+            msg += ": " + "; ".join(claims[:2])
+        _alert("summary honesty", msg[:300])
+        history_record["alerts"] = list(ALERTS)
+
+    _append_history(history_record)
+
+    print(f"[loop] {_final_status(promoted, state['last_dataset_size'], state['total_promotions'])}")
+    return 1 if FAILED_STEPS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

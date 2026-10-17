@@ -1,0 +1,381 @@
+{
+  "completed_at": "2026-09-30T01:42:55.588369-04:00",
+  "environment": {
+    "base_url": "http://100.73.200.19:11434",
+    "concurrency": [
+      1,
+      2
+    ],
+    "host": "100.73.200.19:11434",
+    "keep_alive": "30m",
+    "loaded_models_before_run": [
+      "nomic-embed-text:latest"
+    ],
+    "max_tokens": 96,
+    "model": "gemma4:26b",
+    "prompt": "Classify this local reflection observation as real_regression, flaky_or_nondeterministic, config_or_environment, noise_or_benign, or unknown. Return only JSON with category and novelty.",
+    "prompt_chars": 185,
+    "prompt_words": 19,
+    "residency_probe_error_before_run": "",
+    "resident_before_run": false,
+    "stream_requested": false,
+    "temperature": 0.0,
+    "timeout_s": 180.0,
+    "trials": 2,
+    "warmup_iterations": 1
+  },
+  "results": [
+    {
+      "aggregate_requests_per_sec": {
+        "count": 2,
+        "max": 0.4124250639118054,
+        "mean": 0.40537710032389845,
+        "min": 0.3983291367359915,
+        "p50": 0.40537710032389845,
+        "p90": 0.411015471194224,
+        "p99": 0.4122841046400473,
+        "stddev": 0.009967325693129728
+      },
+      "concurrency": 1,
+      "latency_ms": {
+        "total": {
+          "count": 2,
+          "max": 2490.399599992088,
+          "mean": 2454.7698499955004,
+          "min": 2419.140099998913,
+          "p50": 2454.7698499955004,
+          "p90": 2483.2736499927705,
+          "p99": 2489.6870049921563,
+          "stddev": 50.38807566913697
+        },
+        "trial_wall": {
+          "count": 2,
+          "max": 2510.4867000045488,
+          "mean": 2467.5848000042606,
+          "min": 2424.6829000039725,
+          "p50": 2467.5848000042606,
+          "p90": 2501.906320004491,
+          "p99": 2509.628662004543,
+          "stddev": 60.6724488319818
+        },
+        "ttft": {
+          "count": 0,
+          "max": null,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p99": null,
+          "stddev": null
+        }
+      },
+      "loaded_models_after": [
+        "gemma4:26b"
+      ],
+      "loaded_models_before": [
+        "nomic-embed-text:latest"
+      ],
+      "notes": [],
+      "request_count": 2,
+      "residency_probe_error_after": "",
+      "residency_probe_error_before": "",
+      "resident_after": true,
+      "resident_before": false,
+      "streaming": {
+        "requested": false,
+        "requests_streamed": 0,
+        "ttft_measured": false,
+        "ttft_note": "streaming disabled, so TTFT is unavailable by design"
+      },
+      "tokens": {
+        "aggregate_tokens_per_sec": {
+          "count": 2,
+          "max": 13.610027109089579,
+          "mean": 13.377444310688649,
+          "min": 13.14486151228772,
+          "p50": 13.377444310688649,
+          "p90": 13.563510549409393,
+          "p99": 13.60537545312156,
+          "speedup_vs_concurrency_1": 1.0,
+          "stddev": 0.3289217478732815
+        },
+        "output_eval_count": {
+          "count": 2,
+          "max": 33.0,
+          "mean": 33.0,
+          "min": 33.0,
+          "p50": 33.0,
+          "p90": 33.0,
+          "p99": 33.0,
+          "stddev": 0.0
+        },
+        "per_request_server_eval_tokens_per_sec": {
+          "count": 2,
+          "max": 16.982428332865886,
+          "mean": 16.88415433036487,
+          "min": 16.78588032786385,
+          "p50": 16.88415433036487,
+          "p90": 16.962773532365684,
+          "p99": 16.980462852815865,
+          "stddev": 0.13898042716562717
+        },
+        "per_request_wall_tokens_per_sec": {
+          "count": 2,
+          "max": 13.641210775686298,
+          "mean": 13.446048148134476,
+          "min": 13.250885520582656,
+          "p50": 13.446048148134476,
+          "p90": 13.602178250175934,
+          "p99": 13.637307523135261,
+          "stddev": 0.27600163475215433
+        },
+        "prompt_eval_count": {
+          "count": 2,
+          "max": 57.0,
+          "mean": 57.0,
+          "min": 57.0,
+          "p50": 57.0,
+          "p90": 57.0,
+          "p99": 57.0,
+          "stddev": 0.0
+        }
+      },
+      "transport_failures": 0,
+      "trial_count": 2,
+      "trial_details": [
+        {
+          "aggregate_requests_per_sec": 0.4124250639118054,
+          "aggregate_tokens_per_sec": 13.610027109089579,
+          "concurrency": 1,
+          "requests": [
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 16.982428332865886,
+              "stream_used": false,
+              "total_ms": 2419.140099998913,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 13.641210775686298
+            }
+          ],
+          "trial_index": 0,
+          "wall_ms": 2424.6829000039725
+        },
+        {
+          "aggregate_requests_per_sec": 0.3983291367359915,
+          "aggregate_tokens_per_sec": 13.14486151228772,
+          "concurrency": 1,
+          "requests": [
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 16.78588032786385,
+              "stream_used": false,
+              "total_ms": 2490.399599992088,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 13.250885520582656
+            }
+          ],
+          "trial_index": 1,
+          "wall_ms": 2510.4867000045488
+        }
+      ],
+      "warmup_iterations": 1
+    },
+    {
+      "aggregate_requests_per_sec": {
+        "count": 2,
+        "max": 0.7761573165314009,
+        "mean": 0.6373828875570151,
+        "min": 0.4986084585826294,
+        "p50": 0.6373828875570151,
+        "p90": 0.7484024307365237,
+        "p99": 0.7733818279519131,
+        "stddev": 0.19625667956615808
+      },
+      "concurrency": 2,
+      "latency_ms": {
+        "total": {
+          "count": 4,
+          "max": 4008.687599998666,
+          "mean": 3226.5206499978376,
+          "min": 2572.2638000006555,
+          "p50": 3162.5655999960145,
+          "p90": 3931.382489996031,
+          "p99": 4000.9570889984025,
+          "stddev": 761.6948046041039
+        },
+        "trial_wall": {
+          "count": 2,
+          "max": 4011.1634000058984,
+          "mean": 3293.9803000044776,
+          "min": 2576.797200003057,
+          "p50": 3293.9803000044776,
+          "p90": 3867.7267800056143,
+          "p99": 3996.81973800587,
+          "stddev": 1014.250066726789
+        },
+        "ttft": {
+          "count": 0,
+          "max": null,
+          "mean": null,
+          "min": null,
+          "p50": null,
+          "p90": null,
+          "p99": null,
+          "stddev": null
+        }
+      },
+      "loaded_models_after": [
+        "gemma4:26b"
+      ],
+      "loaded_models_before": [
+        "gemma4:26b"
+      ],
+      "notes": [],
+      "request_count": 4,
+      "residency_probe_error_after": "",
+      "residency_probe_error_before": "",
+      "resident_after": true,
+      "resident_before": true,
+      "streaming": {
+        "requested": false,
+        "requests_streamed": 0,
+        "ttft_measured": false,
+        "ttft_note": "streaming disabled, so TTFT is unavailable by design"
+      },
+      "tokens": {
+        "aggregate_tokens_per_sec": {
+          "count": 2,
+          "max": 25.613191445536227,
+          "mean": 21.0336352893815,
+          "min": 16.45407913322677,
+          "p50": 21.0336352893815,
+          "p90": 24.69728021430528,
+          "p99": 25.521600322413132,
+          "speedup_vs_concurrency_1": 1.5723209008297283,
+          "stddev": 6.476470425683217
+        },
+        "output_eval_count": {
+          "count": 4,
+          "max": 33.0,
+          "mean": 33.0,
+          "min": 33.0,
+          "p50": 33.0,
+          "p90": 33.0,
+          "p99": 33.0,
+          "stddev": 0.0
+        },
+        "per_request_server_eval_tokens_per_sec": {
+          "count": 4,
+          "max": 15.257808414635104,
+          "mean": 12.960123883879408,
+          "min": 10.557641845117475,
+          "p50": 13.012522637882526,
+          "p90": 15.25439302712327,
+          "p99": 15.257466875883921,
+          "stddev": 2.6481058714699186
+        },
+        "per_request_wall_tokens_per_sec": {
+          "count": 4,
+          "max": 12.829166277576814,
+          "mean": 10.66970263647054,
+          "min": 8.232120657147487,
+          "p50": 10.808761805578927,
+          "p90": 12.826380034094134,
+          "p99": 12.828887653228547,
+          "stddev": 2.4988628849327883
+        },
+        "prompt_eval_count": {
+          "count": 4,
+          "max": 57.0,
+          "mean": 57.0,
+          "min": 57.0,
+          "p50": 57.0,
+          "p90": 57.0,
+          "p99": 57.0,
+          "stddev": 0.0
+        }
+      },
+      "transport_failures": 0,
+      "trial_count": 2,
+      "trial_details": [
+        {
+          "aggregate_requests_per_sec": 0.7761573165314009,
+          "aggregate_tokens_per_sec": 25.613191445536227,
+          "concurrency": 2,
+          "requests": [
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 15.246423789595655,
+              "stream_used": false,
+              "total_ms": 2574.1273000021465,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 12.819878799301216
+            },
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 15.257808414635104,
+              "stream_used": false,
+              "total_ms": 2572.2638000006555,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 12.829166277576814
+            }
+          ],
+          "trial_index": 0,
+          "wall_ms": 2576.797200003057
+        },
+        {
+          "aggregate_requests_per_sec": 0.4986084585826294,
+          "aggregate_tokens_per_sec": 16.45407913322677,
+          "concurrency": 2,
+          "requests": [
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 10.778621486169396,
+              "stream_used": false,
+              "total_ms": 4008.687599998666,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 8.232120657147487
+            },
+            {
+              "error": "",
+              "output_chars": 165,
+              "output_tokens": 33,
+              "prompt_tokens": 57,
+              "server_eval_tokens_per_sec": 10.557641845117475,
+              "stream_used": false,
+              "total_ms": 3751.0038999898825,
+              "transport_ok": true,
+              "ttft_ms": null,
+              "wall_tokens_per_sec": 8.797644811856637
+            }
+          ],
+          "trial_index": 1,
+          "wall_ms": 4011.1634000058984
+        }
+      ],
+      "warmup_iterations": 1
+    }
+  ],
+  "schema_version": 1,
+  "started_at": "2026-09-30T01:41:10.274610-04:00"
+}

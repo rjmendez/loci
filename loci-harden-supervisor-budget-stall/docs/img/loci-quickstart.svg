@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 220" width="860" height="220">
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    </style>
+    <marker id="arr-qs" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#9CA3AF"/>
+    </marker>
+    <linearGradient id="grad1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#EFF6FF"/>
+      <stop offset="100%" stop-color="#EDE9FE"/>
+    </linearGradient>
+    <linearGradient id="grad2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#EDE9FE"/>
+      <stop offset="100%" stop-color="#ECFDF5"/>
+    </linearGradient>
+    <linearGradient id="grad3" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#ECFDF5"/>
+      <stop offset="100%" stop-color="#D1FAE5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="860" height="220" fill="#F9FAFB" rx="12"/>
+  <text x="430" y="28" text-anchor="middle" fill="#1F2937" font-size="14" font-weight="700">Set up Loci in three steps</text>
+
+  <!-- ── STEP 1 ── -->
+  <rect x="20" y="50" width="245" height="148" rx="12" fill="url(#grad1)" stroke="#BFDBFE" stroke-width="1.5"/>
+  <!-- Step number circle -->
+  <circle cx="50" cy="78" r="16" fill="#3B82F6"/>
+  <text x="50" y="83" text-anchor="middle" fill="white" font-size="14" font-weight="700">1</text>
+  <text x="78" y="83" fill="#1E40AF" font-size="13" font-weight="700">Install dependencies</text>
+
+  <text x="35" y="112" fill="#374151" font-size="11" font-weight="600">Qdrant</text>
+  <text x="35" y="128" fill="#6B7280" font-size="10">docker run -p 6333:6333 qdrant/qdrant</text>
+
+  <text x="35" y="148" fill="#374151" font-size="11" font-weight="600">Ollama + embedding model</text>
+  <text x="35" y="164" fill="#6B7280" font-size="10">brew install ollama</text>
+  <text x="35" y="178" fill="#6B7280" font-size="10">ollama pull nomic-embed-text</text>
+
+  <!-- Arrow 1→2 -->
+  <path d="M 265 124 L 290 124" stroke="#9CA3AF" stroke-width="1.5" fill="none" marker-end="url(#arr-qs)"/>
+
+  <!-- ── STEP 2 ── -->
+  <rect x="290" y="50" width="275" height="148" rx="12" fill="url(#grad2)" stroke="#C4B5FD" stroke-width="1.5"/>
+  <circle cx="320" cy="78" r="16" fill="#8B5CF6"/>
+  <text x="320" y="83" text-anchor="middle" fill="white" font-size="14" font-weight="700">2</text>
+  <text x="348" y="83" fill="#5B21B6" font-size="13" font-weight="700">Install and configure Loci</text>
+
+  <text x="305" y="112" fill="#374151" font-size="11" font-weight="600">Clone and install</text>
+  <text x="305" y="128" fill="#6B7280" font-size="10">git clone github.com/rjmendez/loci</text>
+  <text x="305" y="144" fill="#6B7280" font-size="10">cd loci/mcp &amp;&amp; python3 -m venv .venv</text>
+  <text x="305" y="160" fill="#6B7280" font-size="10">.venv/bin/pip install -e "."</text>
+
+  <text x="305" y="180" fill="#374151" font-size="11" font-weight="600">Configure</text>
+  <text x="305" y="194" fill="#6B7280" font-size="10">cp ../.env.example .env  # set QDRANT_URL + OLLAMA_BASE_URL</text>
+
+  <!-- Arrow 2→3 -->
+  <path d="M 565 124 L 590 124" stroke="#9CA3AF" stroke-width="1.5" fill="none" marker-end="url(#arr-qs)"/>
+
+  <!-- ── STEP 3 ── -->
+  <rect x="590" y="50" width="250" height="148" rx="12" fill="url(#grad3)" stroke="#6EE7B7" stroke-width="1.5"/>
+  <circle cx="620" cy="78" r="16" fill="#10B981"/>
+  <text x="620" y="83" text-anchor="middle" fill="white" font-size="14" font-weight="700">3</text>
+  <text x="648" y="83" fill="#065F46" font-size="13" font-weight="700">Wire into Claude Code</text>
+
+  <text x="605" y="112" fill="#374151" font-size="11" font-weight="600">Add to ~/.claude/settings.json</text>
+  <text x="605" y="130" fill="#6B7280" font-size="10">"loci": {</text>
+  <text x="605" y="146" fill="#6B7280" font-size="10">  "type": "stdio",</text>
+  <text x="605" y="162" fill="#6B7280" font-size="10">  "command": "/path/to/.venv/bin/python3",</text>
+  <text x="605" y="178" fill="#6B7280" font-size="10">  "args": ["/path/to/loci/mcp/server.py"]</text>
+  <text x="605" y="194" fill="#6B7280" font-size="10">}</text>
+</svg>

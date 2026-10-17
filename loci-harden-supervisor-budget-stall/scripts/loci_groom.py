@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+"""Passive grooming for the Loci corpus; meant for unattended cron runs.
+
+Per-pass rules:
+  IDEMPOTENT   rerunning unchanged input proposes nothing new
+  FAIL-OPEN    dead backends degrade to a report; they do not raise or leave the corpus half-written
+  SHADOW-FIRST model-derived output goes to `_groom/proposals.jsonl` with provenance
+               (`pass`, `model`, `score`) and never into `findings.jsonl`; proposals
+               must stay distinguishable from author-written fields
+
+`--apply` promotes only passes that declare `applyable` — today just `index`,
+whose write is a re-upsert of the record already on disk, so it can restore but
+cannot invent.
+
+Usage:
+    loci_groom.py index
+    loci_groom.py index --apply
+    loci_groom.py tags --limit 200
+    loci_groom.py all --json
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+_REPO = Path(os.path.dirname(os.path.abspath(__file__))).parent
+sys.path.insert(0, str(_REPO / "mcp"))
+
+
+def load_env() -> dict:
+    """Resolve backend config the way the server does, then via config files.
+
+    Cron does not inherit the MCP launcher's environment, and the running
+    server's `QDRANT_URL` may exist only in that server process. Without this,
+    scheduled passes can report `qdrant unreachable` forever.
+    Precedence: existing env -> repo `.env` files -> `~/.loci/backends.toml`.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_REPO / ".env")
+        load_dotenv(_REPO / "mcp" / ".env", override=True)
+    except Exception as exc:
+        logger.warning("load_env: .env unreadable (%r) — env-file settings, including "
+                       "LOCI_QDRANT_RETENTION_DAYS, will NOT be applied", exc)
+
+    resolved = {}
+    if not os.environ.get("QDRANT_URL"):
+        try:
+            import backends
+            url, key = backends.qdrant()
+            if url:
+                os.environ["QDRANT_URL"] = url
+                resolved["QDRANT_URL"] = url
+                if key and not os.environ.get("QDRANT_API_KEY"):
+                    os.environ["QDRANT_API_KEY"] = key
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Qdrant from backends: %r", exc)
+    if not os.environ.get("OLLAMA_BASE_URL"):
+        try:
+            import backends
+            url = backends.ollama_url()
+            if url:
+                os.environ["OLLAMA_BASE_URL"] = url
+                resolved["OLLAMA_BASE_URL"] = url
+        except Exception as exc:
+            logger.warning("load_env: could not resolve Ollama from backends: %r", exc)
+
+    # backends.toml uses stdlib tomllib, so this safety setting needs no extra import.
+    if not os.environ.get("LOCI_QDRANT_RETENTION_DAYS"):
+        try:
+            import backends
+            days = backends._cfg("qdrant", "retention_days", None)
+            if days is not None:
+                os.environ["LOCI_QDRANT_RETENTION_DAYS"] = str(days)
+                resolved["LOCI_QDRANT_RETENTION_DAYS"] = str(days)
+        except Exception as exc:
+            logger.warning("load_env: could not resolve retention from backends: %r", exc)
+    return resolved
+
+
+logger = logging.getLogger("loci-groom")
+
+MEMORY_DIR = Path(os.environ.get(
+    "LOCI_MEMORY_DIR",
+    os.path.expanduser("~/.hermes/memory-sessions"),
+))
+GROOM_DIR = MEMORY_DIR / "_groom"
+
+# Unset on purpose: vLLM and Ollama name the same model differently.
+GROOM_MODEL = os.environ.get("LOCI_GROOM_MODEL") or None
+GROOM_BATCH = int(os.environ.get("LOCI_GROOM_BATCH", "16"))
+# Per-run ceilings bound a nightly job, not an interactive operator.
+VERIFY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_VERIFY_INVESTIGATIONS", "5"))
+VERIFY_PER_INVESTIGATION = int(os.environ.get("LOCI_GROOM_VERIFY_FINDINGS", "10"))
+SUMMARY_MAX_PER_RUN = int(os.environ.get("LOCI_GROOM_SUMMARY_INVESTIGATIONS", "12"))
+REFLECT_MAX_ITEMS = int(os.environ.get("LOCI_GROOM_REFLECT_ITEMS", "3"))
+
+
+# --- corpus access ----------------------------------------------------------
+
+def iter_findings(memory_dir: Optional[Path] = None) -> Iterable[dict]:
+    """Yield every on-disk finding. The JSONL files are the system of record."""
+    root = memory_dir or MEMORY_DIR
+    for path in sorted(root.glob("*/findings.jsonl")):
+        try:
+            with open(path, errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except ValueError:
+                        continue
+        except OSError:
+            continue
+
+
+def _proposal(pass_name: str, subject_id: str, kind: str, value, **extra) -> dict:
+    return {
+        "id": f"{pass_name}:{kind}:{subject_id}",
+        "pass": pass_name,
+        "subject_id": subject_id,
+        "kind": kind,
+        "value": value,
+        "proposed_by": f"loci_groom/{pass_name}",
+        "model": extra.pop("model", None),
+        "score": extra.pop("score", None),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+        **extra,
+    }
+
+
+def write_proposals(rows: list[dict], groom_dir: Optional[Path] = None) -> int:
+    """Append proposals, skip ids already on file, and return the number written."""
+    if not rows:
+        return 0
+    root = groom_dir or GROOM_DIR
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "proposals.jsonl"
+
+    seen = set()
+    if path.exists():
+        with open(path, errors="ignore") as fh:
+            for line in fh:
+                try:
+                    seen.add(json.loads(line).get("id"))
+                except ValueError:
+                    continue
+
+    fresh = [r for r in rows if r.get("id") not in seen]
+    if not fresh:
+        return 0
+    with open(path, "a") as fh:
+        for r in fresh:
+            fh.write(json.dumps(r) + "\n")
+    return len(fresh)
+
+
+# --- pass: index ------------------------------------------------------------
+
+def connect(require_safe_retention: bool = True):
+    """Return `(client, collection, refusal)`; the only Qdrant entrypoint here.
+
+    `qdrant_ops._get_qdrant()` runs `_purge_old_records` on first use in a
+    process, so connecting is destructive when retention is non-zero. Guarding
+    one pass is not enough because `pass_index`, `pass_recall`, and
+    `pass_knn_tags` all connect. Centralize the guard here.
+
+    When connecting is unsafe, return a refusal dict in the third slot.
+    """
+    try:
+        import qdrant_ops
+    except Exception as exc:
+        return None, None, {"status": "degraded", "detail": f"qdrant_ops unavailable: {exc!r}"}
+
+    if require_safe_retention:
+        retention = qdrant_ops._retention_days()
+        if retention != 0:
+            return None, None, {
+                "status": "refused",
+                "detail": (f"LOCI_QDRANT_RETENTION_DAYS resolves to {retention}, not 0 — connecting "
+                           f"would run the startup purge and delete findings older than {retention} "
+                           f"days. Set it in the environment, the repo .env, or [qdrant].retention_days "
+                           f"in ~/.loci/backends.toml before running this pass."),
+            }
+    try:
+        client, col = qdrant_ops._get_qdrant()
+    except Exception as exc:
+        return None, None, {"status": "degraded", "detail": f"qdrant_ops unavailable: {exc!r}"}
+    if client is None:
+        return None, None, {"status": "degraded", "detail": "qdrant unreachable"}
+    return client, col, None
+
+
+def indexed_ids(client, col: str) -> set:
+    """Every point id in the collection, paged."""
+    out: set = set()
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=col, limit=1024, offset=offset,
+            with_payload=False, with_vectors=False,
+        )
+        out.update(str(p.id) for p in points)
+        if offset is None:
+            return out
+
+
+def pass_index(apply: bool = False, limit: Optional[int] = None, **_) -> dict:
+    """Reconcile the JSONL corpus against the Qdrant index.
+
+    Findings reach Qdrant only via `_qdrant_upsert` at store time, while the
+    startup TTL purge deletes by `created_at_ts`. Records past retention stay on
+    disk but disappear from search. This pass restores that reconciliation.
+    """
+    on_disk = {}
+    for f in iter_findings():
+        fid = f.get("id")
+        if fid:
+            on_disk[str(fid)] = f
+
+    report = {
+        "pass": "index",
+        "on_disk": len(on_disk),
+        "indexed": 0,
+        "missing": 0,
+        "applied": 0,
+        "status": "ok",
+    }
+
+    client, col, refusal = connect()
+    if refusal:
+        report.update(**refusal)
+        return report
+    import qdrant_ops
+
+    try:
+        indexed = indexed_ids(client, col)
+    except Exception as exc:
+        report.update(status="degraded", detail=f"scroll failed: {exc!r}")
+        return report
+
+    # `_qdrant_upsert` stores the finding id verbatim as the point id.
+    missing = [f for fid, f in on_disk.items() if fid not in indexed]
+
+    report["indexed"] = len(indexed)
+    report["missing"] = len(missing)
+    report["coverage"] = round(1.0 - len(missing) / max(len(on_disk), 1), 4)
+
+    if not apply:
+        report["sample_missing"] = [f.get("id") for f in missing[:5]]
+        return report
+
+    for finding in missing[: (limit or len(missing))]:
+        text = str(finding.get("text") or "")
+        if not text:
+            continue
+        try:
+            qdrant_ops._qdrant_upsert(str(finding["id"]), text, finding)
+            report["applied"] += 1
+        except Exception:
+            continue
+    return report
+
+
+# --- pass: tags -------------------------------------------------------------
+
+_TAG_PROMPT = (
+    "You are labelling an engineering finding with tags from a fixed vocabulary.\n\n"
+    "VOCABULARY (the only permitted values):\n{vocab}\n\n"
+    "FINDING:\n{text}\n\n"
+    "Pick the 1-4 vocabulary terms that genuinely describe this finding. If none fit, "
+    "return an empty list. Do not invent terms. Do not explain.\n"
+    'Output exactly one JSON object of the form {{"tags": ["term", "term"]}} and nothing else.\n'
+    'Example output: {{"tags": ["mqtt", "wiring-gap"]}}'
+)
+
+
+def _parse_tags(raw: str) -> Optional[list]:
+    """Pull a tag list out of a small model's JSON; `None` means unparseable.
+
+    A 3B model asked for `{"tags": [...]}` may answer with a bare list or put
+    the list under another key. Accept those shapes, but still run every term
+    through the downstream vocabulary filter.
+    """
+    try:
+        obj = json.loads(raw or "")
+    except ValueError:
+        return None
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        if isinstance(obj.get("tags"), list):
+            return obj["tags"]
+        lists = [v for v in obj.values() if isinstance(v, list)]
+        if len(lists) == 1:
+            return lists[0]
+    return None
+
+
+def build_vocabulary(findings: Iterable[dict], min_uses: int = 5, top_n: int = 60) -> list[str]:
+    """Return the tags that carry signal: tags reused across the corpus.
+
+    On this corpus, 4,267 distinct tags exist and 2,809 are single-use, so the
+    raw tag set behaves more like free text than a vocabulary. Repeated terms are
+    the ones a reader can actually filter on.
+    """
+    counts: collections.Counter = collections.Counter()
+    for f in findings:
+        for t in (f.get("tags") or []):
+            t = str(t).strip().lower()
+            # `dt_*` are per-run provenance stamps, not subject tags.
+            if t and not t.startswith("dt_"):
+                counts[t] += 1
+    return [t for t, n in counts.most_common(top_n) if n >= min_uses]
+
+
+def pass_tags(limit: Optional[int] = None, gen_fn: Optional[Callable] = None,
+              memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
+              calibrate: bool = False, seed: int = 0, **_) -> dict:
+    """Propose vocabulary tags for untagged findings.
+
+    Proposals only: author tags are evidence of intent, and a 3B model's guess
+    must stay distinguishable from them.
+    """
+    findings = list(iter_findings(memory_dir))
+    vocab = build_vocabulary(findings)
+    report = {
+        "pass": "tags", "corpus": len(findings), "vocabulary": len(vocab),
+        "candidates": 0, "proposed": 0, "status": "ok",
+    }
+    if not vocab:
+        report.update(status="degraded", detail="no vocabulary could be derived")
+        return report
+
+    if calibrate:
+        # Same holdout protocol as `knn_tags --calibrate`, so methods share a scale.
+        candidates = [f for f in findings
+                      if f.get("text") and set(_tags_of(f)) & set(vocab)]
+        random.Random(seed).shuffle(candidates)
+    else:
+        candidates = [f for f in findings if not (f.get("tags") or []) and f.get("text")]
+    report["candidates"] = len(candidates)
+    if limit:
+        candidates = candidates[:limit]
+    if not candidates:
+        return report
+
+    if gen_fn is None:
+        try:
+            import batched_gen
+            gen_fn = lambda prompts: batched_gen.generate_batch(  # noqa: E731
+                prompts, model=GROOM_MODEL, max_tokens=96, fmt="json")
+        except Exception as exc:
+            report.update(status="degraded", detail=f"no generation tier: {exc!r}")
+            return report
+
+    vocab_block = ", ".join(vocab)
+    vocab_set = set(vocab)
+    proposals = []
+    # Count per cause: generation errors and declined answers are different zeros.
+    rej = collections.Counter()
+    scored: list = []
+
+    for i in range(0, len(candidates), GROOM_BATCH):
+        chunk = candidates[i:i + GROOM_BATCH]
+        prompts = [
+            _TAG_PROMPT.format(vocab=vocab_block, text=str(f.get("text"))[:1200])
+            for f in chunk
+        ]
+        try:
+            results = gen_fn(prompts)
+        except Exception:
+            rej["generation_error"] += len(chunk)
+            continue
+        for finding, res in zip(chunk, results or []):
+            if not (res or {}).get("ok"):
+                rej["generation_failed"] += 1
+                continue
+            tags = _parse_tags(res.get("text") or "")
+            if tags is None:
+                rej["unparseable"] += 1
+                continue
+            # Drop out-of-vocabulary terms; do not widen the supplied vocabulary.
+            if not tags:
+                rej["declined"] += 1        # the model saw no fitting term — a real answer
+                continue
+            kept = [t for t in (str(x).strip().lower() for x in tags) if t in vocab_set][:4]
+            if not kept:
+                rej["out_of_vocabulary"] += 1
+                continue
+            if calibrate:
+                truth = set(_tags_of(finding)) & vocab_set
+                scored.append(len(set(kept) & truth) / max(len(kept), 1))
+                continue
+            proposals.append(_proposal(
+                "tags", str(finding["id"]), "tags", kept,
+                model=GROOM_MODEL,
+                investigation_id=finding.get("investigation_id"),
+            ))
+
+    report["rejected"] = dict(rej)
+    if calibrate:
+        report["checked"] = len(scored)
+        report["mean_precision"] = round(sum(scored) / max(len(scored), 1), 4)
+        report["any_correct_rate"] = round(
+            sum(1 for x in scored if x > 0) / max(len(scored), 1), 4)
+        return report
+    report["generated"] = len(proposals)
+    report["proposed"] = write_proposals(proposals, groom_dir)
+    return report
+
+
+# --- pass: recall -----------------------------------------------------------
+
+_QUESTION_PROMPT = (
+    "Below is a finding from an engineering investigation. Write ONE short question "
+    "that this finding answers — the question someone would type if they wanted this "
+    "finding back. Use the finding's own vocabulary. No preamble, no quotes.\n\n"
+    "FINDING:\n{text}\n\nQUESTION:"
+)
+
+
+def _rank_of(finding_id: str, results: list) -> Optional[int]:
+    for i, row in enumerate(results, start=1):
+        if str(row.get("id") or "") == finding_id:
+            return i
+    return None
+
+
+def _score(ranks: list, k: int, attempted: int) -> dict:
+    hits1 = sum(1 for r in ranks if r == 1)
+    hitsk = sum(1 for r in ranks if r is not None and r <= k)
+    mrr = sum(1.0 / r for r in ranks if r) / max(attempted, 1)
+    return {
+        "attempted": attempted,
+        "recall_at_1": round(hits1 / max(attempted, 1), 4),
+        f"recall_at_{k}": round(hitsk / max(attempted, 1), 4),
+        "mrr": round(mrr, 4),
+    }
+
+
+def pass_recall(sample: int = 40, k: int = 5, paraphrase: bool = True,
+                gen_fn: Optional[Callable] = None, memory_dir: Optional[Path] = None,
+                groom_dir: Optional[Path] = None, search_fn: Optional[Callable] = None,
+                seed: int = 0, limit: Optional[int] = None, rerank: bool = True,
+                **_) -> dict:
+    """Ask the retriever for findings it already holds and measure the return path.
+
+    Keep two probes separate because they fail for different reasons:
+      identity   the query is the finding text itself. A miss here is wiring:
+                 wrong embedder, wrong width, or an unqueryable collection.
+                 No model is involved.
+      paraphrase the query is a model-written question derived from the finding.
+                 A miss here with identity intact is semantic reach, not breakage.
+
+    Sample only findings that are actually indexed; otherwise this just measures
+    the index gap that `index` already reports.
+    """
+    sample = limit or sample          # --limit is the CLI's name for the sample size
+    report = {"pass": "recall", "k": k, "sample": sample, "rerank": rerank, "status": "ok"}
+
+    client, col, refusal = connect()
+    if refusal:
+        report.update(**refusal)
+        return report
+    import qdrant_ops
+
+    by_id = {}
+    for f in iter_findings(memory_dir):
+        fid = f.get("id")
+        if fid and (f.get("text") or "").strip():
+            by_id[str(fid)] = f
+    try:
+        live = sorted(indexed_ids(client, col) & set(by_id))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"scroll failed: {exc!r}")
+        return report
+
+    report["indexed_with_text"] = len(live)
+    if not live:
+        report.update(status="degraded", detail="nothing indexed to probe")
+        return report
+
+    rnd = random.Random(seed)
+    chosen = rnd.sample(live, min(sample, len(live)))
+    search = search_fn or (
+        lambda q: qdrant_ops._qdrant_similarity_search(q, limit=k, rerank=rerank))
+
+    ident_ranks, errors = [], 0
+    for fid in chosen:
+        try:
+            res = search(str(by_id[fid]["text"])[:1000])
+        except Exception:
+            errors += 1
+            continue
+        if not (res or {}).get("ok"):
+            errors += 1
+            continue
+        ident_ranks.append(_rank_of(fid, res.get("results") or []))
+    report["search_errors"] = errors
+    report["identity"] = _score(ident_ranks, k, len(ident_ranks))
+    if not ident_ranks:
+        # If every probe raised, `recall_at_1=0.0` would misreport a dead GPU as retrieval collapse.
+        report.update(status="degraded",
+                      detail=f"all {errors} probe search(es) failed — no measurement taken")
+        return report
+
+    if not paraphrase:
+        _append_recall(report, groom_dir)
+        return report
+
+    if gen_fn is None:
+        try:
+            import batched_gen
+            gen_fn = lambda prompts: batched_gen.generate_batch(  # noqa: E731
+                prompts, model=GROOM_MODEL, max_tokens=64)
+        except Exception as exc:
+            report["paraphrase"] = {"status": "degraded", "detail": f"no generation tier: {exc!r}"}
+            _append_recall(report, groom_dir)
+            return report
+
+    para_ranks, unusable = [], 0
+    for i in range(0, len(chosen), GROOM_BATCH):
+        chunk = chosen[i:i + GROOM_BATCH]
+        prompts = [_QUESTION_PROMPT.format(text=str(by_id[f]["text"])[:1000]) for f in chunk]
+        try:
+            gen = gen_fn(prompts)
+        except Exception:
+            unusable += len(chunk)
+            continue
+        for fid, g in zip(chunk, gen or []):
+            question = (g or {}).get("text", "").strip()
+            if not (g or {}).get("ok") or len(question) < 8:
+                unusable += 1
+                continue
+            try:
+                res = search(question)
+            except Exception:
+                unusable += 1
+                continue
+            if not (res or {}).get("ok"):
+                unusable += 1
+                continue
+            para_ranks.append(_rank_of(fid, res.get("results") or []))
+    report["paraphrase"] = {**_score(para_ranks, k, len(para_ranks)), "unusable": unusable}
+
+    _append_recall(report, groom_dir)
+    return report
+
+
+def _append_recall(report: dict, groom_dir: Optional[Path] = None) -> None:
+    """Append one row per run; the trend matters more than any single value."""
+    root = groom_dir or GROOM_DIR
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / "recall.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                                 **report}) + "\n")
+    except OSError:
+        pass
+
+
+# --- pass: knn_tags ---------------------------------------------------------
+
+def _tags_of(row: dict) -> list:
+    """Normalized payload tags. Some writers store them as a comma-joined string."""
+    raw = row.get("tags")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return []
+    return [t for t in (str(x).strip().lower() for x in raw) if t and not t.startswith("dt_")]
+
+
+def _knn_vote(neighbours: list, self_id: str, vocab: set, min_weight: float) -> list:
+    """Run a similarity-weighted tag vote over retrieved neighbours.
+
+    Weight by score, not count, so one very close neighbour can carry a tag that
+    several weak neighbours cannot. That is the point of using embeddings here.
+    """
+    weights: dict = {}
+    for row in neighbours:
+        if str(row.get("id") or "") == self_id:
+            continue
+        score = float(row.get("score") or 0.0)
+        if score <= 0:
+            continue
+        for tag in _tags_of(row):
+            if vocab and tag not in vocab:
+                continue
+            weights[tag] = weights.get(tag, 0.0) + score
+    ranked = sorted(weights.items(), key=lambda kv: -kv[1])
+    return [(t, round(w, 4)) for t, w in ranked if w >= min_weight]
+
+
+def pass_knn_tags(limit: Optional[int] = None, k: int = 8, min_weight: float = 1.0,
+                  max_tags: int = 3, calibrate: bool = False, seed: int = 0,
+                  memory_dir: Optional[Path] = None, groom_dir: Optional[Path] = None,
+                  search_fn: Optional[Callable] = None, **_) -> dict:
+    """Transfer tags from a finding's nearest tagged neighbours.
+
+    No generation is involved. Embeddings are already in the index, author tags
+    are the labels, and the method is deterministic, so unlike a model guess it
+    can be scored against held-out truth before promotion. `calibrate=True`
+    hides existing tags, re-derives them from neighbours, and reports agreement.
+    """
+    report = {"pass": "knn_tags", "k": k, "min_weight": min_weight,
+              "calibrate": calibrate, "status": "ok"}
+
+    findings = list(iter_findings(memory_dir))
+    vocab = set(build_vocabulary(findings))
+    report["vocabulary"] = len(vocab)
+    if not vocab:
+        report.update(status="degraded", detail="no vocabulary could be derived")
+        return report
+
+    if search_fn is None:
+        client, _col, refusal = connect()
+        if refusal:
+            report.update(**refusal)
+            return report
+        import qdrant_ops
+        search_fn = lambda q: qdrant_ops._qdrant_similarity_search(  # noqa: E731
+            q, limit=k + 1, rerank=False)
+
+    if calibrate:
+        subjects = [f for f in findings
+                    if f.get("text") and set(_tags_of(f)) & vocab]
+        rnd = random.Random(seed)
+        rnd.shuffle(subjects)
+    else:
+        subjects = [f for f in findings if f.get("text") and not _tags_of(f)]
+    report["candidates"] = len(subjects)
+    if limit:
+        subjects = subjects[:limit]
+
+    proposals, agree, checked = [], [], 0
+    for f in subjects:
+        try:
+            res = search_fn(str(f["text"])[:1000])
+        except Exception:
+            continue
+        if not (res or {}).get("ok"):
+            continue
+        voted = _knn_vote(res.get("results") or [], str(f.get("id") or ""), vocab, min_weight)
+        picked = [t for t, _w in voted[:max_tags]]
+
+        if calibrate:
+            truth = set(_tags_of(f)) & vocab
+            if not truth:
+                continue
+            checked += 1
+            agree.append(len(set(picked) & truth) / max(len(picked), 1) if picked else 0.0)
+            continue
+
+        if picked:
+            proposals.append(_proposal(
+                "knn_tags", str(f["id"]), "tags", picked,
+                model=None, score=voted[0][1],
+                method=f"knn/{k}", investigation_id=f.get("investigation_id"),
+            ))
+
+    if calibrate:
+        report["checked"] = checked
+        report["mean_precision"] = round(sum(agree) / max(checked, 1), 4)
+        report["exact_or_partial_hit_rate"] = round(
+            sum(1 for a in agree if a > 0) / max(checked, 1), 4)
+        return report
+
+    report["generated"] = len(proposals)
+    report["proposed"] = write_proposals(proposals, groom_dir)
+    return report
+
+
+# --- pass: codelink ---------------------------------------------------------
+
+# Identifier-shaped tokens: snake_case, CamelCase, dotted paths, File.ext.
+_IDENT_RE = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]{3,}\b")
+
+# Words that look like identifiers to a regex and like noise to a reader.
+_IDENT_STOP = frozenset({
+    "which", "there", "these", "those", "where", "while", "would", "could",
+    "should", "because", "before", "after", "every", "never", "always", "still",
+    "value", "values", "return", "returns", "error", "errors", "false", "true",
+    "none", "null", "class", "function", "method", "module", "import", "input",
+    "output", "result", "results", "state", "check", "checks", "count", "counts",
+    "under", "above", "below", "about", "against", "without", "within", "into",
+    "test", "tests", "code", "path", "paths", "file", "files", "line", "lines",
+    "data", "type", "types", "name", "names", "call", "calls", "read", "write",
+})
+
+
+def _is_distinctive(tok: str) -> bool:
+    """Decide whether `tok` looks like a real symbol, not just a word.
+
+    This is measured, not guessed: live calibration linked plain words like
+    `device`, `roll`, `train`, `report`, `baseline`, and `confirmed` to real
+    symbols somewhere in an 11k-symbol, three-language graph. Bare lowercase
+    words are weak evidence; structure matters: underscore, internal case
+    change, or enough length. This matches `code_memory_relink`'s conservative
+    idea of "distinctive".
+    """
+    if "_" in tok:
+        return True
+    if any(c.isupper() for c in tok[1:]) and any(c.islower() for c in tok):
+        return True
+    return len(tok) >= 12
+
+
+def _candidate_symbols(text: str, index: dict) -> tuple:
+    """Return `(unique_hits, ambiguous_hits)` for identifier-shaped tokens.
+
+    A token naming exactly one symbol is evidence. A token naming several is a
+    question, so send it to the model instead of guessing. That asymmetry is the
+    design.
+    """
+    unique, ambiguous = {}, {}
+    for raw in set(_IDENT_RE.findall(text or "")):
+        tok = raw.split(".")[-1]
+        if len(tok) < 4 or tok.lower() in _IDENT_STOP or not _is_distinctive(tok):
+            continue
+        hits = index.get(tok) or []
+        if len(hits) == 1:
+            unique[tok] = hits[0]
+        elif 1 < len(hits) <= 8:
+            ambiguous[tok] = hits
+    return unique, ambiguous
+
+
+_DISAMBIGUATE_PROMPT = (
+    "A finding mentions the symbol `{token}`. Several symbols share that name.\n\n"
+    "FINDING:\n{text}\n\nCANDIDATES:\n{options}\n\n"
+    "Which candidate does the finding mean? Answer with the number alone, or 0 if "
+    "the finding is not about any of them."
+)
+
+
+def pass_codelink(limit: Optional[int] = None, calibrate: bool = False,
+                  gen_fn: Optional[Callable] = None, symbols_fn: Optional[Callable] = None,
+                  linked_fn: Optional[Callable] = None, memory_dir: Optional[Path] = None,
+                  groom_dir: Optional[Path] = None, **_) -> dict:
+    """Propose `Finding -> CodeSymbol` links the strict lexical linker skips.
+
+    `code_memory_relink` is precision-first and reaches 180 of 2,634 findings.
+    This pass adds the two things it avoids: treating uniquely resolved tokens as
+    evidence even when they are not "distinctive" by its rules, and sending
+    genuinely ambiguous tokens to the local model with candidate file paths.
+    Proposals only: a wrong code link is worse than none because it survives as
+    provenance.
+    """
+    report = {"pass": "codelink", "calibrate": calibrate, "status": "ok"}
+
+    if symbols_fn is None or linked_fn is None:
+        try:
+            from graph.ladybug_store import LadybugStore
+            ks = LadybugStore(str((memory_dir or MEMORY_DIR) / "graph.ladybug"))
+            if not ks.readable_probe():
+                report.update(status="degraded", detail="graph store unreadable")
+                return report
+            symbols_fn = symbols_fn or (lambda: ks._rows(
+                "MATCH (s:CodeSymbol) RETURN s.name, s.id, s.file"))
+            linked_fn = linked_fn or (lambda: ks._rows(
+                "MATCH (f:Finding)-[:REFERENCES]->(s:CodeSymbol) RETURN f.id, s.id"))
+        except Exception as exc:
+            report.update(status="degraded", detail=f"graph unavailable: {exc!r}")
+            return report
+
+    index: dict = {}
+    where: dict = {}
+    try:
+        for name, sid, sfile in symbols_fn():
+            index.setdefault(str(name), []).append(str(sid))
+            where[str(sid)] = str(sfile or "")
+    except Exception as exc:
+        report.update(status="degraded", detail=f"symbol read failed: {exc!r}")
+        return report
+    report["symbols"] = len(where)
+
+    already: dict = {}
+    try:
+        for fid, sid in linked_fn():
+            already.setdefault(str(fid), set()).add(str(sid))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"link read failed: {exc!r}")
+        return report
+    report["already_linked"] = len(already)
+
+    findings = [f for f in iter_findings(memory_dir) if f.get("text") and f.get("id")]
+    if calibrate:
+        subjects = [f for f in findings if str(f["id"]) in already]
+    else:
+        subjects = [f for f in findings if str(f["id"]) not in already]
+    report["candidates"] = len(subjects)
+    if limit:
+        subjects = subjects[:limit]
+
+    proposals, hits, checked, ambiguous_total = [], [], 0, 0
+    for f in subjects:
+        unique, ambiguous = _candidate_symbols(str(f["text"]), index)
+        ambiguous_total += len(ambiguous)
+        picked = dict(unique)
+
+        if ambiguous and gen_fn is not None:
+            toks = list(ambiguous)[:4]
+            prompts = []
+            for tok in toks:
+                opts = "\n".join(
+                    f"{i}. {where.get(sid, '?')}" for i, sid in enumerate(ambiguous[tok], 1))
+                prompts.append(_DISAMBIGUATE_PROMPT.format(
+                    token=tok, text=str(f["text"])[:600], options=opts))
+            try:
+                answers = gen_fn(prompts)
+            except Exception:
+                answers = []
+            for tok, ans in zip(toks, answers or []):
+                if not (ans or {}).get("ok"):
+                    continue
+                digits = "".join(ch for ch in (ans.get("text") or "") if ch.isdigit())
+                if not digits:
+                    continue
+                choice = int(digits[:2])
+                if 1 <= choice <= len(ambiguous[tok]):
+                    picked[tok] = ambiguous[tok][choice - 1]
+
+        if calibrate:
+            truth = already.get(str(f["id"]), set())
+            if not truth:
+                continue
+            checked += 1
+            got = set(picked.values())
+            hits.append(len(got & truth) / max(len(got), 1) if got else 0.0)
+            continue
+
+        if picked:
+            proposals.append(_proposal(
+                "codelink", str(f["id"]), "code_refs",
+                [{"token": t, "symbol_id": sid, "file": where.get(sid, "")}
+                 for t, sid in picked.items()],
+                model=GROOM_MODEL if ambiguous and gen_fn else None,
+                investigation_id=f.get("investigation_id"),
+            ))
+
+    report["ambiguous_tokens"] = ambiguous_total
+    if calibrate:
+        report["checked"] = checked
+        report["mean_precision"] = round(sum(hits) / max(checked, 1), 4)
+        report["any_correct_rate"] = round(
+            sum(1 for h in hits if h > 0) / max(checked, 1), 4)
+        return report
+
+    report["generated"] = len(proposals)
+    report["proposed"] = write_proposals(proposals, groom_dir)
+    return report
+
+
+def pass_verify(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
+                verify_fn: Optional[Callable] = None,
+                gen_probe: Optional[Callable] = None, **_) -> dict:
+    """Batch adversarial-verify open findings, one investigation at a time.
+
+    investigation_verify_all is a correct, exposed tool that had never been
+    invoked: finding_verifications.jsonl held 0 records across 131
+    investigations (#194). Nothing was broken — nothing had ever called it.
+
+    Safe unattended because it is append-only to a SEPARATE file and explicitly
+    not a lifecycle change: a verdict is recorded as a verification note and does
+    not overwrite a finding's resolution. Bounded per run so a nightly pass
+    cannot turn into an unbounded model spend.
+    """
+    report = {"pass": "verify", "status": "ok"}
+    budget = int(limit or VERIFY_MAX_PER_RUN)
+
+    # verify_finding is fail-open: with the model down every finding lands uncertain/0.0 on disk.
+    if gen_probe is None:
+        def gen_probe():
+            sys.path.insert(0, str(_REPO / "mcp"))
+            from llm_local import generate
+            return bool(generate("Reply with OK.", max_tokens=8).get("ok"))
+    try:
+        if not gen_probe():
+            report.update(status="degraded",
+                          detail="generation backend is not answering; skipping rather "
+                                 "than writing uncertain/0.0 verdicts for every finding")
+            return report
+    except Exception as exc:
+        report.update(status="degraded", detail=f"generation probe failed: {exc!r}")
+        return report
+
+    if verify_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            verify_fn = _server.investigation_verify_all
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import the verifier: {exc!r}")
+            return report
+
+    root = memory_dir or MEMORY_DIR
+    checked = verified = 0
+    errors = 0
+    for inv_dir in sorted(root.glob("*/findings.jsonl")):
+        if checked >= budget:
+            break
+        inv = inv_dir.parent.name
+        # Skip investigations already carrying verdicts so repeated runs advance the corpus.
+        if (inv_dir.parent / "finding_verifications.jsonl").exists():
+            continue
+        try:
+            raw = verify_fn(investigation_id=inv, limit=VERIFY_PER_INVESTIGATION)
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            n = len(payload.get("results") or payload.get("verifications") or [])
+            verified += n
+            checked += 1
+        except Exception as exc:
+            errors += 1
+            logger.debug("verify: %s failed: %r", inv, exc)
+    report.update(investigations_checked=checked, findings_verified=verified,
+                  errors=errors, budget=budget)
+    if errors and not checked:
+        report.update(status="degraded", detail=f"every attempt failed ({errors})")
+    return report
+
+
+def pass_reflect(limit: Optional[int] = None, seed_fn: Optional[Callable] = None,
+                 tick_fn: Optional[Callable] = None, **_) -> dict:
+    """Seed and tick the bounded self-reflection queue.
+
+    The loop had never ticked (#194) and no state file existed, so its queue was
+    never seeded — not because it lacks input: this host carries 25 copilot
+    session-state files, 3 process logs and 15 Claude Code project logs.
+
+    Safe unattended for two reasons that are worth stating, because a cron job
+    that manufactures findings is otherwise exactly what this project spent a
+    session learning not to build. Findings land in ONE dedicated investigation
+    ("Copilot self-reflection loop"), not scattered through the corpus. And the
+    tick is deterministic parsing with no model call, bounded by max_items and
+    max_lines_per_file.
+    """
+    report = {"pass": "reflect", "status": "ok"}
+    if seed_fn is None or tick_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            seed_fn = seed_fn or _server.reflection_loop_seed
+            tick_fn = tick_fn or _server.reflection_loop_tick
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import the reflection loop: {exc!r}")
+            return report
+    try:
+        seeded = json.loads(seed_fn())
+        report["queued"] = seeded.get("queued", seeded.get("queue_size"))
+    except Exception as exc:
+        report.update(status="degraded", detail=f"seed failed: {exc!r}")
+        return report
+    try:
+        ticked = json.loads(tick_fn(max_items=int(limit or REFLECT_MAX_ITEMS)))
+        report["processed_items"] = ticked.get("processed_items", 0)
+        report["findings_written"] = ticked.get("findings_written", 0)
+        # remaining_queue, NOT queue_size: tick emits queue_size only on the empty-queue return.
+        if "remaining_queue" in ticked:
+            report["remaining_queue"] = ticked["remaining_queue"]
+    except Exception as exc:
+        report.update(status="degraded", detail=f"tick failed: {exc!r}")
+    return report
+
+
+def _summarisable(inv_dir: Path) -> bool:
+    """True if the investigation holds at least one record worth summarising.
+
+    findings.jsonl also carries text-less access rows, so a file that is not
+    empty is not the same as an investigation with findings.
+    """
+    fj = inv_dir / "findings.jsonl"
+    if not fj.exists():
+        return False
+    # investigation_reflect drops retracted findings, so counting them asks for a summary of nothing.
+    retracted = set()
+    rj = inv_dir / "retractions.jsonl"
+    if rj.exists():
+        try:
+            with rj.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("active") and rec.get("finding_id"):
+                        retracted.add(str(rec["finding_id"]))
+        except OSError:
+            pass
+    try:
+        with fj.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if (rec.get("record_type") or rec.get("type") or "") == "access":
+                    continue
+                if str(rec.get("id", "")) in retracted:
+                    continue
+                if str(rec.get("text", "")).strip():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _has_llm_summary(manifest: dict) -> bool:
+    """True only for a MODEL-authored summary.
+
+    investigation_reflect always persists something: when the model is
+    unavailable it falls back to a deterministic stub built from the last few
+    findings. Treating that stub as "done" would let one run with the backend
+    down permanently mark every investigation as summarised, which is the shape
+    of failure this tier exists to catch. The stub's paragraph is recognisable.
+    """
+    if not manifest.get("summary_l1"):
+        return False
+    l2 = str(manifest.get("summary_l2") or "").strip()
+    if not l2 or re.match(r"^Investigation with \d+ finding", l2):
+        return False
+    return True
+
+
+def pass_summaries(limit: Optional[int] = None, memory_dir: Optional[Path] = None,
+                   reflect_fn: Optional[Callable] = None,
+                   gen_probe: Optional[Callable] = None, **_) -> dict:
+    """Fill in the per-investigation summaries that investigation_load asks for.
+
+    The summary ladder lives inside investigation_reflect, and that tool had
+    never been called: 6 of 142 manifests carried a summary while 7 of 15 real
+    investigation_load calls asked for fidelity=summary or brief. The generator
+    exists and works; nothing drove it.
+
+    Safe unattended: it writes only summary_l1/summary_l2 on the manifest, never
+    findings, and it is bounded per run. Investigations that already carry a
+    model-authored summary are skipped, so repeated runs advance the backlog
+    instead of re-spending on the same ones.
+    """
+    report = {"pass": "summaries", "status": "ok"}
+    budget = int(limit or SUMMARY_MAX_PER_RUN)
+
+    # Same guard as pass_verify: with the backend down the ladder writes its deterministic stub.
+    if gen_probe is None:
+        def gen_probe():
+            sys.path.insert(0, str(_REPO / "mcp"))
+            from llm_local import generate
+            return bool(generate("Reply with OK.", max_tokens=8).get("ok"))
+    try:
+        if not gen_probe():
+            report.update(status="degraded",
+                          detail="generation backend is not answering; skipping rather "
+                                 "than stamping a deterministic stub on every manifest")
+            return report
+    except Exception as exc:
+        report.update(status="degraded", detail=f"generation probe failed: {exc!r}")
+        return report
+
+    if reflect_fn is None:
+        try:
+            sys.path.insert(0, str(_REPO / "mcp"))
+            import server as _server
+            reflect_fn = _server.investigation_reflect
+        except Exception as exc:
+            report.update(status="degraded",
+                          detail=f"cannot import investigation_reflect: {exc!r}")
+            return report
+
+    root = Path(memory_dir or MEMORY_DIR)
+    done = skipped = errors = empty = 0
+    for man_path in sorted(root.glob("*/manifest.json")):
+        if done >= budget:
+            break
+        try:
+            manifest = json.loads(man_path.read_text())
+        except Exception:
+            errors += 1
+            continue
+        if _has_llm_summary(manifest):
+            skipped += 1
+            continue
+        # Nothing to summarise is not a failure; a permanently degraded pass is one nobody reads.
+        if not _summarisable(man_path.parent):
+            empty += 1
+            continue
+        inv = manifest.get("investigation_id") or man_path.parent.name
+        try:
+            reflect_fn(investigation_id=inv)
+        except Exception:
+            errors += 1
+            continue
+        # Confirm the model actually authored one; a stub means it did not.
+        try:
+            if _has_llm_summary(json.loads(man_path.read_text())):
+                done += 1
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+    report.update(summarised=done, already_had=skipped, nothing_to_say=empty,
+                  errors=errors, budget=budget)
+    if errors and not done:
+        report.update(status="degraded",
+                      detail=f"{errors} investigations errored and none were summarised")
+    return report
+
+
+PASSES = {
+    "index": {"fn": pass_index, "applyable": True},
+    "tags": {"fn": pass_tags, "applyable": False},
+    "recall": {"fn": pass_recall, "applyable": False},
+    "knn_tags": {"fn": pass_knn_tags, "applyable": False},
+    "codelink": {"fn": pass_codelink, "applyable": False},
+    "verify": {"fn": pass_verify, "applyable": False},
+    "reflect": {"fn": pass_reflect, "applyable": False},
+    "summaries": {"fn": pass_summaries, "applyable": False},
+}
+
+
+def main(argv: Optional[list] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("passes", nargs="*", default=["all"],
+                    help=f"one or more of: {', '.join(PASSES)}, all")
+    ap.add_argument("--apply", action="store_true",
+                    help="promote results for passes that allow it (index only)")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-rerank", action="store_true",
+                    help="recall: probe the bi-encoder stage alone, without the cross-encoder")
+    args = ap.parse_args(argv)
+    load_env()
+
+    names = list(PASSES) if (not args.passes or "all" in args.passes) else args.passes
+    unknown = [n for n in names if n not in PASSES]
+    if unknown:
+        print(f"unknown pass(es): {', '.join(unknown)}", file=sys.stderr)
+        return 2
+
+    reports = []
+    for name in names:
+        spec = PASSES[name]
+        apply = args.apply and spec["applyable"]
+        if args.apply and not spec["applyable"]:
+            print(f"[groom] {name}: --apply ignored (proposals only)", file=sys.stderr)
+        try:
+            reports.append(spec["fn"](apply=apply, limit=args.limit,
+                                      rerank=not args.no_rerank))
+        except Exception as exc:      # a pass must never take the cron job down
+            import traceback
+            logger.error("pass %s raised:\n%s", name, traceback.format_exc())
+            reports.append({"pass": name, "status": "error", "detail": repr(exc),
+                            "traceback": traceback.format_exc()})
+
+    if args.json:
+        print(json.dumps(reports, indent=2))
+    else:
+        for r in reports:
+            head = f"[groom] {r['pass']}: {r.get('status')}"
+            rest = " ".join(f"{k}={v}" for k, v in r.items()
+                            if k not in ("pass", "status") and not isinstance(v, (list, dict)))
+            print(f"{head} {rest}".rstrip())
+    # Three-way: a scheduler only sees the exit code, and refused/degraded must not read as success.
+    if any(r.get("status") == "error" for r in reports):
+        return 1
+    if any(r.get("status") in ("refused", "degraded") for r in reports):
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+# Deploy script rewrites FROM to the downloaded GGUF's absolute path before `ollama create`.
+FROM ./huihui-ai_Mistral-Small-24B-Instruct-2501-abliterated-Q5_K_M.gguf
+
+# Newer Ollama usually reads the GGUF-embedded Jinja template. Keep this fallback TEMPLATE
+# for older builds that need an explicit [SYSTEM_PROMPT]/[INST] prompt shape.
+TEMPLATE """<s>{{ if .System }}[SYSTEM_PROMPT]{{ .System }}[/SYSTEM_PROMPT]{{ end }}[INST]{{ .Prompt }}[/INST]{{ .Response }}"""
+
+PARAMETER temperature 0.2
+PARAMETER stop "</s>"
+PARAMETER stop "[INST]"
+PARAMETER stop "[/INST]"

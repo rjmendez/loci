@@ -1,0 +1,15 @@
+# Deploy script rewrites FROM to the downloaded GGUF's absolute path before `ollama create`.
+FROM ./Qwen2.5-Coder-14B-Instruct-abliterated-Q4_K_M.gguf
+
+# Qwen2.5 instruct is ChatML-style: system/user/assistant wrapped in <|im_start|> blocks.
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+{{ .Response }}
+"""
+
+PARAMETER temperature 0.2
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"

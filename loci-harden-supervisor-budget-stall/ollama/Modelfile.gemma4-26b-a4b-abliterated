@@ -1,0 +1,18 @@
+# Deploy script rewrites FROM to the downloaded GGUF's absolute path before `ollama create`.
+FROM ./gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
+
+# Gemma4 A4B is the MoE variant with only ~4B active params, cheaper than dense peers.
+# Keep this fallback TEMPLATE for older Ollama builds that do not rely on the GGUF's
+# embedded chat template. Google also publishes official QAT GGUFs of the non-abliterated
+# base model if you want a more-trusted side-by-side baseline for sanity-checking
+# abliteration side effects.
+TEMPLATE """<bos>{{ if .System }}<|turn>system
+{{ .System }}<turn|>
+{{ end }}<|turn>user
+{{ .Prompt }}<turn|>
+<|turn>model
+{{ .Response }}"""
+
+PARAMETER temperature 0.2
+PARAMETER stop "<turn|>"
+PARAMETER stop "<eos>"

@@ -1,0 +1,152 @@
+"""Tests for graph.analytics — the composed code<->memory tools."""
+import pytest
+
+from graph.ladybug_store import LadybugStore
+from graph import analytics as A
+
+
+@pytest.fixture
+def ks(tmp_path):
+    s = LadybugStore(str(tmp_path / "g.ladybug"))
+    assert s.available()
+    e = s._exec
+    e("MERGE (c:CodeFile {path:'a.java'}) SET c.lang='java'")
+    for sid, name, kind in [
+        ("a.java::ClassA", "ClassA", "class"),
+        ("a.java::ClassA.foo", "foo", "method"),
+        ("a.java::ClassA.caller", "caller", "method"),
+    ]:
+        e("MERGE (s:CodeSymbol {id:$i}) SET s.name=$n, s.kind=$k, s.file='a.java', s.line=1, s.lang='java'",
+          {"i": sid, "n": name, "k": kind})
+        e("MATCH (c:CodeFile {path:'a.java'}),(s:CodeSymbol {id:$i}) MERGE (c)-[:DEFINES]->(s)", {"i": sid})
+    e("MATCH (a:CodeSymbol {id:'a.java::ClassA.caller'}),(b:CodeSymbol {id:'a.java::ClassA.foo'}) "
+      "MERGE (a)-[:CALLS]->(b)")
+    for fid, inv in [("f1", "inv1"), ("f2", "inv2")]:
+        e("MERGE (f:Finding {id:$i}) SET f.investigation=$v, f.text=$t, f.ftype='observed', "
+          "f.confidence='high', f.source='x', f.ts=1", {"i": fid, "v": inv, "t": f"foo issue in {inv}"})
+        e("MERGE (iv:Investigation {id:$v})", {"v": inv})
+        e("MATCH (f:Finding {id:$i}),(iv:Investigation {id:$v}) MERGE (f)-[:IN_INVESTIGATION]->(iv)",
+          {"i": fid, "v": inv})
+        e("MATCH (f:Finding {id:$i}),(s:CodeSymbol {id:'a.java::ClassA.foo'}) MERGE (f)-[:REFERENCES]->(s)",
+          {"i": fid})
+    return s
+
+
+def test_impact_report_method(ks):
+    r = A.impact_report(ks, "foo")
+    assert "foo" in {x["name"] for x in r["resolved"]}
+    assert "caller" in r["direct_callers"]
+    assert r["referencing_finding_count"] == 2
+    assert {i["id"] for i in r["investigations"]} == {"inv1", "inv2"}
+
+
+def test_impact_report_class_folds_methods(ks):
+    r = A.impact_report(ks, "ClassA")
+    # class target folds in ClassA.foo -> the referencing findings still surface.
+    assert r["referencing_finding_count"] == 2
+    assert "ClassA.foo" in {x["id"].split("::")[-1] for x in r["resolved"]}
+
+
+def test_finding_code_context(ks):
+    ctx = A.finding_code_context(ks, "f1")
+    foo = next((s for s in ctx["symbols"] if s["name"] == "foo"), None)
+    assert foo is not None
+    assert "caller" in foo["callers"]
+
+
+def test_related_investigations_via_code(ks):
+    rel = A.related_investigations_via_code(ks, "inv1")
+    assert rel and rel[0]["investigation"] == "inv2"
+    assert rel[0]["shared_symbols"] >= 1
+
+
+def test_subsystem_report(ks):
+    r = A.subsystem_report(ks, "a.java")
+    assert r["files"] == ["a.java"]
+    assert r["symbol_count"] == 3
+    assert r["kinds"] == {"class": 1, "method": 2}
+    assert {h["name"]: h["findings"] for h in r["hotspot_symbols"]}.get("foo") == 2
+    assert {i["id"] for i in r["investigations"]} == {"inv1", "inv2"}
+    # all calls are internal to a.java -> no boundary crossings
+    assert r["inbound_callers"] == [] and r["outbound_callees"] == []
+
+
+def test_subsystem_report_prefix(ks):
+    # a path prefix should match the file too
+    assert A.subsystem_report(ks, "a.")["symbol_count"] == 3
+    assert A.subsystem_report(ks, "nonexistent/")["files"] == []
+
+
+def test_investigation_code_briefing(ks):
+    b = A.investigation_code_briefing(ks, "inv1", top=2)
+    assert b["finding_count"] == 1
+    assert b["symbols_touched"] == 1  # inv1's finding references foo
+    top = {t["symbol"]: t for t in b["top_symbols"]}
+    assert "foo" in top
+    # foo is also referenced by inv2 -> shows up as a related/other investigation
+    assert "inv2" in top["foo"]["other_investigations"]
+    assert any(r["investigation"] == "inv2" for r in b["related_investigations"])
+
+
+def test_dead_code_candidates(tmp_path):
+    from graph.ladybug_store import LadybugStore
+    s = LadybugStore(str(tmp_path / "dc.ladybug"))
+    e = s._exec
+    # `referenced` is the usage signal now (name occurs more than it's defined).
+    def sym(sid, name, kind="function", decs="", referenced=False):
+        e("MERGE (x:CodeSymbol {id:$i}) SET x.name=$n, x.kind=$k, x.file='m.py', x.line=1, "
+          "x.lang='python', x.decorators=$d, x.referenced=$r",
+          {"i": sid, "n": name, "k": kind, "d": decs, "r": referenced})
+    sym("m.py::genuine_dead", "genuine_dead")               # not referenced -> candidate
+    sym("m.py::tool_fn", "tool_fn", decs="mcp.tool")         # entry point -> excluded
+    sym("m.py::_private", "_private")                        # private -> excluded
+    sym("m.py::main", "main")                                # convention entry point -> excluded
+    sym("m.py::setUp", "setUp", kind="method")               # unittest hook -> excluded
+    sym("m.py::used_fn", "used_fn", referenced=True)         # referenced -> excluded
+    names = {c["name"] for c in A.dead_code_candidates(s)["candidates"]}
+    assert "genuine_dead" in names
+    assert names.isdisjoint({"tool_fn", "_private", "main", "setUp", "used_fn"})
+
+
+def test_impact_report_healthy_run_is_not_partial(ks):
+    r = A.impact_report(ks, "foo")
+    assert r["partial"] is False
+    assert r["queries_failed"] == 0
+
+
+def test_impact_report_flags_a_dead_caller_query_instead_of_claiming_no_callers(ks, monkeypatch):
+    """Reads fail open to [], so a dead CALLS query would otherwise report a symbol
+    that IS in the graph as having zero callers — the input to a delete decision."""
+    real_rows = ks._rows
+
+    def flaky(cypher, params=None):
+        if "CALLS" in cypher:
+            raise RuntimeError("ladybug read session unavailable")
+        return real_rows(cypher, params)
+
+    monkeypatch.setattr(ks, "_rows", flaky)
+    r = A.impact_report(ks, "foo")
+
+    assert {x["name"] for x in r["resolved"]} == {"foo"}   # the symbol resolved fine
+    assert r["direct_callers"] == []                       # ... but nobody asked
+    assert r["transitive_caller_count"] == 0
+    assert r["partial"] is True
+    assert r["queries_failed"] == 2                        # transitive + direct
+
+
+def test_impact_report_flags_a_dead_resolve_query(ks, monkeypatch):
+    monkeypatch.setattr(ks, "_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")))
+    r = A.impact_report(ks, "foo")
+    assert r["resolved"] == []
+    assert r["partial"] is True   # "not in the graph" and "never asked" are different
+
+
+def test_fail_open():
+    class Dead:
+        def available(self):
+            return False
+
+    assert A.impact_report(Dead(), "x")["resolved"] == []
+    assert A.finding_code_context(Dead(), "x")["symbols"] == []
+    assert A.related_investigations_via_code(Dead(), "x") == []
+    assert A.subsystem_report(Dead(), "x")["files"] == []

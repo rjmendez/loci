@@ -13184,6 +13184,50 @@ class _BearerAuthMiddleware:
         await self._app(scope, receive, send)
 
 
+try:
+    from policy import Policy, PolicyBackend, PolicyTier, PolicyRegion, validate_policy
+except ImportError:  # pragma: no cover - policy module optional at import time
+    Policy = PolicyBackend = PolicyTier = PolicyRegion = validate_policy = None  # type: ignore
+
+
+@mcp.tool()
+def policy_store(
+    title: str,
+    tier: str = "medium",
+    region: str = "memory",
+    labels: Optional[list[str]] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Store a policy.md document (tier-aware retrieval/routing constraints) and return its policy_id."""
+    if Policy is None:
+        return json.dumps({"error": "policy module unavailable"})
+    try:
+        policy = Policy(
+            title=title,
+            tier=PolicyTier(tier),
+            region=PolicyRegion(region),
+            labels=labels or [],
+            config=config or {},
+        )
+        backend = PolicyBackend()
+        result = backend.store(policy)
+        return json.dumps(result)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_load(policy_id: str) -> str:
+    """Load a stored policy.md document by policy_id; returns its full serialized form or not_found."""
+    if PolicyBackend is None:
+        return json.dumps({"error": "policy module unavailable"})
+    backend = PolicyBackend()
+    policy = backend.load(policy_id)
+    if policy is None:
+        return json.dumps({"error": "not_found", "policy_id": policy_id})
+    return json.dumps(policy.to_dict())
+
+
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:

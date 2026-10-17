@@ -1,0 +1,17 @@
+[Unit]
+Description=Run the MrPink A2A context bridge periodically
+Documentation=https://github.com/rjmendez/loci
+
+[Timer]
+# 10 min, matching loci-context-bridge.timer on the jetson so the two halves of the
+# mesh converge on the same cadence.
+OnBootSec=3min
+OnUnitActiveSec=10min
+# The two nodes' timers drifting into lockstep is harmless, but staggering keeps each
+# node's server from handling both directions in the same instant.
+RandomizedDelaySec=45s
+Persistent=true
+Unit=mrpink-context-bridge.service
+
+[Install]
+WantedBy=timers.target

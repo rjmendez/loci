@@ -1,0 +1,71 @@
+# Loci backend config — copy to ~/.loci/backends.toml (or point $LOCI_CONFIG at it) and edit.
+# This file holds MACHINE-SPECIFIC endpoints/keys so they never live in the public repo.
+# Resolution order per backend: env var > local probe (localhost) > this file > safe default.
+# So on a laptop with its own Ollama you can leave everything blank (the probe finds it);
+# on a headless box, point these at a GPU host reachable over your network (LAN, VPN/tailscale).
+# The hosts below are PLACEHOLDERS — replace with your own.
+
+[ollama]
+# url = "http://gpu-host:11434"        # EMBEDDING endpoint (omit to use local :11434)
+# gen_url = "http://gpu-host:11434"    # GENERATION endpoint — resolved SEPARATELY from `url`
+                                        # (mcp/llm_local.py). These are often different hosts:
+                                        # a shared/cluster Ollama may serve embeddings only, while
+                                        # your own GPU box serves generation with a richer model
+                                        # library. Omit gen_url to fall back to `url`.
+# gen_model = "your-pulled-model:tag"  # must be a tag `ollama list` actually shows on gen_url —
+                                        # an unpulled/misspelled tag fails EVERY generate() call
+                                        # silently (fail-open -> degraded=True everywhere upstream:
+                                        # compress_text, classify_text, query_expand, verify_finding)
+# verify_model = "your-pulled-model:tag"   # optional: model for verify_finding's adversarial
+                                            # reasoning specifically, falls back to gen_model when
+                                            # unset. Live hard-tier benchmarking showed this task
+                                            # benefits from a stronger/slower model than classify.
+# compress_model = "your-pulled-model:tag" # optional: model for compress_text's summarization
+                                            # specifically, falls back to gen_model when unset.
+                                            # Compress correctness varies far more across models
+                                            # than classify does — worth tuning independently.
+# guardian_model = "granite3-guardian:2b"  # optional: model for guardian.check_injection_risk's
+                                            # jailbreak/prompt-injection classification. Does NOT
+                                            # fall back to gen_model when unset (defaults to
+                                            # "granite3-guardian:2b" instead) — Granite Guardian is
+                                            # a purpose-built safety classifier tuned on a specific
+                                            # risk-definition prompt shape, and routing this check
+                                            # through an arbitrary chat model would produce
+                                            # meaningless Yes/No output. Also consulted by
+                                            # scripts/hooks/pre_tool_grounding.py (via
+                                            # LOCI_OLLAMA_GUARDIAN_MODEL / OLLAMA_BASE_URL /
+                                            # OLLAMA_GEN_URL env vars, since the hook is a
+                                            # standalone stdlib script and doesn't import mcp/).
+# redteam_model = "hf.co/slevinw/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF:Q4_K_M"
+                                            # optional: explicitly adversarial model for
+                                            # scripts/local_deep_think.py's --red-team tier.
+                                            # Defaults to a heretic/abliterated Qwen3.8 build
+                                            # because aligned models often refuse or soften the
+                                            # "attack this proposal as an adversary would"
+                                            # framing used there.
+#
+# Gotcha on Windows+WSL2 (NAT networking, the default — no networkingMode=mirrored
+# in .wslconfig): WSL cannot reach a Windows-bound Ollama via 127.0.0.1, the WSL
+# default-route gateway IP, or any other Windows adapter IP, even with matching
+# Windows Firewall allow rules already in place — NAT mode simply doesn't bridge
+# WSL to arbitrary Windows-side ports that way. The one address that reliably
+# works is the Windows host's OWN Tailscale (or other VPN mesh) IP, if it has one
+# on the same tailnet as the WSL/Loci side. Confirm with a direct
+# `curl http://<candidate-ip>:11434/api/tags` before trusting any IP guess.
+
+[embed]
+# model = "nomic-embed-text"
+
+[vllm]
+# url = "http://gpu-host:8000"         # batched OpenAI-compatible server (omit -> Ollama fallback)
+# model = "Qwen/Qwen2.5-3B-Instruct"
+
+[rerank]
+# model = "BAAI/bge-reranker-v2-m3"    # default; or the lighter "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+[qdrant]
+# url = "http://qdrant-host:6333"
+# api_key = "..."
+
+[memory]
+# dir = "/absolute/path/to/curated/MEMORY.md/dir"
