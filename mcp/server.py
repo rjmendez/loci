@@ -13230,14 +13230,13 @@ def policy_load(policy_id: str) -> str:
 
 try:
     from drpg_evolution import (
-        TrajectoryStore as _TrajectoryStore,
         evolve_policy as _evolve_policy,
         _default_trajectory_store,
     )
     _DRPG_AVAILABLE = True
 except ImportError:  # pragma: no cover - drpg_evolution module optional at import time
     _DRPG_AVAILABLE = False
-    _TrajectoryStore = _evolve_policy = _default_trajectory_store = None  # type: ignore
+    _evolve_policy = _default_trajectory_store = None  # type: ignore
 
 
 @mcp.tool()

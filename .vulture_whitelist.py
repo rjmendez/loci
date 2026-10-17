@@ -18,6 +18,8 @@
 _ = causal_edges_list
 _ = policy_store
 _ = policy_load
+_ = policy_evolve
+_ = policy_trajectory_push
 _ = investigation_search
 _ = investigation_evidence_precheck
 _ = investigation_entity_lookup
