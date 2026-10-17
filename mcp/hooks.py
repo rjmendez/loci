@@ -10,6 +10,8 @@ Provides:
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -95,7 +97,31 @@ async def loci_policy_hook(
             "reason": "model_not_allowed",
             "violations": [v.to_dict() for v in violations],
         }
-    
+
+    # Check tool_call gating
+    tool_call_name = kwargs.get("tool_call_name")
+    if tool_call_name and policy_config.enabled:
+        allowed_tools: Optional[List[str]] = None
+        allowed_tools_env = os.environ.get("LOCI_POLICY_ALLOWED_TOOLS")
+        if allowed_tools_env:
+            allowed_tools = [t.strip() for t in allowed_tools_env.split(",")]
+        elif policy_config.allowed_models:
+            # Reuse allowed_models list as fallback tool allowlist when no TOOLS env set
+            allowed_tools = policy_config.allowed_models
+
+        if allowed_tools is not None and tool_call_name not in allowed_tools:
+            violations.append(PolicyViolation(
+                "tool_not_allowed",
+                f"Tool '{tool_call_name}' not in allowed tools list",
+                severity="error",
+            ))
+            return {
+                "apply": False,
+                "policy_id": None,
+                "reason": "tool_not_allowed",
+                "violations": [v.to_dict() for v in violations],
+            }
+
     # Try to load a policy for this model/tier
     # For now, we'll just indicate policy is ready to apply
     # In production, this would select a specific policy from the backend
@@ -289,44 +315,57 @@ async def eval_hook_stub(
     logger_arg: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    Stub hook: captures step-level feedback for DRPG policy evolution.
-    
-    Logs reward vector at each step, enabling offline policy optimization.
-    
+    Hook: captures step-level feedback for DRPG policy evolution.
+
+    Persists reward vector to JSONL trajectory file under LOCI_TRAJECTORY_DIR
+    (defaults to ~/.loci/trajectories) and also logs via logger.
+
     Expected kwargs:
     - policy_id: str
     - step: int
     - action: str (SEARCH, BACKTRACK, ANSWER, REFUSE)
     - reward_vector: Dict[str, float] (r_ret, r_rem, r_ovp, r_bkp, r_ref, r_step, r_cor)
-    
+
     Returns:
     {
         "logged": bool,
+        "persisted": bool,
         "step_id": str,
         "feedback": {...}
     }
     """
+    from drpg_evolution import TrajectoryStore
+
     step = kwargs.get("step", 0)
     action = kwargs.get("action", "unknown")
     reward_vector = kwargs.get("reward_vector", {})
     policy_id = kwargs.get("policy_id")
-    
+
     feedback = StepFeedback(
         step=step,
         action=action,
         reward_vector=reward_vector,
         policy_id=policy_id,
     )
-    
-    # In production, this would persist to a log file or database
-    # for DRPG to consume during policy optimization
-    if logger_arg:
-        logger_arg.info(f"DRPG Feedback: {json.dumps(feedback.to_dict())}")
-    else:
-        logger.info(f"DRPG Feedback: {json.dumps(feedback.to_dict())}")
-    
+
+    _log = logger_arg or logger
+    _log.info(f"DRPG Feedback: {json.dumps(feedback.to_dict())}")
+
+    persisted = False
+    if policy_id:
+        try:
+            traj_dir = os.environ.get(
+                "LOCI_TRAJECTORY_DIR", str(Path.home() / ".loci" / "trajectories")
+            )
+            store = TrajectoryStore(Path(traj_dir))
+            store.push(policy_id, feedback.to_dict())
+            persisted = True
+        except Exception as exc:
+            _log.warning("eval_hook_stub: trajectory persist failed (fail-open): %r", exc)
+
     return {
         "logged": True,
+        "persisted": persisted,
         "step_id": f"{policy_id}:step:{step}",
         "feedback": feedback.to_dict(),
     }
