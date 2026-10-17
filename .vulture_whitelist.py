@@ -89,6 +89,7 @@ _ = get_task
 # reporting them (another name reference satisfies it), as did audit_log and
 # memory_promote once server.py itself began calling them.
 
+_ = docs_ingest_indexer
 _ = docs_recall
 _ = finding_resolve
 _ = loci_validated_knowledge_promotion
