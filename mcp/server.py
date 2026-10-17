@@ -13060,6 +13060,59 @@ def memory_route_policy_optimize(
         })
 
 
+@mcp.tool()
+def memory_route_to_policy(
+    investigate_id: str = "",
+    limit: int = 30,
+    days: int = 7,
+    min_decisions: int = 8,
+) -> str:
+    """
+    Run memory_route_policy_optimize and store the recommendation as a Policy object.
+
+    Calls the routing optimizer and feeds its structured recommendation dict
+    {top_k, deduplicate, dedup_threshold} into the PolicyBackend, making it
+    available to the DRPG evolution loop.
+
+    Returns adaptation result: adapted (bool), policy_id, tier, score_delta, reason.
+    """
+    from memory_route_adapter import adapt_route_optimization_to_policy
+
+    optimize_json = memory_route_policy_optimize(
+        investigation_id=investigate_id or None,
+        limit=limit,
+        days=days,
+        min_decisions=min_decisions,
+    )
+    return json.dumps(adapt_route_optimization_to_policy(optimize_json), indent=2)
+
+
+@mcp.tool()
+def counterfactual_gate(
+    top_k: int = 3,
+    deduplicate: bool = True,
+    dedup_threshold: float = 0.8,
+    max_changed_fraction: float = 0.05,
+) -> str:
+    """
+    Run memory_route_counterfactual_simulate and return a go/no-go verdict for tier downgrades.
+
+    Simulates routing under the proposed policy parameters and reports whether
+    the fraction of changed decisions is within the acceptable threshold.
+
+    Returns: safe_to_downgrade (bool), changed_fraction, changed, total, reason.
+    """
+    from memory_route_adapter import evaluate_counterfactual_gate
+
+    simulate_json = memory_route_counterfactual_simulate(
+        top_k=top_k,
+        deduplicate=deduplicate,
+        dedup_threshold=dedup_threshold,
+    )
+    result = evaluate_counterfactual_gate(simulate_json, max_changed_fraction=max_changed_fraction)
+    return json.dumps(result, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
