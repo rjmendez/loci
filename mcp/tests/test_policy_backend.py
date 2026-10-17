@@ -116,10 +116,8 @@ class TestPolicyLoading(unittest.TestCase):
             region=PolicyRegion.MEMORY
         )
         
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaisesRegex(ValueError, "missing_title"):
             self.backend.store(policy)
-        
-        self.assertIn("missing_title", str(cm.exception))
 
 
 class TestEnvironmentDefaults(unittest.TestCase):
@@ -372,123 +370,172 @@ class TestLociMCPTools(unittest.TestCase):
 
 
 class TestHookIntegration(unittest.TestCase):
-    """RED: LiteLLM hooks integration (policy_hook, grounding_hook augment, tier_router)."""
+    """GREEN: LiteLLM hooks integration (policy_hook, grounding_hook augment, tier_router)."""
+
+    def setUp(self):
+        self.original_env = os.environ.copy()
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.original_env)
 
     def test_loci_policy_hook_decides_whether_to_apply_policy(self):
-        """Test: loci_policy_hook returns (apply: bool, policy_id: str|None, reason: str)."""
-        # Hook signature:
-        # async def loci_policy_hook(model, messages, kwargs, litellm_params, logger):
-        #     return {"apply": True, "policy_id": "...", "reason": "..."}
-        # Returns:
-        #   - apply=True if policy is enabled and matches model/tier
-        #   - apply=False with reason if policy disabled or model excluded
-        pass
+        """Test: loci_policy_hook returns apply=False when disabled, apply=True when enabled."""
+        # Negative: policy disabled (default) → apply=False with reason
+        os.environ.pop("LOCI_POLICY_ENABLE", None)
+        result = asyncio.run(loci_policy_hook("gpt-4", [], {}, {}))
+        self.assertFalse(result["apply"])
+        self.assertEqual(result["reason"], "policy_disabled_via_env")
+
+        # Positive: policy enabled → apply=True
+        os.environ["LOCI_POLICY_ENABLE"] = "1"
+        result = asyncio.run(loci_policy_hook("gpt-4", [], {}, {}))
+        self.assertTrue(result["apply"])
+        self.assertEqual(result["reason"], "policy_enabled")
 
     def test_grounding_hook_augmented_with_policy_backing(self):
-        """Test: grounding_hook augmented to surface policy's backing evidence."""
-        # The EVO-RAG discovery phase policy backs retrieval with reward vector
-        # grounding_hook should inject:
-        # MEMORY MATCH (policy-aware):
-        #   - discovery_mode: use broad search
-        #   - reward_vector: ["r_ret", "r_rem", "r_ovp"]
-        #   - matching findings with scores
-        pass
+        """Test: grounding_hook returns messages unchanged when no policy; augments when one is set."""
+        messages = [{"role": "user", "content": "query"}]
+
+        # Negative: no policy_id → not augmented, messages pass through unchanged
+        result = asyncio.run(grounding_hook_augmented("gpt-4", messages, {}, {}))
+        self.assertEqual(result["messages"], messages)
+        self.assertFalse(result["augmented"])
+
+        # Positive: policy_id provided with mocked backend → augmented=True
+        policy = Policy(
+            title="Test Policy",
+            tier=PolicyTier.LIGHT,
+            region=PolicyRegion.MEMORY,
+            config={"discovery_mode": True},
+        )
+        with patch("hooks.PolicyBackend") as mock_backend_cls:
+            mock_backend_cls.return_value.load.return_value = policy
+            result = asyncio.run(
+                grounding_hook_augmented("gpt-4", messages, {"policy_id": "p-test"}, {})
+            )
+        self.assertTrue(result["augmented"])
+        self.assertEqual(result["policy_id"], "p-test")
 
     def test_tier_router_surfaces_policy_constraints(self):
-        """Test: tier_router respects policy tier limits on model selection."""
-        # If policy tier=light, tier_router should:
-        #   - Reject heavy-tier models
-        #   - Downgrade to light-tier equivalent
-        #   - Log violation if LOCI_POLICY_ENABLE=1
-        pass
+        """Test: tier_router returns default when no policy; downgrades when tier exceeds policy."""
+        # Negative: no policy_id → no downgrade
+        result = asyncio.run(tier_router_surface("gpt-4", [], {}, {}))
+        self.assertEqual(result["tier_decision"], "default")
+        self.assertFalse(result["downgraded"])
+
+        # Positive: policy tier=light, requested tier=heavy → downgraded to light
+        policy = Policy(
+            title="Light Policy",
+            tier=PolicyTier.LIGHT,
+            region=PolicyRegion.ROUTING,
+        )
+        with patch("hooks.PolicyBackend") as mock_backend_cls:
+            mock_backend_cls.return_value.load.return_value = policy
+            result = asyncio.run(
+                tier_router_surface("gpt-4", [], {"policy_id": "p1", "tier": "heavy"}, {})
+            )
+        self.assertTrue(result["downgraded"])
+        self.assertEqual(result["tier_decision"], "light")
 
     def test_eval_hook_stub_captures_feedback_for_drpg(self):
-        """Test: eval_hook_stub logs step-level feedback for DRPG policy evolution."""
-        # Expected logs:
-        # {
-        #   "step": 1,
-        #   "action": "SEARCH",
-        #   "reward": {
-        #     "r_ret": 1.0,  # hit gold docs
-        #     "r_rem": -0.1,  # search penalty
-        #     "r_ovp": 0.0,   # no overlap
-        #     "r_step": -0.05  # step penalty
-        #   },
-        #   "timestamp": "...",
-        #   "policy_id": "..."
-        # }
-        pass
+        """Test: eval_hook_stub returns logged=True with step_id and full reward vector."""
+        reward_vector = {
+            "r_ret": 1.0, "r_rem": -0.1, "r_ovp": 0.0,
+            "r_bkp": 0.0, "r_ref": 0.0, "r_step": -0.05, "r_cor": 0.0,
+        }
+        kwargs = {
+            "step": 1, "action": "SEARCH",
+            "reward_vector": reward_vector, "policy_id": "policy-abc",
+        }
+        result = asyncio.run(eval_hook_stub("gpt-4", [], kwargs, {}))
+
+        self.assertTrue(result["logged"])
+        self.assertEqual(result["step_id"], "policy-abc:step:1")
+        feedback = result["feedback"]
+        self.assertEqual(feedback["step"], 1)
+        self.assertEqual(feedback["action"], "SEARCH")
+        self.assertEqual(feedback["reward"]["r_ret"], 1.0)
+        self.assertEqual(feedback["reward"]["r_step"], -0.05)
 
 
 class TestPolicyValidation(unittest.TestCase):
-    """RED: Policy validation against tier/region constraints."""
+    """GREEN: Policy validation against tier/region constraints."""
 
     def test_policy_validation_rejects_invalid_tier(self):
         """Test: policy validator rejects tier not in (light, medium, heavy)."""
-        policy = {
-            "tier": "extreme",  # Invalid
-            "region": "memory",
-            "config": {}
-        }
-        # from loci_mcp.policy import validate_policy
-        # errors = validate_policy(policy)
-        # self.assertIn("invalid_tier", [e["code"] for e in errors])
-        pass
+        # Negative: invalid tier → error with code invalid_tier
+        errors = validate_policy({"tier": "extreme", "region": "memory", "title": "x", "config": {}})
+        self.assertIn("invalid_tier", [e["code"] for e in errors])
+
+        # Positive: valid tier → no invalid_tier error
+        errors = validate_policy({"tier": "light", "region": "memory", "title": "x", "config": {}})
+        self.assertNotIn("invalid_tier", [e["code"] for e in errors])
 
     def test_policy_validation_rejects_invalid_region(self):
         """Test: policy validator rejects region not in (memory, context, routing)."""
-        policy = {
-            "tier": "light",
-            "region": "unknown",  # Invalid
-            "config": {}
-        }
-        # from loci_mcp.policy import validate_policy
-        # errors = validate_policy(policy)
-        # self.assertIn("invalid_region", [e["code"] for e in errors])
-        pass
+        # Negative: invalid region → error with code invalid_region
+        errors = validate_policy({"tier": "light", "region": "unknown", "title": "x", "config": {}})
+        self.assertIn("invalid_region", [e["code"] for e in errors])
+
+        # Positive: valid region → no invalid_region error
+        errors = validate_policy({"tier": "light", "region": "context", "title": "x", "config": {}})
+        self.assertNotIn("invalid_region", [e["code"] for e in errors])
 
     def test_policy_validation_checks_config_consistency(self):
-        """Test: max_context_chars must align with tier constraints."""
-        policy = {
-            "tier": "light",
-            "config": {
-                "max_context_chars": 100000  # Exceeds light tier limit
-            }
-        }
-        # from loci_mcp.policy import validate_policy
-        # errors = validate_policy(policy)
-        # self.assertTrue(any(e["code"] == "tier_config_mismatch" for e in errors))
-        pass
+        """Test: max_context_chars above light-tier limit (2048) triggers tier_config_mismatch."""
+        # Negative: config exceeds light-tier limit
+        errors = validate_policy({"tier": "light", "title": "x", "config": {"max_context_chars": 100000}})
+        self.assertTrue(any(e["code"] == "tier_config_mismatch" for e in errors))
+
+        # Positive: config within light-tier limit → no mismatch
+        errors = validate_policy({"tier": "light", "title": "x", "config": {"max_context_chars": 1024}})
+        self.assertFalse(any(e["code"] == "tier_config_mismatch" for e in errors))
 
 
 class TestDRPGIntegration(unittest.TestCase):
-    """RED: DRPG discovery↔refinement and 7D reward vector integration."""
+    """GREEN: DRPG discovery↔refinement and 7D reward vector integration."""
 
     def test_policy_discovery_phase_uses_high_retrieval_bonus(self):
-        """Test: Discovery phase policy has r_ret weight = 1.0 (high incentive to retrieve)."""
-        # From EVO-RAG grounded reference:
-        # Discovery: broad exploration, high retrieval incentive
-        # policy.config.discovery_mode = True implies:
-        #   - r_ret_weight: 1.0
-        #   - r_rem_weight: -0.05  (low penalty for searching)
-        #   - r_bkp_weight: -0.2   (penalize backtrack)
-        pass
+        """Test: Discovery phase policy has r_ret=1.0, r_rem=-0.05, r_bkp=-0.2."""
+        policy = Policy(
+            title="Discovery Policy",
+            tier=PolicyTier.MEDIUM,
+            region=PolicyRegion.MEMORY,
+            config={"discovery_mode": True},
+        )
+        weights = policy.get_reward_vector_weights()
+        self.assertEqual(weights["r_ret"], 1.0)
+        self.assertEqual(weights["r_rem"], -0.05)
+        self.assertEqual(weights["r_bkp"], -0.2)
 
     def test_policy_refinement_phase_prioritizes_efficiency(self):
-        """Test: Refinement phase policy penalizes searches, prioritizes correctness."""
-        # Refinement: efficiency, penalize searches
-        # policy.config.discovery_mode = False implies:
-        #   - r_ret_weight: 0.5
-        #   - r_rem_weight: -0.2   (higher penalty for searching)
-        #   - r_ref_weight: 1.0    (high reward for refusal when insufficient)
-        pass
+        """Test: Refinement phase policy has r_ret=0.5, r_rem=-0.2, r_ref=1.0."""
+        policy = Policy(
+            title="Refinement Policy",
+            tier=PolicyTier.MEDIUM,
+            region=PolicyRegion.MEMORY,
+            config={"discovery_mode": False},
+        )
+        weights = policy.get_reward_vector_weights()
+        self.assertEqual(weights["r_ret"], 0.5)
+        self.assertEqual(weights["r_rem"], -0.2)
+        self.assertEqual(weights["r_ref"], 1.0)
 
     def test_reward_vector_step_tracking(self):
-        """Test: eval_hook tracks 7-dimensional reward vector per step."""
-        # reward_vector = [r_ret, r_rem, r_ovp, r_bkp, r_ref, r_step, r_cor]
-        # eval_hook logs each component at every step
-        # Used by DRPG to evolve policy parameters
-        pass
+        """Test: eval_hook_stub returns all 7 reward components logged for DRPG."""
+        reward_vector = {
+            "r_ret": 1.0, "r_rem": -0.1, "r_ovp": 0.0,
+            "r_bkp": 0.0, "r_ref": 0.0, "r_step": -0.05, "r_cor": 0.8,
+        }
+        kwargs = {"step": 3, "action": "ANSWER", "reward_vector": reward_vector, "policy_id": "drpg-1"}
+        result = asyncio.run(eval_hook_stub("gpt-4", [], kwargs, {}))
+
+        self.assertTrue(result["logged"])
+        feedback = result["feedback"]
+        self.assertEqual(len(feedback["reward"]), 7)
+        self.assertEqual(feedback["reward"]["r_cor"], 0.8)
+        self.assertEqual(feedback["action"], "ANSWER")
 
 
 if __name__ == "__main__":

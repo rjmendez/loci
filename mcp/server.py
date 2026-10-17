@@ -13185,9 +13185,9 @@ class _BearerAuthMiddleware:
 
 
 try:
-    from policy import Policy, PolicyBackend, PolicyTier, PolicyRegion, validate_policy
+    from policy import Policy, PolicyBackend, PolicyTier, PolicyRegion
 except ImportError:  # pragma: no cover - policy module optional at import time
-    Policy = PolicyBackend = PolicyTier = PolicyRegion = validate_policy = None  # type: ignore
+    Policy = PolicyBackend = PolicyTier = PolicyRegion = None  # type: ignore
 
 
 @mcp.tool()

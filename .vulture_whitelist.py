@@ -16,6 +16,8 @@
 
 # ── MCP tool functions (registered via @mcp.tool() decorator, called by the framework)
 _ = causal_edges_list
+_ = policy_store
+_ = policy_load
 _ = investigation_search
 _ = investigation_evidence_precheck
 _ = investigation_entity_lookup
@@ -86,7 +88,7 @@ _ = get_task
 # health (@mcp.custom_route) and loci_health left this list once vulture stopped
 # reporting them (another name reference satisfies it), as did audit_log and
 # memory_promote once server.py itself began calling them.
-_ = docs_ingest_indexer
+
 _ = docs_recall
 _ = finding_resolve
 _ = loci_validated_knowledge_promotion
