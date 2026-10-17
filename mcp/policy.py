@@ -174,22 +174,27 @@ class PolicyConfig:
     enabled: bool = False
     max_chars: int = 8192
     allowed_models: Optional[List[str]] = None
+    cache_confidence_threshold: float = 0.85
+    cache_ttl_hours: float = 24.0
 
     @classmethod
     def from_env(cls) -> "PolicyConfig":
         """Load policy config from environment variables."""
         enabled = os.getenv("LOCI_POLICY_ENABLE", "0").lower() in ("1", "true", "yes")
         max_chars = int(os.getenv("LOCI_POLICY_MAX_CHARS", "8192"))
-        
-        allowed_models_str = os.getenv("LOCI_POLICY_ALLOWED_MODELS", None)
-        allowed_models = None
-        if allowed_models_str:
-            allowed_models = [m.strip() for m in allowed_models_str.split(",")]
-        
+
+        allowed_models_str = os.getenv("LOCI_POLICY_ALLOWED_MODELS")
+        allowed_models = [m.strip() for m in allowed_models_str.split(",")] if allowed_models_str else None
+
+        cache_confidence_threshold = float(os.getenv("LOCI_CACHE_CONFIDENCE", "0.85"))
+        cache_ttl_hours = float(os.getenv("LOCI_CACHE_TTL_HOURS", "24.0"))
+
         return cls(
             enabled=enabled,
             max_chars=max_chars,
             allowed_models=allowed_models,
+            cache_confidence_threshold=cache_confidence_threshold,
+            cache_ttl_hours=cache_ttl_hours,
         )
 
 
