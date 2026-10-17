@@ -13189,6 +13189,19 @@ try:
 except ImportError:  # pragma: no cover - policy module optional at import time
     Policy = PolicyBackend = PolicyTier = PolicyRegion = validate_policy = None  # type: ignore
 
+try:
+    from litellm_client import (
+        call_litellm_proxy,
+        resolve_model_for_tier_simple,
+        LiteLLMResponse,
+        LITELLM_PROXY_URL,
+    )
+    _LITELLM_CLIENT_AVAILABLE = True
+except ImportError:  # pragma: no cover - litellm_client optional
+    call_litellm_proxy = resolve_model_for_tier_simple = LiteLLMResponse = None  # type: ignore
+    LITELLM_PROXY_URL = "http://localhost:4000"
+    _LITELLM_CLIENT_AVAILABLE = False
+
 
 @mcp.tool()
 def policy_store(
@@ -13278,6 +13291,91 @@ def policy_trajectory_push(
         return json.dumps({"pushed": True, "policy_id": policy_id, "step": step})
     except Exception as exc:
         return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def mcp__loci__litellm_call(
+    model: str,
+    messages: list,
+    policy_id: str = "",
+    max_tokens: int = 1024,
+) -> str:
+    """Make a governed, cost-optimal LiteLLM completion call via the LiteLLM proxy.
+
+    If policy_id is provided, the policy's tier constrains the model: heavy models are
+    automatically downgraded to the tier's lightest model. Falls back open on proxy error.
+    Trajectory feedback is pushed to TrajectoryStore when policy_id and DRPG are available.
+    """
+    if not _LITELLM_CLIENT_AVAILABLE:
+        return json.dumps({"error": "litellm_client unavailable"})
+
+    tier = "heavy"  # no restriction by default
+    if policy_id and PolicyBackend is not None:
+        try:
+            backend = PolicyBackend()
+            policy = backend.load(policy_id)
+            if policy is not None:
+                tier = getattr(policy, "tier", None)
+                if hasattr(tier, "value"):
+                    tier = tier.value
+                if not isinstance(tier, str):
+                    tier = "heavy"
+        except Exception:
+            tier = "heavy"
+
+    resolved_model, was_rewritten = resolve_model_for_tier_simple(model, tier)
+
+    try:
+        response = call_litellm_proxy(resolved_model, messages, max_tokens)
+    except Exception as exc:
+        return json.dumps({
+            "error": "proxy_unavailable",
+            "detail": str(exc),
+            "model": model,
+        })
+
+    if policy_id and _DRPG_AVAILABLE:
+        try:
+            r_ret = 1.0 if response.content else 0.0
+            r_cor = 1.0
+            r_step = -0.01 * response.latency_ms / 100
+            store = _default_trajectory_store()
+            store.push(policy_id, {
+                "step": int(time.time()),
+                "action": "ANSWER",
+                "reward": {
+                    "r_ret": r_ret,
+                    "r_cor": r_cor,
+                    "r_step": r_step,
+                },
+                "policy_id": policy_id,
+            })
+        except Exception as exc:
+            logger.debug("litellm_call: trajectory push failed (fail-open): %r", exc)
+
+    return json.dumps({
+        "model": resolved_model,
+        "original_model": model if was_rewritten else None,
+        "content": response.content,
+        "usage": response.to_dict()["usage"],
+        "latency_ms": response.latency_ms,
+        "policy_applied": bool(policy_id),
+        "downgraded": was_rewritten,
+    })
+
+
+@mcp.tool()
+def mcp__loci__litellm_health() -> str:
+    """Check LiteLLM proxy health. Returns healthy/unhealthy status and detail. Never raises."""
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    url = f"{LITELLM_PROXY_URL.rstrip('/')}/health"
+    try:
+        with _ureq.urlopen(url, timeout=5) as resp:
+            detail = resp.read().decode("utf-8", errors="replace")
+        return json.dumps({"healthy": True, "proxy_url": LITELLM_PROXY_URL, "detail": detail})
+    except Exception as exc:
+        return json.dumps({"healthy": False, "proxy_url": LITELLM_PROXY_URL, "detail": str(exc)})
 
 
 def main() -> None:
