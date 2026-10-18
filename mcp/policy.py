@@ -16,7 +16,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 import json
 
 
@@ -46,6 +46,78 @@ class PolicyTier(str, Enum):
             },
         }
         return tiers.get(self, {})
+
+
+TIER_MODEL_MAP: Dict[PolicyTier, List[str]] = {
+    PolicyTier.LIGHT: [
+        "claude-haiku-4.5",
+        "gpt-5-mini",
+        "mistral-7b-instruct",
+        "llama-3-8b-instruct",
+    ],
+    PolicyTier.MEDIUM: [
+        "claude-sonnet-4.6",
+        "gpt-5.4-mini",
+        "llama-3-70b-instruct",
+        "mistral-large",
+    ],
+    PolicyTier.HEAVY: [
+        "claude-opus-4.8",
+        "gpt-5.4",
+        "gpt-5.5",
+        "claude-sonnet-4.6",  # fallback if opus unavailable
+    ],
+}
+
+
+def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
+    """
+    Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
+
+    LOCI_TIER_MODEL_MAP should be a JSON string:
+    {"light": ["model-a", "model-b"], "medium": [...], "heavy": [...]}
+    """
+    override = os.getenv("LOCI_TIER_MODEL_MAP")
+    if override:
+        try:
+            data = json.loads(override)
+            return {
+                PolicyTier(k): v
+                for k, v in data.items()
+                if k in ("light", "medium", "heavy")
+            }
+        except (json.JSONDecodeError, ValueError):
+            pass  # fall through to default
+    return TIER_MODEL_MAP
+
+
+def resolve_model_for_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
+    """
+    Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
+
+    If requested_model is already in the tier's allowed list, returns it unchanged.
+    If it's in an allowed or lower tier, keeps it (within cost budget).
+    If it's in a higher tier or unknown, downgrades to the first model in the allowed tier.
+    """
+    tier_map = get_tier_model_map()
+    allowed = tier_map.get(tier, [])
+    tier_order = {PolicyTier.LIGHT: 0, PolicyTier.MEDIUM: 1, PolicyTier.HEAVY: 2}
+
+    # Find which tier the requested model belongs to
+    requested_tier = None
+    for t, models in tier_map.items():
+        if requested_model in models:
+            requested_tier = t
+            break
+
+    # If model is in an allowed or lower tier, keep it
+    if requested_tier is not None and tier_order[requested_tier] <= tier_order[tier]:
+        return requested_model, False
+
+    # Otherwise downgrade to first model in allowed tier
+    if allowed:
+        return allowed[0], True
+    return requested_model, False
 
 
 class PolicyRegion(str, Enum):
