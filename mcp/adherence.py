@@ -16,7 +16,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-ADHERENCE_DIR = Path(os.getenv("LOCI_ADHERENCE_DIR", "~/.loci/adherence")).expanduser()
+from loci.jsonl_bounds import append_bounded, tail_lines
+from loci.policy import loci_home
+
+
+def default_adherence_dir() -> Path:
+    """$LOCI_ADHERENCE_DIR, else <LOCI_HOME or ~/.loci>/adherence, resolved at call time (never at import)."""
+    override = os.getenv("LOCI_ADHERENCE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return loci_home() / "adherence"
 
 
 @dataclass
@@ -45,33 +54,35 @@ class AdherenceStore:
     """Stores and queries policy adherence records."""
 
     def __init__(self, adherence_dir: Optional[Path] = None):
-        self.adherence_dir = Path(adherence_dir or ADHERENCE_DIR)
+        self.adherence_dir = Path(adherence_dir or default_adherence_dir())
         self.adherence_dir.mkdir(parents=True, exist_ok=True)
 
     def record(self, rec: PolicyAdherenceRecord) -> None:
-        """Append one adherence record. Fail-open."""
+        """Append one adherence record. Fail-open.
+
+        The per-policy file is bounded: past 5000 rows or 1 MiB it is rotated to
+        ``<policy_id>.jsonl.<k>`` (plain JSONL) and a fresh file is started.
+        """
         path = self.adherence_dir / f"{rec.policy_id}.jsonl"
         try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec.to_dict()) + "\n")
-        except OSError:
+            append_bounded(path, json.dumps(rec.to_dict()))
+        except (OSError, ValueError):
             pass
 
     def read(self, policy_id: str, limit: int = 100) -> List[PolicyAdherenceRecord]:
-        """Read most recent N adherence records for a policy."""
+        """Read the most recent N adherence records for a policy.
+
+        Only the last ``limit`` lines of the file are read (cost bounded by ``limit``, not file
+        size); a malformed line among them is skipped, so fewer than ``limit`` records can come back.
+        """
         path = self.adherence_dir / f"{policy_id}.jsonl"
-        if not path.exists():
-            return []
         records = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        records.append(PolicyAdherenceRecord.from_dict(json.loads(line)))
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-        return records[-limit:]  # most recent
+        for raw in tail_lines(path, limit):
+            try:
+                records.append(PolicyAdherenceRecord.from_dict(json.loads(raw)))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return records
 
     def compute_report(self, policy_id: str, min_records: int = 5) -> Dict[str, Any]:
         """
