@@ -61,12 +61,14 @@ class TestResolveModelForTier:
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is False
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_heavy_model_against_light_policy_downgrades_to_first_light(self):
         """HEAVY model against LIGHT policy → downgraded to first LIGHT model."""
         resolved, was_rewritten = downgrade_model_to_tier("claude-opus-4.8", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is True
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_unknown_model_against_medium_policy_returns_first_medium(self):
         """Unknown model against MEDIUM policy → first MEDIUM model, was_rewritten=True."""
         resolved, was_rewritten = downgrade_model_to_tier("gpt-4-turbo-unknown", PolicyTier.MEDIUM)
@@ -91,12 +93,14 @@ class TestResolveModelForTier:
         assert resolved == "claude-opus-4.8"
         assert was_rewritten is False
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_unknown_model_against_light_policy_downgrades(self):
         """Unknown model against LIGHT policy → downgraded to first LIGHT model."""
         resolved, was_rewritten = downgrade_model_to_tier("some-future-model-v99", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is True
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_medium_model_against_light_policy_downgrades(self):
         """MEDIUM model against LIGHT policy → downgraded to first LIGHT model."""
         resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6", PolicyTier.LIGHT)
@@ -110,6 +114,7 @@ class TestResolveModelForTier:
 
 
 class TestGetTierModelMap:
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_default_returns_tier_model_map(self, monkeypatch):
         """Without env override, returns the module-level TIER_MODEL_MAP."""
         monkeypatch.delenv("LOCI_TIER_MODEL_MAP", raising=False)
@@ -131,6 +136,7 @@ class TestGetTierModelMap:
         assert result[PolicyTier.MEDIUM] == ["mid-model-x"]
         assert result[PolicyTier.HEAVY] == ["big-model-z"]
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_invalid_json_falls_back_to_default(self, monkeypatch):
         """Invalid JSON in LOCI_TIER_MODEL_MAP silently falls back to TIER_MODEL_MAP."""
         monkeypatch.setenv("LOCI_TIER_MODEL_MAP", "{not valid json}")
@@ -172,6 +178,7 @@ def _make_policy(tier: PolicyTier) -> Policy:
 
 
 class TestTierRouterSurface:
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_heavy_model_light_policy_downgrades(self):
         """HEAVY model + LIGHT policy → model rewritten, downgraded=True, violation logged."""
         light_policy = _make_policy(PolicyTier.LIGHT)
@@ -367,11 +374,13 @@ class TestResolveModelForTierNewTiers(unittest.TestCase):
         self.assertEqual(resolved, "claude-sonnet-4.6")
         self.assertFalse(was_rewritten)
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_turbo_model_against_light_downgrades(self):
         resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6-extended", PolicyTier.LIGHT)
         self.assertEqual(resolved, "claude-haiku-4.5")
         self.assertTrue(was_rewritten)
 
+    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_nano_model_against_light_kept_as_is(self):
         # NANO (order=1) is lower than LIGHT (order=2), so it's within budget
         resolved, was_rewritten = downgrade_model_to_tier("ollama/llama3.2:3b", PolicyTier.LIGHT)
