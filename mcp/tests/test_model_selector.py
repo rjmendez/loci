@@ -68,7 +68,7 @@ def test_general_role_serves_a_tier_with_no_tier_role(pool):
 
 
 @pytest.mark.parametrize("tier,role", [
-    ("nano", "decide"), ("light", "gen"), ("standard", "gen"), ("medium", "gen"),
+    ("nano", "gen"), ("light", "gen"), ("standard", "gen"), ("medium", "gen"),
     ("turbo", "gen_large"), ("heavy", "gen_large"), ("research", "gen_large"),
 ])
 def test_each_tier_falls_back_to_its_general_role(pool, tier, role):
@@ -147,7 +147,7 @@ def test_env_switch_turns_local_preference_off_and_on(pool, monkeypatch):
 
 
 def test_a_pool_pick_already_in_the_map_is_listed_once(pool):
-    pool({"decide": "llama3.2:3b"})
+    pool({"gen": "llama3.2:3b"})
     assert model_selector.candidates("nano") == [
         "ollama/llama3.2:3b", "ollama/mistral:7b", "ollama/phi3:mini"]
 
@@ -211,13 +211,13 @@ def test_downgrade_at_zero_leaves_the_request_alone(pool):
 
 
 def test_resolve_model_for_tier_leads_with_the_pool_and_honours_available(pool):
-    pool({"decide": "tiny:1b"})
+    pool({"gen": "tiny:1b"})
     assert resolve_model_for_tier(PolicyTier.NANO) == "ollama/tiny:1b"
     assert resolve_model_for_tier(PolicyTier.NANO, available=["ollama/phi3:mini"]) == "ollama/phi3:mini"
     assert resolve_model_for_tier(PolicyTier.NANO, available=["nothing-matches"]) == "ollama/tiny:1b"
 
 
 def test_resolve_model_for_tier_zero_is_refused(pool):
-    pool({"decide": "tiny:1b"})
+    pool({"gen": "tiny:1b"})
     with pytest.raises(ValueError, match="PolicyTier.ZERO forbids LLM calls"):
         resolve_model_for_tier(PolicyTier.ZERO)

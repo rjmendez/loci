@@ -14,6 +14,16 @@ over-confident when wrong. Treat ``confidence`` as a ranking signal and route lo
 person or a bigger model; do not treat it as a probability of being right.
 
 Fail-open like ``llm_local``: nothing here raises; a problem returns ``{"ok": False, "degraded": True, ...}``.
+
+Wrapper limits (shadow only, advisory only, 0 cloud tokens: the only server it talks to is the local Ollama):
+at most ``MAX_INFLIGHT`` (2) calls run at once, and a further call returns the degraded rules-fallback result at once
+(``fallback: "busy"``), it never waits; ``timeout`` (``TIMEOUT_S``, 5 s) is the budget of the WHOLE call, questions
+included, and a call that runs past it is degraded; ``BREAKER_THRESHOLD`` (3) consecutive degraded calls open a
+breaker that answers ``fallback: "breaker_open"`` for ``BREAKER_COOLDOWN_S`` (60 s), after which ONE probe call is let
+through (half-open) and its result closes or re-opens the breaker. A malformed request is the caller's fault: counted,
+but it neither opens nor resets the breaker. Every fallback and breaker event is counted and ``stats()`` returns the
+counters, so degraded operation is reported, not silent. Each limit is a module constant, overridable by the
+``LOCI_DECIDE_*`` environment variables (read when ``Limits`` is built) or by constructing ``Limits`` with arguments.
 The model comes from the pool role ``decide`` (``LOCI_DECIDE_MODEL`` overrides), the card from the pool's
 ``gpu`` key, the server from ``backends.ollama_gen_url()``. Calls are logged for the pool's outcome log.
 """
@@ -24,6 +34,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -35,6 +46,16 @@ MAX_QUESTIONS = 64
 MIN_OPTIONS, MAX_OPTIONS = 2, 26
 TOP_LOGPROBS = 20
 _KINDS = ("choice", "noul", "score")
+
+# Wrapper limits. Each has an environment override, read when ``Limits`` is built.
+MAX_INFLIGHT = 2
+TIMEOUT_S = 5.0
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN_S = 60.0
+MAX_INFLIGHT_ENV = "LOCI_DECIDE_MAX_INFLIGHT"
+TIMEOUT_ENV = "LOCI_DECIDE_TIMEOUT_S"
+BREAKER_THRESHOLD_ENV = "LOCI_DECIDE_BREAKER_THRESHOLD"
+BREAKER_COOLDOWN_ENV = "LOCI_DECIDE_BREAKER_COOLDOWN_S"
 
 
 class DecideError(ValueError):
@@ -182,6 +203,121 @@ def answer_field(field: dict, letters: dict[str, float], floor: Optional[float] 
             "probabilities": probs, "confidence": confidence, "letter_mass": mass}
 
 
+# ---------------------------------------------------------------------------------- wrapper limits
+
+def _env_number(name: str, default: Any, cast: Callable[[str], Any]) -> Any:
+    """The positive number in environment variable ``name``, else ``default`` (fail-open on junk)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        _LOG.warning("decide: ignoring %s=%r (not a number)", name, raw)
+        return default
+    if not value > 0:                       # also rejects nan
+        _LOG.warning("decide: ignoring %s=%r (must be positive)", name, raw)
+        return default
+    return value
+
+
+class Limits:
+    """In-flight cap, breaker and counters for ``decide``. One process-wide instance (``_LIMITS``) serves callers.
+
+    Every argument defaults to its module constant, overridden by its environment variable. ``clock`` (seconds,
+    monotonic) times the call budget and the breaker, so tests drive both without sleeping.
+    """
+
+    def __init__(self, max_inflight: Optional[int] = None, timeout: Optional[float] = None,
+                 threshold: Optional[int] = None, cooldown: Optional[float] = None,
+                 clock: Callable[[], float] = time.monotonic):
+        self.max_inflight = max_inflight or _env_number(MAX_INFLIGHT_ENV, MAX_INFLIGHT, int)
+        self.timeout = timeout or _env_number(TIMEOUT_ENV, TIMEOUT_S, float)
+        self.threshold = threshold or _env_number(BREAKER_THRESHOLD_ENV, BREAKER_THRESHOLD, int)
+        self.cooldown = cooldown or _env_number(BREAKER_COOLDOWN_ENV, BREAKER_COOLDOWN_S, float)
+        self.clock = clock
+        self._slots = threading.BoundedSemaphore(self.max_inflight)
+        self._lock = threading.Lock()
+        self._state = "closed"              # closed | open | half_open
+        self._opened_at = 0.0
+        self._probing = False
+        self._consecutive = 0
+        self._inflight = 0
+        self._counts = {k: 0 for k in (
+            "calls", "ok", "degraded", "invalid_request", "timeouts", "fallback_busy", "fallback_breaker_open",
+            "breaker_opened", "breaker_probes", "breaker_closed")}
+
+    def note_invalid(self) -> None:
+        with self._lock:
+            self._counts["calls"] += 1
+            self._counts["invalid_request"] += 1
+
+    def admit(self) -> tuple[Optional[str], bool]:
+        """``(fallback_reason, is_probe)``. A reason means do not call the model; otherwise a slot is held."""
+        with self._lock:
+            self._counts["calls"] += 1
+            if self._state == "open" and self.clock() - self._opened_at >= self.cooldown:
+                self._state, self._probing = "half_open", False
+            if self._state == "open" or (self._state == "half_open" and self._probing):
+                self._counts["fallback_breaker_open"] += 1
+                return "breaker_open", False
+            probe = self._state == "half_open"
+            if not self._slots.acquire(blocking=False):
+                self._counts["fallback_busy"] += 1      # a probe that found no slot never ran: the next call probes
+                return "busy", False
+            self._probing = probe
+            self._inflight += 1
+            if probe:
+                self._counts["breaker_probes"] += 1
+            return None, probe
+
+    def finish(self, probe: bool, degraded: bool, timed_out: bool) -> None:
+        """Release the slot taken by ``admit`` and feed the call's result to the breaker.
+
+        Only the probe moves a tripped breaker; a call that was already in flight when it opened is counted and ignored.
+        """
+        with self._lock:
+            self._slots.release()
+            self._inflight -= 1
+            self._counts["degraded" if degraded else "ok"] += 1
+            if timed_out:
+                self._counts["timeouts"] += 1
+            if probe:
+                self._probing = False
+            if not degraded:
+                if probe:
+                    self._state = "closed"
+                    self._counts["breaker_closed"] += 1
+                    _LOG.warning("decide: breaker closed after a good probe")
+                if self._state == "closed":
+                    self._consecutive = 0
+                return
+            if self._state == "closed":
+                self._consecutive += 1
+            if probe or (self._state == "closed" and self._consecutive >= self.threshold):
+                self._state, self._opened_at = "open", self.clock()
+                self._counts["breaker_opened"] += 1
+                _LOG.warning("decide: breaker open for %.0fs after %d degraded calls", self.cooldown, self._consecutive)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {**self._counts, "breaker": self._state, "consecutive_degraded": self._consecutive,
+                    "inflight": self._inflight, "max_inflight": self.max_inflight, "timeout_s": self.timeout,
+                    "breaker_threshold": self.threshold, "breaker_cooldown_s": self.cooldown}
+
+
+_LIMITS = Limits()
+
+
+def stats() -> dict:
+    """Counters and limits of this process's ``decide`` calls (fallbacks, timeouts, breaker events)."""
+    return _LIMITS.stats()
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or any("Timeout" in c.__name__ for c in type(exc).__mro__)
+
+
 # ---------------------------------------------------------------------------------- the call
 
 def _resolve_model(model: str) -> str:
@@ -233,15 +369,20 @@ def _record(model: str, ok: bool, started: float, prompt_chars: int) -> None:
         _LOG.debug("decide: outcome log skipped: %r", exc)
 
 
-def decide(state: Any, questions: dict, *, model: str = "", base_url: str = "", timeout: float = 60.0,
-           keep_alive: str = "30m", post: Optional[Callable[[str, dict, float], dict]] = None) -> dict:
-    """Ask every question. Returns ``{"ok", "degraded", "model", "answers", "error", "ms"}``.
+def decide(state: Any, questions: dict, *, model: str = "", base_url: str = "", timeout: Optional[float] = None,
+           keep_alive: str = "30m", post: Optional[Callable[[str, dict, float], dict]] = None,
+           limits: Optional[Limits] = None) -> dict:
+    """Ask every question. Returns ``{"ok", "degraded", "model", "answers", "error", "ms", "fallback"}``.
 
     ``answers`` maps each question name to its answer (see ``answer_field``) or ``{"error": ...}``;
     ``ok`` is True only when every question was answered. ``post(url, body, timeout)`` is injectable for tests.
+    ``timeout`` is the budget in seconds of the whole call (default ``TIMEOUT_S``); each request gets what is left
+    of it, and a call that overruns it is degraded. ``fallback`` is ``"busy"`` or ``"breaker_open"`` when the
+    wrapper limits refused the call without asking the model (callers use their rules), else None.
     """
+    lim = limits or _LIMITS
     started = time.monotonic()
-    out: dict = {"ok": False, "degraded": True, "model": "", "answers": {}, "error": None, "ms": 0.0}
+    out: dict = {"ok": False, "degraded": True, "model": "", "answers": {}, "error": None, "ms": 0.0, "fallback": None}
 
     def done(error: Optional[str] = None) -> dict:
         out["error"] = error or out["error"]
@@ -250,15 +391,39 @@ def decide(state: Any, questions: dict, *, model: str = "", base_url: str = "", 
     try:
         compiled = compile_request(state, questions)
     except DecideError as exc:
+        lim.note_invalid()
         return done(str(exc))
     except Exception as exc:  # noqa: BLE001 - fail-open
+        lim.note_invalid()
         return done(f"request could not be compiled: {exc}")
+    reason, probe = lim.admit()
+    if reason:
+        out["fallback"] = reason
+        return done("decision model busy: use the rules" if reason == "busy"
+                    else "decision model breaker open: use the rules")
+    tally = {"timed_out": False}
+    try:
+        _ask(out, compiled, lim, tally, model, base_url, timeout, keep_alive, post)
+    except Exception as exc:  # noqa: BLE001 - fail-open: nothing here raises
+        out["ok"], out["degraded"] = False, True
+        out["error"] = f"decide failed: {str(exc)[:200]}"
+    lim.finish(probe, bool(out["degraded"]), tally["timed_out"])
+    return done()
+
+
+def _ask(out: dict, compiled: dict, lim: Limits, tally: dict, model: str, base_url: str,
+         timeout: Optional[float], keep_alive: str, post: Optional[Callable[[str, dict, float], dict]]) -> None:
+    """Fill ``out`` from the model, one request per question, inside the call budget."""
+    budget = timeout if timeout and timeout > 0 else lim.timeout
+    deadline = lim.clock() + budget
     mdl = _resolve_model(model)
     base = _resolve_base(base_url)
     if not mdl:
-        return done(f"no decision model: add a pool entry with roles = [\"{ROLE}\"] or set {MODEL_ENV}")
+        out["error"] = f"no decision model: add a pool entry with roles = [\"{ROLE}\"] or set {MODEL_ENV}"
+        return
     if not base:
-        return done("no Ollama URL configured")
+        out["error"] = "no Ollama URL configured"
+        return
     out["model"] = mdl
     sender = post or _http_post
     options = {"temperature": 0, "num_predict": 1, **_placement(mdl)}
@@ -270,9 +435,17 @@ def decide(state: Any, questions: dict, *, model: str = "", base_url: str = "", 
         body = {"model": mdl, "stream": False, "think": False, "keep_alive": keep_alive, "logprobs": True,
                 "top_logprobs": TOP_LOGPROBS, "options": options,
                 "messages": [{"role": "user", "content": user}]}
+        remaining = deadline - lim.clock()
+        if remaining <= 0:
+            tally["timed_out"] = True
+            out["answers"][f["name"]] = {"error": f"timeout: the {budget:g}s call budget was spent"}
+            errors.append(f"{f['name']}: timeout")
+            continue
         t0 = time.monotonic()
         try:
-            resp = sender(f"{base}/api/chat", body, timeout)
+            resp = sender(f"{base}/api/chat", body, remaining)
+            if lim.clock() > deadline:      # a late answer is not used: the budget is the contract
+                raise TimeoutError(f"answer arrived after the {budget:g}s call budget")
             first = (resp.get("logprobs") or [{}])[0]
             tops = first.get("top_logprobs") or []
             lps = [float(e["logprob"]) for e in tops if isinstance(e, dict) and "logprob" in e]
@@ -280,12 +453,14 @@ def decide(state: Any, questions: dict, *, model: str = "", base_url: str = "", 
             out["answers"][f["name"]] = answer_field(f, letter_logprobs(tops), floor)
             _record(mdl, True, t0, len(user))
         except Exception as exc:  # noqa: BLE001 - fail-open: one bad question must not sink the rest
+            if _is_timeout(exc):
+                tally["timed_out"] = True
             out["answers"][f["name"]] = {"error": str(exc)[:200]}
             errors.append(f"{f['name']}: {str(exc)[:120]}")
             _record(mdl, False, t0, len(user))
     out["ok"] = not errors
     out["degraded"] = bool(errors)
-    return done("; ".join(errors) if errors else None)
+    out["error"] = "; ".join(errors) if errors else None
 
 
 def yes_no(state: Any, question: str, *, true_means: str = "", false_means: str = "", **kw) -> Optional[float]:
@@ -349,7 +524,10 @@ def _main(argv: list[str]) -> int:
         options = dict(a.split("=", 1) if "=" in a else (a, None) for a in argv[3:])
         print(json.dumps(choose(state, question, options) or {"error": "no answer"}, indent=1))
         return 0
-    print("usage: decide.py check | decide.py ask <state> <question> <key[=description]>...")
+    if cmd == "stats":                                  # this process's counters: zeros in a fresh CLI process
+        print(json.dumps(stats(), indent=1))
+        return 0
+    print("usage: decide.py check | decide.py stats | decide.py ask <state> <question> <key[=description]>...")
     return 2
 
 

@@ -8,10 +8,16 @@ who wants a different local model for a tier edits the pool, not this file.
 
 Pool roles, most specific first:
 
-* a task type (``security_review``, ``rtl_verify``, ``code``, ``triage``) names the pool role
-  that already serves it (``security``, ``rtl``, ``code``, ``decide``);
+* a task type (``security_review``, ``rtl_verify``, ``code``) names the pool role that already
+  serves it (``security``, ``rtl``, ``code``);
 * each tier names its own role (``tier_nano`` .. ``tier_heavy``) so an operator can pin a model to
-  a tier, and falls back to the general role a tier maps onto (``decide``, ``gen``, ``gen_large``).
+  a tier, and falls back to the general role a tier maps onto (``gen``, ``gen_large``).
+
+Every role here must GENERATE text: the result is a chat model for a request. The ``decide`` role is
+the SystemOne decision model, a 0.8B classifier that answers one answer-letter probability per
+question and cannot write a reply, so it is never a candidate (``_NON_GENERATING_ROLES``; it is used
+only through ``mcp/decide.py``). Until 2026-10-18 nano fell back to ``decide`` and ``triage`` mapped
+to it, which resolved a nano or triage chat request to that classifier.
 
 The lookup is ``model_pool.rank_role(role).chosen``, which is pure: it logs no routing decision
 and never explores, unlike ``pick()``, because a tier rewrite is not itself a model call.
@@ -33,7 +39,7 @@ LOCAL_PREFIX = "ollama/"
 
 # tier -> pool roles to try, most specific first
 _TIER_ROLES = {
-    "nano":     ("tier_nano", "decide"),
+    "nano":     ("tier_nano", "gen"),
     "light":    ("tier_light", "gen"),
     "standard": ("tier_standard", "gen"),
     "medium":   ("tier_standard", "gen"),
@@ -47,8 +53,10 @@ _TASK_ROLES = {
     "security_review": "security",
     "rtl_verify": "rtl",
     "code": "code",
-    "triage": "decide",
 }
+
+# pool roles whose models classify but do not generate; never a candidate for a chat request
+_NON_GENERATING_ROLES = frozenset({"decide"})
 
 
 def prefer_local_default() -> bool:
@@ -72,6 +80,8 @@ def local_model(tier: str, task_type: Optional[str] = None) -> str:
         roles.append(_TASK_ROLES[task_type])
     roles.extend(_TIER_ROLES.get(tier.lower(), ()))
     for role in roles:
+        if role in _NON_GENERATING_ROLES:
+            continue
         tag = _pool_best(role)
         if tag:
             return LOCAL_PREFIX + tag
