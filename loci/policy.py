@@ -23,21 +23,13 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple
 import json
 
+from loci.mtime_cache import MtimeCache
+
 # ---------------------------------------------------------------------------
 # Module-level mtime-keyed policy cache
 # ---------------------------------------------------------------------------
 
-# {policy_id: (Policy, mtime_float)}
-_POLICY_CACHE: Dict[str, Tuple["Policy", float]] = {}
-_POLICY_CACHE_MAX = 256
-
-
-def _evict_policy_cache_if_needed() -> None:
-    """Simple FIFO eviction when cache exceeds max size."""
-    if len(_POLICY_CACHE) > _POLICY_CACHE_MAX:
-        to_remove = list(_POLICY_CACHE.keys())[: _POLICY_CACHE_MAX // 4]
-        for k in to_remove:
-            _POLICY_CACHE.pop(k, None)
+_POLICY_CACHE: "MtimeCache[Policy]" = MtimeCache(maxsize=256)
 
 
 class PolicyTier(str, Enum):
@@ -510,7 +502,7 @@ class PolicyBackend:
             json.dump(policy.to_dict(), f, indent=2)
         
         # Invalidate cache so next load picks up the freshly written file
-        _POLICY_CACHE.pop(policy.policy_id, None)
+        _POLICY_CACHE.invalidate(policy.policy_id)
         
         return {
             "policy_id": policy.policy_id,
@@ -531,14 +523,13 @@ class PolicyBackend:
             mtime = policy_file.stat().st_mtime
         except OSError:
             return None
-        cached = _POLICY_CACHE.get(policy_id)
-        if cached is not None and cached[1] == mtime:
-            return cached[0]
+        cached = _POLICY_CACHE.get(policy_id, mtime)
+        if cached is not None:
+            return cached
         with open(policy_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         policy = Policy.from_dict(data)
-        _POLICY_CACHE[policy_id] = (policy, mtime)
-        _evict_policy_cache_if_needed()
+        _POLICY_CACHE.set(policy_id, policy, mtime)
         return policy
     
     def list_policies(self, labels: Optional[List[str]] = None, region: Optional[str] = None) -> List[Policy]:
@@ -555,13 +546,13 @@ class PolicyBackend:
                 mtime = policy_file.stat().st_mtime
             except OSError:
                 continue
-            cached = _POLICY_CACHE.get(policy_id)
-            if cached is not None and cached[1] == mtime:
-                policy = cached[0]
+            cached = _POLICY_CACHE.get(policy_id, mtime)
+            if cached is not None:
+                policy = cached
             else:
                 with open(policy_file, "r", encoding="utf-8") as f:
                     policy = Policy.from_dict(json.load(f))
-                _POLICY_CACHE[policy_id] = (policy, mtime)
+                _POLICY_CACHE.set(policy_id, policy, mtime)
             
             # Apply filters
             if labels and not any(label in policy.labels for label in labels):
