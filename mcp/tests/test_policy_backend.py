@@ -12,32 +12,28 @@ Tests cover:
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-import sys
+from unittest.mock import patch
 
 # Add mcp directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from loci.hooks import (
+    eval_hook_stub,
+    grounding_hook_augmented,
+    loci_policy_hook,
+    tier_router_surface,
+)
 from loci.policy import (
-    PolicyBackend,
     Policy,
-    PolicyTier,
+    PolicyBackend,
     PolicyRegion,
-    PolicyConfig,
-    PolicyMetadata,
+    PolicyTier,
     get_policy_config,
     validate_policy,
-)
-from loci.hooks import (
-    loci_policy_hook,
-    grounding_hook_augmented,
-    tier_router_surface,
-    eval_hook_stub,
-    PolicyViolation,
-    StepFeedback,
 )
 
 
@@ -196,7 +192,8 @@ class TestTierAwareTracking(unittest.TestCase):
         )
         
         constraints = medium_policy.get_constraints()
-        self.assertEqual(constraints["max_context_chars"], 8192)        self.assertEqual(constraints["max_retrieval_hops"], 7)
+        self.assertEqual(constraints["max_context_chars"], 8192)
+        self.assertEqual(constraints["max_retrieval_hops"], 7)
         self.assertEqual(constraints["max_refinement_steps"], 4)
 
     def test_policy_tier_heavy_unrestricted(self):

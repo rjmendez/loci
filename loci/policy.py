@@ -96,50 +96,46 @@ _TIER_ORDER: Dict[PolicyTier, int] = {
 
 
 def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
-    """
-    Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
-
-    LOCI_TIER_MODEL_MAP should be a JSON string:
-    {"light": ["model-a", "model-b"], "standard": [...], "heavy": [...]}
-    """
-    override = os.getenv("LOCI_TIER_MODEL_MAP")
-    if override:
-        try:
-            data = json.loads(override)
-            all_tiers = {t.value for t in PolicyTier}
-            return {
-                PolicyTier(k): v
-                for k, v in data.items()
-                if k in all_tiers
-            }
-        except (json.JSONDecodeError, ValueError):
-            pass  # fall through to default
-    return TIER_MODEL_MAP
+    """Get tier→model map — delegates to model_selector for Ollama support."""
+    try:
+        from loci.model_selector import get_tier_model_map as _get
+        raw = _get()
+        result = {}
+        for k, v in raw.items():
+            try:
+                result[PolicyTier(k)] = v
+            except ValueError:
+                pass
+        return result if result else TIER_MODEL_MAP
+    except ImportError:
+        return TIER_MODEL_MAP
 
 
 def resolve_model_for_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
     """
     Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
 
-    If requested_model is already in the tier's allowed list, returns it unchanged.
-    If it's in an allowed or lower tier, keeps it (within cost budget).
-    If it's in a higher tier or unknown, downgrades to the first model in the allowed tier.
+    Delegates to model_selector.resolve_for_loci when available for Ollama-aware routing.
     """
+    try:
+        from loci.model_selector import resolve_for_loci
+        resolved, downgraded = resolve_for_loci(requested_model, tier.value)
+        return resolved, downgraded
+    except ImportError:
+        pass
+
     tier_map = get_tier_model_map()
     allowed = tier_map.get(tier, [])
 
-    # Find which tier the requested model belongs to
     requested_tier = None
     for t, models in tier_map.items():
         if requested_model in models:
             requested_tier = t
             break
 
-    # If model is in an allowed or lower tier, keep it
     if requested_tier is not None and _TIER_ORDER.get(requested_tier, 3) <= _TIER_ORDER.get(tier, 3):
         return requested_model, False
 
-    # Otherwise downgrade to first model in allowed tier
     if allowed:
         return allowed[0], True
     return requested_model, False

@@ -10,8 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from policy import (
-    PolicyTier,
     TIER_MODEL_MAP,
+    PolicyTier,
     StagePolicy,
     resolve_model_for_tier,
 )
@@ -89,7 +89,7 @@ class TestResolveModelForTier(unittest.TestCase):
     """resolve_model_for_tier picks a model correctly."""
 
     def test_zero_tier_raises_value_error(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, r"ZERO"):
             resolve_model_for_tier(PolicyTier.ZERO)
 
     def test_nano_tier_returns_ollama_model(self):
