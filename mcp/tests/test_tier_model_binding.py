@@ -179,7 +179,7 @@ class TestTierRouterSurface:
         mock_backend.load.return_value = light_policy
 
         async def run():
-            with patch("hooks.PolicyBackend", return_value=mock_backend):
+            with patch("loci.hooks.PolicyBackend", return_value=mock_backend):
                 return await tier_router_surface(
                     model="claude-opus-4.8",
                     messages=[],
@@ -206,7 +206,7 @@ class TestTierRouterSurface:
         mock_backend.load.return_value = light_policy
 
         async def run():
-            with patch("hooks.PolicyBackend", return_value=mock_backend):
+            with patch("loci.hooks.PolicyBackend", return_value=mock_backend):
                 return await tier_router_surface(
                     model="claude-haiku-4.5",
                     messages=[],
@@ -227,7 +227,7 @@ class TestTierRouterSurface:
         not_called = MagicMock()
 
         async def run():
-            with patch("hooks.PolicyBackend", return_value=not_called):
+            with patch("loci.hooks.PolicyBackend", return_value=not_called):
                 return await tier_router_surface(
                     model="claude-opus-4.8",
                     messages=[],
@@ -249,7 +249,7 @@ class TestTierRouterSurface:
         mock_backend.load.return_value = None
 
         async def run():
-            with patch("hooks.PolicyBackend", return_value=mock_backend):
+            with patch("loci.hooks.PolicyBackend", return_value=mock_backend):
                 return await tier_router_surface(
                     model="claude-opus-4.8",
                     messages=[],
@@ -273,7 +273,7 @@ class TestTierRouterSurface:
         mock_backend.load.return_value = heavy_policy
 
         async def run():
-            with patch("hooks.PolicyBackend", return_value=mock_backend):
+            with patch("loci.hooks.PolicyBackend", return_value=mock_backend):
                 return await tier_router_surface(
                     model="claude-sonnet-4.6",
                     messages=[],
