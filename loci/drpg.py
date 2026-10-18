@@ -12,13 +12,18 @@ Architecture:
 """
 
 import json
+import logging
+import math
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+from loci.jsonl_bounds import MAX_FILE_ROWS, append_bounded, tail_lines
 from loci.policy import Policy, PolicyBackend, loci_home, validate_policy_id
 from loci.mtime_cache import MtimeCache
+
+logger = logging.getLogger(__name__)
 
 # evolve_all_policies is serial and bounded: one process, one thread, at most this many
 # policies per call.  A bigger batch is refused, not truncated.
@@ -46,17 +51,28 @@ class TrajectoryStore:
         validate_policy_id(policy_id)
         return self.base_dir / f"{policy_id}.jsonl"
 
-    def push(self, policy_id: str, step_feedback_dict: Dict[str, Any]) -> None:
-        """Append one step's feedback dict to the trajectory file."""
+    def push(self, policy_id: str, step_feedback_dict: Dict[str, Any], *, strict: bool = False) -> None:
+        """Append one step's feedback dict to the trajectory file.
+
+        Reward integrity: when the step carries a ``reward`` vector, every value present must be a
+        finite number in [-1, 1] and a non-object reward is refused; with ``strict=True`` all seven
+        reward keys must also be present.  Violations raise ValueError('invalid reward: ...') and
+        nothing is written.  The file is bounded: past 5000 rows or 1 MiB it is rotated to
+        ``<policy_id>.jsonl.<k>`` and a fresh file is started.
+        """
         entry = dict(step_feedback_dict)
+        _check_reward(entry.get("reward"), strict=strict, present="reward" in entry)
         entry.setdefault("_ts", datetime.utcnow().isoformat() + "Z")
-        with open(self._path(policy_id), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
+        append_bounded(self._path(policy_id), json.dumps(entry))
         # Invalidate cache so next read picks up the new step
         _TRAJ_CACHE.invalidate(policy_id)
 
-    def read(self, policy_id: str) -> List[Dict[str, Any]]:
-        """Return all persisted steps for a policy_id. Uses mtime-keyed cache."""
+    def read(self, policy_id: str, limit: int = MAX_FILE_ROWS) -> List[Dict[str, Any]]:
+        """Return the most recent ``limit`` persisted steps (default: a whole file, 5000) for a policy_id.
+
+        Only the tail of the file is read, so the cost is bounded by ``limit`` and not by file size.
+        The default-limit read uses the mtime-keyed cache.
+        """
         path = self._path(policy_id)
         if not path.exists():
             return []
@@ -64,19 +80,19 @@ class TrajectoryStore:
             mtime = path.stat().st_mtime
         except OSError:
             return []
-        cached = _TRAJ_CACHE.get(policy_id, mtime)
-        if cached is not None:
-            return list(cached)
+        cacheable = limit == MAX_FILE_ROWS
+        if cacheable:
+            cached = _TRAJ_CACHE.get(policy_id, mtime)
+            if cached is not None:
+                return list(cached)
         steps = []
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        steps.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        _TRAJ_CACHE.set(policy_id, steps, mtime)
+        for raw in tail_lines(path, limit):
+            try:
+                steps.append(json.loads(raw))
+            except json.JSONDecodeError:
+                continue
+        if cacheable:
+            _TRAJ_CACHE.set(policy_id, steps, mtime)
         return list(steps)
 
     def list_policies(self) -> List[str]:
@@ -97,11 +113,65 @@ _REWARD_WEIGHTS_DEFAULT = (1.0, 0.5, -1.0, -1.0, 1.0, -1.0, 1.0)
 _ABS_DIM_INDICES = (2, 3, 5)  # r_ovp, r_bkp, r_step require abs before weighting
 
 
+_REWARD_MIN, _REWARD_MAX = -1.0, 1.0
+_LEGACY_WEIGHT_KEYS = {"r_rem": "r_mem"}  # Policy.get_reward_vector_weights() still says r_rem for the memory term
+
+
+def _check_reward(reward: Any, *, strict: bool, present: bool) -> None:
+    """ValueError('invalid reward: ...') unless *reward* is an in-range reward vector (see TrajectoryStore.push)."""
+    if not present:
+        if strict:
+            raise ValueError("invalid reward: step has no reward vector")
+        return
+    if not isinstance(reward, dict):
+        raise ValueError(f"invalid reward: expected an object of reward values, got {type(reward).__name__}")
+    for key in _REWARD_DIMS:
+        if key not in reward:
+            continue
+        value = reward[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                or not (_REWARD_MIN <= value <= _REWARD_MAX):
+            raise ValueError(f"invalid reward: {key}={value!r} is not a finite number in [-1, 1]")
+    if strict:
+        missing = [key for key in _REWARD_DIMS if key not in reward]
+        if missing:
+            raise ValueError(f"invalid reward: missing required key(s) {', '.join(missing)}")
+
+
+def weights_from_mapping(weights: Mapping[str, float]) -> tuple:
+    """A weight tuple in _REWARD_DIMS order from a {reward key: weight} mapping.
+
+    Dimensions the mapping omits weigh 0.0.  The legacy key ``r_rem`` is the memory term
+    ``r_mem``: it is mapped with one logged warning (an explicit ``r_mem`` wins over it), never
+    dropped silently.  Any other key is a ValueError.
+    """
+    resolved: Dict[str, float] = {}
+    legacy_seen = []
+    for key, weight in weights.items():
+        canonical = _LEGACY_WEIGHT_KEYS.get(key, key)
+        if canonical not in _REWARD_DIMS:
+            raise ValueError(f"unknown reward weight key {key!r}")
+        if key != canonical:
+            legacy_seen.append((key, canonical))
+        if key == canonical or canonical not in weights:
+            resolved[canonical] = float(weight)
+    for legacy, canonical in legacy_seen:
+        logger.warning("reward weight key %r is the legacy name of %r; mapped (use %r)", legacy, canonical, canonical)
+    return tuple(resolved.get(dim, 0.0) for dim in _REWARD_DIMS)
+
+
 class TrajectoryScorer:
     """Aggregates a list of step dicts into a scalar quality score."""
 
-    def __init__(self, weights=_REWARD_WEIGHTS_DEFAULT):
+    def __init__(self, weights: Union[Sequence[float], Mapping[str, float]] = _REWARD_WEIGHTS_DEFAULT):
+        if isinstance(weights, Mapping):
+            weights = weights_from_mapping(weights)
         self.weights = tuple(weights)
+
+    @classmethod
+    def from_policy(cls, policy: Policy) -> "TrajectoryScorer":
+        """A scorer weighted by ``policy.get_reward_vector_weights()`` (its tier and phase)."""
+        return cls(policy.get_reward_vector_weights())
 
     def score(self, steps: List[Dict[str, Any]]) -> float:
         """
@@ -250,7 +320,8 @@ def evolve_policy(
     """
     Full DRPG pipeline:
       1. Read trajectory from store
-      2. Score via TrajectoryScorer
+      2. Score via TrajectoryScorer, weighted by the policy's own reward weights
+         (Policy.get_reward_vector_weights: its tier and discovery/refinement phase)
       3. Decide promote/demote/keep via PolicyPromoter
       4. If promote: update policy metadata and re-store
       5. Return summary dict
@@ -265,19 +336,20 @@ def evolve_policy(
         }
     """
     steps = trajectory_store.read(policy_id)
-    scorer = TrajectoryScorer()
-    score = scorer.score(steps)
 
     policy: Optional[Policy] = backend.load(policy_id)
     if policy is None:
         return {
             "policy_id": policy_id,
             "action": "error",
-            "score": score,
+            "score": TrajectoryScorer().score(steps),
             "suggestions": [],
             "steps_analyzed": len(steps),
             "error": "policy_not_found",
         }
+
+    # The policy's own tier/phase weights (Policy.get_reward_vector_weights), not a fixed tuple.
+    score = TrajectoryScorer.from_policy(policy).score(steps)
 
     promoter = PolicyPromoter()
     decision = promoter.decide(score, policy)

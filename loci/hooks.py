@@ -268,7 +268,18 @@ async def tier_router_surface(
             "violations": [{"type": "policy_not_found", "message": f"Policy {policy_id} not found"}],
         }
 
-    resolved_model, was_rewritten = downgrade_model_to_tier(model, policy.tier)
+    decision = downgrade_model_to_tier(model, policy.tier)
+    resolved_model, was_rewritten = decision
+
+    if getattr(decision, "tier_unresolved", False):
+        if not decision.usable_model:  # the tier forbids every model (ZERO): pass nothing through
+            resolved_model, was_rewritten = "", True
+        shown = f"'{resolved_model}'" if resolved_model else "no model"
+        violations.append(PolicyViolation(
+            "tier_unresolved",
+            f"Tier {policy.tier.value} lists no model; requested '{model}' was not passed through, using {shown}",
+            severity="error",
+        ))
 
     if was_rewritten:
         violations.append(PolicyViolation(

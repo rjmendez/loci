@@ -1,10 +1,34 @@
-"""DRPG MCP tools: mcp__loci__policy_evolve, mcp__loci__policy_trajectory_push, mcp__loci__policy_evolve_all."""
+"""DRPG MCP tools: mcp__loci__policy_evolve, mcp__loci__policy_evolve_all.
+
+policy_trajectory_push is deliberately NOT an MCP tool (reward integrity): it had no caller
+identity, so any agent could write the reward vector that decides promotion.  Trajectories are
+written by the recorder only, through ``record_trajectory_step`` below.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 
-from loci.drpg import evolve_policy as _evolve_policy, evolve_all_policies as _evolve_all, _default_trajectory_store
+from loci.drpg import (
+    evolve_policy as _evolve_policy,
+    evolve_all_policies as _evolve_all,
+    _default_trajectory_store,
+)
+
+
+def record_trajectory_step(policy_id: str, step: int, action: str, reward_vector: dict) -> dict:
+    """Recorder entry point: validate and append one reward step for *policy_id*.
+
+    Not registered as an MCP tool.  The reward vector must be complete (all seven keys) and every
+    value within [-1, 1]; otherwise ValueError('invalid reward: ...') and nothing is written.
+    """
+    store = _default_trajectory_store()
+    store.push(
+        policy_id,
+        {"step": step, "action": action, "reward": reward_vector, "policy_id": policy_id},
+        strict=True,
+    )
+    return {"pushed": True, "policy_id": policy_id, "step": step}
 
 
 def register(mcp_server):
@@ -19,27 +43,6 @@ def register(mcp_server):
             store = _default_trajectory_store()
             result = _evolve_policy(policy_id, backend, store)
             return json.dumps(result)
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
-    @mcp_server.tool()
-    def policy_trajectory_push(
-        policy_id: str,
-        step: int,
-        action: str,
-        reward_vector: dict,
-    ) -> str:
-        """Push a reward step to the trajectory store for a given policy_id."""
-        try:
-            store = _default_trajectory_store()
-            step_dict = {
-                "step": step,
-                "action": action,
-                "reward": reward_vector,
-                "policy_id": policy_id,
-            }
-            store.push(policy_id, step_dict)
-            return json.dumps({"pushed": True, "policy_id": policy_id, "step": step})
         except Exception as exc:
             return json.dumps({"error": str(exc)})
 
