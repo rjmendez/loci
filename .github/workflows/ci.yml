@@ -34,7 +34,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[test]"
-          pip install pytest pytest-asyncio pytest-timeout
+          pip install pytest pytest-asyncio pytest-timeout pytest-benchmark
 
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=60
