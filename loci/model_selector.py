@@ -1,150 +1,128 @@
-"""
-Ollama-aware model selection by PolicyTier.
+"""Tier -> model candidates. No model is named here.
 
-Maps PolicyTier levels to specific local Ollama model names,
-with cloud API fallbacks. Reads LOCI_TIER_MODEL_MAP env var
-as JSON override, or falls back to machine-specific defaults.
+The local model for a tier is whatever the model pool (``mcp/model_pool.py``, the
+``[[models.pool]]`` entries in backends.toml) ranks first for that tier's pool role; cloud
+candidates are the entries of ``loci.policy.get_tier_model_map()`` (the compiled map or the
+``LOCI_TIER_MODEL_MAP`` override). Nothing here picks, ranks or remembers a model: an operator
+who wants a different local model for a tier edits the pool, not this file.
+
+Pool roles, most specific first:
+
+* a task type (``security_review``, ``rtl_verify``, ``code``, ``triage``) names the pool role
+  that already serves it (``security``, ``rtl``, ``code``, ``decide``);
+* each tier names its own role (``tier_nano`` .. ``tier_heavy``) so an operator can pin a model to
+  a tier, and falls back to the general role a tier maps onto (``decide``, ``gen``, ``gen_large``).
+
+The lookup is ``model_pool.rank_role(role).chosen``, which is pure: it logs no routing decision
+and never explores, unlike ``pick()``, because a tier rewrite is not itself a model call.
+
+Fail-open: no pool, a role nobody serves, ``model_pool`` not importable (the LiteLLM proxy
+process does not have ``mcp/`` on its path) or any error in the lookup leaves the local slot
+empty, and the candidates are exactly the policy map's, as before the pool existed.
 """
 
 from __future__ import annotations
-import json
+
+import logging
 import os
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-_DEFAULT_OLLAMA_TIER_MAP: Dict[str, List[str]] = {
-    "zero": [],
-    "nano": [
-        "ollama/openthai-systemone:0.8b-q8_0",
-        "ollama/antares-1b:Q8_0",
-        "ollama/qwen2.5:3b",
-    ],
-    "light": [
-        "ollama/qwen2.5:3b",
-        "ollama/huihui_ai/qwen3.5-abliterated:4b",
-        "ollama/granite3-guardian:2b",
-        "claude-haiku-4.5",
-    ],
-    "standard": [
-        "ollama/ministral3-8b-reasoning-uncensored:Q4_K_M",
-        "ollama/qwen3.5-9b-defiant-fable-heretic:Q4_K_M",
-        "ollama/foundation-sec-8b-reasoning:Q4_K_M",
-        "claude-sonnet-4.6",
-    ],
-    "medium": [
-        "ollama/ministral3-8b-reasoning-uncensored:Q4_K_M",
-        "ollama/qwen3.5-9b-defiant-fable-heretic:Q4_K_M",
-    ],
-    "turbo": [
-        "ollama/gemma4-12b-heretic:Q4_K_M",
-        "claude-sonnet-4.6",
-    ],
-    "heavy": [
-        "ollama/qwen3.8-27b-heretic:64k",
-        "claude-opus-4.8",
-        "gpt-5.4",
-    ],
-    "research": [
-        "ollama/qwen3.8-27b-heretic:64k",
-        "claude-opus-4.8",
-    ],
+logger = logging.getLogger("loci.model_selector")
+
+LOCAL_PREFIX = "ollama/"
+
+# tier -> pool roles to try, most specific first
+_TIER_ROLES = {
+    "nano":     ("tier_nano", "decide"),
+    "light":    ("tier_light", "gen"),
+    "standard": ("tier_standard", "gen"),
+    "medium":   ("tier_standard", "gen"),
+    "turbo":    ("tier_turbo", "gen_large"),
+    "heavy":    ("tier_heavy", "gen_large"),
+    "research": ("tier_research", "gen_large"),
 }
 
-_TASK_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
-    "security_review": {
-        "standard": "ollama/foundation-sec-8b-reasoning:Q4_K_M",
-        "light": "ollama/vulnllm-r-7b:Q4_K_M",
-    },
-    "rtl_verify": {
-        "standard": "ollama/verireason-rtl-7b:Q4_K_M",
-    },
-    "code": {
-        "standard": "ollama/qwen2.5-coder-agent:latest",
-        "light": "ollama/qwen2.5-coder:7b",
-    },
-    "triage": {
-        "nano": "ollama/antares-1b:Q8_0",
-        "light": "ollama/qwen2.5:3b",
-    },
+# task type -> the pool role that serves it
+_TASK_ROLES = {
+    "security_review": "security",
+    "rtl_verify": "rtl",
+    "code": "code",
+    "triage": "decide",
 }
 
 
-def get_tier_model_map() -> Dict[str, List[str]]:
-    """Load tier->model map from env override or defaults."""
-    override = os.getenv("LOCI_TIER_MODEL_MAP")
-    if override:
-        try:
-            data = json.loads(override)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-    return _DEFAULT_OLLAMA_TIER_MAP
+def prefer_local_default() -> bool:
+    """``LOCI_TIER_PREFER_LOCAL=0`` puts cloud candidates ahead of the pool's local pick."""
+    return os.getenv("LOCI_TIER_PREFER_LOCAL", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _pool_best(role: str) -> str:
+    try:
+        import model_pool
+        return model_pool.rank_role(role).chosen or ""
+    except Exception as exc:  # noqa: BLE001 - fail-open to the policy map
+        logger.debug("model pool lookup for role %r failed: %r", role, exc)
+        return ""
+
+
+def local_model(tier: str, task_type: Optional[str] = None) -> str:
+    """The pool's pick for *tier* (``ollama/<tag>``), or "" when the pool has none."""
+    roles: List[str] = []
+    if task_type and task_type in _TASK_ROLES:
+        roles.append(_TASK_ROLES[task_type])
+    roles.extend(_TIER_ROLES.get(tier.lower(), ()))
+    for role in roles:
+        tag = _pool_best(role)
+        if tag:
+            return LOCAL_PREFIX + tag
+    return ""
+
+
+def candidates(
+    tier: str,
+    task_type: Optional[str] = None,
+    prefer_local: Optional[bool] = None,
+) -> List[str]:
+    """Ordered model candidates for *tier*: the pool's local pick and the policy map's entries.
+
+    With ``prefer_local`` (default ``LOCI_TIER_PREFER_LOCAL``, on) the local pick leads and the
+    policy map follows in its own order; without it the map's cloud entries lead, then the local
+    pick, then the map's own ``ollama/`` entries. Duplicates are dropped. Empty for ZERO.
+    Raises ValueError for a tier name PolicyTier does not know.
+    """
+    from loci.policy import PolicyTier, get_tier_model_map  # lazy: policy imports this module lazily too
+
+    try:
+        tier_enum = PolicyTier(tier.lower())
+    except ValueError:
+        raise ValueError(f"unknown policy tier {tier!r}") from None
+    static = list(get_tier_model_map().get(tier_enum, []))
+    local = local_model(tier_enum.value, task_type)
+    if prefer_local is None:
+        prefer_local = prefer_local_default()
+    if prefer_local:
+        ordered = [local] + static
+    else:
+        ordered = ([m for m in static if not m.startswith(LOCAL_PREFIX)] + [local]
+                   + [m for m in static if m.startswith(LOCAL_PREFIX)])
+    seen, out = set(), []
+    for m in ordered:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 
 def select_model(
     tier: str,
     task_type: Optional[str] = None,
-    prefer_local: bool = True,
+    prefer_local: Optional[bool] = None,
 ) -> str:
+    """First candidate for *tier* ("" when there is none).
+
+    Raises ValueError for the ZERO tier (it forbids LLM calls) and for an unknown tier name.
     """
-    Select the best model for a given tier and task type.
-
-    Args:
-        tier: PolicyTier value string (nano/light/standard/heavy etc.)
-        task_type: Optional task hint (security_review/code/triage/rtl_verify)
-        prefer_local: If True, prefer Ollama local models over API
-
-    Returns:
-        Model name string (Ollama-prefixed or API name)
-    """
-    tier_lower = tier.lower()
-
-    if task_type and task_type in _TASK_MODEL_OVERRIDES:
-        override = _TASK_MODEL_OVERRIDES[task_type].get(tier_lower)
-        if override:
-            return override
-
-    tier_map = get_tier_model_map()
-    candidates = tier_map.get(tier_lower, tier_map.get("standard", []))
-
-    if not candidates:
-        return "ollama/antares-1b:Q8_0"
-
-    if prefer_local:
-        local = [m for m in candidates if m.startswith("ollama/")]
-        if local:
-            return local[0]
-
-    return candidates[0]
-
-
-def resolve_for_loci(
-    requested_model: str,
-    tier: str,
-    task_type: Optional[str] = None,
-) -> tuple[str, bool]:
-    """
-    Resolve model: if requested model is in a higher tier than allowed,
-    downgrade to tier-appropriate model.
-
-    Returns (resolved_model, was_downgraded).
-    """
-    tier_order = {
-        "zero": 0, "nano": 1, "light": 2, "standard": 3,
-        "medium": 3, "turbo": 4, "heavy": 5, "research": 6,
-    }
-    requested_tier_order = 5
-
-    tier_map = get_tier_model_map()
-    for t, models in tier_map.items():
-        if requested_model in models:
-            requested_tier_order = tier_order.get(t, 5)
-            break
-
-    allowed_order = tier_order.get(tier.lower(), 3)
-
-    if requested_tier_order <= allowed_order:
-        return requested_model, False
-
-    resolved = select_model(tier, task_type)
-    return resolved, resolved != requested_model
+    if tier.lower() == "zero":
+        raise ValueError("PolicyTier.ZERO forbids LLM calls: no model can be selected for it")
+    found = candidates(tier, task_type, prefer_local)
+    return found[0] if found else ""
