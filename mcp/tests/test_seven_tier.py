@@ -6,7 +6,6 @@ and StagePolicy.
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -97,7 +96,6 @@ class TestResolveModelForTier(unittest.TestCase):
         model = resolve_model_for_tier(PolicyTier.NANO)
         self.assertTrue(model.startswith("ollama/"), f"Expected ollama/ prefix, got {model}")
 
-    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_light_returns_first_model(self):
         model = resolve_model_for_tier(PolicyTier.LIGHT)
         self.assertIn(model, TIER_MODEL_MAP[PolicyTier.LIGHT])
@@ -107,7 +105,6 @@ class TestResolveModelForTier(unittest.TestCase):
         model = resolve_model_for_tier(PolicyTier.STANDARD, available=available)
         self.assertIn(model, available)
 
-    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_available_filter_falls_back_when_none_match(self):
         model = resolve_model_for_tier(PolicyTier.HEAVY, available=["nonexistent-model"])
         self.assertIn(model, TIER_MODEL_MAP[PolicyTier.HEAVY])

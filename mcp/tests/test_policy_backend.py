@@ -407,7 +407,6 @@ class TestLociMCPTools(unittest.TestCase):
         """Test wrapper for async test."""
         asyncio.run(self.async_tier_router_tests())
 
-    @patch.dict('sys.modules', {'loci.model_selector': None})
     def test_tier_router_downgrades_on_exceed_tier(self):
         """Test wrapper for downgrade test."""
         asyncio.run(self.async_tier_router_downgrade_tests())

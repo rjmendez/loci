@@ -1,83 +1,58 @@
-# Ollama Tier Map -- Local Model Routing
+# Tier -> model routing (local pick from the model pool)
 
-This document describes how Loci routes LLM requests to local Ollama models
-based on the `PolicyTier` assigned to each task.
+`loci/model_selector.py` names no model. For a `PolicyTier` it returns an ordered candidate
+list: the local model the **model pool** ranks first for that tier's role, then the entries of
+the policy map (`loci.policy.get_tier_model_map()`: the compiled `TIER_MODEL_MAP`, or the
+`LOCI_TIER_MODEL_MAP` JSON override). To change which local model serves a tier, edit the pool
+(`[[models.pool]]` in `backends.toml`), never this repo.
 
-## Tier -> Model Mapping (This Machine)
+## Which pool role serves a tier
 
-| Tier | Primary Models | Size | Notes |
-|------|---------------|------|-------|
-| **zero** | *(none)* | -- | No model; used for pass-through / skip |
-| **nano** | `openthai-systemone:0.8b-q8_0` -> `antares-1b:Q8_0` -> `qwen2.5:3b` | 0.8-2 GB | Triage, classification, fast checks |
-| **light** | `qwen2.5:3b` -> `huihui_ai/qwen3.5-abliterated:4b` -> `granite3-guardian:2b` | 1.9-3.3 GB | Low-cost reasoning, quick answers |
-| **standard** | `ministral3-8b-reasoning-uncensored:Q4_K_M` -> `qwen3.5-9b-defiant-fable-heretic:Q4_K_M` | 5-7 GB | General-purpose STANDARD quality |
-| **medium** | Same as standard (alias) | 5-7 GB | -- |
-| **turbo** | `gemma4-12b-heretic:Q4_K_M` -> `claude-sonnet-4.6` | 7.4 GB | Heavy local or API extended thinking |
-| **heavy** | `qwen3.8-27b-heretic:64k` -> `claude-opus-4.8` -> `gpt-5.4` | 17 GB | Splits across both GPUs |
-| **research** | `qwen3.8-27b-heretic:64k` -> `claude-opus-4.8` | 17 GB | Deep research mode |
+The lookup is `model_pool.rank_role(role).chosen` (installed, within the VRAM cap, best
+`rank - resident_bonus`). It is pure: it logs no routing decision and never explores, because
+rewriting a tier is not a model call. Roles are tried in order; the first that yields a model wins.
 
-GPU allocation: RTX 4070 Ti (12 GB) + RTX 2080 Ti (11 GB). The 27b model requires both GPUs.
+| Tier | Roles tried |
+|------|-------------|
+| zero | none (no LLM call is allowed) |
+| nano | `tier_nano`, `decide` |
+| light | `tier_light`, `gen` |
+| standard, medium | `tier_standard`, `gen` |
+| turbo | `tier_turbo`, `gen_large` |
+| heavy | `tier_heavy`, `gen_large` |
+| research | `tier_research`, `gen_large` |
 
-## Expected Latency Per Tier
+A `task_type` goes first: `security_review` -> `security`, `rtl_verify` -> `rtl`,
+`code` -> `code`, `triage` -> `decide`. An unknown task type is ignored.
 
-| Tier | Typical first-token latency | Tokens/sec (est.) |
-|------|----------------------------|-------------------|
-| nano | 0.5-2 s | 80-150 tok/s |
-| light | 2-5 s | 40-80 tok/s |
-| standard | 5-15 s | 15-40 tok/s |
-| turbo | 8-20 s | 10-25 tok/s |
-| heavy | 15-40 s | 5-12 tok/s |
-| research | 30-120 s | 3-8 tok/s |
+To pin a model to one tier, give a pool entry that role:
 
-## Task-Type Overrides
-
-| Task type | Tier | Override model |
-|-----------|------|---------------|
-| `security_review` | standard | `foundation-sec-8b-reasoning:Q4_K_M` |
-| `security_review` | light | `vulnllm-r-7b:Q4_K_M` |
-| `code` | standard | `qwen2.5-coder-agent:latest` |
-| `code` | light | `qwen2.5-coder:7b` |
-| `triage` | nano | `antares-1b:Q8_0` |
-| `triage` | light | `qwen2.5:3b` |
-| `rtl_verify` | standard | `verireason-rtl-7b:Q4_K_M` |
-
-Pass `task_type=` to `select_model()` to activate overrides.
-
-## `LOCI_TIER_MODEL_MAP` Environment Override
-
-Set this env var to a JSON object to override all defaults at runtime:
-
-```bash
-export LOCI_TIER_MODEL_MAP='{"nano":["ollama/my-custom-1b"],"standard":["ollama/my-8b","claude-sonnet-4.6"]}'
+```toml
+[[models.pool]]
+name = "<an installed tag>"
+roles = ["gen", "tier_standard"]
 ```
 
-Keys are tier names (`zero`, `nano`, `light`, `standard`, `medium`, `turbo`, `heavy`, `research`).
-Values are ordered lists -- the first available model wins. Loaded on every call (no restart needed).
+The pick is returned as `ollama/<tag>`.
 
-The `.loci/.env` file on this machine sets `LOCI_TIER_MODEL_MAP` to the full deployment map.
+## Ordering
 
-## LiteLLM Routing: `ollama/` Prefix
+* `prefer_local` (default on; `LOCI_TIER_PREFER_LOCAL=0` turns it off): `[local pick, *policy map]`.
+* Off: the map's non-`ollama/` entries first, then the local pick, then the map's own `ollama/`
+  entries, so the cloud fallback is reachable.
+* Duplicates are dropped. `select_model(tier)` is the first candidate, or `""`.
+* `select_model("zero")` and an unknown tier name raise `ValueError`.
 
-Models prefixed with `ollama/` are routed to the local Ollama instance via LiteLLM.
-The proxy URL is configured by `LOCI_LITELLM_PROXY_URL` (default: `http://localhost:4000`).
+## What uses it
 
-Cloud API models (`claude-*`, `gpt-*`) are used as fallbacks when `prefer_local=False`.
+* `resolve_model_for_tier(tier, available=None)` walks the candidates.
+* `downgrade_model_to_tier(requested, tier)`: a model the map lists at or below the tier, or that
+  the pool serves for such a tier, is kept. Anything else (including a model no tier lists) is
+  replaced by the first candidate for the tier.
 
-## Adding a New Model
+## Failing open
 
-1. Pull the model: `ollama pull my-new-model:tag`
-2. Add to `LOCI_TIER_MODEL_MAP` in `~/.loci/.env`
-3. No restart needed -- the map is read on each call.
-
-## API Reference
-
-```python
-from loci.model_selector import select_model, resolve_for_loci, get_tier_model_map
-
-model = select_model("standard")
-model = select_model("standard", task_type="security_review")
-
-resolved, was_downgraded = resolve_for_loci("ollama/qwen3.8-27b-heretic:64k", "nano")
-
-tier_map = get_tier_model_map()
-```
+No pool configured, a role nobody serves, `model_pool` not importable (the LiteLLM proxy
+process has no `mcp/` on its path) or an error in the lookup all leave the local slot empty.
+The candidates are then exactly the policy map's, which is what the code did before the pool
+existed.

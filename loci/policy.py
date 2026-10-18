@@ -89,24 +89,16 @@ _TIER_ORDER: Dict[PolicyTier, int] = {
 
 def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     """
-    Get the tier→model map, delegating to model_selector for Ollama support.
+    Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
 
-    Falls back to LOCI_TIER_MODEL_MAP env var override (JSON string mapping tier
-    names to model lists), then to the compiled TIER_MODEL_MAP default.
+    LOCI_TIER_MODEL_MAP should be a JSON string mapping tier names to model lists.
+    Only keys that map to a valid PolicyTier are included; unknown keys are silently
+    ignored.  When the env var is set, only the tiers present in it are returned
+    (no merge with defaults).  Falls back to TIER_MODEL_MAP on parse error.
+
+    This is the policy map only; the model pool's local pick is added by
+    ``loci.model_selector.candidates`` (see ``resolve_model_for_tier``).
     """
-    try:
-        from loci.model_selector import get_tier_model_map as _get
-        raw = _get()
-        result = {}
-        for k, v in raw.items():
-            try:
-                result[PolicyTier(k)] = v
-            except ValueError:
-                pass
-        if result:
-            return result
-    except ImportError:
-        pass
     override = os.getenv("LOCI_TIER_MODEL_MAP")
     if override:
         try:
@@ -124,12 +116,22 @@ def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     return TIER_MODEL_MAP
 
 
+def _tier_candidates(tier: PolicyTier) -> List[str]:
+    """The model pool's local pick for *tier* (when a pool serves it) followed by the policy map's entries."""
+    try:
+        from loci.model_selector import candidates
+    except ImportError:
+        return list(get_tier_model_map().get(tier, []))
+    return candidates(tier.value)
+
+
 def resolve_model_for_tier(
     tier: PolicyTier,
     available: Optional[List[str]] = None,
 ) -> str:
     """
-    Return the best model for *tier* from the tier model map.
+    Return the best model for *tier*: the model pool's local pick when one serves the
+    tier, then the tier model map's entries.
 
     If *available* is provided, the first model in the tier's list that also
     appears in *available* is preferred; when none matches, the first model in
@@ -142,8 +144,7 @@ def resolve_model_for_tier(
             f"PolicyTier.ZERO forbids LLM calls — no model can be selected. "
             f"Use a higher tier or handle the ZERO case before calling resolve_model_for_tier."
         )
-    tier_map = get_tier_model_map()
-    candidates = tier_map.get(tier, [])
+    candidates = _tier_candidates(tier)
     if available and candidates:
         for model in candidates:
             if model in available:
@@ -159,24 +160,28 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str
 
     This is the cost-enforcement path: if *requested_model* already belongs to
     *tier* or a cheaper tier it is returned unchanged; otherwise the first
-    model in the tier's allowed list is substituted.
-    Delegates to model_selector.resolve_for_loci when available for Ollama-aware routing.
+    candidate for the tier (see ``resolve_model_for_tier``) is substituted.
+    A model the pool serves for a tier counts as belonging to that tier. A model no
+    tier lists is substituted, as it always was.
     """
-    try:
-        from loci.model_selector import resolve_for_loci
-        resolved, downgraded = resolve_for_loci(requested_model, tier.value)
-        return resolved, downgraded
-    except ImportError:
-        pass
-
     tier_map = get_tier_model_map()
-    allowed = tier_map.get(tier, [])
+    allowed = _tier_candidates(tier)
 
     requested_tier = None
     for t, models in tier_map.items():
         if requested_model in models:
             requested_tier = t
             break
+    if requested_tier is None:
+        try:
+            from loci.model_selector import local_model
+        except ImportError:
+            local_model = None
+        if local_model is not None:
+            for t in tier_map:
+                if requested_model == local_model(t.value):
+                    requested_tier = t
+                    break
 
     if requested_tier is not None and _TIER_ORDER.get(requested_tier, 3) <= _TIER_ORDER.get(tier, 3):
         return requested_model, False
