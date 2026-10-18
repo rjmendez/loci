@@ -21,7 +21,7 @@ import sys
 # Add mcp directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from policy import (
+from loci.policy import (
     PolicyBackend,
     Policy,
     PolicyTier,
@@ -31,7 +31,7 @@ from policy import (
     get_policy_config,
     validate_policy,
 )
-from hooks import (
+from loci.hooks import (
     loci_policy_hook,
     grounding_hook_augmented,
     tier_router_surface,
@@ -409,7 +409,7 @@ class TestHookIntegration(unittest.TestCase):
             region=PolicyRegion.MEMORY,
             config={"discovery_mode": True},
         )
-        with patch("hooks.PolicyBackend") as mock_backend_cls:
+        with patch("loci.hooks.PolicyBackend") as mock_backend_cls:
             mock_backend_cls.return_value.load.return_value = policy
             result = asyncio.run(
                 grounding_hook_augmented("gpt-4", messages, {"policy_id": "p-test"}, {})
@@ -430,7 +430,7 @@ class TestHookIntegration(unittest.TestCase):
             tier=PolicyTier.LIGHT,
             region=PolicyRegion.ROUTING,
         )
-        with patch("hooks.PolicyBackend") as mock_backend_cls:
+        with patch("loci.hooks.PolicyBackend") as mock_backend_cls:
             mock_backend_cls.return_value.load.return_value = policy
             result = asyncio.run(
                 tier_router_surface("gpt-4", [], {"policy_id": "p1", "tier": "heavy"}, {})
