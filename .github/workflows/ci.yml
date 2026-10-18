@@ -33,6 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          pip install -e ".."
           pip install -e ".[test]"
           pip install pytest pytest-asyncio pytest-timeout pytest-benchmark
 
@@ -331,6 +332,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
+          pip install -e ".."
           pip install -e ".[test]"
           pip install pytest pytest-asyncio pytest-timeout
 
