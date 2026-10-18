@@ -113,3 +113,52 @@ def test_benchmark_trajectory_push(benchmark, trajectory_store):
     benchmark(trajectory_store.push, "bench-policy", step)
     steps = trajectory_store.read("bench-policy")
     assert any(s.get("step") == 999 for s in steps)
+
+
+# ---------------------------------------------------------------------------
+# orjson vs stdlib JSONL parse benchmarks
+# ---------------------------------------------------------------------------
+
+def test_benchmark_jsonl_parse_stdlib(benchmark, tmp_path):
+    """Baseline: stdlib json for 500-line JSONL."""
+    import json
+    path = tmp_path / "bench.jsonl"
+    rows = [json.dumps({"id": f"f{i}", "content": f"finding {i}", "confidence": 0.8, "ts": "2026-01-01"}) for i in range(500)]
+    path.write_text("\n".join(rows))
+
+    def parse():
+        lines = []
+        for line in path.read_bytes().decode("utf-8").splitlines():
+            if line.strip():
+                lines.append(json.loads(line))
+        return lines
+
+    result = benchmark(parse)
+    assert len(result) == 500
+    assert result[0]["id"] == "f0"
+    assert result[499]["id"] == "f499"
+
+
+def test_benchmark_jsonl_parse_orjson(benchmark, tmp_path):
+    """orjson: same 500-line JSONL."""
+    import json
+    try:
+        import orjson
+    except ImportError:
+        pytest.skip("orjson not installed")
+
+    path = tmp_path / "bench.jsonl"
+    rows = [json.dumps({"id": f"f{i}", "content": f"finding {i}", "confidence": 0.8, "ts": "2026-01-01"}) for i in range(500)]
+    path.write_text("\n".join(rows))
+
+    def parse():
+        lines = []
+        for line in path.read_bytes().splitlines():
+            if line.strip():
+                lines.append(orjson.loads(line))
+        return lines
+
+    result = benchmark(parse)
+    assert len(result) == 500
+    assert result[0]["id"] == "f0"
+    assert result[499]["id"] == "f499"
