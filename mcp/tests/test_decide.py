@@ -221,6 +221,7 @@ class FakeServer:
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch, tmp_path):
     monkeypatch.delenv(D.MODEL_ENV, raising=False)
+    monkeypatch.setattr(D, "_LIMITS", D.Limits())     # a fresh breaker and counters: no test inherits another's failures
     monkeypatch.setenv("LOCI_MEMORY_DIR", str(tmp_path / "mem" / "sessions"))
     monkeypatch.delenv("LOCI_MODEL_POOL_SHADOW", raising=False)
     model_pool.clear_cache()
@@ -247,9 +248,9 @@ class TestDecide:
         return res, server
 
     def test_the_request_is_a_user_only_chat_with_thinking_off_and_logprobs(self, monkeypatch):
-        res, server = self._go(monkeypatch, lambda b: YES)
+        res, server = self._go(monkeypatch, lambda b: YES, limits=D.Limits(clock=lambda: 100.0))
         url, body, timeout = server.calls[0]
-        assert url == "http://ollama/api/chat" and timeout == 60.0
+        assert url == "http://ollama/api/chat" and timeout == 5.0
         assert body["model"] == "m:1" and body["stream"] is False and body["think"] is False
         assert body["logprobs"] is True and body["top_logprobs"] == 20 and body["keep_alive"] == "30m"
         assert body["options"] == {"temperature": 0, "num_predict": 1}
@@ -326,7 +327,7 @@ class TestDecide:
 
     def test_a_response_with_no_logprobs_or_no_letters_is_a_per_question_error(self, monkeypatch):
         for bad in ({}, {"logprobs": []}, {"logprobs": [{"top_logprobs": []}]}, _resp({"Z": -1.0})):
-            res, _ = self._go(monkeypatch, lambda b, bad=bad: bad)
+            res, _ = self._go(monkeypatch, lambda b, bad=bad: bad, limits=D.Limits())     # each bad reply starts a fresh breaker
             assert res["ok"] is False and "none of the answer letters" in res["answers"]["q"]["error"]
 
     def test_yes_no_and_choose_return_the_answer_or_none(self, monkeypatch):
