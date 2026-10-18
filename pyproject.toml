@@ -15,6 +15,7 @@ dependencies = [
 mcp = ["mcp>=1.0", "qdrant-client>=1.7"]
 litellm = ["litellm>=1.0", "httpx>=0.24"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+analytics = ["duckdb>=0.10"]
 
 [tool.setuptools.packages.find]
 where = ["."]
