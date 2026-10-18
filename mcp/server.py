@@ -13191,6 +13191,60 @@ except ImportError:
 _register_all(mcp)
 
 
+try:
+    from adherence import AdherenceStore, PolicyAdherenceRecord
+    _ADHERENCE_AVAILABLE = True
+except ImportError:  # pragma: no cover - adherence module optional at import time
+    AdherenceStore = PolicyAdherenceRecord = None  # type: ignore
+    _ADHERENCE_AVAILABLE = False
+
+
+@mcp.tool()
+def policy_adherence_record(
+    policy_id: str,
+    call_id: str,
+    tier_requested: str,
+    model_requested: str,
+    model_used: str,
+    was_downgraded: bool,
+    r_cor: float,
+    r_step: float = -0.01,
+) -> str:
+    """Record one call's policy adherence data (tier routing + correctness signal)."""
+    if not _ADHERENCE_AVAILABLE:
+        return json.dumps({"error": "adherence module unavailable"})
+    try:
+        rec = PolicyAdherenceRecord(
+            policy_id=policy_id,
+            call_id=call_id,
+            tier_requested=tier_requested,
+            model_requested=model_requested,
+            model_used=model_used,
+            was_downgraded=was_downgraded,
+            r_cor=r_cor,
+            r_step=r_step,
+        )
+        AdherenceStore().record(rec)
+        return json.dumps({"recorded": True, "policy_id": policy_id, "call_id": call_id})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_adherence_report(
+    policy_id: str,
+    min_records: int = 5,
+) -> str:
+    """Compute adherence confidence report for a policy: effective/ineffective/monitoring."""
+    if not _ADHERENCE_AVAILABLE:
+        return json.dumps({"error": "adherence module unavailable"})
+    try:
+        report = AdherenceStore().compute_report(policy_id, min_records)
+        return json.dumps(report)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:

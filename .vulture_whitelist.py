@@ -93,6 +93,8 @@ _ = finding_resolve
 _ = loci_validated_knowledge_promotion
 _ = memory_route_counterfactual_simulate
 _ = memory_route_policy_optimize
+_ = policy_adherence_record
+_ = policy_adherence_report
 _ = retrieval_selftest
 
 # ── Private helper called only from mcp/tests/ (out of vulture's scanned
