@@ -9,6 +9,7 @@ _TOOL_SUBMODULES = [
     "litellm_tools",
     "memory_route_tools",
     "investigation_tools",
+    "analytics_tools",
 ]
 
 def register_all(mcp_server):
