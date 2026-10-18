@@ -589,5 +589,69 @@ class TestDRPGIntegration(unittest.TestCase):
         self.assertEqual(feedback["action"], "ANSWER")
 
 
+class TestToolCallEnforcementNoToolsEnv(unittest.TestCase):
+    """Fix 2: allowed_models must NOT be reused as fallback tool allowlist.
+
+    Mutations run:
+    - Reintroduced the `elif policy_config.allowed_models: allowed_tools = ...`
+      branch → tool_not_allowed returned for any tool call, test_passes_all_tools
+      failed.
+    - Also verified positive twin: with LOCI_POLICY_ALLOWED_TOOLS set, blocking
+      still fires (test_blocks_disallowed_tool passes only if the env var path works).
+    """
+
+    def _run_hook(self, tool_name, env_overrides):
+        async def _inner():
+            return await loci_policy_hook(
+                model="claude-haiku-4.5",
+                messages=[],
+                kwargs={"tool_call_name": tool_name},
+                litellm_params={},
+            )
+        with patch.dict(os.environ, env_overrides, clear=False):
+            return asyncio.run(_inner())
+
+    def test_passes_all_tools_when_only_allowed_models_set(self):
+        """LOCI_POLICY_ALLOWED_TOOLS unset, LOCI_POLICY_ALLOWED_MODELS set → any tool passes."""
+        env = {
+            "LOCI_POLICY_ENABLE": "1",
+            "LOCI_POLICY_ALLOWED_MODELS": "claude-haiku-4.5,gpt-5-mini",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            # Remove LOCI_POLICY_ALLOWED_TOOLS if present
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LOCI_POLICY_ALLOWED_TOOLS", None)
+                result = asyncio.run(loci_policy_hook(
+                    model="claude-haiku-4.5",
+                    messages=[],
+                    kwargs={"tool_call_name": "some_arbitrary_tool_not_in_models_list"},
+                    litellm_params={},
+                ))
+        self.assertEqual(result["reason"], "policy_enabled")
+        self.assertNotEqual(result["reason"], "tool_not_allowed")
+        self.assertTrue(result["apply"])
+        violations = [v for v in result["violations"] if v["type"] == "tool_not_allowed"]
+        self.assertEqual(violations, [])
+
+    def test_blocks_disallowed_tool_when_allowed_tools_env_set(self):
+        """LOCI_POLICY_ALLOWED_TOOLS set → tool not in list is blocked (positive twin)."""
+        env = {
+            "LOCI_POLICY_ENABLE": "1",
+            "LOCI_POLICY_ALLOWED_MODELS": "claude-haiku-4.5",
+            "LOCI_POLICY_ALLOWED_TOOLS": "tool_a,tool_b",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            result = asyncio.run(loci_policy_hook(
+                model="claude-haiku-4.5",
+                messages=[],
+                kwargs={"tool_call_name": "tool_c"},
+                litellm_params={},
+            ))
+        self.assertEqual(result["reason"], "tool_not_allowed")
+        self.assertFalse(result["apply"])
+        violations = [v for v in result["violations"] if v["type"] == "tool_not_allowed"]
+        self.assertEqual(len(violations), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -73,8 +73,9 @@ def trajectory_store(tmp_path):
 def test_benchmark_policy_load_cold(benchmark, policy_backend, monkeypatch):
     """First load (cold cache): file open + json.load on every call."""
     import loci.policy as _policy_mod
+    from loci.mtime_cache import MtimeCache
     backend, policies = policy_backend
-    monkeypatch.setattr(_policy_mod, "_POLICY_CACHE", {})
+    monkeypatch.setattr(_policy_mod, "_POLICY_CACHE", MtimeCache(maxsize=256))
     result = benchmark(backend.load, policies[0].policy_id)
     assert result is not None
     assert result.title == "policy-0"
@@ -103,7 +104,8 @@ def test_benchmark_policy_list(benchmark, policy_backend):
 def test_benchmark_trajectory_read_cold(benchmark, trajectory_store, monkeypatch):
     """Read all 100 steps (cold cache): full JSONL scan."""
     import loci.drpg as _drpg_mod
-    monkeypatch.setattr(_drpg_mod, "_TRAJ_CACHE", {})
+    from loci.mtime_cache import MtimeCache
+    monkeypatch.setattr(_drpg_mod, "_TRAJ_CACHE", MtimeCache(maxsize=64))
     result = benchmark(trajectory_store.read, "bench-policy")
     assert len(result) == 100
 

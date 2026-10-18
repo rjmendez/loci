@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from loci.litellm_client import call_litellm_proxy, resolve_model_for_tier_simple, LITELLM_PROXY_URL
+from loci.litellm_client import call_litellm_proxy, LITELLM_PROXY_URL
+from loci.policy import downgrade_model_to_tier, PolicyTier
 
 
 def register(mcp_server):
@@ -19,7 +20,8 @@ def register(mcp_server):
         temperature: float = 0.0,
     ) -> str:
         """Make a governed LiteLLM proxy call with tier-based model routing."""
-        resolved_model, was_rewritten = resolve_model_for_tier_simple(model, tier)
+        tier_enum = PolicyTier(tier) if tier else PolicyTier.MEDIUM
+        resolved_model, was_rewritten = downgrade_model_to_tier(model, tier_enum)
         try:
             response = call_litellm_proxy(
                 model=resolved_model,
@@ -34,7 +36,6 @@ def register(mcp_server):
             return json.dumps(result)
         except Exception as exc:
             return json.dumps({"error": str(exc), "model": resolved_model})
-
     @mcp_server.tool()
     def litellm_health() -> str:
         """Check LiteLLM proxy health; returns proxy URL and reachability status."""

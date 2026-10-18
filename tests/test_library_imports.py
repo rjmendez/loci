@@ -46,15 +46,22 @@ def test_graph_cache_import():
 
 
 def test_litellm_import():
-    from loci import call_litellm_proxy, resolve_model_for_tier_simple, LiteLLMResponse
-    model, rewritten = resolve_model_for_tier_simple("claude-haiku-4.5", "light")
+    from loci import call_litellm_proxy, LiteLLMResponse
+    assert callable(call_litellm_proxy)
+
+
+def test_litellm_tier_resolve_no_rewrite():
+    from loci import resolve_model_for_tier
+    from loci.policy import PolicyTier
+    model, rewritten = resolve_model_for_tier("claude-haiku-4.5", PolicyTier.LIGHT)
     assert model == "claude-haiku-4.5"
     assert rewritten is False
 
 
 def test_litellm_tier_downgrade():
-    from loci import resolve_model_for_tier_simple
-    model, rewritten = resolve_model_for_tier_simple("claude-opus-4.8", "light")
+    from loci import resolve_model_for_tier
+    from loci.policy import PolicyTier
+    model, rewritten = resolve_model_for_tier("claude-opus-4.8", PolicyTier.LIGHT)
     assert rewritten is True
     assert model == "claude-haiku-4.5"
 

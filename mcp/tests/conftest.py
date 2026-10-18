@@ -21,7 +21,12 @@ from pathlib import Path
 import pytest
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _MCP_DIR.parent  # loci-slop-fix/; ensures loci/ in this repo shadows any installed loci
 
+# Prepend repo root so `import loci` resolves to this working tree, not a
+# previously installed copy that predates changes made on this branch.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 def _load_hermetic():
     """Import testsupport/loci_hermetic.py by path (it is not on sys.path)."""
