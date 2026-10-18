@@ -15,9 +15,16 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from policy import Policy, PolicyBackend
+
+# ---------------------------------------------------------------------------
+# Module-level mtime-keyed trajectory cache
+# ---------------------------------------------------------------------------
+
+# {policy_id: (steps_list, mtime_float)}
+_TRAJ_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
 
 
 class TrajectoryStore:
@@ -36,19 +43,32 @@ class TrajectoryStore:
         entry.setdefault("_ts", datetime.utcnow().isoformat() + "Z")
         with open(self._path(policy_id), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
+        # Invalidate cache so next read picks up the new step
+        _TRAJ_CACHE.pop(policy_id, None)
 
     def read(self, policy_id: str) -> List[Dict[str, Any]]:
-        """Return all persisted steps for a policy_id."""
+        """Return all persisted steps for a policy_id. Uses mtime-keyed cache."""
         path = self._path(policy_id)
         if not path.exists():
             return []
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return []
+        cached = _TRAJ_CACHE.get(policy_id)
+        if cached is not None and cached[1] == mtime:
+            return list(cached[0])  # return a copy
         steps = []
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line:
-                    steps.append(json.loads(line))
-        return steps
+                    try:
+                        steps.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        _TRAJ_CACHE[policy_id] = (steps, mtime)
+        return list(steps)
 
     def list_policies(self) -> List[str]:
         """Return policy IDs that have trajectory files."""

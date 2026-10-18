@@ -13198,6 +13198,8 @@ def policy_store(
     labels: Optional[list[str]] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> str:
+    # TODO: convert to async and wrap backend.store with asyncio.to_thread to
+    # avoid blocking the event loop on file I/O.
     """Store a policy.md document (tier-aware retrieval/routing constraints) and return its policy_id."""
     if Policy is None:
         return json.dumps({"error": "policy module unavailable"})
@@ -13218,6 +13220,8 @@ def policy_store(
 
 @mcp.tool()
 def policy_load(policy_id: str) -> str:
+    # TODO: convert to async and wrap backend.load with asyncio.to_thread to
+    # avoid blocking the event loop on file I/O.
     """Load a stored policy.md document by policy_id; returns its full serialized form or not_found."""
     if PolicyBackend is None:
         return json.dumps({"error": "policy module unavailable"})
