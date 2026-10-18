@@ -14,7 +14,7 @@ The **DRPG (Dynamic Retrieval-based Policy Generation) loop** closes the reward 
          │ StepFeedback.to_dict()
          ▼
   ┌─────────────────┐   push(policy_id, step)
-  │ TrajectoryStore  │◄──────────────────────────── mcp__loci__policy_trajectory_push
+  │ TrajectoryStore  │◄──────────────────────────── recorder only (not an MCP tool)
   │  ~/.loci/traj/  │
   │  {policy_id}.   │
   │  jsonl          │
@@ -71,15 +71,15 @@ Each step is appended as a JSONL line to `$LOCI_TRAJECTORY_DIR/{policy_id}.jsonl
 
 Steps are written by `eval_hook_stub` in `mcp/hooks.py` automatically whenever a LiteLLM call carries `policy_id`, `step`, `action`, and `reward_vector` in its kwargs.
 
-You can also push steps directly via MCP:
-```
-mcp__loci__policy_trajectory_push(
-    policy_id="abc-123",
-    step=3,
-    action="SEARCH",
-    reward_vector={"r_ret": 1.0, "r_ovp": -0.1, "r_step": -0.05, "r_cor": 0.5}
-)
-```
+There is no MCP tool for pushing steps. `mcp__loci__policy_trajectory_push` was removed: it had no
+caller identity, so any agent could write the reward vector that decides promotion. Only the recorder
+writes trajectories: `eval_hook_stub`, or `record_trajectory_step()` in `mcp/tools/drpg_tools.py`, which
+requires all seven keys. `TrajectoryStore.push` itself refuses any reward value outside [-1, 1] (and,
+with `strict=True`, a vector missing a key) with `ValueError("invalid reward: ...")`.
+
+Each policy's trajectory file is bounded to 5000 rows or 1 MiB. The next push past either limit renames
+the file to `{policy_id}.jsonl.1` (then `.2`, ...; plain JSONL, still readable) and starts a fresh one;
+reads take only the tail of the current file. Policy ids must match `^[a-z0-9][a-z0-9_.-]{0,63}$`.
 
 ---
 
@@ -123,11 +123,19 @@ The 7D reward vector (from EVO-RAG research) has different weights per phase:
 | Step Penalty         | `r_step` | −0.02 | −0.1  | Per-step cost                         |
 | Answer Correctness   | `r_cor`  | +0.5  | +1.0  | Reward for correct answer             |
 
-The **scoring formula** used by `TrajectoryScorer` sums over all steps:
+The **scoring formula** used by `TrajectoryScorer` is a weighted mean over all steps. `evolve_policy`
+builds the scorer from the policy itself (`TrajectoryScorer.from_policy`), so the weights are the ones in
+the table above for the policy's tier and phase (`Policy.get_reward_vector_weights()`):
 ```
-per_step = r_ret - |r_ovp| - |r_bkp| + r_ref - |r_step| + r_cor
+per_step = w_ret*r_ret + w_mem*r_mem + w_ovp*|r_ovp| + w_bkp*|r_bkp| + w_ref*r_ref + w_step*|r_step| + w_cor*r_cor
 score    = Σ(per_step) / N
 ```
+The table's `r_rem` column is the `r_mem` term: a weight mapping that still says `r_rem` is mapped to
+`r_mem` with one logged warning. `TrajectoryScorer()` with no argument keeps the fixed default weights.
+
+`mcp__loci__policy_evolve_all` evolves its policies one after another in this process (no process
+pool), at most 64 per call, and returns `status` 1 with `error: "rows_read=0"` when no trajectory rows
+were read.
 
 ---
 
