@@ -32,14 +32,18 @@ try:
         return _orjson.loads(b)
 
     def _json_dumps(obj) -> str:  # type: ignore[misc]
-        return _orjson.dumps(obj).decode("utf-8")
+        # orjson leaves U+2028/U+2029 as literal characters; Python's
+        # str.splitlines() treats them as line endings, which would corrupt JSONL.
+        raw = _orjson.dumps(obj).decode("utf-8")
+        return raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 except ImportError:
     def _json_loads(b):  # type: ignore[misc]
         return json.loads(b)
 
     def _json_dumps(obj) -> str:  # type: ignore[misc]
-        return json.dumps(obj, ensure_ascii=False)
+        raw = json.dumps(obj, ensure_ascii=False)
+        return raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 import caller_identity
 
