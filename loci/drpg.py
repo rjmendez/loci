@@ -18,13 +18,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from loci.policy import Policy, PolicyBackend
+from loci.mtime_cache import MtimeCache
 
 # ---------------------------------------------------------------------------
 # Module-level mtime-keyed trajectory cache
 # ---------------------------------------------------------------------------
 
-# {policy_id: (steps_list, mtime_float)}
-_TRAJ_CACHE: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
+_TRAJ_CACHE: MtimeCache[List[Dict[str, Any]]] = MtimeCache(maxsize=64)
 
 
 class TrajectoryStore:
@@ -44,7 +44,7 @@ class TrajectoryStore:
         with open(self._path(policy_id), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
         # Invalidate cache so next read picks up the new step
-        _TRAJ_CACHE.pop(policy_id, None)
+        _TRAJ_CACHE.invalidate(policy_id)
 
     def read(self, policy_id: str) -> List[Dict[str, Any]]:
         """Return all persisted steps for a policy_id. Uses mtime-keyed cache."""
@@ -55,9 +55,9 @@ class TrajectoryStore:
             mtime = path.stat().st_mtime
         except OSError:
             return []
-        cached = _TRAJ_CACHE.get(policy_id)
-        if cached is not None and cached[1] == mtime:
-            return list(cached[0])  # return a copy
+        cached = _TRAJ_CACHE.get(policy_id, mtime)
+        if cached is not None:
+            return list(cached)
         steps = []
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -67,7 +67,7 @@ class TrajectoryStore:
                         steps.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
-        _TRAJ_CACHE[policy_id] = (steps, mtime)
+        _TRAJ_CACHE.set(policy_id, steps, mtime)
         return list(steps)
 
     def list_policies(self) -> List[str]:

@@ -22,22 +22,6 @@ from loci.cache import check_memory_cache, format_cache_response
 logger = logging.getLogger(__name__)
 
 
-class PolicyDecision:
-    """Result of policy decision: whether to apply and why."""
-    
-    def __init__(self, apply: bool, policy_id: Optional[str] = None, reason: str = ""):
-        self.apply = apply
-        self.policy_id = policy_id
-        self.reason = reason
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "apply": self.apply,
-            "policy_id": self.policy_id,
-            "reason": self.reason,
-        }
-
-
 class PolicyViolation:
     """Represents a policy constraint violation."""
     
@@ -106,9 +90,6 @@ async def loci_policy_hook(
         allowed_tools_env = os.environ.get("LOCI_POLICY_ALLOWED_TOOLS")
         if allowed_tools_env:
             allowed_tools = [t.strip() for t in allowed_tools_env.split(",")]
-        elif policy_config.allowed_models:
-            # Reuse allowed_models list as fallback tool allowlist when no TOOLS env set
-            allowed_tools = policy_config.allowed_models
 
         if allowed_tools is not None and tool_call_name not in allowed_tools:
             violations.append(PolicyViolation(
