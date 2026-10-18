@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config
+from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config, _TIER_ORDER
 from loci.cache import check_memory_cache, format_cache_response
 
 
