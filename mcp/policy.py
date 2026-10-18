@@ -19,6 +19,22 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple
 import json
 
+# ---------------------------------------------------------------------------
+# Module-level mtime-keyed policy cache
+# ---------------------------------------------------------------------------
+
+# {policy_id: (Policy, mtime_float)}
+_POLICY_CACHE: Dict[str, Tuple["Policy", float]] = {}
+_POLICY_CACHE_MAX = 256
+
+
+def _evict_policy_cache_if_needed() -> None:
+    """Simple FIFO eviction when cache exceeds max size."""
+    if len(_POLICY_CACHE) > _POLICY_CACHE_MAX:
+        to_remove = list(_POLICY_CACHE.keys())[: _POLICY_CACHE_MAX // 4]
+        for k in to_remove:
+            _POLICY_CACHE.pop(k, None)
+
 
 class PolicyTier(str, Enum):
     """Policy tier constraints for retrieval and context limits."""
@@ -128,7 +144,7 @@ class PolicyRegion(str, Enum):
     TOOL_CALL = "tool_call"   # Affects MCP tool invocation gating
 
 
-@dataclass
+@dataclass(slots=True)
 class PolicyMetadata:
     """Policy metadata: creation, modification, provenance."""
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
@@ -353,8 +369,11 @@ class PolicyBackend:
         
         # Save to file
         policy_file = self.policy_dir / f"{policy.policy_id}.json"
-        with open(policy_file, "w") as f:
+        with open(policy_file, "w", encoding="utf-8") as f:
             json.dump(policy.to_dict(), f, indent=2)
+        
+        # Invalidate cache so next load picks up the freshly written file
+        _POLICY_CACHE.pop(policy.policy_id, None)
         
         return {
             "policy_id": policy.policy_id,
@@ -365,31 +384,47 @@ class PolicyBackend:
         """
         Load a policy by ID.
         
-        Returns: Policy object or None if not found
+        Returns: Policy object or None if not found.
+        Uses mtime-keyed cache to avoid redundant file reads.
         """
         policy_file = self.policy_dir / f"{policy_id}.json"
-        
         if not policy_file.exists():
             return None
-        
-        with open(policy_file, "r") as f:
+        try:
+            mtime = policy_file.stat().st_mtime
+        except OSError:
+            return None
+        cached = _POLICY_CACHE.get(policy_id)
+        if cached is not None and cached[1] == mtime:
+            return cached[0]
+        with open(policy_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
-        return Policy.from_dict(data)
+        policy = Policy.from_dict(data)
+        _POLICY_CACHE[policy_id] = (policy, mtime)
+        _evict_policy_cache_if_needed()
+        return policy
     
     def list_policies(self, labels: Optional[List[str]] = None, region: Optional[str] = None) -> List[Policy]:
         """
         List policies, optionally filtered by labels or region.
         
-        Returns: List of Policy objects
+        Returns: List of Policy objects. Skips re-reading files whose mtime matches the cache.
         """
         policies = []
         
         for policy_file in self.policy_dir.glob("*.json"):
-            with open(policy_file, "r") as f:
-                data = json.load(f)
-            
-            policy = Policy.from_dict(data)
+            policy_id = policy_file.stem
+            try:
+                mtime = policy_file.stat().st_mtime
+            except OSError:
+                continue
+            cached = _POLICY_CACHE.get(policy_id)
+            if cached is not None and cached[1] == mtime:
+                policy = cached[0]
+            else:
+                with open(policy_file, "r", encoding="utf-8") as f:
+                    policy = Policy.from_dict(json.load(f))
+                _POLICY_CACHE[policy_id] = (policy, mtime)
             
             # Apply filters
             if labels and not any(label in policy.labels for label in labels):
