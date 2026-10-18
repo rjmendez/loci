@@ -1,0 +1,10 @@
+# Registry of default-off LEARNED features (Tripwire-Governor S15). Checked in CI by
+# scripts/check_policy_flags.py: every entry needs a reason and a review_by date, and CI fails once
+# review_by is in the past. Add an entry in the same change that ships a learned feature OFF:
+#
+# [[flag]]
+# name = "learned_router"
+# reason = "why it is off, and what evidence would turn it on"
+# review_by = 2026-11-17
+#
+# Empty today: nothing learned ships default-off yet.
