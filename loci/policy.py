@@ -89,13 +89,24 @@ _TIER_ORDER: Dict[PolicyTier, int] = {
 
 def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     """
-    Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
+    Get the tier→model map, delegating to model_selector for Ollama support.
 
-    LOCI_TIER_MODEL_MAP should be a JSON string mapping tier names to model lists.
-    Only keys that map to a valid PolicyTier are included; unknown keys are silently
-    ignored.  When the env var is set, only the tiers present in it are returned
-    (no merge with defaults).  Falls back to TIER_MODEL_MAP on parse error.
+    Falls back to LOCI_TIER_MODEL_MAP env var override (JSON string mapping tier
+    names to model lists), then to the compiled TIER_MODEL_MAP default.
     """
+    try:
+        from loci.model_selector import get_tier_model_map as _get
+        raw = _get()
+        result = {}
+        for k, v in raw.items():
+            try:
+                result[PolicyTier(k)] = v
+            except ValueError:
+                pass
+        if result:
+            return result
+    except ImportError:
+        pass
     override = os.getenv("LOCI_TIER_MODEL_MAP")
     if override:
         try:
@@ -149,7 +160,15 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str
     This is the cost-enforcement path: if *requested_model* already belongs to
     *tier* or a cheaper tier it is returned unchanged; otherwise the first
     model in the tier's allowed list is substituted.
+    Delegates to model_selector.resolve_for_loci when available for Ollama-aware routing.
     """
+    try:
+        from loci.model_selector import resolve_for_loci
+        resolved, downgraded = resolve_for_loci(requested_model, tier.value)
+        return resolved, downgraded
+    except ImportError:
+        pass
+
     tier_map = get_tier_model_map()
     allowed = tier_map.get(tier, [])
 
