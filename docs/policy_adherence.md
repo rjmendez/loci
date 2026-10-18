@@ -102,12 +102,15 @@ The `downgrade_effectiveness` field is a normalized correctness-preservation rat
 report = json.loads(mcp__loci__policy_adherence_report(policy_id="my-cost-policy"))
 
 if report["recommendation"] != "insufficient_data":
-    mcp__loci__policy_trajectory_push(
+    # mcp__loci__policy_trajectory_push no longer exists: the recorder writes this step
+    # (loci/drpg.py TrajectoryStore.push; every reward value must be within [-1, 1]).
+    record_trajectory_step(
         policy_id="my-cost-policy",
         step=current_step,
         action="tier_routing",
-        reward_vector={
-            "r_cor": report["downgrade_effectiveness"],
+        reward_vector={  # all seven keys are required by the recorder
+            "r_ret": 0.0, "r_mem": 0.0, "r_ovp": 0.0, "r_bkp": 0.0, "r_ref": 0.0,
+            "r_cor": min(1.0, report["downgrade_effectiveness"]),
             "r_step": report["avg_r_step"],
         },
     )

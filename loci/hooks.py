@@ -11,11 +11,11 @@ Provides:
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config, _TIER_ORDER
+# PolicyRegion and _TIER_ORDER are re-exported through mcp/hooks.py (star import).
+from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config, _TIER_ORDER  # noqa: F401
 from loci.cache import check_memory_cache, format_cache_response
 
 
@@ -137,7 +137,10 @@ async def grounding_hook_augmented(
 
     if policy_id:
         backend = PolicyBackend()
-        policy = backend.load(policy_id)
+        try:
+            policy = backend.load(policy_id)
+        except ValueError:
+            policy = None  # not a valid policy id: behave as "no such policy"
 
     # Check for cache hit before model call
     context = kwargs.get("grounding_context", {})
@@ -251,7 +254,10 @@ async def tier_router_surface(
         }
 
     backend = PolicyBackend()
-    policy = backend.load(policy_id)
+    try:
+        policy = backend.load(policy_id)
+    except ValueError:
+        policy = None  # not a valid policy id: reported below as policy_not_found
 
     if not policy:
         return {
@@ -262,7 +268,18 @@ async def tier_router_surface(
             "violations": [{"type": "policy_not_found", "message": f"Policy {policy_id} not found"}],
         }
 
-    resolved_model, was_rewritten = downgrade_model_to_tier(model, policy.tier)
+    decision = downgrade_model_to_tier(model, policy.tier)
+    resolved_model, was_rewritten = decision
+
+    if getattr(decision, "tier_unresolved", False):
+        if not decision.usable_model:  # the tier forbids every model (ZERO): pass nothing through
+            resolved_model, was_rewritten = "", True
+        shown = f"'{resolved_model}'" if resolved_model else "no model"
+        violations.append(PolicyViolation(
+            "tier_unresolved",
+            f"Tier {policy.tier.value} lists no model; requested '{model}' was not passed through, using {shown}",
+            severity="error",
+        ))
 
     if was_rewritten:
         violations.append(PolicyViolation(
@@ -334,7 +351,7 @@ async def eval_hook_stub(
         "feedback": {...}
     }
     """
-    from loci.drpg import TrajectoryStore
+    from loci.drpg import _default_trajectory_store
 
     step = kwargs.get("step", 0)
     action = kwargs.get("action", "unknown")
@@ -354,10 +371,7 @@ async def eval_hook_stub(
     persisted = False
     if policy_id:
         try:
-            traj_dir = os.environ.get(
-                "LOCI_TRAJECTORY_DIR", str(Path.home() / ".loci" / "trajectories")
-            )
-            store = TrajectoryStore(Path(traj_dir))
+            store = _default_trajectory_store()
             store.push(policy_id, feedback.to_dict())
             persisted = True
         except Exception as exc:

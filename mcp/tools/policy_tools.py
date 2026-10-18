@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any, Optional
 
-from loci.policy import Policy, PolicyBackend, PolicyTier, PolicyRegion, validate_policy
+from loci.policy import Policy, PolicyBackend, PolicyTier, PolicyRegion
 
 
 def register(mcp_server):
@@ -38,7 +38,10 @@ def register(mcp_server):
     async def policy_load(policy_id: str) -> str:
         """Load a stored policy.md document by policy_id; returns its full serialized form or not_found."""
         backend = PolicyBackend()
-        policy = await asyncio.to_thread(backend.load, policy_id)
+        try:
+            policy = await asyncio.to_thread(backend.load, policy_id)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc), "policy_id": policy_id})
         if policy is None:
             return json.dumps({"error": "not_found", "policy_id": policy_id})
         return json.dumps(policy.to_dict())

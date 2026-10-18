@@ -15,12 +15,13 @@ Provides:
 """
 
 import os
+import re
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any
 import json
 
 from loci.mtime_cache import MtimeCache
@@ -30,6 +31,31 @@ from loci.mtime_cache import MtimeCache
 # ---------------------------------------------------------------------------
 
 _POLICY_CACHE: "MtimeCache[Policy]" = MtimeCache(maxsize=256)
+
+# A policy id names a file under the store, so it is restricted to a safe filename:
+# lowercase alphanumeric first, then alphanumerics, '_', '.', '-', at most 64 characters.
+# Default ids (uuid4) match.  Nothing with a separator, drive colon or empty value does.
+POLICY_ID_PATTERN = r"[a-z0-9][a-z0-9_.-]{0,63}"
+_POLICY_ID_RE = re.compile(POLICY_ID_PATTERN)
+
+
+def loci_home() -> Path:
+    """Root of the Loci state directory: $LOCI_HOME when set, else ~/.loci.
+
+    Resolved at call time (never at import) so a test that sets LOCI_HOME, or HOME,
+    after this module is imported still redirects every default store path.
+    """
+    override = os.environ.get("LOCI_HOME")
+    if override:
+        return Path(override)
+    return Path.home() / ".loci"
+
+
+def validate_policy_id(policy_id: Any) -> str:
+    """Return *policy_id* when it is a safe store key; raise ValueError('invalid policy_id: ...') otherwise."""
+    if not isinstance(policy_id, str) or _POLICY_ID_RE.fullmatch(policy_id) is None:
+        raise ValueError(f"invalid policy_id: {policy_id!r} (must match {POLICY_ID_PATTERN})")
+    return policy_id
 
 
 class PolicyTier(str, Enum):
@@ -154,7 +180,55 @@ def resolve_model_for_tier(
     return ""
 
 
-def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
+class DowngradeResult(tuple):
+    """``(model, was_rewritten)`` -- it unpacks and compares as that pair -- plus ``tier_unresolved``.
+
+    ``tier_unresolved`` is True when the tier named no usable model and the cost ceiling was
+    enforced anyway (see ``downgrade_model_to_tier``): *model* is then the cheapest model allowed
+    at or below the tier, or "" when there is none.  A caller must not call "".
+    """
+
+    def __new__(cls, model: str, was_rewritten: bool, tier_unresolved: bool = False) -> "DowngradeResult":
+        self = super().__new__(cls, (model, was_rewritten))
+        self.tier_unresolved = tier_unresolved
+        return self
+
+    @property
+    def model(self) -> str:
+        return self[0]
+
+    @property
+    def was_rewritten(self) -> bool:
+        return self[1]
+
+    @property
+    def usable_model(self) -> str:
+        """The model a caller may actually call: "" when the tier forbids every model.
+
+        That is the ZERO case: tier_unresolved with the request left alone (was_rewritten False).
+        Every other result, including an unresolved one that fell back to the cheapest allowed
+        model, is usable as returned.
+        """
+        return "" if self.tier_unresolved and not self.was_rewritten else self.model
+
+
+def _cheapest_allowed(tier: Any) -> str:
+    """The first candidate of the cheapest tier that has one, among tiers at or below *tier*; "" if none.
+
+    An unknown *tier* (not a PolicyTier) has no known ceiling, so the whole ladder is searched
+    and the cheapest candidate anywhere wins.
+    """
+    ceiling = _TIER_ORDER[tier] if isinstance(tier, PolicyTier) else max(_TIER_ORDER.values())
+    for candidate_tier in sorted(_TIER_ORDER, key=lambda t: _TIER_ORDER[t]):
+        if _TIER_ORDER[candidate_tier] > ceiling:
+            break
+        models = _tier_candidates(candidate_tier)
+        if models:
+            return models[0]
+    return ""
+
+
+def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> DowngradeResult:
     """
     Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
 
@@ -163,7 +237,21 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str
     candidate for the tier (see ``resolve_model_for_tier``) is substituted.
     A model the pool serves for a tier counts as belonging to that tier. A model no
     tier lists is substituted, as it always was.
+
+    Fail closed: when the tier has no candidate at all (a tier the model map or its
+    LOCI_TIER_MODEL_MAP override does not list, or a tier that is not a PolicyTier) the requested
+    model is NOT passed through.  The result is the cheapest allowed model at or below the tier
+    (or "" if there is none), ``was_rewritten`` is True and ``tier_unresolved`` is True.
+
+    The ZERO tier is the one exception to the pair: it still returns ``(requested_model, False)``,
+    because mcp/tests/test_model_selector.py pins that, but with ``tier_unresolved`` True and
+    ``usable_model`` "" -- callers must use ``usable_model`` (tier_router_surface and litellm_call do).
     """
+    if not isinstance(tier, PolicyTier):
+        try:
+            tier = PolicyTier(tier)
+        except ValueError:
+            return DowngradeResult(_cheapest_allowed(tier), True, True)
     tier_map = get_tier_model_map()
     allowed = _tier_candidates(tier)
 
@@ -184,11 +272,16 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str
                     break
 
     if requested_tier is not None and _TIER_ORDER.get(requested_tier, 3) <= _TIER_ORDER.get(tier, 3):
-        return requested_model, False
+        return DowngradeResult(requested_model, False)
 
     if allowed:
-        return allowed[0], True
-    return requested_model, False
+        return DowngradeResult(allowed[0], True)
+    if tier is PolicyTier.ZERO:
+        # ZERO forbids every model.  The legacy pair (requested, False) is kept because an existing
+        # test (mcp/tests/test_model_selector.py) pins it; tier_unresolved=True and usable_model == ""
+        # tell callers that the request must not be called.
+        return DowngradeResult(requested_model, False, True)
+    return DowngradeResult(_cheapest_allowed(tier), True, True)
 
 
 # ---------------------------------------------------------------------------
@@ -503,10 +596,19 @@ class PolicyBackend:
     def __init__(self, policy_dir: Optional[Path] = None):
         """Initialize backend with optional policy directory."""
         if policy_dir is None:
-            policy_dir = Path.home() / ".loci" / "policies"
-        
+            policy_dir = loci_home() / "policies"
+
         self.policy_dir = Path(policy_dir)
         self.policy_dir.mkdir(parents=True, exist_ok=True)
+
+    def _policy_file(self, policy_id: str) -> Path:
+        """The file for *policy_id*; ValueError('invalid policy_id') unless it is a safe name inside policy_dir."""
+        validate_policy_id(policy_id)
+        base = self.policy_dir.resolve()
+        path = (base / f"{policy_id}.json").resolve()
+        if path.parent != base:
+            raise ValueError(f"invalid policy_id: {policy_id!r} (resolves outside the policy directory)")
+        return path
     
     def store(self, policy: Policy) -> Dict[str, Any]:
         """
@@ -521,7 +623,7 @@ class PolicyBackend:
             raise ValueError(f"Policy validation failed: {errors}")
         
         # Save to file
-        policy_file = self.policy_dir / f"{policy.policy_id}.json"
+        policy_file = self._policy_file(policy.policy_id)
         with open(policy_file, "w", encoding="utf-8") as f:
             json.dump(policy.to_dict(), f, indent=2)
         
@@ -538,9 +640,10 @@ class PolicyBackend:
         Load a policy by ID.
         
         Returns: Policy object or None if not found.
+        Raises: ValueError('invalid policy_id') for an id that is not a safe store key.
         Uses mtime-keyed cache to avoid redundant file reads.
         """
-        policy_file = self.policy_dir / f"{policy_id}.json"
+        policy_file = self._policy_file(policy_id)
         if not policy_file.exists():
             return None
         try:
