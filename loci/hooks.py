@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
-from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config
+from loci.policy import Policy, PolicyBackend, PolicyRegion, get_policy_config, _TIER_ORDER
 from loci.cache import check_memory_cache, format_cache_response
 
 
@@ -255,7 +255,7 @@ async def tier_router_surface(
         "violations": [...]
     }
     """
-    from loci.policy import resolve_model_for_tier  # avoid circular import
+    from loci.policy import downgrade_model_to_tier  # avoid circular import
 
     violations: List[PolicyViolation] = []
     policy_id = kwargs.get("policy_id")
@@ -281,7 +281,7 @@ async def tier_router_surface(
             "violations": [{"type": "policy_not_found", "message": f"Policy {policy_id} not found"}],
         }
 
-    resolved_model, was_rewritten = resolve_model_for_tier(model, policy.tier)
+    resolved_model, was_rewritten = downgrade_model_to_tier(model, policy.tier)
 
     if was_rewritten:
         violations.append(PolicyViolation(

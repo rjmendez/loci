@@ -2,12 +2,16 @@
 Loci policy.md backend — policy storage, validation, and tier-aware tracking.
 
 Provides:
-1. PolicyTier: enum for light/medium/heavy tiers
-2. PolicyScope: region definitions (memory, context, routing)
-3. Policy: main policy document class
-4. PolicyBackend: storage and retrieval
-5. get_policy_config(): environment variable resolution
-6. validate_policy(): constraint checking
+1. PolicyTier: 7-tier enum (ZERO/NANO/LIGHT/STANDARD/TURBO/HEAVY/RESEARCH)
+2. TIER_MODEL_MAP: model lists per tier
+3. _TIER_ORDER: numeric ordering for tier comparisons
+4. resolve_model_for_tier(): tier → model selection (with rewrite tracking)
+5. StagePolicy: per-stage tier assignment for multi-stage tools
+6. PolicyScope: region definitions (memory, context, routing)
+7. Policy: main policy document class
+8. PolicyBackend: storage and retrieval
+9. get_policy_config(): environment variable resolution
+10. validate_policy(): constraint checking
 """
 
 import os
@@ -37,52 +41,57 @@ def _evict_policy_cache_if_needed() -> None:
 
 
 class PolicyTier(str, Enum):
-    """Policy tier constraints for retrieval and context limits."""
-    LIGHT = "light"       # 2K context, 3 hops, 2 refinement steps
-    MEDIUM = "medium"     # 8K context, 7 hops, 4 refinement steps
-    HEAVY = "heavy"       # 64K context, 15 hops, 10 refinement steps
+    """7-tier policy ladder for retrieval and context limits."""
+    ZERO     = "zero"      # No LLM — graph/cache/index only. r_step=0.
+    NANO     = "nano"      # Local Ollama only. Zero API cost.
+    LIGHT    = "light"     # haiku/flash. ~$0.25/1M tokens.
+    STANDARD = "standard"  # sonnet/gpt-4o-mini. ~$0.60/1M.
+    TURBO    = "turbo"     # sonnet+extended-think / o3-mini. ~$3/1M.
+    HEAVY    = "heavy"     # opus/gpt-4o. ~$15/1M.
+    RESEARCH = "research"  # Full swarm pipeline. ~$50+/run. session_limit=1.
+
+    # Backward-compat alias — STANDARD replaces MEDIUM
+    MEDIUM   = "medium"
 
     def constraints(self) -> Dict[str, int]:
         """Return constraint values for this tier."""
         tiers = {
-            PolicyTier.LIGHT: {
-                "max_context_chars": 2048,
-                "max_retrieval_hops": 3,
-                "max_refinement_steps": 2,
-            },
-            PolicyTier.MEDIUM: {
-                "max_context_chars": 8192,
-                "max_retrieval_hops": 7,
-                "max_refinement_steps": 4,
-            },
-            PolicyTier.HEAVY: {
-                "max_context_chars": 65536,
-                "max_retrieval_hops": 15,
-                "max_refinement_steps": 10,
-            },
+            PolicyTier.ZERO:     {"max_context_chars": 0,      "max_retrieval_hops": 0,  "max_refinement_steps": 0,  "max_perspectives": 0, "max_fanout": 0,  "session_limit": -1},
+            PolicyTier.NANO:     {"max_context_chars": 512,    "max_retrieval_hops": 1,  "max_refinement_steps": 1,  "max_perspectives": 1, "max_fanout": 4,  "session_limit": -1},
+            PolicyTier.LIGHT:    {"max_context_chars": 2048,   "max_retrieval_hops": 3,  "max_refinement_steps": 2,  "max_perspectives": 1, "max_fanout": 8,  "session_limit": -1},
+            PolicyTier.STANDARD: {"max_context_chars": 8192,   "max_retrieval_hops": 7,  "max_refinement_steps": 4,  "max_perspectives": 3, "max_fanout": 16, "session_limit": -1},
+            PolicyTier.TURBO:    {"max_context_chars": 32768,  "max_retrieval_hops": 12, "max_refinement_steps": 6,  "max_perspectives": 4, "max_fanout": 24, "session_limit": -1},
+            PolicyTier.HEAVY:    {"max_context_chars": 65536,  "max_retrieval_hops": 15, "max_refinement_steps": 10, "max_perspectives": 5, "max_fanout": 32, "session_limit": -1},
+            PolicyTier.RESEARCH: {"max_context_chars": 524288, "max_retrieval_hops": 30, "max_refinement_steps": 20, "max_perspectives": 5, "max_fanout": 64, "session_limit": 1},
         }
-        return tiers.get(self, {})
+        # MEDIUM is an alias for STANDARD
+        result = tiers.get(self)
+        if result is None and self == PolicyTier.MEDIUM:
+            return tiers[PolicyTier.STANDARD]
+        return result or {}
 
 
 TIER_MODEL_MAP: Dict[PolicyTier, List[str]] = {
-    PolicyTier.LIGHT: [
-        "claude-haiku-4.5",
-        "gpt-5-mini",
-        "mistral-7b-instruct",
-        "llama-3-8b-instruct",
-    ],
-    PolicyTier.MEDIUM: [
-        "claude-sonnet-4.6",
-        "gpt-5.4-mini",
-        "llama-3-70b-instruct",
-        "mistral-large",
-    ],
-    PolicyTier.HEAVY: [
-        "claude-opus-4.8",
-        "gpt-5.4",
-        "gpt-5.5",
-        "claude-sonnet-4.6",  # fallback if opus unavailable
-    ],
+    PolicyTier.ZERO:     [],  # no model calls
+    PolicyTier.NANO:     ["ollama/llama3.2:3b", "ollama/mistral:7b", "ollama/phi3:mini"],
+    PolicyTier.LIGHT:    ["claude-haiku-4.5", "gpt-5-mini", "mistral-7b-instruct"],
+    PolicyTier.STANDARD: ["claude-sonnet-4.6", "gpt-5.4-mini", "llama-3-70b-instruct"],
+    PolicyTier.MEDIUM:   ["claude-sonnet-4.6", "gpt-5.4-mini", "llama-3-70b-instruct"],  # alias
+    PolicyTier.TURBO:    ["claude-sonnet-4.6-extended", "o3-mini", "gpt-5.4-mini-thinking"],
+    PolicyTier.HEAVY:    ["claude-opus-4.8", "gpt-5.4", "gpt-5.5"],
+    PolicyTier.RESEARCH: ["claude-opus-4.8", "gpt-5.5"],  # full swarm uses these
+}
+
+# Numeric ordering for tier comparisons
+_TIER_ORDER: Dict[PolicyTier, int] = {
+    PolicyTier.ZERO: 0,
+    PolicyTier.NANO: 1,
+    PolicyTier.LIGHT: 2,
+    PolicyTier.STANDARD: 3,
+    PolicyTier.MEDIUM: 3,   # same level as STANDARD
+    PolicyTier.TURBO: 4,
+    PolicyTier.HEAVY: 5,
+    PolicyTier.RESEARCH: 6,
 }
 
 
@@ -90,58 +99,139 @@ def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     """
     Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
 
-    LOCI_TIER_MODEL_MAP should be a JSON string:
-    {"light": ["model-a", "model-b"], "medium": [...], "heavy": [...]}
+    LOCI_TIER_MODEL_MAP should be a JSON string mapping tier names to model lists.
+    Only keys that map to a valid PolicyTier are included; unknown keys are silently
+    ignored.  When the env var is set, only the tiers present in it are returned
+    (no merge with defaults).  Falls back to TIER_MODEL_MAP on parse error.
     """
     override = os.getenv("LOCI_TIER_MODEL_MAP")
     if override:
         try:
             data = json.loads(override)
-            return {
-                PolicyTier(k): v
-                for k, v in data.items()
-                if k in ("light", "medium", "heavy")
-            }
+            result = {}
+            for k, v in data.items():
+                try:
+                    result[PolicyTier(k)] = v
+                except ValueError:
+                    pass  # unknown tier key — ignore silently
+            if result:
+                return result
         except (json.JSONDecodeError, ValueError):
             pass  # fall through to default
     return TIER_MODEL_MAP
 
 
-def resolve_model_for_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
+def resolve_model_for_tier(
+    tier: PolicyTier,
+    available: Optional[List[str]] = None,
+) -> str:
+    """
+    Return the best model for *tier* from the tier model map.
+
+    If *available* is provided, the first model in the tier's list that also
+    appears in *available* is preferred; when none matches, the first model in
+    the tier map is returned as a fallback.
+
+    Raises ValueError for PolicyTier.ZERO (that tier forbids all LLM calls).
+    """
+    if tier is PolicyTier.ZERO:
+        raise ValueError(
+            f"PolicyTier.ZERO forbids LLM calls — no model can be selected. "
+            f"Use a higher tier or handle the ZERO case before calling resolve_model_for_tier."
+        )
+    tier_map = get_tier_model_map()
+    candidates = tier_map.get(tier, [])
+    if available and candidates:
+        for model in candidates:
+            if model in available:
+                return model
+    if candidates:
+        return candidates[0]
+    return ""
+
+
+def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
     """
     Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
 
-    If requested_model is already in the tier's allowed list, returns it unchanged.
-    If it's in an allowed or lower tier, keeps it (within cost budget).
-    If it's in a higher tier or unknown, downgrades to the first model in the allowed tier.
+    This is the cost-enforcement path: if *requested_model* already belongs to
+    *tier* or a cheaper tier it is returned unchanged; otherwise the first
+    model in the tier's allowed list is substituted.
     """
     tier_map = get_tier_model_map()
     allowed = tier_map.get(tier, [])
-    tier_order = {PolicyTier.LIGHT: 0, PolicyTier.MEDIUM: 1, PolicyTier.HEAVY: 2}
 
-    # Find which tier the requested model belongs to
     requested_tier = None
     for t, models in tier_map.items():
         if requested_model in models:
             requested_tier = t
             break
 
-    # If model is in an allowed or lower tier, keep it
-    if requested_tier is not None and tier_order[requested_tier] <= tier_order[tier]:
+    if requested_tier is not None and _TIER_ORDER.get(requested_tier, 3) <= _TIER_ORDER.get(tier, 3):
         return requested_model, False
 
-    # Otherwise downgrade to first model in allowed tier
     if allowed:
         return allowed[0], True
     return requested_model, False
 
 
+# ---------------------------------------------------------------------------
+# StagePolicy — per-stage tier assignment
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StagePolicy:
+    """Per-stage tier assignment for multi-stage tools like swarm_reason."""
+    stages: Dict[str, PolicyTier] = field(default_factory=dict)
+    outer_tier: PolicyTier = PolicyTier.STANDARD
+
+    def tier_for(self, stage: str) -> PolicyTier:
+        """Get tier for a stage, clamped to outer_tier ceiling."""
+        stage_tier = self.stages.get(stage, self.outer_tier)
+        if _TIER_ORDER.get(stage_tier, 3) > _TIER_ORDER.get(self.outer_tier, 3):
+            return self.outer_tier
+        return stage_tier
+
+    @classmethod
+    def for_swarm_reason(cls, outer: PolicyTier = PolicyTier.STANDARD) -> "StagePolicy":
+        """Default stage policy for swarm_reason."""
+        return cls(
+            stages={
+                "decompose":        PolicyTier.NANO,
+                "fanout":           PolicyTier.LIGHT,
+                "self_consistency": PolicyTier.LIGHT,
+                "escalation":       PolicyTier.STANDARD,
+                "synthesis":        PolicyTier.HEAVY,
+            },
+            outer_tier=outer,
+        )
+
+    @classmethod
+    def for_investigation(cls, outer: PolicyTier = PolicyTier.STANDARD) -> "StagePolicy":
+        """Default stage policy for the investigation pipeline."""
+        return cls(
+            stages={
+                "pre_answer_check": PolicyTier.ZERO,
+                "reason":           PolicyTier.STANDARD,
+                "reflect":          PolicyTier.NANO,
+                "verify":           PolicyTier.NANO,
+                "adversarial":      PolicyTier.STANDARD,
+            },
+            outer_tier=outer,
+        )
+
+
 class PolicyRegion(str, Enum):
     """Policy region/scope definitions."""
-    MEMORY = "memory"         # Affects grounding_hook retrieval strategy
-    CONTEXT = "context"       # Affects system message injection
-    ROUTING = "routing"       # Affects tier_router circuit-breaker decisions
-    TOOL_CALL = "tool_call"   # Affects MCP tool invocation gating
+    MEMORY    = "memory"     # Affects grounding_hook retrieval strategy
+    CONTEXT   = "context"    # Affects system message injection
+    ROUTING   = "routing"    # Affects tier_router circuit-breaker decisions
+    TOOL_CALL = "tool_call"  # Affects MCP tool invocation gating
+
+
+# Sets used by validate_policy() error messages
+_VALID_TIERS: frozenset = frozenset(t.value for t in PolicyTier)
+_VALID_REGIONS: frozenset = frozenset(r.value for r in PolicyRegion)
 
 
 @dataclass(slots=True)
@@ -164,7 +254,7 @@ class Policy:
     policy_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     title: str = ""
     type: str = "policy.md"
-    tier: PolicyTier = PolicyTier.MEDIUM
+    tier: PolicyTier = PolicyTier.STANDARD
     region: PolicyRegion = PolicyRegion.MEMORY
     labels: List[str] = field(default_factory=list)
     config: Dict[str, Any] = field(default_factory=dict)
@@ -173,13 +263,13 @@ class Policy:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Policy":
         """Deserialize policy from dict."""
-        tier_str = data.get("tier", "medium")
+        tier_str = data.get("tier", "standard")
         region_str = data.get("region", "memory")
         
         try:
             tier = PolicyTier(tier_str) if isinstance(tier_str, str) else tier_str
         except ValueError:
-            tier = PolicyTier.MEDIUM
+            tier = PolicyTier.STANDARD
         
         try:
             region = PolicyRegion(region_str) if isinstance(region_str, str) else region_str
@@ -219,7 +309,7 @@ class Policy:
 
     def get_reward_vector_weights(self) -> Dict[str, float]:
         """
-        Get 7D reward vector weights based on policy phase.
+        Get 7D reward vector weights based on policy tier and phase.
         
         From EVO-RAG research:
         - r_ret: Retrieval_Bonus
@@ -230,29 +320,69 @@ class Policy:
         - r_step: Step_Penalty
         - r_cor: Answer_Correctness
         """
+        tier = self.tier
         is_discovery = self.config.get("discovery_mode", True)
-        
-        if is_discovery:
-            # Discovery phase: high retrieval incentive, low search penalty
+
+        # ZERO: no model call — all zeros
+        if tier == PolicyTier.ZERO:
+            return {k: 0.0 for k in ("r_ret", "r_rem", "r_ovp", "r_bkp", "r_ref", "r_step", "r_cor")}
+
+        # NANO: lightweight discovery weights
+        if tier == PolicyTier.NANO:
             return {
-                "r_ret": 1.0,      # High incentive to retrieve
-                "r_rem": -0.05,    # Low search penalty
-                "r_ovp": -0.1,     # Moderate overlap penalty
-                "r_bkp": -0.2,     # Moderate backtrack penalty
-                "r_ref": -0.5,     # Discourage refusal during discovery
-                "r_step": -0.02,   # Low step penalty
-                "r_cor": 0.5,      # Moderate correctness reward
+                "r_ret":  0.8,
+                "r_rem":  -0.03,
+                "r_ovp":  -0.05,
+                "r_bkp":  -0.1,
+                "r_ref":  -0.3,
+                "r_step": -0.01,
+                "r_cor":  0.4,
+            }
+
+        # TURBO: refinement-leaning weights (between STANDARD and HEAVY)
+        if tier == PolicyTier.TURBO:
+            return {
+                "r_ret":  0.6,
+                "r_rem":  -0.15,
+                "r_ovp":  -0.12,
+                "r_bkp":  -0.25,
+                "r_ref":  0.7,
+                "r_step": -0.06,
+                "r_cor":  0.9,
+            }
+
+        # RESEARCH: full discovery with high backtrack penalty (expensive)
+        if tier == PolicyTier.RESEARCH:
+            return {
+                "r_ret":  1.0,
+                "r_rem":  -0.05,
+                "r_ovp":  -0.1,
+                "r_bkp":  -0.6,   # high: backtracking is expensive at this tier
+                "r_ref":  -0.5,
+                "r_step": -0.02,
+                "r_cor":  0.8,
+            }
+
+        # LIGHT / STANDARD / MEDIUM / HEAVY — phase-driven weights
+        if is_discovery:
+            return {
+                "r_ret":  1.0,
+                "r_rem":  -0.05,
+                "r_ovp":  -0.1,
+                "r_bkp":  -0.2,
+                "r_ref":  -0.5,
+                "r_step": -0.02,
+                "r_cor":  0.5,
             }
         else:
-            # Refinement phase: efficiency focus, high refusal reward when evidence insufficient
             return {
-                "r_ret": 0.5,      # Moderate retrieval reward
-                "r_rem": -0.2,     # Higher search penalty
-                "r_ovp": -0.15,    # Higher overlap penalty
-                "r_bkp": -0.3,     # Higher backtrack penalty
-                "r_ref": 1.0,      # High reward for refusal with insufficient evidence
-                "r_step": -0.1,    # Higher step penalty
-                "r_cor": 1.0,      # High correctness reward
+                "r_ret":  0.5,
+                "r_rem":  -0.2,
+                "r_ovp":  -0.15,
+                "r_bkp":  -0.3,
+                "r_ref":  1.0,
+                "r_step": -0.1,
+                "r_cor":  1.0,
             }
 
 
@@ -312,7 +442,7 @@ def validate_policy(policy_dict: Dict[str, Any]) -> List[Dict[str, str]]:
     except ValueError:
         errors.append({
             "code": "invalid_tier",
-            "message": f"Tier must be one of: light, medium, heavy. Got: {tier_str}"
+            "message": f"Tier must be one of: {', '.join(sorted(_VALID_TIERS))}. Got: {tier_str}"
         })
     
     # Check region
@@ -322,7 +452,7 @@ def validate_policy(policy_dict: Dict[str, Any]) -> List[Dict[str, str]]:
     except ValueError:
         errors.append({
             "code": "invalid_region",
-            "message": f"Region must be one of: memory, context, routing, tool_call. Got: {region_str}"
+            "message": f"Region must be one of: {', '.join(sorted(_VALID_REGIONS))}. Got: {region_str}"
         })
     
     # Check tier/config consistency

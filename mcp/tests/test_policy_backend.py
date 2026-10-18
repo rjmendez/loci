@@ -12,32 +12,28 @@ Tests cover:
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-import sys
+from unittest.mock import patch
 
 # Add mcp directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from loci.hooks import (
+    eval_hook_stub,
+    grounding_hook_augmented,
+    loci_policy_hook,
+    tier_router_surface,
+)
 from loci.policy import (
-    PolicyBackend,
     Policy,
-    PolicyTier,
+    PolicyBackend,
     PolicyRegion,
-    PolicyConfig,
-    PolicyMetadata,
+    PolicyTier,
     get_policy_config,
     validate_policy,
-)
-from loci.hooks import (
-    loci_policy_hook,
-    grounding_hook_augmented,
-    tier_router_surface,
-    eval_hook_stub,
-    PolicyViolation,
-    StepFeedback,
 )
 
 
@@ -258,6 +254,53 @@ class TestTierAwareTracking(unittest.TestCase):
         self.assertAlmostEqual(weights["r_rem"], -0.2)    # Higher search penalty
         self.assertAlmostEqual(weights["r_ref"], 1.0)     # High refusal reward
         self.assertAlmostEqual(weights["r_cor"], 1.0)    # High correctness
+
+    def test_policy_tier_standard_balanced(self):
+        """Test: STANDARD tier has 8K context, 7 hops, 4 refinement steps."""
+        policy = Policy(
+            title="Standard Tier Test",
+            tier=PolicyTier.STANDARD,
+            config={"max_context_chars": 8192, "max_retrieval_hops": 7},
+        )
+        c = policy.get_constraints()
+        self.assertEqual(c["max_context_chars"], 8192)
+        self.assertEqual(c["max_retrieval_hops"], 7)
+        self.assertEqual(c["max_refinement_steps"], 4)
+
+    def test_policy_tier_medium_equals_standard(self):
+        """Test: MEDIUM is a backward-compat alias for STANDARD constraints."""
+        policy = Policy(title="Medium Alias Test", tier=PolicyTier.MEDIUM)
+        c = policy.get_constraints()
+        self.assertEqual(c["max_context_chars"], 8192)
+        self.assertEqual(c["max_retrieval_hops"], 7)
+
+    def test_policy_tier_zero_all_zeros(self):
+        """Test: ZERO tier returns zero-cost reward vector."""
+        policy = Policy(title="Zero Tier", tier=PolicyTier.ZERO, config={"discovery_mode": True})
+        weights = policy.get_reward_vector_weights()
+        for key, val in weights.items():
+            self.assertEqual(val, 0.0, f"{key} should be 0.0 for ZERO tier")
+
+    def test_policy_tier_nano_lightweight_weights(self):
+        """Test: NANO tier returns lightweight discovery weights."""
+        policy = Policy(title="Nano Tier", tier=PolicyTier.NANO)
+        weights = policy.get_reward_vector_weights()
+        self.assertAlmostEqual(weights["r_ret"], 0.8)
+        self.assertAlmostEqual(weights["r_cor"], 0.4)
+
+    def test_policy_tier_turbo_refinement_weights(self):
+        """Test: TURBO tier returns refinement-leaning weights."""
+        policy = Policy(title="Turbo Tier", tier=PolicyTier.TURBO)
+        weights = policy.get_reward_vector_weights()
+        self.assertAlmostEqual(weights["r_cor"], 0.9)
+        self.assertAlmostEqual(weights["r_ref"], 0.7)
+
+    def test_policy_tier_research_high_backtrack_penalty(self):
+        """Test: RESEARCH tier has high backtrack penalty (expensive operations)."""
+        policy = Policy(title="Research Tier", tier=PolicyTier.RESEARCH)
+        weights = policy.get_reward_vector_weights()
+        self.assertAlmostEqual(weights["r_bkp"], -0.6)
+        self.assertAlmostEqual(weights["r_ret"], 1.0)
 
 
 class TestLociMCPTools(unittest.TestCase):
@@ -491,6 +534,14 @@ class TestPolicyValidation(unittest.TestCase):
         # Positive: config within light-tier limit → no mismatch
         errors = validate_policy({"tier": "light", "title": "x", "config": {"max_context_chars": 1024}})
         self.assertFalse(any(e["code"] == "tier_config_mismatch" for e in errors))
+
+    def test_new_tiers_pass_validation(self):
+        """Test: all 7 new tiers (zero, nano, standard, turbo, research) are valid."""
+        for tier_str in ("zero", "nano", "standard", "turbo", "research"):
+            with self.subTest(tier=tier_str):
+                errors = validate_policy({"title": "x", "tier": tier_str, "region": "memory"})
+                tier_errors = [e for e in errors if e["code"] == "invalid_tier"]
+                self.assertFalse(tier_errors, f"{tier_str} flagged as invalid tier")
 
 
 class TestDRPGIntegration(unittest.TestCase):
