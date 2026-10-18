@@ -218,6 +218,10 @@ jobs:
       - name: Test honesty
         run: python3 scripts/check_test_honesty.py --fail-stale
 
+      # Every default-off learned feature has a reason and a review_by date; an expired one fails.
+      - name: Learned-flag registry
+        run: python3 scripts/check_policy_flags.py
+
       # Heuristic, so it warns rather than fails: a commit that changes source and,
       # in the same commit, drops assertions / loosens == to >= / adds skips in a
       # test file, without a 'Test-weakened-because:' trailer.
