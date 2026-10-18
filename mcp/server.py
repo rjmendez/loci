@@ -13193,12 +13193,11 @@ try:
     from litellm_client import (
         call_litellm_proxy,
         resolve_model_for_tier_simple,
-        LiteLLMResponse,
         LITELLM_PROXY_URL,
     )
     _LITELLM_CLIENT_AVAILABLE = True
 except ImportError:  # pragma: no cover - litellm_client optional
-    call_litellm_proxy = resolve_model_for_tier_simple = LiteLLMResponse = None  # type: ignore
+    call_litellm_proxy = resolve_model_for_tier_simple = None  # type: ignore
     LITELLM_PROXY_URL = "http://localhost:4000"
     _LITELLM_CLIENT_AVAILABLE = False
 
@@ -13367,7 +13366,6 @@ def mcp__loci__litellm_call(
 def mcp__loci__litellm_health() -> str:
     """Check LiteLLM proxy health. Returns healthy/unhealthy status and detail. Never raises."""
     import urllib.request as _ureq
-    import urllib.error as _uerr
     url = f"{LITELLM_PROXY_URL.rstrip('/')}/health"
     try:
         with _ureq.urlopen(url, timeout=5) as resp:
