@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from loci.litellm_client import call_litellm_proxy, LITELLM_PROXY_URL
+from loci.litellm_client import call_litellm_proxy, check_proxy_health
 from loci.policy import downgrade_model_to_tier, PolicyTier
 
 
@@ -38,13 +38,5 @@ def register(mcp_server):
             return json.dumps({"error": str(exc), "model": resolved_model})
     @mcp_server.tool()
     def litellm_health() -> str:
-        """Check LiteLLM proxy health; returns proxy URL and reachability status."""
-        import urllib.request, urllib.error
-        url = f"{LITELLM_PROXY_URL.rstrip('/')}/health"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                return json.dumps({"status": "ok", "proxy_url": LITELLM_PROXY_URL, "http_status": resp.status})
-        except urllib.error.URLError as exc:
-            return json.dumps({"status": "unreachable", "proxy_url": LITELLM_PROXY_URL, "error": str(exc)})
-        except Exception as exc:
-            return json.dumps({"status": "error", "proxy_url": LITELLM_PROXY_URL, "error": str(exc)})
+        """Check LiteLLM proxy health: status ok / auth_required / error / unreachable, and whether it answered."""
+        return json.dumps(check_proxy_health())

@@ -31,3 +31,29 @@ def call_litellm_proxy(model: str, messages: List[Dict[str, str]], max_tokens: i
     choice = raw["choices"][0]["message"]["content"]
     usage = raw.get("usage", {})
     return LiteLLMResponse(model=raw.get("model", model), content=choice, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=latency_ms, raw=raw)
+
+
+def check_proxy_health(url: Optional[str] = None, api_key: Optional[str] = None, timeout: float = 5.0) -> Dict[str, Any]:
+    """Probe ``<url>/health``. ``reachable`` says whether anything answered; ``status`` says how it went.
+
+    ok            2xx
+    auth_required 401/403: the proxy is up but wants a key (set LOCI_LITELLM_API_KEY)
+    error         any other HTTP status, or an unexpected failure
+    unreachable   no HTTP answer at all (connection refused, DNS, timeout)
+    """
+    base = (url or LITELLM_PROXY_URL).rstrip("/")
+    key = LITELLM_API_KEY if api_key is None else api_key
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    req = urllib.request.Request(f"{base}/health", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"status": "ok", "reachable": True, "proxy_url": base, "http_status": resp.status}
+    except urllib.error.HTTPError as exc:   # before URLError: HTTPError is a URLError, and it did answer
+        if exc.code in (401, 403):
+            return {"status": "auth_required", "reachable": True, "proxy_url": base, "http_status": exc.code,
+                    "key_sent": bool(key), "hint": "set LOCI_LITELLM_API_KEY to a key the proxy accepts"}
+        return {"status": "error", "reachable": True, "proxy_url": base, "http_status": exc.code, "error": str(exc)}
+    except (urllib.error.URLError, OSError) as exc:
+        return {"status": "unreachable", "reachable": False, "proxy_url": base, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reachable": False, "proxy_url": base, "error": str(exc)}
