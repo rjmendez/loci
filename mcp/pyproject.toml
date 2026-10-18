@@ -27,6 +27,9 @@ dependencies = [
 mnemosyne = [
     "mnemosyne-memory[mcp]",
 ]
+perf = [
+    "orjson>=3.9",
+]
 test = [
     "hypothesis>=6.0",
     # tests/test_d10_gate.py checks numpy inference against the sklearn model.

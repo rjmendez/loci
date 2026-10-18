@@ -23,6 +23,46 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+# orjson is 3-5x faster than stdlib json for JSONL hot paths.  Fall back to
+# stdlib transparently so the module works without the optional dependency.
+
+# Characters that Python's str.splitlines() treats as line endings but that
+# neither orjson nor json.dumps(ensure_ascii=False) escapes automatically:
+#   U+0085 NEXT LINE (C1 control code)
+#   U+2028 LINE SEPARATOR
+#   U+2029 PARAGRAPH SEPARATOR
+# Leaving these literal in a JSONL record corrupts the file: splitlines()
+# splits the line, and subsequent readers parse the tail as a separate (broken)
+# JSON object.  Escape them in both serialisation paths.
+_SPLITLINES_ESCAPES = {
+    "\x85":   "\\u0085",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+
+
+def _escape_splitlines(s: str) -> str:
+    for ch, esc in _SPLITLINES_ESCAPES.items():
+        s = s.replace(ch, esc)
+    return s
+
+
+try:
+    import orjson as _orjson
+
+    def _json_loads(b):  # type: ignore[misc]
+        return _orjson.loads(b)
+
+    def _json_dumps(obj) -> str:  # type: ignore[misc]
+        return _escape_splitlines(_orjson.dumps(obj).decode("utf-8"))
+
+except ImportError:
+    def _json_loads(b):  # type: ignore[misc]
+        return json.loads(b)
+
+    def _json_dumps(obj) -> str:  # type: ignore[misc]
+        return _escape_splitlines(json.dumps(obj, ensure_ascii=False))
+
 import caller_identity
 
 logger = logging.getLogger("loci-mcp")
@@ -207,7 +247,7 @@ def _load_manifest(investigation_id: str) -> dict | None:
         if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
             _manifest_cache.pop(next(iter(_manifest_cache)))
         _manifest_cache[key] = raw
-    manifest = json.loads(raw)
+    manifest = _json_loads(raw)
     # Backward compat: initialize ACL fields if missing (old investigations)
     if "owner" not in manifest:
         manifest["owner"] = ""
@@ -223,7 +263,7 @@ def _load_manifest_fresh(investigation_id: str) -> dict | None:
     if not p.exists():
         return None
     raw = p.read_text()
-    manifest = json.loads(raw)
+    manifest = _json_loads(raw)
     if "owner" not in manifest:
         manifest["owner"] = ""
     if "acl" not in manifest:
@@ -307,7 +347,7 @@ def _append_jsonl(path: Path, entry: dict) -> None:
     # workflow agents recording to the same investigation) can't interleave a >PIPE_BUF
     # line and corrupt the file. Bound the wait so a contended writer returns a
     # retryable busy signal before the MCP transport times out and drops the response.
-    line = json.dumps(entry) + "\n"
+    line = _json_dumps(entry) + "\n"
     with _locked_file(path, "a", exclusive=True) as f:
         f.write(line)
         f.flush()
@@ -340,7 +380,7 @@ def _read_jsonl(path: Path) -> list[dict]:
         line = line.strip()
         if line:
             try:
-                rec = json.loads(line)
+                rec = _json_loads(line)
             except Exception:
                 bad += 1
                 continue
@@ -369,13 +409,13 @@ def _rewrite_jsonl_preserving(path: Path, update) -> int:
         rec = None
         if stripped:
             try:
-                rec = json.loads(stripped)
+                rec = _json_loads(stripped)
             except Exception:
                 rec = None
         if isinstance(rec, dict) and not (skip_access and _is_access_row(rec)):
             new = update(rec)
             if new is not None:
-                new_lines.append(json.dumps(new))
+                new_lines.append(_json_dumps(new))
                 replaced += 1
                 continue
         new_lines.append(line)

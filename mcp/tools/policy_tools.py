@@ -1,6 +1,7 @@
 """Policy MCP tools: mcp__loci__policy_store, mcp__loci__policy_load."""
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Optional
 
@@ -11,7 +12,7 @@ def register(mcp_server):
     """Register policy tools on the given FastMCP server."""
 
     @mcp_server.tool()
-    def policy_store(
+    async def policy_store(
         title: str,
         tier: str = "medium",
         region: str = "memory",
@@ -28,16 +29,16 @@ def register(mcp_server):
                 config=config or {},
             )
             backend = PolicyBackend()
-            result = backend.store(policy)
+            result = await asyncio.to_thread(backend.store, policy)
             return json.dumps(result)
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
 
     @mcp_server.tool()
-    def policy_load(policy_id: str) -> str:
+    async def policy_load(policy_id: str) -> str:
         """Load a stored policy.md document by policy_id; returns its full serialized form or not_found."""
         backend = PolicyBackend()
-        policy = backend.load(policy_id)
+        policy = await asyncio.to_thread(backend.load, policy_id)
         if policy is None:
             return json.dumps({"error": "not_found", "policy_id": policy_id})
         return json.dumps(policy.to_dict())
