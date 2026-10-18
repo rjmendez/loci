@@ -13184,6 +13184,105 @@ class _BearerAuthMiddleware:
         await self._app(scope, receive, send)
 
 
+try:
+    from policy import Policy, PolicyBackend, PolicyTier, PolicyRegion
+except ImportError:  # pragma: no cover - policy module optional at import time
+    Policy = PolicyBackend = PolicyTier = PolicyRegion = None  # type: ignore
+
+
+@mcp.tool()
+def policy_store(
+    title: str,
+    tier: str = "medium",
+    region: str = "memory",
+    labels: Optional[list[str]] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
+    # TODO: convert to async and wrap backend.store with asyncio.to_thread to
+    # avoid blocking the event loop on file I/O.
+    """Store a policy.md document (tier-aware retrieval/routing constraints) and return its policy_id."""
+    if Policy is None:
+        return json.dumps({"error": "policy module unavailable"})
+    try:
+        policy = Policy(
+            title=title,
+            tier=PolicyTier(tier),
+            region=PolicyRegion(region),
+            labels=labels or [],
+            config=config or {},
+        )
+        backend = PolicyBackend()
+        result = backend.store(policy)
+        return json.dumps(result)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_load(policy_id: str) -> str:
+    # TODO: convert to async and wrap backend.load with asyncio.to_thread to
+    # avoid blocking the event loop on file I/O.
+    """Load a stored policy.md document by policy_id; returns its full serialized form or not_found."""
+    if PolicyBackend is None:
+        return json.dumps({"error": "policy module unavailable"})
+    backend = PolicyBackend()
+    policy = backend.load(policy_id)
+    if policy is None:
+        return json.dumps({"error": "not_found", "policy_id": policy_id})
+    return json.dumps(policy.to_dict())
+
+
+try:
+    from drpg_evolution import (
+        evolve_policy as _evolve_policy,
+        _default_trajectory_store,
+    )
+    _DRPG_AVAILABLE = True
+except ImportError:  # pragma: no cover - drpg_evolution module optional at import time
+    _DRPG_AVAILABLE = False
+    _evolve_policy = _default_trajectory_store = None  # type: ignore
+
+
+@mcp.tool()
+def policy_evolve(policy_id: str) -> str:
+    """Run DRPG evolution loop for a policy: score trajectory, promote/demote, return decision."""
+    if not _DRPG_AVAILABLE:
+        return json.dumps({"error": "drpg_evolution module unavailable"})
+    if PolicyBackend is None:
+        return json.dumps({"error": "policy module unavailable"})
+    try:
+        backend = PolicyBackend()
+        store = _default_trajectory_store()
+        result = _evolve_policy(policy_id, backend, store)
+        return json.dumps(result)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_trajectory_push(
+    policy_id: str,
+    step: int,
+    action: str,
+    reward_vector: dict,
+) -> str:
+    """Push a reward step to the trajectory store for a given policy_id."""
+    if not _DRPG_AVAILABLE:
+        return json.dumps({"error": "drpg_evolution module unavailable"})
+    try:
+        store = _default_trajectory_store()
+        step_dict = {
+            "step": step,
+            "action": action,
+            "reward": reward_vector,
+            "policy_id": policy_id,
+        }
+        store.push(policy_id, step_dict)
+        return json.dumps({"pushed": True, "policy_id": policy_id, "step": step})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 def main() -> None:
     # Warm-ping so the first RAG/dedup call doesn't eat the ~9s nomic cold-load; non-blocking, fail-open.
     try:

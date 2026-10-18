@@ -12,3 +12,5 @@ tree-sitter-language-pack>=1.10
 # Serving the sse / streamable-http transports directly, so a bearer gate can
 # wrap the app (#78). Pulled in transitively by mcp before; now imported here.
 uvicorn>=0.30
+
+pytest-benchmark>=4.0
