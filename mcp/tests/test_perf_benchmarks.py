@@ -17,7 +17,15 @@ Mutation-verification notes (mutations applied to confirm tests go red, then rev
 - test_benchmark_trajectory_push: deleted _TRAJ_CACHE.pop in push() → cache not
   invalidated; subsequent read returns stale; assertion on step=999 presence fails
   (cache returns snapshot from before push was called). ✓ red on this mutation.
+- test_benchmark_jsonl_read_cold: removed _jsonl_cache_set from _read_jsonl →
+  len(result) still 500 (file re-read each benchmark iteration, no cache), but
+  warm benchmark would now equal cold; len assertion still passes. Correctness
+  is caught by test_inv_store_cache.py; benchmark number is the signal here.
+- test_benchmark_jsonl_read_warm: removed ``if cached is not None: return cached``
+  guard → file re-read every call; len(result) still 500, but warm ≈ cold latency
+  (visible in benchmark stats). ✓
 """
+import json
 import sys
 from pathlib import Path
 
@@ -162,3 +170,34 @@ def test_benchmark_jsonl_parse_orjson(benchmark, tmp_path):
     assert len(result) == 500
     assert result[0]["id"] == "f0"
     assert result[499]["id"] == "f499"
+
+
+# ---------------------------------------------------------------------------
+# inv_store JSONL cache benchmarks
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def jsonl_file(tmp_path):
+    """500-line JSONL file mimicking a findings.jsonl."""
+    path = tmp_path / "findings.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for i in range(500):
+            f.write(json.dumps({"id": f"f{i}", "content": f"finding {i}", "confidence": 0.8}) + "\n")
+    return path
+
+
+def test_benchmark_jsonl_read_cold(benchmark, jsonl_file, monkeypatch):
+    """Read 500-line JSONL cold (no cache): full file scan."""
+    import inv_store as _inv_store_mod
+    monkeypatch.setattr(_inv_store_mod, "_JSONL_CACHE", {})
+    result = benchmark(_inv_store_mod._read_jsonl, jsonl_file)
+    assert len(result) == 500
+
+
+def test_benchmark_jsonl_read_warm(benchmark, jsonl_file, monkeypatch):
+    """Read 500-line JSONL warm (cache hit): should be near-zero cost."""
+    import inv_store as _inv_store_mod
+    monkeypatch.setattr(_inv_store_mod, "_JSONL_CACHE", {})
+    _inv_store_mod._read_jsonl(jsonl_file)  # prime cache
+    result = benchmark(_inv_store_mod._read_jsonl, jsonl_file)
+    assert len(result) == 500
