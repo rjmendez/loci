@@ -20,6 +20,9 @@ _ = policy_store
 _ = policy_load
 _ = policy_evolve
 _ = policy_trajectory_push
+_ = memory_route_to_policy
+_ = counterfactual_gate
+_ = policy_trajectory_push
 _ = investigation_search
 _ = investigation_evidence_precheck
 _ = investigation_entity_lookup
@@ -95,8 +98,6 @@ _ = docs_ingest_indexer
 _ = docs_recall
 _ = finding_resolve
 _ = loci_validated_knowledge_promotion
-_ = memory_route_counterfactual_simulate
-_ = memory_route_policy_optimize
 _ = retrieval_selftest
 
 # ── Private helper called only from mcp/tests/ (out of vulture's scanned
