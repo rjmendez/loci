@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 from loci.litellm_client import call_litellm_proxy, check_proxy_health
 from loci.policy import downgrade_model_to_tier, PolicyTier
@@ -21,7 +21,14 @@ def register(mcp_server):
     ) -> str:
         """Make a governed LiteLLM proxy call with tier-based model routing."""
         tier_enum = PolicyTier(tier) if tier else PolicyTier.MEDIUM
-        resolved_model, was_rewritten = downgrade_model_to_tier(model, tier_enum)
+        decision = downgrade_model_to_tier(model, tier_enum)
+        resolved_model, was_rewritten = decision
+        if getattr(decision, "tier_unresolved", False) and not decision.usable_model:
+            return json.dumps({
+                "error": f"tier {tier_enum.value} allows no model; the requested model was not called",
+                "model": "",
+                "original_model": model,
+            })
         try:
             response = call_litellm_proxy(
                 model=resolved_model,
