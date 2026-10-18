@@ -78,6 +78,8 @@ _REMOVED = (
     "LOCI_MCP_TOKEN",
     "HERMES_MCP_TOKEN",
     "HERMES_MEMORY_DIR",
+    "LOCI_TRAJECTORY_DIR",  # policy/trajectory/adherence stores then default under LOCI_HOME
+    "LOCI_ADHERENCE_DIR",
     "LOCI_MEMORY_MD_DIR",
     "LOCI_EVENT_LOG",
     "RERANK_HTTP_URL",
@@ -261,6 +263,9 @@ def install() -> dict:
         "HOME": str(home),
         "USERPROFILE": str(home),
         "HERMES_HOME": str(home / ".hermes"),
+        # State root for the policy, trajectory and adherence stores (loci.policy.loci_home()):
+        # a default-constructed PolicyBackend()/AdherenceStore() lands here, never in ~/.loci.
+        "LOCI_HOME": str(root / "loci-home"),
         "LOCI_CONFIG": str(root / "no-such-backends.toml"),
         "LOCI_MEMORY_DIR": str(root / "memory-sessions"),
         "MNEMOSYNE_DATA_DIR": str(root / "mnemosyne"),

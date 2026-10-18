@@ -11,16 +11,22 @@ Architecture:
 - DrpgSuggestionGenerator: generates next-step discovery/refinement suggestions
 """
 
-import asyncio
 import json
 import os
-from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from loci.policy import Policy, PolicyBackend
+from loci.policy import Policy, PolicyBackend, loci_home, validate_policy_id
 from loci.mtime_cache import MtimeCache
+
+# evolve_all_policies is serial and bounded: one process, one thread, at most this many
+# policies per call.  A bigger batch is refused, not truncated.
+MAX_POLICIES_PER_CALL = 64
+
+
+class PolicyLimitError(ValueError):
+    """evolve_all_policies was given more than MAX_POLICIES_PER_CALL policies."""
 
 # ---------------------------------------------------------------------------
 # Module-level mtime-keyed trajectory cache
@@ -37,6 +43,7 @@ class TrajectoryStore:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, policy_id: str) -> Path:
+        validate_policy_id(policy_id)
         return self.base_dir / f"{policy_id}.jsonl"
 
     def push(self, policy_id: str, step_feedback_dict: Dict[str, Any]) -> None:
@@ -74,7 +81,13 @@ class TrajectoryStore:
 
     def list_policies(self) -> List[str]:
         """Return policy IDs that have trajectory files."""
-        return [p.stem for p in self.base_dir.glob("*.jsonl")]
+        ids = []
+        for path in self.base_dir.glob("*.jsonl"):
+            try:
+                ids.append(validate_policy_id(path.stem))
+            except ValueError:
+                continue  # not a policy id: never hand a stray file name to the store
+        return ids
 
 
 _REWARD_DIMS = ("r_ret", "r_mem", "r_ovp", "r_bkp", "r_ref", "r_step", "r_cor")
@@ -289,18 +302,16 @@ def evolve_policy(
 
 
 def _default_trajectory_store() -> TrajectoryStore:
-    traj_dir = os.environ.get("LOCI_TRAJECTORY_DIR", str(Path.home() / ".loci" / "trajectories"))
+    traj_dir = os.environ.get("LOCI_TRAJECTORY_DIR") or str(loci_home() / "trajectories")
     return TrajectoryStore(Path(traj_dir))
 
 
 def _evolve_worker(args):
-    """Top-level picklable worker for ProcessPoolExecutor."""
+    """Evolve one policy from a (policy_id, policy_dir, trajectory_dir) tuple; errors become an 'error' result."""
     policy_id, policy_dir_str, traj_dir_str = args
-    from loci.policy import PolicyBackend
-    from loci.drpg import TrajectoryStore, evolve_policy
-    backend = PolicyBackend(Path(policy_dir_str))
-    store = TrajectoryStore(Path(traj_dir_str))
     try:
+        backend = PolicyBackend(Path(policy_dir_str))
+        store = TrajectoryStore(Path(traj_dir_str))
         return evolve_policy(policy_id, backend, store)
     except Exception as e:
         return {
@@ -318,17 +329,16 @@ async def evolve_all_policies(
     trajectory_dir: Path,
     max_workers: int = None,
 ) -> List[Dict[str, Any]]:
-    """Evolve N policies in parallel using a process pool."""
-    if not policy_ids:
-        return []
-    workers = max_workers or min(os.cpu_count() or 1, len(policy_ids))
-    args_list = [(pid, str(policy_dir), str(trajectory_dir)) for pid in policy_ids]
-    loop = asyncio.get_event_loop()
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = [loop.run_in_executor(pool, _evolve_worker, a) for a in args_list]
-        results = await asyncio.gather(*futs, return_exceptions=True)
-    return [
-        r if not isinstance(r, Exception)
-        else {"policy_id": args_list[i][0], "action": "error", "error": str(r)}
-        for i, r in enumerate(results)
-    ]
+    """Evolve the given policies one after another, in sorted policy_id order, in this process.
+
+    Serial by design: no process pool, no threads.  Duplicate ids are evolved once.  More than
+    MAX_POLICIES_PER_CALL distinct ids raises PolicyLimitError before anything is evolved.
+    ``max_workers`` is accepted for backward compatibility and ignored.
+    """
+    del max_workers  # compatibility only; evolution is serial
+    ids = sorted(set(policy_ids or []))
+    if len(ids) > MAX_POLICIES_PER_CALL:
+        raise PolicyLimitError(
+            f"{len(ids)} policies requested; at most {MAX_POLICIES_PER_CALL} per call"
+        )
+    return [_evolve_worker((pid, str(policy_dir), str(trajectory_dir))) for pid in ids]

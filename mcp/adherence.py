@@ -16,7 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-ADHERENCE_DIR = Path(os.getenv("LOCI_ADHERENCE_DIR", "~/.loci/adherence")).expanduser()
+from loci.policy import loci_home
+
+
+def default_adherence_dir() -> Path:
+    """$LOCI_ADHERENCE_DIR, else <LOCI_HOME or ~/.loci>/adherence, resolved at call time (never at import)."""
+    override = os.getenv("LOCI_ADHERENCE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return loci_home() / "adherence"
 
 
 @dataclass
@@ -45,7 +53,7 @@ class AdherenceStore:
     """Stores and queries policy adherence records."""
 
     def __init__(self, adherence_dir: Optional[Path] = None):
-        self.adherence_dir = Path(adherence_dir or ADHERENCE_DIR)
+        self.adherence_dir = Path(adherence_dir or default_adherence_dir())
         self.adherence_dir.mkdir(parents=True, exist_ok=True)
 
     def record(self, rec: PolicyAdherenceRecord) -> None:

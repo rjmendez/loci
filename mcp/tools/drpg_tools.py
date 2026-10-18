@@ -45,30 +45,37 @@ def register(mcp_server):
 
     @mcp_server.tool()
     def policy_evolve_all(policy_ids: list = None) -> str:
-        """Evolve all (or a given list of) policies in parallel via ProcessPoolExecutor.
+        """Evolve all (or a given list of) policies serially, at most 64 per call.
 
         If policy_ids is omitted or empty, all policies found in the trajectory store
-        are evolved. Returns a summary with total, promoted, demoted, and error counts.
+        are evolved.  Returns total, promoted, demoted, errors, policies_evolved (results that
+        are not errors), rows_read (trajectory rows analyzed) and per-policy results, plus
+        ``status``: 0 on success, 1 with an ``error`` when nothing could be read
+        ('rows_read=0'), more than 64 policies were requested, or anything else failed.
         """
         try:
-            from pathlib import Path
-            import os
+            from loci.policy import PolicyBackend
             store = _default_trajectory_store()
             ids = policy_ids if policy_ids else store.list_policies()
-            traj_dir = Path(os.environ.get("LOCI_TRAJECTORY_DIR", str(Path.home() / ".loci" / "trajectories")))
-            from loci.policy import PolicyBackend
             backend = PolicyBackend()
-            policy_dir = backend.base_dir
-            results = asyncio.run(_evolve_all(ids, policy_dir, traj_dir))
+            results = asyncio.run(_evolve_all(ids, backend.policy_dir, store.base_dir))
             promoted = sum(1 for r in results if r.get("action") == "promote")
             demoted = sum(1 for r in results if r.get("action") == "demote")
             errors = sum(1 for r in results if r.get("action") == "error")
-            return json.dumps({
+            rows_read = sum(int(r.get("steps_analyzed", 0)) for r in results)
+            summary = {
                 "total": len(results),
                 "promoted": promoted,
                 "demoted": demoted,
                 "errors": errors,
+                "policies_evolved": len(results) - errors,
+                "rows_read": rows_read,
                 "results": results,
-            })
+                "status": 0,
+            }
+            if rows_read == 0:
+                summary["status"] = 1
+                summary["error"] = "rows_read=0"
+            return json.dumps(summary)
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return json.dumps({"error": str(exc), "status": 1})
