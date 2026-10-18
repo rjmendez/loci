@@ -42,6 +42,7 @@ from policy import (
     TIER_MODEL_MAP,
     get_tier_model_map,
     resolve_model_for_tier,
+    downgrade_model_to_tier,
     Policy,
     PolicyRegion,
 )
@@ -56,49 +57,49 @@ from hooks import tier_router_surface
 class TestResolveModelForTier:
     def test_model_already_in_tier_no_rewrite(self):
         """LIGHT model against LIGHT policy → returned unchanged, was_rewritten=False."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-haiku-4.5", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-haiku-4.5", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is False
 
     def test_heavy_model_against_light_policy_downgrades_to_first_light(self):
         """HEAVY model against LIGHT policy → downgraded to first LIGHT model."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-opus-4.8", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-opus-4.8", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is True
 
     def test_unknown_model_against_medium_policy_returns_first_medium(self):
         """Unknown model against MEDIUM policy → first MEDIUM model, was_rewritten=True."""
-        resolved, was_rewritten = resolve_model_for_tier("gpt-4-turbo-unknown", PolicyTier.MEDIUM)
+        resolved, was_rewritten = downgrade_model_to_tier("gpt-4-turbo-unknown", PolicyTier.MEDIUM)
         assert resolved == "claude-sonnet-4.6"
         assert was_rewritten is True
 
     def test_light_model_against_medium_policy_kept_as_is(self):
         """LIGHT model against MEDIUM policy → kept unchanged (within budget)."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-haiku-4.5", PolicyTier.MEDIUM)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-haiku-4.5", PolicyTier.MEDIUM)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is False
 
     def test_medium_model_against_heavy_policy_kept_as_is(self):
         """MEDIUM model against HEAVY policy → kept unchanged (within budget)."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-sonnet-4.6", PolicyTier.HEAVY)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6", PolicyTier.HEAVY)
         assert resolved == "claude-sonnet-4.6"
         assert was_rewritten is False
 
     def test_heavy_model_against_heavy_policy_no_rewrite(self):
         """HEAVY model against HEAVY policy → returned unchanged."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-opus-4.8", PolicyTier.HEAVY)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-opus-4.8", PolicyTier.HEAVY)
         assert resolved == "claude-opus-4.8"
         assert was_rewritten is False
 
     def test_unknown_model_against_light_policy_downgrades(self):
         """Unknown model against LIGHT policy → downgraded to first LIGHT model."""
-        resolved, was_rewritten = resolve_model_for_tier("some-future-model-v99", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("some-future-model-v99", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is True
 
     def test_medium_model_against_light_policy_downgrades(self):
         """MEDIUM model against LIGHT policy → downgraded to first LIGHT model."""
-        resolved, was_rewritten = resolve_model_for_tier("claude-sonnet-4.6", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6", PolicyTier.LIGHT)
         assert resolved == "claude-haiku-4.5"
         assert was_rewritten is True
 
@@ -359,20 +360,20 @@ class TestTierOrderConsistency(unittest.TestCase):
 
 
 class TestResolveModelForTierNewTiers(unittest.TestCase):
-    """resolve_model_for_tier handles all 7 tiers correctly."""
+    """downgrade_model_to_tier handles all 7 tiers correctly."""
 
     def test_standard_model_against_standard_no_rewrite(self):
-        resolved, was_rewritten = resolve_model_for_tier("claude-sonnet-4.6", PolicyTier.STANDARD)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6", PolicyTier.STANDARD)
         self.assertEqual(resolved, "claude-sonnet-4.6")
         self.assertFalse(was_rewritten)
 
     def test_turbo_model_against_light_downgrades(self):
-        resolved, was_rewritten = resolve_model_for_tier("claude-sonnet-4.6-extended", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("claude-sonnet-4.6-extended", PolicyTier.LIGHT)
         self.assertEqual(resolved, "claude-haiku-4.5")
         self.assertTrue(was_rewritten)
 
     def test_nano_model_against_light_kept_as_is(self):
         # NANO (order=1) is lower than LIGHT (order=2), so it's within budget
-        resolved, was_rewritten = resolve_model_for_tier("ollama/llama3.2:3b", PolicyTier.LIGHT)
+        resolved, was_rewritten = downgrade_model_to_tier("ollama/llama3.2:3b", PolicyTier.LIGHT)
         self.assertEqual(resolved, "ollama/llama3.2:3b")
         self.assertFalse(was_rewritten)

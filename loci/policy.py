@@ -96,34 +96,68 @@ _TIER_ORDER: Dict[PolicyTier, int] = {
 
 
 def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
-    """Get tier→model map — delegates to model_selector for Ollama support."""
-    try:
-        from loci.model_selector import get_tier_model_map as _get
-        raw = _get()
-        result = {}
-        for k, v in raw.items():
-            try:
-                result[PolicyTier(k)] = v
-            except ValueError:
-                pass
-        return result if result else TIER_MODEL_MAP
-    except ImportError:
-        return TIER_MODEL_MAP
+    """
+    Get the tier→model map, respecting LOCI_TIER_MODEL_MAP env var override.
+
+    LOCI_TIER_MODEL_MAP should be a JSON string mapping tier names to model lists.
+    Only keys that map to a valid PolicyTier are included; unknown keys are silently
+    ignored.  When the env var is set, only the tiers present in it are returned
+    (no merge with defaults).  Falls back to TIER_MODEL_MAP on parse error.
+    """
+    override = os.getenv("LOCI_TIER_MODEL_MAP")
+    if override:
+        try:
+            data = json.loads(override)
+            result = {}
+            for k, v in data.items():
+                try:
+                    result[PolicyTier(k)] = v
+                except ValueError:
+                    pass  # unknown tier key — ignore silently
+            if result:
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass  # fall through to default
+    return TIER_MODEL_MAP
 
 
-def resolve_model_for_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
+def resolve_model_for_tier(
+    tier: PolicyTier,
+    available: Optional[List[str]] = None,
+) -> str:
+    """
+    Return the best model for *tier* from the tier model map.
+
+    If *available* is provided, the first model in the tier's list that also
+    appears in *available* is preferred; when none matches, the first model in
+    the tier map is returned as a fallback.
+
+    Raises ValueError for PolicyTier.ZERO (that tier forbids all LLM calls).
+    """
+    if tier is PolicyTier.ZERO:
+        raise ValueError(
+            f"PolicyTier.ZERO forbids LLM calls — no model can be selected. "
+            f"Use a higher tier or handle the ZERO case before calling resolve_model_for_tier."
+        )
+    tier_map = get_tier_model_map()
+    candidates = tier_map.get(tier, [])
+    if available and candidates:
+        for model in candidates:
+            if model in available:
+                return model
+    if candidates:
+        return candidates[0]
+    return ""
+
+
+def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Tuple[str, bool]:
     """
     Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
 
-    Delegates to model_selector.resolve_for_loci when available for Ollama-aware routing.
+    This is the cost-enforcement path: if *requested_model* already belongs to
+    *tier* or a cheaper tier it is returned unchanged; otherwise the first
+    model in the tier's allowed list is substituted.
     """
-    try:
-        from loci.model_selector import resolve_for_loci
-        resolved, downgraded = resolve_for_loci(requested_model, tier.value)
-        return resolved, downgraded
-    except ImportError:
-        pass
-
     tier_map = get_tier_model_map()
     allowed = tier_map.get(tier, [])
 
@@ -193,6 +227,11 @@ class PolicyRegion(str, Enum):
     CONTEXT   = "context"    # Affects system message injection
     ROUTING   = "routing"    # Affects tier_router circuit-breaker decisions
     TOOL_CALL = "tool_call"  # Affects MCP tool invocation gating
+
+
+# Sets used by validate_policy() error messages
+_VALID_TIERS: frozenset = frozenset(t.value for t in PolicyTier)
+_VALID_REGIONS: frozenset = frozenset(r.value for r in PolicyRegion)
 
 
 @dataclass(slots=True)
