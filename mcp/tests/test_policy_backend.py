@@ -306,6 +306,16 @@ class TestTierAwareTracking(unittest.TestCase):
 class TestLociMCPTools(unittest.TestCase):
     """GREEN: LociMCP mcp__loci__policy_store and mcp__loci__policy_load tools."""
 
+    def setUp(self):
+        # These tests build a default PolicyBackend() (and tier_router_surface does too), which
+        # resolves its directory from LOCI_HOME.  Point it at a per-test temp dir so no run, under
+        # pytest or plain unittest, can write 'Tier Constraint Test' policies into ~/.loci/policies.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(os.environ, {"LOCI_HOME": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     async def async_loci_policy_hook_test(self):
         """Test: loci_policy_hook returns (apply: bool, policy_id: str|None, reason: str)."""
         # Test: disabled env

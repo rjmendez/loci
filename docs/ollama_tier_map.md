@@ -15,7 +15,7 @@ rewriting a tier is not a model call. Roles are tried in order; the first that y
 | Tier | Roles tried |
 |------|-------------|
 | zero | none (no LLM call is allowed) |
-| nano | `tier_nano`, `decide` |
+| nano | `tier_nano`, `gen` |
 | light | `tier_light`, `gen` |
 | standard, medium | `tier_standard`, `gen` |
 | turbo | `tier_turbo`, `gen_large` |
@@ -23,7 +23,13 @@ rewriting a tier is not a model call. Roles are tried in order; the first that y
 | research | `tier_research`, `gen_large` |
 
 A `task_type` goes first: `security_review` -> `security`, `rtl_verify` -> `rtl`,
-`code` -> `code`, `triage` -> `decide`. An unknown task type is ignored.
+`code` -> `code`. An unknown task type (including `triage`) is ignored.
+
+Only roles whose models generate text are tried. The `decide` role is the SystemOne decision
+model (`docs/decision_model.md`), a 0.8B classifier that scores answer letters and cannot write a
+reply, so the selector skips it even if a table lists it. Before 2026-10-18 nano fell back to
+`decide` and `triage` mapped to it; a nano or triage chat request then resolved to that
+classifier. Classification goes through `mcp/decide.py`, which asks the pool for `decide` itself.
 
 To pin a model to one tier, give a pool entry that role:
 

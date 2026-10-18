@@ -21,6 +21,26 @@ In `hillclimb`, `python mcp/hillclimb.py label --decide` shows the decision mode
 answer, tallied as `decide_compared` / `decide_agreed` beside the existing `--model` comparison.
 `reflection_triage.classify_reflection_observation_decide` is the same classifier as a function.
 
+## Limits (shadow only, advisory only, 0 cloud tokens)
+
+`decide()` runs inside wrapper limits so a slow or sick 0.8B server cannot stall its callers. Every limit is a module
+constant, overridable by an environment variable (read when `Limits` is built) or by building `Limits(...)` with arguments.
+
+| Limit | Default | Env |
+|---|---|---|
+| calls in flight | 2; a third returns the rules fallback at once (`fallback: "busy"`), it never waits | `LOCI_DECIDE_MAX_INFLIGHT` |
+| call budget | 5 s for the whole call (each request gets what is left); a call that overruns is degraded and its late answer dropped | `LOCI_DECIDE_TIMEOUT_S` (or `timeout=`) |
+| breaker | 3 consecutive degraded calls open it for 60 s (`fallback: "breaker_open"`); then ONE probe call decides: good closes, degraded re-opens for another 60 s | `LOCI_DECIDE_BREAKER_THRESHOLD`, `LOCI_DECIDE_BREAKER_COOLDOWN_S` |
+
+A malformed request is the caller's fault: counted (`invalid_request`) but it neither opens nor resets the breaker. A call
+already in flight when the breaker opens cannot close it; only the probe can. `decide.stats()` (and `python mcp/decide.py
+stats`, for this process) returns the counters: `calls`, `ok`, `degraded`, `invalid_request`, `timeouts`, `fallback_busy`,
+`fallback_breaker_open`, `breaker_opened`, `breaker_probes`, `breaker_closed`, plus the breaker state and the limits, so
+degraded operation is reported, not silent. The result dict gained one key, `fallback` (None, `"busy"` or `"breaker_open"`).
+
+The tier selector (`loci/model_selector.py`) never resolves a chat request to this model: the `decide` role is a
+classifier that cannot write text, so nano falls back to `gen` and `triage` has no task role (`docs/ollama_tier_map.md`).
+
 ## Setup
 
 * Pool entry: `roles = ["decide"]`, `gpu = <card>` in `[[models.pool]]`; `LOCI_DECIDE_MODEL` overrides the model.
