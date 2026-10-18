@@ -29,17 +29,22 @@ import argparse
 import datetime as dt
 import json
 import re
+import sqlite3
 import sys
 from collections import Counter, defaultdict
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import urlparse
 
 UTC = dt.timezone.utc
 DEFAULT_LEDGER = Path.home() / ".loci" / "litellm_cost_ledger.jsonl"
 HOUR = 3600.0
 DAY = 86400.0
 CENT = Decimal("0.000001")
+# Hosts (host:port, exact match) that are the LiteLLM gateway as Hermes sees it: the lab name behind Caddy and loopback.
+# Anything else in Hermes' usage table is a direct route that the gateway ledger and its caps cannot see.
+GATEWAY_HOSTS = ("litellm.lab.floppydicks.net:4443", "localhost:4000", "127.0.0.1:4000")
 
 Event = tuple  # (ts: datetime, cost: Decimal, internal: bool, deployment: str, empty: bool, stream: bool, completion_tokens: int, key_alias_empty: bool)
 
@@ -194,8 +199,53 @@ def empty_stats(events: list[Event]) -> dict[str, Any]:
             "by_deployment": dict(by_dep.most_common())}
 
 
+def _host(url: Any) -> str:
+    return urlparse(str(url or "")).netloc.lower()
+
+
+def read_hermes_usage(db: Path, gateway_hosts: Iterable[str] = GATEWAY_HOSTS) -> dict[str, Any]:
+    """Hermes' own usage table (state.db, session_model_usage), read-only, grouped by provider and route host.
+
+    Tokens only: Hermes' cost columns are not trustworthy (estimated_cost_usd on OpenRouter rows sums to a large
+    negative number), so they are never read. A route is "gateway" when its host:port is exactly one of
+    ``gateway_hosts``; every other host is "direct" (invisible to the LiteLLM ledger and its caps). An unreadable
+    database is reported in ``error``; it is never reported as zero usage."""
+    gateway = {h.strip().lower() for h in gateway_hosts}
+    out: dict[str, Any] = {"db": str(db), "error": None, "routes": [], "cost_columns": "ignored: unreliable"}
+    try:
+        con = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    except (sqlite3.Error, OSError) as exc:
+        out["error"] = f"cannot open: {exc}"
+        return out
+    try:
+        rows = con.execute(
+            "SELECT billing_provider, billing_base_url, COUNT(*), SUM(api_call_count), SUM(input_tokens), "
+            "SUM(output_tokens), SUM(cache_read_tokens) FROM session_model_usage GROUP BY 1, 2").fetchall()
+    except sqlite3.Error as exc:
+        out["error"] = f"cannot read session_model_usage: {exc}"
+        return out
+    finally:
+        con.close()
+    merged: dict[tuple[str, str], list[int]] = {}
+    for provider, base_url, usage_rows, calls, tin, tout, cread in rows:
+        acc = merged.setdefault((str(provider or "?"), _host(base_url)), [0, 0, 0, 0, 0])
+        for i, v in enumerate((usage_rows, calls, tin, tout, cread)):
+            acc[i] += int(v or 0)
+    for (provider, host), (usage_rows, calls, tin, tout, cread) in merged.items():
+        out["routes"].append({"provider": provider, "host": host, "route": "gateway" if host in gateway else "direct",
+                              "usage_rows": usage_rows, "api_calls": calls, "input_tokens": tin,
+                              "output_tokens": tout, "cache_read_tokens": cread})
+    out["routes"].sort(key=lambda r: (-r["input_tokens"], r["host"]))
+    total = sum(r["input_tokens"] for r in out["routes"])
+    outside = sum(r["input_tokens"] for r in out["routes"] if r["route"] == "direct")
+    out["input_tokens_total"], out["input_tokens_outside_gateway"] = total, outside
+    out["outside_gateway_share"] = round(outside / total, 4) if total else 0.0
+    return out
+
+
 def build_report(paths: list[Path], tz_spec: str, daily_caps: list[Decimal], hour_caps: list[Decimal],
-                 rolling24_cap: Decimal, exclude_internal: bool = False) -> dict[str, Any]:
+                 rolling24_cap: Decimal, exclude_internal: bool = False, hermes_db: Optional[Path] = None,
+                 gateway_hosts: Iterable[str] = GATEWAY_HOSTS) -> dict[str, Any]:
     tz = parse_tz(tz_spec)
     all_events, bad, read = read_ledger(paths)
     if not all_events:
@@ -209,7 +259,7 @@ def build_report(paths: list[Path], tz_spec: str, daily_caps: list[Decimal], hou
     r1, r1_at = rolling_max(events, HOUR)
     r24, r24_at = rolling_max(events, DAY)
     span_h = (all_events[-1][0] - all_events[0][0]).total_seconds() / HOUR
-    return {
+    report: dict[str, Any] = {
         "ledger": {
             "files_read": read, "rows_read": len(all_events), "bad_rows": bad,
             "first_ts": all_events[0][0].isoformat(), "last_ts": all_events[-1][0].isoformat(),
@@ -237,6 +287,9 @@ def build_report(paths: list[Path], tz_spec: str, daily_caps: list[Decimal], hou
         "empty_response": empty_stats(all_events),
         "ledger_quality": {"key_alias_empty": sum(1 for e in all_events if e[7]), "rows": len(all_events)},
     }
+    if hermes_db is not None:
+        report["hermes_direct_usage"] = read_hermes_usage(hermes_db, gateway_hosts)
+    return report
 
 
 def _money(value: Decimal) -> str:
@@ -282,6 +335,15 @@ def render_text(report: dict[str, Any]) -> str:
     e = report["empty_response"]
     out += ["", f"empty responses: {e['empty_total']} (stream + 0 completion tokens: {e['empty_suspect_stream']}, other: {e['empty_other']}) by deployment {e['by_deployment']}",
             f"ledger quality: key_alias empty on {report['ledger_quality']['key_alias_empty']} of {report['ledger_quality']['rows']} rows"]
+    h = report.get("hermes_direct_usage")
+    if h is not None:
+        out += ["", f"Hermes usage ({h['db']}); cost columns {h['cost_columns']}:"]
+        if h["error"]:
+            out.append(f"  UNREADABLE: {h['error']}")
+        else:
+            for r in h["routes"]:
+                out.append(f"  {r['route']:7} {r['provider']:11} {r['host']:36} {r['api_calls']:>6} calls  in {r['input_tokens']:>11}  out {r['output_tokens']:>9}")
+            out.append(f"  input tokens outside the gateway: {h['input_tokens_outside_gateway']} of {h['input_tokens_total']} ({h['outside_gateway_share']:.1%})")
     return "\n".join(out)
 
 
@@ -297,11 +359,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--rolling24", default="60", help="rolling-24h cap (USD) to replay")
     ap.add_argument("--hour-caps", default="10,25", help="comma list of rolling-1h caps (USD) to replay")
     ap.add_argument("--exclude-internal", action="store_true", help="replay caps against external traffic only")
+    ap.add_argument("--hermes-db", type=Path, default=None,
+                    help="Hermes state.db: also report its usage by route (tokens), flagging routes outside the gateway")
+    ap.add_argument("--gateway-host", action="append", default=None,
+                    help="host:port counted as the gateway (repeatable; default: the lab name and loopback :4000)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON (money as exact strings)")
     args = ap.parse_args(argv)
     paths = [args.ledger, args.ledger.with_name(args.ledger.name + ".1")]
     report = build_report(paths, args.tz, _decimals(args.daily_hard), _decimals(args.hour_caps),
-                          Decimal(args.rolling24), args.exclude_internal)
+                          Decimal(args.rolling24), args.exclude_internal, args.hermes_db,
+                          args.gateway_host or GATEWAY_HOSTS)
     print(json.dumps(_jsonable(report), indent=1) if args.json else render_text(report))
     return 0
 
