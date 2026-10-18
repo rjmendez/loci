@@ -25,6 +25,28 @@ from pathlib import Path
 
 # orjson is 3-5x faster than stdlib json for JSONL hot paths.  Fall back to
 # stdlib transparently so the module works without the optional dependency.
+
+# Characters that Python's str.splitlines() treats as line endings but that
+# neither orjson nor json.dumps(ensure_ascii=False) escapes automatically:
+#   U+0085 NEXT LINE (C1 control code)
+#   U+2028 LINE SEPARATOR
+#   U+2029 PARAGRAPH SEPARATOR
+# Leaving these literal in a JSONL record corrupts the file: splitlines()
+# splits the line, and subsequent readers parse the tail as a separate (broken)
+# JSON object.  Escape them in both serialisation paths.
+_SPLITLINES_ESCAPES = {
+    "\x85":   "\\u0085",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+
+
+def _escape_splitlines(s: str) -> str:
+    for ch, esc in _SPLITLINES_ESCAPES.items():
+        s = s.replace(ch, esc)
+    return s
+
+
 try:
     import orjson as _orjson
 
@@ -32,18 +54,14 @@ try:
         return _orjson.loads(b)
 
     def _json_dumps(obj) -> str:  # type: ignore[misc]
-        # orjson leaves U+2028/U+2029 as literal characters; Python's
-        # str.splitlines() treats them as line endings, which would corrupt JSONL.
-        raw = _orjson.dumps(obj).decode("utf-8")
-        return raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+        return _escape_splitlines(_orjson.dumps(obj).decode("utf-8"))
 
 except ImportError:
     def _json_loads(b):  # type: ignore[misc]
         return json.loads(b)
 
     def _json_dumps(obj) -> str:  # type: ignore[misc]
-        raw = json.dumps(obj, ensure_ascii=False)
-        return raw.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+        return _escape_splitlines(json.dumps(obj, ensure_ascii=False))
 
 import caller_identity
 
