@@ -11,8 +11,10 @@ Architecture:
 - DrpgSuggestionGenerator: generates next-step discovery/refinement suggestions
 """
 
+import asyncio
 import json
 import os
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -75,31 +77,74 @@ class TrajectoryStore:
         return [p.stem for p in self.base_dir.glob("*.jsonl")]
 
 
+_REWARD_DIMS = ("r_ret", "r_mem", "r_ovp", "r_bkp", "r_ref", "r_step", "r_cor")
+# Weights applied AFTER abs() on penalty dims (r_ovp, r_bkp, r_step at indices 2,3,5).
+# Formula: r_ret + 0.5*r_mem - abs(r_ovp) - abs(r_bkp) + r_ref - abs(r_step) + r_cor
+_REWARD_WEIGHTS_DEFAULT = (1.0, 0.5, -1.0, -1.0, 1.0, -1.0, 1.0)
+_ABS_DIM_INDICES = (2, 3, 5)  # r_ovp, r_bkp, r_step require abs before weighting
+
+
 class TrajectoryScorer:
     """Aggregates a list of step dicts into a scalar quality score."""
 
+    def __init__(self, weights=_REWARD_WEIGHTS_DEFAULT):
+        self.weights = tuple(weights)
+
     def score(self, steps: List[Dict[str, Any]]) -> float:
         """
-        Weighted sum over all steps of:
-            r_ret - abs(r_ovp) - abs(r_bkp) + r_ref - abs(r_step) + r_cor
+        Weighted mean over all steps of:
+            r_ret + 0.5*r_mem - abs(r_ovp) - abs(r_bkp) + r_ref - abs(r_step) + r_cor
 
-        Normalized by step count. Returns 0.0 for empty input.
+        Dispatches to _score_scalar for <10 steps, _score_vectorized otherwise.
+        Returns 0.0 for empty input.
         """
         if not steps:
             return 0.0
+        if len(steps) < 10:
+            return self._score_scalar(steps)
+        return self._score_vectorized(steps)
 
+    def _score_scalar(self, steps: List[Dict[str, Any]]) -> float:
+        """Pure Python weighted sum for small step counts."""
+        w = self.weights
         total = 0.0
-        for step in steps:
-            rv = step.get("reward", {})
-            r_ret = float(rv.get("r_ret", 0.0))
-            r_ovp = float(rv.get("r_ovp", 0.0))
-            r_bkp = float(rv.get("r_bkp", 0.0))
-            r_ref = float(rv.get("r_ref", 0.0))
+        for s in steps:
+            rv = s.get("reward", s)
+            r_ret  = float(rv.get("r_ret",  0.0))
+            r_mem  = float(rv.get("r_mem",  0.0))
+            r_ovp  = float(rv.get("r_ovp",  0.0))
+            r_bkp  = float(rv.get("r_bkp",  0.0))
+            r_ref  = float(rv.get("r_ref",  0.0))
             r_step = float(rv.get("r_step", 0.0))
-            r_cor = float(rv.get("r_cor", 0.0))
-            total += r_ret - abs(r_ovp) - abs(r_bkp) + r_ref - abs(r_step) + r_cor
-
+            r_cor  = float(rv.get("r_cor",  0.0))
+            total += (
+                w[0] * r_ret
+                + w[1] * r_mem
+                + w[2] * abs(r_ovp)
+                + w[3] * abs(r_bkp)
+                + w[4] * r_ref
+                + w[5] * abs(r_step)
+                + w[6] * r_cor
+            )
         return total / len(steps)
+
+    def _score_vectorized(self, steps: List[Dict[str, Any]]) -> float:
+        """NumPy/CuPy vectorized weighted mean for larger batches.
+
+        Applies abs() to penalty dimensions (r_ovp, r_bkp, r_step) before
+        weighting, matching the _score_scalar formula exactly.
+        """
+        from loci.accelerator import get_array_module
+        xp = get_array_module()
+        dims = _REWARD_DIMS
+        R = xp.array(
+            [[float(s.get("reward", s).get(k, 0.0)) for k in dims] for s in steps],
+            dtype=xp.float32,
+        )
+        for i in _ABS_DIM_INDICES:
+            R[:, i] = xp.abs(R[:, i])
+        w = xp.array(self.weights, dtype=xp.float32)
+        return float(xp.mean(R @ w))
 
 
 class PolicyPromoter:
@@ -246,3 +291,44 @@ def evolve_policy(
 def _default_trajectory_store() -> TrajectoryStore:
     traj_dir = os.environ.get("LOCI_TRAJECTORY_DIR", str(Path.home() / ".loci" / "trajectories"))
     return TrajectoryStore(Path(traj_dir))
+
+
+def _evolve_worker(args):
+    """Top-level picklable worker for ProcessPoolExecutor."""
+    policy_id, policy_dir_str, traj_dir_str = args
+    from loci.policy import PolicyBackend
+    from loci.drpg import TrajectoryStore, evolve_policy
+    backend = PolicyBackend(Path(policy_dir_str))
+    store = TrajectoryStore(Path(traj_dir_str))
+    try:
+        return evolve_policy(policy_id, backend, store)
+    except Exception as e:
+        return {
+            "policy_id": policy_id,
+            "action": "error",
+            "error": str(e),
+            "score": 0.0,
+            "steps_analyzed": 0,
+        }
+
+
+async def evolve_all_policies(
+    policy_ids: List[str],
+    policy_dir: Path,
+    trajectory_dir: Path,
+    max_workers: int = None,
+) -> List[Dict[str, Any]]:
+    """Evolve N policies in parallel using a process pool."""
+    if not policy_ids:
+        return []
+    workers = max_workers or min(os.cpu_count() or 1, len(policy_ids))
+    args_list = [(pid, str(policy_dir), str(trajectory_dir)) for pid in policy_ids]
+    loop = asyncio.get_event_loop()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futs = [loop.run_in_executor(pool, _evolve_worker, a) for a in args_list]
+        results = await asyncio.gather(*futs, return_exceptions=True)
+    return [
+        r if not isinstance(r, Exception)
+        else {"policy_id": args_list[i][0], "action": "error", "error": str(r)}
+        for i, r in enumerate(results)
+    ]

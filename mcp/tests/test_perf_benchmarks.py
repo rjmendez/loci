@@ -203,3 +203,30 @@ def test_benchmark_jsonl_read_warm(benchmark, jsonl_file, monkeypatch):
     _inv_store_mod._read_jsonl(jsonl_file)  # prime cache
     result = benchmark(_inv_store_mod._read_jsonl, jsonl_file)
     assert len(result) == 500
+
+
+# ---------------------------------------------------------------------------
+# TrajectoryScorer benchmarks (scalar vs vectorized)
+# ---------------------------------------------------------------------------
+
+_BENCH_STEPS = [
+    {
+        "reward": {
+            "r_ret": 1.0, "r_mem": 0.5, "r_ovp": -0.1,
+            "r_bkp": -0.1, "r_ref": 0.0, "r_step": -0.05, "r_cor": 0.9,
+        }
+    }
+    for _ in range(500)
+]
+
+
+def test_benchmark_scorer_scalar(benchmark):
+    from loci.drpg import TrajectoryScorer
+    result = benchmark(TrajectoryScorer()._score_scalar, _BENCH_STEPS)
+    assert result == pytest.approx(1.9, abs=1e-3)
+
+
+def test_benchmark_scorer_vectorized(benchmark):
+    from loci.drpg import TrajectoryScorer
+    result = benchmark(TrajectoryScorer()._score_vectorized, _BENCH_STEPS)
+    assert result == pytest.approx(1.9, abs=1e-3)
