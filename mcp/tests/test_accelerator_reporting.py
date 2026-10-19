@@ -36,8 +36,13 @@ class FakeCupy(types.ModuleType):
 
 @pytest.fixture
 def clock(monkeypatch):
-    for name in _GLOBALS:  # register the originals so teardown restores whatever _detect assigns
-        monkeypatch.setattr(accelerator, name, getattr(accelerator, name))
+    # start from the module's true initial state, not whatever an earlier test in the same process left behind
+    # (in CI another test had already put it on cpu, so this suite saw 'recovered after retry'); monkeypatch restores it
+    fresh = {"_BACKEND": None, "_XP": None, "_REASON": "", "_FALLBACK": False, "_PERMANENT": False,
+             "_RETRY_AT": None, "_RETRY_DELAY_S": accelerator._RETRY_INITIAL_S, "_RETRIES": 0}
+    assert set(fresh) == set(_GLOBALS)
+    for name, value in fresh.items():
+        monkeypatch.setattr(accelerator, name, value)
     now = [1000.0]
     monkeypatch.setattr(accelerator, "_monotonic", lambda: now[0])
     monkeypatch.setattr(accelerator, "_RETRIES", 0)
