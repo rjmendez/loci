@@ -8863,6 +8863,38 @@ def loci_health() -> str:
     except Exception as exc:
         logger.warning("loci_health: latch state probe failed: %r", exc)
 
+    # Silent-degradation surfaces from the 2026-10-19 fail-open audit: the GPU load signal behind load-aware routing,
+    # the cupy/numpy accelerator, and fallbacks that used to hand back a default without a word. Each degraded mode
+    # is a warning (never a status change: all of these are fail-open by design).
+    try:
+        import gpu_load as _gpu_load
+        caps = {"gpu_load": _gpu_load.gpu_load_health()}
+        gl = caps["gpu_load"]
+        if gl.get("gpu_load_signal") != "present":
+            out.setdefault("warnings", []).append(
+                f"GPU load signal {gl.get('gpu_load_signal')}: load-aware model routing is inactive "
+                f"({gl.get('detail') or gl.get('path')})")
+        if "loci.accelerator" in sys.modules:       # importing it runs the cupy probe; only report when something already did
+            from loci.accelerator import accelerator_info as _accel_info
+            caps["accelerator"] = _accel_info()
+            if caps["accelerator"].get("fallback"):
+                out.setdefault("warnings", []).append(
+                    f"accelerator fell back to numpy: {caps['accelerator'].get('reason')} "
+                    f"({caps['accelerator'].get('retries')} retries)")
+        from loci import model_selector as _model_selector
+        from loci import policy as _policy
+        caps["pool_lookup_failures"] = _model_selector.pool_failure_counts()
+        caps["policy_degraded"] = _policy.policy_degraded_counts()
+        if caps["pool_lookup_failures"]:
+            out.setdefault("warnings", []).append(
+                f"model pool lookups failed {caps['pool_lookup_failures']}: tier candidates fell back to the policy map")
+        if caps["policy_degraded"]:
+            out.setdefault("warnings", []).append(
+                f"tier policy ran degraded {caps['policy_degraded']} (unparseable tier map or failing pool)")
+        out["capabilities"] = caps
+    except Exception as exc:
+        logger.warning("loci_health: capabilities probe failed: %r", exc)
+
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
         import qdrant_ops
