@@ -2,7 +2,8 @@
 
 Resident-only exploration (2026-10-06) only tries models Ollama already holds, because a cold load takes 25-70 s and
 queues every other request behind it. Something has to keep a second model resident for it to try; this is that,
-and it refuses a model that has no home card or that would not fit the card beside what is already there.
+and it refuses a model that would not fit beside what is already there. A pinned model (``gpu = n``) is budgeted against
+that card's static ``gpu_vram_gb``; an unpinned one (the default) against the VRAM that is free right now.
 """
 import sys
 from pathlib import Path
@@ -32,9 +33,10 @@ def entry(name, gpu=1, vram=5.0, warm=True, roles=("gen",)):
     return M.PoolEntry(name, roles, vram_gb=vram, gpu=gpu, warm=warm)
 
 
-def plan(pool, resident=(), inv=None, cards=None, held=()):
+def plan(pool, resident=(), inv=None, cards=None, held=(), free=None):
     return M.warm_plan(pool=pool, resident=set(resident), inv=INV if inv is None else inv,
-                       gpu_gb=CARDS if cards is None else cards, held_out=set(held))
+                       gpu_gb=CARDS if cards is None else cards, held_out=set(held),
+                       free_gb={} if free is None else free)
 
 
 def by(rows):
@@ -82,9 +84,46 @@ class TestWarmPlan:
     def test_a_model_held_out_by_a_lease_is_skipped(self):
         assert by(plan([entry("a")], held={"a"})) == {"a": ("skip", "evicted by an active lease")}
 
-    def test_a_model_with_no_home_card_is_never_warmed(self):
-        action, why = by(plan([entry("a", gpu=None)]))["a"]
-        assert action == "skip" and why.startswith("no home gpu")
+    def test_an_unpinned_model_is_planned_against_the_vram_free_right_now(self):
+        # no home card: the card with the most free VRAM must have the model plus headroom free
+        assert plan([entry("a", gpu=None, vram=5.0)], free={0: 2.7, 1: 7.5}) == [
+            {"model": "a", "gpu": None, "action": "load",
+             "why": "needs 5 GB (+1 headroom); card 1 has 7.5 GB free"}]
+
+    def test_an_unpinned_model_that_fits_no_card_is_skipped_with_the_best_figure(self):
+        assert by(plan([entry("a", gpu=None, vram=5.0)], free={0: 2.7, 1: 5.9})) == {
+            "a": ("skip", "5 GB (+1 GB headroom) does not fit: the card with the most free VRAM is 1 with 5.9 GB")}
+
+    def test_the_headroom_boundary_is_inclusive_for_an_unpinned_model(self):
+        assert by(plan([entry("a", gpu=None, vram=5.0)], free={0: 6.0}))["a"][0] == "load"
+        assert by(plan([entry("a", gpu=None, vram=5.0)], free={0: 5.99}))["a"][0] == "skip"
+
+    def test_unpinned_loads_are_charged_to_the_card_ollama_would_use(self):
+        # two 5 GB models, cards with 7.5 and 7 GB free: the first goes to card 1 (most free), leaving 2.5, so the
+        # second needs card 0 (7 >= 6) - not card 1 again
+        rows = plan([entry("a", gpu=None, vram=5.0), entry("b", gpu=None, vram=5.0)], free={0: 7.0, 1: 7.5})
+        assert [(r["model"], r["action"]) for r in rows] == [("a", "load"), ("b", "load")]
+        assert rows[0]["why"].endswith("card 1 has 7.5 GB free") and rows[1]["why"].endswith("card 0 has 7.0 GB free")
+        third = plan([entry(n, gpu=None, vram=5.0) for n in ("a", "b", "c")], free={0: 7.0, 1: 7.5})
+        assert [r["action"] for r in third] == ["load", "load", "skip"]
+
+    def test_unreadable_free_vram_means_not_loaded_blind(self):
+        assert by(plan([entry("a", gpu=None)], free={})) == {"a": ("skip", "free VRAM could not be read, so it is not loaded blind")}
+
+    def test_the_static_budget_is_not_used_for_an_unpinned_model(self):
+        # card 1 is "budgeted" at 11 GB, but only 3 GB is really free right now: the live figure decides
+        assert by(plan([entry("a", gpu=None, vram=5.0)], cards={1: 11.0}, free={1: 3.0}))["a"][0] == "skip"
+
+    def test_a_pinned_model_still_ignores_the_live_figure(self):
+        assert by(plan([entry("a", gpu=1, vram=5.0)], free={1: 0.5}))["a"][0] == "load"
+
+    def test_free_vram_is_read_once_per_plan_and_only_when_an_unpinned_model_needs_it(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(M, "gpu_free_gb", lambda: calls.append(1) or {0: 8.0})
+        M.warm_plan(pool=[entry("a", gpu=1), entry("b", gpu=1)], resident=set(), inv=INV, gpu_gb=CARDS, held_out=set())
+        assert calls == []
+        M.warm_plan(pool=[entry("a", gpu=None), entry("b", gpu=None)], resident=set(), inv=INV, gpu_gb=CARDS, held_out=set())
+        assert calls == [1]
 
     def test_a_model_with_no_vram_figure_or_no_card_budget_is_skipped(self):
         assert by(plan([entry("a", vram=None)])) == {"a": ("skip", "no vram_gb to budget with")}
@@ -142,8 +181,16 @@ class TestWarmRun:
         assert loaded == [] and rows[0]["action"] == "load" and "loaded" not in rows[0]
 
     def test_a_skipped_model_is_not_loaded(self, monkeypatch):
-        rows, loaded = self._run(monkeypatch, [entry("a", gpu=None)])
+        rows, loaded = self._run(monkeypatch, [entry("zzz")])                 # not installed
         assert loaded == [] and rows[0]["action"] == "skip" and "loaded" not in rows[0]
+
+    def test_an_unpinned_model_is_loaded_when_a_card_has_room_and_not_otherwise(self, monkeypatch):
+        monkeypatch.setattr(M, "gpu_free_gb", lambda: {0: 8.0})
+        rows, loaded = self._run(monkeypatch, [entry("a", gpu=None, vram=5.0)])
+        assert loaded == [("http://ollama", "a", "2h")] and rows[0]["loaded"] is True
+        monkeypatch.setattr(M, "gpu_free_gb", lambda: {0: 3.0})
+        rows, loaded = self._run(monkeypatch, [entry("a", gpu=None, vram=5.0)])
+        assert loaded == [] and rows[0]["action"] == "skip"
 
     def test_a_failed_load_is_reported(self, monkeypatch):
         self._run(monkeypatch, [entry("a")])
@@ -164,3 +211,32 @@ class TestCli:
         monkeypatch.setattr(M, "warm", lambda dry_run=False: [])
         assert M._main(["warm"]) == 0
         assert "no pool entry has warm = true" in capsys.readouterr().out
+
+
+class TestGpuFreeGb:
+    def run(self, monkeypatch, stdout=None, exc=None):
+        import types
+
+        def fake(cmd, **kw):
+            assert cmd == ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]
+            if exc:
+                raise exc
+            return types.SimpleNamespace(stdout=stdout)
+        monkeypatch.setattr("subprocess.run", fake)
+        return M.gpu_free_gb()
+
+    def test_parses_mib_to_gb_per_card(self, monkeypatch):
+        assert self.run(monkeypatch, "0, 7677\n1, 2733\n") == {0: 7677 / 1024, 1: 2733 / 1024}
+
+    def test_crlf_and_unreadable_rows(self, monkeypatch):
+        assert self.run(monkeypatch, "0, 7677\r\n1, [N/A]\r\nx\r\n") == {0: 7677 / 1024}
+
+    @pytest.mark.parametrize("exc", [FileNotFoundError("nvidia-smi"), RuntimeError("driver")])
+    def test_a_failure_is_none_and_logged(self, monkeypatch, caplog, exc):
+        import logging
+        with caplog.at_level(logging.WARNING):
+            assert self.run(monkeypatch, exc=exc) is None
+        assert any("could not read free VRAM from nvidia-smi" in r.getMessage() for r in caplog.records)
+
+    def test_no_rows_is_none(self, monkeypatch):
+        assert self.run(monkeypatch, "\n") is None
