@@ -13,10 +13,15 @@ import os
 import threading
 from typing import Optional
 
+from retry_latch import RetryLatch
+
 logger = logging.getLogger("loci-mcp")
 
 _verdict_backend = None                # QdrantBackend for loci_verdicts (pre_answer_check)
-_verdict_backend_failed = False        # permanent-failure sentinel — don't retry
+# Transient failures (a Qdrant timeout, an HTTP blip) retry after 30 s, 60 s ... capped at 10 min; only an
+# ImportError or a VerdictDimensionMismatch (the collection is not the vector contract) is permanent.
+_verdict_latch = RetryLatch("verdict_backend", base_s=30.0, cap_s=600.0, log=logger)
+_verdict_backend_failed = False        # True only while the latch is PERMANENTLY failed (mirrors the latch)
 _verdict_backend_lock = threading.Lock()  # guards _verdict_backend lazy-init (#106)
 
 
@@ -40,6 +45,8 @@ def _get_verdict_backend():
         qdrant_url = os.environ.get("QDRANT_URL", "")
         if not qdrant_url:
             return None
+        if not _verdict_latch.allow():      # still inside the backoff window after a transient failure
+            return None
         try:
             from memcheck.qdrant import QdrantBackend
             from memcheck.vectors import COLLECTION, VECTOR_NAME, ensure_collection, hash_embed
@@ -53,11 +60,22 @@ def _get_verdict_backend():
                 embed=hash_embed,
                 vector_name=VECTOR_NAME,
             )
+            _verdict_latch.success()
             return _verdict_backend
         except Exception as exc:
-            logger.debug("Verdict backend unavailable: %s", exc)
-            _verdict_backend_failed = True
+            # VerdictDimensionMismatch is a real incompatibility (retrying cannot fix it); the vectors
+            # module may itself be unimportable, in which case the ImportError is permanent anyway.
+            mismatch = any(c.__name__ == "VerdictDimensionMismatch" for c in type(exc).__mro__)
+            if _verdict_latch.failure(exc, permanent=True if mismatch else None):
+                _verdict_backend_failed = True
             return None
+
+
+def verdict_backend_health() -> dict:
+    """Verdict-backend state for loci_health: the retry latch plus whether the backend is built. Never builds it."""
+    out = _verdict_latch.state()
+    out["loaded"] = _verdict_backend is not None
+    return out
 
 
 def _record_claim_verdicts(
