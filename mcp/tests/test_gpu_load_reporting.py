@@ -269,3 +269,38 @@ def test_sidecar_failure_warning_is_first_then_every_sixtieth(caplog):
         f"GPU load signal not updated ({k} consecutive failed polls): no GPU rows from nvidia-smi"
         for k in (1, 60, 120)
     ]
+
+
+# ---- pinned by independent mutation runs: the exact staleness boundary and the llm_local reader's log-once rule ----
+
+def test_a_signal_exactly_at_the_age_limit_is_fresh_and_just_over_it_is_stale(monkeypatch, tmp_path):
+    path = tmp_path / "gpu.json"
+    path.write_text(json.dumps({"timestamp": 1000.0, "gpus": [
+        {"index": 0, "name": "RTX", "util_pct": 55.0, "vram_used_mb": 1000, "vram_total_mb": 12000}]}), encoding="utf-8")
+    monkeypatch.setenv("LOCI_GPU_LOAD_PATH", str(path))
+    assert gpu_load._SIGNAL_MAX_AGE_S == 30.0
+    monkeypatch.setattr(gpu_load.time, "time", lambda: 1029.999)
+    assert gpu_load.read_gpu_load() is not None and gpu_load._status["state"] == "ok"      # positive twin
+    monkeypatch.setattr(gpu_load.time, "time", lambda: 1030.0)
+    assert gpu_load.read_gpu_load() is not None                                            # exactly 30 s: still fresh
+    monkeypatch.setattr(gpu_load.time, "time", lambda: 1030.5)
+    assert gpu_load.read_gpu_load() is None and gpu_load._status["state"] == "stale"
+
+
+def test_llm_local_reports_an_unusable_load_reader_once_and_counts_every_call(monkeypatch, caplog):
+    import llm_local
+
+    def broken():
+        raise RuntimeError("nvml gone")
+    monkeypatch.setattr(gpu_load, "read_gpu_load", broken)
+    monkeypatch.setattr(llm_local, "_gpu_load_unavailable", 0)
+    with caplog.at_level(logging.WARNING, logger=llm_local._LOG.name):
+        assert llm_local._read_gpu_load() is None
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1       # on the FIRST failure, not later
+        assert llm_local._read_gpu_load() is None
+        assert llm_local._read_gpu_load() is None
+    assert llm_local._gpu_load_unavailable == 3
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warns == ["GPU load reader unavailable (RuntimeError('nvml gone')): load-aware routing is inactive until it imports"]
+    monkeypatch.setattr(gpu_load, "read_gpu_load", lambda: "fine")                         # twin: a working reader is untouched
+    assert llm_local._read_gpu_load() == "fine" and llm_local._gpu_load_unavailable == 3
