@@ -21,7 +21,7 @@ def register(mcp_server):
     ) -> str:
         """Make a governed LiteLLM proxy call with tier-based model routing."""
         tier_enum = PolicyTier(tier) if tier else PolicyTier.MEDIUM
-        decision = downgrade_model_to_tier(model, tier_enum)
+        decision = downgrade_model_to_tier(model, tier_enum, pool=False)   # name only models the proxy serves (LOCI_TIER_MODEL_MAP)
         resolved_model, was_rewritten = decision
         if getattr(decision, "tier_unresolved", False) and not decision.usable_model:
             return json.dumps({
