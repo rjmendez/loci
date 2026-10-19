@@ -21,8 +21,10 @@ Start is refused, with these exact codes (first failing check wins, in this orde
     governor_unavailable  governor_level  concurrency_limit  run_count_limit  run_count_unknown
     cwd_is_home  disk_free_low  repo_untracked_limit  worktree_failed  job_failed  containment_failed
 
-Stop codes of a run: ``completed`` ``exit_nonzero`` ``wall_limit`` ``turn_limit`` ``deadman`` plus the
-S11 codes. Progress for the deadman is transcript GROWTH plus child CPU delta, never file mtimes: a loop
+Stop codes of a run: ``completed`` ``exit_nonzero`` ``wall_limit`` ``turn_limit`` ``deadman``, and from the
+S11 containment monitor ``worktree_budget`` ``disk_floor`` ``governor_l4`` ``monitor_blind`` plus the audit
+codes ``protected_path`` ``persistence_change`` ``persistence_unknown`` ``sandbox_violation`` ``diff_budget``.
+Path rules are DETECTION, not prevention, until the restricted-token test passes (docs/agentd.md). Progress for the deadman is transcript GROWTH plus child CPU delta, never file mtimes: a loop
 that touches files proves nothing.
 
 Everything that touches the OS is injected: clocks, the governor level, git, the untracked-file counter,
@@ -44,6 +46,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
 
+from loci import agentd_audit as audit
 from loci import vitals
 
 FLAG_ENV = "LOCI_AGENTD"
@@ -80,6 +83,8 @@ DISK_FREE_LOW = "disk_free_low"
 REPO_UNTRACKED_LIMIT = "repo_untracked_limit"
 WORKTREE_FAILED = "worktree_failed"
 CONTAINMENT_FAILED = "containment_failed"
+WORKTREES_TOTAL_BUDGET = "worktrees_total_budget"
+AUDIT_SETUP_FAILED = "audit_setup_failed"
 JOB_FAILED = "job_failed"
 
 # stop codes
@@ -88,6 +93,16 @@ EXIT_NONZERO = "exit_nonzero"
 WALL_LIMIT = "wall_limit"
 TURN_LIMIT = "turn_limit"
 DEADMAN = "deadman"
+WORKTREE_BUDGET = "worktree_budget"
+DISK_FLOOR = "disk_floor"
+GOVERNOR_L4 = "governor_l4"
+MONITOR_BLIND = "monitor_blind"
+
+MONITOR_INTERVAL_S = 30.0
+WORKTREE_CAP_BYTES = 3 * GIB
+WORKTREES_TOTAL_CAP_BYTES = 6 * GIB
+FLOOR_FREE_GB = 8.0
+BLIND_TICKS_TO_KILL = 3
 
 
 class GitResult(NamedTuple):
@@ -305,6 +320,10 @@ class AgentdConfig:
     max_untracked: int = MAX_UNTRACKED_FILES
     runs_per_day: int = MAX_RUNS_PER_DAY
     deadman_s: float = DEADMAN_S
+    monitor_interval_s: float = MONITOR_INTERVAL_S
+    worktree_cap_bytes: int = WORKTREE_CAP_BYTES
+    worktrees_total_cap_bytes: int = WORKTREES_TOTAL_CAP_BYTES
+    floor_free_gb: float = FLOOR_FREE_GB
 
 
 @dataclass
@@ -324,6 +343,9 @@ class Run:
     stop_code: Optional[str] = None
     finalized: bool = False
     summary: Optional[dict] = None
+    baseline: Any = None
+    last_monitor: float = 0.0
+    blind_ticks: int = 0
 
 
 class Agentd:
@@ -343,6 +365,9 @@ class Agentd:
         dir_size_reader: Callable[[Any], int] = dir_size,
         store: Optional[RunStore] = None,
         containment: Any = None,
+        auditor: Optional[audit.RunAuditor] = None,
+        commit_reader: Callable[[], float] = vitals.default_commit_reader,
+        audit_sink: Optional[Callable[[str], None]] = None,
         id_factory: Callable[[], str] = lambda: uuid.uuid4().hex[:12],
     ):
         self.config = config
@@ -358,6 +383,9 @@ class Agentd:
         self._dir_size = dir_size_reader
         self.store = store
         self._containment = containment
+        self._auditor = auditor
+        self._commit_reader = commit_reader
+        self._audit_sink = audit_sink
         self._new_id = id_factory
         self._lock = threading.Lock()
         self._active: dict = {}
@@ -365,6 +393,7 @@ class Agentd:
         self._seeded: set = set()
         self._refusals: Counter = Counter()
         self._stops: Counter = Counter()
+        self._degraded: Counter = Counter()   # things agentd could not read or check: REPORTED, never silent
         self.leaks = 0
 
     # -- reporting
@@ -375,6 +404,8 @@ class Agentd:
             "refusals": dict(self._refusals),
             "stops": dict(self._stops),
             "leaks": self.leaks,
+            "degraded": dict(self._degraded),
+            "path_rules": audit.PATH_RULES_MODE,
             "store_dropped": self.store.dropped if self.store else 0,
             "store_corrupt_lines": self.store.corrupt_lines if self.store else 0,
         }
@@ -438,6 +469,9 @@ class Agentd:
         free = self._free_gb(cfg.worktrees_root)
         if free < cfg.min_free_gb:
             raise StartRefused(DISK_FREE_LOW, f"{free:.2f} GB free, need {cfg.min_free_gb:g}")
+        total = self._dir_size(cfg.worktrees_root)
+        if total > cfg.worktrees_total_cap_bytes:
+            raise StartRefused(WORKTREES_TOTAL_BUDGET, f"worktrees hold {total} bytes, cap {cfg.worktrees_total_cap_bytes}")
         try:
             untracked = self._count_untracked(repo, cfg.max_untracked)
         except Exception as exc:
@@ -468,7 +502,13 @@ class Agentd:
             raise StartRefused(WORKTREE_FAILED, f"git worktree add failed: {made.err.strip()[:200]}")
         job = self._job_factory()
         spawner = None
+        baseline = None
         try:
+            if self._auditor is not None:
+                try:
+                    baseline = self._auditor.begin(worktree, base_sha)
+                except Exception as exc:
+                    raise StartRefused(AUDIT_SETUP_FAILED, f"{type(exc).__name__}: {exc}") from exc
             if req.mode == "rw":
                 try:
                     self._containment.prepare(worktree)
@@ -490,7 +530,7 @@ class Agentd:
         probe = FileProbe(req.transcript_path, job.cpu_seconds)
         run = Run(run_id=run_id, backend=req.backend, mode=req.mode, worktree=worktree, base_sha=base_sha, job=job,
                   wall_s=wall, turns_limit=turns, started=now, started_wall=wall_now,
-                  progress=ProgressTracker(now, probe, self.config.deadman_s))
+                  progress=ProgressTracker(now, probe, self.config.deadman_s), baseline=baseline, last_monitor=now)
         self._active[run_id] = run
         self._starts[day] = self._starts.get(day, 0) + 1
         self._record({"event": "start", "run_id": run_id, "backend": req.backend, "mode": req.mode,
@@ -545,7 +585,90 @@ class Agentd:
         if run.progress.expired(now):
             self.kill_run(run, DEADMAN)
             return DEADMAN
+        if now - run.last_monitor >= self.config.monitor_interval_s:
+            run.last_monitor = now
+            return self._monitor(run)
         return None
+
+    def _monitor(self, run: Run) -> Optional[str]:
+        """The 30 s loop. Reads commit charge and volume free space ITSELF, so a dead vitals sampler cannot
+        blind it; also honours the sampler's level when there is one. Kills keep the worktree (and its diff)."""
+        cfg = self.config
+        sampler_level: Optional[int] = None
+        try:
+            sampler_level = self._level()
+        except StartRefused:
+            self._degraded["sampler_dead"] += 1
+        commit = disk = None
+        try:
+            commit = float(self._commit_reader())
+        except Exception:
+            self._degraded["commit_read_error"] += 1
+        try:
+            disk = float(self._free_gb(cfg.worktrees_root))
+        except Exception:
+            self._degraded["disk_read_error"] += 1
+        own_level = vitals.level_for(vitals.Readings(commit, 0, 0, disk)) if (commit, disk) != (None, None) else 0
+        if max(own_level, sampler_level or 0) >= vitals.MAX_LEVEL:
+            self.kill_run(run, GOVERNOR_L4)
+            return GOVERNOR_L4
+        if disk is not None and disk < cfg.floor_free_gb:
+            self.kill_run(run, DISK_FLOOR)
+            return DISK_FLOOR
+        try:
+            size = self._dir_size(run.worktree)
+        except OSError:
+            size = None
+            self._degraded["worktree_size_error"] += 1
+        if size is not None and size > cfg.worktree_cap_bytes:
+            self.kill_run(run, WORKTREE_BUDGET)
+            return WORKTREE_BUDGET
+        if sampler_level is None and commit is None and disk is None:
+            run.blind_ticks += 1
+            if run.blind_ticks >= BLIND_TICKS_TO_KILL:
+                self.kill_run(run, MONITOR_BLIND)
+                return MONITOR_BLIND
+        else:
+            run.blind_ticks = 0
+        if self._auditor is not None and run.baseline is not None:
+            hit = self._auditor.quick_check(run.baseline)
+            if hit is not None:
+                self._audit_entry(run, hit)
+                self.kill_run(run, hit.code)
+                return hit.code
+        return None
+
+    def report_write(self, run: Run, path: Any) -> None:
+        """A write the agent made (from a tool hook or a permission log). A write outside the worktree fails
+        the run: the run is killed with the violation's code and :class:`audit.SandboxViolation` is raised."""
+        protected = self._auditor.protected if self._auditor is not None else ()
+        try:
+            audit.check_write(path, run.worktree, protected)
+        except audit.SandboxViolation as violation:
+            self._audit_entry(run, audit.Violation(violation.code, str(violation)))
+            self.kill_run(run, violation.code)
+            raise
+
+    def _audit_entry(self, run: Run, violation: audit.Violation) -> None:
+        if self._audit_sink is None:
+            return
+        try:
+            self._audit_sink(audit.audit_entry(run.run_id, violation, self._wall()))
+        except OSError:
+            self._degraded["audit_write_error"] += 1
+
+    def _final_audit(self, run: Run) -> Optional[audit.AuditReport]:
+        if self._auditor is None or run.baseline is None:
+            return None
+        try:
+            result = self._auditor.final_check(run.baseline)
+        except Exception as exc:  # an audit that cannot run is reported as a violation, never as a pass
+            result = audit.AuditReport([audit.Violation(audit.CODE_DIFF, f"audit failed: {type(exc).__name__}: {exc}"[:300])])
+        for violation in result.violations:
+            self._audit_entry(run, violation)
+        for note in result.degraded:
+            self._degraded[note.split(":")[0]] += 1
+        return result
 
     def supervise(self, run: Run, sleep: Callable[[float], None] = time.sleep,
                   interval: float = SUPERVISE_INTERVAL_S) -> dict:
@@ -565,6 +688,12 @@ class Agentd:
         if stop is None:
             stop = COMPLETED if exit_code == 0 else EXIT_NONZERO
             self._stops[stop] += 1
+        audit_report = self._final_audit(run)
+        override = audit_report.top_code if audit_report is not None else None
+        runtime_stop = stop
+        if override is not None:
+            stop = override   # a containment violation outranks how the run happened to end
+            self._stops[stop] += 1
         if run.mode == "rw" and self._containment is not None:
             self._release_containment(run.worktree)
         wall = self._clock() - run.started
@@ -572,6 +701,10 @@ class Agentd:
                    "wall_s": round(wall, 3), "turns": run.turns, "stop_code": stop, "leak": report.leak,
                    "survivors": report.survivors, "day": self._day_of(run.started_wall),
                    "ts": round(self._wall(), 3), "worktree_kept": True}
+        if audit_report is not None:
+            summary["violations"] = list(dict.fromkeys(v.code for v in audit_report.violations))
+            if override is not None:
+                summary["runtime_stop"] = runtime_stop
         run.summary = summary
         run.finalized = True
         self._active.pop(run.run_id, None)

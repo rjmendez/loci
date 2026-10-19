@@ -65,3 +65,56 @@ real CLIs and an account) and its result must be recorded in the PR before rollo
 
 Unset `LOCI_AGENTD` (Hermes returns to its previous launch path; rehearse once first). `paused` halts delegation
 without a restart. Discard worktrees by hand with `git worktree remove` once their diffs are reviewed.
+
+## Containment (S11)
+
+Code: `loci/agentd_audit.py`, `loci/agentd_token_win.py`, and the monitor in `loci/agentd.py`.
+
+**Path rules are DETECTION, not prevention.** The protected-path list (`~/.loci`, `~/.ssh`, `~/.claude`, `~/.hermes`,
+`F:/services`, which holds the LiteLLM directory) is checked by comparing file fingerprints (size, mtime, SHA-256 of
+files up to 64 KiB) before and after each run, by a stat check of `~/.loci/envelope.toml` on every monitor tick, and by
+`Agentd.report_write` when a tool hook reports a write. All of that notices a write after it happened; none of it stops
+one. The restricted-token test has NOT passed: it has not been written or run, because creating a token or an ACL is a
+live change to the machine. Until a real-Windows test shows a child under the restricted token getting access denied on
+`~/.loci/envelope.toml` and the audit directory, rw delegation stays OFF (`AgentdConfig.rw_enabled=False`, and an rw run
+also needs a per-run `rw_flag` and a containment object) and this section keeps saying DETECTION. Hermes' own config
+directory is assumed to be `~/.hermes`; add others with `default_protected_paths(home, extra=...)`.
+
+### The 30 s monitor
+
+Every `monitor_interval_s` (30 s) `Agentd.tick` runs, for each live run:
+
+| check | kill when | stop code |
+|---|---|---|
+| governor level (the vitals heartbeat, if readable) or agentd's own commit-charge reading | level 4 (commit >= 94 %) | `governor_l4` |
+| free space of the worktrees volume, read by agentd itself | < 8 GB | `disk_floor` |
+| size of the run's worktree | > 3 GiB | `worktree_budget` |
+| nothing readable (sampler, commit, disk all fail) for 3 ticks in a row | | `monitor_blind` |
+| `~/.loci/envelope.toml` fingerprint | changed or deleted | `protected_path` |
+
+agentd reads commit charge and disk itself, so a dead vitals sampler does not blind it; the dead sampler is counted in
+`stats()["degraded"]["sampler_dead"]`. A killed run keeps its worktree, so its diff is preserved. New runs are refused
+(`worktrees_total_budget`) when the worktrees root already holds more than 6 GiB.
+
+### After the run
+
+`final_check` re-fingerprints the protected paths, re-lists scheduled tasks, services, Run keys and the startup folders,
+and measures the diff against the base commit. Codes, highest first: `protected_path`, `persistence_change` (a listing
+differs in either direction), `persistence_unknown` (a listing could not be taken: fail closed), `sandbox_violation`,
+`diff_budget` (more than 2,000 changed lines, 40 files, or a binary over 1 MiB). The highest-ranked violation becomes the
+run's `stop_code`; how the run ended is kept as `runtime_stop`. Audit entries are one JSON line of at most 1 KiB. Anything
+the audit could not check (truncated snapshot, no listers, walk errors) is counted in `stats()["degraded"]`.
+
+### Restricted token (not exercised)
+
+`RestrictedTokenContainment` implements the plan in decision 3 against an injected `TokenOsApi`: an explicit DENY ACE for
+`S-1-5-12` on every existing protected path, an ALLOW ACE for it on the run's worktree, and a restricted token (privileges
+stripped, user SID and Administrators deny-only, restricting SIDs Everyone, Users, RESTRICTED). The ACEs are reference
+counted across concurrent runs and removed with the last one; a failure half way removes what was added. It is unit
+tested with a recording fake only. `Win32TokenApi` (ctypes and `icacls`) has never been run. Rollout gate: the owner
+decides between the restricted token, a dedicated account and AppContainer before rw delegation is on by default, chaos
+tests pass, and a 7-day observe-mode process census sets the final `ActiveProcessLimit`.
+
+### Rollback
+
+Revert to S10 behaviour (omit the auditor and containment arguments): detection stops, rw delegation stays off.
