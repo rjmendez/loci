@@ -129,21 +129,37 @@ def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     This is the policy map only; the model pool's local pick is added by
     ``loci.model_selector.candidates`` (see ``resolve_model_for_tier``).
     """
-    override = os.getenv("LOCI_TIER_MODEL_MAP")
-    if override:
-        try:
-            data = json.loads(override)
-            result = {}
-            for k, v in data.items():
-                try:
-                    result[PolicyTier(k)] = v
-                except ValueError:
-                    pass  # unknown tier key — ignore silently
-            if result:
-                return result
-        except (json.JSONDecodeError, ValueError):
-            pass  # fall through to default
-    return TIER_MODEL_MAP
+    return _parse_tier_map(os.getenv("LOCI_TIER_MODEL_MAP")) or TIER_MODEL_MAP
+
+
+#: A tier map for callers that talk to the LiteLLM proxy (litellm_call): its values are the proxy's own model group
+#: names. A separate variable, because LOCI_TIER_MODEL_MAP also feeds every other tier lookup (pool candidates,
+#: swarm stages) and changing it to group names would change those too.
+PROXY_TIER_MAP_ENV = "LOCI_LITELLM_TIER_MAP"
+
+
+def _parse_tier_map(raw: Optional[str]) -> Optional[Dict[PolicyTier, List[str]]]:
+    """A JSON tier→models map as a dict keyed by PolicyTier, or None when *raw* is unset, unparseable or names no
+    valid tier. Unknown tier keys are ignored; the tiers present are the only ones returned (no merge)."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        result = {}
+        for k, v in data.items():
+            try:
+                result[PolicyTier(k)] = v
+            except ValueError:
+                pass  # unknown tier key — ignore silently
+        return result or None
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return None
+
+
+def get_proxy_tier_model_map() -> Dict[PolicyTier, List[str]]:
+    """The tier→model map for calls through the LiteLLM proxy: LOCI_LITELLM_TIER_MAP when it parses, else the
+    ordinary map (``get_tier_model_map``)."""
+    return _parse_tier_map(os.getenv(PROXY_TIER_MAP_ENV)) or get_tier_model_map()
 
 
 def _tier_candidates(tier: PolicyTier) -> List[str]:
@@ -158,7 +174,7 @@ def _tier_candidates(tier: PolicyTier) -> List[str]:
 def _candidates(tier: PolicyTier, pool: bool) -> List[str]:
     """Candidates for *tier*: with *pool* the pool's local pick leads (see ``_tier_candidates``); without it
     only the policy map's entries, which a caller that must name proxy aliases sets through LOCI_TIER_MODEL_MAP."""
-    return _tier_candidates(tier) if pool else list(get_tier_model_map().get(tier, []))
+    return _tier_candidates(tier) if pool else list(get_proxy_tier_model_map().get(tier, []))
 
 
 def resolve_model_for_tier(
@@ -259,15 +275,15 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier, *, pool: boo
 
     ``pool=False`` leaves the model pool out: candidates are only the tier map's entries and a request is
     judged only against the map, never against the pool's local pick. litellm_call uses it so that a rewrite
-    names a model the LiteLLM proxy serves (LOCI_TIER_MODEL_MAP lists the proxy's group names), not an Ollama
-    model the pool prefers.
+    names a model the LiteLLM proxy serves (LOCI_LITELLM_TIER_MAP lists the proxy's group names, falling back to
+    LOCI_TIER_MODEL_MAP), not an Ollama model the pool prefers.
     """
     if not isinstance(tier, PolicyTier):
         try:
             tier = PolicyTier(tier)
         except ValueError:
             return DowngradeResult(_cheapest_allowed(tier, pool), True, True)
-    tier_map = get_tier_model_map()
+    tier_map = get_tier_model_map() if pool else get_proxy_tier_model_map()
     allowed = _candidates(tier, pool)
 
     requested_tier = None
