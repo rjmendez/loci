@@ -245,7 +245,7 @@ def test_health_never_raises(monkeypatch):
 def _fake_torch(monkeypatch, cuda, version):
     torch = types.ModuleType("torch")
     torch.__version__ = version
-    torch.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+    torch.cuda = types.SimpleNamespace(is_available=lambda: cuda, device_count=lambda: 1 if cuda else 0, get_device_name=lambda i: "Fake GPU %d" % i, mem_get_info=lambda i: (8 << 30, 11 << 30), empty_cache=lambda: None)
     st = types.ModuleType("sentence_transformers")
     created = []
 
@@ -259,7 +259,10 @@ def _fake_torch(monkeypatch, cuda, version):
     monkeypatch.setattr(R, "_model_name", None)
     monkeypatch.setattr(R, "_device", None)
     monkeypatch.setattr(R, "_torch_build", None)
+    monkeypatch.setattr(R, "_placement", {})
     monkeypatch.delenv("RERANK_HTTP_URL", raising=False)
+    monkeypatch.delenv("LOCI_RERANK_DEVICE", raising=False)
+    monkeypatch.delenv("LOCI_RERANK_MIN_FREE_MB", raising=False)
     monkeypatch.setenv("RERANK_MODEL", "some/reranker")
     return created
 
@@ -275,7 +278,7 @@ def test_loading_on_a_cpu_only_torch_records_cpu_and_the_build(monkeypatch):
 def test_loading_with_cuda_records_cuda(monkeypatch):
     created = _fake_torch(monkeypatch, cuda=True, version="2.11.0+cu128")
     assert R._get_model() is not None
-    assert created == [("some/reranker", 512, "cuda")]
+    assert created == [("some/reranker", 512, "cuda:0")]
     h = R.health()
     assert (h["state"], h["device"], h["torch"]) == ("loaded", "cuda", "2.11.0+cu128")
 

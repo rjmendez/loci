@@ -71,12 +71,15 @@ def rr(monkeypatch):
     clock = Clock()
     torch = types.ModuleType("torch")
     torch.__version__ = "2.11.0+cu128"
-    torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+    torch.cuda = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 1, get_device_name=lambda i: "Fake GPU %d" % i, mem_get_info=lambda i: (8 << 30, 11 << 30), empty_cache=lambda: None)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setattr(R, "_model", None)
     monkeypatch.setattr(R, "_model_name", None)
     monkeypatch.setattr(R, "_device", None)
     monkeypatch.setattr(R, "_torch_build", None)
+    monkeypatch.setattr(R, "_placement", {})
+    monkeypatch.delenv("LOCI_RERANK_DEVICE", raising=False)
+    monkeypatch.delenv("LOCI_RERANK_MIN_FREE_MB", raising=False)
     monkeypatch.setattr(R, "_latch", RetryLatch("reranker", base_s=30.0, cap_s=600.0, clock=clock,
                                                 wall=lambda: 1_700_000_000.0))
     monkeypatch.delenv("RERANK_HTTP_URL", raising=False)
@@ -95,8 +98,10 @@ def test_a_transient_load_failure_retries_at_the_backoff_and_recovers(rr, caplog
     enc = rr.install([OSError("not enough memory"), None])
     with caplog.at_level(logging.WARNING, logger="loci-mcp"):
         assert R._get_model() is None
-    assert enc.created == [("some/reranker", "cuda")]
-    assert _warnings(caplog) == ["reranker failed (attempt 1), retrying in 30s: OSError: not enough memory"]
+    assert enc.created == [("some/reranker", "cuda:0")]
+    assert _warnings(caplog) == [
+        "Reranker could not load some/reranker on cuda:0 (Fake GPU 0, 8192 MiB free at the time): OSError: not enough memory",
+        "reranker failed (attempt 1), retrying in 30s: OSError: not enough memory"]
     lat = R.health()["latch"]
     assert (lat["ok"], lat["permanent"], lat["attempts"], lat["last_error"], lat["next_retry_in_s"]) == (
         False, False, 1, "OSError: not enough memory", 30.0)
@@ -193,7 +198,7 @@ def test_a_healthy_dependency_loads_once_and_reports_ok(rr):
     m1 = R._get_model()
     m2 = R._get_model()
     assert m1 is m2 and m1 is not None
-    assert enc.created == [("some/reranker", "cuda")]
+    assert enc.created == [("some/reranker", "cuda:0")]
     h = R.health()
     assert (h["state"], h["device"], h["latch"]["ok"], h["latch"]["failures_total"]) == ("loaded", "cuda", True, 0)
 
