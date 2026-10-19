@@ -87,11 +87,19 @@ def _lease_inflight(model: str):
 
 def _read_gpu_load():
     """Read the shared GPU load signal without raising."""
+    global _gpu_load_unavailable
     try:
         from gpu_load import read_gpu_load as _rgl
         return _rgl()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - fail open, but reported (no retry latch: every call re-imports)
+        _gpu_load_unavailable += 1
+        if _gpu_load_unavailable == 1:
+            _LOG.warning("GPU load reader unavailable (%r): load-aware routing is inactive until it imports", exc)
         return None
+
+
+#: Number of generate() calls that found the GPU load reader itself unusable (import/runtime failure).
+_gpu_load_unavailable = 0
 
 
 def _deadline_s() -> float:
