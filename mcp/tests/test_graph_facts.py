@@ -86,6 +86,7 @@ def test_find_graph_looks_where_the_server_actually_writes(tmp_path, monkeypatch
     legacy = home / ".hermes" / "memory-sessions" / "graph.ladybug"
     legacy.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))   # Path.home() reads this on Windows
     monkeypatch.delenv("LOCI_MEMORY_DIR", raising=False)
     monkeypatch.delenv("HERMES_MEMORY_DIR", raising=False)
 
@@ -120,6 +121,7 @@ def test_find_graph_finds_a_fresh_install_under_dot_loci(tmp_path, monkeypatch):
     graph = home / ".loci" / "memory-sessions" / "graph.ladybug"
     graph.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))   # Path.home() reads this on Windows
     monkeypatch.delenv("LOCI_MEMORY_DIR", raising=False)
     monkeypatch.delenv("HERMES_MEMORY_DIR", raising=False)
 

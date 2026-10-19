@@ -369,9 +369,9 @@ def _get_ladybug(backfill: bool = True):
             if not ks.available():
                 # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
-                _ladybug_note_failure("store open failed (lock contention or transient IO)")
-                logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
-                               "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
+                why = getattr(ks, "last_open_error", "") or _kz._DLL_SETUP_ERROR or "lock contention or transient IO"
+                _ladybug_note_failure(f"store cannot open a database: {why}")
+                logger.warning("LadybugDB store unavailable (%s) — will retry after %ss.", why, _LADYBUG_RETRY_SECONDS)
                 return None
             _ladybug_store = ks
             _ladybug_last_attempt = 0.0
