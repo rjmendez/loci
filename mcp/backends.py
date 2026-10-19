@@ -33,9 +33,12 @@ import functools
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
+
+from retry_latch import RetryLatch
 
 logger = logging.getLogger("loci-mcp.backends")
 
@@ -166,16 +169,23 @@ def _http_status(url: str, path: str = "", timeout: float = 1.0,
 _SIZE_UNITS = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
 
 
-@functools.lru_cache(maxsize=1)
-def _ollama_list() -> dict[str, "int | None"]:
-    """Best-effort local Ollama inventory: tag -> size in bytes (None if unparsed). Never raises."""
-    try:
-        p = subprocess.run(["ollama", "list"], capture_output=True, text=True,
-                           timeout=_OLLAMA_LIST_TIMEOUT, check=False)
-    except Exception:
-        return {}
+# `ollama list` result cache. A SUCCESSFUL listing is kept for _OLLAMA_LIST_TTL_S; a FAILED one is never
+# cached as an empty inventory (that once made ollama_gen_model() fall to the 3B fallback for the whole
+# process life): the next call inside the short backoff window returns {} without spawning, and after it
+# the listing is retried. Failures log at WARNING (rate-limited) and are visible through ollama_list_health().
+_OLLAMA_LIST_TTL_S = float(os.environ.get("LOCI_OLLAMA_LIST_TTL_S", "300"))
+_ollama_list_latch = RetryLatch("ollama_list", base_s=5.0, cap_s=60.0, permanent_types=())
+_ollama_list_lock = threading.Lock()
+_ollama_list_cache: "tuple[float, dict[str, int | None]] | None" = None   # (monotonic stamp, inventory)
+_ollama_list_clock = time.monotonic
+
+
+def _ollama_list_run() -> dict[str, "int | None"]:
+    """One `ollama list`. Raises on any failure (missing binary, timeout, non-zero exit)."""
+    p = subprocess.run(["ollama", "list"], capture_output=True, text=True,
+                       timeout=_OLLAMA_LIST_TIMEOUT, check=False)
     if p.returncode != 0:
-        return {}
+        raise RuntimeError(f"ollama list exited {p.returncode}: {(p.stderr or '').strip()[:120]}")
     models: dict[str, "int | None"] = {}
     for line in (p.stdout or "").splitlines():
         s = line.strip()
@@ -193,9 +203,45 @@ def _ollama_list() -> dict[str, "int | None"]:
     return models
 
 
-@functools.lru_cache(maxsize=1)
+def _ollama_list() -> dict[str, "int | None"]:
+    """Best-effort local Ollama inventory: tag -> size in bytes (None if unparsed). Never raises.
+
+    Returns {} while `ollama list` is failing, but never remembers that as the answer."""
+    global _ollama_list_cache
+    with _ollama_list_lock:
+        now = _ollama_list_clock()
+        cached = _ollama_list_cache
+        if cached is not None and now - cached[0] < _OLLAMA_LIST_TTL_S:
+            return dict(cached[1])
+        if not _ollama_list_latch.allow():
+            return {}
+        try:
+            models = _ollama_list_run()
+        except Exception as exc:
+            _ollama_list_latch.failure(exc)
+            return {}
+        _ollama_list_latch.success()
+        _ollama_list_cache = (now, models)
+        return dict(models)
+
+
+def _ollama_list_cache_clear() -> None:
+    global _ollama_list_cache
+    with _ollama_list_lock:
+        _ollama_list_cache = None
+    _ollama_list_latch.reset()
+
+
+_ollama_list.cache_clear = _ollama_list_cache_clear   # type: ignore[attr-defined]  # _reset_cache() contract
+
+
+def ollama_list_health() -> dict:
+    """State of the `ollama list` probe for loci_health: ok / last_error / next_retry_in_s."""
+    return _ollama_list_latch.state()
+
+
 def _ollama_local_tags() -> set[str]:
-    """Best-effort local Ollama tag inventory. Never raises."""
+    """Best-effort local Ollama tag inventory. Never raises. Not cached on its own (it would pin a failure)."""
     return set(_ollama_list())
 
 
