@@ -8837,6 +8837,32 @@ def loci_health() -> str:
     except Exception as exc:
         logger.debug("loci_health: reranker probe failed: %r", exc)
 
+    # Lazy singletons that retry after a transient failure: show which are failing now, why, and when the next
+    # attempt is due (a permanent one needs a code or environment fix, not a wait).
+    try:
+        import backends as _backends
+        import qdrant_ops as _qops_latch
+        import verdict_ops as _verdict_ops
+        latches = {
+            "reranker": (out.get("reranker") or {}).get("latch"),
+            "sparse_embedder": _qops_latch.sparse_health(),
+            "verdict_backend": _verdict_ops.verdict_backend_health(),
+            "ollama_list": _backends.ollama_list_health(),
+        }
+        out["latches"] = latches
+        for lname, lst in latches.items():
+            if not lst or lst.get("ok"):
+                continue
+            if lst.get("permanent"):
+                out.setdefault("warnings", []).append(
+                    f"{lname} unavailable permanently: {lst.get('last_error')} (needs a fix, not a wait)")
+            else:
+                out.setdefault("warnings", []).append(
+                    f"{lname} failing ({lst.get('attempts')} attempt(s) since {lst.get('since')}): "
+                    f"{lst.get('last_error')}; next retry in {lst.get('next_retry_in_s')}s")
+    except Exception as exc:
+        logger.warning("loci_health: latch state probe failed: %r", exc)
+
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
         import qdrant_ops

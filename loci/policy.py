@@ -14,6 +14,7 @@ Provides:
 10. validate_policy(): constraint checking
 """
 
+import logging
 import math
 import os
 import random
@@ -29,6 +30,8 @@ import json
 import tomllib
 
 from loci.mtime_cache import MtimeCache
+
+logger = logging.getLogger("loci.policy")
 
 # ---------------------------------------------------------------------------
 # Module-level mtime-keyed policy cache
@@ -129,7 +132,7 @@ def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
     This is the policy map only; the model pool's local pick is added by
     ``loci.model_selector.candidates`` (see ``resolve_model_for_tier``).
     """
-    return _parse_tier_map(os.getenv("LOCI_TIER_MODEL_MAP")) or TIER_MODEL_MAP
+    return _parse_tier_map(os.getenv("LOCI_TIER_MODEL_MAP"), "LOCI_TIER_MODEL_MAP") or TIER_MODEL_MAP
 
 
 #: A tier map for callers that talk to the LiteLLM proxy (litellm_call): its values are the proxy's own model group
@@ -138,9 +141,31 @@ def get_tier_model_map() -> Dict[PolicyTier, List[str]]:
 PROXY_TIER_MAP_ENV = "LOCI_LITELLM_TIER_MAP"
 
 
-def _parse_tier_map(raw: Optional[str]) -> Optional[Dict[PolicyTier, List[str]]]:
+#: Degraded-mode counters (tier-map env unparseable, model_selector unimportable), keyed by reason; read through
+#: ``policy_degraded_counts()``. Each distinct (reason, detail) is also logged once at WARNING.
+_DEGRADED: Dict[str, int] = {}
+_DEGRADED_SEEN: set = set()
+
+
+def _note_degraded(reason: str, detail: str, message: str) -> None:
+    """Count one degraded-mode event under *reason*; log *message* at WARNING the first time this (reason,
+    detail) is seen, so a malformed env read on every call is one log line and a rising counter."""
+    _DEGRADED[reason] = _DEGRADED.get(reason, 0) + 1
+    key = (reason, detail)
+    if key not in _DEGRADED_SEEN:
+        _DEGRADED_SEEN.add(key)
+        logger.warning("%s", message)
+
+
+def policy_degraded_counts() -> Dict[str, int]:
+    """Copy of the degraded-mode counters: reason -> events since process start."""
+    return dict(_DEGRADED)
+
+
+def _parse_tier_map(raw: Optional[str], source: str = "tier map") -> Optional[Dict[PolicyTier, List[str]]]:
     """A JSON tier→models map as a dict keyed by PolicyTier, or None when *raw* is unset, unparseable or names no
-    valid tier. Unknown tier keys are ignored; the tiers present are the only ones returned (no merge)."""
+    valid tier. Unknown tier keys are ignored; the tiers present are the only ones returned (no merge).
+    An unparseable or tier-less *raw* is reported (counter + one WARNING naming *source*) before None is returned."""
     if not raw:
         return None
     try:
@@ -151,22 +176,35 @@ def _parse_tier_map(raw: Optional[str]) -> Optional[Dict[PolicyTier, List[str]]]
                 result[PolicyTier(k)] = v
             except ValueError:
                 pass  # unknown tier key — ignore silently
-        return result or None
-    except (json.JSONDecodeError, ValueError, AttributeError):
+    except (json.JSONDecodeError, ValueError, AttributeError) as exc:
+        _note_degraded(
+            f"{source}_unparseable", raw,
+            f"{source} is not a JSON object of tier -> models ({exc!r}); ignoring it and using the built-in "
+            f"fallback map. Value: {raw[:200]!r}",
+        )
         return None
+    if not result:
+        _note_degraded(
+            f"{source}_no_valid_tier", raw,
+            f"{source} names no valid tier ({sorted(data)!r}); ignoring it and using the built-in fallback map.",
+        )
+        return None
+    return result
 
 
 def get_proxy_tier_model_map() -> Dict[PolicyTier, List[str]]:
     """The tier→model map for calls through the LiteLLM proxy: LOCI_LITELLM_TIER_MAP when it parses, else the
     ordinary map (``get_tier_model_map``)."""
-    return _parse_tier_map(os.getenv(PROXY_TIER_MAP_ENV)) or get_tier_model_map()
+    return _parse_tier_map(os.getenv(PROXY_TIER_MAP_ENV), PROXY_TIER_MAP_ENV) or get_tier_model_map()
 
 
 def _tier_candidates(tier: PolicyTier) -> List[str]:
     """The model pool's local pick for *tier* (when a pool serves it) followed by the policy map's entries."""
     try:
         from loci.model_selector import candidates
-    except ImportError:
+    except ImportError as exc:
+        _note_degraded("model_selector_unimportable", repr(exc),
+                       f"loci.model_selector is not importable ({exc!r}); tier candidates are the policy map only")
         return list(get_tier_model_map().get(tier, []))
     return candidates(tier.value)
 

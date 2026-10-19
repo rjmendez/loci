@@ -64,12 +64,30 @@ def prefer_local_default() -> bool:
     return os.getenv("LOCI_TIER_PREFER_LOCAL", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+#: Pool lookups that raised or could not run, keyed by role (read through ``pool_failure_counts()``); each distinct
+#: (role, exception) is logged once at WARNING, an unimportable ``model_pool`` once at INFO (the expected state in
+#: the LiteLLM proxy process, which has no ``mcp/`` on its path).
+_POOL_FAILURES: dict = {}
+_POOL_FAILURES_SEEN: set = set()
+
+
+def pool_failure_counts() -> dict:
+    """Copy of the pool-lookup failure counters: role -> failures since process start."""
+    return dict(_POOL_FAILURES)
+
+
 def _pool_best(role: str) -> str:
     try:
         import model_pool
         return model_pool.rank_role(role).chosen or ""
-    except Exception as exc:  # noqa: BLE001 - fail-open to the policy map
-        logger.debug("model pool lookup for role %r failed: %r", role, exc)
+    except Exception as exc:  # noqa: BLE001 - fail-open to the policy map, but reported
+        _POOL_FAILURES[role] = _POOL_FAILURES.get(role, 0) + 1
+        key = (role, repr(exc))
+        if key not in _POOL_FAILURES_SEEN:
+            _POOL_FAILURES_SEEN.add(key)
+            level = logging.INFO if isinstance(exc, ImportError) else logging.WARNING
+            logger.log(level, "model pool lookup for role %r failed: %r; candidates fall back to the policy map",
+                       role, exc)
         return ""
 
 

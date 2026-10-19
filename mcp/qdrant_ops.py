@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from inv_store import _CONFIDENCE_RANK
+from retry_latch import RetryLatch
 
 logger = logging.getLogger("loci-mcp")
 
@@ -32,6 +33,8 @@ VECTOR_DIM = int(os.environ.get("MNEMOSYNE_EMBEDDING_DIM", 768))
 # --- Lazy singletons / fail-open latches ---
 _sparse_model = None
 _sparse_model_lock = threading.Lock()          # guards _sparse_model lazy-init (#106)
+# None = not yet tried, False = the last load failed (_sparse_latch decides when to retry), else the model.
+_sparse_latch = RetryLatch("sparse_embedder", base_s=60.0, cap_s=600.0)
 _qdrant_client: tuple | None = None    # (QdrantClient, collection_name) singleton
 _qdrant_failed_at: float | None = None  # monotonic timestamp of last connection failure
 _QDRANT_RETRY_SECONDS = 60             # backoff before retrying after a transient failure
@@ -77,6 +80,7 @@ _HEALTH_WINDOW_S = 900.0
 _health_events = {
     "embed": collections.deque(maxlen=200),
     "index_write": collections.deque(maxlen=200),
+    "sparse": collections.deque(maxlen=200),
 }
 
 
@@ -246,17 +250,38 @@ def _query_points_with_retry(call, *, attempts: int, op: str = "qdrant_query"):
 
 
 def _get_sparse_embedder():
+    """The BM25 sparse embedder, or None while unavailable.
+
+    A load failure is NOT latched for the life of the process: a transient one (HF Hub blip during the
+    model download, a cache-dir permission error) retries after an exponential backoff (60 s, 120 s ...
+    capped at 10 min), like _get_qdrant. Only ImportError (fastembed absent) is permanent. Each failure
+    is a WARNING and counted in _health_note('sparse'); sparse_health() exposes the state to loci_health.
+    """
     global _sparse_model
-    if _sparse_model is None:
-        with _sparse_model_lock:
-            if _sparse_model is None:
-                try:
-                    from fastembed import SparseTextEmbedding
-                    _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
-                except Exception as exc:
-                    logger.warning("SparseTextEmbedding unavailable: %s", exc)
-                    _sparse_model = False
-    return _sparse_model if _sparse_model is not False else None
+    model = _sparse_model
+    if model is not None and model is not False:
+        return model
+    with _sparse_model_lock:
+        if _sparse_model is not None and _sparse_model is not False:
+            return _sparse_model
+        if not _sparse_latch.allow():
+            return None
+        try:
+            from fastembed import SparseTextEmbedding
+            _sparse_model = SparseTextEmbedding("Qdrant/bm25", language="english", avg_len=200, disable_stemmer=True)
+        except Exception as exc:
+            _sparse_model = False
+            _sparse_latch.failure(exc)
+            return None
+        _sparse_latch.success()
+        return _sparse_model
+
+
+def sparse_health() -> dict:
+    """Sparse-embedder state for loci_health: the retry latch plus whether a model is loaded. Never loads it."""
+    out = _sparse_latch.state()
+    out["loaded"] = _sparse_model is not None and _sparse_model is not False
+    return out
 
 
 def _get_cross_encoder():
@@ -280,7 +305,8 @@ def _get_cross_encoder():
 
 
 def _embed_sparse(text: str):
-    """Returns a SparseVector or None."""
+    """Returns a SparseVector or None. None means this call has no sparse vector: it is counted in
+    _health_note('sparse') and logged at WARNING (rate-limited), never silently."""
     cached = _embed_sparse_cache.get(text)
     if cached is not None:
         try:
@@ -290,6 +316,10 @@ def _embed_sparse(text: str):
             logger.debug("_embed_sparse: fail-open swallow: %r", exc)
     model = _get_sparse_embedder()
     if model is None:
+        _health_note("sparse", False)
+        _sparse_latch.warn("unavailable", "sparse embedder unavailable: hybrid search is dense-only and "
+                           "points are written without a sparse vector (%s)",
+                           _sparse_latch.state()["last_error"] or "not loaded")
         return None
     try:
         from qdrant_client.models import SparseVector
@@ -300,9 +330,12 @@ def _embed_sparse(text: str):
             if len(_embed_sparse_cache) >= _EMBED_CACHE_MAXSIZE:
                 _embed_sparse_cache.pop(next(iter(_embed_sparse_cache)))
             _embed_sparse_cache[text] = (tuple(indices), tuple(values))
+        _health_note("sparse", True)
         return SparseVector(indices=indices, values=values)
     except Exception as exc:
-        logger.debug("sparse embed failed: %s", exc)
+        _health_note("sparse", False)
+        _sparse_latch.warn("embed", "sparse embed failed (%s: %s); this call is dense-only",
+                           type(exc).__name__, str(exc)[:200])
         return None
 
 
@@ -662,6 +695,9 @@ def _qdrant_upsert(point_id: str, text: str, payload: dict) -> bool:
         _health_note("index_write", False)
         return False
     sparse_vec = _embed_sparse(text)
+    if sparse_vec is None and "sparse" not in payload:
+        # Permanent gap in the store: mark the point so it can be found and re-embedded later.
+        payload = {**payload, "sparse": False}
     # Stamp multi-tenancy fields if not already set by the caller.
     _agent_id  = os.environ.get("HERMES_AGENT_ID", "")
     _namespace = os.environ.get("LOCI_NAMESPACE", "")
