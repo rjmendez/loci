@@ -155,6 +155,12 @@ def _tier_candidates(tier: PolicyTier) -> List[str]:
     return candidates(tier.value)
 
 
+def _candidates(tier: PolicyTier, pool: bool) -> List[str]:
+    """Candidates for *tier*: with *pool* the pool's local pick leads (see ``_tier_candidates``); without it
+    only the policy map's entries, which a caller that must name proxy aliases sets through LOCI_TIER_MODEL_MAP."""
+    return _tier_candidates(tier) if pool else list(get_tier_model_map().get(tier, []))
+
+
 def resolve_model_for_tier(
     tier: PolicyTier,
     available: Optional[List[str]] = None,
@@ -216,7 +222,7 @@ class DowngradeResult(tuple):
         return "" if self.tier_unresolved and not self.was_rewritten else self.model
 
 
-def _cheapest_allowed(tier: Any) -> str:
+def _cheapest_allowed(tier: Any, pool: bool = True) -> str:
     """The first candidate of the cheapest tier that has one, among tiers at or below *tier*; "" if none.
 
     An unknown *tier* (not a PolicyTier) has no known ceiling, so the whole ladder is searched
@@ -226,13 +232,13 @@ def _cheapest_allowed(tier: Any) -> str:
     for candidate_tier in sorted(_TIER_ORDER, key=lambda t: _TIER_ORDER[t]):
         if _TIER_ORDER[candidate_tier] > ceiling:
             break
-        models = _tier_candidates(candidate_tier)
+        models = _candidates(candidate_tier, pool)
         if models:
             return models[0]
     return ""
 
 
-def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> DowngradeResult:
+def downgrade_model_to_tier(requested_model: str, tier: PolicyTier, *, pool: bool = True) -> DowngradeResult:
     """
     Given a requested model and a tier constraint, return (resolved_model, was_rewritten).
 
@@ -250,21 +256,26 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Downgrade
     The ZERO tier is the one exception to the pair: it still returns ``(requested_model, False)``,
     because mcp/tests/test_model_selector.py pins that, but with ``tier_unresolved`` True and
     ``usable_model`` "" -- callers must use ``usable_model`` (tier_router_surface and litellm_call do).
+
+    ``pool=False`` leaves the model pool out: candidates are only the tier map's entries and a request is
+    judged only against the map, never against the pool's local pick. litellm_call uses it so that a rewrite
+    names a model the LiteLLM proxy serves (LOCI_TIER_MODEL_MAP lists the proxy's group names), not an Ollama
+    model the pool prefers.
     """
     if not isinstance(tier, PolicyTier):
         try:
             tier = PolicyTier(tier)
         except ValueError:
-            return DowngradeResult(_cheapest_allowed(tier), True, True)
+            return DowngradeResult(_cheapest_allowed(tier, pool), True, True)
     tier_map = get_tier_model_map()
-    allowed = _tier_candidates(tier)
+    allowed = _candidates(tier, pool)
 
     requested_tier = None
     for t, models in tier_map.items():
         if requested_model in models:
             requested_tier = t
             break
-    if requested_tier is None:
+    if requested_tier is None and pool:
         try:
             from loci.model_selector import local_model
         except ImportError:
@@ -285,7 +296,7 @@ def downgrade_model_to_tier(requested_model: str, tier: PolicyTier) -> Downgrade
         # test (mcp/tests/test_model_selector.py) pins it; tier_unresolved=True and usable_model == ""
         # tell callers that the request must not be called.
         return DowngradeResult(requested_model, False, True)
-    return DowngradeResult(_cheapest_allowed(tier), True, True)
+    return DowngradeResult(_cheapest_allowed(tier, pool), True, True)
 
 
 # ---------------------------------------------------------------------------
