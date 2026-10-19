@@ -599,3 +599,17 @@ def test_loci_health_is_quiet_when_every_latch_is_healthy(rr, sp, ol, vb):
     assert sorted(out["latches"]) == ["ollama_list", "reranker", "sparse_embedder", "verdict_backend"]
     assert all(v["ok"] for v in out["latches"].values())
     assert not any("failing" in w or "unavailable permanently" in w for w in out.get("warnings", []))
+
+
+# ---------------------------------------------------------------- the production configuration itself
+
+def test_the_production_latches_carry_the_documented_schedules():
+    # every fixture above swaps in a latch with a fake clock and the same numbers, so the schedules actually shipped at each
+    # site need their own assertion (a mutation of any of them passed the whole file)
+    cfg = lambda l: (l.base_s, l.cap_s, l.factor, l.permanent_types)           # noqa: E731
+    assert cfg(R._latch) == (30.0, 600.0, 2.0, (ImportError,))
+    assert cfg(Q._sparse_latch) == (60.0, 600.0, 2.0, (ImportError,))
+    assert cfg(V._verdict_latch) == (30.0, 600.0, 2.0, (ImportError,))         # a dimension mismatch is made permanent explicitly
+    assert cfg(B._ollama_list_latch) == (5.0, 60.0, 2.0, ())                   # an inventory outage is never permanent
+    assert [l.name for l in (R._latch, Q._sparse_latch, V._verdict_latch, B._ollama_list_latch)] == [
+        "reranker", "sparse_embedder", "verdict_backend", "ollama_list"]
