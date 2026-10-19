@@ -8820,6 +8820,23 @@ def loci_health() -> str:
         logger.warning("loci_health: degradation assessment failed: %r", exc)
         out.setdefault("warnings", []).append(f"degradation assessment failed, status may be too optimistic: {exc!r}")
 
+    # Which device the reranker runs on and how often its budget cut a search short. A CPU-only torch wheel on a GPU host
+    # once made every rag_context_search take minutes with nothing reporting it.
+    try:
+        import reranker as _reranker
+        rr = _reranker.health()
+        out["reranker"] = rr
+        if rr.get("device") == "cpu":
+            out.setdefault("warnings", []).append(
+                f"reranker {rr.get('model')} runs on CPU (torch {rr.get('torch')}): searches are cut short by "
+                f"LOCI_RERANK_BUDGET_S={rr.get('budget_s')}; install a CUDA torch build or set RERANK_HTTP_URL")
+        if rr.get("degraded_searches"):
+            out.setdefault("warnings", []).append(
+                f"reranker budget cut {rr['degraded_searches']} of {rr.get('searches')} searches short "
+                f"(last: {rr.get('last_reason')}, {rr.get('last_seconds')}s)")
+    except Exception as exc:
+        logger.debug("loci_health: reranker probe failed: %r", exc)
+
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
         import qdrant_ops
@@ -8987,15 +9004,25 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
     ce = _get_cross_encoder()
     if ce is None or len(results) <= 1:
         return
-    try:
-        # Same budget as qdrant_ops._ce_rerank: 512 chars scored below using no reranker at all on a 1,048-char median finding.
-        pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS])
-                 for r in results[:20]]
-        for r, sc in zip(results[:20], ce.predict(pairs)):
-            r['final_ce_score'] = round(float(sc), 4)
-        results[:20] = sorted(results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)
-    except Exception as exc:
-        logger.debug('Final CE re-pass failed: %s', exc)
+    import reranker as _reranker
+    with _reranker.search_budget() as budget:
+        try:
+            top = results[:20]
+            # Same budget as qdrant_ops._ce_rerank: 512 chars scored below using no reranker at all on a 1,048-char median finding.
+            pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS]) for r in top]
+            scores = _reranker.score_pairs(ce, pairs, budget, final=True)
+        except Exception as exc:
+            logger.debug('Final CE re-pass failed: %s', exc)
+            _reranker.mark_error(budget, exc)
+            return
+    scored = [(r, sc) for r, sc in zip(top, scores) if sc is not None]
+    if not scored:
+        return
+    for r, sc in scored:
+        r['final_ce_score'] = round(sc, 4)
+    # Rows the budget left unscored keep their order behind the scored ones.
+    results[:20] = (sorted((r for r, _ in scored), key=lambda r: r.get('final_ce_score', -999), reverse=True)
+                    + [r for r, sc in zip(top, scores) if sc is None])
 
 
 _SUPERSEDED_MARK = "[superseded: a later finding replaced this; do not rely on it] "
@@ -9137,29 +9164,32 @@ def rag_context_search(
         from qdrant_client.models import Filter, FieldCondition, MatchAny
         _agent_filter = Filter(must_not=[FieldCondition(key="type", match=MatchAny(any=exclude_types))])
 
-    # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
-    all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
+    # One rerank budget covers every cross-encoder call of this search (per-candidate passes and the final one).
+    import reranker as _reranker
+    with _reranker.search_budget() as _rerank_budget:
+        # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
+        all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
-    # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
-    # before ranking, access tracking and assembly; mark superseded ones.
-    _rfilter = build_recall_filter(
-        MEMORY_DIR,
-        {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
-        with_superseded=True,
-    )
-    all_results, _rag_excluded = _rfilter.split(all_results)
-    # ACL: hits from investigations the caller may not read never reach the context.
-    all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
+        # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
+        # before ranking, access tracking and assembly; mark superseded ones.
+        _rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
+            with_superseded=True,
+        )
+        all_results, _rag_excluded = _rfilter.split(all_results)
+        # ACL: hits from investigations the caller may not read never reach the context.
+        all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
 
-    # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
-    if decay:
-        _rag_apply_decay(all_results)
+        # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
+        if decay:
+            _rag_apply_decay(all_results)
 
-    # Merge-sort by score descending across all collections
-    all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        # Merge-sort by score descending across all collections
+        all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
 
-    # Final cross-encoder re-pass for consistent cross-collection ranking
-    _rag_cross_encode(all_results, query)
+        # Final cross-encoder re-pass for consistent cross-collection ranking
+        _rag_cross_encode(all_results, query)
 
     # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
@@ -9190,6 +9220,12 @@ def rag_context_search(
         ctx["query_expansion"] = expansion_info
     if errors:
         ctx["collection_errors"] = errors
+    # Say so when reranking was cut short: the ordering is then partly bi-encoder, not cross-encoder.
+    # (absent when no cross-encoder ran, so a search without one keeps its response shape).
+    if _rerank_budget.scored or _rerank_budget.skipped or _rerank_budget.degraded:
+        ctx["rerank"] = _rerank_budget.summary()
+    if _rerank_budget.degraded:
+        ctx["rerank_degraded"] = True
     return json.dumps(ctx, indent=2)
 
 

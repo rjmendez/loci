@@ -731,24 +731,35 @@ def _quant_search_params():
 def _ce_rerank(query: str, rows: list[dict], top_k: int) -> tuple[list[dict], bool]:
     """Cross-encoder rerank of ``rows`` against ``query``, truncated to ``top_k``.
 
-    Returns ``(rows, True)`` only when the cross-encoder scored every row and the
-    sort completed.  Returns ``(rows, False)`` — original bi-encoder order, still
-    truncated to ``top_k`` — when the cross-encoder is unavailable or scoring
-    raised, so the return count is consistent whether CE is installed or not.
+    Returns ``(rows, True)`` when the cross-encoder scored the rows and the sort
+    completed.  Returns ``(rows, False)`` — original bi-encoder order, still
+    truncated to ``top_k`` — when the cross-encoder is unavailable, scoring raised,
+    or the search's rerank budget (``reranker.RerankBudget``: LOCI_RERANK_BUDGET_S,
+    LOCI_RERANK_MAX_PAIRS) was already spent, so the return count is consistent
+    whether CE is installed or not.
+
+    When the budget runs out part-way the rows scored so far are sorted by ``ce_score``
+    and the unscored remainder follows in its original bi-encoder order (still
+    ``True``; the shared budget records the search as degraded).
     """
     ce = _get_cross_encoder()
     if ce is not None and rows:
-        try:
-            pairs = [(query, str(r.get("text", ""))[:RERANK_MAX_CHARS]) for r in rows]
-            ce_scores = ce.predict(pairs)
-            for row, ce_score in zip(rows, ce_scores):
-                row["ce_score"] = round(float(ce_score), 4)
-            return sorted(rows, key=lambda r: r.get("ce_score", 0.0), reverse=True)[:top_k], True
-        except Exception as exc:
-            logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
-            # All rows scored or none: strip partial ce_score annotations written before the exception.
-            for row in rows:
-                row.pop("ce_score", None)
+        import reranker
+        with reranker.search_budget() as budget:
+            try:
+                pairs = [(query, str(r.get("text", ""))[:RERANK_MAX_CHARS]) for r in rows]
+                scores = reranker.score_pairs(ce, pairs, budget)
+            except Exception as exc:
+                logger.debug("Cross-encoder reranking failed, using bi-encoder order: %s", exc)
+                reranker.mark_error(budget, exc)
+                return rows[:top_k], False
+        scored = [(row, sc) for row, sc in zip(rows, scores) if sc is not None]
+        if scored:
+            for row, sc in scored:
+                row["ce_score"] = round(sc, 4)
+            unscored = [row for row, sc in zip(rows, scores) if sc is None]
+            ranked = sorted((row for row, _ in scored), key=lambda r: r.get("ce_score", 0.0), reverse=True)
+            return (ranked + unscored)[:top_k], True
     return rows[:top_k], False
 
 
