@@ -7,4 +7,8 @@
 # reason = "why it is off, and what evidence would turn it on"
 # review_by = 2026-11-17
 #
-# Empty today: nothing learned ships default-off yet.
+
+[[flag]]
+name = "learned_genes"
+reason = "S18 bounded evolver: learned gene scales in Policy.config are ignored until the owner removes this entry (needs C11 trajectory rows, S16/S17 passed and a Stage-0 pass); LOCI_LEARNED_GENES=1 alone cannot turn it on"
+review_by = 2026-11-17

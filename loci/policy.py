@@ -14,15 +14,19 @@ Provides:
 10. validate_policy(): constraint checking
 """
 
+import math
 import os
+import random
 import re
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Callable, Mapping, Optional, Dict, List, Any
 import json
+import tomllib
 
 from loci.mtime_cache import MtimeCache
 
@@ -416,6 +420,28 @@ class Policy:
         """Get tier-based constraints for this policy."""
         return self.tier.constraints()
 
+    def get_learned_genes(self) -> Dict[str, float]:
+        """The valid learned gene scales stored in ``config['learned_genes']`` (see ``LEARNED_GENES_KEY``)."""
+        return read_learned_genes(self.config)[0]
+
+    def get_effective_constraints(
+        self,
+        *,
+        environ: Optional[Mapping[str, str]] = None,
+        registry_path: Optional[Path] = None,
+    ) -> Dict[str, int]:
+        """``get_constraints()`` with the learned gene scales applied, ONLY when the learned-genes feature is ON.
+
+        The feature is OFF unless ``LOCI_LEARNED_GENES=1`` AND ``learned_genes`` is not registered default-off
+        in ``scripts/policy_flags.toml`` (see ``learned_feature_on``).  Off, this returns exactly
+        ``get_constraints()``.  On, a limit can only get tighter: never above the tier value, never below 1
+        for a limit the tier allows.  Nothing calls this yet.
+        """
+        base = self.get_constraints()
+        if not learned_feature_on(LEARNED_GENES_FLAG, environ=environ, registry_path=registry_path):
+            return base
+        return apply_genes(base, self.get_learned_genes())
+
     def get_reward_vector_weights(self) -> Dict[str, float]:
         """
         Get 7D reward vector weights based on policy tier and phase.
@@ -610,10 +636,13 @@ class PolicyBackend:
             raise ValueError(f"invalid policy_id: {policy_id!r} (resolves outside the policy directory)")
         return path
     
-    def store(self, policy: Policy) -> Dict[str, Any]:
+    def store(self, policy: Policy, *, writer: Optional[Callable[[Path, bytes], None]] = None) -> Dict[str, Any]:
         """
         Store a policy document.
-        
+
+        ``writer(path, data)`` replaces the plain file write when given (the bounded evolver passes its
+        sandboxed temp+rename writer); the validation, the path check and the cache invalidation are the same.
+
         Returns: {"policy_id": "...", "status": "stored"}
         Raises: ValueError if policy validation fails
         """
@@ -624,8 +653,11 @@ class PolicyBackend:
         
         # Save to file
         policy_file = self._policy_file(policy.policy_id)
-        with open(policy_file, "w", encoding="utf-8") as f:
-            json.dump(policy.to_dict(), f, indent=2)
+        if writer is not None:
+            writer(policy_file, json.dumps(policy.to_dict(), indent=2).encode("utf-8"))
+        else:
+            with open(policy_file, "w", encoding="utf-8") as f:
+                json.dump(policy.to_dict(), f, indent=2)
         
         # Invalidate cache so next load picks up the freshly written file
         _POLICY_CACHE.invalidate(policy.policy_id)
@@ -690,3 +722,205 @@ class PolicyBackend:
             policies.append(policy)
         
         return policies
+
+
+# ---------------------------------------------------------------------------
+# Bounded policy genes (Tripwire-Governor S18)
+# ---------------------------------------------------------------------------
+#
+# A gene is a SCALE in [floor, 1.0] on one tier limit.  1.0 is the safe-side human default: the tier value
+# a person wrote.  The learner may only tighten (move toward the floor), at most 10% per gene per patch, and
+# never past the floor.  There are at most MAX_GENES.  The owner envelope's caps (spend caps, ladder
+# thresholds, kill switches, path denylist) are NOT genes: check_cap_change refuses to widen them.
+# Everything here is pure; nothing is wired to a caller, and the learned values take effect only behind the
+# learned_genes flag (default OFF, registered in scripts/policy_flags.toml).
+
+MAX_GENES = 8
+GENE_STEP_MAX = Fraction(1, 10)          # a patch may tighten a gene by at most 10% of its current value
+LEARNED_GENES_KEY = "learned_genes"      # Policy.config key holding {gene name: scale}
+LEARNED_GENES_FLAG = "learned_genes"     # name in scripts/policy_flags.toml
+LEARNED_GENES_ENV = "LOCI_LEARNED_GENES"  # must be "1" for the genes to take effect
+DEFAULT_FLAG_REGISTRY = Path(__file__).resolve().parents[1] / "scripts" / "policy_flags.toml"
+_DRAW_OVERSHOOT = 0.1                    # exploration overshoots both ends of the log range, then clips to them
+
+
+class GeneBoundsError(ValueError):
+    """A gene name or value is outside what the evolver may produce."""
+
+
+class CapViolation(ValueError):
+    """A change would widen a cap of the owner envelope (or tighten it by more than one step)."""
+
+
+@dataclass(frozen=True)
+class GeneSpec:
+    """One evolvable limit: ``tier_key`` of Policy.get_constraints() scaled by a value in [floor, default]."""
+    name: str
+    tier_key: str
+    floor: float
+    default: float = 1.0
+
+
+GENES: tuple = (
+    GeneSpec("retrieval_hops_scale", "max_retrieval_hops", 0.5),
+    GeneSpec("refinement_steps_scale", "max_refinement_steps", 0.5),
+    GeneSpec("perspectives_scale", "max_perspectives", 0.5),
+    GeneSpec("fanout_scale", "max_fanout", 0.4),
+    GeneSpec("context_chars_scale", "max_context_chars", 0.25),
+)
+GENE_BY_NAME: Dict[str, GeneSpec] = {g.name: g for g in GENES}
+
+
+def validate_gene_set(genes: tuple) -> tuple:
+    """GeneBoundsError unless ``genes`` has 1..MAX_GENES specs with unique names and 0 < floor < default."""
+    if not 0 < len(genes) <= MAX_GENES:
+        raise GeneBoundsError(f"{len(genes)} genes; at most {MAX_GENES} are allowed")
+    if len({g.name for g in genes}) != len(genes):
+        raise GeneBoundsError("gene names must be unique")
+    for g in genes:
+        if not (0.0 < g.floor < g.default):
+            raise GeneBoundsError(f"gene {g.name}: need 0 < floor < default, got floor={g.floor!r} default={g.default!r}")
+    return genes
+
+
+validate_gene_set(GENES)
+
+
+def default_genome() -> Dict[str, float]:
+    """Every gene at its human default (the do-nothing genome)."""
+    return {g.name: g.default for g in GENES}
+
+
+def clamp_gene(name: str, value: float) -> float:
+    """``value`` clipped to [floor, default] of gene ``name``; GeneBoundsError for an unknown gene or non-finite value."""
+    spec = GENE_BY_NAME.get(name)
+    if spec is None:
+        raise GeneBoundsError(f"unknown gene {name!r}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise GeneBoundsError(f"gene {name}: {value!r} is not a finite number")
+    return min(max(float(value), spec.floor), spec.default)
+
+
+def draw_gene(name: str, rng: random.Random) -> float:
+    """One exploratory draw for a gene: log-uniform over [floor, default], overshooting each end by 10% of the
+    log range and then clipped, so the bounds themselves are reachable and never exceeded."""
+    spec = GENE_BY_NAME[name]
+    t = rng.uniform(-_DRAW_OVERSHOOT, 1.0 + _DRAW_OVERSHOOT)
+    value = spec.floor * (spec.default / spec.floor) ** t
+    return min(max(value, spec.floor), spec.default)
+
+
+def draw_genome(rng: random.Random) -> Dict[str, float]:
+    return {g.name: draw_gene(g.name, rng) for g in GENES}
+
+
+def _q(x: Any) -> Fraction:
+    """Exact value of a number as written: 0.9 is 9/10, not its binary neighbour."""
+    return x if isinstance(x, Fraction) else Fraction(str(x))
+
+
+def read_learned_genes(config: Mapping[str, Any]) -> tuple:
+    """``(valid genes, problems)`` from ``config['learned_genes']``.
+
+    An entry that is unknown, not a finite number, or outside [floor, default] is NOT used (the human default
+    applies instead) and is named in ``problems`` so the degradation is reported, not silent.
+    """
+    raw = config.get(LEARNED_GENES_KEY) if isinstance(config, Mapping) else None
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, Mapping):
+        return {}, [f"{LEARNED_GENES_KEY} is not an object"]
+    genes: Dict[str, float] = {}
+    problems: List[str] = []
+    for name, value in raw.items():
+        spec = GENE_BY_NAME.get(name)
+        if spec is None:
+            problems.append(f"unknown gene {name!r}")
+        elif (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+              or not spec.floor <= value <= spec.default):
+            problems.append(f"gene {name}={value!r} outside [{spec.floor}, {spec.default}]")
+        else:
+            genes[name] = float(value)
+    return genes, problems
+
+
+def apply_genes(constraints: Mapping[str, int], genes: Mapping[str, float]) -> Dict[str, int]:
+    """``constraints`` with each gene's scale applied: floor(limit * scale), at least 1 when the limit is positive.
+
+    A gene outside [floor, default] is ignored here as well (defence in depth); the result never exceeds the input.
+    """
+    out = dict(constraints)
+    for name, scale in genes.items():
+        spec = GENE_BY_NAME.get(name)
+        if spec is None or isinstance(scale, bool) or not isinstance(scale, (int, float)) \
+                or not math.isfinite(scale) or not spec.floor <= scale <= spec.default:
+            continue
+        limit = out.get(spec.tier_key)
+        if isinstance(limit, int) and limit > 0:
+            out[spec.tier_key] = max(1, min(limit, math.floor(limit * scale)))
+    return out
+
+
+def check_genome_step(current: Mapping[str, float], proposed: Mapping[str, float]) -> bool:
+    """Validate a patch from ``current`` to ``proposed``; True when it WIDENS at least one gene.
+
+    GeneBoundsError for an unknown gene, a value outside [floor, default], or a tightening of more than
+    10% of the current value.  Genes absent from ``current`` start at their default.
+    """
+    widening = False
+    for name, new in proposed.items():
+        spec = GENE_BY_NAME.get(name)
+        if clamp_gene(name, new) != new:
+            raise GeneBoundsError(f"gene {name}: {new!r} is outside [{spec.floor}, {spec.default}]")
+        old = current.get(name, spec.default)
+        if _q(new) > _q(old):
+            widening = True
+        elif _q(new) < _q(old) * (1 - GENE_STEP_MAX):
+            raise GeneBoundsError(f"gene {name}: {old!r} -> {new!r} tightens by more than {GENE_STEP_MAX * 100}% in one patch")
+    return widening
+
+
+def check_cap_change(caps: Mapping[str, float], proposed: Mapping[str, float]) -> Dict[str, float]:
+    """The owner envelope's caps are not genes.  Return ``proposed`` merged over ``caps`` if every change only
+    tightens (lowers) a cap by at most 10%; CapViolation('... widen ...') for a raise, a new cap, or a cut over 10%.
+    """
+    merged = dict(caps)
+    for name, new in proposed.items():
+        if name not in caps:
+            raise CapViolation(f"cap {name!r} is not in the envelope; the learner cannot add caps")
+        if isinstance(new, bool) or not isinstance(new, (int, float)) or not math.isfinite(new) or new < 0:
+            raise CapViolation(f"cap {name}: {new!r} is not a finite non-negative number")
+        old = caps[name]
+        if _q(new) > _q(old):
+            raise CapViolation(f"cap {name}: {old!r} -> {new!r} would widen the cap; only the owner may widen")
+        if _q(new) < _q(old) * (1 - GENE_STEP_MAX):
+            raise CapViolation(f"cap {name}: {old!r} -> {new!r} tightens by more than {GENE_STEP_MAX * 100}% in one step")
+        merged[name] = new
+    return merged
+
+
+def registered_off(name: str, registry_path: Optional[Path] = None) -> bool:
+    """Is ``name`` registered as a default-off learned flag?  An unreadable or missing registry counts as YES
+    (fail closed): a feature whose switch cannot be read is off."""
+    try:
+        with open(registry_path or DEFAULT_FLAG_REGISTRY, "rb") as fh:
+            flags = tomllib.load(fh).get("flag", [])
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return any(isinstance(f, dict) and f.get("name") == name for f in flags)
+
+
+def learned_feature_on(
+    name: str,
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    registry_path: Optional[Path] = None,
+) -> bool:
+    """A learned feature is ON only when ``LOCI_LEARNED_GENES=1`` is set AND it is not registered default-off.
+    Removing the registry entry is the owner's act; the environment alone cannot turn a registered feature on."""
+    env = os.environ if environ is None else environ
+    if name != LEARNED_GENES_FLAG:
+        return False
+    if env.get(LEARNED_GENES_ENV) != "1":
+        return False
+    return not registered_off(name, registry_path)

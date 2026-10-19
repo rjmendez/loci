@@ -173,10 +173,3 @@ _ = cleanup_target_async
 # scripts/tests/test_issue_proposer.py: fails any test that writes the
 # operator's real queue/dashboard/ledger files instead of its tmp paths.
 _ = _production_files_untouched
-
-# ── scripts/policy_prereg/registry.py ScoredOnceLedger (Tripwire-Governor S15)
-# Public API of the held-out scored-once ledger. The caller is the S16 router
-# evaluation, which does not exist yet; tests/test_prereg_harness.py exercises both.
-# (Module-level names are exported through __all__; vulture does not apply that to methods.)
-_ = record_scoring
-_ = times_scored
