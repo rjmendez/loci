@@ -124,3 +124,40 @@ class TestLitellmCall:
         out, rec = call(model="simple-tier", tier="zero")
         assert rec.models == []
         assert out["error"] == "tier zero allows no model; the requested model was not called"
+
+
+class TestTheProxyHasItsOwnTierMap:
+    """LOCI_LITELLM_TIER_MAP lists the proxy's group names for litellm_call only. LOCI_TIER_MODEL_MAP also feeds every
+    other tier lookup, so changing it to group names would change those; the dedicated variable must not leak."""
+
+    PROXY = {"nano": ["proxy-small"], "light": ["proxy-small"], "standard": ["proxy-mid"], "medium": ["proxy-mid"],
+             "turbo": ["proxy-big"], "heavy": ["proxy-big"], "research": ["proxy-big"]}
+
+    def test_it_wins_for_the_proxy_and_does_not_touch_the_ordinary_map(self, monkeypatch):
+        monkeypatch.setenv("LOCI_LITELLM_TIER_MAP", json.dumps(self.PROXY))
+        from loci.policy import get_proxy_tier_model_map, get_tier_model_map
+        assert get_proxy_tier_model_map()[PolicyTier.LIGHT] == ["proxy-small"]
+        assert get_tier_model_map()[PolicyTier.LIGHT] == ["simple-tier"]          # the ordinary map is unchanged
+        assert downgrade_model_to_tier("proxy-big", PolicyTier.LIGHT, pool=False) == ("proxy-small", True)
+        assert downgrade_model_to_tier("complex-tier", PolicyTier.LIGHT) == (POOL_PICK, True)   # pool=True ignores it
+
+    def test_without_it_the_ordinary_map_is_used(self, monkeypatch):
+        monkeypatch.delenv("LOCI_LITELLM_TIER_MAP", raising=False)
+        assert downgrade_model_to_tier("complex-tier", PolicyTier.LIGHT, pool=False) == ("simple-tier", True)
+
+    @pytest.mark.parametrize("bad", ["not json", "[]", '{"unknown-tier": ["x"]}', "{}", ""])
+    def test_an_unusable_value_falls_back_to_the_ordinary_map(self, monkeypatch, bad):
+        monkeypatch.setenv("LOCI_LITELLM_TIER_MAP", bad)
+        assert downgrade_model_to_tier("complex-tier", PolicyTier.LIGHT, pool=False) == ("simple-tier", True)
+
+    def test_litellm_call_sends_the_proxy_group_name(self, call, monkeypatch):
+        monkeypatch.setenv("LOCI_LITELLM_TIER_MAP", json.dumps(self.PROXY))
+        out, rec = call(model="proxy-big", tier="light")
+        assert rec.models == ["proxy-small"] and out["model_rewritten"] is True
+
+    def test_a_request_is_recognised_by_the_proxy_map_not_the_ordinary_one(self, monkeypatch):
+        monkeypatch.setenv("LOCI_LITELLM_TIER_MAP", json.dumps(self.PROXY))
+        # "proxy-small" exists only in the proxy map, at a tier at or below STANDARD: it stays as asked
+        assert downgrade_model_to_tier("proxy-small", PolicyTier.STANDARD, pool=False) == ("proxy-small", False)
+        # twin: the ordinary lookup has never heard of it and rewrites it
+        assert downgrade_model_to_tier("proxy-small", PolicyTier.STANDARD) == (POOL_PICK, True)
