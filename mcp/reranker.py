@@ -83,6 +83,61 @@ _model_name: Optional[str] = None
 # Set by _get_model, read by health(): a CPU-only torch wheel on a GPU host is otherwise silent.
 _device: Optional[str] = None
 _torch_build: Optional[str] = None
+# Which card the model landed on and why ({"index", "name", "free_mb_at_load", "reason", "cards_seen"}); health() reports it.
+_placement: dict = {}
+
+#: A card must have this much free VRAM to be a candidate (bge-reranker-v2-m3 fp32 weights are ~2.2 GB, plus activations).
+DEFAULT_MIN_FREE_MB = 2600
+
+
+def _device_setting() -> str:
+    """LOCI_RERANK_DEVICE: "auto" (default; the card with the most free VRAM), "cpu", "cuda" (same as auto) or "cuda:N"."""
+    return (os.environ.get("LOCI_RERANK_DEVICE") or "auto").strip().lower() or "auto"
+
+
+def _cuda_cards(torch) -> List[dict]:
+    """Every CUDA card torch can see with its free/total VRAM in MiB, read now. A card whose query fails is reported
+    with free_mb None (never a guess)."""
+    cards = []
+    for i in range(int(torch.cuda.device_count())):
+        card = {"index": i, "name": "", "free_mb": None, "total_mb": None}
+        try:
+            card["name"] = str(torch.cuda.get_device_name(i))
+            free, total = torch.cuda.mem_get_info(i)
+            card["free_mb"], card["total_mb"] = int(free) // (1 << 20), int(total) // (1 << 20)
+        except Exception as exc:  # noqa: BLE001 - one broken card must not hide the others
+            card["error"] = f"{type(exc).__name__}: {exc}"
+        cards.append(card)
+    return cards
+
+
+def choose_devices(cards: List[dict], setting: str, min_free_mb: int) -> tuple:
+    """``(candidates, reason)``: the cards to try, best first, and why. No static pin: ``auto`` ranks by free VRAM at
+    load time, so the model lands wherever there is room (Ollama frees memory by unloading idle models).
+
+    * ``cpu``      -> no candidates (a deliberate choice).
+    * ``cuda:N``   -> that one card, if torch sees it with a readable free figure.
+    * ``auto``/``cuda`` -> every card with at least *min_free_mb* free, most free first.
+    An empty candidate list always carries the reason, so a CPU placement is never unexplained.
+    """
+    if setting == "cpu":
+        return [], "LOCI_RERANK_DEVICE=cpu"
+    seen = ", ".join(f"cuda:{c['index']} {c['name'] or '?'} {c['free_mb'] if c['free_mb'] is not None else 'unreadable'} MiB free"
+                     for c in cards) or "none"
+    if setting.startswith("cuda:"):
+        try:
+            want = int(setting.split(":", 1)[1])
+        except ValueError:
+            return [], f"LOCI_RERANK_DEVICE={setting!r} is not cuda:<integer>; cards: {seen}"
+        match = [c for c in cards if c["index"] == want and c["free_mb"] is not None]
+        return (match, f"LOCI_RERANK_DEVICE={setting}") if match else ([], f"{setting} not usable; cards: {seen}")
+    if not cards:
+        return [], "torch sees no CUDA card"
+    ranked = sorted((c for c in cards if c["free_mb"] is not None and c["free_mb"] >= min_free_mb),
+                    key=lambda c: c["free_mb"], reverse=True)
+    if not ranked:
+        return [], f"no card has {min_free_mb} MiB free; cards: {seen}"
+    return ranked, f"most free VRAM of: {seen}"
 
 
 def _model_id() -> str:
@@ -145,7 +200,7 @@ def _get_model():
     logs at WARNING and is visible in health(). Returns the loaded model, or None while unavailable
     (fail-open -- never raises).
     """
-    global _model, _model_name, _device, _torch_build
+    global _model, _model_name, _device, _torch_build, _placement
     http_url = _http_url()
     wanted = f"http:{http_url}" if http_url else _model_id()
     # Fast path: already loaded for the currently-configured model.
@@ -168,27 +223,60 @@ def _get_model():
         if not _latch.allow():       # permanent, or inside the backoff window after a failure
             return None
         try:
-            # Resolve device lazily: cuda:0 when torch sees a GPU, else cpu [hardware].
-            device = "cpu"
+            # Place the model where there is room NOW (no static pin): rank the CUDA cards by free VRAM, try them best
+            # first, and fall back to CPU only when no card qualifies [hardware].
             build = None
+            cards: List[dict] = []
+            torch = None
             try:
                 import torch
                 build = str(getattr(torch, "__version__", "")) or None
                 if torch.cuda.is_available():
-                    device = "cuda"
-            except Exception:
-                device = "cpu"
+                    cards = _cuda_cards(torch)
+            except Exception as exc:  # noqa: BLE001 - reported through the reason below
+                logger.warning("Reranker: probing torch/CUDA failed (%s: %s); treating the host as having no GPU",
+                               type(exc).__name__, exc)
+            min_free = int(_env_number("LOCI_RERANK_MIN_FREE_MB", DEFAULT_MIN_FREE_MB))
+            candidates, reason = choose_devices(cards, _device_setting(), min_free)
             from sentence_transformers import CrossEncoder
-            _model = CrossEncoder(wanted, max_length=512, device=device)
+            model, chosen, last_exc = None, None, None
+            for card in candidates:
+                try:
+                    model = CrossEncoder(wanted, max_length=512, device=f"cuda:{card['index']}")
+                    chosen = card
+                    break
+                except ImportError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - e.g. CUDA OOM because another process took the memory first
+                    last_exc = exc
+                    logger.warning("Reranker could not load %s on cuda:%s (%s, %s MiB free at the time): %s: %s%s", wanted,
+                                   card["index"], card["name"], card["free_mb"], type(exc).__name__, exc,
+                                   "; trying the next card" if card is not candidates[-1] else "")
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if model is None and candidates:
+                # Cards qualified but every load failed: a transient condition (memory taken meanwhile), not a reason
+                # to quietly latch onto the CPU. The latch retries after its backoff.
+                raise last_exc
+            if model is None:
+                model = CrossEncoder(wanted, max_length=512, device="cpu")
+            device = "cuda" if chosen else "cpu"
+            _model = model
             _device, _torch_build = device, build
+            _placement = {"index": chosen["index"] if chosen else None, "name": chosen["name"] if chosen else None,
+                          "free_mb_at_load": chosen["free_mb"] if chosen else None, "reason": reason,
+                          "cards_seen": [{k: c.get(k) for k in ("index", "name", "free_mb", "total_mb")} for c in cards]}
             _latch.success()
             if device == "cpu":
                 # Loud on purpose: a CPU build of torch on a GPU host once made every search take minutes.
                 logger.warning(
-                    "Reranker %s runs on CPU (torch %s): expect ~0.1-0.3 s per (query, doc) pair; "
-                    "searches are capped by LOCI_RERANK_BUDGET_S", wanted, build)
+                    "Reranker %s runs on CPU (torch %s; %s): expect ~0.1-0.3 s per (query, doc) pair; "
+                    "searches are capped by LOCI_RERANK_BUDGET_S", wanted, build, reason)
             else:
-                logger.info("Reranker enabled (%s on %s)", wanted, device)
+                logger.info("Reranker enabled (%s on cuda:%s %s, %s MiB free at load; %s)", wanted, chosen["index"],
+                            chosen["name"], chosen["free_mb"], reason)
         except Exception as exc:
             _model = False
             _latch.failure(exc)      # ImportError -> permanent; anything else retried after a backoff
@@ -387,6 +475,9 @@ def health() -> dict:
             "model": _model_id(),
             "state": state,
             "device": _device if state == "loaded" else None,
+            "device_index": _placement.get("index") if state == "loaded" else None,
+            "device_name": _placement.get("name") if state == "loaded" else None,
+            "placement": dict(_placement) if state == "loaded" else None,
             "torch": _torch_build,
             "latch": _latch.state(),
             "budget_s": _env_number("LOCI_RERANK_BUDGET_S", DEFAULT_BUDGET_S),
