@@ -27,8 +27,8 @@ Substrate facts this is built against (session grounding):
     cuda:0 maps to is host-specific; see scripts/gpu_placement.md.
   - [rerank] server.py already reranks on GPU with a lazily-loaded, globally-cached
     CrossEncoder. This module mirrors that: lazy-init, cache in a module global, and
-    on load failure set the cache to `False` PERMANENTLY so we never re-attempt a
-    known-broken load per call.
+    on load failure remember it (`False`) and retry after an exponential backoff; only an
+    ImportError is permanent.
   - [pattern:fail-open] EVERY op fails open (mirror embed_ops.py / llm_local.py): if
     the model can't load (or no model_fn is injected and the real model is
     unavailable), we return the docs in ORIGINAL order with score=None and set the
@@ -58,6 +58,8 @@ import threading
 import time
 from typing import Callable, Iterator, List, Optional, Sequence
 
+from retry_latch import RetryLatch
+
 logger = logging.getLogger(__name__)
 
 # Ultimate fallback if `backends` can't be imported. Flipped to bge on judge-eval
@@ -66,9 +68,14 @@ _DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Module-global model cache, mirroring server.py's `_cross_encoder` singleton [rerank]:
 #   None  -> not yet attempted (lazy)
-#   False -> load failed permanently; never retry (fail-open)
+#   False -> the last load failed; _latch decides when (or whether) to try again
 #   obj   -> a loaded CrossEncoder
 _model = None
+# Transient load failures retry with exponential backoff (30 s, 60 s ... capped at 10 min), like
+# _get_qdrant/_get_ladybug; only ImportError is permanent.
+_RETRY_BASE_S = 30.0
+_RETRY_CAP_S = 600.0
+_latch = RetryLatch("reranker", base_s=_RETRY_BASE_S, cap_s=_RETRY_CAP_S)
 _model_lock = threading.Lock()
 # Which model name `_model` was loaded for, so a changed RERANK_MODEL forces a reload.
 _model_name: Optional[str] = None
@@ -131,25 +138,35 @@ def _get_model():
     """Lazy-init + globally cache the reranker backend (HTTP shim or local
     sentence_transformers.CrossEncoder on GPU if available).
 
-    Mirrors server.py ~588-609: double-checked locking, cache in a module global, and on
-    ANY load failure set the global to `False` permanently so we never re-attempt per call.
-    Returns the loaded model, or None if unavailable/failed (fail-open — never raises).
+    Mirrors server.py ~588-609: double-checked locking and a module-global cache. A load failure
+    does NOT latch for the life of the process: a transient error (MemoryError/OSError under commit
+    pressure, a Hugging Face HEAD blip, one CUDA OOM) is retried after an exponential backoff
+    (_latch). Only ImportError (sentence-transformers genuinely absent) is permanent. Every failure
+    logs at WARNING and is visible in health(). Returns the loaded model, or None while unavailable
+    (fail-open -- never raises).
     """
     global _model, _model_name, _device, _torch_build
     http_url = _http_url()
     wanted = f"http:{http_url}" if http_url else _model_id()
     # Fast path: already loaded for the currently-configured model.
-    if _model is not None and _model_name == wanted:
-        return _model if _model is not False else None
+    if _model is not None and _model is not False and _model_name == wanted:
+        return _model
     with _model_lock:
-        if _model is not None and _model_name == wanted:  # re-check under lock
-            return _model if _model is not False else None
+        if _model is not None and _model is not False and _model_name == wanted:  # re-check under lock
+            return _model
+        if _model_name != wanted:
+            # A different model is configured now: the old failure says nothing about it.
+            _model = None
+            _latch.reset()
         _model_name = wanted
         if http_url:
             _model = _HttpCrossEncoder(http_url)
             _device, _torch_build = "http", None
+            _latch.success()
             logger.info("Reranker enabled via HTTP backend (%s)", http_url)
             return _model
+        if not _latch.allow():       # permanent, or inside the backoff window after a failure
+            return None
         try:
             # Resolve device lazily: cuda:0 when torch sees a GPU, else cpu [hardware].
             device = "cpu"
@@ -164,6 +181,7 @@ def _get_model():
             from sentence_transformers import CrossEncoder
             _model = CrossEncoder(wanted, max_length=512, device=device)
             _device, _torch_build = device, build
+            _latch.success()
             if device == "cpu":
                 # Loud on purpose: a CPU build of torch on a GPU host once made every search take minutes.
                 logger.warning(
@@ -171,12 +189,10 @@ def _get_model():
                     "searches are capped by LOCI_RERANK_BUDGET_S", wanted, build)
             else:
                 logger.info("Reranker enabled (%s on %s)", wanted, device)
-        except ImportError:
-            logger.debug("sentence-transformers not installed — reranking disabled")
-            _model = False
         except Exception as exc:
-            logger.warning("Reranker init failed — reranking disabled: %s", exc)
             _model = False
+            _latch.failure(exc)      # ImportError -> permanent; anything else retried after a backoff
+            return None
     return _model if _model is not False else None
 
 
@@ -372,6 +388,7 @@ def health() -> dict:
             "state": state,
             "device": _device if state == "loaded" else None,
             "torch": _torch_build,
+            "latch": _latch.state(),
             "budget_s": _env_number("LOCI_RERANK_BUDGET_S", DEFAULT_BUDGET_S),
             "max_pairs": int(_env_number("LOCI_RERANK_MAX_PAIRS", 0)),
         }

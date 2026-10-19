@@ -70,6 +70,7 @@ py-modules = [
     "query_expand",
     "reranker",
     "retrieval_eval",
+    "retry_latch",
     "server",
     "text_ops",
     "tool_offload",
