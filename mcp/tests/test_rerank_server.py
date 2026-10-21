@@ -124,6 +124,20 @@ def test_a_scorer_failure_is_a_500_with_the_error_not_a_dropped_connection():
     assert (code, body) == (500, {"error": "RuntimeError: CUDA out of memory"})
 
 
+@pytest.mark.parametrize("preload,expected_loads", [(True, [("m1", "d1")]), (False, [])])
+def test_preload_loads_the_model_at_construction_and_not_otherwise(monkeypatch, preload, expected_loads):
+    loads = []
+
+    def fake_load(model_name, device):
+        loads.append((model_name, device))
+        return LengthScorer()
+
+    monkeypatch.setattr(rerank_server, "load_predict", fake_load)
+    srv = rerank_server.make_server(None, "127.0.0.1", 0, model_name="m1", device="d1", preload=preload)
+    srv.server_close()
+    assert loads == expected_loads
+
+
 def test_health_reports_model_and_device_and_unknown_routes_404(served):
     base, _ = served
     with urllib.request.urlopen(base + "/health", timeout=5) as resp:
