@@ -132,8 +132,10 @@ _ = row_factory
 
 # ── http.server.BaseHTTPRequestHandler dispatch hook
 # scripts/hooks/tests/test_pre_tool_grounding.py's _StubGuardianServer subclasses
-# BaseHTTPRequestHandler; do_POST is called by the base class's request dispatch
+# BaseHTTPRequestHandler, and so does scripts/rerank_server.py's Handler (GET /health,
+# POST /rerank); do_GET and do_POST are called by the base class's request dispatch
 # by name convention (do_<METHOD>), never directly in our code.
+_ = do_GET
 _ = do_POST
 
 # ── scripts/redteam/loci_adversarial_harness.py dataclass fields
