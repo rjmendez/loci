@@ -11,6 +11,13 @@ points Qdrant, Ollama and vLLM at `127.0.0.1:1` and refuses access to `~/.loci`,
 `~/.hermes` and the live collections. Run the suite for the area you changed, e.g.
 `python -m pytest mcp/tests/test_x.py -q`. Never point a test at a live store.
 
+**Targeted tests on commits, the full suite at merge to main (owner, 2026-10-21; every repo).**
+On a feature-branch commit or push, run only the tests for what the diff touches: the test
+files for each changed module, plus every test that imports a changed module (a shared
+module such as settings or the CLI means all of its importers, not the whole suite), plus
+the repo's honesty/lint checks. Run the full integration suite once, when merging to main,
+and say in the PR which tests were run. Mutation checks on new guards still apply.
+
 ## Test-writing rules for agents
 
 An audit of this suite (2026-09, commit 3a1ad78) mutated the code under ~330 suspect
