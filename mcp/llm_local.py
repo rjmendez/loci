@@ -436,6 +436,11 @@ def _generate(prompt: str,
             tmux_policy.get("session"),
             tmux_policy.get("priority"),
         )
+    if prompt and _gateway_enabled():
+        via = _via_gateway(prompt, fmt=fmt, max_tokens=max_tokens, temperature=temperature, timeout=timeout)
+        if via["ok"] or not _gateway_fallback_raw():
+            return _finish(via, fmt, role, prompt)
+        _LOG.warning("llm_local gateway failed, falling back to raw Ollama (fallback_raw): %s", via.get("why"))
     model_was_unspecified = not bool(model)
     if not model:
         try:
@@ -581,6 +586,42 @@ def _generate(prompt: str,
                         f"under the {_auto_max_bytes() / 10**9:g} GB one-GPU cap)")
             return fail(why[:300])
 
+    return _finish({"text": text, "ok": True, "model": model}, fmt, role, prompt)
+
+
+def _gateway_enabled() -> bool:
+    try:
+        import llm_gateway
+        return llm_gateway.enabled()
+    except Exception:
+        return False
+
+
+def _gateway_fallback_raw() -> bool:
+    try:
+        import llm_gateway
+        return llm_gateway.fallback_raw()
+    except Exception:
+        return False
+
+
+def _via_gateway(prompt: str, *, fmt: Optional[str], max_tokens: int, temperature: float,
+                 timeout: Optional[float]) -> dict:
+    """One chat completion through the LLM gateway. The gateway owns model choice, cloud-first ordering and
+    fallbacks, so the caller's local model tag and keep_alive/placement hints do not apply."""
+    import llm_gateway
+    per_request = _TIMEOUT if timeout is None else float(timeout)
+    _LOG.info("llm_local request tier=gateway model=%s fmt=%s max_tokens=%s",
+              llm_gateway.chat_model(), fmt or "", max_tokens)
+    return llm_gateway.chat(prompt, max_tokens=max_tokens, temperature=temperature,
+                            json_mode=(fmt == "json"), timeout=max(0.1, min(per_request, _deadline_s())))
+
+
+def _finish(result: dict, fmt: Optional[str], role: Optional[str], prompt: str) -> dict:
+    """Validate a successful generation and attach the tmux-offload fields; a failed result passes through."""
+    text, model = result.get("text", ""), result.get("model", "")
+    if not result.get("ok"):
+        return result
     if fmt == "json":
         # ok=True only if the body actually parses as JSON.
         try:
@@ -589,7 +630,7 @@ def _generate(prompt: str,
             return {"text": text, "ok": False, "model": model,
                     "why": f"response was not valid JSON: {exc}"[:200]}
 
-    out = {"text": text, "ok": True, "model": model}
+    out = dict(result)
     tmux_policy = _tmux_offload_policy(_normalize_role(role) or _heuristic_route(prompt).get("role"))
     if tmux_policy.get("enabled") and tmux_policy.get("session"):
         out["tmux_session"] = tmux_policy["session"]
