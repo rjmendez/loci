@@ -28,6 +28,49 @@ Job record (one JSON object per line in --jobs):
 """
 import argparse, json, os, subprocess, sys, threading, time, urllib.request
 
+
+def _priority_value(job):
+    try:
+        return int(job.get("priority", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pauseable(job):
+    return bool(job.get("pauseable", True))
+
+
+def _resume_paused_jobs(jobs, state):
+    """Requeue paused jobs once the queue no longer contains a higher-priority task."""
+    for jid, job in jobs.items():
+        if state.get(jid) != "paused":
+            continue
+        urgent = [
+            other_jid for other_jid, other_job in jobs.items()
+            if state.get(other_jid) == "queued" and _priority_value(other_job) < _priority_value(job)
+        ]
+        if not urgent:
+            state[jid] = "queued"
+
+
+def _pause_lower_priority_jobs(jobs, state):
+    """Pause lower-priority running jobs when a higher-priority task is queued."""
+    queued = [(jid, job) for jid, job in jobs.items() if state.get(jid) == "queued"]
+    running = [(jid, job) for jid, job in jobs.items() if state.get(jid) == "running"]
+    if not queued or not running:
+        return
+    urgent_priority = min(_priority_value(job) for _, job in queued)
+    for jid, job in running:
+        if not _pauseable(job):
+            continue
+        if _priority_value(job) > urgent_priority:
+            state[jid] = "paused"
+
+
+def _with_cancel_event(thread, *, event):
+    setattr(thread, "cancel_event", event)
+    return thread
+
 # --- topology: endpoints and the physical GPU indices each one can place models on ---
 # Nothing environment-specific is hardcoded. URLs, the nvidia-smi path, and the VRAM
 # slack come from the environment with generic localhost defaults (see the README):
@@ -155,7 +198,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     jobs = {j["id"]: j for j in load_jobs(args.jobs)}
-    state = {jid: "queued" for jid in jobs}          # queued|running|done|failed
+    state = {jid: "queued" for jid in jobs}          # queued|running|paused|done|failed
     results, lock = {}, threading.Lock()
     threads = {}                                      # jid -> Thread
     inflight = {ep: 0 for ep in ENDPOINTS}
@@ -201,11 +244,14 @@ def main():
                         print(f"[reclaim] unloaded {fin_model} on {jobs[jid]['_ep']} (queue waiting on VRAM)")
                 del threads[jid]
 
+        _pause_lower_priority_jobs(jobs, state)
+        _resume_paused_jobs(jobs, state)
+
         free = gpu_free_gb()
         res_cache = {ep: resident_models(c["url"]) for ep, c in live_eps.items()}
 
         # admission: schedule queued jobs whose deps are met and VRAM fits
-        for jid, j in sorted(jobs.items(), key=lambda kv: kv[1]["priority"]):
+        for jid, j in sorted(jobs.items(), key=lambda kv: _priority_value(kv[1])):
             if state[jid] != "queued" or not deps_done(j):
                 continue
             cands = [j["endpoint"]] if j.get("endpoint") in live_eps else list(live_eps)
@@ -238,14 +284,14 @@ def main():
                     break
 
         # status line + heartbeat
-        counts = {s: sum(1 for v in state.values() if v == s) for s in ("queued", "running", "done", "failed")}
+        counts = {s: sum(1 for v in state.values() if v == s) for s in ("queued", "running", "paused", "done", "failed")}
         gpustr = " ".join(f"g{g}:{free.get(g,0):.1f}GBfree" for g in sorted(set(sum((c['gpus'] for c in live_eps.values()), []))))
         line = f"[tick {tick}] {counts} | inflight={inflight} | {gpustr}"
         print(line, flush=True)
         with open(args.heartbeat, "w") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
 
-        if counts["queued"] == 0 and counts["running"] == 0:
+        if counts["queued"] == 0 and counts["running"] == 0 and counts["paused"] == 0:
             print(f"[done] all jobs settled: {counts}")
             break
         time.sleep(args.poll)
