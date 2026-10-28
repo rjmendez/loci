@@ -60,7 +60,10 @@ Training and testing a selector (a FlyBrain-style brain, or the baseline in ``po
   Windows host 0 is the RTX 4070 Ti and 1 the RTX 2080 Ti, the reverse of nvidia-smi). ``options_for(model)``
   turns that into ``{"main_gpu": n}``, which ``llm_local``, ``memcheck`` and the lease reload merge into
   their Ollama options. Ollama reloads a loaded model when a request's options differ, so give a model one
-  home and do not pin one that other clients also call without it.
+  home and do not pin one that other clients also call without it. **Prefer no pin at all** (the default): a pinned model
+  is forced onto that card whatever else is there, and callers that disagree make Ollama reload it every few minutes.
+  An unpinned ``warm = true`` model is planned against the VRAM that is free right now (``gpu_free_gb``), not a static
+  per-card budget, and Ollama places it where it fits.
 * ``python model_pool.py report`` joins the logs and says, per role, whether the data can support
   learning (two or more arms with enough outcomes) or only one arm has ever been observed.
 """
@@ -269,23 +272,49 @@ def gpu_vram_gb() -> dict[int, float]:
     return out
 
 
+def gpu_free_gb() -> Optional[dict]:
+    """``{card: free GB}`` read from nvidia-smi NOW (card = nvidia-smi's index), or None when it cannot be read.
+
+    This is the live view an unpinned warm model is planned against: the static ``gpu_vram_gb`` budget cannot know what
+    the desktop, another process or an idle model is holding at the moment. Tests replace this function."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10, check=True).stdout
+    except Exception as exc:  # noqa: BLE001 - missing binary, driver hiccup, timeout
+        logger.warning("model_pool: could not read free VRAM from nvidia-smi: %r", exc)
+        return None
+    free: dict[int, float] = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        try:
+            free[int(parts[0])] = float(parts[1]) / 1024.0
+        except (ValueError, IndexError):
+            continue                  # "[N/A]" and the like: that card is not a candidate
+    return free or None
+
+
 def _is_resident(name: str, resident: set) -> bool:
     return name in resident or f"{name}:latest" in resident or (name.endswith(":latest") and name[:-7] in resident)
 
 
 def warm_plan(*, pool: Optional[Iterable[PoolEntry]] = None, resident: Optional[set] = None,
               inv: Optional[dict] = None, gpu_gb: Optional[dict] = None, held_out: Optional[set] = None,
-              headroom_gb: float = 1.0) -> list[dict]:
+              headroom_gb: float = 1.0, free_gb: Optional[dict] = None) -> list[dict]:
     """What ``warm`` would do for each ``warm = true`` entry: ``{"model", "gpu", "action": "load"|"skip", "why"}``.
 
-    A model is loaded only when it is installed, not resident, not held out by a lease, has a home card and a
-    ``vram_gb``, and that card's budget (``gpu_vram_gb`` minus ``headroom_gb``) still has room for it beside the
-    pool models already resident there, including the ones this plan has already decided to load. Without a
-    home card Ollama could put it anywhere, including on the card the production model needs."""
+    A model is loaded only when it is installed, not resident, not held out by a lease and has a ``vram_gb``.
+    * With a home card (``gpu = n``, an explicit pin): that card's static budget (``gpu_vram_gb`` minus ``headroom_gb``)
+      must still have room for it beside the pool models already resident there, including ones this plan already loads.
+    * Without one (the default, no pin): some card must have ``vram_gb`` plus ``headroom_gb`` FREE right now, read live
+      from nvidia-smi (``free_gb``, ``{card: GB}``). Ollama puts a model that fits on the card with the most free memory,
+      so the plan charges the load to that card; nothing is evicted because only what fits is loaded. When free VRAM
+      cannot be read the model is skipped, never loaded blind."""
     pool_entries = list(entries() if pool is None else pool)
     resident_ = set(resident_models() if resident is None else resident)
     inventory_ = inventory() if inv is None else inv
     budget = gpu_vram_gb() if gpu_gb is None else gpu_gb
+    live_free: Optional[dict] = None          # read lazily, once, only if an unpinned model gets that far
     if held_out is None:
         try:
             import model_lease
@@ -306,10 +335,25 @@ def warm_plan(*, pool: Optional[Iterable[PoolEntry]] = None, resident: Optional[
             skip("already resident")
         elif _is_resident(e.name, held_out):
             skip("evicted by an active lease")
-        elif e.gpu is None:
-            skip("no home gpu: Ollama could place it on the production model's card")
         elif e.vram_gb is None:
             skip("no vram_gb to budget with")
+        elif e.gpu is None:
+            if live_free is None:
+                snapshot = gpu_free_gb() if free_gb is None else free_gb
+                live_free = dict(snapshot) if snapshot else {}
+            if not live_free:
+                skip("free VRAM could not be read, so it is not loaded blind")
+                continue
+            card, free = max(live_free.items(), key=lambda kv: kv[1])
+            need = e.vram_gb + headroom_gb
+            if free < need:
+                skip(f"{e.vram_gb:g} GB (+{headroom_gb:g} GB headroom) does not fit: the card with the most free VRAM "
+                     f"is {card} with {free:.1f} GB")
+            else:
+                plan.append({**row, "action": "load",
+                             "why": f"needs {e.vram_gb:g} GB (+{headroom_gb:g} headroom); card {card} has {free:.1f} GB free"})
+                live_free[card] = free - e.vram_gb          # Ollama will have put it there
+                resident_.add(e.name)
         elif e.gpu not in budget:
             skip(f"no gpu_vram_gb for card {e.gpu}")
         else:

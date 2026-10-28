@@ -26,9 +26,15 @@ import functools
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("loci-mcp.ladybug")
@@ -71,6 +77,53 @@ _LEASE_TIMEOUT_S = _WRITE_LEASE_TIMEOUT_S  # backward-compat test knob for write
 _LEASE_INITIAL_BACKOFF_S = 0.01
 _LEASE_MAX_BACKOFF_S = 0.1
 _LEASE_POLL_S = _LEASE_INITIAL_BACKOFF_S  # backward-compat test knob
+
+#: Why the Windows OpenSSL aliases could not be set up, "" when they were or none were needed. Health reports it.
+_DLL_SETUP_ERROR = ""
+
+# LadybugDB's native module links "libssl-3-x64.dll" / "libcrypto-3-x64.dll"; CPython ships the same OpenSSL as
+# "libssl-3.dll" / "libcrypto-3.dll" under <base_prefix>\DLLs. Without the alias names the module fails to load
+# ("DLL load failed") and ladybug falls back to a C shim that is not installed either, so no database can open.
+_WIN_SSL_ALIASES = (("libssl-3.dll", "libssl-3-x64.dll"), ("libcrypto-3.dll", "libcrypto-3-x64.dll"))
+
+
+def _windows_ssl_aliases(platform=None, base_prefix=None, target=None, copy=None, add_dll_directory=None):
+    """Make the OpenSSL DLLs LadybugDB links resolvable on Windows. Returns ``(directories_added, error)``.
+
+    Copies CPython's OpenSSL DLLs under the ``-x64`` names into *target* (default ``$LOCI_HOME/dll`` or
+    ``~/.loci/dll``) when absent or a different size, then registers *target* and CPython's own DLL directory.
+    A no-op elsewhere. Never raises: a failure comes back as the error text so health can say why."""
+    platform = sys.platform if platform is None else platform
+    if platform != "win32":
+        return [], ""
+    base = Path(sys.base_prefix if base_prefix is None else base_prefix) / "DLLs"
+    if target is None:
+        target = Path(os.environ.get("LOCI_HOME") or Path.home() / ".loci") / "dll"
+    target = Path(target)
+    copy = shutil.copy2 if copy is None else copy
+    add_dll_directory = getattr(os, "add_dll_directory", None) if add_dll_directory is None else add_dll_directory
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for src_name, alias in _WIN_SSL_ALIASES:
+            src, dst = base / src_name, target / alias
+            if not src.is_file():
+                return [], f"OpenSSL DLL not found: {src}"
+            if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+                copy(src, dst)
+        added = []
+        for d in (target, base):
+            if add_dll_directory is not None:
+                add_dll_directory(str(d))
+            added.append(str(d))
+        return added, ""
+    except Exception as exc:  # fail-open: report, never raise at import
+        return [], f"OpenSSL alias setup failed: {exc!r}"
+
+
+_dlls, _DLL_SETUP_ERROR = _windows_ssl_aliases()
+_DLL_DIRS = list(_dlls)  # handed to the probe child, which runs isolated (-I) and must register them itself
+if _DLL_SETUP_ERROR:
+    logger.warning("LadybugDB: %s", _DLL_SETUP_ERROR)
 
 try:  # ladybug (LadybugDB) is optional — the store degrades to unavailable.
     import ladybug  # type: ignore
@@ -366,6 +419,66 @@ def _resolve_calls(
     }
 
 
+_PROBE_TIMEOUT_S = _parse_timeout("LOCI_LADYBUG_PROBE_TIMEOUT_S", 60.0)
+_QUARANTINE_KEEP = 5
+#: NTSTATUS codes a native crash of the engine shows as an exit code on Windows (stack-buffer overrun, access violation).
+_WIN_CRASH_CODES = frozenset({0xC0000409, 0xC0000005})
+
+# Opens the real database read-only in a throwaway process: a native crash there kills the child, not the server.
+_PROBE_CHILD = """
+import os, sys
+for p in filter(None, os.environ.get("LOCI_LADYBUG_SYS_PATH", "").split(os.pathsep)):
+    sys.path.insert(0, p)
+for d in filter(None, os.environ.get("LOCI_LADYBUG_DLL_DIRS", "").split(os.pathsep)):
+    if hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(d)
+import ladybug
+db = ladybug.Database(sys.argv[1], read_only=True)
+conn = ladybug.Connection(db)
+res = conn.execute("MATCH (n) RETURN count(*)")
+print(res.get_next()[0])
+res.close(); conn.close(); db.close()
+"""
+
+
+def _engine_version() -> str:
+    """Installed ladybug version from package metadata (``ladybug.__version__`` loads the native library)."""
+    from importlib import metadata
+    for dist in ("ladybug", "real_ladybug"):
+        try:
+            return metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            continue
+    return "unknown"
+
+
+def _signed_exit(rc: int) -> int:
+    """An exit code as the signed 32-bit value Windows tools print (3221226505 -> -1073740791)."""
+    rc &= 0xFFFFFFFF
+    return rc - 0x100000000 if rc >= 0x80000000 else rc
+
+
+def _is_native_crash(rc: Optional[int]) -> bool:
+    """True when a child's exit code means the engine died natively (POSIX signal = negative, Windows NTSTATUS)."""
+    if rc is None:
+        return False
+    return rc < 0 or (rc & 0xFFFFFFFF) in _WIN_CRASH_CODES
+
+
+def _run_probe_child(db_path: str, timeout_s: float) -> tuple:
+    """Run the probe child. Returns ``(exit_code, output)``; exit_code is None on timeout (the child is killed)."""
+    env = dict(os.environ)
+    env["LOCI_LADYBUG_DLL_DIRS"] = os.pathsep.join(_DLL_DIRS)
+    pkg = getattr(ladybug, "__file__", None)
+    env["LOCI_LADYBUG_SYS_PATH"] = os.path.dirname(os.path.dirname(pkg)) if pkg else ""
+    try:
+        done = subprocess.run([sys.executable, "-I", "-c", _PROBE_CHILD, db_path], env=env, timeout=timeout_s,
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None, f"no answer within {timeout_s:g} s"
+    return done.returncode, (done.stdout + done.stderr).strip()[-300:]
+
+
 class LadybugStore:
     """Embedded LadybugDB graph store. All public methods are fail-open."""
 
@@ -385,6 +498,25 @@ class LadybugStore:
         self.code_query_failures = 0
         self.code_query_last_error = ""  # repr of the most recent swallowed read error
         self._read_miss = threading.local()  # per-thread "_rows found no session" flag
+        # Why the engine last failed to open a database ("" while it works); health and the tools report it.
+        self.last_open_error = ""
+        self._engine_cache: Optional[tuple] = None  # (ok, error, monotonic time) of the last engine probe
+        self._clock = time.monotonic                 # injectable for tests
+        self._now = lambda: datetime.now(timezone.utc)  # injectable for tests (quarantine names)
+        # Corruption hardening: subprocess probe, WAL quarantine, checkpoint recovery (all injectable for tests).
+        self._probe_runner = _run_probe_child        # (db_path, timeout_s) -> (exit code | None on timeout, output)
+        self.probe_timeout_s = _PROBE_TIMEOUT_S
+        self.probe_enabled = os.environ.get("LOCI_LADYBUG_PROBE", "1") != "0"  # ops kill switch
+        self.probe_state = "unprobed"                # unprobed | no-database | ok | error | crashed
+        self.last_probe_error = ""
+        self.last_crash_reason = ""
+        self.last_crash_exit_code: Optional[int] = None
+        self._probe_cache: Optional[tuple] = None    # (crashed, monotonic time) of the last child probe
+        self.quarantine_count = 0
+        self.last_quarantine_error = ""
+        self.recovery_count = 0
+        self._last_recovery_at: Optional[float] = None
+        self._recovery_episode = False               # a checkpoint error was seen and no open has succeeded since
         if not _HAS_LADYBUG:
             logger.info("ladybug not importable; LadybugStore unavailable")
 
@@ -431,6 +563,9 @@ class LadybugStore:
                 # Callers never nest a write inside a read, so the outer session's mode is compatible.
                 yield self._active
                 return
+            if not self._native_guard():
+                yield None
+                return
             fd = os.open(self._lease_path, os.O_CREAT | os.O_RDWR, 0o644)
             got = False
             db = conn = None
@@ -442,15 +577,18 @@ class LadybugStore:
                         yield None
                         return
                     got = True
-                    db = ladybug.Database(self.db_path, read_only=not write)
+                    try:
+                        db = ladybug.Database(self.db_path, read_only=not write)
+                    except Exception as exc:
+                        db = self._heal_open(fd, write, exc)
+                    self._recovery_episode = False
                     conn = ladybug.Connection(db)
                     if write:
                         self._ensure_schema(conn)
                         self._stamp_holder(fd)
                     self._active = conn
                 except Exception as exc:  # open/lock failure -> fail-open, retried next op
-                    logger.debug("ladybug session (%s) unavailable: %s",
-                                 "write" if write else "read", exc)
+                    self._note_open_error(exc, "write" if write else "read")
                     yield None
                     return
                 # Outside the open/lock try: a caller exception at this yield must
@@ -471,12 +609,233 @@ class LadybugStore:
                 finally:
                     os.close(fd)
 
+    # ------------------------------------------------------------------ #
+    # Corruption hardening: probe child, WAL quarantine, checkpoint recovery
+    # ------------------------------------------------------------------ #
+    #: A clean probe is trusted this long; a crash is re-probed sooner so a repair is noticed.
+    PROBE_OK_TTL_S = 300.0
+    PROBE_CRASH_TTL_S = 20.0
+    #: At most one recovery open per this many seconds.
+    RECOVERY_MIN_INTERVAL_S = 60.0
+
+    def _wal_files(self) -> list:
+        return [p for p in (self.db_path + ".wal", self.db_path + ".wal.checkpoint") if os.path.exists(p)]
+
+    @staticmethod
+    def _is_checkpoint_error(exc: BaseException) -> bool:
+        t = str(exc).lower()
+        return "checkpoint" in t and "progress" in t
+
+    @staticmethod
+    def _is_lock_error(exc: BaseException) -> bool:
+        """Another process holds the database's own file lock: its WAL is live, not corrupt."""
+        return bool(re.search(r"could not set lock|lock on file|used by another process|temporarily unavailable",
+                              str(exc), re.IGNORECASE))
+
+    def _quarantine_wal(self, reason: str) -> bool:
+        """Move ``<db>.wal`` / ``<db>.wal.checkpoint`` to ``<dir>/quarantine/<name>.<UTC stamp>``; never deletes.
+        Keeps the newest ``_QUARANTINE_KEEP`` sets. True when every file moved; a failure is logged, kept in
+        ``last_quarantine_error`` and reported by health. Needs the exclusive lease (the caller holds it)."""
+        files = self._wal_files()
+        if not files:
+            return False
+        qdir = os.path.join(os.path.dirname(self.db_path) or ".", "quarantine")
+        stamp = self._now().strftime("%Y%m%dT%H%M%S%fZ")
+        sizes = {os.path.basename(f): os.path.getsize(f) for f in files}
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            for f in files:
+                shutil.move(f, os.path.join(qdir, f"{os.path.basename(f)}.{stamp}"))
+        except Exception as exc:
+            self.last_quarantine_error = repr(exc)[:300]
+            logger.error("ladybug WAL quarantine FAILED (%s): %s; files %s", reason, self.last_quarantine_error, sizes)
+            return False
+        self.quarantine_count += 1
+        self.last_quarantine_error = ""
+        logger.warning("ladybug WAL quarantined to %s (%s): sizes %s", qdir, reason, sizes)
+        self._prune_quarantine(qdir)
+        return True
+
+    def _prune_quarantine(self, qdir: str) -> None:
+        try:
+            names = os.listdir(qdir)
+            stamps = sorted({n.rsplit(".", 1)[1] for n in names if "." in n}, reverse=True)
+            for old in stamps[_QUARANTINE_KEEP:]:
+                for n in names:
+                    if n.endswith("." + old):
+                        os.remove(os.path.join(qdir, n))
+        except Exception as exc:
+            logger.warning("ladybug quarantine prune failed: %r", exc)
+
+    def _heal_open(self, fd: int, write: bool, exc: BaseException):
+        """A session open failed with *exc*. Try the two repairs under the exclusive lease, then retry the open once.
+
+        1. read-only open refused because a checkpoint is in progress (nothing live holds the lease, so it is a
+           leftover): open read-write once, which replays/clears it (rate limited, logged once per episode);
+        2. any other failure with a WAL on disk and no foreign file lock: quarantine the WAL.
+        Returns the Database, or re-raises *exc* (or the retry's own error)."""
+        checkpoint = (not write) and self._is_checkpoint_error(exc)
+        if checkpoint and not self._recovery_episode:
+            self._recovery_episode = True
+            logger.warning("ladybug read-only open blocked by a leftover checkpoint (%s); recovering", exc)
+        if checkpoint:
+            now = self._clock()
+            if self._last_recovery_at is not None and now - self._last_recovery_at < self.RECOVERY_MIN_INTERVAL_S:
+                raise exc
+        elif not self._wal_files() or self._is_lock_error(exc):
+            raise exc
+        if not write:  # a reader holds the shared lease: trade it for the exclusive one, never wait on a live writer
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            if not self._acquire_lease(fd, exclusive=True, timeout_s=_WRITE_LEASE_TIMEOUT_S):
+                self._acquire_lease(fd, exclusive=False, timeout_s=_READ_LEASE_TIMEOUT_S)
+                raise exc
+        try:
+            if checkpoint:
+                self._last_recovery_at = self._clock()
+                try:
+                    rw = ladybug.Database(self.db_path, read_only=False)
+                    rw.close()
+                    self.recovery_count += 1
+                    logger.warning("ladybug recovery open done (recoveries: %d)", self.recovery_count)
+                except Exception as rexc:
+                    logger.warning("ladybug recovery open failed: %r", rexc)
+                    if not self._quarantine_wal(f"recovery open failed: {rexc!r}"[:200]):
+                        raise exc
+            elif not self._quarantine_wal(f"open failed: {exc!r}"[:200]):
+                raise exc
+        finally:
+            if not write:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                if not self._acquire_lease(fd, exclusive=False, timeout_s=_READ_LEASE_TIMEOUT_S):
+                    raise exc
+        return ladybug.Database(self.db_path, read_only=not write)
+
+    def _probe_once(self) -> bool:
+        """Run the probe child once; True if the engine crashed (or hung) opening the real database."""
+        rc, out = self._probe_runner(self.db_path, self.probe_timeout_s)
+        if rc is None:
+            self.last_crash_reason = f"engine hung opening the database (no answer within {self.probe_timeout_s:g} s)"
+            self.last_crash_exit_code = None
+            self.probe_state = "crashed"
+            return True
+        if _is_native_crash(rc):
+            self.last_crash_exit_code = _signed_exit(rc)
+            self.last_crash_reason = f"engine crashed opening the database (exit {self.last_crash_exit_code})"
+            self.probe_state = "crashed"
+            return True
+        if rc != 0:
+            self.probe_state, self.last_probe_error = "error", f"probe exit {rc}: {out}"[:300]
+        else:
+            self.probe_state, self.last_probe_error = "ok", ""
+        return False
+
+    def _native_guard(self) -> bool:
+        """False when the real database must not be opened in this process because the probe child crashed on it.
+
+        Probes before the first in-process open and again after a TTL. A crash quarantines the WAL and re-probes
+        once. A clean failure of the child (lock held, schema missing) does not block: the in-process open
+        reports it with the existing fail-open behaviour. Never raises."""
+        if not self.probe_enabled or not self.ok:
+            return True
+        with self._lock:
+            now = self._clock()
+            cached = self._probe_cache
+            if cached is not None:
+                crashed, at = cached
+                if now - at < (self.PROBE_CRASH_TTL_S if crashed else self.PROBE_OK_TTL_S):
+                    return not crashed
+            if not os.path.exists(self.db_path) and not self._wal_files():
+                self.probe_state = "no-database"
+                return True
+            try:
+                crashed = self._probe_once()
+                if crashed and self._quarantine_wal(self.last_crash_reason):
+                    crashed = self._probe_once()
+            except Exception as exc:
+                logger.warning("ladybug probe could not run: %r", exc)
+                self.probe_state, self.last_probe_error = "error", repr(exc)[:300]
+                crashed = False
+            self._probe_cache = (crashed, now)
+            if crashed:
+                self._record_open_error(self.last_crash_reason, "probe")
+            return not crashed
+
+    def health_report(self) -> dict:
+        """What loci_health shows about the store beyond 'available'."""
+        return {
+            "engine_version": _engine_version(),
+            "probe_state": self.probe_state,
+            "last_crash_reason": self.last_crash_reason,
+            "last_crash_exit_code": self.last_crash_exit_code,
+            "last_probe_error": self.last_probe_error,
+            "quarantine_count": self.quarantine_count,
+            "last_quarantine_error": self.last_quarantine_error,
+            "recovery_count": self.recovery_count,
+        }
+
+    def _note_open_error(self, exc: BaseException, mode: str) -> None:
+        """Record why a session could not open. A change of reason is logged at WARNING (it used to be DEBUG, so a
+        store that could never open looked healthy in every log); a repeat of the same reason stays at DEBUG."""
+        self._record_open_error(repr(exc)[:300], mode)
+
+    def _record_open_error(self, text: str, mode: str) -> None:
+        if text != self.last_open_error:
+            logger.warning("ladybug session (%s) unavailable: %s", mode, text)
+        else:
+            logger.debug("ladybug session (%s) unavailable: %s", mode, text)
+        self.last_open_error = text
+
+    #: A working engine is re-checked this rarely, a failing one this soon (so a fix is noticed quickly).
+    ENGINE_OK_TTL_S = 300.0
+    ENGINE_FAIL_TTL_S = 20.0
+
+    def engine_probe(self) -> tuple:
+        """``(ok, error)``: can this process open a LadybugDB database and run a query at all?
+
+        Opens a throwaway database in a temporary directory, so it needs neither the real store's file nor its
+        lease and never touches real data. This is the check "available" used to skip: importing ``ladybug`` says
+        nothing about whether the native engine loads (on Windows it imports fine and then every open fails).
+        Cached per TTL; the failure text is also kept in ``last_open_error``. Never raises."""
+        if not self.ok:
+            return False, self.last_open_error or ("ladybug not importable" if not _HAS_LADYBUG else "no database path")
+        now = self._clock()
+        cached = self._engine_cache
+        if cached is not None:
+            ok, err, at = cached
+            if now - at < (self.ENGINE_OK_TTL_S if ok else self.ENGINE_FAIL_TTL_S):
+                return ok, err
+        ok, err = True, ""
+        tmp = tempfile.mkdtemp(prefix="loci-ladybug-probe-")
+        db = conn = None
+        try:
+            db = ladybug.Database(os.path.join(tmp, "probe.ladybug"))
+            conn = ladybug.Connection(db)
+            res = conn.execute("RETURN 1")
+            self._close_result(res)
+        except Exception as exc:
+            ok, err = False, repr(exc)[:300]
+        finally:
+            for c in (conn, db):
+                try:
+                    if c is not None:
+                        c.close()
+                except Exception as exc:
+                    logger.debug("engine_probe: close swallow: %r", exc)
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not ok:
+            self._record_open_error(err, "probe")
+        elif self.last_open_error:
+            self.last_open_error = ""
+        self._engine_cache = (ok, err, now)
+        return ok, err
+
     def _stamp_holder(self, fd: int) -> None:
         """Record the current writer's PID in the lease file (diagnostics only) so a
         contended state can name who is writing. Best-effort; never raises."""
         try:
             os.ftruncate(fd, 0)
-            os.pwrite(fd, f"{os.getpid()} {int(time.time())}\n".encode(), 0)
+            os.lseek(fd, 0, os.SEEK_SET)   # os.pwrite does not exist on Windows; this fd is only used for the lease and this stamp
+            os.write(fd, f"{os.getpid()} {int(time.time())}\n".encode())
         except Exception as exc:
             logger.debug("_stamp_holder: fail-open swallow: %r", exc)
 
@@ -498,9 +857,11 @@ class LadybugStore:
         if not self.ok:
             return False
         if not os.path.exists(self.db_path):
-            # No database file yet: nothing can be holding it (the first write creates it). A read-only
-            # open of a missing file fails too, which health used to report as "contended".
-            return True
+            # No database file yet: nothing can be holding it (the first write creates it), and a read-only open
+            # of a missing file fails, which health used to report as "contended". But "no file" must not read
+            # as "fine": when the engine cannot open a database at all, the file never gets created, so ask the
+            # engine (a throwaway database) instead of assuming it works.
+            return self.engine_probe()[0]
         try:
             with self._session(write=False, timeout_s=_READ_LEASE_TIMEOUT_S) as conn:
                 return conn is not None
@@ -619,7 +980,8 @@ class LadybugStore:
             return out
 
     def available(self) -> bool:
-        return bool(self.ok)
+        """True only if the engine can really open a database (see ``engine_probe``), not merely if it imported."""
+        return bool(self.ok) and self.engine_probe()[0] and self._native_guard()
 
     # ------------------------------------------------------------------ #
     # Writes (idempotent via MERGE; fail-open)
@@ -1051,28 +1413,30 @@ class LadybugStore:
         if not self.ok:
             return out
         prefix = (path_prefix or "").strip()
-        # Over-broad guard: empty, or a path made only of separators ("/", "//").
-        if not prefix or not prefix.strip("/"):
+        # Over-broad guard: empty, a path made only of separators ("/", "//", "\\"), or a bare drive root ("C:\\").
+        if not prefix or not prefix.strip("/\\") or re.fullmatch(r"[A-Za-z]:[\\/]*", prefix):
             logger.warning("delete_code_under refused over-broad prefix: %r", path_prefix)
             return out
-        # Prefix exactly, plus strictly beneath — "/a/b" must not match "/a/bc".
-        sub = prefix.rstrip("/") + "/"
+        # Prefix exactly, plus strictly beneath — "/a/b" must not match "/a/bc". Stored paths keep the separator
+        # they were parsed with ("\\" on Windows), so both are tried; with only "/" a Windows tree was never pruned.
+        stem = prefix.rstrip("/\\")
+        params = {"p": prefix, "sub": stem + "/", "sub2": stem + "\\"}
         try:
             srows = self._rows(
-                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub "
-                "RETURN count(s)", {"p": prefix, "sub": sub},
+                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub OR s.file STARTS WITH $sub2 "
+                "RETURN count(s)", params,
             )
             frows = self._rows(
-                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub "
-                "RETURN count(c)", {"p": prefix, "sub": sub},
+                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub OR c.path STARTS WITH $sub2 "
+                "RETURN count(c)", params,
             )
             self._exec(
-                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub "
-                "DETACH DELETE s", {"p": prefix, "sub": sub},
+                "MATCH (s:CodeSymbol) WHERE s.file = $p OR s.file STARTS WITH $sub OR s.file STARTS WITH $sub2 "
+                "DETACH DELETE s", params,
             )
             self._exec(
-                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub "
-                "DETACH DELETE c", {"p": prefix, "sub": sub},
+                "MATCH (c:CodeFile) WHERE c.path = $p OR c.path STARTS WITH $sub OR c.path STARTS WITH $sub2 "
+                "DETACH DELETE c", params,
             )
             out["symbols_deleted"] = int(srows[0][0]) if srows else 0
             out["files_deleted"] = int(frows[0][0]) if frows else 0

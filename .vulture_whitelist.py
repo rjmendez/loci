@@ -86,12 +86,15 @@ _ = get_task
 # health (@mcp.custom_route) and loci_health left this list once vulture stopped
 # reporting them (another name reference satisfies it), as did audit_log and
 # memory_promote once server.py itself began calling them.
+
 _ = docs_ingest_indexer
 _ = docs_recall
 _ = finding_resolve
 _ = loci_validated_knowledge_promotion
 _ = memory_route_counterfactual_simulate
 _ = memory_route_policy_optimize
+_ = policy_adherence_record
+_ = policy_adherence_report
 _ = retrieval_selftest
 
 # ── Private helper called only from mcp/tests/ (out of vulture's scanned
@@ -129,8 +132,10 @@ _ = row_factory
 
 # ── http.server.BaseHTTPRequestHandler dispatch hook
 # scripts/hooks/tests/test_pre_tool_grounding.py's _StubGuardianServer subclasses
-# BaseHTTPRequestHandler; do_POST is called by the base class's request dispatch
+# BaseHTTPRequestHandler, and so does scripts/rerank_server.py's Handler (GET /health,
+# POST /rerank); do_GET and do_POST are called by the base class's request dispatch
 # by name convention (do_<METHOD>), never directly in our code.
+_ = do_GET
 _ = do_POST
 
 # ── scripts/redteam/loci_adversarial_harness.py dataclass fields

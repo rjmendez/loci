@@ -8,14 +8,39 @@ SAFETY: This script writes 384-dim vectors to the local SQLite memory_embeddings
 The Qdrant pipeline uses 768-dim nomic-embed-text. Do NOT add Qdrant writes here.
 Run with --dry-run first to preview changes.
 """
-import sqlite3, json, os, sys
+import json
+import logging
+import os
+import sqlite3
+import sys
+
 from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DRY_RUN = "--dry-run" in sys.argv
 
-print(f"Loading embedding model: {MODEL_NAME}")
-model = SentenceTransformer(MODEL_NAME)
+def resolve_device(environ=None, torch_module=None):
+    """Device for the embedder: MNEM_DEVICE (default "cuda"). A CUDA request that torch cannot honour falls back to
+    CPU with a WARNING (never silently); MNEM_REQUIRE_CUDA=1 makes it an error. Needs an interpreter with CUDA torch."""
+    environ = os.environ if environ is None else environ
+    device = environ.get("MNEM_DEVICE", "cuda").strip() or "cuda"
+    if not device.startswith("cuda"):
+        return device
+    if torch_module is None:
+        import torch as torch_module
+    if torch_module.cuda.is_available():
+        return device
+    msg = (f"MNEM_DEVICE={device!r} but torch {getattr(torch_module, '__version__', '?')} has no usable CUDA; "
+           "embedding on CPU (use an interpreter with CUDA torch)")
+    if environ.get("MNEM_REQUIRE_CUDA", "") not in ("", "0"):
+        raise RuntimeError(msg)
+    logging.warning(msg)
+    return "cpu"
+
+
+DEVICE = resolve_device()
+print(f"Loading embedding model: {MODEL_NAME} on {DEVICE}")
+model = SentenceTransformer(MODEL_NAME, device=DEVICE)
 print("Model loaded.")
 test_vec = model.encode("dimension check", normalize_embeddings=True)
 assert len(test_vec) == 384, f"ABORT: Expected 384-dim from {MODEL_NAME}, got {len(test_vec)}. Wrong model loaded?"

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loci"
+version = "0.1.0"
+description = "Policy-aware retrieval, memory, and LLM routing library"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0", "qdrant-client>=1.7"]
+litellm = ["litellm>=1.0", "httpx>=0.24"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+analytics = ["duckdb>=0.10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["loci*"]
