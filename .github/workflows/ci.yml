@@ -35,7 +35,8 @@ jobs:
           pip install --upgrade pip
           pip install -e ".."
           pip install -e ".[test]"
-          pip install pytest pytest-asyncio pytest-timeout pytest-benchmark
+          # pytest 9.2.0 breaks pytest-benchmark 5.3.0 (AttributeError: 'Function' object has no attribute '_nodeid' at fixture setup); lift once a fixed benchmark release exists
+          pip install "pytest<9.2" pytest-asyncio pytest-timeout pytest-benchmark
 
       - name: Run tests
         run: pytest tests/ -v --tb=short --timeout=60
