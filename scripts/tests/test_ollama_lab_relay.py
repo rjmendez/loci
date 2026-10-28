@@ -61,6 +61,12 @@ class FakeUpstream(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 
+    def do_DELETE(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._record(body)
+        self.send_response(204)
+        self.end_headers()
+
 
 def serve(handler):
     srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -152,3 +158,14 @@ def test_default_upstream_is_the_lab_name_not_an_ip():
     host = fresh.UPSTREAM.hostname
     assert fresh.UPSTREAM.scheme == "https" and host.endswith(".lab.floppydicks.net")
     assert not all(part.isdigit() for part in host.split("."))
+
+
+def test_delete_with_body_is_forwarded_with_its_method(stack):
+    """Ollama's model delete is DELETE /api/delete with a JSON body; the relay serves every method, not just GET and POST."""
+    front, _ = stack
+    conn = http.client.HTTPConnection("127.0.0.1", front, timeout=10)
+    conn.request("DELETE", "/api/delete", body=b'{"model":"m:1"}', headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp.read()
+    assert resp.status == 204
+    assert [(r["method"], r["path"], r["body"]) for r in FakeUpstream.seen] == [("DELETE", "/api/delete", b'{"model":"m:1"}')]
