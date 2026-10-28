@@ -313,6 +313,7 @@ _ladybug_store = None                     # LadybugStore singleton once initiali
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
 _ladybug_last_error = ""                  # why the store last failed to open (truncated); "" while healthy
+_ladybug_unopened = None                  # last store whose first open failed: health still reports its probe/crash detail
 _ladybug_since = ""                       # UTC ISO time of the first failure in the current run of failures
 _ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
 _ladybug_backfill_lock = threading.Lock()  # own lock: _ladybug_lock is non-reentrant and already held on one path
@@ -343,7 +344,7 @@ def _get_ladybug(backfill: bool = True):
     use the graph.
     """
     global _ladybug_store, _ladybug_failed, _ladybug_last_attempt, _ladybug_backfilled
-    global _ladybug_last_error, _ladybug_since
+    global _ladybug_last_error, _ladybug_since, _ladybug_unopened
     if _ladybug_store is not None:
         return _ladybug_backfill_once(backfill)
     if _ladybug_failed:
@@ -367,6 +368,7 @@ def _get_ladybug(backfill: bool = True):
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
             ks = _kz.LadybugStore(str(MEMORY_DIR / "graph.ladybug"))
             if not ks.available():
+                _ladybug_unopened = ks
                 # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
                 why = getattr(ks, "last_open_error", "") or _kz._DLL_SETUP_ERROR or "lock contention or transient IO"
@@ -420,7 +422,8 @@ def _ladybug_health_state() -> str:
     """Read-only view of the LadybugDB store state for loci_health, WITHOUT grabbing the
     single-writer lock (a RO probe never steals a writer's lock): 'available' (open +
     readable now) | 'contended' (store up but another process holds Kuzu's writer lock
-    right now — a RO open fails) | 'latched' (permanent failure, won't retry) |
+    right now — a RO open fails) | 'crashed' (the probe child died opening the database; never
+    opened in-process) | 'latched' (permanent failure, won't retry) |
     'backoff' (transient failure, retrying after the window) | 'unavailable' (not yet
     initialized / unknown). With per-op leasing the store no longer holds the lock
     between ops, so 'contended' is transient and self-heals. Never raises.
@@ -444,6 +447,8 @@ def _ladybug_health_state() -> str:
             # rather than reporting the attempt as an unknown.
             return _ladybug_closed_state() or "unavailable"
         probe = getattr(store, "readable_probe", None)
+        if getattr(store, "probe_state", "") == "crashed":
+            return "crashed"
         if probe is not None and not probe():
             return "contended"
         return "available"
@@ -8668,6 +8673,9 @@ def loci_health() -> str:
         pid = _ladybug_writer_pid()
         if pid is not None:
             out["ladybug_writer_pid"] = pid
+        report = getattr(_ladybug_store or _ladybug_unopened, "health_report", None)
+        if report is not None:
+            out["ladybug_detail"] = report()
         if _ladybug_last_error:
             out["ladybug_last_error"] = _ladybug_last_error
             out["ladybug_failing_since"] = _ladybug_since
@@ -8765,6 +8773,12 @@ def loci_health() -> str:
                 + (f" since {_ladybug_since}" if _ladybug_since else "")
                 + (f": {_ladybug_last_error}" if _ladybug_last_error else "")
                 + "); code-graph and code-to-memory tools are unavailable until the server restarts"
+            )
+        detail = out.get("ladybug_detail") or {}
+        if detail.get("probe_state") == "crashed":
+            failures.append(
+                f"ladybug: {detail.get('last_crash_reason')}; the database is not opened in-process "
+                f"(WAL quarantines: {detail.get('quarantine_count')})"
             )
         if out.get("ollama_gen_model_present") is False:
             failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
