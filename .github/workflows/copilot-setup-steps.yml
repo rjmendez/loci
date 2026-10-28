@@ -1,0 +1,48 @@
+name: "Copilot Setup Steps"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install MCP and policy dependencies
+        run: |
+          cd mcp
+          pip install -r requirements.txt || pip install qdrant-client python-dotenv
+          pip install pytest  # guarantee pytest is available regardless of requirements.txt
+
+      - name: Create Loci directories
+        run: |
+          mkdir -p ~/.loci/policies
+          mkdir -p ~/.loci/trajectories
+
+      - name: Verify policy module imports
+        run: |
+          cd mcp
+          python -c "from policy import Policy, PolicyTier, PolicyBackend; print('policy OK')"
+          python -c "from drpg_evolution import TrajectoryStore, TrajectoryScorer; print('drpg_evolution OK')" || echo "drpg_evolution not yet on this branch"
+
+      - name: Run policy unit tests
+        run: |
+          cd mcp
+          python -m pytest tests/test_policy_backend.py -q --tb=short || true

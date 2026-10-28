@@ -18,10 +18,52 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Tuple
+
+# orjson is 3-5x faster than stdlib json for JSONL hot paths.  Fall back to
+# stdlib transparently so the module works without the optional dependency.
+
+# Characters that Python's str.splitlines() treats as line endings but that
+# neither orjson nor json.dumps(ensure_ascii=False) escapes automatically:
+#   U+0085 NEXT LINE (C1 control code)
+#   U+2028 LINE SEPARATOR
+#   U+2029 PARAGRAPH SEPARATOR
+# Leaving these literal in a JSONL record corrupts the file: splitlines()
+# splits the line, and subsequent readers parse the tail as a separate (broken)
+# JSON object.  Escape them in both serialisation paths.
+_SPLITLINES_ESCAPES = {
+    "\x85":   "\\u0085",
+    "\u2028": "\\u2028",
+    "\u2029": "\\u2029",
+}
+
+
+def _escape_splitlines(s: str) -> str:
+    for ch, esc in _SPLITLINES_ESCAPES.items():
+        s = s.replace(ch, esc)
+    return s
+
+
+try:
+    import orjson as _orjson
+
+    def _json_loads(b):  # type: ignore[misc]
+        return _orjson.loads(b)
+
+    def _json_dumps(obj) -> str:  # type: ignore[misc]
+        return _escape_splitlines(_orjson.dumps(obj).decode("utf-8"))
+
+except ImportError:
+    def _json_loads(b):  # type: ignore[misc]
+        return json.loads(b)
+
+    def _json_dumps(obj) -> str:  # type: ignore[misc]
+        return _escape_splitlines(json.dumps(obj, ensure_ascii=False))
 
 import caller_identity
 
@@ -203,11 +245,11 @@ def _load_manifest(investigation_id: str) -> dict | None:
         p = Path(key)
         if not p.exists():
             return None
-        raw = p.read_text()
+        raw = p.read_text(encoding="utf-8")
         if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
             _manifest_cache.pop(next(iter(_manifest_cache)))
         _manifest_cache[key] = raw
-    manifest = json.loads(raw)
+    manifest = _json_loads(raw)
     # Backward compat: initialize ACL fields if missing (old investigations)
     if "owner" not in manifest:
         manifest["owner"] = ""
@@ -222,8 +264,8 @@ def _load_manifest_fresh(investigation_id: str) -> dict | None:
     p = _root() / investigation_id / "manifest.json"
     if not p.exists():
         return None
-    raw = p.read_text()
-    manifest = json.loads(raw)
+    raw = p.read_text(encoding="utf-8")
+    manifest = _json_loads(raw)
     if "owner" not in manifest:
         manifest["owner"] = ""
     if "acl" not in manifest:
@@ -240,7 +282,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w") as f:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp_path, path)
     except Exception:
@@ -291,7 +333,7 @@ def _acquire_file_lock(fd: int, path: Path, *, exclusive: bool, timeout_s: float
 def _locked_file(path: Path, mode: str, *, exclusive: bool = True, timeout_s: float | None = None):
     """Open ``path`` and hold a bounded advisory lock for the caller's critical section."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, mode) as fh:
+    with open(path, mode, encoding=None if "b" in mode else "utf-8") as fh:
         _acquire_file_lock(fh.fileno(), path, exclusive=exclusive, timeout_s=timeout_s)
         try:
             yield fh
@@ -302,15 +344,51 @@ def _locked_file(path: Path, mode: str, *, exclusive: bool = True, timeout_s: fl
                 logger.debug("_locked_file: fail-open swallow: %r", exc)
 
 
+# ---------------------------------------------------------------------------
+# JSONL mtime cache — avoids O(n) full-file scans on every read call.
+# Keyed by absolute path string; value is (parsed_rows, mtime_float).
+# The lock ensures thread-safe updates; dict insertion order gives cheap LRU eviction.
+# ---------------------------------------------------------------------------
+
+_JSONL_CACHE: dict[str, Tuple[list, float]] = {}
+_JSONL_CACHE_LOCK = threading.Lock()
+_JSONL_CACHE_MAX = 64  # max files cached simultaneously
+
+
+def _jsonl_cache_get(path_str: str, mtime: float) -> list | None:
+    """Return a copy of the cached rows if mtime matches, else None."""
+    with _JSONL_CACHE_LOCK:
+        entry = _JSONL_CACHE.get(path_str)
+        if entry is not None and entry[1] == mtime:
+            return list(entry[0])
+        return None
+
+
+def _jsonl_cache_set(path_str: str, content: list, mtime: float) -> None:
+    """Store parsed rows in the cache. Evicts the oldest entry when at capacity."""
+    with _JSONL_CACHE_LOCK:
+        if path_str not in _JSONL_CACHE and len(_JSONL_CACHE) >= _JSONL_CACHE_MAX:
+            oldest = next(iter(_JSONL_CACHE))
+            del _JSONL_CACHE[oldest]
+        _JSONL_CACHE[path_str] = (content, mtime)
+
+
+def _jsonl_cache_invalidate(path_str: str) -> None:
+    """Remove a cache entry immediately after a write, before the next stat."""
+    with _JSONL_CACHE_LOCK:
+        _JSONL_CACHE.pop(path_str, None)
+
+
 def _append_jsonl(path: Path, entry: dict) -> None:
     # Exclusive advisory lock around the append so concurrent writers (e.g. parallel
     # workflow agents recording to the same investigation) can't interleave a >PIPE_BUF
     # line and corrupt the file. Bound the wait so a contended writer returns a
     # retryable busy signal before the MCP transport times out and drops the response.
-    line = json.dumps(entry) + "\n"
+    line = _json_dumps(entry) + "\n"
     with _locked_file(path, "a", exclusive=True) as f:
         f.write(line)
         f.flush()
+    _jsonl_cache_invalidate(str(path))
 
 
 # rag_context_search access bookkeeping lives in its own per-investigation log.
@@ -328,19 +406,36 @@ def _is_access_row(rec) -> bool:
 
 
 def _read_jsonl(path: Path) -> list[dict]:
-    """Parse a JSONL log. Legacy access rows are dropped from findings.jsonl."""
-    if not path.exists():
+    """Parse a JSONL log with mtime-keyed cache. O(1) on warm hit.
+
+    Legacy access rows are dropped from findings.jsonl.
+    """
+    path_str = str(path)
+    try:
+        mtime = os.stat(path_str).st_mtime
+    except FileNotFoundError:
         return []
+    cached = _jsonl_cache_get(path_str, mtime)
+    if cached is not None:
+        return cached
+    # Cold read — parse every line individually so one corrupt append can't
+    # void the whole log (critical for retractions.jsonl tombstones).
+    # FileNotFoundError (race: deleted between stat and read) → empty.
+    # All other OSError (PermissionError, lock violation, …) propagates so
+    # callers that handle contention (e.g. wiring_obligation_resolve's
+    # except PermissionError handler) still see it.
     out = []
     bad = 0
     drop_access = path.name == FINDINGS_LOG_NAME
-    # Decode per line: one torn, non-UTF-8 append must cost that line, not the whole log
-    # (for retractions.jsonl that would void every tombstone in the investigation).
-    for line in path.read_bytes().decode("utf-8", errors="replace").splitlines():
+    try:
+        raw = path.read_bytes().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return []
+    for line in raw.splitlines():
         line = line.strip()
         if line:
             try:
-                rec = json.loads(line)
+                rec = _json_loads(line)
             except Exception:
                 bad += 1
                 continue
@@ -349,7 +444,8 @@ def _read_jsonl(path: Path) -> list[dict]:
             out.append(rec)
     if bad:
         logger.debug("_read_jsonl: skipped %d unparseable line(s) in %s", bad, path)
-    return out
+    _jsonl_cache_set(path_str, out, mtime)
+    return list(out)
 
 
 def _rewrite_jsonl_preserving(path: Path, update) -> int:
@@ -364,22 +460,23 @@ def _rewrite_jsonl_preserving(path: Path, update) -> int:
     skip_access = path.name == FINDINGS_LOG_NAME
     new_lines = []
     replaced = 0
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         rec = None
         if stripped:
             try:
-                rec = json.loads(stripped)
+                rec = _json_loads(stripped)
             except Exception:
                 rec = None
         if isinstance(rec, dict) and not (skip_access and _is_access_row(rec)):
             new = update(rec)
             if new is not None:
-                new_lines.append(json.dumps(new))
+                new_lines.append(_json_dumps(new))
                 replaced += 1
                 continue
         new_lines.append(line)
     _atomic_write_text(path, "\n".join(new_lines) + ("\n" if new_lines else ""))
+    _jsonl_cache_invalidate(str(path))
     return replaced
 
 

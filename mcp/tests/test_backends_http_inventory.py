@@ -142,15 +142,32 @@ def test_the_pool_and_an_env_pin_both_outrank_the_resident_model(ollama, monkeyp
     assert B.ollama_gen_model() == "env-gen:7b"
 
 
-def test_a_model_installed_after_the_first_lookup_is_seen_once_the_ttl_passes(ollama, monkeypatch):
+def test_an_empty_first_lookup_backs_off_and_the_model_is_seen_after_the_retry_window(ollama, monkeypatch):
+    """Main's RetryLatch is the cache: an empty inventory (HTTP empty, no CLI) is a failure, not an answer."""
     clock = [1000.0]
-    monkeypatch.setattr(B.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(B, "_ollama_list_clock", lambda: clock[0])
+    monkeypatch.setattr(B._ollama_list_latch, "_clock", lambda: clock[0])
     ollama.tags = []
     assert B._ollama_list() == {}
 
     ollama.tags = [_tag("late-arrival:3b", 2_000_000_000)]
-    clock[0] += B._INVENTORY_TTL_S - 1
+    clock[0] += 1
     assert B._ollama_list() == {}
 
-    clock[0] += 2
+    clock[0] += 70
     assert B._ollama_list() == {"late-arrival:3b": 2_000_000_000}
+
+
+def test_a_successful_http_inventory_is_served_from_the_cache_until_the_ttl_passes(ollama, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(B, "_ollama_list_clock", lambda: clock[0])
+    monkeypatch.setattr(B._ollama_list_latch, "_clock", lambda: clock[0])
+    ollama.tags = [_tag("first:3b", 2_000_000_000)]
+    assert B._ollama_list() == {"first:3b": 2_000_000_000}
+
+    ollama.tags = [_tag("second:3b", 3_000_000_000)]
+    clock[0] += B._OLLAMA_LIST_TTL_S - 1
+    assert B._ollama_list() == {"first:3b": 2_000_000_000}
+
+    clock[0] += 2
+    assert B._ollama_list() == {"second:3b": 3_000_000_000}

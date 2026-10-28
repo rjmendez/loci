@@ -34,7 +34,9 @@ import os
 import json
 import uuid
 import hashlib
+import logging
 import subprocess
+from collections import Counter
 from datetime import datetime, timezone
 
 # ── Config from env or defaults ────────────────────────────────────────────
@@ -44,6 +46,15 @@ OLLAMA_URL  = os.environ.get("OLLAMA_URL")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 COLLECTION  = os.environ.get("UA_COLLECTION", "understand_anything")
 BATCH_SIZE  = int(os.environ.get("UA_BATCH_SIZE", "32"))  # embed + upsert batch
+# Without OLLAMA_URL there is no default embedder: the vectors would come from a DIFFERENT model build
+# than Ollama's EMBED_MODEL and land in the same collection. Opt in with UA_EMBED_FALLBACK=fastembed.
+EMBED_FALLBACK = os.environ.get("UA_EMBED_FALLBACK", "").strip().lower()
+FASTEMBED_MODEL = os.environ.get("UA_FASTEMBED_MODEL", "nomic-ai/nomic-embed-text-v1.5")
+CUDA_DEVICE = int(os.environ.get("UA_CUDA_DEVICE", "0"))       # CUDA order, not nvidia-smi PCI order
+REQUIRE_CUDA = os.environ.get("UA_REQUIRE_CUDA", "") not in ("", "0")
+
+log = logging.getLogger("ua-ingest")
+DEGRADED = Counter()        # degraded outcomes in this run, printed in the summary
 
 try:
     import requests
@@ -64,10 +75,59 @@ def qdrant(method, path, **kwargs):
 
 _fastembed_model = None
 
-def embed_batch(texts):
-    """Embed texts via Ollama /api/embed, or fastembed if OLLAMA_URL is unset."""
-    global _fastembed_model
+
+def resolve_backend():
+    """Which embedder this run uses: "ollama", or "fastembed" only when explicitly requested.
+    Raises RuntimeError when neither is configured (no silent default)."""
     if OLLAMA_URL:
+        return "ollama"
+    if EMBED_FALLBACK == "fastembed":
+        return "fastembed"
+    raise RuntimeError(
+        "OLLAMA_URL is not set, so there is no embedder. Set OLLAMA_URL, or set UA_EMBED_FALLBACK=fastembed to "
+        f"opt in to the local fastembed model {FASTEMBED_MODEL!r} (a different build than Ollama's {EMBED_MODEL!r}; "
+        "its vectors are not interchangeable with Ollama's in the same collection)")
+
+
+def _fastembed_session_providers(model):
+    """Providers of the ONNX session inside a fastembed TextEmbedding, or None if fastembed hides it."""
+    try:
+        return list(model.model.model.get_providers())
+    except AttributeError:
+        return None
+
+
+def _load_fastembed():
+    """fastembed on CUDA when possible; every miss is warned about and counted (fatal with UA_REQUIRE_CUDA=1)."""
+    import onnxruntime as ort
+    from fastembed import TextEmbedding
+    log.warning("OLLAMA_URL is unset: embedding with fastembed %r instead of Ollama %r "
+                "(UA_EMBED_FALLBACK=fastembed); vectors are not interchangeable with Ollama's", FASTEMBED_MODEL, EMBED_MODEL)
+    DEGRADED["fastembed-instead-of-ollama"] += 1
+    if hasattr(ort, "preload_dlls") and "CUDAExecutionProvider" in ort.get_available_providers():
+        try:
+            ort.preload_dlls()
+        except Exception as e:
+            log.warning("ort.preload_dlls() raised %s: %s", type(e).__name__, str(e)[:200])
+            DEGRADED["preload-dlls-failed"] += 1
+    model = TextEmbedding(FASTEMBED_MODEL, providers=[("CUDAExecutionProvider", {"device_id": CUDA_DEVICE}),
+                                                      "CPUExecutionProvider"])
+    got = _fastembed_session_providers(model)
+    if got is None or not got or got[0] != "CUDAExecutionProvider":
+        msg = (f"fastembed CUDA was requested (device_id={CUDA_DEVICE}) but the session runs on "
+               f"{got if got is not None else 'unknown providers (fastembed did not expose the session)'}; "
+               "install fastembed-gpu / onnxruntime-gpu and the nvidia-cudnn wheels, or expect ~10x slower embedding")
+        DEGRADED["cuda-not-obtained"] += 1
+        log.warning(msg)
+        if REQUIRE_CUDA:
+            raise RuntimeError(msg)
+    return model
+
+
+def embed_batch(texts):
+    """Embed texts via Ollama /api/embed, or via fastembed when UA_EMBED_FALLBACK=fastembed (see resolve_backend)."""
+    global _fastembed_model
+    if resolve_backend() == "ollama":
         r = requests.post(
             f"{OLLAMA_URL}/api/embed",
             json={"model": EMBED_MODEL, "input": texts},
@@ -75,10 +135,8 @@ def embed_batch(texts):
         )
         r.raise_for_status()
         return r.json()["embeddings"]
-    # Fallback: fastembed TextEmbedding (CPU, same nomic-embed-text model)
     if _fastembed_model is None:
-        from fastembed import TextEmbedding
-        _fastembed_model = TextEmbedding("nomic-ai/nomic-embed-text-v1.5")
+        _fastembed_model = _load_fastembed()
     return [v.tolist() for v in _fastembed_model.embed(texts)]
 
 
@@ -145,6 +203,10 @@ def main():
 
     if not QDRANT_URL:
         sys.exit("ERROR: QDRANT_URL is required")
+    try:
+        backend = resolve_backend()
+    except RuntimeError as e:
+        sys.exit(f"ERROR: {e}")
 
     project_root = os.path.abspath(sys.argv[1])
     ua_dir       = os.path.join(project_root, ".understand-anything")
@@ -161,6 +223,7 @@ def main():
 
     print(f"\nua-ingest: {project_root}")
     print(f"  Graph:  {graph_path}")
+    print(f"  Embedder: {backend}")
 
     # ── Load graph ──────────────────────────────────────────────────────────
     with open(graph_path) as f:
@@ -286,6 +349,9 @@ def main():
         type_counts[t] = type_counts.get(t, 0) + 1
     for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
         print(f"    {t:15s} {c}")
+
+    if DEGRADED:
+        print(f"\n  DEGRADED: {dict(DEGRADED)}")
 
     print(f"\nIngestion complete. Search with:")
     print(f"  QDRANT_URL={QDRANT_URL}")

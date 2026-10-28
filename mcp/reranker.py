@@ -27,8 +27,8 @@ Substrate facts this is built against (session grounding):
     cuda:0 maps to is host-specific; see scripts/gpu_placement.md.
   - [rerank] server.py already reranks on GPU with a lazily-loaded, globally-cached
     CrossEncoder. This module mirrors that: lazy-init, cache in a module global, and
-    on load failure set the cache to `False` PERMANENTLY so we never re-attempt a
-    known-broken load per call.
+    on load failure remember it (`False`) and retry after an exponential backoff; only an
+    ImportError is permanent.
   - [pattern:fail-open] EVERY op fails open (mirror embed_ops.py / llm_local.py): if
     the model can't load (or no model_fn is injected and the real model is
     unavailable), we return the docs in ORIGINAL order with score=None and set the
@@ -50,10 +50,15 @@ The existing server.py `_get_cross_encoder()` / `_cross_encoder` global and the 
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import os
 import threading
-from typing import Callable, List, Optional, Sequence
+import time
+from typing import Callable, Iterator, List, Optional, Sequence
+
+from retry_latch import RetryLatch
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +68,76 @@ _DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Module-global model cache, mirroring server.py's `_cross_encoder` singleton [rerank]:
 #   None  -> not yet attempted (lazy)
-#   False -> load failed permanently; never retry (fail-open)
+#   False -> the last load failed; _latch decides when (or whether) to try again
 #   obj   -> a loaded CrossEncoder
 _model = None
+# Transient load failures retry with exponential backoff (30 s, 60 s ... capped at 10 min), like
+# _get_qdrant/_get_ladybug; only ImportError is permanent.
+_RETRY_BASE_S = 30.0
+_RETRY_CAP_S = 600.0
+_latch = RetryLatch("reranker", base_s=_RETRY_BASE_S, cap_s=_RETRY_CAP_S)
 _model_lock = threading.Lock()
 # Which model name `_model` was loaded for, so a changed RERANK_MODEL forces a reload.
 _model_name: Optional[str] = None
+# Where the loaded model runs ("cuda" / "cpu" / "http") and the torch build that decided it.
+# Set by _get_model, read by health(): a CPU-only torch wheel on a GPU host is otherwise silent.
+_device: Optional[str] = None
+_torch_build: Optional[str] = None
+# Which card the model landed on and why ({"index", "name", "free_mb_at_load", "reason", "cards_seen"}); health() reports it.
+_placement: dict = {}
+
+#: A card must have this much free VRAM to be a candidate (bge-reranker-v2-m3 fp32 weights are ~2.2 GB, plus activations).
+DEFAULT_MIN_FREE_MB = 2600
+
+
+def _device_setting() -> str:
+    """LOCI_RERANK_DEVICE: "auto" (default; the card with the most free VRAM), "cpu", "cuda" (same as auto) or "cuda:N"."""
+    return (os.environ.get("LOCI_RERANK_DEVICE") or "auto").strip().lower() or "auto"
+
+
+def _cuda_cards(torch) -> List[dict]:
+    """Every CUDA card torch can see with its free/total VRAM in MiB, read now. A card whose query fails is reported
+    with free_mb None (never a guess)."""
+    cards = []
+    for i in range(int(torch.cuda.device_count())):
+        card = {"index": i, "name": "", "free_mb": None, "total_mb": None}
+        try:
+            card["name"] = str(torch.cuda.get_device_name(i))
+            free, total = torch.cuda.mem_get_info(i)
+            card["free_mb"], card["total_mb"] = int(free) // (1 << 20), int(total) // (1 << 20)
+        except Exception as exc:  # noqa: BLE001 - one broken card must not hide the others
+            card["error"] = f"{type(exc).__name__}: {exc}"
+        cards.append(card)
+    return cards
+
+
+def choose_devices(cards: List[dict], setting: str, min_free_mb: int) -> tuple:
+    """``(candidates, reason)``: the cards to try, best first, and why. No static pin: ``auto`` ranks by free VRAM at
+    load time, so the model lands wherever there is room (Ollama frees memory by unloading idle models).
+
+    * ``cpu``      -> no candidates (a deliberate choice).
+    * ``cuda:N``   -> that one card, if torch sees it with a readable free figure.
+    * ``auto``/``cuda`` -> every card with at least *min_free_mb* free, most free first.
+    An empty candidate list always carries the reason, so a CPU placement is never unexplained.
+    """
+    if setting == "cpu":
+        return [], "LOCI_RERANK_DEVICE=cpu"
+    seen = ", ".join(f"cuda:{c['index']} {c['name'] or '?'} {c['free_mb'] if c['free_mb'] is not None else 'unreadable'} MiB free"
+                     for c in cards) or "none"
+    if setting.startswith("cuda:"):
+        try:
+            want = int(setting.split(":", 1)[1])
+        except ValueError:
+            return [], f"LOCI_RERANK_DEVICE={setting!r} is not cuda:<integer>; cards: {seen}"
+        match = [c for c in cards if c["index"] == want and c["free_mb"] is not None]
+        return (match, f"LOCI_RERANK_DEVICE={setting}") if match else ([], f"{setting} not usable; cards: {seen}")
+    if not cards:
+        return [], "torch sees no CUDA card"
+    ranked = sorted((c for c in cards if c["free_mb"] is not None and c["free_mb"] >= min_free_mb),
+                    key=lambda c: c["free_mb"], reverse=True)
+    if not ranked:
+        return [], f"no card has {min_free_mb} MiB free; cards: {seen}"
+    return ranked, f"most free VRAM of: {seen}"
 
 
 def _model_id() -> str:
@@ -124,43 +193,300 @@ def _get_model():
     """Lazy-init + globally cache the reranker backend (HTTP shim or local
     sentence_transformers.CrossEncoder on GPU if available).
 
-    Mirrors server.py ~588-609: double-checked locking, cache in a module global, and on
-    ANY load failure set the global to `False` permanently so we never re-attempt per call.
-    Returns the loaded model, or None if unavailable/failed (fail-open — never raises).
+    Mirrors server.py ~588-609: double-checked locking and a module-global cache. A load failure
+    does NOT latch for the life of the process: a transient error (MemoryError/OSError under commit
+    pressure, a Hugging Face HEAD blip, one CUDA OOM) is retried after an exponential backoff
+    (_latch). Only ImportError (sentence-transformers genuinely absent) is permanent. Every failure
+    logs at WARNING and is visible in health(). Returns the loaded model, or None while unavailable
+    (fail-open -- never raises).
     """
-    global _model, _model_name
+    global _model, _model_name, _device, _torch_build, _placement
     http_url = _http_url()
     wanted = f"http:{http_url}" if http_url else _model_id()
     # Fast path: already loaded for the currently-configured model.
-    if _model is not None and _model_name == wanted:
-        return _model if _model is not False else None
+    if _model is not None and _model is not False and _model_name == wanted:
+        return _model
     with _model_lock:
-        if _model is not None and _model_name == wanted:  # re-check under lock
-            return _model if _model is not False else None
+        if _model is not None and _model is not False and _model_name == wanted:  # re-check under lock
+            return _model
+        if _model_name != wanted:
+            # A different model is configured now: the old failure says nothing about it.
+            _model = None
+            _latch.reset()
         _model_name = wanted
         if http_url:
             _model = _HttpCrossEncoder(http_url)
+            _device, _torch_build = "http", None
+            _latch.success()
             logger.info("Reranker enabled via HTTP backend (%s)", http_url)
             return _model
+        if not _latch.allow():       # permanent, or inside the backoff window after a failure
+            return None
         try:
-            # Resolve device lazily: cuda:0 when torch sees a GPU, else cpu [hardware].
-            device = "cpu"
+            # Place the model where there is room NOW (no static pin): rank the CUDA cards by free VRAM, try them best
+            # first, and fall back to CPU only when no card qualifies [hardware].
+            build = None
+            cards: List[dict] = []
+            torch = None
             try:
                 import torch
+                build = str(getattr(torch, "__version__", "")) or None
                 if torch.cuda.is_available():
-                    device = "cuda"
-            except Exception:
-                device = "cpu"
+                    cards = _cuda_cards(torch)
+            except Exception as exc:  # noqa: BLE001 - reported through the reason below
+                logger.warning("Reranker: probing torch/CUDA failed (%s: %s); treating the host as having no GPU",
+                               type(exc).__name__, exc)
+            min_free = int(_env_number("LOCI_RERANK_MIN_FREE_MB", DEFAULT_MIN_FREE_MB))
+            candidates, reason = choose_devices(cards, _device_setting(), min_free)
             from sentence_transformers import CrossEncoder
-            _model = CrossEncoder(wanted, max_length=512, device=device)
-            logger.info("Reranker enabled (%s on %s)", wanted, device)
-        except ImportError:
-            logger.debug("sentence-transformers not installed — reranking disabled")
-            _model = False
+            model, chosen, last_exc = None, None, None
+            for card in candidates:
+                try:
+                    model = CrossEncoder(wanted, max_length=512, device=f"cuda:{card['index']}")
+                    chosen = card
+                    break
+                except ImportError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - e.g. CUDA OOM because another process took the memory first
+                    last_exc = exc
+                    logger.warning("Reranker could not load %s on cuda:%s (%s, %s MiB free at the time): %s: %s%s", wanted,
+                                   card["index"], card["name"], card["free_mb"], type(exc).__name__, exc,
+                                   "; trying the next card" if card is not candidates[-1] else "")
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if model is None and candidates:
+                # Cards qualified but every load failed: a transient condition (memory taken meanwhile), not a reason
+                # to quietly latch onto the CPU. The latch retries after its backoff.
+                raise last_exc
+            if model is None:
+                model = CrossEncoder(wanted, max_length=512, device="cpu")
+            device = "cuda" if chosen else "cpu"
+            _model = model
+            _device, _torch_build = device, build
+            _placement = {"index": chosen["index"] if chosen else None, "name": chosen["name"] if chosen else None,
+                          "free_mb_at_load": chosen["free_mb"] if chosen else None, "reason": reason,
+                          "cards_seen": [{k: c.get(k) for k in ("index", "name", "free_mb", "total_mb")} for c in cards]}
+            _latch.success()
+            if device == "cpu":
+                # Loud on purpose: a CPU build of torch on a GPU host once made every search take minutes.
+                logger.warning(
+                    "Reranker %s runs on CPU (torch %s; %s): expect ~0.1-0.3 s per (query, doc) pair; "
+                    "searches are capped by LOCI_RERANK_BUDGET_S", wanted, build, reason)
+            else:
+                logger.info("Reranker enabled (%s on cuda:%s %s, %s MiB free at load; %s)", wanted, chosen["index"],
+                            chosen["name"], chosen["free_mb"], reason)
         except Exception as exc:
-            logger.warning("Reranker init failed — reranking disabled: %s", exc)
             _model = False
+            _latch.failure(exc)      # ImportError -> permanent; anything else retried after a backoff
+            return None
     return _model if _model is not False else None
+
+
+# --------------------------------------------------------------------------- #
+# Per-search budget: a rerank must never make a search take minutes.
+#
+# One rag_context_search scores (collections x expanded queries x limit*5) candidates plus a final
+# top-20 pass: 60 pairs with expansion off, ~260 with five query variants on one collection and ~510
+# on two. At 0.1-0.3 s per pair on a CPU-only torch that is minutes. The budget is a wall-clock
+# deadline plus an optional pair cap, shared by every scoring call inside one search.
+#
+#   LOCI_RERANK_BUDGET_S   wall-clock seconds per search (default 20; 0 disables the deadline)
+#   LOCI_RERANK_MAX_PAIRS  pairs scored per search by the candidate stage (default 0 = no cap)
+#   LOCI_RERANK_CHUNK      pairs per model.predict call (default 16): the deadline is checked
+#                          between chunks, so a search overshoots by at most one chunk
+#
+# The candidate stage may use at most (1 - FINAL_RESERVE) of the budget; the last quarter is held for
+# the final cross-collection pass against the original query so it still runs after a slow
+# candidate stage. When the budget runs out the scores obtained are kept, unscored rows follow in
+# their original (bi-encoder) order, and the search is marked degraded.
+# --------------------------------------------------------------------------- #
+DEFAULT_BUDGET_S = 20.0
+DEFAULT_CHUNK = 16
+FINAL_RESERVE = 0.25
+
+
+def _env_number(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+class RerankBudget:
+    """Wall-clock and pair budget shared by every scoring call of one search. `clock` is
+    injectable so tests drive the deadline exactly."""
+
+    def __init__(self, budget_s: Optional[float] = None, max_pairs: Optional[int] = None,
+                 chunk: Optional[int] = None, clock: Optional[Callable[[], float]] = None):
+        clock = _now if clock is None else clock   # resolved per construction so tests can swap _now
+        self.budget_s = _env_number("LOCI_RERANK_BUDGET_S", DEFAULT_BUDGET_S) if budget_s is None else float(budget_s)
+        self.max_pairs = int(_env_number("LOCI_RERANK_MAX_PAIRS", 0)) if max_pairs is None else int(max_pairs)
+        self.chunk = max(1, int(_env_number("LOCI_RERANK_CHUNK", DEFAULT_CHUNK)) if chunk is None else int(chunk))
+        self._clock = clock
+        self.started = clock()
+        self.scored = 0
+        self.skipped = 0
+        self.stage_scored = 0      # candidate-stage pairs, the ones max_pairs caps
+        self.scoring_s = 0.0
+        self.reason: Optional[str] = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.reason is not None
+
+    def _remaining_s(self, final: bool) -> Optional[float]:
+        if self.budget_s <= 0:
+            return None
+        usable = self.budget_s if final else self.budget_s * (1.0 - FINAL_RESERVE)
+        return usable - (self._clock() - self.started)
+
+    def allowance(self, final: bool = False) -> tuple[int, Optional[str]]:
+        """(pairs that may be scored now, why it is 0 or limited). A huge number means unlimited."""
+        left = self._remaining_s(final)
+        if left is not None and left <= 0:
+            return 0, "deadline"
+        if not final and self.max_pairs > 0:
+            cap = self.max_pairs - self.stage_scored
+            if cap <= 0:
+                return 0, "max_pairs"
+            return cap, "max_pairs"
+        return 1 << 30, None
+
+    def summary(self) -> dict:
+        return {
+            "degraded": self.degraded,
+            "reason": self.reason,
+            "pairs_scored": self.scored,
+            "pairs_skipped": self.skipped,
+            "seconds": round(self.scoring_s, 3),
+            "budget_s": self.budget_s,
+            "max_pairs": self.max_pairs,
+        }
+
+
+_current_budget: contextvars.ContextVar[Optional[RerankBudget]] = contextvars.ContextVar(
+    "loci_rerank_budget", default=None)
+
+_stats_lock = threading.Lock()
+_stats: dict = {
+    "searches": 0, "degraded_searches": 0, "pairs_scored": 0, "pairs_skipped": 0,
+    "last_seconds": None, "last_degraded": None, "last_reason": None, "last_at": None,
+}
+
+
+def _record(b: RerankBudget) -> None:
+    """Fold a finished search into the process-wide counters (only searches that reached the scorer)."""
+    if b.scored == 0 and b.skipped == 0 and b.reason is None:
+        return
+    with _stats_lock:
+        _stats["searches"] += 1
+        _stats["degraded_searches"] += 1 if b.degraded else 0
+        _stats["pairs_scored"] += b.scored
+        _stats["pairs_skipped"] += b.skipped
+        _stats["last_seconds"] = round(b.scoring_s, 3)
+        _stats["last_degraded"] = b.degraded
+        _stats["last_reason"] = b.reason
+        _stats["last_at"] = time.time()
+
+
+@contextlib.contextmanager
+def search_budget(**kwargs) -> Iterator[RerankBudget]:
+    """Open the budget for one search. Scoring calls inside it (any depth, same thread) draw on it.
+    Re-entrant: a nested scope shares the outer budget, and only the outermost records stats."""
+    outer = _current_budget.get()
+    if outer is not None:
+        yield outer
+        return
+    b = RerankBudget(**kwargs)
+    token = _current_budget.set(b)
+    try:
+        yield b
+    finally:
+        _current_budget.reset(token)
+        _record(b)
+
+
+def score_pairs(model, pairs: Sequence, budget: RerankBudget, final: bool = False) -> List[Optional[float]]:
+    """Score `pairs` with `model.predict` in chunks until `budget` runs out.
+
+    Returns one entry per pair: the float score, or None for pairs left unscored. A prefix is
+    scored, the tail is not. Exceptions from `model.predict` propagate (callers fail open on them);
+    nothing is recorded for the failed chunk.
+    """
+    n = len(pairs)
+    scores: List[Optional[float]] = [None] * n
+    i = 0
+    stopped: Optional[str] = None
+    while i < n:
+        allowed, why = budget.allowance(final)
+        if allowed <= 0:
+            stopped = why
+            break
+        take = min(budget.chunk, allowed, n - i)
+        t0 = budget._clock()
+        out = list(model.predict(list(pairs[i:i + take])))
+        budget.scoring_s += budget._clock() - t0
+        if len(out) != take:
+            raise ValueError(f"reranker returned {len(out)} scores for {take} pairs")
+        scores[i:i + take] = [float(x) for x in out]
+        i += take
+        budget.scored += take
+        if not final:
+            budget.stage_scored += take
+    if i < n:
+        budget.skipped += n - i
+        if budget.reason is None:
+            budget.reason = stopped or "deadline"
+    return scores
+
+
+def mark_error(budget: RerankBudget, exc: BaseException) -> None:
+    """A predict() failure means this rerank did not happen: report the search as degraded."""
+    if budget.reason is None:
+        budget.reason = "error:" + type(exc).__name__
+
+
+def stats() -> dict:
+    with _stats_lock:
+        return dict(_stats)
+
+
+def health() -> dict:
+    """Reranker state for loci_health: model, device, torch build and rerank counters. Never raises
+    and never loads the model."""
+    try:
+        if _model is None:
+            state = "not_loaded"
+        elif _model is False:
+            state = "unavailable"
+        else:
+            state = "loaded"
+        out = {
+            "model": _model_id(),
+            "state": state,
+            "device": _device if state == "loaded" else None,
+            "device_index": _placement.get("index") if state == "loaded" else None,
+            "device_name": _placement.get("name") if state == "loaded" else None,
+            "placement": dict(_placement) if state == "loaded" else None,
+            "torch": _torch_build,
+            "latch": _latch.state(),
+            "budget_s": _env_number("LOCI_RERANK_BUDGET_S", DEFAULT_BUDGET_S),
+            "max_pairs": int(_env_number("LOCI_RERANK_MAX_PAIRS", 0)),
+        }
+        out.update(stats())
+        return out
+    except Exception as exc:  # health must report, never raise
+        return {"state": "error", "error": f"{type(exc).__name__}: {exc}"}
 
 
 def get_model():
