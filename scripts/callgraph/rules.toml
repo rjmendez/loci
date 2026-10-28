@@ -45,6 +45,7 @@ wrapping = [
     "dataclasses.dataclass",
     "property",
     "_writes",
+    "_ttl_memo",
 ]
 
 # extract/registry.py's REG-FN rule: a module-level function whose NAME
