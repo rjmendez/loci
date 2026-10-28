@@ -313,6 +313,7 @@ _ladybug_store = None                     # LadybugStore singleton once initiali
 _ladybug_failed = False                   # PERMANENT-failure latch (ladybug unimportable) — don't retry
 _ladybug_last_attempt = 0.0               # monotonic ts of last TRANSIENT init failure
 _ladybug_last_error = ""                  # why the store last failed to open (truncated); "" while healthy
+_ladybug_unopened = None                  # last store whose first open failed: health still reports its probe/crash detail
 _ladybug_since = ""                       # UTC ISO time of the first failure in the current run of failures
 _ladybug_backfilled = False               # one-time findings backfill attempted (deferred past health)
 _ladybug_backfill_lock = threading.Lock()  # own lock: _ladybug_lock is non-reentrant and already held on one path
@@ -343,7 +344,7 @@ def _get_ladybug(backfill: bool = True):
     use the graph.
     """
     global _ladybug_store, _ladybug_failed, _ladybug_last_attempt, _ladybug_backfilled
-    global _ladybug_last_error, _ladybug_since
+    global _ladybug_last_error, _ladybug_since, _ladybug_unopened
     if _ladybug_store is not None:
         return _ladybug_backfill_once(backfill)
     if _ladybug_failed:
@@ -367,11 +368,12 @@ def _get_ladybug(backfill: bool = True):
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)  # ladybug won't create parents
             ks = _kz.LadybugStore(str(MEMORY_DIR / "graph.ladybug"))
             if not ks.available():
+                _ladybug_unopened = ks
                 # Import OK but open failed = single-writer lock contention: transient, retry after the backoff.
                 _ladybug_last_attempt = time.monotonic()
-                _ladybug_note_failure("store open failed (lock contention or transient IO)")
-                logger.warning("LadybugDB store unavailable (lock contention or transient IO?) "
-                               "— will retry after %ss.", _LADYBUG_RETRY_SECONDS)
+                why = getattr(ks, "last_open_error", "") or _kz._DLL_SETUP_ERROR or "lock contention or transient IO"
+                _ladybug_note_failure(f"store cannot open a database: {why}")
+                logger.warning("LadybugDB store unavailable (%s) — will retry after %ss.", why, _LADYBUG_RETRY_SECONDS)
                 return None
             _ladybug_store = ks
             _ladybug_last_attempt = 0.0
@@ -420,7 +422,8 @@ def _ladybug_health_state() -> str:
     """Read-only view of the LadybugDB store state for loci_health, WITHOUT grabbing the
     single-writer lock (a RO probe never steals a writer's lock): 'available' (open +
     readable now) | 'contended' (store up but another process holds Kuzu's writer lock
-    right now — a RO open fails) | 'latched' (permanent failure, won't retry) |
+    right now — a RO open fails) | 'crashed' (the probe child died opening the database; never
+    opened in-process) | 'latched' (permanent failure, won't retry) |
     'backoff' (transient failure, retrying after the window) | 'unavailable' (not yet
     initialized / unknown). With per-op leasing the store no longer holds the lock
     between ops, so 'contended' is transient and self-heals. Never raises.
@@ -444,6 +447,8 @@ def _ladybug_health_state() -> str:
             # rather than reporting the attempt as an unknown.
             return _ladybug_closed_state() or "unavailable"
         probe = getattr(store, "readable_probe", None)
+        if getattr(store, "probe_state", "") == "crashed":
+            return "crashed"
         if probe is not None and not probe():
             return "contended"
         return "available"
@@ -8668,6 +8673,9 @@ def loci_health() -> str:
         pid = _ladybug_writer_pid()
         if pid is not None:
             out["ladybug_writer_pid"] = pid
+        report = getattr(_ladybug_store or _ladybug_unopened, "health_report", None)
+        if report is not None:
+            out["ladybug_detail"] = report()
         if _ladybug_last_error:
             out["ladybug_last_error"] = _ladybug_last_error
             out["ladybug_failing_since"] = _ladybug_since
@@ -8766,6 +8774,12 @@ def loci_health() -> str:
                 + (f": {_ladybug_last_error}" if _ladybug_last_error else "")
                 + "); code-graph and code-to-memory tools are unavailable until the server restarts"
             )
+        detail = out.get("ladybug_detail") or {}
+        if detail.get("probe_state") == "crashed":
+            failures.append(
+                f"ladybug: {detail.get('last_crash_reason')}; the database is not opened in-process "
+                f"(WAL quarantines: {detail.get('quarantine_count')})"
+            )
         if out.get("ollama_gen_model_present") is False:
             failures.append(f"ollama_gen: model {_gen_model!r} not installed at the generation endpoint")
         if failures:
@@ -8819,6 +8833,81 @@ def loci_health() -> str:
         # Not debug-only: a silently failed assessment reads as "nothing wrong", the failure this block exists to end.
         logger.warning("loci_health: degradation assessment failed: %r", exc)
         out.setdefault("warnings", []).append(f"degradation assessment failed, status may be too optimistic: {exc!r}")
+
+    # Which device the reranker runs on and how often its budget cut a search short. A CPU-only torch wheel on a GPU host
+    # once made every rag_context_search take minutes with nothing reporting it.
+    try:
+        import reranker as _reranker
+        rr = _reranker.health()
+        out["reranker"] = rr
+        if rr.get("device") == "cpu":
+            out.setdefault("warnings", []).append(
+                f"reranker {rr.get('model')} runs on CPU (torch {rr.get('torch')}): searches are cut short by "
+                f"LOCI_RERANK_BUDGET_S={rr.get('budget_s')}; install a CUDA torch build or set RERANK_HTTP_URL")
+        if rr.get("degraded_searches"):
+            out.setdefault("warnings", []).append(
+                f"reranker budget cut {rr['degraded_searches']} of {rr.get('searches')} searches short "
+                f"(last: {rr.get('last_reason')}, {rr.get('last_seconds')}s)")
+    except Exception as exc:
+        logger.debug("loci_health: reranker probe failed: %r", exc)
+
+    # Lazy singletons that retry after a transient failure: show which are failing now, why, and when the next
+    # attempt is due (a permanent one needs a code or environment fix, not a wait).
+    try:
+        import backends as _backends
+        import qdrant_ops as _qops_latch
+        import verdict_ops as _verdict_ops
+        latches = {
+            "reranker": (out.get("reranker") or {}).get("latch"),
+            "sparse_embedder": _qops_latch.sparse_health(),
+            "verdict_backend": _verdict_ops.verdict_backend_health(),
+            "ollama_list": _backends.ollama_list_health(),
+        }
+        out["latches"] = latches
+        for lname, lst in latches.items():
+            if not lst or lst.get("ok"):
+                continue
+            if lst.get("permanent"):
+                out.setdefault("warnings", []).append(
+                    f"{lname} unavailable permanently: {lst.get('last_error')} (needs a fix, not a wait)")
+            else:
+                out.setdefault("warnings", []).append(
+                    f"{lname} failing ({lst.get('attempts')} attempt(s) since {lst.get('since')}): "
+                    f"{lst.get('last_error')}; next retry in {lst.get('next_retry_in_s')}s")
+    except Exception as exc:
+        logger.warning("loci_health: latch state probe failed: %r", exc)
+
+    # Silent-degradation surfaces from the 2026-10-19 fail-open audit: the GPU load signal behind load-aware routing,
+    # the cupy/numpy accelerator, and fallbacks that used to hand back a default without a word. Each degraded mode
+    # is a warning (never a status change: all of these are fail-open by design).
+    try:
+        import gpu_load as _gpu_load
+        caps = {"gpu_load": _gpu_load.gpu_load_health()}
+        gl = caps["gpu_load"]
+        if gl.get("gpu_load_signal") != "present":
+            out.setdefault("warnings", []).append(
+                f"GPU load signal {gl.get('gpu_load_signal')}: load-aware model routing is inactive "
+                f"({gl.get('detail') or gl.get('path')})")
+        if "loci.accelerator" in sys.modules:       # importing it runs the cupy probe; only report when something already did
+            from loci.accelerator import accelerator_info as _accel_info
+            caps["accelerator"] = _accel_info()
+            if caps["accelerator"].get("fallback"):
+                out.setdefault("warnings", []).append(
+                    f"accelerator fell back to numpy: {caps['accelerator'].get('reason')} "
+                    f"({caps['accelerator'].get('retries')} retries)")
+        from loci import model_selector as _model_selector
+        from loci import policy as _policy
+        caps["pool_lookup_failures"] = _model_selector.pool_failure_counts()
+        caps["policy_degraded"] = _policy.policy_degraded_counts()
+        if caps["pool_lookup_failures"]:
+            out.setdefault("warnings", []).append(
+                f"model pool lookups failed {caps['pool_lookup_failures']}: tier candidates fell back to the policy map")
+        if caps["policy_degraded"]:
+            out.setdefault("warnings", []).append(
+                f"tier policy ran degraded {caps['policy_degraded']} (unparseable tier map or failing pool)")
+        out["capabilities"] = caps
+    except Exception as exc:
+        logger.warning("loci_health: capabilities probe failed: %r", exc)
 
     # A 30-day purge default silently deleted older indexed findings on each start and nothing reported it; these fields make that answerable.
     try:
@@ -8987,15 +9076,25 @@ def _rag_cross_encode(results: list[dict], query: str) -> None:
     ce = _get_cross_encoder()
     if ce is None or len(results) <= 1:
         return
-    try:
-        # Same budget as qdrant_ops._ce_rerank: 512 chars scored below using no reranker at all on a 1,048-char median finding.
-        pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS])
-                 for r in results[:20]]
-        for r, sc in zip(results[:20], ce.predict(pairs)):
-            r['final_ce_score'] = round(float(sc), 4)
-        results[:20] = sorted(results[:20], key=lambda r: r.get('final_ce_score', -999), reverse=True)
-    except Exception as exc:
-        logger.debug('Final CE re-pass failed: %s', exc)
+    import reranker as _reranker
+    with _reranker.search_budget() as budget:
+        try:
+            top = results[:20]
+            # Same budget as qdrant_ops._ce_rerank: 512 chars scored below using no reranker at all on a 1,048-char median finding.
+            pairs = [(query, str(r.get('text', r.get('content', '')))[:_RERANK_MAX_CHARS]) for r in top]
+            scores = _reranker.score_pairs(ce, pairs, budget, final=True)
+        except Exception as exc:
+            logger.debug('Final CE re-pass failed: %s', exc)
+            _reranker.mark_error(budget, exc)
+            return
+    scored = [(r, sc) for r, sc in zip(top, scores) if sc is not None]
+    if not scored:
+        return
+    for r, sc in scored:
+        r['final_ce_score'] = round(sc, 4)
+    # Rows the budget left unscored keep their order behind the scored ones.
+    results[:20] = (sorted((r for r, _ in scored), key=lambda r: r.get('final_ce_score', -999), reverse=True)
+                    + [r for r, sc in zip(top, scores) if sc is None])
 
 
 _SUPERSEDED_MARK = "[superseded: a later finding replaced this; do not rely on it] "
@@ -9137,29 +9236,32 @@ def rag_context_search(
         from qdrant_client.models import Filter, FieldCondition, MatchAny
         _agent_filter = Filter(must_not=[FieldCondition(key="type", match=MatchAny(any=exclude_types))])
 
-    # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
-    all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
+    # One rerank budget covers every cross-encoder call of this search (per-candidate passes and the final one).
+    import reranker as _reranker
+    with _reranker.search_budget() as _rerank_budget:
+        # Expansion only widens the candidate pool; the cross-encoder re-ranks against the ORIGINAL query.
+        all_results.extend(_rag_search_collections(_collections, search_queries, limit, _agent_filter, errors))
 
-    # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
-    # before ranking, access tracking and assembly; mark superseded ones.
-    _rfilter = build_recall_filter(
-        MEMORY_DIR,
-        {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
-        with_superseded=True,
-    )
-    all_results, _rag_excluded = _rfilter.split(all_results)
-    # ACL: hits from investigations the caller may not read never reach the context.
-    all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
+        # memory_retract keeps the finding's Qdrant point: drop retracted hits by id
+        # before ranking, access tracking and assembly; mark superseded ones.
+        _rfilter = build_recall_filter(
+            MEMORY_DIR,
+            {str(r.get("investigation_id")) for r in all_results if r.get("investigation_id")},
+            with_superseded=True,
+        )
+        all_results, _rag_excluded = _rfilter.split(all_results)
+        # ACL: hits from investigations the caller may not read never reach the context.
+        all_results, _rag_acl_excluded = inv_store._acl_filter_rows(all_results, requesting_agent_id)
 
-    # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
-    if decay:
-        _rag_apply_decay(all_results)
+        # Findings only — agent_core_chunks is static knowledge, not time-sensitive.
+        if decay:
+            _rag_apply_decay(all_results)
 
-    # Merge-sort by score descending across all collections
-    all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        # Merge-sort by score descending across all collections
+        all_results.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
 
-    # Final cross-encoder re-pass for consistent cross-collection ranking
-    _rag_cross_encode(all_results, query)
+        # Final cross-encoder re-pass for consistent cross-collection ranking
+        _rag_cross_encode(all_results, query)
 
     # Best-effort: access-tracking failures must never block the response.
     _rag_record_access(all_results, query)
@@ -9190,6 +9292,12 @@ def rag_context_search(
         ctx["query_expansion"] = expansion_info
     if errors:
         ctx["collection_errors"] = errors
+    # Say so when reranking was cut short: the ordering is then partly bi-encoder, not cross-encoder.
+    # (absent when no cross-encoder ran, so a search without one keeps its response shape).
+    if _rerank_budget.scored or _rerank_budget.skipped or _rerank_budget.degraded:
+        ctx["rerank"] = _rerank_budget.summary()
+    if _rerank_budget.degraded:
+        ctx["rerank_degraded"] = True
     return json.dumps(ctx, indent=2)
 
 
@@ -13182,6 +13290,67 @@ class _BearerAuthMiddleware:
         else:
             scope.pop(caller_identity.SCOPE_KEY, None)
         await self._app(scope, receive, send)
+
+
+try:
+    from mcp.tools import register_all as _register_all
+except ImportError:
+    from tools import register_all as _register_all  # type: ignore[no-redef]
+_register_all(mcp)
+
+
+try:
+    from adherence import AdherenceStore, PolicyAdherenceRecord
+    _ADHERENCE_AVAILABLE = True
+except ImportError:  # pragma: no cover - adherence module optional at import time
+    AdherenceStore = PolicyAdherenceRecord = None  # type: ignore
+    _ADHERENCE_AVAILABLE = False
+
+
+@mcp.tool()
+def policy_adherence_record(
+    policy_id: str,
+    call_id: str,
+    tier_requested: str,
+    model_requested: str,
+    model_used: str,
+    was_downgraded: bool,
+    r_cor: float,
+    r_step: float = -0.01,
+) -> str:
+    """Record one call's policy adherence data (tier routing + correctness signal)."""
+    if not _ADHERENCE_AVAILABLE:
+        return json.dumps({"error": "adherence module unavailable"})
+    try:
+        rec = PolicyAdherenceRecord(
+            policy_id=policy_id,
+            call_id=call_id,
+            tier_requested=tier_requested,
+            model_requested=model_requested,
+            model_used=model_used,
+            was_downgraded=was_downgraded,
+            r_cor=r_cor,
+            r_step=r_step,
+        )
+        AdherenceStore().record(rec)
+        return json.dumps({"recorded": True, "policy_id": policy_id, "call_id": call_id})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+@mcp.tool()
+def policy_adherence_report(
+    policy_id: str,
+    min_records: int = 5,
+) -> str:
+    """Compute adherence confidence report for a policy: effective/ineffective/monitoring."""
+    if not _ADHERENCE_AVAILABLE:
+        return json.dumps({"error": "adherence module unavailable"})
+    try:
+        report = AdherenceStore().compute_report(policy_id, min_records)
+        return json.dumps(report)
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
 
 
 def main() -> None:

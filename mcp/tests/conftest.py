@@ -21,7 +21,12 @@ from pathlib import Path
 import pytest
 
 _MCP_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _MCP_DIR.parent  # loci-slop-fix/; ensures loci/ in this repo shadows any installed loci
 
+# Prepend repo root so `import loci` resolves to this working tree, not a
+# previously installed copy that predates changes made on this branch.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 def _load_hermetic():
     """Import testsupport/loci_hermetic.py by path (it is not on sys.path)."""
@@ -43,6 +48,9 @@ loci_hermetic.install()
 # Autouse fixture failing any test that reached ~/.loci or ~/.hermes, plus the
 # report header and the session-level check. Opt-out: LOCI_TESTS_LIVE=1.
 globals().update(loci_hermetic.pytest_hooks())
+# The graph store probes a real database in a child process (2-3 s each on a busy host); the suite's stores skip it.
+# The hardening tests turn it on per store (test_ladybug_hardening.py).
+os.environ.setdefault("LOCI_LADYBUG_PROBE", "0")
 
 
 def _configure_pytest_temp_root() -> None:

@@ -494,7 +494,7 @@ def test_reingest_replace_is_idempotent(tmp_path):
     # Counts did not double (idempotent); the removed file AND its symbol are pruned.
     assert (files_2, syms_2) == (1, 1)
     paths = [row[0] for row in store.code_query("MATCH (c:CodeFile) RETURN c.path")]
-    assert [p.endswith("pkg/keep.py") for p in paths] == [True]
+    assert [p.replace("\\", "/").endswith("pkg/keep.py") for p in paths] == [True]   # stored with the OS separator
     assert store.callers_of("dropped") == []  # nothing references it; symbol pruned
     assert store.code_query("MATCH (s:CodeSymbol {name:'dropped'}) RETURN s.id") == []
     assert ["kept"] in store.code_query("MATCH (s:CodeSymbol) RETURN s.name")

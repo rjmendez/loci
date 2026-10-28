@@ -62,6 +62,12 @@ def code_graph_ingest(path: str, max_files: Optional[int] = None, replace: bool 
         # Prune stale/duplicate code nodes under this path so re-ingest is clean.
         pruned = ks.delete_code_under(str(p)) if replace else None
         counts = ks.ingest_code(parsed)
+        if parsed and not (counts or {}).get("files"):
+            # ingest_code is fail-open and answers {} when the store could not be written. Parsed files with
+            # nothing stored is a failure, not an empty success (the 2026-10-18 investigation found exactly that).
+            why = getattr(ks, "last_open_error", "") or "the store accepted no rows"
+            return json.dumps({"error": f"code_graph_ingest stored nothing from {len(parsed)} parsed file(s): {why}",
+                               "path": str(p), "parsed_files": len(parsed), "ingested": counts or {}})
         out = {"path": str(p), "parsed_files": len(parsed), "ingested": counts}
         if pruned is not None:
             out["pruned"] = pruned

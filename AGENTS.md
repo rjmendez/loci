@@ -2,7 +2,24 @@
 
 Instructions for coding agents working in this repository. Behavioural rules for
 agents *using* Loci are in `rules/` and `docs/onboarding/for-agents.md`; this file is
-about changing the code.
+about changing the code. The first section applies to every repository; the rest is
+specific to Loci.
+
+## Every repository
+
+**Targeted tests on commits, the full suite at merge to main (owner, 2026-10-21).**
+This applies in any repository and any language. On a feature-branch commit or push, run
+only the tests that cover what the diff touches:
+- the tests for each changed module, package or crate;
+- the tests of everything that depends on it. A change to shared code (config, settings,
+  a CLI entry point, a common utility, a build or dependency file) means all of its
+  dependents, not the whole suite;
+- the repository's own fast checks (lint, type check, test-honesty or similar), where it
+  has them.
+
+Run the full integration suite once, when merging to main, and say in the PR which tests
+were run. A docs-only change needs no test run. Proving that a new test fails without the
+change it guards still applies.
 
 ## Running tests
 
