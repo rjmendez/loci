@@ -536,6 +536,20 @@ _MEMORY_DECAY_LAMBDA  = float(os.environ.get("MEMORY_DECAY_LAMBDA", "0.007"))  #
 _CODE_CHUNKS_COLLECTION = os.environ.get("CODE_CHUNKS_COLLECTION", "")
 
 
+def _rag_default_collections() -> list:
+    """Collections rag_context_search and the retrieval health probe cover by default: the main memory
+    collection, CODE_CHUNKS_COLLECTION when set, then LOCI_RAG_EXTRA_COLLECTIONS (comma separated, for
+    example "ops_logs"). Order is kept and duplicates are dropped. Unset means no change in behavior.
+    A name listed here that does not exist is reported as a failed collection by the search and as a
+    fault by the probe, never silently skipped."""
+    names = [QDRANT_COLLECTION_PREFIX] + ([_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
+    for extra in os.environ.get("LOCI_RAG_EXTRA_COLLECTIONS", "").split(","):
+        extra = extra.strip()
+        if extra and extra not in names:
+            names.append(extra)
+    return names
+
+
 from verdict_ops import _get_verdict_backend, _record_claim_verdicts  # noqa: E402,F401
 
 
@@ -7261,8 +7275,7 @@ def retrieval_selftest(query: str = "system architecture", limit: int = 3,
 
     try:
         present = sorted(qdrant_ops.collection_names_with_aliases(client)[0])
-        queried = [QDRANT_COLLECTION_PREFIX] + (
-            [_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
+        queried = _rag_default_collections()
         if collections:
             names, in_scope = list(collections), set(collections)
         elif scope == "all":
@@ -9157,10 +9170,12 @@ def rag_context_search(
     This tool always uses Qdrant: there is no keyword fallback, and missing
     Qdrant returns ``rag_required``. By default it searches
     ``QDRANT_COLLECTION_PREFIX`` (usually ``"loci_memory"``) plus
-    ``CODE_CHUNKS_COLLECTION`` when configured, then merges results, reranks
+    ``CODE_CHUNKS_COLLECTION`` when configured, plus any names in
+    ``LOCI_RAG_EXTRA_COLLECTIONS`` (comma separated, e.g. ``"ops_logs"`` to make
+    the shipped log index searchable by default), then merges results, reranks
     them with a cross-encoder, and assembles cited context.
 
-    Important default note: the default collections come only from those two env
+    Important default note: the default collections come only from those three env
     vars. The docstring used to claim an ``agent_core_chunks`` default; it never
     existed. On this deployment that collection is a large DAMA telemetry lake,
     mostly GPS points and barely any code, so overriding into it is usually slow
@@ -9170,8 +9185,8 @@ def rag_context_search(
         query: Natural language search query.
         limit: Results per collection (default 10).
         collections: Override the collection list. The default is
-            ``[QDRANT_COLLECTION_PREFIX] + [CODE_CHUNKS_COLLECTION if set]``,
-            not ``agent_core_chunks``.
+            ``[QDRANT_COLLECTION_PREFIX] + [CODE_CHUNKS_COLLECTION if set] +
+            LOCI_RAG_EXTRA_COLLECTIONS``, not ``agent_core_chunks``.
         budget_chars: Max characters in assembled context (default 6000).
         exclude_types: Payload ``type`` values to exclude from
             ``agent_core_chunks``-style results. ``None`` defaults to
@@ -9204,7 +9219,7 @@ def rag_context_search(
     if exclude_types is None:
         exclude_types = ["gps_trajectory"]
 
-    _default_cols = [QDRANT_COLLECTION_PREFIX] + ([_CODE_CHUNKS_COLLECTION] if _CODE_CHUNKS_COLLECTION else [])
+    _default_cols = _rag_default_collections()
     _collections = list(collections) if collections else _default_cols
     client, _col = _get_qdrant()
     qdrant_available = client is not None
