@@ -148,7 +148,7 @@ def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
         if not want:
             return out
         scored = []
-        for line in idx.read_text(errors="ignore").splitlines():
+        for line in idx.read_text(encoding="utf-8", errors="replace").splitlines():
             m = re.search(r"\((?P<file>[\w.-]+\.md)\)", line)
             if not m:
                 continue
@@ -163,7 +163,7 @@ def _select_memory_files(task: dict, memory_dir: str, limit: int = 2,
             body = ""
             fp = d / fname
             if fp.exists():
-                body = fp.read_text(errors="ignore")
+                body = fp.read_text(encoding="utf-8", errors="replace")
             out.append((fname, line, body))
     except Exception:
         return out

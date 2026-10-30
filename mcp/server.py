@@ -2940,7 +2940,7 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 
         # Atomic rewrite: temp file + rename
         tmp_path = entities_path.with_suffix(".tmp")
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             for ent in existing:
                 f.write(json.dumps(ent) + "\n")
         tmp_path.replace(entities_path)

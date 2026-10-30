@@ -104,7 +104,7 @@ def load_agent_tokens(environ: Optional[dict] = None) -> dict[str, str]:
     raw = str(env.get("LOCI_MCP_AGENT_TOKENS", "") or "").strip()
     sources = []
     if raw_file:
-        with open(os.path.expanduser(raw_file)) as fh:
+        with open(os.path.expanduser(raw_file), encoding="utf-8") as fh:
             sources.append(fh.read())
     if raw:
         sources.append(raw)
