@@ -31,6 +31,11 @@ def store(tmp_path, monkeypatch):
 
 
 def _store(text, source, **kw):
+    if kw.get("evidence_provenance_tier") == "tool_verified" and "metadata" not in kw:
+        # the store-time gate: a tool_verified write must cite a receipt audit_log recorded
+        rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                          investigation_id="bf-case"))["receipt_id"]
+        kw["metadata"] = {"receipt_ids": [rid]}
     r = json.loads(server.investigation_store("bf-case", "inferred", text, source, **kw))
     assert r.get("stored"), r
     return r["finding_id"]

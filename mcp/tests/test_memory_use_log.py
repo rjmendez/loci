@@ -10,6 +10,13 @@ import pytest
 
 import server
 
+
+def _verified_metadata(investigation_id):
+    """metadata for a tool_verified write. The store-time gate needs a receipt audit_log actually recorded."""
+    rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                      investigation_id=investigation_id))["receipt_id"]
+    return {"evidence_provenance_tier": "tool_verified", "receipt_ids": [rid]}
+
 CONTEXT = "tracing the flaky login redirect in the auth gateway"
 FINDING_TEXT = "the auth gateway drops the session cookie on redirect"
 
@@ -93,7 +100,7 @@ def _seed(inv, text=FINDING_TEXT, derived_from=None):
     stored = _json(server.investigation_store(
         investigation_id=inv, finding_type="observed", text=text,
         source="unit-test", confidence="high", derived_from=derived_from,
-        evidence_provenance_tier="tool_verified",
+        metadata=_verified_metadata(inv),
     ))
     return stored["finding_id"]
 
