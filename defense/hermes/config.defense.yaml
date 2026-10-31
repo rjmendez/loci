@@ -1,0 +1,31 @@
+# Hermes defense config (tracked template). Live file: AppData\Local\hermes\config.yaml.
+# Replace ${LOCI_CLIENT_SECRET} with the secret from the owner's secret store. Never commit the real value.
+
+# 2026-10-31 defense in depth, layer 2: block malformed tool calls and guessed non-host paths before a tool runs.
+# fail_closed: a crashing guard blocks the call. Needs first-use consent (hermes asks, or --accept-hooks).
+hooks:
+  pre_tool_call:
+    - command: "C:/Python314/python.exe -I C:/Users/rjmendez-admin/AppData/Local/hermes/hooks/guard_tool.py"
+      timeout: 10
+      fail_closed: true
+
+providers:
+  # 2026-10-31: the identity headers must be on the CLIENT. model.default_headers is merged after the client
+  # kwargs are stored (agent_init: _apply_user_default_headers runs before _client_kwargs is set), so it never
+  # reached the proxy. A providers entry scoped to the LiteLLM route is merged before the client is built.
+  litellm-hermes:
+    api: https://litellm.lab.floppydicks.net:4443/v1
+    extra_headers:
+      x-loci-client: "hermes"
+      x-loci-client-secret: "${LOCI_CLIENT_SECRET}"
+
+# dead IPv6 route fix (doctor 2026-10-29)
+  cf-gateway:
+    api: https://gateway.ai.cloudflare.com/v1/ed0dc89266c02fa4a1cf299548ffea70/oxalis-hermes/openai
+    key_env: HERMES_CUSTOM_GATEWAY_AI_CLOUDFLARE_COM_API_KEY
+    model: clef-omni
+
+network:
+  force_ipv4: true   # doctor 2026-10-29: IPv6 route to openrouter.ai was advertised but dead, 2s stall per connect
+
+# Cloudflare gateway provider (key via env var name, no value)
