@@ -53,22 +53,22 @@ def _run(mw, path="/mcp", auth=None):
 class BearerAuthMiddlewareTest(unittest.TestCase):
     def _mw(self):
         return server._BearerAuthMiddleware(
-            app=None, token="shared-secret-123",
-            agent_tokens={"agent-tok-abc": "hermes"},
+            app=None, token="fixture-token-a",
+            agent_tokens={"agent-tok-abc": "agent-b"},
         )
 
     def test_shared_token_authenticates_but_binds_no_agent(self) -> None:
-        status, scope = _run(self._mw(), auth="Bearer shared-secret-123")
+        status, scope = _run(self._mw(), auth="Bearer fixture-token-a")
         self.assertEqual(status, 200)
         self.assertNotIn(caller_identity.SCOPE_KEY, scope)   # shared token cannot tell callers apart
 
     def test_agent_token_binds_identity(self) -> None:
         status, scope = _run(self._mw(), auth="Bearer agent-tok-abc")
         self.assertEqual(status, 200)
-        self.assertEqual(scope.get(caller_identity.SCOPE_KEY), "hermes")
+        self.assertEqual(scope.get(caller_identity.SCOPE_KEY), "agent-b")
 
     def test_wrong_token_is_401(self) -> None:
-        status, scope = _run(self._mw(), auth="Bearer not-the-secret")
+        status, scope = _run(self._mw(), auth="Bearer fixture-token-wrong")
         self.assertEqual(status, 401)
         self.assertIsNone(scope)
 
@@ -78,7 +78,7 @@ class BearerAuthMiddlewareTest(unittest.TestCase):
         self.assertIsNone(scope)
 
     def test_bearer_prefix_is_case_insensitive(self) -> None:
-        status, _ = _run(self._mw(), auth="bearer shared-secret-123")
+        status, _ = _run(self._mw(), auth="bearer fixture-token-a")
         self.assertEqual(status, 200)
 
     def test_health_is_exempt(self) -> None:
