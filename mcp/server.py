@@ -11399,7 +11399,19 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str, requesting
     if _acl_denied:
         return _acl_denied
     try:
+        gate = None
+        if tier != "cold":
+            try:
+                import memory_adjudicate as _adj
+                gate = _adj.verify_gate(investigation_id, finding_id)   # off unless LOCI_PROMOTE_TEACHER_VERIFY
+            except Exception as exc:  # noqa: BLE001 - the gate fails open
+                logger.debug("promote verify gate failed (fail-open): %r", exc)
+        if gate and gate.get("block"):
+            return json.dumps({"finding_id": finding_id, "ok": False, "blocked": "teacher_verify_unsupported",
+                               "teacher_verify": gate}, indent=2)
         result = _change_finding_tier(investigation_id, finding_id, tier)
+        if gate:
+            result["teacher_verify"] = gate
         return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
