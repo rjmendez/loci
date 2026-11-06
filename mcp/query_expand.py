@@ -97,7 +97,7 @@ def _degraded(query: str) -> dict:
 
 
 def expand(query: str, gen_fn: Optional[GenFn] = None,
-           n_queries: int = 3, n_keywords: int = 6) -> dict:
+           n_queries: int = 3, n_keywords: int = 6, guidance: str = "") -> dict:
     """Expand `query` into alternate phrasings + domain keywords for retrieval fan-out.
 
     Returns {"queries": [...], "keywords": [...], "degraded": bool}. `queries` always
@@ -112,6 +112,8 @@ def expand(query: str, gen_fn: Optional[GenFn] = None,
     n_keywords = max(0, int(n_keywords))
 
     prompt = _PROMPT_TMPL.format(query=q, n_queries=n_queries, n_keywords=n_keywords)
+    if guidance and guidance.strip():
+        prompt += "\nExtra guidance:\n" + guidance.strip() + "\n"
     fn = gen_fn or _lazy_generate
     try:
         res = fn(prompt, fmt="json", max_tokens=220)

@@ -135,3 +135,16 @@ processes you run. `status()` repeats this in its `limits` field and reports `ov
 python mcp/teacher.py status          # caps, spent, remaining, by group (JSON)
 python mcp/teacher.py check <role>    # guard decision at the usable per-call cap (readiness probe); exit 0 allowed, 1 refused
 ```
+
+## Hillclimb proposer
+
+`python mcp/hillclimb.py run --suite <s> --proposer teacher [--max-usd N]` proposes with
+`teacher_call("propose", ...)`. Default stays the local proposer. Case text leaves the machine only for a
+suite whose `<hillclimb dir>/<suite>/config.json` has `"allow_cloud": true` (literal true; `"proposer":
+"teacher"` there selects it without the flag). Only failing TRAIN cases are sent, sanitized. A refusal or
+error becomes an `aborted_infra` round (reason code only): not scored, not counted against patience,
+counted in `aborted_rounds`; `patience` consecutive aborts stop the run (`infra_aborted`). `--max-usd`
+stops the run (`budget`) once spend plus the last call's cost reaches it; overshoot is at most one call,
+itself capped by the guard. The `query_expand` suite scores against
+`<memory parent>/teacher/gold/query_expand.jsonl` (`LOCI_TEACHER_GOLD_DIR`), rows
+`{id, query, expect: [terms]}`; no file => stop `suite_unavailable`, status "no gold set yet".
