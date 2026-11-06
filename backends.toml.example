@@ -111,3 +111,23 @@
 # breaker_failures = 3          # consecutive failures/timeouts that open the circuit breaker
 # breaker_cooldown_s = 300      # how long the breaker skips the judge once open
 # slow_s = 60                   # a judge call slower than this counts as a failure
+
+[teacher]
+# Budget-guarded cloud calls for learning loops (mcp/teacher.py). Everything off until enabled.
+# Env LOCI_TEACHER_* wins (ENABLED, MONTHLY_USD_CAP, DAILY_USD_CAP, MAX_USD_PER_CALL, LEDGER_FILE,
+# GROUPS_COUNTED, SANITIZE, EST_REF_TOKENS, ROLE_<ROLE>). A missing or zero cap allows NO spend.
+# enabled = false
+# monthly_usd_cap = 0.0
+# daily_usd_cap = 0.0
+# max_usd_per_call = 0.0
+# ledger_file = "~/.loci/litellm_cost_ledger.jsonl"
+# groups_counted = []            # default: every group named under [teacher.roles]
+# sanitize = true
+# est_ref_tokens = 4000          # request size at which the pre-call estimate equals max_usd_per_call
+# [teacher.roles]                # role -> LiteLLM group name (from your LiteLLM config)
+# judge = "<litellm-group>"
+# label_a = "<litellm-group>"
+# label_b = "<litellm-group>"
+# propose = "<litellm-group>"
+# adjudicate = "<litellm-group>"
+# verify = "<litellm-group>"
