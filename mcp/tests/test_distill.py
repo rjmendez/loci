@@ -404,3 +404,28 @@ def test_cli_gate_malformed_criteria_exits_2_not_hold(tmp_path, capsys):
                  "--student-test", str(f), "--incumbent-test", str(f), "--student-validation", str(f)])
     assert rc == 2
     assert "invalid JSON" in capsys.readouterr().err
+
+
+def test_main_missing_input_exits_2_with_message(tmp_path, capsys):
+    rc = D.main(["export", "--gold", str(tmp_path / "nope.jsonl"), "--out", str(tmp_path / "o"), "--seed", "1",
+                  "--loci-commit", "abc", "--embed-url", "http://x", "--model-out", str(tmp_path / "m")])
+    assert rc == 2
+    assert capsys.readouterr().err.startswith("distill: ")
+
+
+def test_main_plan_malformed_curve_exits_2(tmp_path, capsys):
+    c = tmp_path / "c.json"
+    c.write_text("[1, 2]")
+    rc = D.main(["plan", "--cap-usd", "1", "--cost-per-label-usd", "0.1", "--curve", str(c),
+                       "--min-gain-per-step", "0.01", "--step-labels", "10"])
+    assert rc == 2
+    assert "curve must be" in capsys.readouterr().err
+
+
+def test_main_plan_good_curve_exits_0(tmp_path, capsys):
+    c = tmp_path / "c.json"
+    c.write_text("[[10, 0.5], [20, 0.6]]")
+    rc = D.main(["plan", "--cap-usd", "1", "--cost-per-label-usd", "0.1", "--curve", str(c),
+                       "--min-gain-per-step", "0.01", "--step-labels", "10"])
+    assert rc == 0
+    assert '"affordable_labels": 10' in capsys.readouterr().out

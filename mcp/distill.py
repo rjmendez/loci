@@ -65,9 +65,15 @@ def normalize_rows(raw: Iterable[Mapping[str, Any]], source: str) -> list[dict[s
 
 
 def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
-    raw = Path(path).read_bytes()
+    try:
+        raw = Path(path).read_bytes()
+        text = raw.decode("utf-8")
+    except OSError as e:
+        raise DistillError(f"{path}: cannot read ({e.strerror or e})") from e
+    except UnicodeDecodeError as e:
+        raise DistillError(f"{path}: not valid UTF-8 ({e.reason})") from e
     rows = []
-    for n, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+    for n, line in enumerate(text.splitlines(), start=1):
         if line.strip():
             try:
                 rows.append(json.loads(line))
@@ -269,7 +275,10 @@ def plan_budget(cap_usd: float, cost_per_label_usd: float, curve: Sequence[Seque
         raise DistillError("cap_usd >= 0 and cost_per_label_usd, step_labels, min_gain_per_step > 0 required")
     if not all(map(math.isfinite, (cap_usd, cost_per_label_usd, min_gain_per_step))):
         raise DistillError("cap_usd, cost_per_label_usd, min_gain_per_step must be finite")
-    pts = sorted((int(n), float(m)) for n, m in curve)
+    try:
+        pts = sorted((int(n), float(m)) for n, m in curve)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise DistillError(f"curve must be [[n_labels, metric], ...] of numbers ({e})") from e
     if not all(math.isfinite(m) for _, m in pts):
         raise DistillError("curve has a non-finite metric")
     if len({n for n, _ in pts}) != len(pts):
@@ -344,7 +353,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                          _load_json(a.student_validation))
             print(json.dumps(res, indent=2, sort_keys=True))
             return 0 if res["decision"] == "promote" else 1
-        res = plan_budget(a.cap_usd, a.cost_per_label_usd, _load_json(a.curve),
+        if not isinstance(curve := _load_json(a.curve), list):
+            raise DistillError("curve must be a JSON list")
+        res = plan_budget(a.cap_usd, a.cost_per_label_usd, curve,
                           a.min_gain_per_step, a.step_labels)
         print(json.dumps(res, indent=2, sort_keys=True))
         return 0
