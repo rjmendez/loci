@@ -820,7 +820,8 @@ def test_default_transport_goes_through_shared_litellm_client(monkeypatch):
     meta = {"loci_internal_call": True}
     assert T._default_transport("g", [{"role": "user", "content": "q"}], 7, meta) == R.raw
     assert seen == [{"model": "g", "messages": [{"role": "user", "content": "q"}], "max_tokens": 7,
-                     "temperature": 0.0, "metadata": meta}]
+                     "temperature": 0.0, "metadata": meta,
+                     "extra_body": {"thinking": {"type": "disabled"}}}]
 
 
 def test_client_sends_metadata_in_request_body(monkeypatch):
@@ -889,3 +890,25 @@ def test_cli_check_is_a_readiness_probe_under_default_margin(env, capsys):
     setup_cfg(env, ("enabled = true", "enabled = false"))      # not ready: still exits 1
     assert T.main(["check", "judge"]) == 1
     assert json.loads(capsys.readouterr().out)["reason"] == "disabled"
+
+
+def test_client_merges_extra_body_but_never_overrides_core_fields(monkeypatch):
+    import loci.litellm_client as lc
+    bodies = []
+
+    class Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps({"choices": [{"message": {"content": "k"}}], "usage": {}}).encode()
+
+    def fake_open(req, timeout=0):
+        bodies.append(json.loads(req.data))
+        return Resp()
+
+    monkeypatch.setattr(lc.urllib.request, "urlopen", fake_open)
+    lc.call_litellm_proxy("m", [{"role": "user", "content": "q"}], 5,
+                          extra_body={"thinking": {"type": "disabled"}, "max_tokens": 99999})
+    assert bodies[0]["thinking"] == {"type": "disabled"}
+    assert bodies[0]["max_tokens"] == 5
+    lc.call_litellm_proxy("m", [{"role": "user", "content": "q"}], 5)
+    assert "thinking" not in bodies[1]

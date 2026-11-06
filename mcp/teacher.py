@@ -428,8 +428,11 @@ def release(decision: Decision, settle_usd: float = 0.0, settle_s: float = 0.0) 
 def _default_transport(group: str, messages: Messages, max_tokens: int, metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Through the shared LiteLLM client; returns the raw OpenAI-shaped response dict."""
     from loci.litellm_client import call_litellm_proxy
-    return call_litellm_proxy(model=group, messages=messages, max_tokens=max_tokens,
-                              temperature=0.0, metadata=metadata).raw
+    # Claude 5.x models think by default and the hidden thinking tokens count against max_tokens: a tight limit then
+    # returns an empty body (finish_reason=length), and the output the guard priced is not the output that is billed.
+    # Thinking off keeps max_tokens the true bound on visible, billed output.
+    return call_litellm_proxy(model=group, messages=messages, max_tokens=max_tokens, temperature=0.0,
+                              metadata=metadata, extra_body={"thinking": {"type": "disabled"}}).raw
 
 
 def _to_messages(prompt_or_messages: Union[str, Messages]) -> Messages:
