@@ -912,3 +912,40 @@ def test_client_merges_extra_body_but_never_overrides_core_fields(monkeypatch):
     assert bodies[0]["max_tokens"] == 5
     lc.call_litellm_proxy("m", [{"role": "user", "content": "q"}], 5)
     assert "thinking" not in bodies[1]
+
+
+def usage_reply(prompt, completion, **extra):
+    return {"choices": [{"message": {"content": "k"}}], "usage": {"prompt_tokens": prompt, "completion_tokens": completion, **extra}}
+
+
+def test_unreported_cost_is_priced_from_token_usage_not_the_worst_case(env):
+    setup_cfg(env)
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(usage_reply(1000, 300)))
+    # 1000 in * 50/M + 300 out * 200/M, not the 0.025 worst case for max_tokens=100
+    assert (out["usd"], out["usd_source"]) == (pytest.approx(0.11), "usage")
+    assert T.check("judge", 0.01).settling == pytest.approx(0.11)
+
+
+def test_usage_pricing_releases_most_of_the_hold_a_worst_case_would_keep(env):
+    setup_cfg(env)
+    T.teacher_call("judge", "x" * 300, 1000, "p", transport=Rec(usage_reply(100, 10)))
+    # worst case would hold 100*50/M + 1000*200/M = 0.205; the real tokens cost 0.007
+    assert T.check("judge", 0.01).settling == pytest.approx(0.007)
+
+
+@pytest.mark.parametrize("usage", [{}, {"prompt_tokens": 5}, {"completion_tokens": 5},
+                                   {"prompt_tokens": -1, "completion_tokens": 5},
+                                   {"prompt_tokens": "9", "completion_tokens": 5},
+                                   {"prompt_tokens": True, "completion_tokens": 5},
+                                   {"prompt_tokens": 0, "completion_tokens": 0}])
+def test_unusable_usage_falls_back_to_the_estimate(env, usage):
+    setup_cfg(env)
+    resp = {"choices": [{"message": {"content": "k"}}], "usage": usage}
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(resp))
+    assert (out["usd"], out["usd_source"]) == (pytest.approx(0.025), "estimate")
+
+
+def test_gateway_reported_cost_still_wins_over_usage(env):
+    setup_cfg(env)
+    out = T.teacher_call("judge", "hello", 100, "p", transport=Rec(usage_reply(1000, 300, cost=0.02)))
+    assert (out["usd"], out["usd_source"]) == (0.02, "gateway")
