@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import backends
 ROLES = ("judge", "label_a", "label_b", "propose", "adjudicate", "verify")
 DEFAULT_LEDGER = "~/.loci/litellm_cost_ledger.jsonl"
 LEDGER_CACHE_S = 5.0
+DEFAULT_SETTLE_S = 120.0          # how long a finished call's cost stays held while the gateway writes its ledger row
 MAX_SIBLINGS = 12                 # ledger.jsonl.1 .. .12
 DEFAULT_EST_REF_TOKENS = 4000     # request size at which the estimate equals max_usd_per_call
 _CHUNK = 1 << 20
@@ -64,6 +66,14 @@ def _money(v: Any) -> float:
     return f if math.isfinite(f) and f > 0 else 0.0
 
 
+def _settle(v: Any) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return DEFAULT_SETTLE_S
+    return f if math.isfinite(f) and f >= 0 else DEFAULT_SETTLE_S
+
+
 def teacher_config() -> Dict[str, Any]:
     """Resolved config, read now: env LOCI_TEACHER_* over backends.toml [teacher]."""
     def get(key: str, env: str, default: Any = None) -> Any:
@@ -96,6 +106,8 @@ def teacher_config() -> Dict[str, Any]:
         "groups_counted": counted,
         "sanitize": _bool(get("sanitize", "LOCI_TEACHER_SANITIZE", True), True),
         "est_ref_tokens": ref if ref > 0 else DEFAULT_EST_REF_TOKENS,
+        "allow_missing_ledger": _bool(get("allow_missing_ledger", "LOCI_TEACHER_ALLOW_MISSING_LEDGER", False), False),
+        "settle_seconds": _settle(get("settle_seconds", "LOCI_TEACHER_SETTLE_SECONDS", DEFAULT_SETTLE_S)),
     }
 
 
@@ -192,7 +204,7 @@ def cache_clear() -> None:
 def read_ledger(cfg: Optional[Dict[str, Any]] = None) -> LedgerTotals:
     """Spend of counted groups for the current local month and day. Raises LedgerUnreadable.
 
-    A missing ledger is zero spend with ``missing=True``. Cached for LEDGER_CACHE_S."""
+    A missing ledger is zero spend with ``missing=True`` (the guard refuses it unless opted in). Cached for LEDGER_CACHE_S."""
     cfg = cfg or teacher_config()
     now = _now()
     lt = datetime.fromtimestamp(now)
@@ -221,6 +233,7 @@ class Decision:
     in_flight: float = 0.0
     caps: Dict[str, float] = field(default_factory=dict)
     ledger_missing: bool = False
+    settling: float = 0.0         # finished calls' cost still held while their ledger rows land
     reservation: int = 0          # >0 only for a held reservation (see reserve/release)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -229,6 +242,7 @@ class Decision:
 
 _res_lock = threading.Lock()
 _reservations: Dict[int, float] = {}
+_settling: List[tuple] = []     # (expires_mono, usd): spent calls not yet trusted to be in the ledger
 _res_seq = 0
 
 
@@ -267,8 +281,14 @@ def _decide(role: str, est_usd: float, hold: bool) -> Decision:
         d.reason = "ledger_error"
         return d
     d.month_spent, d.day_spent, d.ledger_missing = led.month, led.day, led.missing
+    if led.missing and not cfg["allow_missing_ledger"]:
+        d.reason = "ledger_missing"
+        return d
     with _res_lock:
-        held = sum(_reservations.values())
+        mono = _mono()
+        _settling[:] = [(e, u) for e, u in _settling if e > mono]
+        d.settling = sum(u for _, u in _settling)
+        held = sum(_reservations.values()) + d.settling
         d.in_flight = held
         if est > caps["per_call_usd"]:
             d.reason = "over_per_call_cap"
@@ -295,10 +315,13 @@ def reserve(role: str, est_usd: float) -> Decision:
     return _decide(role, est_usd, hold=True)
 
 
-def release(decision: Decision) -> None:
-    """Drop a held reservation (idempotent). The ledger carries the real spend."""
+def release(decision: Decision, settle_usd: float = 0.0, settle_s: float = 0.0) -> None:
+    """Drop a held reservation (idempotent). The ledger carries the real spend; ``settle_usd`` stays
+    counted for ``settle_s`` more seconds because the gateway may write its row after the call returns."""
     with _res_lock:
-        _reservations.pop(decision.reservation, None)
+        held = _reservations.pop(decision.reservation, None)
+        if held is not None and settle_usd > 0 and settle_s > 0:
+            _settling.append((_mono() + settle_s, settle_usd))
     decision.reservation = 0
 
 
@@ -315,6 +338,20 @@ def _to_messages(prompt_or_messages: Union[str, Messages]) -> Messages:
         return [{"role": "user", "content": prompt_or_messages}]
     return [{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
             for m in prompt_or_messages]
+
+
+_PII = (
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[EMAIL]"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[IP]"),
+    (re.compile(r"(?i)(?:[a-z]:[\\/]+users[\\/]+|/(?:home|users)/)[^\\/\s]+"), "[HOME]"),
+)
+
+
+def _redact_pii(text: str) -> str:
+    """Emails, IPv4 addresses and home-directory user names. Not a privacy filter: callers choose what leaves."""
+    for rx, sub in _PII:
+        text = rx.sub(sub, text)
+    return text
 
 
 def _estimate(messages: Messages, max_tokens: int, cfg: Dict[str, Any]) -> float:
@@ -348,10 +385,15 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
                  transport: Optional[Transport] = None) -> Dict[str, Any]:
     """Guarded cloud call. Never raises. Returns {ok, text, usd, reason, role, group, decision}.
 
-    ``usd`` is the cost the gateway reported, else the pre-call estimate (``usd_source`` says which)."""
+    ``usd`` is the cost the gateway reported, else the pre-call estimate (``usd_source`` says which).
+    After a request was sent, its cost (reported, else the estimate) stays counted by the guard for
+    ``settle_seconds``, so the window before the gateway's ledger row lands is covered. A failure after
+    sending (``transport_error``, ``bad_response``) sets ``cost_unknown``: the gateway may have billed."""
     out: Dict[str, Any] = {"ok": False, "text": "", "usd": 0.0, "reason": "", "role": role, "group": "",
-                           "decision": None, "usd_source": "none"}
+                           "decision": None, "usd_source": "none", "cost_unknown": False}
     decision: Optional[Decision] = None
+    settle_usd = 0.0
+    settle_s = 0.0
     try:
         cfg = teacher_config()
         messages = _to_messages(prompt_or_messages)
@@ -366,18 +408,22 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
             except Exception:  # noqa: BLE001
                 out["reason"] = "sanitizer_unavailable"
                 return out
-            messages = [{"role": m["role"], "content": _sanitize_for_cloud(m["content"], max_len=max(len(m["content"]), 1))}
+            messages = [{"role": m["role"],
+                         "content": _redact_pii(_sanitize_for_cloud(m["content"], max_len=max(len(m["content"]), 1)))}
                         for m in messages]
+        settle_s = cfg["settle_seconds"]
         meta = {"loci_internal_call": True, "loci_teacher_purpose": str(purpose)}
+        settle_usd = decision.est_usd     # sent => may be billed, whatever happens next
         try:
             resp = (transport or _default_transport)(decision.group, messages, int(max_tokens), meta)
         except Exception as exc:  # noqa: BLE001
-            out["reason"] = f"transport_error:{type(exc).__name__}"
+            out["reason"], out["cost_unknown"] = f"transport_error:{type(exc).__name__}", True
             return out
         if not isinstance(resp, dict):
-            out["reason"] = "bad_response"
+            out["reason"], out["cost_unknown"] = "bad_response", True
             return out
         actual = _actual_usd(resp)
+        settle_usd = actual if actual is not None else decision.est_usd
         out["usd"], out["usd_source"] = (actual, "gateway") if actual is not None else (decision.est_usd, "estimate")
         out["text"] = _text(resp)
         out["ok"], out["reason"] = True, "ok"
@@ -388,7 +434,7 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
         return out
     finally:
         if decision is not None:
-            release(decision)
+            release(decision, settle_usd, settle_s)
 
 
 # ------------------------------------------------------------------ status / CLI

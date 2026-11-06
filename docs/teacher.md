@@ -22,6 +22,8 @@ come from config only, read at call time.
 | `groups_counted` | `LOCI_TEACHER_GROUPS_COUNTED` (csv) | the configured role groups |
 | `sanitize` | `LOCI_TEACHER_SANITIZE` | true |
 | `est_ref_tokens` | `LOCI_TEACHER_EST_REF_TOKENS` | 4000 |
+| `allow_missing_ledger` | `LOCI_TEACHER_ALLOW_MISSING_LEDGER` | false (missing ledger refuses) |
+| `settle_seconds` | `LOCI_TEACHER_SETTLE_SECONDS` | 120 |
 
 ## Public API (`import teacher`)
 
@@ -41,28 +43,32 @@ def cache_clear() -> None
 
 `Decision` (dataclass, `.to_dict()`): `allowed: bool`, `reason: str`, `role`, `group`, `est_usd`,
 `month_spent`, `day_spent`, `in_flight`, `caps: {monthly_usd, daily_usd, per_call_usd}`,
-`ledger_missing: bool`, `reservation: int`.
+`ledger_missing: bool`, `settling: float`, `reservation: int`.
 
 `reason` is one of: `ok`, `disabled`, `unknown_role`, `role_unmapped`, `no_cap`, `bad_estimate`,
-`ledger_unreadable`, `ledger_error`, `over_per_call_cap`, `over_daily_cap`, `over_monthly_cap`.
+`ledger_missing`, `ledger_unreadable`, `ledger_error`, `over_per_call_cap`, `over_daily_cap`, `over_monthly_cap`.
 
 `LedgerTotals`: `month`, `day`, `by_group_month`, `by_group_day`, `missing`, `bad_lines`,
 `rows_counted`, `files`.
 
 ### teacher_call
 
-Returns `{ok, text, usd, usd_source, reason, role, group, decision}`.
+Returns `{ok, text, usd, usd_source, cost_unknown, reason, role, group, decision}`.
 
 1. `reserve` (guard + in-process hold, so concurrent callers cannot share one remaining budget).
    The estimate is `max_usd_per_call * (chars/3 + max_tokens) / est_ref_tokens`; a request bigger
    than the reference size therefore exceeds the per-call cap and is refused.
-2. Sanitize each message with `llm_local._sanitize_for_cloud` when `sanitize` (unavailable => refused,
-   `sanitizer_unavailable`).
+2. When `sanitize`: redact credentials (`llm_local._sanitize_for_cloud`; unavailable => refused,
+   `sanitizer_unavailable`) and emails, IPv4 addresses and home-directory user names. This is not a
+   privacy filter: case, finding and memory text goes out as given, so callers choose what may leave.
 3. Call the LiteLLM group with metadata `loci_internal_call=true`, `loci_teacher_purpose=<purpose>`,
    so the LiteLLM plugin skips grounding and memory write-back.
 4. `usd` is the cost the response reports (`usage.cost`, `response_cost`), else the estimate;
-   `usd_source` is `gateway`, `estimate` or `none`. The reservation is always released; the ledger
-   carries real spend.
+   `usd_source` is `gateway`, `estimate` or `none`. The reservation is always released, but once the
+   request was sent its cost (reported, else the estimate) stays counted by the guard for
+   `settle_seconds`, covering the gap before the gateway writes its ledger row (conservative: it is
+   double counted once the row lands, until the window ends). `transport_error` and `bad_response`
+   set `cost_unknown=true`: the gateway may have billed; the estimate is held the same way.
 
 `reason` on failure: a guard reason above, `sanitizer_unavailable`, `transport_error:<Type>`,
 `bad_response`, `error:<Type>`.
@@ -74,7 +80,8 @@ default goes through `loci.litellm_client.call_litellm_proxy` (which now accepts
 
 Rows `{ts, group, cost_usd, ok}`, append-only jsonl, rotated to `<file>.1`, `.2`, ... Read backward
 by `ts`, stopping before the start of the local month; bad lines are skipped and counted. A missing
-file is zero spend with `ledger_missing=true`; an existing but unreadable one refuses all spend.
+file reads as zero spend with `ledger_missing=true` but the guard refuses (`ledger_missing`) unless
+`allow_missing_ledger` is set; an existing but unreadable one refuses all spend.
 Cached 5 s (cleared after each `teacher_call`).
 
 ## CLI

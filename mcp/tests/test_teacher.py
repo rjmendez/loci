@@ -51,18 +51,22 @@ def env(monkeypatch, tmp_path):
     backends._config_cache_clear()
     T.cache_clear()
     T._reservations.clear()
+    T._settling.clear()
     yield {"cfg": cfg, "ledger": tmp_path / "ledger.jsonl", "clock": clock, "tmp": tmp_path}
     T._reservations.clear()
+    T._settling.clear()
     T.cache_clear()
     backends._config_cache_clear()
 
 
-def setup_cfg(env, replace=None):
+def setup_cfg(env, replace=None, ledger=True):
     text = TOML.format(ledger=str(env["ledger"]).replace("\\", "/"))
     if replace:
         assert replace[0] in text
         text = text.replace(*replace)
     env["cfg"].write_text(text, encoding="utf-8")
+    if ledger and not env["ledger"].exists():
+        env["ledger"].write_text("", encoding="utf-8")     # the guard refuses a missing ledger
     backends._config_cache_clear()
     T.cache_clear()
 
@@ -150,10 +154,33 @@ def test_ledger_tolerates_bad_lines_and_counts_them(env):
 
 
 def test_ledger_missing_is_zero_and_reported(env):
-    setup_cfg(env)
+    setup_cfg(env, ledger=False)
     led = T.read_ledger()
     assert (led.month, led.day, led.missing) == (0.0, 0.0, True)
     assert T.check("judge", 0.1).ledger_missing is True
+
+
+def test_guard_refuses_missing_ledger(env):
+    setup_cfg(env, ledger=False)
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason) == (False, "ledger_missing")
+    assert T.reserve("judge", 0.1).reservation == 0 and T._reservations == {}
+
+
+def test_guard_allows_missing_ledger_only_when_opted_in(env, monkeypatch):
+    setup_cfg(env, ledger=False)
+    assert T.check("judge", 0.1).reason == "ledger_missing"
+    monkeypatch.setenv("LOCI_TEACHER_ALLOW_MISSING_LEDGER", "1")
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason, d.ledger_missing) == (True, "ok", True)
+
+
+def test_call_with_missing_ledger_never_reaches_transport(env):
+    setup_cfg(env, ledger=False)
+    rec = Rec(reply())
+    out = T.teacher_call("judge", "hello", 50, "p", transport=rec)
+    assert rec.calls == []
+    assert (out["ok"], out["reason"]) == (False, "ledger_missing")
 
 
 def test_ledger_present_is_not_reported_missing(env):
@@ -243,6 +270,7 @@ def test_guard_missing_or_zero_cap_refuses(env, key, val):
 def test_guard_unreadable_ledger_refuses(env):
     setup_cfg(env)
     assert T.check("judge", 0.1).allowed is True
+    env["ledger"].unlink()
     env["ledger"].mkdir()
     T.cache_clear()
     d = T.check("judge", 0.1)
@@ -409,6 +437,66 @@ def test_call_drops_ledger_cache_so_next_guard_sees_spend(env):
     assert T.check("judge", 0.1).day_spent == 0.75
 
 
+def test_settling_cost_blocks_next_call_until_window_passes(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 1, "grp-j", 1.2)])           # 0.8 left today
+    out = T.teacher_call("judge", "hello", 50, "p", transport=Rec(reply(cost=0.45)))
+    assert (out["ok"], out["usd"], out["cost_unknown"]) == (True, 0.45, False)
+    assert T._reservations == {}                              # released, but the cost is still held
+    d = T.check("judge", 0.45)                                # ledger row has not landed yet
+    assert (d.allowed, d.reason, d.settling, d.in_flight) == (False, "over_daily_cap", 0.45, 0.45)
+    env["clock"]["t"] += 119.0
+    assert T.check("judge", 0.45).allowed is False
+    env["clock"]["t"] += 2.0                                  # past settle_seconds (120)
+    d = T.check("judge", 0.45)
+    assert (d.allowed, d.settling) == (True, 0.0)
+
+
+def test_settling_uses_estimate_when_gateway_reports_no_cost(env):
+    setup_cfg(env)
+    T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply()))
+    assert T.check("judge", 0.1).settling == pytest.approx(0.025)
+
+
+def test_settle_seconds_zero_disables_the_hold(env, monkeypatch):
+    setup_cfg(env)
+    monkeypatch.setenv("LOCI_TEACHER_SETTLE_SECONDS", "0")
+    T.teacher_call("judge", "hello", 50, "p", transport=Rec(reply(cost=0.4)))
+    assert T.check("judge", 0.1).settling == 0.0
+
+
+def test_transport_error_holds_estimate_and_flags_cost_unknown(env):
+    setup_cfg(env)
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(exc=TimeoutError("late")))
+    assert (out["ok"], out["reason"], out["cost_unknown"]) == (False, "transport_error:TimeoutError", True)
+    assert T.check("judge", 0.1).settling == pytest.approx(0.025)
+
+
+def test_bad_response_flags_cost_unknown_and_holds(env):
+    setup_cfg(env)
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec("text"))
+    assert (out["reason"], out["cost_unknown"]) == ("bad_response", True)
+    assert T.check("judge", 0.1).settling == pytest.approx(0.025)
+
+
+def test_refusal_holds_nothing_and_is_not_cost_unknown(env):
+    setup_cfg(env)
+    out = T.teacher_call("nope", "hello", 50, "p", transport=Rec(reply()))
+    assert (out["reason"], out["cost_unknown"]) == ("unknown_role", False)
+    assert T._settling == []
+
+
+def test_call_redacts_emails_ips_and_home_paths(env):
+    setup_cfg(env)
+    rec = Rec(reply())
+    T.teacher_call("judge", "mail bob@example.org from 10.1.2.3 at /home/amy/y and /users/Bob/z", 80, "p", transport=rec)
+    assert rec.calls[0][1][0]["content"] == "mail [EMAIL] from [IP] at [HOME]/y and [HOME]/z"
+
+
+def test_redaction_leaves_ordinary_text_alone():
+    assert T._redact_pii("version 1.2.3 of module a.b") == "version 1.2.3 of module a.b"
+
+
 def test_default_transport_goes_through_shared_litellm_client(monkeypatch):
     import loci.litellm_client as lc
     seen = []
@@ -465,7 +553,7 @@ def test_status_reports_caps_spent_remaining_by_group(env):
 
 
 def test_status_reports_unreadable_ledger(env):
-    setup_cfg(env)
+    setup_cfg(env, ledger=False)
     env["ledger"].mkdir()
     s = T.status()
     assert "ledger.jsonl" in s["ledger_error"] and "spent" not in s

@@ -124,6 +124,8 @@
 # groups_counted = []            # default: every group named under [teacher.roles]
 # sanitize = true
 # est_ref_tokens = 4000          # request size at which the pre-call estimate equals max_usd_per_call
+# allow_missing_ledger = false   # true: a missing ledger file counts as zero spend (default: refuse, ledger_missing)
+# settle_seconds = 120           # a finished call's cost stays counted this long while the gateway writes its ledger row
 # [teacher.roles]                # role -> LiteLLM group name (from your LiteLLM config)
 # judge = "<litellm-group>"
 # label_a = "<litellm-group>"
