@@ -438,3 +438,12 @@ def test_promote_to_cold_skips_the_gate(promote_store, monkeypatch):
     monkeypatch.setattr(T, "_default_transport", t)
     r = json.loads(server.memory_promote("promo", promote_store, "cold"))
     assert (t.calls, "teacher_verify" in r) == ([], False)
+
+
+def test_adjudicate_call_leaves_room_for_a_verbose_model_and_asks_for_a_short_rationale():
+    seed()
+    t = Transport([decision("keep_a")])
+    M.run_batch([INV], transport=t)
+    assert len(t.calls) == 1
+    assert t.calls[0]["max_tokens"] == 1000
+    assert "Keep rationale under 40 words." in t.calls[0]["messages"][0]["content"]
