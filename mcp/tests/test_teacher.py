@@ -27,6 +27,7 @@ enabled = true
 monthly_usd_cap = 10.0
 daily_usd_cap = 2.0
 max_usd_per_call = 0.5
+safety_margin_pct = 0
 ledger_file = "{ledger}"
 [teacher.roles]
 judge = "grp-j"
@@ -35,7 +36,8 @@ label_b = "grp-b"
 propose = "grp-p"
 adjudicate = "grp-d"
 verify = "grp-v"
-"""
+""" + "".join(f'[teacher.prices.{g}]\nin_usd_per_mtok = 50.0\nout_usd_per_mtok = 200.0\n'
+              for g in ("grp-j", "grp-a", "grp-b", "grp-p", "grp-d", "grp-v"))
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +54,7 @@ def env(monkeypatch, tmp_path):
     T.cache_clear()
     T._reservations.clear()
     T._settling.clear()
+    T.overruns_reset()
     yield {"cfg": cfg, "ledger": tmp_path / "ledger.jsonl", "clock": clock, "tmp": tmp_path}
     T._reservations.clear()
     T._settling.clear()
@@ -86,6 +89,7 @@ def test_defaults_everything_off():
     assert c["sanitize"] is True
     assert c["ledger_file"] == str(Path("~/.loci/litellm_cost_ledger.jsonl").expanduser())
     assert c["groups_counted"] == []
+    assert (c["max_bad_lines"], c["safety_margin_pct"], c["chars_per_token"], c["prices"]) == (0, 10.0, 3.0, {})
 
 
 def test_config_from_toml_counts_role_groups_by_default(env):
@@ -95,6 +99,28 @@ def test_config_from_toml_counts_role_groups_by_default(env):
     assert c["roles"] == GROUPS
     assert c["groups_counted"] == ["grp-a", "grp-b", "grp-d", "grp-j", "grp-p", "grp-v"]
     assert (c["monthly_usd_cap"], c["daily_usd_cap"], c["max_usd_per_call"]) == (10.0, 2.0, 0.5)
+    assert c["safety_margin_pct"] == 0.0
+    assert c["prices"]["grp-j"] == {"in": 50.0, "out": 200.0} and len(c["prices"]) == 6
+
+
+def test_prices_from_env_replace_toml_and_drop_incomplete(env, monkeypatch):
+    setup_cfg(env)
+    monkeypatch.setenv("LOCI_TEACHER_PRICES", "grp-j=1.5:2.5, grp-a=3, grp-b=-1:2, grp-p=x:1")
+    assert T.teacher_config()["prices"] == {"grp-j": {"in": 1.5, "out": 2.5}}
+
+
+def test_chars_per_token_and_bad_lines_from_env(monkeypatch):
+    monkeypatch.setenv("LOCI_TEACHER_CHARS_PER_TOKEN", "4")
+    monkeypatch.setenv("LOCI_TEACHER_MAX_BAD_LINES", "7")
+    monkeypatch.setenv("LOCI_TEACHER_SAFETY_MARGIN_PCT", "25")
+    c = T.teacher_config()
+    assert (c["chars_per_token"], c["max_bad_lines"], c["safety_margin_pct"]) == (4.0, 7, 25.0)
+
+
+@pytest.mark.parametrize("bad", ["100", "-5", "abc", "nan"])
+def test_unusable_safety_margin_falls_back_to_default(bad, monkeypatch):
+    monkeypatch.setenv("LOCI_TEACHER_SAFETY_MARGIN_PCT", bad)
+    assert T.teacher_config()["safety_margin_pct"] == 10.0
 
 
 def test_env_overrides_toml(env, monkeypatch):
@@ -279,6 +305,7 @@ def test_guard_unreadable_ledger_refuses(env):
 
 def test_guard_per_call_boundary(env):
     setup_cfg(env)
+    assert T.check("judge", 0.4999999).allowed is True
     assert T.check("judge", 0.5).allowed is True
     d = T.check("judge", 0.5000001)
     assert (d.allowed, d.reason) == (False, "over_per_call_cap")
@@ -287,17 +314,112 @@ def test_guard_per_call_boundary(env):
 def test_guard_daily_boundary(env):
     setup_cfg(env)
     rows(env["ledger"], [(NOW - 1, "grp-j", 1.75)])
+    assert T.check("judge", 0.2499999).allowed is True
     assert T.check("judge", 0.25).allowed is True
-    d = T.check("judge", 0.3)
+    d = T.check("judge", 0.2500001)
     assert (d.allowed, d.reason) == (False, "over_daily_cap")
 
 
 def test_guard_monthly_boundary(env):
     setup_cfg(env)
     rows(env["ledger"], [(MONTH_START + 1, "grp-j", 9.75)])    # nothing today
+    assert T.check("judge", 0.2499999).allowed is True
     assert T.check("judge", 0.25).allowed is True
-    d = T.check("judge", 0.3)
+    d = T.check("judge", 0.2500001)
     assert (d.allowed, d.reason) == (False, "over_monthly_cap")
+
+
+def test_safety_margin_shrinks_every_usable_cap(env):
+    setup_cfg(env, ("safety_margin_pct = 0", "safety_margin_pct = 10"))
+    rows(env["ledger"], [(NOW - 1, "grp-j", 1.5)])
+    d = T.check("judge", 0.3)                                  # 1.8 == 90% of the 2.0 daily cap
+    assert (d.allowed, d.usable_caps) == (True, {"monthly_usd": 9.0, "daily_usd": 1.8, "per_call_usd": 0.45})
+    assert d.caps == {"monthly_usd": 10.0, "daily_usd": 2.0, "per_call_usd": 0.5}
+    d = T.check("judge", 0.4)                                  # 1.9 fits the raw cap, not the usable one
+    assert (d.allowed, d.reason) == (False, "over_daily_cap")
+    d = T.check("judge", 0.46)                                 # over 0.45 usable per-call, under 0.5 raw
+    assert (d.allowed, d.reason) == (False, "over_per_call_cap")
+    setup_cfg(env)                                             # margin 0: the same 0.4 call fits
+    assert T.check("judge", 0.4).allowed is True
+
+
+def test_safety_margin_shrinks_monthly_cap(env):
+    setup_cfg(env, ("safety_margin_pct = 0", "safety_margin_pct = 10"))
+    rows(env["ledger"], [(MONTH_START + 1, "grp-j", 8.9)])
+    assert T.check("judge", 0.1).allowed is True               # 9.0 == usable monthly cap
+    d = T.check("judge", 0.2)
+    assert (d.allowed, d.reason) == (False, "over_monthly_cap")
+
+
+def test_guard_no_price_refuses_unpriced_group(env):
+    setup_cfg(env)
+    assert T.check("judge", 0.1).allowed is True
+    env["cfg"].write_text(env["cfg"].read_text(encoding="utf-8").replace("[teacher.prices.grp-j]", "[teacher.prices.other]"),
+                          encoding="utf-8")
+    backends._config_cache_clear()
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason) == (False, "no_price")
+    assert T.check("verify", 0.1).allowed is True              # priced groups are unaffected
+
+
+def test_call_no_price_never_reaches_transport(env):
+    setup_cfg(env)
+    env["cfg"].write_text(env["cfg"].read_text(encoding="utf-8").replace("[teacher.prices.grp-p]", "[teacher.prices.other]"),
+                          encoding="utf-8")
+    backends._config_cache_clear()
+    rec = Rec(reply())
+    out = T.teacher_call("propose", "hello", 10, "p", transport=rec)
+    assert (out["ok"], out["reason"], rec.calls) == (False, "no_price", [])
+    assert T.teacher_call("judge", "hello", 10, "p", transport=rec)["ok"] is True
+
+
+def test_guard_corrupt_ledger_refuses_by_default(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 9, "grp-j", 0.5)])
+    assert T.check("judge", 0.1).allowed is True
+    with open(env["ledger"], "a", encoding="utf-8") as f:
+        f.write("{\"ts\": 1\n")                               # truncated row
+    T.cache_clear()
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason, d.bad_lines) == (False, "ledger_corrupt", 1)
+
+
+def test_negative_cost_row_counts_as_corrupt(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 9, "grp-j", -0.5)])
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason, d.bad_lines) == (False, "ledger_corrupt", 1)
+
+
+def test_max_bad_lines_is_an_explicit_tolerance(env, monkeypatch):
+    setup_cfg(env)
+    with open(env["ledger"], "a", encoding="utf-8") as f:
+        f.write("junk\nmore junk\n")
+    monkeypatch.setenv("LOCI_TEACHER_MAX_BAD_LINES", "1")
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason, d.bad_lines) == (False, "ledger_corrupt", 2)
+    monkeypatch.setenv("LOCI_TEACHER_MAX_BAD_LINES", "2")
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.reason, d.bad_lines) == (True, "ok", 2)
+
+
+def test_bad_lines_before_month_start_are_not_counted(env):
+    setup_cfg(env)
+    with open(env["ledger"], "w", encoding="utf-8") as f:
+        f.write("junk in an old month\n")
+        f.write(json.dumps({"ts": MONTH_START - 5, "group": "grp-j", "cost_usd": 1}) + "\n")
+    rows(env["ledger"], [(NOW - 9, "grp-j", 0.5)], mode="a")
+    d = T.check("judge", 0.1)
+    assert (d.allowed, d.bad_lines) == (True, 0)
+
+
+def test_call_with_corrupt_ledger_never_reaches_transport(env):
+    setup_cfg(env)
+    with open(env["ledger"], "a", encoding="utf-8") as f:
+        f.write("junk\n")
+    rec = Rec(reply())
+    out = T.teacher_call("judge", "hello", 10, "p", transport=rec)
+    assert (out["ok"], out["reason"], rec.calls) == (False, "ledger_corrupt", [])
 
 
 @pytest.mark.parametrize("bad", [float("nan"), -1.0, "x"])
@@ -379,7 +501,7 @@ def test_call_without_reported_cost_charges_estimate(env):
     setup_cfg(env)
     rec = Rec(reply())
     out = T.teacher_call("judge", "x" * 300, 100, "p", transport=rec)
-    # tokens = 300/3 + 100 = 200 of ref 4000 -> 0.5 * 200/4000
+    # 300/3 = 100 in-tokens * 50/M + 100 out-tokens * 200/M
     assert (out["usd"], out["usd_source"]) == (pytest.approx(0.025), "estimate")
 
 
@@ -396,9 +518,51 @@ def test_call_refused_never_reaches_transport(env):
 def test_call_oversize_request_refused_by_per_call_cap(env):
     setup_cfg(env)
     rec = Rec(reply())
-    out = T.teacher_call("judge", "x" * 3000, 4000, "p", transport=rec)    # 1000+4000 tokens -> est 0.625 > 0.5
+    out = T.teacher_call("judge", "x" * 3000, 4000, "p", transport=rec)    # 1000*50/M + 4000*200/M = 0.85 > 0.5
     assert rec.calls == []
     assert out["reason"] == "over_per_call_cap"
+    assert out["decision"]["est_usd"] == pytest.approx(0.85)
+
+
+def test_estimate_follows_group_price_not_request_size(env):
+    # A short prompt to an expensive group: the old size-scaled estimate passed this; the price-based one cannot.
+    setup_cfg(env, ('[teacher.prices.grp-j]\nin_usd_per_mtok = 50.0\nout_usd_per_mtok = 200.0',
+                    '[teacher.prices.grp-j]\nin_usd_per_mtok = 50.0\nout_usd_per_mtok = 10000.0'))
+    rec = Rec(reply())
+    out = T.teacher_call("judge", "hi", 100, "p", transport=rec)           # 100 out-tokens * 10000/M = 1.0 + 0.0000333
+    assert (out["reason"], rec.calls) == ("over_per_call_cap", [])
+    assert out["decision"]["est_usd"] == pytest.approx(1.0000333, rel=1e-4)
+    assert T.teacher_call("verify", "hi", 100, "p", transport=rec)["ok"] is True   # cheap group, same request
+
+
+def test_estimate_uses_configured_chars_per_token(env, monkeypatch):
+    setup_cfg(env)
+    msgs = [{"role": "user", "content": "x" * 400}]
+    assert T._estimate(msgs, 0, T.teacher_config(), "grp-j") == pytest.approx(400 / 3.0 * 50 / 1e6)
+    monkeypatch.setenv("LOCI_TEACHER_CHARS_PER_TOKEN", "4")
+    assert T._estimate(msgs, 0, T.teacher_config(), "grp-j") == pytest.approx(100 * 50 / 1e6)
+
+
+def test_gateway_cost_above_estimate_counts_an_overrun(env):
+    setup_cfg(env)
+    T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply(cost=0.125)))   # estimate 0.025
+    s = T.status()
+    assert s["overruns"]["count"] == 1
+    assert s["overruns"]["excess_usd"] == pytest.approx(0.1)
+    assert s["overruns"]["last_excess_usd"] == pytest.approx(0.1)
+
+
+def test_gateway_cost_within_estimate_is_not_an_overrun(env):
+    setup_cfg(env)
+    T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply(cost=0.025)))   # equal to the estimate
+    T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply(cost=0.01)))
+    assert T.status()["overruns"]["count"] == 0
+
+
+def test_ledger_rows_over_per_call_cap_are_surfaced(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 3, "grp-j", 0.5), (NOW - 2, "grp-j", 0.51), (NOW - 1, "other", 9.0)])
+    assert T.status()["overruns"]["ledger_rows_over_call_cap"] == 1
 
 
 def test_call_sanitizes_secrets_by_default_and_not_when_off(env, monkeypatch):
@@ -550,6 +714,9 @@ def test_status_reports_caps_spent_remaining_by_group(env):
     assert s["remaining"] == {"month_usd": 9.25, "day_usd": 1.25}
     assert s["by_group"]["month"] == {"grp-j": 0.5, "grp-a": 0.25}
     assert s["ledger_missing"] is False
+    assert (s["safety_margin_pct"], s["max_bad_lines"]) == (0.0, 0)
+    assert s["priced_groups"] == ["grp-a", "grp-b", "grp-d", "grp-j", "grp-p", "grp-v"]
+    assert "process-local" in s["limits"] and "N x max_usd_per_call" in s["limits"] and "no budget" in s["limits"]
 
 
 def test_status_reports_unreadable_ledger(env):

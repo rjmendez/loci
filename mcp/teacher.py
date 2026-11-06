@@ -3,8 +3,9 @@
 The guard fails CLOSED (anything doubtful refuses the spend). `teacher_call` never raises: callers
 that use it fail OPEN (a refusal or error degrades the feature, not the tool call). Everything is
 off by default. Role -> LiteLLM group names and caps come from backends.toml [teacher] or
-LOCI_TEACHER_* env, read at call time; prices live in the LiteLLM config, spend is read from the
-LiteLLM cost ledger (jsonl, append-only, rotating).
+LOCI_TEACHER_* env, read at call time. Spend is read from the LiteLLM cost ledger (jsonl,
+append-only, rotating). LiteLLM enforces no budget here: this guard is the only brake, and the
+operator-supplied [teacher.prices] table must be kept in sync with the LiteLLM config.
 
 Public API: ROLES, teacher_config, read_ledger, check, reserve, release, teacher_call, status.
 """
@@ -29,7 +30,8 @@ DEFAULT_LEDGER = "~/.loci/litellm_cost_ledger.jsonl"
 LEDGER_CACHE_S = 5.0
 DEFAULT_SETTLE_S = 120.0          # how long a finished call's cost stays held while the gateway writes its ledger row
 MAX_SIBLINGS = 12                 # ledger.jsonl.1 .. .12
-DEFAULT_EST_REF_TOKENS = 4000     # request size at which the estimate equals max_usd_per_call
+DEFAULT_CHARS_PER_TOKEN = 3.0     # conservative (real text is ~4): more tokens estimated, so more cost
+DEFAULT_SAFETY_MARGIN_PCT = 10.0  # usable cap = cap * (100 - margin) / 100
 _CHUNK = 1 << 20
 
 Messages = List[Dict[str, Any]]
@@ -74,6 +76,41 @@ def _settle(v: Any) -> float:
     return f if math.isfinite(f) and f >= 0 else DEFAULT_SETTLE_S
 
 
+def _nonneg(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) and f >= 0 else None
+
+
+def _margin(v: Any) -> float:
+    f = _nonneg(v)
+    return f if f is not None and f < 100 else DEFAULT_SAFETY_MARGIN_PCT
+
+
+def _prices(raw: Any) -> Dict[str, Dict[str, float]]:
+    """group -> {in, out} USD per million tokens. Env form: ``group=in:out,group2=in:out``.
+    Entries missing either price or with a negative/non-finite one are dropped (= no_price)."""
+    items: Dict[str, Any] = {}
+    if isinstance(raw, str):
+        for part in raw.split(","):
+            g, _, pr = part.partition("=")
+            i, _, o = pr.partition(":")
+            if g.strip():
+                items[g.strip()] = {"in_usd_per_mtok": i, "out_usd_per_mtok": o}
+    elif isinstance(raw, dict):
+        items = {str(g).strip(): v for g, v in raw.items()}
+    out: Dict[str, Dict[str, float]] = {}
+    for g, v in items.items():
+        if not g or not isinstance(v, dict):
+            continue
+        i, o = _nonneg(v.get("in_usd_per_mtok")), _nonneg(v.get("out_usd_per_mtok"))
+        if i is not None and o is not None:
+            out[g] = {"in": i, "out": o}
+    return out
+
+
 def teacher_config() -> Dict[str, Any]:
     """Resolved config, read now: env LOCI_TEACHER_* over backends.toml [teacher]."""
     def get(key: str, env: str, default: Any = None) -> Any:
@@ -92,10 +129,12 @@ def teacher_config() -> Dict[str, Any]:
     if isinstance(counted, str):
         counted = [c for c in counted.split(",")]
     counted = sorted({str(c).strip() for c in counted if str(c).strip()}) if counted else sorted(set(roles.values()))
+    cpt = _nonneg(get("chars_per_token", "LOCI_TEACHER_CHARS_PER_TOKEN", DEFAULT_CHARS_PER_TOKEN))
     try:
-        ref = int(get("est_ref_tokens", "LOCI_TEACHER_EST_REF_TOKENS", DEFAULT_EST_REF_TOKENS))
+        max_bad = int(get("max_bad_lines", "LOCI_TEACHER_MAX_BAD_LINES", 0))
     except (TypeError, ValueError):
-        ref = DEFAULT_EST_REF_TOKENS
+        max_bad = 0
+    env_prices = _env("LOCI_TEACHER_PRICES")
     return {
         "enabled": _bool(get("enabled", "LOCI_TEACHER_ENABLED", False), False),
         "roles": roles,
@@ -105,7 +144,10 @@ def teacher_config() -> Dict[str, Any]:
         "ledger_file": str(Path(str(get("ledger_file", "LOCI_TEACHER_LEDGER_FILE", DEFAULT_LEDGER))).expanduser()),
         "groups_counted": counted,
         "sanitize": _bool(get("sanitize", "LOCI_TEACHER_SANITIZE", True), True),
-        "est_ref_tokens": ref if ref > 0 else DEFAULT_EST_REF_TOKENS,
+        "chars_per_token": cpt if cpt else DEFAULT_CHARS_PER_TOKEN,
+        "prices": _prices(env_prices if env_prices is not None else backends._cfg("teacher", "prices", {})),
+        "max_bad_lines": max(max_bad, 0),
+        "safety_margin_pct": _margin(get("safety_margin_pct", "LOCI_TEACHER_SAFETY_MARGIN_PCT", DEFAULT_SAFETY_MARGIN_PCT)),
         "allow_missing_ledger": _bool(get("allow_missing_ledger", "LOCI_TEACHER_ALLOW_MISSING_LEDGER", False), False),
         "settle_seconds": _settle(get("settle_seconds", "LOCI_TEACHER_SETTLE_SECONDS", DEFAULT_SETTLE_S)),
     }
@@ -121,6 +163,7 @@ class LedgerTotals:
     missing: bool = False
     bad_lines: int = 0
     rows_counted: int = 0
+    rows_over_call_cap: int = 0   # counted rows costing more than max_usd_per_call (a per-call overrun seen in the ledger)
     files: List[str] = field(default_factory=list)
 
 
@@ -155,7 +198,7 @@ def _row(line: bytes) -> Optional[tuple]:
     return ts, grp, cost
 
 
-def _scan(base: str, counted: set, month_start: float, day_start: float) -> LedgerTotals:
+def _scan(base: str, counted: set, month_start: float, day_start: float, call_cap: float = 0.0) -> LedgerTotals:
     out = LedgerTotals()
     paths = [base] + [f"{base}.{i}" for i in range(1, MAX_SIBLINGS + 1)]
     existing = [p for p in paths if os.path.exists(p)]
@@ -180,6 +223,8 @@ def _scan(base: str, counted: set, month_start: float, day_start: float) -> Ledg
                 if grp not in counted:
                     continue
                 out.rows_counted += 1
+                if call_cap > 0 and cost > call_cap:
+                    out.rows_over_call_cap += 1
                 out.month += cost
                 out.by_group_month[grp] = out.by_group_month.get(grp, 0.0) + cost
                 if ts >= day_start:
@@ -204,17 +249,18 @@ def cache_clear() -> None:
 def read_ledger(cfg: Optional[Dict[str, Any]] = None) -> LedgerTotals:
     """Spend of counted groups for the current local month and day. Raises LedgerUnreadable.
 
-    A missing ledger is zero spend with ``missing=True`` (the guard refuses it unless opted in). Cached for LEDGER_CACHE_S."""
+    Unparseable and negative-cost rows are skipped and counted in ``bad_lines``; the guard refuses
+    when they exceed ``max_bad_lines``. A missing ledger is zero spend with ``missing=True`` (the guard refuses it unless opted in). Cached for LEDGER_CACHE_S."""
     cfg = cfg or teacher_config()
     now = _now()
     lt = datetime.fromtimestamp(now)
     month_start = lt.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
     day_start = lt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    key = (cfg["ledger_file"], tuple(cfg["groups_counted"]), month_start, day_start)
+    key = (cfg["ledger_file"], tuple(cfg["groups_counted"]), month_start, day_start, cfg["max_usd_per_call"])
     with _cache_lock:
         if _cache["key"] == key and _mono() - _cache["at"] < LEDGER_CACHE_S:
             return _cache["value"]
-    value = _scan(cfg["ledger_file"], set(cfg["groups_counted"]), month_start, day_start)
+    value = _scan(cfg["ledger_file"], set(cfg["groups_counted"]), month_start, day_start, cfg["max_usd_per_call"])
     with _cache_lock:
         _cache.update(key=key, at=_mono(), value=value)
     return value
@@ -235,6 +281,8 @@ class Decision:
     ledger_missing: bool = False
     settling: float = 0.0         # finished calls' cost still held while their ledger rows land
     reservation: int = 0          # >0 only for a held reservation (see reserve/release)
+    bad_lines: int = 0            # unparseable/negative ledger rows in the scanned month window
+    usable_caps: Dict[str, float] = field(default_factory=dict)   # caps after safety_margin_pct
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -244,6 +292,22 @@ _res_lock = threading.Lock()
 _reservations: Dict[int, float] = {}
 _settling: List[tuple] = []     # (expires_mono, usd): spent calls not yet trusted to be in the ledger
 _res_seq = 0
+_overrun_lock = threading.Lock()
+_overruns: Dict[str, Any] = {"count": 0, "excess_usd": 0.0, "last_excess_usd": 0.0}
+
+
+def overruns_reset() -> None:
+    with _overrun_lock:
+        _overruns.update(count=0, excess_usd=0.0, last_excess_usd=0.0)
+
+
+def _record_overrun(actual: float, est: float) -> None:
+    """A gateway-reported cost above the pre-call estimate: the price table is out of sync."""
+    if actual > est:
+        with _overrun_lock:
+            _overruns["count"] += 1
+            _overruns["excess_usd"] += actual - est
+            _overruns["last_excess_usd"] = actual - est
 
 
 def _decide(role: str, est_usd: float, hold: bool) -> Decision:
@@ -252,7 +316,9 @@ def _decide(role: str, est_usd: float, hold: bool) -> Decision:
     caps = {"monthly_usd": cfg["monthly_usd_cap"], "daily_usd": cfg["daily_usd_cap"],
             "per_call_usd": cfg["max_usd_per_call"]}
     group = cfg["roles"].get(role, "")
-    d = Decision(False, "", role=role, group=group, est_usd=est_usd, caps=caps)
+    margin = cfg["safety_margin_pct"]
+    usable = {k: v * (100.0 - margin) / 100.0 for k, v in caps.items()}
+    d = Decision(False, "", role=role, group=group, est_usd=est_usd, caps=caps, usable_caps=usable)
     if not cfg["enabled"]:
         d.reason = "disabled"
         return d
@@ -264,6 +330,9 @@ def _decide(role: str, est_usd: float, hold: bool) -> Decision:
         return d
     if not (caps["monthly_usd"] > 0 and caps["daily_usd"] > 0 and caps["per_call_usd"] > 0):
         d.reason = "no_cap"
+        return d
+    if group not in cfg["prices"]:
+        d.reason = "no_price"
         return d
     try:
         est = float(est_usd)
@@ -280,7 +349,10 @@ def _decide(role: str, est_usd: float, hold: bool) -> Decision:
     except Exception:  # noqa: BLE001 - any ledger failure refuses the spend
         d.reason = "ledger_error"
         return d
-    d.month_spent, d.day_spent, d.ledger_missing = led.month, led.day, led.missing
+    d.month_spent, d.day_spent, d.ledger_missing, d.bad_lines = led.month, led.day, led.missing, led.bad_lines
+    if led.bad_lines > cfg["max_bad_lines"]:
+        d.reason = "ledger_corrupt"
+        return d
     if led.missing and not cfg["allow_missing_ledger"]:
         d.reason = "ledger_missing"
         return d
@@ -290,11 +362,11 @@ def _decide(role: str, est_usd: float, hold: bool) -> Decision:
         d.settling = sum(u for _, u in _settling)
         held = sum(_reservations.values()) + d.settling
         d.in_flight = held
-        if est > caps["per_call_usd"]:
+        if est > usable["per_call_usd"]:
             d.reason = "over_per_call_cap"
-        elif d.day_spent + held + est > caps["daily_usd"]:
+        elif d.day_spent + held + est > usable["daily_usd"]:
             d.reason = "over_daily_cap"
-        elif d.month_spent + held + est > caps["monthly_usd"]:
+        elif d.month_spent + held + est > usable["monthly_usd"]:
             d.reason = "over_monthly_cap"
         else:
             d.allowed, d.reason = True, "ok"
@@ -354,10 +426,14 @@ def _redact_pii(text: str) -> str:
     return text
 
 
-def _estimate(messages: Messages, max_tokens: int, cfg: Dict[str, Any]) -> float:
-    """Prices are not here: scale max_usd_per_call by request size (chars/3 + max_tokens vs est_ref_tokens)."""
-    tokens = sum(len(m["content"]) for m in messages) / 3.0 + max(int(max_tokens), 0)
-    return cfg["max_usd_per_call"] * tokens / cfg["est_ref_tokens"]
+def _estimate(messages: Messages, max_tokens: int, cfg: Dict[str, Any], group: str) -> float:
+    """Worst-case cost: input tokens (chars / chars_per_token) * in price + max_tokens * out price.
+    An unpriced group yields 0.0; the guard refuses it (no_price) before the estimate is used."""
+    price = cfg["prices"].get(group)
+    if price is None:
+        return 0.0
+    in_tok = sum(len(m["content"]) for m in messages) / cfg["chars_per_token"]
+    return (in_tok * price["in"] + max(int(max_tokens), 0) * price["out"]) / 1e6
 
 
 def _actual_usd(resp: Dict[str, Any]) -> Optional[float]:
@@ -397,7 +473,7 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
     try:
         cfg = teacher_config()
         messages = _to_messages(prompt_or_messages)
-        decision = reserve(role, _estimate(messages, max_tokens, cfg))
+        decision = reserve(role, _estimate(messages, max_tokens, cfg, cfg["roles"].get(role, "")))
         out["decision"], out["group"] = decision.to_dict(), decision.group
         if not decision.allowed:
             out["reason"] = decision.reason
@@ -424,6 +500,8 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
             return out
         actual = _actual_usd(resp)
         settle_usd = actual if actual is not None else decision.est_usd
+        if actual is not None:
+            _record_overrun(actual, decision.est_usd)
         out["usd"], out["usd_source"] = (actual, "gateway") if actual is not None else (decision.est_usd, "estimate")
         out["text"] = _text(resp)
         out["ok"], out["reason"] = True, "ok"
@@ -438,11 +516,19 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
 
 
 # ------------------------------------------------------------------ status / CLI
+LIMITS_NOTE = ("Reservations and the settling hold are process-local and the ledger is cached "
+               f"{LEDGER_CACHE_S:g}s: N Loci processes can jointly overshoot a cap by up to "
+               "N x max_usd_per_call plus the spend inside the cache window. LiteLLM enforces no budget; "
+               "this guard is the only brake. Overruns (cost above estimate) mean the price table is stale.")
+
+
 def status() -> Dict[str, Any]:
     """Caps, spent, remaining, by group. Never raises."""
     cfg = teacher_config()
     out: Dict[str, Any] = {"enabled": cfg["enabled"], "roles": cfg["roles"], "groups_counted": cfg["groups_counted"],
-                           "ledger_file": cfg["ledger_file"],
+                           "ledger_file": cfg["ledger_file"], "max_bad_lines": cfg["max_bad_lines"],
+                           "safety_margin_pct": cfg["safety_margin_pct"], "priced_groups": sorted(cfg["prices"]),
+                           "limits": LIMITS_NOTE,
                            "caps": {"monthly_usd": cfg["monthly_usd_cap"], "daily_usd": cfg["daily_usd_cap"],
                                     "per_call_usd": cfg["max_usd_per_call"]}}
     try:
@@ -450,6 +536,10 @@ def status() -> Dict[str, Any]:
     except LedgerUnreadable as exc:
         out.update(ledger_error=str(exc), ledger_missing=False)
         return out
+    with _overrun_lock:
+        out["overruns"] = {"count": _overruns["count"], "excess_usd": _overruns["excess_usd"],
+                           "last_excess_usd": _overruns["last_excess_usd"],
+                           "ledger_rows_over_call_cap": led.rows_over_call_cap}
     out.update(ledger_missing=led.missing, bad_lines=led.bad_lines,
                spent={"month_usd": led.month, "day_usd": led.day},
                remaining={"month_usd": max(cfg["monthly_usd_cap"] - led.month, 0.0),

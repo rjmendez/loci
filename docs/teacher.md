@@ -4,8 +4,12 @@
 verifier) to the cloud. Off by default. The guard fails CLOSED; callers fail OPEN: `teacher_call`
 never raises, a refusal or error is a result the feature degrades on.
 
-Prices are not in Loci. Spend is read from the LiteLLM cost ledger. Role -> LiteLLM group names
-come from config only, read at call time.
+Spend is read from the LiteLLM cost ledger. Role -> LiteLLM group names and the per-group price
+table come from config only, read at call time. Nothing is defaulted in code.
+
+**LiteLLM has no budget enforcement here. The Loci guard is the only brake.** The `[teacher.prices]`
+table is operator-supplied and must be kept in sync with the LiteLLM config; a stale (too low) price
+lets calls cost more than the guard thinks. Such calls are counted as overruns (see `status()`).
 
 ## Config
 
@@ -21,7 +25,10 @@ come from config only, read at call time.
 | `ledger_file` | `LOCI_TEACHER_LEDGER_FILE` | `~/.loci/litellm_cost_ledger.jsonl` |
 | `groups_counted` | `LOCI_TEACHER_GROUPS_COUNTED` (csv) | the configured role groups |
 | `sanitize` | `LOCI_TEACHER_SANITIZE` | true |
-| `est_ref_tokens` | `LOCI_TEACHER_EST_REF_TOKENS` | 4000 |
+| `[teacher.prices.<group>]` `in_usd_per_mtok`, `out_usd_per_mtok` | `LOCI_TEACHER_PRICES` (`group=in:out,group2=in:out`; replaces the toml table) | none (unpriced group => `no_price`) |
+| `chars_per_token` | `LOCI_TEACHER_CHARS_PER_TOKEN` | 3.0 (conservative; real text is nearer 4) |
+| `max_bad_lines` | `LOCI_TEACHER_MAX_BAD_LINES` | 0 (any corrupt ledger row refuses) |
+| `safety_margin_pct` | `LOCI_TEACHER_SAFETY_MARGIN_PCT` | 10 (usable cap = cap * (100 - pct) / 100; applies to all three caps) |
 | `allow_missing_ledger` | `LOCI_TEACHER_ALLOW_MISSING_LEDGER` | false (missing ledger refuses) |
 | `settle_seconds` | `LOCI_TEACHER_SETTLE_SECONDS` | 120 |
 
@@ -43,21 +50,25 @@ def cache_clear() -> None
 
 `Decision` (dataclass, `.to_dict()`): `allowed: bool`, `reason: str`, `role`, `group`, `est_usd`,
 `month_spent`, `day_spent`, `in_flight`, `caps: {monthly_usd, daily_usd, per_call_usd}`,
-`ledger_missing: bool`, `settling: float`, `reservation: int`.
+`usable_caps` (caps after the safety margin; the guard compares against these), `ledger_missing: bool`,
+`bad_lines: int`, `settling: float`, `reservation: int`.
 
-`reason` is one of: `ok`, `disabled`, `unknown_role`, `role_unmapped`, `no_cap`, `bad_estimate`,
-`ledger_missing`, `ledger_unreadable`, `ledger_error`, `over_per_call_cap`, `over_daily_cap`, `over_monthly_cap`.
+`reason` is one of: `ok`, `disabled`, `unknown_role`, `role_unmapped`, `no_cap`, `no_price`, `bad_estimate`,
+`ledger_missing`, `ledger_corrupt`, `ledger_unreadable`, `ledger_error`, `over_per_call_cap`, `over_daily_cap`, `over_monthly_cap`.
 
 `LedgerTotals`: `month`, `day`, `by_group_month`, `by_group_day`, `missing`, `bad_lines`,
-`rows_counted`, `files`.
+`rows_counted`, `rows_over_call_cap`, `files`.
 
 ### teacher_call
 
 Returns `{ok, text, usd, usd_source, cost_unknown, reason, role, group, decision}`.
 
 1. `reserve` (guard + in-process hold, so concurrent callers cannot share one remaining budget).
-   The estimate is `max_usd_per_call * (chars/3 + max_tokens) / est_ref_tokens`; a request bigger
-   than the reference size therefore exceeds the per-call cap and is refused.
+   The estimate is price-based: `chars/chars_per_token * in_price + max_tokens * out_price` (prices per
+   million tokens, from `[teacher.prices]`). It is an upper bound on the call (output cannot exceed
+   `max_tokens`), so `max_usd_per_call` is a real per-call bound as long as the prices are right. A
+   role whose group has no price is refused (`no_price`); a call whose estimate exceeds the usable
+   per-call cap is refused (`over_per_call_cap`).
 2. When `sanitize`: redact credentials (`llm_local._sanitize_for_cloud`; unavailable => refused,
    `sanitizer_unavailable`) and emails, IPv4 addresses and home-directory user names. This is not a
    privacy filter: case, finding and memory text goes out as given, so callers choose what may leave.
@@ -69,6 +80,9 @@ Returns `{ok, text, usd, usd_source, cost_unknown, reason, role, group, decision
    `settle_seconds`, covering the gap before the gateway writes its ledger row (conservative: it is
    double counted once the row lands, until the window ends). `transport_error` and `bad_response`
    set `cost_unknown=true`: the gateway may have billed; the estimate is held the same way.
+5. A gateway-reported cost above the estimate increments the overrun counter (`status()["overruns"]`):
+   the price table is out of date. Ledger rows costing more than `max_usd_per_call` are counted too
+   (`ledger_rows_over_call_cap`).
 
 `reason` on failure: a guard reason above, `sanitizer_unavailable`, `transport_error:<Type>`,
 `bad_response`, `error:<Type>`.
@@ -79,10 +93,21 @@ default goes through `loci.litellm_client.call_litellm_proxy` (which now accepts
 ## Ledger
 
 Rows `{ts, group, cost_usd, ok}`, append-only jsonl, rotated to `<file>.1`, `.2`, ... Read backward
-by `ts`, stopping before the start of the local month; bad lines are skipped and counted. A missing
+by `ts`, stopping before the start of the local month. Unparseable and negative-cost rows are skipped
+but counted (`bad_lines`); when the count exceeds `max_bad_lines` (default 0) the guard refuses with
+`ledger_corrupt` (a truncated row would otherwise silently under-count spend). A missing
 file reads as zero spend with `ledger_missing=true` but the guard refuses (`ledger_missing`) unless
 `allow_missing_ledger` is set; an existing but unreadable one refuses all spend.
 Cached 5 s (cleared after each `teacher_call`).
+
+## Limits: several processes
+
+Reservations and the settling hold live in the memory of one process, and the ledger is cached for
+5 s. The CLI, a second Loci process and the MCP server each see only the ledger, so N processes can
+jointly overshoot the daily or monthly cap by up to `N x max_usd_per_call` plus the spend that lands
+inside the cache window. `safety_margin_pct` is the cushion for this; size it for the number of
+processes you run. `status()` repeats this in its `limits` field and reports `overruns`,
+`max_bad_lines`, `safety_margin_pct` and `priced_groups`.
 
 ## CLI
 
