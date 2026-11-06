@@ -499,6 +499,13 @@ def _usage_usd(resp: Dict[str, Any], price: Optional[Dict[str, float]]) -> Optio
     return cost if cost > 0 else None
 
 
+def _finish_reason(resp: Dict[str, Any]) -> str:
+    try:
+        return str(resp["choices"][0].get("finish_reason") or "")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+
+
 def _text(resp: Dict[str, Any]) -> str:
     try:
         return str(resp["choices"][0]["message"]["content"] or "")
@@ -567,6 +574,10 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
         out["usd"], out["usd_source"] = (actual, source) if actual is not None else (decision.est_usd, "estimate")
         out["text"] = _text(resp)
         out["ok"], out["reason"] = True, "ok"
+        if _finish_reason(resp) == "content_filter":
+            out["ok"], out["reason"] = False, "content_filter"      # the provider refused; the spend above is still counted
+        elif not out["text"].strip():
+            out["ok"], out["reason"] = False, "empty_response"
         cache_clear()                 # the next guard read should see the new ledger row
         return out
     except Exception as exc:  # noqa: BLE001 - fail open for the caller

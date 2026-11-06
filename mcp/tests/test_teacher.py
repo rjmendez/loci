@@ -949,3 +949,24 @@ def test_gateway_reported_cost_still_wins_over_usage(env):
     setup_cfg(env)
     out = T.teacher_call("judge", "hello", 100, "p", transport=Rec(usage_reply(1000, 300, cost=0.02)))
     assert (out["usd"], out["usd_source"]) == (0.02, "gateway")
+
+
+def test_provider_content_filter_is_a_failed_call_that_still_counts_its_spend(env):
+    setup_cfg(env)
+    resp = usage_reply(1000, 0)
+    resp["usage"]["completion_tokens"] = 0
+    resp["choices"] = [{"message": {"content": None}, "finish_reason": "content_filter"}]
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(resp))
+    assert (out["ok"], out["reason"], out["text"]) == (False, "content_filter", "")
+    assert (out["usd"], out["usd_source"]) == (pytest.approx(0.05), "usage")   # 1000 input tokens * 50/M
+    assert T.check("judge", 0.01).settling == pytest.approx(0.05)
+
+
+def test_empty_text_is_not_an_ok_answer_but_a_nonempty_one_is(env):
+    setup_cfg(env)
+    empty = {"choices": [{"message": {"content": "  "}, "finish_reason": "length"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    out = T.teacher_call("judge", "hi", 100, "p", transport=Rec(empty))
+    assert (out["ok"], out["reason"]) == (False, "empty_response")
+    good = {"choices": [{"message": {"content": "yes"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    out = T.teacher_call("judge", "hi", 100, "p", transport=Rec(good))
+    assert (out["ok"], out["reason"], out["text"]) == (True, "ok", "yes")
