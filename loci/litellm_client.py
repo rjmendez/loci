@@ -13,11 +13,13 @@ class LiteLLMResponse:
     def to_dict(self) -> Dict[str, Any]:
         return {"model": self.model, "content": self.content, "usage": {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens, "total_tokens": self.total_tokens}, "latency_ms": round(self.latency_ms, 1)}
 
-def call_litellm_proxy(model: str, messages: List[Dict[str, str]], max_tokens: int = 1024, temperature: float = 0.0, metadata: Optional[Dict[str, Any]] = None) -> LiteLLMResponse:
+def call_litellm_proxy(model: str, messages: List[Dict[str, str]], max_tokens: int = 1024, temperature: float = 0.0, metadata: Optional[Dict[str, Any]] = None, extra_body: Optional[Dict[str, Any]] = None) -> LiteLLMResponse:
     url = f"{LITELLM_PROXY_URL.rstrip('/')}/v1/chat/completions"
     body: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
     if metadata:
         body["metadata"] = metadata
+    if extra_body:
+        body.update({k: v for k, v in extra_body.items() if k not in body})
     payload = json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json", "Content-Length": str(len(payload))}
     if LITELLM_API_KEY:

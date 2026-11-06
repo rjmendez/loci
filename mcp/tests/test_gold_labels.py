@@ -418,10 +418,40 @@ def test_default_retrieve_fn_hands_the_teacher_real_text(monkeypatch):
     import types, json as _j
     ctx = "[SOURCE 1] [x]\nfirst text\n\n[SOURCE 2] [x]\nsecond text\n"
     seen = {}
-    def fake(query, limit, mode):
-        seen["mode"] = mode
+    def fake(query, limit, mode, budget_chars):
+        seen["mode"], seen["budget"] = mode, budget_chars
         return _j.dumps({"context": ctx, "sources": [{"n": 1, "id": "a"}, {"n": 2, "id": "b"}, {"n": 3, "id": "c"}]})
     monkeypatch.setitem(sys.modules, "server", types.SimpleNamespace(rag_context_search=fake))
     out = G.default_retrieve_fn(5)("q", "b")
-    assert seen["mode"] == "full"
+    assert seen == {"mode": "full", "budget": G.RETRIEVE_BUDGET_CHARS}
+    assert G.RETRIEVE_BUDGET_CHARS >= 100000
     assert out == [{"id": "a", "text": "first text"}]
+
+
+def _syn(q, inv, source="synthetic_finding"):
+    return {"query": q, "source": source, "investigation": inv, "collection": "loci_memory",
+            "exclude_id": None, "synthetic": True}
+
+
+def test_sample_queries_round_robins_investigations_and_prefers_questions_then_titles():
+    cands = [_syn("noisy file text one aaaa", "big"), _syn("noisy file text two bbbb", "big"),
+             _syn("noisy file text three cc", "big"), _syn("a small investigation title", "small",
+                                                          "synthetic_investigation_title"),
+             _syn("how does the watchdog restart loci", "small", "synthetic_question"),
+             _syn("how do I rotate the key", "mid", "synthetic_question")]
+    got = [c["query"] for c in G.sample_queries(cands, 4)]
+    assert got == ["noisy file text one aaaa", "how do I rotate the key", "how does the watchdog restart loci",
+                   "noisy file text two bbbb"]
+
+
+def test_synthetic_queries_strips_q_prefix_and_tags_the_investigation(tmp_path):
+    d = tmp_path / "inv-a"
+    d.mkdir()
+    (d / "manifest.json").write_text(json.dumps({"title": "Inv A title"}), encoding="utf-8")
+    (d / "findings.jsonl").write_text(
+        json.dumps({"id": "f1", "text": "Q: how does the watchdog restart loci\nA: it does"}) + "\n"
+        + json.dumps({"id": "f2", "text": "README plain finding text here"}) + "\n", encoding="utf-8")
+    got = {(c["query"], c["source"], c["investigation"]) for c in G.synthetic_queries(tmp_path)}
+    assert got == {("Inv A title", "synthetic_investigation_title", "inv-a"),
+                   ("how does the watchdog restart loci", "synthetic_question", "inv-a"),
+                   ("README plain finding text here", "synthetic_finding", "inv-a")}

@@ -137,29 +137,40 @@ def synthetic_queries(memory_dir: Path) -> List[dict]:
             man = {}
         title = _first_line(man.get("title", "") if isinstance(man, dict) else "")
         if title:
-            out.append({"query": title, "source": "synthetic_investigation_title",
+            out.append({"query": title, "source": "synthetic_investigation_title", "investigation": d.name,
                         "collection": DEFAULT_COLLECTION, "exclude_id": None, "synthetic": True})
         for row in _jsonl(d / "findings.jsonl"):
-            q = _first_line(row.get("title") or row.get("content") or row.get("text") or row.get("finding"))
+            raw = str(row.get("title") or row.get("content") or row.get("text") or row.get("finding") or "")
+            if raw.lstrip()[:2].lower() == "q:":       # a Q:/A: entry: the question is the first line, never the answer
+                raw = raw.lstrip().splitlines()[0]
+            q = _first_line(raw)
             if len(q) < 12:
                 continue
             fid = row.get("id") or row.get("finding_id")
-            out.append({"query": q, "source": "synthetic_finding", "collection": DEFAULT_COLLECTION,
+            source = "synthetic_finding"
+            if q[:2].lower() == "q:":                  # memory entries written as Q:/A: pairs: the Q is a real question
+                q, source = q[2:].strip(), "synthetic_question"
+                if len(q) < 12:
+                    continue
+            out.append({"query": q, "source": source, "investigation": d.name, "collection": DEFAULT_COLLECTION,
                         "exclude_id": str(fid) if fid else None, "synthetic": True})
     return out
 
 
 def sample_queries(candidates: Sequence[dict], n: int) -> List[dict]:
-    """Dedupe by normalized text, then stratify by collection (round robin, real before synthetic,
+    """Dedupe by normalized text, then stratify by (collection, investigation) (round robin, real before synthetic,
     stable order). Adds query_id."""
     seen: set = set()
     strata: Dict[str, List[dict]] = {}
-    for c in sorted(candidates, key=lambda c: bool(c.get("synthetic"))):    # stable: real first
+    rank = {"synthetic_question": 1, "synthetic_investigation_title": 2}   # real 0 < questions < titles < raw finding text
+    for c in sorted(candidates, key=lambda c: (bool(c.get("synthetic")), rank.get(c.get("source"), 3))):    # stable
         key = normalize_query(c["query"])
         if not key or key in seen:
             continue
         seen.add(key)
-        strata.setdefault(c.get("collection") or DEFAULT_COLLECTION, []).append(dict(c, query_id=query_id(c["query"])))
+        # One stratum per investigation (else per collection), so one noisy investigation cannot fill the sample.
+        stratum = (c.get("collection") or DEFAULT_COLLECTION, c.get("investigation") or "")
+        strata.setdefault(stratum, []).append(dict(c, query_id=query_id(c["query"])))
     out: List[dict] = []
     names = sorted(strata)
     i = 0
@@ -459,6 +470,7 @@ def stats(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ default retrieval (live only)
+RETRIEVE_BUDGET_CHARS = 200000  # the default 6000 cuts the context after the first large document
 _SOURCE_RE = re.compile(r"^\[SOURCE (\d+)\][^\n]*\n", re.M)
 
 
@@ -477,7 +489,7 @@ def default_retrieve_fn(top_k: int) -> RetrieveFn:
     each candidate's text is its [SOURCE n] block of the assembled context."""
     def retrieve(query: str, exclude_id):
         import server as S
-        res = json.loads(S.rag_context_search(query, limit=top_k + 1, mode="full"))
+        res = json.loads(S.rag_context_search(query, limit=top_k + 1, mode="full", budget_chars=RETRIEVE_BUDGET_CHARS))
         texts = split_sources(res.get("context", ""))
         out = []
         for s in res.get("sources", []):
