@@ -111,3 +111,32 @@
 # breaker_failures = 3          # consecutive failures/timeouts that open the circuit breaker
 # breaker_cooldown_s = 300      # how long the breaker skips the judge once open
 # slow_s = 60                   # a judge call slower than this counts as a failure
+
+[teacher]
+# Budget-guarded cloud calls for learning loops (mcp/teacher.py). Everything off until enabled.
+# Env LOCI_TEACHER_* wins (ENABLED, MONTHLY_USD_CAP, DAILY_USD_CAP, MAX_USD_PER_CALL, LEDGER_FILE,
+# GROUPS_COUNTED, SANITIZE, CHARS_PER_TOKEN, MAX_BAD_LINES, SAFETY_MARGIN_PCT, PRICES, ROLE_<ROLE>).
+# A missing or zero cap allows NO spend. LiteLLM enforces no budget here: this guard is the only brake,
+# so keep [teacher.prices] in sync with your LiteLLM config. A role whose group has no price is refused.
+# enabled = false
+# monthly_usd_cap = 0.0
+# daily_usd_cap = 0.0
+# max_usd_per_call = 0.0
+# ledger_file = "~/.loci/litellm_cost_ledger.jsonl"
+# groups_counted = []            # default: every group named under [teacher.roles]
+# sanitize = true
+# chars_per_token = 3.0          # pre-call input estimate: chars / this (lower = more conservative)
+# max_bad_lines = 0              # corrupt ledger rows tolerated before the guard refuses (ledger_corrupt)
+# safety_margin_pct = 10         # usable cap = cap * (100 - pct) / 100; covers multi-process overshoot
+# allow_missing_ledger = false   # true: a missing ledger file counts as zero spend (default: refuse, ledger_missing)
+# settle_seconds = 120           # a finished call's cost stays counted this long while the gateway writes its ledger row
+# [teacher.prices.<litellm-group>]   # operator-supplied USD per million tokens, one table per group
+# in_usd_per_mtok = 0.0
+# out_usd_per_mtok = 0.0
+# [teacher.roles]                # role -> LiteLLM group name (from your LiteLLM config)
+# judge = "<litellm-group>"
+# label_a = "<litellm-group>"
+# label_b = "<litellm-group>"
+# propose = "<litellm-group>"
+# adjudicate = "<litellm-group>"
+# verify = "<litellm-group>"
