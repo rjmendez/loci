@@ -113,5 +113,5 @@ processes you run. `status()` repeats this in its `limits` field and reports `ov
 
 ```
 python mcp/teacher.py status          # caps, spent, remaining, by group (JSON)
-python mcp/teacher.py check <role>    # guard decision at max_usd_per_call; exit 0 allowed, 1 refused
+python mcp/teacher.py check <role>    # guard decision at the usable per-call cap (readiness probe); exit 0 allowed, 1 refused
 ```

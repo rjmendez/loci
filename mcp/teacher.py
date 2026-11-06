@@ -554,7 +554,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(status(), indent=2, sort_keys=True))
         return 0
     if len(argv) == 2 and argv[0] == "check":
-        est = _money(teacher_config()["max_usd_per_call"])
+        cfg = teacher_config()
+        est = cfg["max_usd_per_call"] * (100.0 - cfg["safety_margin_pct"]) / 100.0   # the usable per-call cap
         d = check(argv[1], est)
         print(json.dumps(d.to_dict(), indent=2, sort_keys=True))
         return 0 if d.allowed else 1

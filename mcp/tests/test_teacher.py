@@ -735,3 +735,13 @@ def test_cli_status_and_check(env, capsys):
     assert T.main(["check", "nope"]) == 1
     assert json.loads(capsys.readouterr().out)["reason"] == "unknown_role"
     assert T.main(["bogus"]) == 2
+
+
+def test_cli_check_is_a_readiness_probe_under_default_margin(env, capsys):
+    setup_cfg(env, ("safety_margin_pct = 0", "safety_margin_pct = 10"))
+    assert T.main(["check", "judge"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["reason"], out["est_usd"], out["usable_caps"]["per_call_usd"]) == ("ok", 0.45, 0.45)
+    setup_cfg(env, ("enabled = true", "enabled = false"))      # not ready: still exits 1
+    assert T.main(["check", "judge"]) == 1
+    assert json.loads(capsys.readouterr().out)["reason"] == "disabled"
