@@ -79,7 +79,7 @@ def query_id(q: str) -> str:
 
 def _jsonl(path: Path) -> Iterable[dict]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     row = json.loads(line)
@@ -459,16 +459,32 @@ def stats(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ default retrieval (live only)
+_SOURCE_RE = re.compile(r"^\[SOURCE (\d+)\][^\n]*\n", re.M)
+
+
+def split_sources(context: str) -> Dict[int, str]:
+    """{source number: its text} from rag_context_search's assembled context ("[SOURCE n] ..." blocks)."""
+    marks = list(_SOURCE_RE.finditer(context or ""))
+    out: Dict[int, str] = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(context)
+        out[int(m.group(1))] = context[m.end():end].strip()
+    return out
+
+
 def default_retrieve_fn(top_k: int) -> RetrieveFn:
-    """Candidate pool via the server's rag_context_search; texts come from the assembled context."""
+    """Candidate pool via the server's rag_context_search (mode=full: compact carries no text at all);
+    each candidate's text is its [SOURCE n] block of the assembled context."""
     def retrieve(query: str, exclude_id):
         import server as S
-        res = json.loads(S.rag_context_search(query, limit=top_k + 1, mode="compact"))
+        res = json.loads(S.rag_context_search(query, limit=top_k + 1, mode="full"))
+        texts = split_sources(res.get("context", ""))
         out = []
         for s in res.get("sources", []):
             sid = str(s.get("id") or "")
-            if sid and sid != str(exclude_id):
-                out.append({"id": sid, "text": str(s.get("title", ""))})
+            text = texts.get(s.get("n"), "")
+            if sid and sid != str(exclude_id) and text:
+                out.append({"id": sid, "text": text})
         return out[:top_k]
     return retrieve
 

@@ -396,3 +396,32 @@ def test_gold_config_defaults_and_env(monkeypatch):
     monkeypatch.setenv("LOCI_GOLD_MAX_TEXT_CHARS", "junk")
     c2 = G.gold_config()
     assert (c2["top_k"], c2["file"], c2["max_text_chars"]) == (5, str(Path("/tmp/x.jsonl").expanduser()), 800)
+
+
+def test_jsonl_keeps_rows_around_a_cp1252_byte(tmp_path):
+    p = tmp_path / "findings.jsonl"
+    p.write_bytes(b'{"a": "one"}\n{"a": "caf\x97e"}\n{"a": "three"}\n')
+    rows = list(G._jsonl(p))
+    assert [r["a"] for r in rows] == ["one", "caf\ufffde", "three"]
+
+
+def test_split_sources_maps_each_source_number_to_its_own_block():
+    ctx = ("## Retrieved Context\nQuery: q\n\n[SOURCE 1]  [score=0.5, origin=m]\nTitle: a\nalpha body\n---\n\n"
+           "[SOURCE 2]  [score=0.4, origin=m]\nTitle: b\nbeta body\n")
+    got = G.split_sources(ctx)
+    assert sorted(got) == [1, 2]
+    assert got[1] == "Title: a\nalpha body\n---"
+    assert got[2] == "Title: b\nbeta body"
+
+
+def test_default_retrieve_fn_hands_the_teacher_real_text(monkeypatch):
+    import types, json as _j
+    ctx = "[SOURCE 1] [x]\nfirst text\n\n[SOURCE 2] [x]\nsecond text\n"
+    seen = {}
+    def fake(query, limit, mode):
+        seen["mode"] = mode
+        return _j.dumps({"context": ctx, "sources": [{"n": 1, "id": "a"}, {"n": 2, "id": "b"}, {"n": 3, "id": "c"}]})
+    monkeypatch.setitem(sys.modules, "server", types.SimpleNamespace(rag_context_search=fake))
+    out = G.default_retrieve_fn(5)("q", "b")
+    assert seen["mode"] == "full"
+    assert out == [{"id": "a", "text": "first text"}]
