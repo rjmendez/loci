@@ -573,6 +573,92 @@ def test_status_warns_only_when_sanitize_is_off(env):
     assert T.status()["warnings"] == ["sanitize is OFF: prompts leave the machine without credential or PII redaction"]
 
 
+def test_reported_zero_cost_is_unknown_not_free(env):
+    setup_cfg(env)
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply(cost=0)))
+    assert (out["usd"], out["usd_source"]) == (pytest.approx(0.025), "estimate")
+    assert T.check("judge", 0.1).settling == pytest.approx(0.025)    # a reported 0 must not leave the cap blind
+
+
+def test_highest_reported_cost_wins_over_a_zero_in_another_field(env):
+    setup_cfg(env)
+    resp = reply(cost=0)
+    resp["response_cost"] = 0.02
+    out = T.teacher_call("judge", "hello", 100, "p", transport=Rec(resp))
+    assert (out["usd"], out["usd_source"]) == (0.02, "gateway")
+
+
+def test_estimate_counts_utf8_bytes_so_cjk_is_not_undercounted(env):
+    setup_cfg(env)
+    cfg = T.teacher_config()
+    cjk = T._estimate([{"role": "user", "content": "日" * 30}], 100, cfg, "grp-j")     # 90 bytes
+    ascii_ = T._estimate([{"role": "user", "content": "a" * 90}], 100, cfg, "grp-j")   # 90 bytes
+    short = T._estimate([{"role": "user", "content": "a" * 30}], 100, cfg, "grp-j")    # 30 bytes
+    # 90 bytes / 3 = 30 in-tokens * 50 + 100 out-tokens * 200, per million
+    assert (cjk, ascii_) == (pytest.approx(0.0215), pytest.approx(0.0215))
+    assert short == pytest.approx(0.0205)
+
+
+def test_estimate_describes_the_text_actually_sent_after_redaction(env):
+    setup_cfg(env)
+    rec = Rec(reply(cost=0.001))
+    out = T.teacher_call("judge", "a@b.c " * 100, 100, "p", transport=rec)
+    sent = rec.calls[0][1][0]["content"]
+    assert len(sent) > len("a@b.c " * 100)                       # redaction lengthened it
+    assert out["decision"]["est_usd"] == pytest.approx((len(sent.encode("utf-8")) / 3 * 50 + 100 * 200) / 1e6)
+
+
+def test_one_stray_old_row_does_not_hide_the_spend_above_it(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 100, "grp-j", 1.9), (0, "grp-j", 0.0), (NOW - 1, "grp-j", 0.001)])
+    d = T.check("judge", 0.2)
+    assert (d.reason, d.month_spent) == ("over_daily_cap", pytest.approx(1.901))
+    env["ledger"].unlink()
+    rows(env["ledger"], [(NOW - 100, "grp-j", 1.9), (NOW - 1, "grp-j", 0.001)])
+    T.cache_clear()
+    assert T.check("judge", 0.2).reason == "over_daily_cap"        # same answer without the stray row
+
+
+def test_a_run_of_old_rows_still_ends_the_scan(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(MONTH_START - 10, "grp-j", 9.0)] * (T.OLD_ROWS_TO_STOP + 5) + [(NOW - 1, "grp-j", 0.001)])
+    assert T.read_ledger().month == pytest.approx(0.001)
+
+
+def test_ledger_group_match_ignores_case_and_padding(env):
+    setup_cfg(env)
+    with open(env["ledger"], "w", encoding="utf-8") as f:
+        for g in ("GRP-J", " grp-j "):
+            f.write(json.dumps({"ts": NOW - 1, "group": g, "cost_usd": 1.0}) + "\n")
+    d = T.check("judge", 0.01)
+    assert (d.reason, d.month_spent, d.day_spent) == ("over_daily_cap", 2.0, 2.0)
+
+
+def test_history_beyond_the_read_siblings_refuses_but_the_last_read_one_does_not(env):
+    setup_cfg(env)
+    (env["tmp"] / f"ledger.jsonl.{T.MAX_SIBLINGS}").write_text("", encoding="utf-8")
+    assert T.check("judge", 0.1).allowed is True
+    (env["tmp"] / f"ledger.jsonl.{T.MAX_SIBLINGS + 1}").write_text("", encoding="utf-8")
+    T.cache_clear()
+    assert T.check("judge", 0.1).reason == "ledger_corrupt"
+
+
+def test_toml_boolean_is_not_a_cap(env):
+    setup_cfg(env, replace=("monthly_usd_cap = 10.0", "monthly_usd_cap = true"))
+    assert T.teacher_config()["monthly_usd_cap"] == 0.0
+    assert T.check("judge", 0.1).reason == "no_cap"
+
+
+def test_deeply_nested_ledger_line_is_a_bad_line_and_status_still_answers(env):
+    setup_cfg(env)
+    rows(env["ledger"], [(NOW - 1, "grp-j", 0.5)])
+    with open(env["ledger"], "a", encoding="utf-8") as f:
+        f.write("[" * 100000 + "\n")
+    s = T.status()
+    assert s["bad_lines"] == 1 and "ledger_error" not in s
+    assert s["spent"] == {"month_usd": 0.5, "day_usd": 0.5}
+
+
 def test_call_oversize_request_refused_by_per_call_cap(env):
     setup_cfg(env)
     rec = Rec(reply())

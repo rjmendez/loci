@@ -100,6 +100,26 @@ file reads as zero spend with `ledger_missing=true` but the guard refuses (`ledg
 `allow_missing_ledger` is set; an existing but unreadable one refuses all spend.
 Cached 5 s (cleared after each `teacher_call`).
 
+Group names are matched case- and whitespace-insensitively (the gateway does not normalise them),
+and a role's group is always counted whatever `groups_counted` says. One stray out-of-order row
+(zero or missing `ts`) does not end the backward scan; `OLD_ROWS_TO_STOP` consecutive pre-month rows
+do, and bad lines inside such a run are not counted. A `<file>.13` (beyond the 12 rotated siblings
+that are read) counts as an unreadable line, so it refuses rather than hiding that history.
+
+## Cost accounting
+
+A gateway-reported cost of `0` is treated as unknown (LiteLLM reports 0 for unmapped or unpriced
+models) and the pre-call estimate is held and charged instead; if several fields report a cost the
+highest wins. The estimate counts UTF-8 bytes / `chars_per_token` and is taken AFTER sanitizing,
+so it prices what is actually sent. Emoji and rare scripts can still cost more tokens than that.
+
+## Limits: the ledger is trusted
+
+The guard sees only what the gateway writes to the ledger. If that file is stalled, rotated away or
+points somewhere else, spend beyond the process-local settling hold reads as zero. Check
+`python mcp/teacher.py status` against the Console now and then, and keep `max_usd_per_call` and
+the caps low until you have.
+
 ## Limits: several processes
 
 Reservations and the settling hold live in the memory of one process, and the ledger is cached for

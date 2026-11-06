@@ -29,7 +29,8 @@ ROLES = ("judge", "label_a", "label_b", "propose", "adjudicate", "verify")
 DEFAULT_LEDGER = "~/.loci/litellm_cost_ledger.jsonl"
 LEDGER_CACHE_S = 5.0
 DEFAULT_SETTLE_S = 120.0          # how long a finished call's cost stays held while the gateway writes its ledger row
-MAX_SIBLINGS = 12                 # ledger.jsonl.1 .. .12
+MAX_SIBLINGS = 12                 # ledger.jsonl.1 .. .12; a .13 is counted as unreadable history (fail closed)
+OLD_ROWS_TO_STOP = 25             # consecutive pre-month rows that end the backward scan (one stray old row must not)
 DEFAULT_CHARS_PER_TOKEN = 3.0     # conservative (real text is ~4): more tokens estimated, so more cost
 DEFAULT_SAFETY_MARGIN_PCT = 10.0  # usable cap = cap * (100 - margin) / 100
 _CHUNK = 1 << 20
@@ -61,6 +62,8 @@ def _bool(v: Any, default: bool) -> bool:
 
 def _money(v: Any) -> float:
     """Non-negative finite float; anything else is 0 (= no spend allowed)."""
+    if isinstance(v, bool):      # TOML `true` must not become a $1 cap
+        return 0.0
     try:
         f = float(v)
     except (TypeError, ValueError):
@@ -184,6 +187,11 @@ def _reverse_lines(path: str) -> Iterator[bytes]:
         yield tail
 
 
+def _norm(group: str) -> str:
+    """Ledger/config group key: the gateway does not normalise group strings, so neither case nor padding may hide spend."""
+    return str(group).strip().casefold()
+
+
 def _row(line: bytes) -> Optional[tuple]:
     """(ts, group, cost) or None for a blank/bad line."""
     line = line.strip()
@@ -192,11 +200,11 @@ def _row(line: bytes) -> Optional[tuple]:
     try:
         d = json.loads(line)
         ts, cost, grp = float(d["ts"]), float(d["cost_usd"]), d["group"]
-    except (ValueError, TypeError, KeyError):
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
         return False  # type: ignore[return-value]
     if not (math.isfinite(ts) and math.isfinite(cost) and cost >= 0 and isinstance(grp, str)):
         return False  # type: ignore[return-value]
-    return ts, grp, cost
+    return ts, _norm(grp), cost
 
 
 def _scan(base: str, counted: set, month_start: float, day_start: float, call_cap: float = 0.0) -> LedgerTotals:
@@ -206,21 +214,36 @@ def _scan(base: str, counted: set, month_start: float, day_start: float, call_ca
     if not existing:
         out.missing = True
         return out
+    if os.path.exists(f"{base}.{MAX_SIBLINGS + 1}"):
+        out.bad_lines += 1            # history beyond what is read: spend there is invisible, so count it as unreadable
     for p in existing:
         out.files.append(p)
         crossed = False
+        old_run = 0
+        pending_bad = 0               # bad lines seen inside a run of pre-month rows: real only if a current-month row follows
         try:
             for line in _reverse_lines(p):
                 row = _row(line)
                 if row is None:
                     continue
                 if row is False:
-                    out.bad_lines += 1
+                    if old_run:
+                        pending_bad += 1
+                    else:
+                        out.bad_lines += 1
                     continue
                 ts, grp, cost = row
                 if ts < month_start:
-                    crossed = True
-                    break
+                    # One stray old/zero-ts row (clock skew, a gateway bug) must not hide the spend above it:
+                    # only a run of OLD_ROWS_TO_STOP consecutive old rows means the month is really behind us.
+                    old_run += 1
+                    if old_run >= OLD_ROWS_TO_STOP:
+                        crossed = True
+                        break
+                    continue
+                old_run = 0
+                out.bad_lines += pending_bad          # a current-month row followed them, so they were inside the month
+                pending_bad = 0
                 if grp not in counted:
                     continue
                 out.rows_counted += 1
@@ -233,6 +256,8 @@ def _scan(base: str, counted: set, month_start: float, day_start: float, call_ca
                     out.by_group_day[grp] = out.by_group_day.get(grp, 0.0) + cost
         except OSError as exc:
             raise LedgerUnreadable(f"{p}: {type(exc).__name__}") from exc
+        if old_run:
+            crossed = True            # the head of this file is already before the month: older siblings hold nothing of it
         if crossed:
             break
     return out
@@ -261,7 +286,8 @@ def read_ledger(cfg: Optional[Dict[str, Any]] = None) -> LedgerTotals:
     with _cache_lock:
         if _cache["key"] == key and _mono() - _cache["at"] < LEDGER_CACHE_S:
             return _cache["value"]
-    value = _scan(cfg["ledger_file"], set(cfg["groups_counted"]), month_start, day_start, cfg["max_usd_per_call"])
+    value = _scan(cfg["ledger_file"], {_norm(g) for g in cfg["groups_counted"]}, month_start, day_start,
+                  cfg["max_usd_per_call"])
     with _cache_lock:
         _cache.update(key=key, at=_mono(), value=value)
     return value
@@ -433,7 +459,8 @@ def _estimate(messages: Messages, max_tokens: int, cfg: Dict[str, Any], group: s
     price = cfg["prices"].get(group)
     if price is None:
         return 0.0
-    in_tok = sum(len(m["content"]) for m in messages) / cfg["chars_per_token"]
+    # UTF-8 bytes, not characters: CJK and emoji cost about a token per character, so chars/3 undercounted them ~3x.
+    in_tok = sum(len(m["content"].encode("utf-8")) for m in messages) / cfg["chars_per_token"]
     return (in_tok * price["in"] + max(int(max_tokens), 0) * price["out"]) / 1e6
 
 
@@ -441,14 +468,15 @@ def _actual_usd(resp: Dict[str, Any]) -> Optional[float]:
     """Cost the gateway reported in the response, else None."""
     usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
     hidden = resp.get("_hidden_params") if isinstance(resp.get("_hidden_params"), dict) else {}
+    best: Optional[float] = None
     for v in (usage.get("cost"), usage.get("cost_usd"), resp.get("response_cost"), hidden.get("response_cost")):
         try:
             f = float(v)
         except (TypeError, ValueError):
             continue
-        if math.isfinite(f) and f >= 0:
-            return f
-    return None
+        if math.isfinite(f) and f >= 0 and (best is None or f > best):
+            best = f                  # the highest reported figure: a 0 in one field must not mask a real cost in another
+    return best
 
 
 def _text(resp: Dict[str, Any]) -> str:
@@ -479,12 +507,9 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
             out["reason"] = "bad_max_tokens"
             return out
         messages = _to_messages(prompt_or_messages)
-        decision = reserve(role, _estimate(messages, max_tokens, cfg, cfg["roles"].get(role, "")))
-        out["decision"], out["group"] = decision.to_dict(), decision.group
-        if not decision.allowed:
-            out["reason"] = decision.reason
-            return out
-        if cfg["sanitize"]:
+        # Sanitize BEFORE pricing: redaction can lengthen the text, and the estimate must describe what is actually sent.
+        # Skipped while the guard is disabled (it refuses below anyway).
+        if cfg["enabled"] and cfg["sanitize"]:
             try:
                 from llm_local import _sanitize_for_cloud
             except Exception:  # noqa: BLE001
@@ -493,6 +518,11 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
             messages = [{"role": m["role"],
                          "content": _redact_pii(_sanitize_for_cloud(m["content"], max_len=max(len(m["content"]), 1)))}
                         for m in messages]
+        decision = reserve(role, _estimate(messages, max_tokens, cfg, cfg["roles"].get(role, "")))
+        out["decision"], out["group"] = decision.to_dict(), decision.group
+        if not decision.allowed:
+            out["reason"] = decision.reason
+            return out
         settle_s = cfg["settle_seconds"]
         meta = {"loci_internal_call": True, "loci_teacher_purpose": str(purpose)}
         settle_usd = decision.est_usd     # sent => may be billed, whatever happens next
@@ -505,6 +535,8 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
             out["reason"], out["cost_unknown"] = "bad_response", True
             return out
         actual = _actual_usd(resp)
+        if actual is not None and actual <= 0:
+            actual = None             # LiteLLM reports 0 for unmapped or unpriced models: that is "unknown", never "free"
         settle_usd = actual if actual is not None else decision.est_usd
         if actual is not None:
             _record_overrun(actual, decision.est_usd)
@@ -526,7 +558,10 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
 LIMITS_NOTE = ("Reservations and the settling hold are process-local and the ledger is cached "
                f"{LEDGER_CACHE_S:g}s: N Loci processes can jointly overshoot a cap by up to "
                "N x max_usd_per_call plus the spend inside the cache window. LiteLLM enforces no budget; "
-               "this guard is the only brake. Overruns (cost above estimate) mean the price table is stale.")
+               "this guard is the only brake. Overruns (cost above estimate) mean the price table is stale. "
+               "The guard trusts the ledger the gateway writes: if that file is stalled or points elsewhere, spend "
+               "beyond the settling hold reads as zero. Token estimates count UTF-8 bytes; emoji and rare scripts "
+               "can still cost more tokens than bytes/chars_per_token.")
 
 
 def status() -> Dict[str, Any]:
@@ -542,8 +577,9 @@ def status() -> Dict[str, Any]:
                                     "per_call_usd": cfg["max_usd_per_call"]}}
     try:
         led = read_ledger(cfg)
-    except LedgerUnreadable as exc:
-        out.update(ledger_error=str(exc), ledger_missing=False)
+    except Exception as exc:  # noqa: BLE001 - status() never raises, whatever the ledger holds
+        out.update(ledger_error=str(exc) if isinstance(exc, LedgerUnreadable) else f"{type(exc).__name__}",
+                   ledger_missing=False)
         return out
     with _overrun_lock:
         out["overruns"] = {"count": _overruns["count"], "excess_usd": _overruns["excess_usd"],
