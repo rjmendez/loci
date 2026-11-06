@@ -482,6 +482,30 @@ def _actual_usd(resp: Dict[str, Any]) -> Optional[float]:
     return best
 
 
+def _usage_usd(resp: Dict[str, Any], price: Optional[Dict[str, float]]) -> Optional[float]:
+    """Cost of the tokens the response says were used, at the configured price. None unless both counts are present
+    and sane. The gateway often reports no cost; the worst-case estimate (max_tokens at the full output price) can be
+    several times the real cost, and the settling hold would then throttle callers far below the cap."""
+    usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+    if price is None:
+        return None
+    toks = []
+    for k in ("prompt_tokens", "completion_tokens"):
+        v = usage.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+            return None
+        toks.append(float(v))
+    cost = (toks[0] * price["in"] + toks[1] * price["out"]) / 1e6
+    return cost if cost > 0 else None
+
+
+def _finish_reason(resp: Dict[str, Any]) -> str:
+    try:
+        return str(resp["choices"][0].get("finish_reason") or "")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+
+
 def _text(resp: Dict[str, Any]) -> str:
     try:
         return str(resp["choices"][0]["message"]["content"] or "")
@@ -540,12 +564,20 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
         actual = _actual_usd(resp)
         if actual is not None and actual <= 0:
             actual = None             # LiteLLM reports 0 for unmapped or unpriced models: that is "unknown", never "free"
+        source = "gateway"
+        if actual is None:
+            actual = _usage_usd(resp, cfg["prices"].get(decision.group))
+            source = "usage"
         settle_usd = actual if actual is not None else decision.est_usd
         if actual is not None:
             _record_overrun(actual, decision.est_usd)
-        out["usd"], out["usd_source"] = (actual, "gateway") if actual is not None else (decision.est_usd, "estimate")
+        out["usd"], out["usd_source"] = (actual, source) if actual is not None else (decision.est_usd, "estimate")
         out["text"] = _text(resp)
         out["ok"], out["reason"] = True, "ok"
+        if _finish_reason(resp) == "content_filter":
+            out["ok"], out["reason"] = False, "content_filter"      # the provider refused; the spend above is still counted
+        elif not out["text"].strip():
+            out["ok"], out["reason"] = False, "empty_response"
         cache_clear()                 # the next guard read should see the new ledger row
         return out
     except Exception as exc:  # noqa: BLE001 - fail open for the caller
