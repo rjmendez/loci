@@ -20,5 +20,5 @@ the same query id. Splits are by query id (hash of seed+id), so no query spans t
 
 Gate (criteria are data, see the example): promote only if the student beats the incumbent on test by
 `min_margin_over_incumbent` AND its validation metric is within `max_teacher_gap_on_validation` of the
-teacher's own metric vs gold on validation (`teacher_label` per row). Score files map `row_id`
+teacher's own metric vs gold on validation (`teacher_label` per row; gold validation rows must carry `teacher_label` too, else the gate holds). Score files map `row_id`
 (`<query_id>#<k>`) to a score; predict 1 when score >= threshold.

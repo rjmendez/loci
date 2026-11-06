@@ -196,12 +196,18 @@ def evaluate(scores: Mapping[str, float], gold_split: Sequence[dict], threshold:
 
 
 def load_criteria(path: Path) -> dict:
-    c = json.loads(Path(path).read_text(encoding="utf-8"))
+    c = _load_json(path)
+    if not isinstance(c, dict):
+        raise DistillError(f"criteria {path}: must be a JSON object")
     missing = [k for k in CRITERIA_KEYS if k not in c]
     if missing:
         raise DistillError(f"criteria {path}: missing keys {missing}")
     if c["metric"] not in METRICS:
         raise DistillError(f"criteria {path}: unknown metric {c['metric']!r}")
+    for k in CRITERIA_KEYS[1:]:
+        v = c[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise DistillError(f"criteria {path}: {k} must be a finite number, got {v!r}")
     return c
 
 
@@ -223,7 +229,8 @@ def decide(criteria: Mapping[str, Any], test_split: Sequence[dict], val_split: S
         reasons.append(f"validation split has {len(val_split)} rows, need {criteria['min_validation_rows']}")
     no_teacher = [r["row_id"] for r in val_split if "teacher_label" not in r]
     if no_teacher:
-        reasons.append(f"{len(no_teacher)} validation rows lack teacher_label")
+        reasons.append(f"{len(no_teacher)} validation rows lack teacher_label "
+                       "(gold validation rows must carry it too)")
     st = evaluate(student_test, test_split, thr)
     inc = evaluate(incumbent_test, test_split, thr)
     sv = evaluate(student_val, val_split, thr)
@@ -260,7 +267,11 @@ def plan_budget(cap_usd: float, cost_per_label_usd: float, curve: Sequence[Seque
     """
     if cap_usd < 0 or cost_per_label_usd <= 0 or step_labels <= 0 or min_gain_per_step <= 0:
         raise DistillError("cap_usd >= 0 and cost_per_label_usd, step_labels, min_gain_per_step > 0 required")
+    if not all(map(math.isfinite, (cap_usd, cost_per_label_usd, min_gain_per_step))):
+        raise DistillError("cap_usd, cost_per_label_usd, min_gain_per_step must be finite")
     pts = sorted((int(n), float(m)) for n, m in curve)
+    if not all(math.isfinite(m) for _, m in pts):
+        raise DistillError("curve has a non-finite metric")
     if len({n for n, _ in pts}) != len(pts):
         raise DistillError("curve has duplicate label counts")
     have = pts[-1][0] if pts else 0
@@ -275,7 +286,7 @@ def plan_budget(cap_usd: float, cost_per_label_usd: float, curve: Sequence[Seque
     out["last_slope_per_step"] = last
     if last < min_gain_per_step:
         out.update(saturated=True, stop_labels=have, note="last slope below floor; more labels will not pay")
-    elif len(slopes) >= 2 and 0 < last / slopes[-2] < 1:
+    elif len(slopes) >= 2 and 0 < last < slopes[-2]:
         r = last / slopes[-2]
         k = math.ceil(math.log(min_gain_per_step / last) / math.log(r))
         out.update(stop_labels=have + k * step_labels, note=f"extrapolated, slope decay ratio {r:.3f}")
@@ -290,7 +301,12 @@ def plan_budget(cap_usd: float, cost_per_label_usd: float, curve: Sequence[Seque
 # ------------------------------------------------------------------ CLI
 
 def _load_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        raise DistillError(f"{path}: cannot read ({e.strerror or e})") from e
+    except ValueError as e:
+        raise DistillError(f"{path}: invalid JSON ({e})") from e
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -246,7 +246,7 @@ def test_decide_holds_on_small_splits_and_missing_teacher_labels():
     val_nt = _split4([1, 0, 1, 0], prefix="v")
     res = D.decide(CRIT, test, val_nt, good_test, inc_test, _scores(val_nt, [0.9, 0.1, 0.8, 0.2]))
     assert res["decision"] == "hold"
-    assert res["reasons"] == ["4 validation rows lack teacher_label"]
+    assert res["reasons"] == ["4 validation rows lack teacher_label (gold validation rows must carry it too)"]
 
 
 def test_load_criteria_requires_all_keys_and_known_metric(tmp_path):
@@ -331,3 +331,76 @@ def test_cli_gate_exit_codes_and_error(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["decision"] == "hold"
     assert run({}) == 2
     assert "4 rows have no score" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ repair r1
+
+def test_plan_plateau_then_rise_has_no_estimable_stop():
+    res = D.plan_budget(10, 0.1, [[0, .5], [100, .5], [200, .6]], 0.001, 100)
+    assert res["last_slope_per_step"] == pytest.approx(0.1)
+    assert res["stop_labels"] is None and res["saturated"] is False
+    assert res["note"] == "slope is not decaying; no stop point estimable"
+
+
+def test_plan_negative_last_slope_is_saturated():
+    res = D.plan_budget(10, 0.5, [(100, 0.80), (200, 0.70)], 0.01, 100)
+    assert res["saturated"] is True and res["stop_labels"] == 200
+    assert res["last_slope_per_step"] == pytest.approx(-0.1)
+
+
+def test_plan_decaying_after_flat_start_still_extrapolates():
+    res = D.plan_budget(10, 0.5, [(0, 0.5), (100, 0.7), (200, 0.75)], 0.01, 100)
+    assert res["stop_labels"] == 400                  # ceil(log(0.01/0.05)/log(0.25)) = 2 more steps
+    assert res["note"] == "extrapolated, slope decay ratio 0.250"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_plan_rejects_nonfinite_curve(bad):
+    with pytest.raises(D.DistillError, match="non-finite metric"):
+        D.plan_budget(10, 0.5, [(0, 0.5), (100, bad)], 0.01, 100)
+
+
+def test_plan_rejects_nonfinite_cap():
+    with pytest.raises(D.DistillError, match="must be finite"):
+        D.plan_budget(float("inf"), 0.5, [], 0.01, 100)
+
+
+def test_cli_plan_prints_result_and_reports_errors_as_exit_2(tmp_path, capsys):
+    curve = tmp_path / "curve.json"
+    curve.write_text(json.dumps([[0, .5], [100, .5], [200, .6]]), encoding="utf-8")
+    args = ["plan", "--cap-usd", "10", "--cost-per-label-usd", "0.1", "--min-gain-per-step", "0.001",
+            "--step-labels", "100"]
+    assert D.main(args + ["--curve", str(curve)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["affordable_labels"] == 100
+    assert out["note"] == "slope is not decaying; no stop point estimable"
+    curve.write_text("[[0, .5", encoding="utf-8")
+    assert D.main(args + ["--curve", str(curve)]) == 2
+    assert "invalid JSON" in capsys.readouterr().err
+    assert D.main(args + ["--curve", str(tmp_path / "nope.json")]) == 2
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_load_criteria_bad_json_missing_file_and_non_numeric(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(D.DistillError, match="invalid JSON"):
+        D.load_criteria(p)
+    with pytest.raises(D.DistillError, match="cannot read"):
+        D.load_criteria(tmp_path / "absent.json")
+    p.write_text(json.dumps(dict(CRIT, threshold="high")), encoding="utf-8")
+    with pytest.raises(D.DistillError, match="threshold must be a finite number, got 'high'"):
+        D.load_criteria(p)
+    p.write_text(json.dumps(CRIT), encoding="utf-8")
+    assert D.load_criteria(p) == CRIT
+
+
+def test_cli_gate_malformed_criteria_exits_2_not_hold(tmp_path, capsys):
+    c = tmp_path / "c.json"
+    c.write_text("{oops", encoding="utf-8")
+    f = tmp_path / "x.json"
+    f.write_text("{}", encoding="utf-8")
+    rc = D.main(["gate", "--criteria", str(c), "--test", str(f), "--validation", str(f),
+                 "--student-test", str(f), "--incumbent-test", str(f), "--student-validation", str(f)])
+    assert rc == 2
+    assert "invalid JSON" in capsys.readouterr().err
