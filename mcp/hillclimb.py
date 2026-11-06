@@ -19,7 +19,8 @@ Before climbing it checks the grader itself: re-scoring the same cases must agre
 not wrong) are excluded from the mean and counted; too many aborts the run.
 
 Privacy: the ledger holds surface names, patch values, rationales, scores and case ids. Case
-text and model traces stay in memory and go only to the local proposer model.
+text and model traces stay in memory and go only to the proposer: the local model, or the cloud
+teacher for a suite whose ``config.json`` sets ``allow_cloud`` (see ``TeacherProposer``).
 
 Pure and injectable: suites and proposers are plain objects, so tests run offline.
 
@@ -296,6 +297,93 @@ class LLMProposer:
             return None
 
 
+class TeacherProposer:
+    """Cloud proposer via ``teacher.teacher_call(role="propose")``. Fail-open: a refusal or error
+    returns None and sets ``last_abort`` (an infrastructure reason code), which ``climb`` records as an
+    aborted round: excluded from scoring, counted, never a pass. Sees only failing TRAIN cases, scrubbed.
+    ``max_usd`` bounds the run's spend (overshoot is at most one call, itself capped by the teacher guard)."""
+
+    def __init__(self, allow_cloud: bool = False, max_usd: Optional[float] = None,
+                 call_fn: Optional[Callable[..., dict]] = None, max_tokens: int = 700):
+        self.allow_cloud = bool(allow_cloud)
+        self.max_usd = max_usd
+        self._call = call_fn
+        self.max_tokens = max_tokens
+        self.spent_usd = 0.0
+        self.calls = 0
+        self.last_abort: Optional[str] = None
+        self._last_usd = 0.0
+
+    def _scrub_ctx(self, ctx: dict) -> Optional[dict]:
+        """Train-only failures with sanitized traces; None when the sanitizer is unavailable."""
+        try:
+            from llm_local import _sanitize_for_cloud
+        except Exception:
+            return None
+        train_ids = ctx.get("train_ids")
+        out = []
+        for f in ctx.get("failures", []):
+            if train_ids is not None and f["id"] not in train_ids:
+                continue
+            tr = _sanitize_for_cloud(str(f.get("trace", ""))[:_TRACE_HEAD], max_len=_TRACE_HEAD)
+            out.append({**f, "trace": _scrub_text(tr, _TRACE_HEAD)})
+        return {**ctx, "failures": out}
+
+    def propose(self, ctx: dict) -> Optional[Patch]:
+        self.last_abort = None
+        try:
+            if not self.allow_cloud:
+                self.last_abort = "cloud_not_allowed"
+                return None
+            if self.max_usd is not None and self.spent_usd + self._last_usd >= self.max_usd:
+                self.last_abort = "budget_exhausted"
+                return None
+            safe = self._scrub_ctx(ctx)
+            if safe is None:
+                self.last_abort = "sanitizer_unavailable"
+                return None
+            call = self._call
+            if call is None:
+                from teacher import teacher_call as call
+            res = call("propose", _prompt_for(safe), self.max_tokens, "hillclimb_propose")
+            self.calls += 1
+            usd = res.get("usd") if isinstance(res, dict) else 0.0
+            self._last_usd = float(usd) if isinstance(usd, (int, float)) and usd > 0 else 0.0
+            self.spent_usd += self._last_usd
+            if not isinstance(res, dict) or not res.get("ok"):
+                reason = str(res.get("reason") or "teacher_error") if isinstance(res, dict) else "teacher_error"
+                self.last_abort = reason[:60]
+                return None
+            from model_json import extract_json_object
+            obj = extract_json_object(str(res.get("text", "")))
+            if not obj or "key" not in obj or "value" not in obj:
+                self.last_abort = "bad_proposal"
+                return None
+            return Patch(str(obj["key"]), obj["value"], str(obj.get("rationale", ""))[:300])
+        except Exception as exc:
+            self.last_abort = f"error:{type(exc).__name__}"
+            return None
+
+
+def suite_config(suite_name: str) -> dict:
+    """``<suite folder>/config.json``: ``allow_cloud`` (default False) and ``proposer`` (default local)."""
+    raw = _read_json(suite_dir(suite_name) / "config.json")
+    prop = raw.get("proposer")
+    return {"allow_cloud": raw.get("allow_cloud") is True,
+            "proposer": prop if prop in ("local", "teacher") else "local"}
+
+
+def make_proposer(suite_name: str, choice: Optional[str] = None, max_usd: Optional[float] = None):
+    """(proposer, error). ``choice`` (CLI) overrides the suite config; the teacher needs allow_cloud."""
+    cfg = suite_config(suite_name)
+    which = choice or cfg["proposer"]
+    if which == "teacher":
+        if not cfg["allow_cloud"]:
+            return None, f"suite {suite_name!r} does not set allow_cloud: case text may not leave the machine"
+        return TeacherProposer(True, max_usd), None
+    return LLMProposer(), None
+
+
 # ------------------------------------------------------------------------------ diagnostics
 
 def diagnose(suite, train: list[Case], test: list[Case], overlay: dict,
@@ -370,6 +458,11 @@ def climb(suite, proposer, overlay0: Optional[dict] = None, cfg: Optional[ClimbC
     cur_te = score_set(suite, test, overlay, cfg.repeats)
     out: dict = {"run_id": run_id, "suite": suite.name, "overlay": dict(overlay), "rounds": [],
                  "baseline": {"train": cur_tr.summary(), "test": cur_te.summary()}}
+    why_not = getattr(suite, "unavailable", lambda: None)()
+    if why_not:
+        out.update(stop="suite_unavailable", status=why_not, diagnostics={"ok": False, "warnings": [why_not]})
+        _log(log, {"run": run_id, "event": "end", "stop": "suite_unavailable", "status": why_not})
+        return out
 
     if infra_too_high(cur_tr, len(train) * cfg.repeats) or infra_too_high(cur_te, len(test) * cfg.repeats):
         out.update(stop="infra_noise", diagnostics={"ok": False, "warnings": ["too many infrastructure failures at baseline"]})
@@ -387,14 +480,34 @@ def climb(suite, proposer, overlay0: Optional[dict] = None, cfg: Optional[ClimbC
 
     history: list[dict] = []
     misses = 0
+    aborted = 0
+    consec_abort = 0
+    train_ids = {c.id for c in train}
     stop = "rounds"
     for rnd in range(1, cfg.rounds + 1):
         if cur_tr.mean >= cfg.target:
             stop = "saturated"
             break
-        ctx = {"surfaces": surfaces, "overlay": dict(overlay), "failures": cur_tr.failures, "history": history}
+        ctx = {"surfaces": surfaces, "overlay": dict(overlay), "failures": cur_tr.failures, "history": history,
+               "train_ids": train_ids}
         patch = proposer.propose(ctx)
         row: dict = {"run": run_id, "event": "round", "round": rnd}
+        abort = getattr(proposer, "last_abort", None) if patch is None else None
+        if isinstance(abort, str) and abort:
+            # Infrastructure, not a verdict on any change: excluded from scoring and from patience.
+            row.update(verdict="aborted_infra", reason=abort)
+            _log(log, row)
+            out["rounds"].append(row)
+            aborted += 1
+            consec_abort += 1
+            if abort == "budget_exhausted":
+                stop = "budget"
+                break
+            if consec_abort >= cfg.patience:
+                stop = "infra_aborted"
+                break
+            continue
+        consec_abort = 0
         if patch is None:
             row.update(verdict="no_proposal")
             _log(log, row)
@@ -435,10 +548,15 @@ def climb(suite, proposer, overlay0: Optional[dict] = None, cfg: Optional[ClimbC
             if misses >= cfg.patience:
                 stop = "patience"
                 break
-    out.update(stop=stop, overlay=dict(overlay), final={"train": cur_tr.summary(), "test": cur_te.summary()})
+    out.update(stop=stop, overlay=dict(overlay), final={"train": cur_tr.summary(), "test": cur_te.summary()},
+               aborted_rounds=aborted)
+    spent = getattr(proposer, "spent_usd", None)
+    if isinstance(spent, (int, float)):
+        out["teacher_usd"] = round(spent, 6)
     if stop in ("patience", "rounds"):
         out["stall"] = _stall_report(cur_tr.failures, len(test), history)
-    _log(log, {"run": run_id, "event": "end", "stop": stop, "final": out["final"], "overlay_keys": sorted(overlay)})
+    _log(log, {"run": run_id, "event": "end", "stop": stop, "final": out["final"], "overlay_keys": sorted(overlay),
+               "aborted_rounds": aborted, **({"teacher_usd": out["teacher_usd"]} if "teacher_usd" in out else {})})
     d = suite_dir(suite.name)
     _atomic_write(d / "candidate_overlay.json", overlay)
     return out
@@ -902,6 +1020,9 @@ def _main(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--repeats", type=int, default=1)
     r.add_argument("--patience", type=int, default=3)
     r.add_argument("--force", action="store_true")
+    r.add_argument("--proposer", choices=("local", "teacher"), default=None,
+                   help="override the suite config; teacher needs allow_cloud in the suite config.json")
+    r.add_argument("--max-usd", type=float, default=None, help="spend cap for this run (teacher proposer)")
     for name in ("status", "promote", "rollback"):
         s = sub.add_parser(name)
         s.add_argument("--suite", required=True)
@@ -951,7 +1072,11 @@ def _main(argv: Optional[list[str]] = None) -> int:
         start = _read_json(suite_dir(suite.name) / "overlay.json")
         cfg = ClimbConfig(rounds=a.rounds, margin=a.margin, test_gain=a.test_gain,
                           repeats=a.repeats, patience=a.patience, force=a.force)
-        res = climb(suite, LLMProposer(), start, cfg)
+        proposer, err = make_proposer(suite.name, a.proposer, a.max_usd)
+        if proposer is None:
+            print(json.dumps({"ok": False, "why": err}))
+            return 2
+        res = climb(suite, proposer, start, cfg)
     elif a.cmd == "status":
         res = status(suite_name(a.suite))
     elif a.cmd == "promote":
