@@ -134,7 +134,8 @@ def test_env_overrides_toml(env, monkeypatch):
     assert c["enabled"] is False
     assert c["daily_usd_cap"] == 0.25
     assert c["roles"]["judge"] == "env-judge" and c["roles"]["verify"] == "grp-v"
-    assert c["groups_counted"] == ["x", "y"]
+    # the operator list ADDS groups; every role's group (here the env-judge override too) is always counted
+    assert c["groups_counted"] == ["env-judge", "grp-a", "grp-b", "grp-d", "grp-p", "grp-v", "x", "y"]
     assert c["sanitize"] is False
 
 
@@ -513,6 +514,63 @@ def test_call_refused_never_reaches_transport(env):
     assert (out["ok"], out["reason"], out["text"], out["usd"]) == (False, "unknown_role", "", 0.0)
     assert T.teacher_call("judge", "hello", 100, "p", transport=rec)["ok"] is True
     assert len(rec.calls) == 1
+
+
+@pytest.mark.parametrize("bad", [0, -1, -1000000, True, None, "100", 2.5])
+def test_call_refuses_non_positive_or_non_int_max_tokens_before_anything_is_sent(env, bad):
+    setup_cfg(env)
+    rec = Rec(reply())
+    out = T.teacher_call("judge", "hello", bad, "p", transport=rec)
+    assert rec.calls == []
+    assert (out["ok"], out["reason"], out["usd"], out["decision"], out["cost_unknown"]) == (False, "bad_max_tokens", 0.0, None, False)
+    assert T._reservations == {} and T._settling == []
+
+
+def test_call_forwards_the_validated_max_tokens_unchanged(env):
+    setup_cfg(env)
+    rec = Rec(reply(cost=0.001))
+    out = T.teacher_call("judge", "hello", 1, "p", transport=rec)
+    assert out["ok"] is True
+    assert [c[2] for c in rec.calls] == [1]
+
+
+def test_operator_counted_list_cannot_hide_a_role_group(env, monkeypatch):
+    setup_cfg(env)
+    monkeypatch.setenv("LOCI_TEACHER_GROUPS_COUNTED", "other")
+    assert T.teacher_config()["groups_counted"] == ["grp-a", "grp-b", "grp-d", "grp-j", "grp-p", "grp-v", "other"]
+    rows(env["ledger"], [(NOW - 1, "grp-j", 1.9)])
+    assert T.check("judge", 0.2).reason == "over_daily_cap"      # 1.9 + 0.2 > 2.0: the role group's spend is seen
+    assert T.check("judge", 0.1).allowed is True                 # 1.9 + 0.1 == 2.0 is still within the cap
+
+
+def test_exception_after_send_flags_cost_unknown_and_holds_the_estimate(env, monkeypatch):
+    setup_cfg(env)
+
+    def boom(resp):
+        raise RuntimeError("parse")
+    monkeypatch.setattr(T, "_text", boom)
+    out = T.teacher_call("judge", "x" * 300, 100, "p", transport=Rec(reply(cost=0.01)))
+    assert (out["ok"], out["reason"], out["cost_unknown"]) == (False, "error:RuntimeError", True)
+    assert T.check("judge", 0.1).settling == pytest.approx(0.01)   # the gateway-reported cost is what stays held
+
+
+def test_exception_before_send_is_not_cost_unknown(env, monkeypatch):
+    setup_cfg(env)
+
+    def boom(*a, **k):
+        raise RuntimeError("estimate")
+    monkeypatch.setattr(T, "_estimate", boom)
+    rec = Rec(reply())
+    out = T.teacher_call("judge", "hello", 100, "p", transport=rec)
+    assert rec.calls == []
+    assert (out["ok"], out["reason"], out["cost_unknown"]) == (False, "error:RuntimeError", False)
+
+
+def test_status_warns_only_when_sanitize_is_off(env):
+    setup_cfg(env)
+    assert T.status()["warnings"] == []
+    setup_cfg(env, replace=("safety_margin_pct = 0", "safety_margin_pct = 0\nsanitize = false"))
+    assert T.status()["warnings"] == ["sanitize is OFF: prompts leave the machine without credential or PII redaction"]
 
 
 def test_call_oversize_request_refused_by_per_call_cap(env):

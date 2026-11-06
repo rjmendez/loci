@@ -128,7 +128,8 @@ def teacher_config() -> Dict[str, Any]:
     counted = get("groups_counted", "LOCI_TEACHER_GROUPS_COUNTED", None)
     if isinstance(counted, str):
         counted = [c for c in counted.split(",")]
-    counted = sorted({str(c).strip() for c in counted if str(c).strip()}) if counted else sorted(set(roles.values()))
+    # Role groups are ALWAYS counted: an operator list can add groups but never hide one the guard is about to spend on.
+    counted = sorted({str(c).strip() for c in (counted or []) if str(c).strip()} | set(roles.values()))
     cpt = _nonneg(get("chars_per_token", "LOCI_TEACHER_CHARS_PER_TOKEN", DEFAULT_CHARS_PER_TOKEN))
     try:
         max_bad = int(get("max_bad_lines", "LOCI_TEACHER_MAX_BAD_LINES", 0))
@@ -472,6 +473,11 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
     settle_s = 0.0
     try:
         cfg = teacher_config()
+        # max_tokens <= 0 (or not an int) can make a provider fall back to its own, larger output limit, which the
+        # estimate never priced: refuse before anything is reserved or sent, and use this one value everywhere below.
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+            out["reason"] = "bad_max_tokens"
+            return out
         messages = _to_messages(prompt_or_messages)
         decision = reserve(role, _estimate(messages, max_tokens, cfg, cfg["roles"].get(role, "")))
         out["decision"], out["group"] = decision.to_dict(), decision.group
@@ -509,6 +515,7 @@ def teacher_call(role: str, prompt_or_messages: Union[str, Messages], max_tokens
         return out
     except Exception as exc:  # noqa: BLE001 - fail open for the caller
         out["ok"], out["reason"] = False, f"error:{type(exc).__name__}"
+        out["cost_unknown"] = out["cost_unknown"] or settle_usd > 0     # failed after the request was sent: it may have been billed
         return out
     finally:
         if decision is not None:
@@ -529,6 +536,8 @@ def status() -> Dict[str, Any]:
                            "ledger_file": cfg["ledger_file"], "max_bad_lines": cfg["max_bad_lines"],
                            "safety_margin_pct": cfg["safety_margin_pct"], "priced_groups": sorted(cfg["prices"]),
                            "limits": LIMITS_NOTE,
+                           "warnings": ([] if cfg["sanitize"] else
+                                        ["sanitize is OFF: prompts leave the machine without credential or PII redaction"]),
                            "caps": {"monthly_usd": cfg["monthly_usd_cap"], "daily_usd": cfg["daily_usd_cap"],
                                     "per_call_usd": cfg["max_usd_per_call"]}}
     try:
