@@ -216,14 +216,23 @@ def _write_jsonl(path: str, rows: Iterable[dict]) -> int:
 
 
 def _local_judge() -> Tuple[Callable[[str], str], str]:
-    import llm_local
+    """The local judge model straight through the resident Ollama gen endpoint (``backends.ollama_gen_url``).
+    ``llm_local.generate`` is not used: it refuses the judge task unless a tmux offload session is running."""
+    import urllib.request
+    import backends
     import model_pool
-    model = os.environ.get("LOCI_PILOT_JUDGE_MODEL") or ""
-    if not model:
-        model = model_pool.rank_role("verify").candidates[0].name
+    model = os.environ.get("LOCI_PILOT_JUDGE_MODEL") or model_pool.rank_role("verify").candidates[0].name
+    url = backends.ollama_gen_url().rstrip("/") + "/api/generate"
+
     def call(prompt: str) -> str:
-        r = llm_local.generate(prompt, model=model, fmt="json", max_tokens=24, task="judge", timeout=90)
-        return str(r.get("text") or "") if isinstance(r, dict) and r.get("ok") else ""
+        body = json.dumps({"model": model, "prompt": prompt, "stream": False, "format": "json",
+                           "options": {"temperature": 0, "num_predict": 24}}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return str(json.loads(resp.read().decode("utf-8")).get("response") or "")
+        except (OSError, ValueError):
+            return ""
     return call, model
 
 
