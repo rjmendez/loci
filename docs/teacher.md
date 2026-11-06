@@ -135,3 +135,17 @@ processes you run. `status()` repeats this in its `limits` field and reports `ov
 python mcp/teacher.py status          # caps, spent, remaining, by group (JSON)
 python mcp/teacher.py check <role>    # guard decision at the usable per-call cap (readiness probe); exit 0 allowed, 1 refused
 ```
+
+## Judge calibration and oracle judging
+
+`mcp/judge_calibration.py` measures the local judge against gold (agreement, Cohen's kappa, precision, recall,
+leniency bias = false-accept rate, per judge model, seeded bootstrap 95% CIs), picks which verdicts the teacher
+`judge` role re-judges (disagreements with a second signal, then low margin, then a seeded audit fraction, under a
+call cap) and recommends the margin cut that catches a target share of the judge's errors. Gold rows: `(item, bool|grade)`
+pairs or dicts with `gold_correct` / `grade` / `relevance` (0..3, correct at `--threshold`, default 2).
+
+    python mcp/judge_calibration.py report --judge judge.jsonl --gold gold.jsonl [--threshold 2] [--seed 0] [--boot 1000] [--target-capture 0.8] [--json]
+
+`pool_grader` oracle mode (`LOCI_JUDGE_ORACLE`) with `[teacher] enabled` sends the judgment through
+`teacher_call("judge", ...)` (max_tokens 24, purpose `pool_grader_oracle`); the $0.50/day bucket is then neither
+charged nor consulted, and a guard refusal is skipped as `teacher_refused`. Teacher off: unchanged.
