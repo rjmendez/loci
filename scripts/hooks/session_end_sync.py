@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-"""
-on_session_end hook — live-sync the current session into Qdrant loci_sessions.
+"""on_session_end hook: upsert the current session into Qdrant loci_sessions.
 
-Fires at the end of every turn. Reads session_id and transcript_path from stdin
-JSON, takes the session's messages from state.db or, for a Claude Code session
-id that never resolves there, from the transcript, embeds via Ollama
-(nomic-embed-text 768d), and upserts a single point into loci_sessions.
-
-Fast path: if the session has no new messages since the last upsert (checked
-via a lightweight mtime file), exit 0 immediately.
-
-Target latency budget: <500ms (Ollama ~70ms warm + Qdrant ~15ms + overhead).
+Reads session_id/transcript_path from stdin JSON, takes messages from state.db
+(or the Claude Code transcript when the id isn't there), embeds them, upserts one point.
+Env: QDRANT_URL, QDRANT_API_KEY, OLLAMA_BASE_URL / MNEMOSYNE_EMBEDDING_API_URL, LOCI_STATE_DB.
+Fail-open: every error exits 0; an unchanged message count exits before any network call.
 """
 import json, sys, os, sqlite3, hashlib, datetime, time
 import urllib.request, urllib.error
 
-# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
-# next to legacy_env.py; the repo copy finds it as a sibling too.
+# Accept the legacy HERMES_* spelling (legacy_env.py is a sibling in both layouts).
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from legacy_env import apply as _apply_legacy_env
@@ -24,13 +17,11 @@ try:
 except Exception:
     pass
 
-# ── Config ─────────────────────────────────────────────────────────────────
-STATE_DB    = os.path.expanduser(os.environ.get("LOCI_STATE_DB", "~/.hermes/state.db"))
+STATE_DB   = os.path.expanduser(os.environ.get("LOCI_STATE_DB", "~/.hermes/state.db"))
 QDRANT      = os.environ.get("QDRANT_URL")
 QDRANT_KEY  = os.environ.get("QDRANT_API_KEY", "")
 def _embeddings_url() -> "str | None":
-    """OLLAMA_BASE_URL is a bare host; MNEMOSYNE_EMBEDDING_API_URL (what the
-    Hermes profile sets) is already a full /v1 endpoint."""
+    """OLLAMA_BASE_URL is a bare host; MNEMOSYNE_EMBEDDING_API_URL is already a /v1 endpoint."""
     base = os.environ.get("OLLAMA_BASE_URL")
     if base:
         return f"{base.rstrip('/')}/v1/embeddings"
@@ -49,14 +40,9 @@ CACHE_DIR   = os.path.expanduser(os.environ.get("LOCI_SYNC_CACHE", "~/.hermes/.s
 AGENT_ID    = os.environ.get("HERMES_AGENT_ID", "")
 PROFILE     = os.environ.get("HERMES_PROFILE", "")
 ACTIVE_INV  = os.environ.get("LOCI_ACTIVE_INVESTIGATION", "")
-# ───────────────────────────────────────────────────────────────────────────
 
 def ensure_collection():
-    """Create loci_sessions with quantization + HNSW if it doesn't exist.
-
-    Uses the raw REST API (no qdrant-client dep) so the hook stays zero-dep.
-    Non-fatal: any error here is logged but does not abort the sync.
-    """
+    """Create loci_sessions (or re-tune it) via raw REST, keeping the hook zero-dep. Non-fatal."""
     if not QDRANT:
         return
     url = f"{QDRANT}/collections/{COLLECTION}"
@@ -88,7 +74,7 @@ def ensure_collection():
         except Exception as e:
             print(f"[session_end_sync] create collection failed: {e}", file=sys.stderr)
     else:
-        # Idempotent: Qdrant applies these on the next optimizer pass, without pausing writes.
+        # Idempotent; applied on the next optimizer pass without pausing writes.
         body = json.dumps({
             "hnsw_config": {"m": 32, "ef_construct": 200},
             "quantization_config": _quant,
@@ -121,7 +107,7 @@ def read_stdin_session_id() -> str:
     return sid if isinstance(sid, str) else ""
 
 def get_session_content(session_id: str):
-    """Return (title, started_at, source, model, content_text, msg_count)."""
+    """Return the session as a dict (title, started_at, source, model, content, msg_count), or None."""
     if not os.path.exists(STATE_DB):
         return None
     try:
@@ -181,8 +167,7 @@ def get_session_content(session_id: str):
 
 
 def _transcript_text(message) -> str:
-    """A user message carries a plain string; an assistant message carries a
-    list of content blocks. Only the text blocks are of interest."""
+    """User content is a string; assistant content is a block list (keep text blocks only)."""
     content = (message or {}).get("content")
     if isinstance(content, str):
         return content.strip()
@@ -194,14 +179,9 @@ def _transcript_text(message) -> str:
 
 
 def transcript_session_content(transcript_path: str, session_id: str):
-    """Same shape as get_session_content, built from a Claude Code transcript.
+    """Like get_session_content, from a Claude Code transcript (STATE_DB only knows Hermes ids).
 
-    STATE_DB is Hermes' session store and holds Hermes-format ids only, so a
-    Claude Code session id never resolves there and the sync did nothing at all.
-    The Stop payload carries transcript_path, which is the record that exists.
-
-    Streams the file: transcripts reach tens of megabytes and only the last
-    MAX_CHARS of text is ever embedded.
+    Streams the file: transcripts reach tens of MB and only the last MAX_CHARS is embedded.
     """
     if not transcript_path or not os.path.exists(transcript_path):
         return None
@@ -242,7 +222,7 @@ def transcript_session_content(transcript_path: str, session_id: str):
                 entry = f"{kind.upper()}: {text}"
                 tail.append(entry)
                 tail_chars += len(entry)
-                # Keep a bounded tail so recent context drives the embedding.
+                # bounded tail: recent context drives the embedding
                 while tail_chars > MAX_CHARS * 2 and len(tail) > 1:
                     tail_chars -= len(tail.pop(0))
     except OSError:
@@ -269,16 +249,12 @@ def transcript_session_content(transcript_path: str, session_id: str):
         "msg_count":  msg_count,
     }
 
-# One file per session id: without a TTL the directory grows with every session ever run.
+# One cache file per session id; the TTL stops the directory growing forever.
 CACHE_TTL_DAYS = int(os.environ.get("LOCI_SYNC_CACHE_TTL_DAYS", "7"))
 
 
 def prune_cache(now: float | None = None) -> int:
-    """Delete cache entries older than CACHE_TTL_DAYS. Returns how many went.
-
-    Fail-open per file: an unreadable or already-deleted entry is skipped rather
-    than aborting a hook that runs at the end of every session.
-    """
+    """Delete cache entries older than CACHE_TTL_DAYS; return the count. Fail-open per file."""
     if CACHE_TTL_DAYS <= 0:
         return 0
     cutoff = (now if now is not None else time.time()) - CACHE_TTL_DAYS * 86400
@@ -304,7 +280,7 @@ def cache_path(session_id: str) -> str:
 
 def cached_msg_count(session_id: str) -> int:
     try:
-        # inside the try: an unusable cache dir only costs the fast path
+        # inside the try: an unusable cache dir only loses the fast path
         p = cache_path(session_id)
         with open(p) as f:
             return int(f.read().strip())
@@ -360,13 +336,10 @@ def qdrant_upsert(point_id: int, vector: list, payload: dict):
     return result.get("status") == "ok"
 
 def _check_wiring_obligations(investigation_id: str, payload: dict) -> "str | None":
-    """Query Loci for unresolved wiring obligations and append to upsert payload.
+    """Count unresolved wiring_obligation gaps in findings.jsonl and add them to `payload`.
 
-    Uses the MCP HTTP API if QDRANT-side Loci is available; otherwise reads
-    the investigation findings.jsonl directly for the wiring_obligation tag.
-    Non-fatal. Returns "" when the check ran and found nothing outstanding, and
-    None when the check could not run — a health report whose failure mode is a
-    clean line is worse than no report.
+    Returns "" when nothing is outstanding and None when the check could not run
+    (a failure must not read as a clean line). Non-fatal.
     """
     loci_dir = os.path.expanduser(
         os.environ.get("LOCI_INVESTIGATIONS_DIR", "~/.loci/investigations")
@@ -417,7 +390,7 @@ def main():
     if not isinstance(session_id, str) or not session_id:
         sys.exit(0)
 
-    # This hook is the only writer of the cache, so it is the only place that can retire it.
+    # This hook is the cache's only writer, so it must prune it.
     try:
         gone = prune_cache()
         if gone:
@@ -462,8 +435,7 @@ def main():
         "profile":         PROFILE,
     }
 
-    # Before the upsert: the check adds its fields to `payload`, and they only
-    # persist if they are there when the point is serialised.
+    # Must run before the upsert: the check adds fields to `payload`.
     unresolved_note = ""
     if ACTIVE_INV:
         try:

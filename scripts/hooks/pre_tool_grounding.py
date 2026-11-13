@@ -1,39 +1,15 @@
 #!/usr/bin/env python3
 """
-pre_tool_call hook — grounding enforcement, supply chain IOC detection,
-prompt injection scanning, dangerous pattern detection, audit log.
+pre_tool_call hook: supply chain IOC detection, prompt injection scanning,
+dangerous pattern detection, audit log.
 
-v3 changes over v2:
-  - Supply chain IOC patterns: Hades/Miasma worm file path and terminal IOCs
-  - Prompt injection content scanner (HIGH + SUSPICIOUS tiers) applied to all
-    content being written by mutation tools; always-blocks on agent config files
-  - Agent config path detection: AGENTS.md, CLAUDE.md, .cursorrules etc. get
-    extra scrutiny — any injection pattern triggers block regardless of BLOCK_MODE
-  - Supply chain terminal patterns: Bun download/exec, pipe-to-interpreter,
-    base64-encoded exec, site-packages manipulation
-  - _extract_write_targets / _extract_write_content helpers cover all mutation tools
+Injection scan: HIGH and SUSPICIOUS regex tiers over mutation-tool content. Any hit on
+an agent config path blocks regardless of BLOCK_MODE. A SUSPICIOUS hit elsewhere gets a
+granite3-guardian second opinion; "Yes" blocks, anything else fails open (log only).
 
-v4 change:
-  - Granite Guardian semantic corroboration: a SUSPICIOUS-tier regex hit that is
-    NOT on an agent-config path and NOT in BLOCK_MODE used to just get logged and
-    silently allowed through — one low-confidence keyword cue isn't enough to
-    justify blocking on its own, but leaving it as log-only is a real gap. That
-    ambiguous case now gets a semantic second opinion from granite3-guardian:2b
-    (already pulled on the Ollama fleet, a purpose-built safety classifier, not a
-    keyword matcher) via _guardian_confirms_injection(); a confirmed "Yes"
-    escalates to a block, anything else (No / unreachable / timeout / malformed)
-    fails open and preserves the old log-only behavior exactly. This is additive
-    only — it never widens the HIGH tier or agent-config/BLOCK_MODE branches,
-    which already decide without needing corroboration, so no extra latency is
-    added to the common paths.
-  - IMPORTANT LIMITATION: this only strengthens the SUSPICIOUS regex tier. Content
-    that evades every INJECTION_HIGH/SUSPICIOUS pattern entirely (e.g. a novel
-    paraphrase with no matching keyword) never reaches this branch and is not
-    scanned by Guardian here — the hook only runs on mutation-tool *inputs*, not on
-    content read in from web fetches or document ingestion. For that broader
-    surface, call guardian.check_injection_risk() directly at the point content is
-    ingested (see mcp/guardian.py's module docstring for the live-verified example
-    of a regex-evading injection it catches that this hook's regex alone misses).
+Limitation: only mutation-tool inputs are scanned, and Guardian only sees SUSPICIOUS hits.
+For fetched/ingested content call guardian.check_injection_risk() at ingestion
+(see mcp/guardian.py).
 
 Wire in:  {"hook_event_name": "pre_tool_call", "tool_name": ..., "tool_input": ..., "extra": {...}}
 Wire out: Hermes ("pre_tool_call"): {} (allow) | {"action":"block","message":"..."} (block)
@@ -64,17 +40,8 @@ except Exception:
 BLOCK_MODE: bool = os.environ.get("HOOK_BLOCK_MODE", "0").strip().lower() in ("1", "true", "yes")
 MAX_AUDIT_BYTES: int = 5 * 1024 * 1024  # 5 MB — matches Hermes logging.max_size_mb
 
-# ---- Granite Guardian semantic corroboration (opt-in, fail-open) --------------
-# Regex INJECTION_SUSPICIOUS hits are ambiguous by design (single low-confidence
-# cue) and today are log-only unless the target is an agent-config path or
-# BLOCK_MODE is on -- a real attacker who avoids agent-config paths sails
-# through. granite3-guardian:2b is a purpose-built safety classifier (already
-# pulled on the Ollama fleet) that generalizes semantically rather than matching
-# literal keywords, so it can corroborate (or quiet) a SUSPICIOUS hit without the
-# hook needing its own keyword list to keep growing. This is a plain stdlib
-# urllib call (mirrors pre_llm_grounding.py's embedding call) so the hook keeps
-# zero non-stdlib dependencies; it fails open on any error/timeout so a Guardian
-# outage degrades to today's regex-only behavior, never to a hang or crash.
+# Granite Guardian corroboration of SUSPICIOUS hits (fail-open). Stdlib urllib only,
+# like pre_llm_grounding.py; any error/timeout degrades to regex-only, never a hang.
 GUARDIAN_ENABLED: bool = os.environ.get("HOOK_GUARDIAN_ENABLED", "1").strip() not in ("0", "false", "no")
 GUARDIAN_URL: str = (os.environ.get("LOCI_OLLAMA_GEN_URL")
                       or os.environ.get("OLLAMA_GEN_URL")
@@ -105,11 +72,7 @@ _GUARDIAN_PROMPT_TEMPLATE = (
 
 
 def _guardian_confirms_injection(content: str) -> bool | None:
-    """Ask granite3-guardian whether `content` is a jailbreak/injection attempt.
-
-    Returns True/False on a clean answer, None on any failure (unreachable,
-    timeout, malformed response) so the caller can fail open -- a None result
-    must never be treated as either a confirmation or a denial."""
+    """True/False on a clean granite3-guardian answer; None on any failure (caller fails open)."""
     if not GUARDIAN_ENABLED or not GUARDIAN_URL or not content:
         return None
     prompt = _GUARDIAN_PROMPT_TEMPLATE.format(
@@ -138,7 +101,7 @@ def _guardian_confirms_injection(content: str) -> bool | None:
         return False
     return None
 
-# ---- Grounding / read-only tools — always allowed, no audit noise ----------------
+# Read-only tools: always allowed, not audited.
 GROUNDING_TOOLS: frozenset[str] = frozenset({
     # Mnemosyne MCP
     "mcp_mnemosyne_mnemosyne_recall",
@@ -161,7 +124,7 @@ GROUNDING_TOOLS: frozenset[str] = frozenset({
     "mcp_serena_get_diagnostics_for_file",
     "mcp_serena_list_dir",
     "mcp_serena_get_overview",
-    # Claude Code read-only tools — suppress audit noise
+    # Claude Code read-only tools
     "Read",
     "ToolSearch",
     "WebFetch",
@@ -182,7 +145,6 @@ GROUNDING_TOOLS: frozenset[str] = frozenset({
     "todo",
 })
 
-# ---- File-mutation tools — intercepted when BLOCK_MODE is on ------------------
 MUTATION_TOOLS: frozenset[str] = frozenset({
     # Claude Code mutation tools
     "Edit",
@@ -201,10 +163,8 @@ MUTATION_TOOLS: frozenset[str] = frozenset({
     "mcp_serena_create_directory",
 })
 
-# ---- Dangerous terminal patterns — always audited, blocked in BLOCK_MODE ------
 DANGEROUS_TERMINAL_PATTERNS: list[tuple[str, str]] = [
-    # Recursive + force in any spelling: -rf, -fr, -rfv, -r -f, --recursive --force.
-    # Each lookahead scans rm's leading option words for one of the two flags.
+    # rm recursive+force in any spelling (-rf, -fr, -r -f, --recursive --force)
     (r"\brm(?=(?:\s+-\S+)*?\s+(?:-[a-z]*r|--recursive\b))"
      r"(?=(?:\s+-\S+)*?\s+(?:-[a-z]*f|--force\b))", "rm -rf detected"),
     (r"\bDROP\s+(TABLE|DATABASE|SCHEMA)\b", "destructive SQL DDL"),
@@ -218,8 +178,7 @@ DANGEROUS_TERMINAL_PATTERNS: list[tuple[str, str]] = [
     (r">\s*/dev/sd[a-z]", "raw device write"),
 ]
 
-# ---- Hades/Miasma supply chain IOC — terminal patterns -----------------------
-# Execution vectors documented in the June 2026 campaign.
+# Hades/Miasma execution vectors (June 2026 campaign).
 SUPPLY_CHAIN_TERMINAL_PATTERNS: list[tuple[str, str]] = [
     (r"\bbun\b.{0,60}(install|run|x |exec|--)\b",
      "Bun runtime execution (Hades IOC)"),
@@ -241,8 +200,7 @@ SUPPLY_CHAIN_TERMINAL_PATTERNS: list[tuple[str, str]] = [
      "gh-token-monitor (Hades persistence IOC)"),
 ]
 
-# ---- Hades/Miasma supply chain IOC — file path patterns ----------------------
-# Writing to these paths is the Hades import-hook / IDE-open-hook vector.
+# Hades/Miasma import-hook / IDE-open-hook write targets.
 SUPPLY_CHAIN_PATH_PATTERNS: list[tuple[str, str]] = [
     (r"(^|[/\\])__init__\.py$",
      "__init__.py write (Hades import-hook vector)"),
@@ -258,8 +216,7 @@ SUPPLY_CHAIN_PATH_PATTERNS: list[tuple[str, str]] = [
      "binding.gyp (Phantom Gyp / Miasma install-hook)"),
 ]
 
-# ---- Agent config file paths — extra scrutiny on writes ----------------------
-# Writes to these paths containing ANY injection pattern are always blocked.
+# Agent config files: a write containing ANY injection pattern is always blocked.
 AGENT_CONFIG_PATTERNS: list[str] = [
     r"(^|[/\\])(AGENTS|CLAUDE|CLAUDE\.local)\.md$",
     r"(^|[/\\])\.cursorrules$",
@@ -269,9 +226,7 @@ AGENT_CONFIG_PATTERNS: list[str] = [
     r"(^|[/\\])\.openclaw[/\\].+\.(md|yaml|yml|json)$",
 ]
 
-# ---- Prompt injection — HIGH confidence (explicit hijack attempts) ------------
-# Patterns that clearly indicate an attempt to override agent instructions.
-# Sources: OWASP LLM-01, Hades campaign analysis, known jailbreak corpora.
+# HIGH confidence: explicit hijack attempts (OWASP LLM-01, Hades analysis, jailbreak corpora).
 INJECTION_HIGH: list[tuple[str, str]] = [
     (r"(?i)\bIGNORE\s+(ALL\s+)?(PREVIOUS|PRIOR)\s+(INSTRUCTIONS?|RULES?|CONSTRAINTS?|DIRECTIVES?)\b",
      "explicit instruction override"),
@@ -305,8 +260,7 @@ INJECTION_HIGH: list[tuple[str, str]] = [
      "known jailbreak keyword"),
 ]
 
-# ---- Prompt injection — SUSPICIOUS (context-dependent, log + conditional block)
-# Lower confidence; alone only triggers a log. On agent config files, also blocks.
+# SUSPICIOUS: lower confidence; logs, blocks on agent config files.
 INJECTION_SUSPICIOUS: list[tuple[str, str]] = [
     (r"(?i)<!--\s*(claude|copilot|cursor|codex|cline|aider|gemini|tabby|continue|amazon[- ]?q|cody|bolt)\b",
      "HTML comment targeting AI coding assistant"),
@@ -328,8 +282,6 @@ INJECTION_SUSPICIOUS: list[tuple[str, str]] = [
      "explicit injection marker (honeypot)"),
 ]
 
-
-# ---- Audit log setup ----------------------------------------------------------
 LOG_DIR = Path(os.path.expanduser("~/.hermes/logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 _audit_log = LOG_DIR / "tool-audit.log"
@@ -347,8 +299,7 @@ def _rotate_if_needed() -> None:
     try:
         if _audit_log.exists() and _audit_log.stat().st_size > MAX_AUDIT_BYTES:
             content = _audit_log.read_bytes()
-            # Keep the tail: 2 MB, or half the threshold when that is smaller (a
-            # fixed 2 MB tail never shrank a log whose threshold is under 2 MB).
+            # Tail of 2 MB, or half the threshold if smaller (else a <2 MB threshold never shrinks).
             keep = min(2 * 1024 * 1024, max(1, MAX_AUDIT_BYTES // 2))
             _audit_log.write_bytes(content[-keep:])
     except Exception:
@@ -374,19 +325,17 @@ def _is_subagent(payload: dict) -> bool:
     return "subagent" in str(task_id).lower()
 
 
-# ---- Helpers for mutation tool inspection ------------------------------------
-
 def _extract_write_targets(tool_name: str, tool_input: dict) -> list[str]:
     """Extract file path(s) being written from a mutation tool call."""
     paths: list[str] = []
     if not tool_input:
         return paths
-    # Hermes write_file / patch; Claude Code Edit/Write tools use file_path
+    # Hermes: path; Claude Code: file_path
     for key in ("path", "file_path"):
         v = tool_input.get(key)
         if v and isinstance(v, str):
             paths.append(v)
-    # Serena tools use relative_path
+    # Serena
     rp = tool_input.get("relative_path")
     if rp and isinstance(rp, str):
         paths.append(rp)
@@ -397,23 +346,21 @@ def _extract_write_content(tool_name: str, tool_input: dict) -> str:
     """Extract the text being written by a mutation tool call."""
     if not tool_input:
         return ""
-    # write_file / serena create_text_file
     content = tool_input.get("content")
     if content and isinstance(content, str):
         return content
-    # patch new_string
     new_str = tool_input.get("new_string")
     if new_str and isinstance(new_str, str):
         return new_str
-    # serena replace_content repl
+    # serena replace_content
     repl = tool_input.get("repl")
     if repl and isinstance(repl, str):
         return repl
-    # serena replace_symbol_body / insert_* body
+    # serena replace_symbol_body / insert_*
     body = tool_input.get("body")
     if body and isinstance(body, str):
         return body
-    # MultiEdit: every edits[*].new_string is written
+    # MultiEdit
     edits = tool_input.get("edits")
     if isinstance(edits, list):
         return "\n".join(e["new_string"] for e in edits
@@ -441,11 +388,7 @@ def _is_agent_config_path(paths: list[str]) -> bool:
 
 
 def _check_injection_content(content: str) -> tuple[str | None, str | None]:
-    """
-    Scan content string for prompt injection patterns.
-    Returns (high_match_description, suspicious_match_description).
-    High tier is checked first; suspicious only checked if no high match.
-    """
+    """Return (high_description, suspicious_description); suspicious is only checked if no high match."""
     if not content:
         return None, None
 
@@ -486,11 +429,8 @@ def _check_supply_chain_terminal(tool_input: dict | None) -> str | None:
     return None
 
 
-# ---- Main hook logic ----------------------------------------------------------
-
-# The host that called the hook decides the wire format. Claude Code ignores a top-level
-# {"action":"block"}: a PreToolUse hook must print hookSpecificOutput.permissionDecision "deny"
-# (code.claude.com/docs/en/hooks). Hermes (event "pre_tool_call") reads the legacy shape.
+# Wire format follows the calling host. Claude Code ignores a top-level {"action":"block"};
+# PreToolUse needs hookSpecificOutput.permissionDecision "deny" (code.claude.com/docs/en/hooks).
 _HOST_EVENT = ""
 
 
@@ -527,21 +467,20 @@ def main() -> None:
     tool_input: dict | None = payload.get("tool_input")
     session_id: str = payload.get("session_id") or ""
 
-    # Tier 1 — grounding / read tools: silent pass-through
+    # Tier 1: read tools
     if tool_name in GROUNDING_TOOLS:
         sys.exit(0)
 
-    # Tier 2 — file mutation tools
+    # Tier 2: file mutation
     if tool_name in MUTATION_TOOLS:
         paths = _extract_write_targets(tool_name, tool_input or {})
         content = _extract_write_content(tool_name, tool_input or {})
         is_agent_cfg = _is_agent_config_path(paths)
 
-        # 2a — Supply chain path IOC
+        # 2a: supply chain path IOC
         sc_path = _check_supply_chain_path(paths)
         if sc_path:
             _audit(tool_name, tool_input, session_id, f"WARN(supply-chain-path:{sc_path})")
-            # Block if BLOCK_MODE OR if it's also an agent config file (always dangerous)
             if BLOCK_MODE or is_agent_cfg:
                 _emit_block({
                     "action": "block",
@@ -552,12 +491,11 @@ def main() -> None:
                 })
                 return
 
-        # 2b — Prompt injection content scan
+        # 2b: injection content scan
         high_injection, suspicious_injection = _check_injection_content(content)
 
         if high_injection:
             _audit(tool_name, tool_input, session_id, f"INJECTION-HIGH({high_injection}) paths={paths}")
-            # Always block on agent config files; block in BLOCK_MODE for any file
             if BLOCK_MODE or is_agent_cfg:
                 _emit_block({
                     "action": "block",
@@ -573,7 +511,6 @@ def main() -> None:
         elif suspicious_injection:
             _audit(tool_name, tool_input, session_id,
                    f"INJECTION-SUSPICIOUS({suspicious_injection}) paths={paths}")
-            # Suspicious + agent config = always block
             if is_agent_cfg:
                 _emit_block({
                     "action": "block",
@@ -584,7 +521,6 @@ def main() -> None:
                     ),
                 })
                 return
-            # Suspicious + BLOCK_MODE = block
             if BLOCK_MODE:
                 _emit_block({
                     "action": "block",
@@ -595,12 +531,7 @@ def main() -> None:
                     ),
                 })
                 return
-            # Neither agent-config nor BLOCK_MODE forced a decision yet, so this
-            # SUSPICIOUS hit would otherwise just be logged and silently allowed --
-            # the exact gap a single low-confidence regex cue can't resolve on its
-            # own. Ask granite3-guardian for a semantic second opinion before
-            # letting it through; None (unreachable/timeout/malformed) fails open
-            # and preserves today's log-only behavior unchanged.
+            # Otherwise log-only: get a Guardian second opinion; None fails open.
             guardian_verdict = _guardian_confirms_injection(content)
             if guardian_verdict is True:
                 _audit(tool_name, tool_input, session_id,
@@ -619,7 +550,7 @@ def main() -> None:
                    f"INJECTION-GUARDIAN-CLEARED-OR-UNAVAILABLE({suspicious_injection}) "
                    f"verdict={guardian_verdict} paths={paths}")
 
-        # 2c — Standard mutation grounding block
+        # 2c: mutation grounding block
         if BLOCK_MODE:
             _audit(tool_name, tool_input, session_id, "BLOCKED(mutation)")
             _emit_block({
@@ -635,9 +566,9 @@ def main() -> None:
         _audit(tool_name, tool_input, session_id, "ALLOW(mutation)")
         sys.exit(0)
 
-    # Tier 3 — terminal/Bash: supply chain IOCs + dangerous patterns
+    # Tier 3: terminal/Bash
     if tool_name in ("terminal", "Bash"):
-        # 3a — Supply chain IOC (Hades/Miasma) — always audited, blocked in BLOCK_MODE
+        # 3a: supply chain IOC, always audited
         sc_terminal = _check_supply_chain_terminal(tool_input)
         if sc_terminal:
             _audit(tool_name, tool_input, session_id, f"WARN(supply-chain:{sc_terminal})")
@@ -652,7 +583,7 @@ def main() -> None:
                 })
                 return
 
-        # 3b — General dangerous patterns
+        # 3b: dangerous patterns
         danger = _check_dangerous_terminal(tool_input)
         if danger:
             if BLOCK_MODE and not _is_subagent(payload):
@@ -672,7 +603,7 @@ def main() -> None:
 
         sys.exit(0)
 
-    # Tier 4 — everything else: audit with ALLOW
+    # Tier 4: everything else
     _audit(tool_name, tool_input, session_id, "ALLOW")
     sys.exit(0)
 

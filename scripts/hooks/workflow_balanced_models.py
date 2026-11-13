@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""PreToolUse gate: a workflow script must spread work across models and efforts.
+"""PreToolUse gate: a Workflow script must use balanced models and efforts.
 
-Operator standing rule: every workflow, always, uses balanced models and efforts. Memory cannot
-enforce that -- it is guidance to the assistant, which forgets. This runs in the harness, so it
-holds whether or not the model remembers.
+Passes when the script sets `model:` with at least TWO DISTINCT literal values and sets
+`effort:` at least once. Enforced in the harness because memory/guidance is forgotten.
 
-Passes when the script sets `model:` on agent() calls with at least TWO DISTINCT values and sets
-`effort:` at least once. Uniform model+effort across a fan-out wastes the cheap tiers on trivial
-stages and the expensive ones on stages that do not need them.
-
-Fails OPEN by design: anything it cannot inspect (a saved workflow by `name`, a `scriptPath` on
-disk, malformed stdin) is allowed through. A gate that blocks work it cannot read would make the
-Workflow tool unusable the first time it saw an input shape nobody anticipated.
+Fails OPEN: anything it cannot inspect (saved workflow by `name`, unreadable scriptPath,
+malformed stdin) is allowed through.
 """
 import json
 import re
@@ -26,7 +20,7 @@ _EFFORT_ANY = re.compile(r"\beffort\s*:")
 
 
 def verdict(script):
-    """-> (ok, reason). Pure, so the rule is testable without the harness."""
+    """-> (ok, reason). Pure, testable without the harness."""
     if not script:
         return True, "nothing to inspect"
 
@@ -39,8 +33,7 @@ def verdict(script):
         if not has_model_key:
             problems.append("no `model:` on any agent() call -- every agent inherits one tier")
         else:
-            # model: is present but indirect (model: l.model) or all one value. A table of
-            # per-lens models is the normal shape, so say what is missing rather than guess.
+            # model: present but indirect (model: l.model) or a single value.
             seen = ", ".join(sorted(literals)) if literals else "none as literals"
             problems.append(
                 "fewer than %d distinct model literals (found: %s). If models come from a lens "
@@ -68,9 +61,7 @@ def main():
     tool_input = payload.get("tool_input") or {}
     script = tool_input.get("script")
     if not script:
-        # scriptPath IS readable, and the Workflow tool recommends it for
-        # iteration — so the rule was unenforceable through its most common
-        # invocation path. A saved workflow by `name` still fails open.
+        # scriptPath is readable and the common invocation path; `name` alone fails open.
         path = tool_input.get("scriptPath")
         if path:
             try:

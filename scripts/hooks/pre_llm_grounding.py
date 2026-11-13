@@ -1,35 +1,11 @@
 #!/usr/bin/env python3
-"""
-pre_llm_call hook — multi-collection Qdrant grounding (v3)
+"""pre_llm_call / UserPromptSubmit / SubagentStart hook: Qdrant recall grounding.
 
-Architecture:
-  1. Extract intent from user message
-  2. Embed via nomic-embed-text on Ollama (70ms warm)
-  3. Fan-out parallel Qdrant searches across all 768-dim collections (~30ms)
-  4. Merge + rank by score * importance, deduplicate, truncate
-  5. Inject MEMORY MATCH block into context
-
-Collections searched per turn:
-  mnemosyne         (198 pts)   — personal facts, preferences, project notes
-  loci_sessions   (126 pts)   — past conversation history
-  loci_memory     (89 pts)    — investigation notes, research findings
-  ecc_skills        (262 pts)   — skill library knowledge
-  agent_core_chunks (3.09M pts) — great-library KB (DAMA, infra, code, telemetry)
-  dama_gotchi_code  (24.9k pts) — DAMA codebase search
-  prometheus_dama_code (2,605 pts) — prometheus DAMA codebase
-
-Benchmarks (vs v2 BeamMemory):
-  v2 (BeamMemory / SQLite):  ~1500ms per turn
-  v3 (this hook):            ~100ms per turn (70ms embed + 30ms parallel Qdrant)
-
-v3 changes vs v2:
-  - Removes BeamMemory / SQLite dependency entirely — pure Qdrant path
-  - Embeds via Ollama directly (nomic-embed-text, same model used everywhere)
-  - Fan-out to all 768-dim collections in a single parallel sweep
-  - Score fusion: Qdrant cosine score * importance weight (where available)
-  - FTS fallback: if Ollama is down, falls back to BeamMemory (v2 path)
-  - Rules index injection preserved from v2
-  - Subagent skip, min-length guard preserved from v2
+Embeds the prompt, searches the configured Qdrant collections in parallel,
+ranks and injects a MEMORY MATCH block plus a rules index.
+Env: QDRANT_URL, QDRANT_API_KEY, OLLAMA_BASE_URL / MNEMOSYNE_EMBEDDING_API_URL,
+GROUNDING_EXTRA_COLLECTIONS, GROUNDING_DIRECTIVE, HOOK_* tuning knobs.
+Fail-open: embed/Qdrant outages degrade to BeamMemory, then to a warning + directive.
 """
 from __future__ import annotations
 
@@ -45,8 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-# Accept the legacy HERMES_* spelling. Deployed copies sit in ~/.claude/hooks
-# next to legacy_env.py; the repo copy finds it as a sibling too.
+# Accept legacy HERMES_* env names (legacy_env.py is a sibling in both layouts).
 try:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from legacy_env import apply as _apply_legacy_env
@@ -70,8 +45,7 @@ except Exception:
 SA_ENABLED    = os.environ.get("HOOK_SA_ENABLED", "true").lower() not in ("false", "0", "no")
 SA_TIMEOUT_MS = float(os.environ.get("HOOK_SA_TIMEOUT_MS", "25"))  # skip if SA takes > 25ms
 
-# ── env ──────────────────────────────────────────────────────────────────────
-_HERMES_HOME    = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+_HERMES_HOME   = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 _HERMES_PROFILE = os.environ.get("HERMES_PROFILE", "")
 _PROFILE_DIR    = (os.path.join(_HERMES_HOME, "profiles", _HERMES_PROFILE)
                    if _HERMES_PROFILE else _HERMES_HOME)
@@ -84,13 +58,10 @@ if os.path.exists(_ENV_FILE):
                 _k, _, _v = _line.partition("=")
                 os.environ.setdefault(_k.strip(), _v.strip())
 
-# ── constants ─────────────────────────────────────────────────────────────────
-QDRANT_URL   = os.environ.get("QDRANT_URL")
+QDRANT_URL  = os.environ.get("QDRANT_URL")
 QDRANT_KEY   = os.environ.get("QDRANT_API_KEY", "")
 def _embed_base_url() -> Optional[str]:
-    """OpenAI-compatible embeddings base. OLLAMA_BASE_URL is a bare host and needs
-    /v1; MNEMOSYNE_EMBEDDING_API_URL (what the Hermes profile actually sets) is
-    already a full /v1 endpoint."""
+    """OLLAMA_BASE_URL is a bare host (needs /v1); MNEMOSYNE_EMBEDDING_API_URL is already a full /v1 endpoint."""
     base = os.environ.get("OLLAMA_BASE_URL")
     if base:
         return f"{base.rstrip('/')}/v1"
@@ -109,7 +80,7 @@ RULES_DIR    = os.environ.get("HOOK_RULES_DIR",
 RECALL_TOP_K      = int(os.environ.get("HOOK_RECALL_TOP_K",          "3"))
 MIN_IMPORTANCE    = float(os.environ.get("HOOK_RECALL_MIN_IMPORTANCE", "0.2"))
 MIN_SCORE         = float(os.environ.get("HOOK_RECALL_MIN_SCORE",      "0.55"))
-# Every named collection on this instance uses "dense"; overridable if that changes.
+# Every named collection here uses "dense".
 VECTOR_NAME       = os.environ.get("HOOK_RECALL_VECTOR_NAME",    "dense")
 MAX_CONTENT_CHARS = int(os.environ.get("HOOK_RECALL_MAX_CHARS",        "200"))
 RULES_MAX_CHARS   = int(os.environ.get("HOOK_RULES_MAX_CHARS",         "1200"))
@@ -122,12 +93,12 @@ RANKER_W_RELEVANCE = float(os.environ.get("HOOK_RANKER_W_RELEVANCE", "0.50"))
 RANKER_W_RECENCY   = float(os.environ.get("HOOK_RANKER_W_RECENCY",   "0.20"))
 RANKER_W_TRUST     = float(os.environ.get("HOOK_RANKER_W_TRUST",     "0.15"))
 RANKER_W_TYPE      = float(os.environ.get("HOOK_RANKER_W_TYPE",      "0.15"))
-# Half-life for recency decay (days). 7 = a week-old finding scores 0.5 on recency.
+# Recency half-life in days.
 RECENCY_HALFLIFE_DAYS = float(os.environ.get("HOOK_RECENCY_HALFLIFE_DAYS", "7"))
 # MMR lambda: 1.0 = pure relevance, 0.0 = pure diversity.
 MMR_LAMBDA = float(os.environ.get("HOOK_MMR_LAMBDA", "0.75"))
 
-# Stigmergic recall: retrieval deposits pheromone, timestamp decay prevents monoculture lock-in.
+# Stigmergic recall: retrieval deposits pheromone; decay prevents lock-in.
 PHERO_BETA         = float(os.environ.get("HOOK_PHERO_BETA",        "0.08"))  # score boost coefficient
 PHERO_HALFLIFE_H   = float(os.environ.get("HOOK_PHERO_HALFLIFE_H",  "24"))    # pheromone half-life in hours
 PHERO_DEPOSIT      = float(os.environ.get("HOOK_PHERO_DEPOSIT",     "1.0"))   # amount deposited per retrieval
@@ -145,9 +116,8 @@ _DEFAULT_EXTRA_FIELDS = ("text", None, True)
 _BASE_COLLECTIONS = [
     ("mnemosyne",       "content",         "importance", True),
     ("loci_sessions", "content_preview", None,         True),
-    # numeric_confidence, not confidence: the producer writes BOTH — a float
-    # here and the 'high'/'medium'/'low' label that _multi_signal_score reads.
-    # float()ing the label raised, losing this lane on every prompt.
+    # numeric_confidence, not confidence: the latter is a 'high'/'medium'/'low'
+    # label (read by _multi_signal_score); float()ing it raised on every prompt.
     ("loci_memory",   "text",            "numeric_confidence", True),
 ]
 _extra_names = [
@@ -176,8 +146,6 @@ NAVIGATION_SLASH_COMMANDS: frozenset[str] = frozenset({
 })
 
 
-# ── embedding ─────────────────────────────────────────────────────────────────
-
 def _embed_headers() -> dict:
     h = {"Content-Type": "application/json"}
     if _EMBED_API_KEY:
@@ -191,8 +159,7 @@ def _embed_headers() -> dict:
 
 
 def _embed(text: str) -> Optional[list[float]]:
-    """Get embedding vector via OpenAI-compat /v1/embeddings endpoint.
-    Works with Ollama (no auth) and cloud providers (set EMBED_API_KEY)."""
+    """Embed via OpenAI-compat /v1/embeddings; None on any failure."""
     if not OLLAMA_URL:
         return None
     url = f"{OLLAMA_URL.rstrip('/')}/embeddings"
@@ -206,13 +173,9 @@ def _embed(text: str) -> Optional[list[float]]:
         return None
 
 
-# ── Qdrant search ─────────────────────────────────────────────────────────────
-
 class _SearchFailed(Exception):
-    """One collection's search did not complete. Raised so the fan-out can tell
-    'nothing matched' apart from 'every request failed' — the wrong named-vector
-    request shape returned an empty list from all three base collections for
-    months, and an empty list is what a genuinely unmatched query looks like."""
+    """A collection search failed. Raised (not []) so an outage is distinguishable
+    from 'nothing matched': a wrong named-vector shape once returned [] silently for months."""
 
 
 def _search_collection(
@@ -223,7 +186,7 @@ def _search_collection(
     named_vec: bool,
     top_k: int = 5,
 ) -> list[dict]:
-    """Search one Qdrant collection, return normalised hit dicts."""
+    """Search one collection; raises _SearchFailed on transport/HTTP error."""
     url = f"{QDRANT_URL}/collections/{collection}/points/search"
     vec_payload = {"name": VECTOR_NAME, "vector": vector} if named_vec else vector
     body = json.dumps({
@@ -264,7 +227,7 @@ def _search_collection(
             if importance_field else 0.5
         hits.append({
             "collection": collection,
-            "point_id": pt.get("id"),   # needed for pheromone deposit
+            "point_id": pt.get("id"),
             "score": score,
             "importance": importance,
             "fused": score * importance,
@@ -274,10 +237,8 @@ def _search_collection(
     return hits
 
 
-# ── BeamMemory fallback ───────────────────────────────────────────────────────
-
 def _beam_fallback(query: str) -> list[dict]:
-    """v2 BeamMemory path — used only when Ollama is unreachable."""
+    """BeamMemory recall, used only when embedding or every Qdrant search failed."""
     MNEMOSYNE_ROOT = os.path.expanduser("~/.hermes/mnemosyne")
     HERMES_VENV_SITE = os.path.expanduser(
         "~/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
@@ -309,8 +270,6 @@ def _beam_fallback(query: str) -> list[dict]:
     except Exception:
         return []
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _load_rules_summary() -> str:
     rules_dir = Path(RULES_DIR)
@@ -345,7 +304,7 @@ _LN2 = math.log(2)
 
 
 def _multi_signal_score(hit: dict, now_ts: float) -> float:
-    """Score a hit on four axes plus stigmergic pheromone boost."""
+    """Relevance, recency, trust and type, plus a pheromone boost."""
     payload = hit.get("payload") or {}
 
     relevance = (hit["fused"] if "fused" in hit
@@ -369,19 +328,14 @@ def _multi_signal_score(hit: dict, now_ts: float) -> float:
             + RANKER_W_TRUST   * trust
             + RANKER_W_TYPE    * type_w)
 
-    # Prior use is a mild advantage; evaporation keeps cold paths from permanent suppression.
     phero = _effective_pheromone(payload, now_ts)
     return base + PHERO_BETA * math.log1p(phero)
 
 
 def _mmr_select(hits: list[dict], top_k: int) -> list[dict]:
-    """Maximal Marginal Relevance selection with ε-exploration.
-
-    Uses token-overlap as a cheap text-similarity proxy (no re-embedding).
-    ε-exploration: with probability PHERO_EPSILON, the final slot is filled
-    with a random non-selected hit rather than the MMR winner — prevents
-    pheromone-reinforced recall from locking into the same top-K forever.
-    """
+    """MMR selection (token-overlap similarity, no re-embedding). With probability
+    PHERO_EPSILON the last slot is a random hit, so pheromone reinforcement
+    cannot lock recall into one top-K."""
     import random as _random
 
     if len(hits) <= top_k:
@@ -397,7 +351,6 @@ def _mmr_select(hits: list[dict], top_k: int) -> list[dict]:
     selected: list[dict] = []
     remaining = list(hits)
     while remaining and len(selected) < top_k:
-        # ε-exploration on the last slot: occasionally surface a cold hit.
         if (len(selected) == top_k - 1
                 and len(remaining) > 1
                 and _random.random() < PHERO_EPSILON):
@@ -416,7 +369,7 @@ def _mmr_select(hits: list[dict], top_k: int) -> list[dict]:
 
 
 def _effective_pheromone(payload: dict, now_ts: float) -> float:
-    """Pheromone after exponential evaporation since last reinforcement."""
+    """Pheromone after exponential decay since last reinforcement."""
     stored = float(payload.get("pheromone", 0.0) or 0.0)
     if stored <= 0.0:
         return 0.0
@@ -428,7 +381,7 @@ def _effective_pheromone(payload: dict, now_ts: float) -> float:
 
 
 def _pheromone_deposit(collection: str, point_id, current_phero: float, now_ts: float) -> None:
-    """Bump pheromone on a retrieved point via Qdrant set_payload. Fire-and-forget."""
+    """Bump pheromone on a retrieved point via set_payload; best-effort."""
     if not point_id:
         return
     new_phero = current_phero + PHERO_DEPOSIT
@@ -448,7 +401,7 @@ def _pheromone_deposit(collection: str, point_id, current_phero: float, now_ts: 
     try:
         urllib.request.urlopen(req, timeout=0.5).close()
     except Exception:
-        pass  # pheromone deposit is always best-effort
+        pass
 
 
 def _extract_intent(prompt: str) -> str:
@@ -490,12 +443,9 @@ def _clean_content(content: str) -> str:
 
 def _format_results(hits: list[dict], query: str, used_fallback: bool,
                     unreachable: int = 0, searched: int | None = None) -> str:
-    """Render the recall block. ``unreachable`` is the number of collections whose
-    search failed this turn; the header states real coverage, because the model is
-    asked to trust it as "this is what memory holds". ``searched`` overrides
-    len(COLLECTIONS) for a caller that queries a subset — the subagent path below
-    searches loci_memory only, and claiming all of COLLECTIONS answered is the same
-    kind of over-statement as hiding an outage."""
+    """Render the recall block. The header states real coverage (``unreachable``
+    failed collections) because the model trusts it as "what memory holds".
+    ``searched`` overrides len(COLLECTIONS) for subset callers (the subagent path)."""
     lines = []
     seen = set()
     for h in hits:
@@ -535,19 +485,16 @@ def _format_results(hits: list[dict], query: str, used_fallback: bool,
     return f"{header}\n{body}\n{footer}"
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
-
-# The host that called the hook decides the wire format. Claude Code reads only
-# hookSpecificOutput.additionalContext for UserPromptSubmit and SubagentStart (a top-level "context"
-# is ignored, and plain stdout does not inject for these events; max 10,000 chars per string).
-# Hermes ("pre_llm_call") reads the legacy {"context": ...}.
+# Wire format depends on the calling host. Claude Code reads only
+# hookSpecificOutput.additionalContext for UserPromptSubmit/SubagentStart (top-level
+# "context" and plain stdout are ignored; 10,000-char cap). Hermes reads {"context": ...}.
 _HOST_EVENT = ""
 _CLAUDE_CONTEXT_EVENTS = ("UserPromptSubmit", "SubagentStart")
 _CLAUDE_CONTEXT_MAX = 9500
 
 
 def _emit_context(context: str) -> None:
-    """Print the context block in the format of the host that invoked this hook."""
+    """Print the context block in the invoking host's format."""
     if _HOST_EVENT in _CLAUDE_CONTEXT_EVENTS:
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": _HOST_EVENT,
@@ -576,7 +523,7 @@ def main() -> None:
 
     extra = payload.get("extra") or {}
 
-    # Lightweight path, NOT a skip: exiting here leaves every workflow subagent ungrounded.
+    # Lightweight path, not a skip: skipping would leave workflow subagents ungrounded.
     task_id = extra.get("task_id") or payload.get("session_id") or ""
     is_subagent = "subagent" in task_id.lower() or bool(os.environ.get("HERMES_SUBAGENT"))
 
@@ -597,8 +544,7 @@ def main() -> None:
     # No length guard: "fix the bug" is 13 chars and still needs grounding.
     intent = _extract_intent(msg_stripped)
 
-    # ── Lightweight subagent path ─────────────────────────────────────────────
-    # loci_memory only: the collection most relevant to code generation mid-investigation.
+    # Subagents search loci_memory only (most relevant mid-investigation).
     if is_subagent:
         sub_hits: list[dict] = []
         sub_used_fallback = False
@@ -640,7 +586,6 @@ def main() -> None:
         _emit_context(context)
         return
 
-    # ── v3: embed → parallel Qdrant fan-out (main session) ───────────────────
     vector = _embed(intent)
     used_fallback = False
     failed = 0
@@ -691,11 +636,8 @@ def main() -> None:
             h["_ms_score"] = _multi_signal_score(h, _now_ts)
         hits = sorted(hits, key=lambda h: h["_ms_score"], reverse=True)
 
-        # ── Optional spreading activation enrichment ──────────────────────
-        # SA discovers associatively-linked memories that vector search missed.
-        # Its hits join the candidate pool BEFORE the top-K selection below;
-        # appended after it, _format_results cut them off whenever the vector
-        # search had already filled RECALL_TOP_K slots.
+        # Spreading activation adds associatively-linked memories. It must join the
+        # pool BEFORE top-K selection, or a full vector result set cuts it off.
         if SA_ENABLED and _SA_MODULE is not None:
             try:
                 import time as _time
@@ -737,7 +679,7 @@ def main() -> None:
 
         hits = _mmr_select(hits, RECALL_TOP_K)
 
-        # Only loci_memory points have mutable payloads we own; fire-and-forget.
+        # Only loci_memory payloads are ours to mutate.
         for _h in hits:
             if _h.get("collection") in ("loci_memory",) and _h.get("point_id"):
                 _phero_now = _now_ts
@@ -747,8 +689,7 @@ def main() -> None:
     if hits:
         recall_block = _format_results(hits, intent, used_fallback, failed)
     elif failed:
-        # Nothing came back AND part of memory was dark: an empty result is what a
-        # genuine miss looks like too, so say which one this was.
+        # Empty because part of memory was dark, not a genuine miss: say so.
         recall_block = (
             f"[WARNING: memory grounding INCOMPLETE this turn — {failed} of "
             f"{len(COLLECTIONS)} Qdrant collections were unreachable and no result "
