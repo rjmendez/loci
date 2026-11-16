@@ -8722,13 +8722,15 @@ def _gen_residency(url: str, model: str) -> dict | None:
 
 
 def _command_lane_served(names: list) -> list:
-    """Expected tmux companions that a configured, healthy command offload lane serves instead."""
+    """Expected tmux companions served instead by a command lane whose last health result is good.
+
+    Reads the lane cache only; loci_health never runs the lane command."""
     served = []
     for n in names:
         try:
             import offload_lane
             lane = offload_lane.lane_for(n)
-            if lane is not None and offload_lane.available(n, lane):
+            if lane is not None and offload_lane.last_known(n, lane) is True:
                 served.append(n)
         except Exception:
             continue

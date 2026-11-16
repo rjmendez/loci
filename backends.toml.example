@@ -77,7 +77,9 @@
 # allow_cloud = false                   # false: --local-only is always passed, nothing goes to GitHub
 # health_timeout_s = 30                 # `health` must exit 0 within this; result cached cache_ttl_s
 # timeout_s = 180                       # hard cap for one ask
-# cache_ttl_s = 60
+# cache_ttl_s = 60                      # both outcomes of the health probe are cached this long
+# ask_args = ["--no-loci"]              # extra args after `ask --prompt -`; keep a lane prompt from looping back into Loci
+# env_passthrough = []                  # env vars the command may see; the rest of the environment (tokens, API keys) is dropped
 # max_chars = 20000                     # cap on the text returned
 
 [rerank]

@@ -22,13 +22,6 @@ import server  # noqa: E402
 CMD = ["tool-bin", "offload.py"]
 
 
-class _Proc:
-    def __init__(self, returncode=0, stdout=""):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = ""
-
-
 class _Runner:
     """Records every subprocess call; replies per subcommand."""
 
@@ -39,19 +32,21 @@ class _Runner:
         self.ask_out = "hello"
         self.ask_exc = None
         self.health_exc = None
+        self.envs = []
 
-    def __call__(self, cmd, **kw):
-        self.calls.append({"cmd": list(cmd), "input": kw.get("input"), "timeout": kw.get("timeout")})
+    def __call__(self, cmd, input, timeout, env):
+        self.calls.append({"cmd": list(cmd), "input": input, "timeout": timeout, "env": env})
+        self.envs.append(env)
         if cmd[-1] == "health":
             if self.health_exc:
                 raise self.health_exc
-            return _Proc(self.health)
+            return self.health, ""
         if self.ask_exc:
             raise self.ask_exc
-        return _Proc(self.ask_rc, self.ask_out)
+        return self.ask_rc, self.ask_out
 
     def asks(self):
-        return [c for c in self.calls if "ask" in c["cmd"]]
+        return [{k: c[k] for k in ("cmd", "input", "timeout")} for c in self.calls if "ask" in c["cmd"]]
 
     def healths(self):
         return [c for c in self.calls if c["cmd"][-1] == "health"]
@@ -124,6 +119,7 @@ def test_offload_lane_defaults(monkeypatch):
     assert backends.offload_lane("copilot") == {
         "command": CMD, "allow_cloud": False, "health_timeout_s": 30.0,
         "timeout_s": 180.0, "cache_ttl_s": 60.0, "max_chars": 20000,
+        "ask_args": [], "env_passthrough": [],
     }
 
 
@@ -150,7 +146,8 @@ def test_available_true_when_health_exits_zero(env):
     runner, _ = env
     lane = backends.offload_lane("copilot")
     assert offload_lane.available("copilot", lane) is True
-    assert runner.calls == [{"cmd": CMD + ["health"], "input": None, "timeout": 30.0}]
+    assert [{k: c[k] for k in ("cmd", "input", "timeout")} for c in runner.calls] == [
+        {"cmd": CMD + ["health"], "input": None, "timeout": 30.0}]
 
 
 def test_available_false_when_health_nonzero_or_raises(env):
@@ -307,7 +304,7 @@ def test_json_fmt_invalid_reply_falls_back(env, monkeypatch):
 def test_json_fmt_valid_reply_is_served(env, monkeypatch):
     runner, _ = env
     posts = _fake_ollama(monkeypatch)
-    runner.ask_out = '{"a": 1}'
+    runner.ask_out = json.dumps({"answer": '{"a": 1}'})
     r = L.generate("p", role="triage", fmt="json")
     assert (r["text"], r["tier"], posts) == ('{"a": 1}', "command-lane", [])
 
@@ -344,7 +341,11 @@ def _health(monkeypatch, required):
 
 
 def test_health_healthy_lane_replaces_missing_copilot(env, monkeypatch):
+    runner, _ = env
+    offload_lane.available("copilot", backends.offload_lane("copilot"))  # a dispatch warmed the cache
+    runner.calls.clear()
     out = _health(monkeypatch, required=True)
+    assert runner.calls == []
     assert out["status"] == "ok"
     assert out["tmux_companion_command_lanes"] == ["copilot"]
     assert "tmux_companion_missing" not in out
@@ -353,7 +354,10 @@ def test_health_healthy_lane_replaces_missing_copilot(env, monkeypatch):
 def test_health_unhealthy_lane_still_reports_missing(env, monkeypatch):
     runner, _ = env
     runner.health = 1
+    offload_lane.available("copilot", backends.offload_lane("copilot"))
+    runner.calls.clear()
     out = _health(monkeypatch, required=True)
+    assert runner.calls == []
     assert out["status"] == "unhealthy"
     assert out["tmux_companion_missing"] == ["copilot"]
     assert "tmux_companion_command_lanes" not in out
@@ -364,3 +368,212 @@ def test_health_without_lane_config_unchanged(env, monkeypatch):
     out = _health(monkeypatch, required=False)
     assert out["tmux_companion_optional_down"] == ["copilot"]
     assert out["tmux_companion_missing"] == ["copilot"]
+
+
+def test_health_never_runs_the_command_when_cache_is_cold(env, monkeypatch):
+    runner, _ = env
+    out = _health(monkeypatch, required=True)
+    assert runner.calls == []
+    assert out["status"] == "unhealthy"
+    assert out["tmux_companion_missing"] == ["copilot"]
+
+
+def test_last_known_expires_after_five_ttls(env):
+    _, clock = env
+    lane = backends.offload_lane("copilot")
+    offload_lane.available("copilot", lane)
+    clock.t += 299
+    assert offload_lane.last_known("copilot", lane) is True
+    clock.t += 2
+    assert offload_lane.last_known("copilot", lane) is None
+
+
+# --- negative cache, concurrency, timestamp after probe ----------------------
+
+def test_failed_probe_cached_for_ttl_then_rerun(env):
+    runner, clock = env
+    lane = backends.offload_lane("copilot")
+    runner.health = 1
+    assert offload_lane.available("copilot", lane) is False
+    clock.t += 30
+    assert offload_lane.available("copilot", lane) is False
+    assert len(runner.healths()) == 1
+    clock.t += 31  # positive twin: past the TTL it probes again and sees the recovery
+    runner.health = 0
+    assert offload_lane.available("copilot", lane) is True
+    assert len(runner.healths()) == 2
+
+
+def test_cache_stamped_after_probe_not_before(env):
+    runner, clock = env
+    lane = backends.offload_lane("copilot")
+    real = runner.__call__
+
+    def slow(cmd, input, timeout, env):
+        clock.t += 50  # the probe itself takes 50 s
+        return real(cmd, input, timeout, env)
+    offload_lane._run = slow
+    offload_lane.available("copilot", lane)
+    clock.t += 59  # 59 s after the probe finished: still cached
+    offload_lane.available("copilot", lane)
+    assert len(runner.healths()) == 1
+
+
+def test_concurrent_available_spawns_one_probe(env):
+    import threading
+    runner, _ = env
+    lane = backends.offload_lane("copilot")
+    gate = threading.Event()
+    started = []
+    real = runner.__call__
+
+    def blocking(cmd, input, timeout, env):
+        started.append(1)
+        gate.wait(5)
+        return real(cmd, input, timeout, env)
+    offload_lane._run = blocking
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(offload_lane.available("copilot", lane)))
+               for _ in range(8)]
+    for t in threads:
+        t.start()
+    while not started:
+        pass
+    gate.set()
+    for t in threads:
+        t.join(10)
+    assert results == [True] * 8
+    assert len(runner.healths()) == 1
+
+
+# --- _answer ----------------------------------------------------------------
+
+def test_json_without_answer_is_not_served(env):
+    runner, _ = env
+    lane = backends.offload_lane("copilot")
+    runner.ask_out = json.dumps({"error": "refused: prompt contains private key block"})
+    assert offload_lane.ask(lane, "p") == {
+        "ok": False, "text": "", "why": "command lane reply had no answer: refused: prompt contains private key block"}
+    runner.ask_out = json.dumps({"answer": "fine"})  # positive twin
+    assert offload_lane.ask(lane, "p") == {"ok": True, "text": "fine", "why": ""}
+
+
+def test_json_without_answer_falls_back_in_generate(env, monkeypatch):
+    runner, _ = env
+    posts = _fake_ollama(monkeypatch)
+    runner.ask_out = json.dumps({"error": "boom"})
+    r = L.generate("p", role="triage")
+    assert len(posts) == 1
+    assert (r["text"], r["model"]) == ("ollama", "qwen2.5:3b")
+
+
+# --- environment + ask_args ---------------------------------------------------
+
+def test_child_env_drops_secrets_keeps_allowlist_and_passthrough(monkeypatch):
+    monkeypatch.setenv("LOCI_TOKEN", "s1")
+    monkeypatch.setenv("OPENAI_API_KEY", "s2")
+    monkeypatch.setenv("OFFLOAD_ROUTER_URL", "http://r")
+    monkeypatch.setenv("MY_PASS", "p1")
+    monkeypatch.setenv("PATH", "/bin")
+    base = {"env_passthrough": []}
+    env = offload_lane.child_env(base)
+    assert "LOCI_TOKEN" not in env and "OPENAI_API_KEY" not in env and "MY_PASS" not in env
+    assert env["OFFLOAD_ROUTER_URL"] == "http://r"
+    assert env["PATH"] == "/bin"
+    env = offload_lane.child_env({"env_passthrough": ["my_pass"]})
+    assert env["MY_PASS"] == "p1"
+    assert "LOCI_TOKEN" not in env
+
+
+def test_runner_receives_filtered_env_and_ask_args(env, monkeypatch):
+    runner, _ = env
+    monkeypatch.setenv("LOCI_TOKEN", "s1")
+    _set_lane(monkeypatch, ask_args=["--no-loci"])
+    L.generate("p", role="triage")
+    assert "LOCI_TOKEN" not in runner.envs[-1]
+    assert runner.asks()[0]["cmd"] == CMD + ["ask", "--prompt", "-", "--no-loci", "--local-only"]
+
+
+# --- real subprocesses ------------------------------------------------------------
+
+_FAKE_TOOL = r"""
+import json, os, subprocess, sys, time
+cmd = sys.argv[1]
+if cmd == "health":
+    sys.exit(0)
+if "--prompt" in sys.argv and sys.argv[sys.argv.index("--prompt") + 1] == "-":
+    prompt = sys.stdin.read()
+mode = os.environ.get("FAKE_MODE", "env")
+if mode == "hang":
+    g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(25)"])
+    open(os.environ["FAKE_PIDFILE"], "w").write(str(g.pid))
+    time.sleep(25)
+print(json.dumps({"answer": json.dumps({
+    "token": os.environ.get("LOCI_TOKEN"), "pass": os.environ.get("MY_PASS"),
+    "prompt": prompt, "argv": sys.argv[1:]})}))
+"""
+
+
+def _alive(pid):
+    if sys.platform == "win32":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True).stdout
+        return str(pid) in out
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+@pytest.fixture
+def real(monkeypatch, tmp_path):
+    script = tmp_path / "fake_tool.py"
+    script.write_text(_FAKE_TOOL, encoding="utf-8")
+    offload_lane.reset_cache()
+    monkeypatch.setattr(offload_lane, "_run", offload_lane._exec)
+    monkeypatch.setattr(offload_lane, "_clock", __import__("time").monotonic)
+    monkeypatch.setenv("FAKE_PIDFILE", str(tmp_path / "pid"))
+    lane = {"command": [sys.executable, str(script)], "allow_cloud": False, "health_timeout_s": 10.0,
+            "timeout_s": 3.0, "cache_ttl_s": 60.0, "max_chars": 20000, "ask_args": [], "env_passthrough": []}
+    yield lane, tmp_path
+    offload_lane.reset_cache()
+
+
+def test_real_child_sees_prompt_and_argv_but_not_secrets(real, monkeypatch):
+    lane, _ = real
+    monkeypatch.setenv("LOCI_TOKEN", "topsecret")
+    monkeypatch.setenv("MY_PASS", "passme")
+    monkeypatch.setenv("FAKE_MODE", "env")  # FAKE_MODE is not allow-listed: child defaults to "env" too
+    lane["env_passthrough"] = ["MY_PASS"]
+    res = offload_lane.ask(lane, "hello there")
+    assert res["ok"] is True
+    seen = json.loads(res["text"])
+    assert seen == {"token": None, "pass": "passme", "prompt": "hello there",
+                    "argv": ["ask", "--prompt", "-", "--local-only"]}
+
+
+def test_real_timeout_kills_grandchild_and_returns_promptly(real, monkeypatch):
+    import time
+    lane, tmp = real
+    monkeypatch.setenv("FAKE_MODE", "hang")
+    lane["env_passthrough"] = ["FAKE_MODE", "FAKE_PIDFILE"]
+    t0 = time.monotonic()
+    res = offload_lane.ask(lane, "x")
+    elapsed = time.monotonic() - t0
+    assert res == {"ok": False, "text": "", "why": "command lane timed out after 3.0s"}
+    assert elapsed < 5.0
+    pid = int((tmp / "pid").read_text())
+    for _ in range(40):
+        if not _alive(pid):
+            break
+        time.sleep(0.1)
+    assert _alive(pid) is False
+
+
+def test_real_available_true_for_exit_zero(real):
+    lane, _ = real
+    assert offload_lane.available("copilot", lane) is True
+    lane2 = dict(lane, command=[sys.executable, "-c", "import sys; sys.exit(1)", "x"])
+    offload_lane.reset_cache()
+    assert offload_lane.available("copilot", lane2) is False

@@ -659,7 +659,9 @@ def offload_lane(name: str) -> "dict | None":
 
     ``command`` (non-empty list of strings) is required. Defaults: ``allow_cloud=false``
     (the dispatcher passes --local-only), ``health_timeout_s=30``, ``timeout_s=180``,
-    ``cache_ttl_s=60``, ``max_chars=20000``.
+    ``cache_ttl_s=60``, ``max_chars=20000``, ``ask_args=[]`` (extra args after
+    ``ask --prompt -``, e.g. ``["--no-loci"]``), ``env_passthrough=[]`` (extra env vars the
+    command may see; the rest of the environment is dropped).
     """
     lanes = _config().get("offload_lane")
     raw = lanes.get(name) if isinstance(lanes, dict) else None
@@ -668,6 +670,9 @@ def offload_lane(name: str) -> "dict | None":
     cmd = raw.get("command")
     if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) and c for c in cmd):
         return None
+
+    def _str_list(v) -> list:
+        return [x for x in v if isinstance(x, str) and x] if isinstance(v, list) else []
 
     def _num(key: str, default: float) -> float:
         try:
@@ -683,6 +688,8 @@ def offload_lane(name: str) -> "dict | None":
         "timeout_s": _num("timeout_s", 180.0),
         "cache_ttl_s": _num("cache_ttl_s", 60.0),
         "max_chars": int(_num("max_chars", 20000)),
+        "ask_args": _str_list(raw.get("ask_args")),
+        "env_passthrough": _str_list(raw.get("env_passthrough")),
     }
 
 
