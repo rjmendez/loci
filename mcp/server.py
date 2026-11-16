@@ -8720,6 +8720,21 @@ def _gen_residency(url: str, model: str) -> dict | None:
         return None
 
 
+
+def _command_lane_served(names: list) -> list:
+    """Expected tmux companions that a configured, healthy command offload lane serves instead."""
+    served = []
+    for n in names:
+        try:
+            import offload_lane
+            lane = offload_lane.lane_for(n)
+            if lane is not None and offload_lane.available(n, lane):
+                served.append(n)
+        except Exception:
+            continue
+    return served
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -9050,6 +9065,10 @@ def loci_health() -> str:
                 running.append(name)
         running = sorted(set(running))
         missing = [s for s in expected if s not in running]
+        served = _command_lane_served(missing)
+        if served:
+            out["tmux_companion_command_lanes"] = served
+            missing = [s for s in missing if s not in served]
         out["tmux_companion_running"] = running
         if missing:
             out["tmux_companion_missing"] = missing

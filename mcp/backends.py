@@ -654,6 +654,38 @@ def tmux_offload_require_mapped_session() -> bool:
     )
 
 
+def offload_lane(name: str) -> "dict | None":
+    """Command offload lane ``[offload_lane.<name>]``, or None when not configured.
+
+    ``command`` (non-empty list of strings) is required. Defaults: ``allow_cloud=false``
+    (the dispatcher passes --local-only), ``health_timeout_s=30``, ``timeout_s=180``,
+    ``cache_ttl_s=60``, ``max_chars=20000``.
+    """
+    lanes = _config().get("offload_lane")
+    raw = lanes.get(name) if isinstance(lanes, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    cmd = raw.get("command")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) and c for c in cmd):
+        return None
+
+    def _num(key: str, default: float) -> float:
+        try:
+            v = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return v if v > 0 else default
+
+    return {
+        "command": list(cmd),
+        "allow_cloud": _boolish(raw.get("allow_cloud", False), default=False),
+        "health_timeout_s": _num("health_timeout_s", 30.0),
+        "timeout_s": _num("timeout_s", 180.0),
+        "cache_ttl_s": _num("cache_ttl_s", 60.0),
+        "max_chars": int(_num("max_chars", 20000)),
+    }
+
+
 def memory_dir() -> str:
     """Curated MEMORY.md dir for the grounding memory lane.
 
