@@ -353,6 +353,23 @@ def _tmux_offload_policy(role: Optional[str]) -> dict:
     session_name = mappings.get(normalized, "") or ""
     is_expensive = normalized in expensive
     if session_name:
+        try:
+            import offload_lane
+            lane = offload_lane.lane_for(session_name)
+        except Exception:
+            lane = None
+        if lane is not None:
+            available = offload_lane.available(session_name, lane)
+            return {
+                "enabled": True,
+                "role": normalized,
+                "priority": "expensive" if is_expensive else "normal",
+                "session": session_name,
+                "available": available,
+                "require_mapped_session": bool(backends.tmux_offload_require_mapped_session()),
+                "reason": "command lane available" if available else "command lane unavailable",
+                "lane": "command",
+            }
         available = _tmux_session_available(session_name)
         return {
             "enabled": True,
@@ -372,6 +389,32 @@ def _tmux_offload_policy(role: Optional[str]) -> dict:
         "available": False,
         "require_mapped_session": bool(backends.tmux_offload_require_mapped_session()),
         "reason": "no mapped session for role",
+    }
+
+
+def _command_lane_generate(policy: dict, prompt: str, fmt: Optional[str]) -> Optional[dict]:
+    """Serve the call from the role's command lane, or None to fall back to the normal tiers."""
+    import offload_lane
+    session = policy.get("session")
+    lane = offload_lane.lane_for(session)
+    if lane is None:
+        return None
+    res = offload_lane.ask(lane, prompt)
+    if res["ok"] and fmt == "json":
+        try:
+            json.loads(res["text"])
+        except ValueError:
+            res = {"ok": False, "text": "", "why": "command lane reply was not valid JSON"}
+    if not res["ok"]:
+        _LOG.warning("llm_local.command_lane lane=%s fell back: %s", session, res["why"])
+        return None
+    return {
+        "text": res["text"],
+        "ok": True,
+        "model": f"command-lane:{session}",
+        "tier": "command-lane",
+        "route_role": policy.get("role"),
+        "tmux_session": session,
     }
 
 
@@ -429,6 +472,10 @@ def _generate(prompt: str,
             "tmux_session": tmux_policy.get("session"),
             "why": f"tmux offload required for role '{tmux_policy.get('role')}' but session '{tmux_policy.get('session')}' is unavailable",
         }
+    if tmux_policy.get("lane") == "command" and tmux_policy.get("available"):
+        served = _command_lane_generate(tmux_policy, prompt, fmt)
+        if served is not None:
+            return served
     if tmux_policy.get("enabled") and tmux_policy.get("available"):
         _LOG.info(
             "llm_local.tmux_offload role=%s session=%s priority=%s",

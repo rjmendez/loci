@@ -131,6 +131,33 @@ Benchmark gate before promoting defaults:
 - `expensive_roles=[]` optional expensive-role set
 - `require_mapped_session=false` (strict fail-closed toggle)
 
+#### Command offload lanes
+
+A session name in `role_sessions` may name a command lane instead of a tmux session
+(`mcp/offload_lane.py`, readers in `backends.offload_lane`). With no `[offload_lane.<name>]`
+table nothing changes. Example, serving the `triage` role with the bma-offload tool:
+
+```toml
+[tmux_offload]
+enabled = true
+role_sessions = { triage = "copilot" }
+
+[offload_lane.copilot]
+command = ["python", "<path to>/offload.py"]
+allow_cloud = false
+ask_args = ["--no-loci"]
+```
+
+- Available when `<command> health` exits 0 within `health_timeout_s` (default 30). Success and failure are both cached for `cache_ttl_s` (60), and concurrent callers share one probe.
+- The command runs in its own process group and sees only an allow-listed environment (PATH, system/temp/home dirs, `OFFLOAD_*`) plus any names in `env_passthrough`. On timeout the whole process tree is killed.
+- `ask_args` (default empty) are appended after `ask --prompt -`; use `["--no-loci"]` with offload.py so the lane prompt does not call back into Loci.
+- A zero-exit JSON object without an `answer` key (for example `{"error": ...}`) is a failure and falls back.
+- Dispatch runs `<command> ask --prompt -` with the prompt on stdin, `--local-only` appended unless `allow_cloud = true`, hard `timeout_s` (180), output capped at `max_chars` (20000). A JSON `{"answer": ...}` stdout is unwrapped.
+- Fail open: timeout, non-zero exit, empty output or (for `fmt=json`) a non-JSON reply returns to the normal Ollama/cloud tiers. A served call reports `tier: "command-lane"`.
+- `require_mapped_session = true` still refuses with the same text when the lane's health fails.
+- `loci_health` no longer lists an expected companion (`LOCI_TMUX_COMPANION_SESSIONS`, default `claude,copilot`) as missing when a healthy command lane has that name; it reports `tmux_companion_command_lanes` instead. It reads the lane's cached health only (up to 5 TTLs old) and never runs the command, so the lane shows as missing until a dispatch has probed it.
+- The command must read the prompt from stdin when given `--prompt -`.
+
 ### Opt-in heavier Ollama generation tags
 
 The checked-in default stays `qwen2.5:3b`. If you want a local abliterated tier,

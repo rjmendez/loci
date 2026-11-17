@@ -71,6 +71,17 @@
 # expensive_roles = ["reasoning","synthesis","redteam"]  # roles to prioritize into "expensive" lanes
 # require_mapped_session = false         # if true, fail closed when a mapped session is unavailable
 
+# A role's lane name may instead name a command lane. Command lanes win over a tmux session of the same name.
+# [offload_lane.copilot]
+# command = ["python", "/path/to/offload.py"]  # run as `<command> health` and `<command> ask --prompt - [--local-only]`
+# allow_cloud = false                   # false: --local-only is always passed, nothing goes to GitHub
+# health_timeout_s = 30                 # `health` must exit 0 within this; result cached cache_ttl_s
+# timeout_s = 180                       # hard cap for one ask
+# cache_ttl_s = 60                      # both outcomes of the health probe are cached this long
+# ask_args = ["--no-loci"]              # extra args after `ask --prompt -`; keep a lane prompt from looping back into Loci
+# env_passthrough = []                  # env vars the command may see; the rest of the environment (tokens, API keys) is dropped
+# max_chars = 20000                     # cap on the text returned
+
 [rerank]
 # model = "BAAI/bge-reranker-v2-m3"    # default; or the lighter "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
