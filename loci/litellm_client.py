@@ -29,18 +29,41 @@ def call_litellm_proxy(model: str, messages: List[Dict[str, str]], max_tokens: i
         raise ValueError(f"LiteLLM proxy error {e.code}: {body}") from e
     latency_ms = (time.monotonic() - t0) * 1000
     
-    # Extract content robustly from OpenAI-compatible response shape
-    content = None
+    # Extract content robustly across multiple response shapes
+    content = ""
+    
+    # Try 1: choices[0].message.content as a string
     if "choices" in raw and raw["choices"] and isinstance(raw["choices"], list):
         choice_obj = raw["choices"][0]
         if isinstance(choice_obj, dict):
             message = choice_obj.get("message")
             if isinstance(message, dict):
-                content = message.get("content")
-    
-    # Ensure content is a string, not None
-    if content is None:
-        content = ""
+                # Try 1: Direct string content
+                msg_content = message.get("content")
+                if isinstance(msg_content, str) and msg_content.strip():
+                    content = msg_content
+                # Try 2: Content as a list of blocks (Anthropic via LiteLLM)
+                elif isinstance(msg_content, list) and msg_content:
+                    text_parts = []
+                    for block in msg_content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if text:
+                                text_parts.append(text)
+                    if text_parts:
+                        content = "".join(text_parts)
+                
+                # Try 3: reasoning_content field
+                if not content:
+                    reasoning = message.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning.strip():
+                        content = reasoning
+            
+            # Try 4: Legacy completion shape (choices[0].text)
+            if not content:
+                text = choice_obj.get("text")
+                if isinstance(text, str) and text.strip():
+                    content = text
     
     usage = raw.get("usage", {})
     return LiteLLMResponse(model=raw.get("model", model), content=content, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=latency_ms, raw=raw)
