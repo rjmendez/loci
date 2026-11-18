@@ -28,9 +28,22 @@ def call_litellm_proxy(model: str, messages: List[Dict[str, str]], max_tokens: i
         body = e.read().decode("utf-8", errors="replace")
         raise ValueError(f"LiteLLM proxy error {e.code}: {body}") from e
     latency_ms = (time.monotonic() - t0) * 1000
-    choice = raw["choices"][0]["message"]["content"]
+    
+    # Extract content robustly from OpenAI-compatible response shape
+    content = None
+    if "choices" in raw and raw["choices"] and isinstance(raw["choices"], list):
+        choice_obj = raw["choices"][0]
+        if isinstance(choice_obj, dict):
+            message = choice_obj.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+    
+    # Ensure content is a string, not None
+    if content is None:
+        content = ""
+    
     usage = raw.get("usage", {})
-    return LiteLLMResponse(model=raw.get("model", model), content=choice, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=latency_ms, raw=raw)
+    return LiteLLMResponse(model=raw.get("model", model), content=content, prompt_tokens=usage.get("prompt_tokens", 0), completion_tokens=usage.get("completion_tokens", 0), total_tokens=usage.get("total_tokens", 0), latency_ms=latency_ms, raw=raw)
 
 
 def check_proxy_health(url: Optional[str] = None, api_key: Optional[str] = None, timeout: float = 5.0) -> Dict[str, Any]:
