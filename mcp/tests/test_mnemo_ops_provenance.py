@@ -82,7 +82,9 @@ class StoreIndexMnemoMetadataTest(unittest.TestCase):
                 confidence="high",
             ))
         self.assertTrue(res.get("stored"), res)
-        self.assertEqual(captured["metadata"].get("evidence_provenance_tier"), "tool_verified")
+        # An untagged write is stored as model_asserted: a model claim never reads as tool_verified by default.
+        # provenance_defaulted stays True, because nobody asserted the tier and the server applied it.
+        self.assertEqual(captured["metadata"].get("evidence_provenance_tier"), "model_asserted")
         self.assertTrue(captured["metadata"].get("provenance_defaulted"))
 
 

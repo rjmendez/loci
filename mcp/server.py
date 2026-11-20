@@ -2954,7 +2954,7 @@ def _update_entities_jsonl(investigation_id: str, finding_id: str, text: str) ->
 
         # Atomic rewrite: temp file + rename
         tmp_path = entities_path.with_suffix(".tmp")
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             for ent in existing:
                 f.write(json.dumps(ent) + "\n")
         tmp_path.replace(entities_path)
@@ -3860,6 +3860,101 @@ def _store_conflicts(investigation_id: str, finding: dict) -> tuple:
     return False, None, None
 
 
+# Tiers that assert the content was checked against evidence. These are the only ways a write can claim more
+# than model_asserted, and each needs a citation the server can check (see _resolve_write_provenance).
+_TIERS_REQUIRING_EVIDENCE = frozenset({"tool_verified", "deterministic_derived"})
+
+
+def _receipt_recorded(path, receipt_id: str) -> bool:
+    try:
+        return any(isinstance(e, dict) and e.get("receipt_id") == receipt_id for e in _read_jsonl(path))
+    except OSError:
+        return False
+
+
+def _receipt_known(investigation_id: str, receipt_id: str) -> bool:
+    """True when audit_log wrote this receipt: the global daily log for the date in its id, or this
+    investigation's own audit log. A receipt the model made up is in neither."""
+    m = re.match(r"^rcpt-(\d{8})-", receipt_id)
+    if m and _receipt_recorded(MEMORY_DIR.parent / "audit" / f"{m.group(1)}.jsonl", receipt_id):
+        return True
+    return _receipt_recorded(_inv_dir(investigation_id) / "audit.jsonl", receipt_id)
+
+
+def _cited_receipt_ids(metadata) -> list[str]:
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return []
+    if not isinstance(metadata, dict):
+        return []
+    ids = metadata.get("receipt_ids")
+    if isinstance(ids, str):
+        ids = [ids]
+    return [str(i).strip() for i in ids or [] if str(i).strip()]
+
+
+def _resolve_write_provenance(investigation_id: str, evidence_provenance_tier: Optional[str],
+                              derived_from, metadata=None) -> tuple[Optional[str], Optional[str]]:
+    """(tier, error_json). A model claim cannot be stored as verified fact through this path:
+      - an untagged write is model_asserted (never tool_verified, the old legacy default);
+      - tool_verified needs metadata.receipt_ids, and every id must be a receipt audit_log actually recorded
+        (a made-up id is refused). The receipt is the evidence: the tool's own output, stored verbatim;
+      - deterministic_derived needs derived_from naming findings already stored in this investigation."""
+    from provenance_firewall import MODEL_ASSERTED, PROVENANCE_TIERS
+
+    raw = (evidence_provenance_tier or "").strip().lower()
+    if not raw:
+        return MODEL_ASSERTED, None
+    if raw not in PROVENANCE_TIERS:
+        return None, json.dumps({"error": "evidence_provenance_tier must be one of: " + ", ".join(sorted(PROVENANCE_TIERS))})
+    if raw not in _TIERS_REQUIRING_EVIDENCE:
+        return raw, None
+    if raw == "tool_verified":
+        rids = _cited_receipt_ids(metadata)
+        if not rids:
+            return None, json.dumps({"error": "evidence_provenance_tier=tool_verified needs metadata={\"receipt_ids\": [...]} "
+                                              "from audit_log for the tool run that shows it. Without a receipt, store as model_asserted."})
+        missing = [r for r in rids if not _receipt_known(investigation_id, r)]
+        if missing:
+            return None, json.dumps({"error": f"receipt_ids name no recorded audit receipt: {missing[:5]}"})
+        return raw, None
+    refs = _normalize_derived_from(derived_from)
+    if not refs:
+        return None, json.dumps({"error": "evidence_provenance_tier=deterministic_derived needs derived_from: ids of "
+                                          "stored findings it is derived from. Without them, store as model_asserted."})
+    known = {f["id"] for f in _read_jsonl(_inv_dir(investigation_id) / "findings.jsonl") if "id" in f}
+    missing = [r for r in refs if r not in known]
+    if missing:
+        return None, json.dumps({"error": f"derived_from names no stored finding in this investigation: {missing[:5]}"})
+    return raw, None
+
+
+def _metadata_tier(metadata) -> str:
+    """The tier a caller asserted inside metadata (the store has always honored it there), or ''."""
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return ""
+    if isinstance(metadata, dict):
+        return str(metadata.get("evidence_provenance_tier") or "")
+    return ""
+
+
+def _with_defaulted_marker(metadata):
+    """metadata (dict or JSON object text) with provenance_defaulted=True, for writes that asserted no tier."""
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            metadata = {}
+    out = dict(metadata) if isinstance(metadata, dict) else {}
+    out["provenance_defaulted"] = True
+    return out
+
+
 @mcp.tool()
 def investigation_store(
     investigation_id: str,
@@ -3961,11 +4056,19 @@ def investigation_store(
     if invalid:
         return invalid
 
+    asserted_tier = evidence_provenance_tier or _metadata_tier(metadata)
+    resolved_tier, invalid = _resolve_write_provenance(investigation_id, asserted_tier, derived_from, metadata)
+    if invalid:
+        return invalid
+    if not (asserted_tier or "").strip():
+        # Nobody asserted a tier, so the stored model_asserted is a default the server applied: mark it so.
+        metadata = _with_defaulted_marker(metadata)
+
     finding, invalid = _store_build_finding(
         investigation_id, finding_type, text, source, confidence, tags, derived_from,
         numeric_confidence, procedure_preconditions, procedure_steps,
         procedure_postconditions, valid_from, valid_until, authored_by, tier,
-        resolution, code_refs, metadata, evidence_provenance_tier,
+        resolution, code_refs, metadata, resolved_tier,
     )
     if invalid:
         return invalid
@@ -8630,6 +8733,23 @@ def _gen_residency(url: str, model: str) -> dict | None:
         return None
 
 
+
+def _command_lane_served(names: list) -> list:
+    """Expected tmux companions served instead by a command lane whose last health result is good.
+
+    Reads the lane cache only; loci_health never runs the lane command."""
+    served = []
+    for n in names:
+        try:
+            import offload_lane
+            lane = offload_lane.lane_for(n)
+            if lane is not None and offload_lane.last_known(n, lane) is True:
+                served.append(n)
+        except Exception:
+            continue
+    return served
+
+
 @mcp.tool()
 def loci_health() -> str:
     """
@@ -8960,6 +9080,10 @@ def loci_health() -> str:
                 running.append(name)
         running = sorted(set(running))
         missing = [s for s in expected if s not in running]
+        served = _command_lane_served(missing)
+        if served:
+            out["tmux_companion_command_lanes"] = served
+            missing = [s for s in missing if s not in served]
         out["tmux_companion_running"] = running
         if missing:
             out["tmux_companion_missing"] = missing
@@ -11311,7 +11435,19 @@ def memory_promote(investigation_id: str, finding_id: str, tier: str, requesting
     if _acl_denied:
         return _acl_denied
     try:
+        gate = None
+        if tier != "cold":
+            try:
+                import memory_adjudicate as _adj
+                gate = _adj.verify_gate(investigation_id, finding_id)   # off unless LOCI_PROMOTE_TEACHER_VERIFY
+            except Exception as exc:  # noqa: BLE001 - the gate fails open
+                logger.debug("promote verify gate failed (fail-open): %r", exc)
+        if gate and gate.get("block"):
+            return json.dumps({"finding_id": finding_id, "ok": False, "blocked": "teacher_verify_unsupported",
+                               "teacher_verify": gate}, indent=2)
         result = _change_finding_tier(investigation_id, finding_id, tier)
+        if gate:
+            result["teacher_verify"] = gate
         return json.dumps(result, indent=2)
     except Exception as exc:
         return json.dumps({"error": str(exc)})

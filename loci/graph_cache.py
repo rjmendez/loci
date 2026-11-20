@@ -86,7 +86,7 @@ class GraphCache:
         path = self._entry_path(tool_name)
         if not path.exists():
             return None
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -110,7 +110,7 @@ class GraphCache:
             graph_revision=graph_revision,
         )
         path = self._entry_path(tool_name)
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry.to_dict()) + "\n")
         return entry
 
@@ -137,7 +137,7 @@ class GraphCache:
         stats = {}
         for p in self.cache_dir.glob("*.jsonl"):
             tool = p.stem
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 lines = [l for l in f if l.strip()]
             stats[tool] = {"entries": len(lines), "bytes": p.stat().st_size}
         return stats

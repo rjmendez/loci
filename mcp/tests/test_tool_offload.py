@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import threading
 import time
 
@@ -146,6 +147,35 @@ def test_worker_count_env(monkeypatch, raw, expected):
     assert tool_offload.worker_count() == expected
 
 
+def _canon(node):
+    """Schema with the member order of every anyOf/oneOf fixed.
+
+    typing caches ``Optional[str | dict]`` and ``Optional[dict | str]`` as one object, so
+    whichever spelling any imported library evaluates first fixes the member order for the
+    whole process. A reference schema built late (after loci_health lazily imported
+    fastembed) then listed ``object`` before ``string`` while the live one, built at
+    import, did not. The order carries no meaning; the members do.
+    """
+    if isinstance(node, dict):
+        out = {k: _canon(v) for k, v in node.items()}
+        for key in ("anyOf", "oneOf"):
+            if isinstance(out.get(key), list):
+                out[key] = sorted(out[key], key=lambda m: json.dumps(m, sort_keys=True))
+        return out
+    if isinstance(node, list):
+        return [_canon(v) for v in node]
+    return node
+
+
+def test_canon_ignores_union_member_order_but_not_members():
+    a = {"properties": {"x": {"anyOf": [{"type": "string"}, {"type": "object"}, {"type": "null"}]}}}
+    b = {"properties": {"x": {"anyOf": [{"type": "object"}, {"type": "string"}, {"type": "null"}]}}}
+    c = {"properties": {"x": {"anyOf": [{"type": "object"}, {"type": "integer"}, {"type": "null"}]}}}
+    assert a != b
+    assert _canon(a) == _canon(b)
+    assert _canon(a) != _canon(c)
+
+
 def test_every_loci_server_tool_is_offloaded_with_an_unchanged_schema():
     import server as loci_server
 
@@ -161,6 +191,6 @@ def test_every_loci_server_tool_is_offloaded_with_an_unchanged_schema():
     ref = {t.name: t for t in _run(reference.list_tools())}
     live = {t.name: t for t in _run(loci_server.mcp.list_tools())}
     assert set(live) == set(ref)
-    mismatched = [n for n in live if (live[n].description, live[n].inputSchema)
-                  != (ref[n].description, ref[n].inputSchema)]
+    mismatched = [n for n in live if (live[n].description, _canon(live[n].inputSchema))
+                  != (ref[n].description, _canon(ref[n].inputSchema))]
     assert mismatched == []

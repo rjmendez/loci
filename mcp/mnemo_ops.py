@@ -33,7 +33,16 @@ def _get_mnemo_funcs() -> tuple[Any | None, Any | None]:
             _mnemo_remember_fn = getattr(_mnemo, "remember", False)
             _mnemo_recall_fn = getattr(_mnemo, "recall", False)
         except Exception as exc:
-            logger.info("Mnemosyne unavailable — using JSONL/Qdrant paths: %s", exc)
+            # WARNING, not INFO: the loci->mnemo mirror then goes silently inert (remember/recall return
+            # False/[] with no caller-visible alarm), so this must be loud and actionable in the log. The
+            # 2026-10-30 incident (mnemosyne-memory missing from the server's Python) sat undetected behind
+            # one INFO line for a whole session. memory_health probe 5 surfaces it on demand; this is the
+            # passive signal an operator sees without probing.
+            logger.warning(
+                "Mnemosyne unavailable — the loci->mnemo mirror is INERT (episodic remember/recall disabled, "
+                "Qdrant-only). Fix: pip install mnemosyne-memory sqlite-vec into the server's Python. Cause: %s",
+                exc,
+            )
             _mnemo_remember_fn = False
             _mnemo_recall_fn = False
     remember = _mnemo_remember_fn if _mnemo_remember_fn is not False else None

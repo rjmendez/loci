@@ -1,0 +1,11 @@
+# secrets and live state: never tracked
+*.env
+.env.*
+config.yaml
+shell-hooks-allowlist.json
+*secret*
+*.key
+status.json
+status.log
+policy_violations.jsonl
+__pycache__/

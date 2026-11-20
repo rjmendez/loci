@@ -5,10 +5,11 @@ default-OFF behind a gate (mirroring the DAMA shadow-eval + canary discipline). 
 is that gate: it scores retrieval configurations on a held-out query set and recommends a flip
 only when a candidate beats the baseline by a margin without regressing.
 
-No gold relevance labels exist for the Loci corpus, so we use a self-supervised proxy: each
+Default labels: no gold exists, so we use a self-supervised proxy: each
 corpus item is a query whose "relevant" set is the OTHER items sharing its group (e.g. same
 investigation) — a weak but real topical signal. Metrics are standard rank quality: recall@k,
-MRR, nDCG@k.
+MRR, nDCG@k. Gold mode (load_gold + evaluate_gold) scores against real graded labels from
+mcp/gold_labels.py instead; selected by shadow_eval.py --gold.
 
 Pure + injectable: `evaluate()` takes a `retrieve_fn` (query -> candidate pool) and an optional
 `rerank_fn` (query, candidates -> reordered), so tests stub them and the live CLI
@@ -108,6 +109,76 @@ def evaluate(query_set: Sequence[dict],
         f"ndcg@{k}": round(sums["ndcg"] / denom, 4),
         "n": n, "skipped": skipped, "k": k,
     }
+
+
+def graded_ndcg_at_k(ranked_ids: Sequence, gains: dict, k: int) -> float:
+    """nDCG@k with graded gain 2^grade - 1. `gains` maps id -> grade (0-3); an id absent from it
+    counts as grade 0. The ideal ranking is built from the labeled grades only."""
+    def g(i):
+        return (2 ** int(gains.get(i, 0))) - 1
+    dcg = sum(g(rid) / math.log2(i + 2) for i, rid in enumerate(list(ranked_ids)[:k]))
+    ideal = sorted((2 ** int(v) - 1 for v in gains.values()), reverse=True)[:k]
+    idcg = sum(v / math.log2(i + 2) for i, v in enumerate(ideal))
+    return dcg / idcg if idcg else 0.0
+
+
+def load_gold(path: str, min_grade: int = 1) -> list[dict]:
+    """Query set from a gold_labels.py JSONL. Rows: {type:"query", query_id, query, exclude_id} and
+    {type:"label", query_id, candidate_id, grade}. relevant_ids = candidates with grade >= min_grade;
+    `gains` keeps every labeled grade. Queries without a single relevant candidate are kept with an
+    empty relevant set (evaluate_gold skips and counts them). Unreadable lines are ignored."""
+    import json
+    heads: dict = {}
+    gains: dict = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(r, dict):
+                continue
+            if r.get("type") == "query" and r.get("query_id"):
+                heads[r["query_id"]] = r
+            elif r.get("type") == "label" and r.get("query_id") is not None:
+                gains.setdefault(r["query_id"], {})[str(r.get("candidate_id"))] = int(r.get("grade", 0))
+    out = []
+    for qid, h in heads.items():
+        gn = gains.get(qid, {})
+        out.append({"query_id": qid, "query": str(h.get("query", "")), "exclude_id": h.get("exclude_id"),
+                    "relevant_ids": {c for c, v in gn.items() if v >= min_grade}, "gains": gn})
+    return out
+
+
+def evaluate_gold(gold_set: Sequence[dict],
+                  retrieve_fn: Callable[[str, object], Sequence[dict]],
+                  rerank_fn: Optional[Callable[[str, Sequence[dict]], Sequence[dict]]] = None,
+                  k: int = 10) -> dict:
+    """Like evaluate(), against load_gold() output: recall@k and MRR on grade >= min_grade, nDCG@k
+    graded. Queries with no relevant label are excluded (`no_relevant`); a failing retrieve/rerank
+    is skipped (`skipped`). Candidates the gold never saw count as grade 0."""
+    sums = {"recall": 0.0, "mrr": 0.0, "ndcg": 0.0}
+    n = skipped = no_rel = 0
+    for q in gold_set:
+        if not q["relevant_ids"]:
+            no_rel += 1
+            continue
+        try:
+            cands = list(retrieve_fn(q["query"], q.get("exclude_id")))
+            if rerank_fn is not None:
+                cands = list(rerank_fn(q["query"], cands))
+        except Exception:
+            skipped += 1
+            continue
+        ranked = [str(c.get("id")) for c in cands]
+        sums["recall"] += recall_at_k(ranked, q["relevant_ids"], k)
+        sums["mrr"] += mrr(ranked, q["relevant_ids"])
+        sums["ndcg"] += graded_ndcg_at_k(ranked, q["gains"], k)
+        n += 1
+    d = n or 1
+    return {f"recall@{k}": round(sums["recall"] / d, 4), "mrr": round(sums["mrr"] / d, 4),
+            f"ndcg@{k}": round(sums["ndcg"] / d, 4), "n": n, "skipped": skipped,
+            "no_relevant": no_rel, "k": k, "labels": "gold"}
 
 
 def score_configs(rankings_by_config: dict, relevant: set, k: int) -> dict:

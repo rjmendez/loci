@@ -31,6 +31,13 @@ if str(_MCP_DIR) not in sys.path:
 import server  # noqa: E402 — must be after path setup
 
 
+def _verified_metadata(investigation_id):
+    """metadata for a tool_verified write. The store-time gate needs a receipt audit_log actually recorded."""
+    rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                      investigation_id=investigation_id))["receipt_id"]
+    return {"evidence_provenance_tier": "tool_verified", "receipt_ids": [rid]}
+
+
 def _json(result: str) -> dict:
     """Parse a tool's JSON return value; fail the test with the raw string on error."""
     try:
@@ -1787,7 +1794,8 @@ class TestProgressiveSummaryFidelity(unittest.TestCase):
         self.assertEqual(len(reflect_result["summary_l1"]), 3)
         self.assertIn("source=test:db", reflect_result["summary_l1"][0])
         self.assertIn("confidence=high", reflect_result["summary_l1"][0])
-        self.assertIn("provenance=tool_verified", reflect_result["summary_l1"][0])
+        # the finding was stored untagged: it reads as the model's claim, not as tool-verified fact
+        self.assertIn("provenance=model_asserted", reflect_result["summary_l1"][0])
         self.assertIn(
             "Primary DB host 10.0.0.9 returns timeout errors during failover.",
             reflect_result["summary_l1"][0],
@@ -3378,7 +3386,7 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         stored = _json(server.investigation_store(
             investigation_id=inv_id, finding_type="observed", text=text,
             source="psql --version", confidence="high",
-            metadata={"evidence_provenance_tier": "tool_verified"},
+            metadata=_verified_metadata(inv_id),
         ))
         return inv_id, stored["finding_id"]
 
@@ -3529,7 +3537,7 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
             text="The schema parses successfully.",
             source="python3 -m json.tool",
             confidence="high",
-            metadata={"evidence_provenance_tier": "tool_verified"},
+            metadata=_verified_metadata(inv_id),
         )
 
         result = _json(server.investigation_pre_answer_check(
@@ -3544,8 +3552,8 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertTrue(first["provenance_firewall"]["allowed"])
 
     def test_legacy_untagged_support_is_displayed_but_not_independent(self):
-        # An untagged row still displays the legacy tool_verified tier, but nobody
-        # asserted it, so it cannot support a (model_asserted) answer claim.
+        # An untagged row is displayed as model_asserted (not tool_verified: that display let model claims read as
+        # verified fact). Nobody asserted a tier, so it is still marked defaulted and cannot support a claim.
         inv_id = self._setup_investigation("Legacy findings remain usable.")
         result = _json(server.investigation_pre_answer_check(
             investigation_id=inv_id,
@@ -3557,7 +3565,7 @@ class TestInvestigationPreAnswerCheck(unittest.TestCase):
         self.assertFalse(first["supported"])
         self.assertEqual(first["support_basis"], "provenance_blocked")
         firewall = first["provenance_firewall"]
-        self.assertEqual(firewall["evidence_tiers"], ["tool_verified"])
+        self.assertEqual(firewall["evidence_tiers"], ["model_asserted"])
         self.assertEqual(firewall["independent_evidence_tiers"], [])
         self.assertEqual(firewall["defaulted_evidence_count"], 1)
 

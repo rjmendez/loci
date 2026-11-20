@@ -112,15 +112,26 @@ def main() -> int:
     ap.add_argument("--rerankers", default="cross-encoder/ms-marco-MiniLM-L-6-v2")
     ap.add_argument("--query-expand", action="store_true")
     ap.add_argument("--scan", type=int, default=4000)
+    ap.add_argument("--gold", nargs="?", const="", default=None, metavar="PATH",
+                    help="score against gold labels (mcp/gold_labels.py) instead of the proxy; "
+                         "PATH defaults to the configured gold file")
     args = ap.parse_args()
 
     import retrieval_eval as RE
-    corpus = _load_corpus(args.scan)
-    if not corpus:
-        print("no corpus (qdrant unavailable?)", file=sys.stderr)
-        return 1
-    qset = RE.build_query_set(corpus, min_relevant=1, limit=args.queries)
-    print(f"corpus={len(corpus)} query_set={len(qset)} pool={args.pool} k={args.k}", file=sys.stderr)
+    evaluate = RE.evaluate
+    if args.gold is not None:
+        import gold_labels
+        gpath = args.gold or gold_labels.gold_config()["file"]
+        qset = RE.load_gold(gpath)[: args.queries]
+        evaluate = RE.evaluate_gold
+        print(f"gold={gpath} query_set={len(qset)}", file=sys.stderr)
+    else:
+        corpus = _load_corpus(args.scan)
+        if not corpus:
+            print("no corpus (qdrant unavailable?)", file=sys.stderr)
+            return 1
+        qset = RE.build_query_set(corpus, min_relevant=1, limit=args.queries)
+    print(f"query_set={len(qset)} pool={args.pool} k={args.k}", file=sys.stderr)
     if not qset:
         print("no query set (no investigations with >=2 findings)", file=sys.stderr)
         return 1
@@ -131,7 +142,7 @@ def main() -> int:
 
     # baseline = dense retrieval + first reranker
     base_model = models[0]
-    results[f"rerank:{base_model}"] = RE.evaluate(qset, retrieve, _make_rerank(base_model), k=args.k)
+    results[f"rerank:{base_model}"] = evaluate(qset, retrieve, _make_rerank(base_model), k=args.k)
     baseline_key = f"rerank:{base_model}"
 
     report = {"configs": {}, "comparisons": []}
@@ -139,14 +150,14 @@ def main() -> int:
 
     for cand in models[1:]:
         key = f"rerank:{cand}"
-        results[key] = RE.evaluate(qset, retrieve, _make_rerank(cand), k=args.k)
+        results[key] = evaluate(qset, retrieve, _make_rerank(cand), k=args.k)
         report["configs"][key] = results[key]
         report["comparisons"].append(RE.compare(baseline_key, results[baseline_key], key, results[key]))
 
     if args.query_expand:
         exp_retrieve = _expand_retrieve(retrieve, args.pool)
         key = "query_expand+" + base_model
-        results[key] = RE.evaluate(qset, exp_retrieve, _make_rerank(base_model), k=args.k)
+        results[key] = evaluate(qset, exp_retrieve, _make_rerank(base_model), k=args.k)
         report["configs"][key] = results[key]
         report["comparisons"].append(RE.compare(baseline_key, results[baseline_key], key, results[key]))
 

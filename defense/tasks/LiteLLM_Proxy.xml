@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>LiteLLM proxy on 127.0.0.1:4000, supervised (restart on exit or failed health probes). Logs: F:\services\litellm\logs\litellm.log</Description>
+    <URI>\LiteLLM_Proxy</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-3192075562-427652156-3644625709-1001</UserId>
+      <LogonType>S4U</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <Priority>6</Priority>
+    <RestartOnFailure>
+      <Count>999</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+  </Settings>
+  <Triggers>
+    <BootTrigger>
+      <Delay>PT30S</Delay>
+    </BootTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>F:\services\litellm\venv\Scripts\python.exe</Command>
+      <Arguments>F:\services\litellm\litellm_service.py</Arguments>
+      <WorkingDirectory>F:\services\litellm</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

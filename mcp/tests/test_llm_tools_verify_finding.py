@@ -24,6 +24,13 @@ import llm_tools  # noqa: E402
 import server  # noqa: E402
 
 
+def _verified_metadata(investigation_id):
+    """metadata for a tool_verified write. The store-time gate needs a receipt audit_log actually recorded."""
+    rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                      investigation_id=investigation_id))["receipt_id"]
+    return {"evidence_provenance_tier": "tool_verified", "receipt_ids": [rid]}
+
+
 def _json(result: str) -> dict:
     return json.loads(result)
 
@@ -57,11 +64,11 @@ class FindingProvenanceContextTest(unittest.TestCase):
         server.investigation_start(investigation_id=inv_id, title="t")
         related = _json(server.investigation_store(
             inv_id, "observed", "nginx 1.24 serves port 443 on host alpha", "unit-test",
-            confidence="high", metadata={"evidence_provenance_tier": "tool_verified"},
+            confidence="high", metadata=_verified_metadata(inv_id),
         ))["finding_id"]
         unrelated = _json(server.investigation_store(
             inv_id, "observed", "disk usage on host bravo is 41 percent", "unit-test",
-            confidence="high", metadata={"evidence_provenance_tier": "tool_verified"},
+            confidence="high", metadata=_verified_metadata(inv_id),
         ))["finding_id"]
         target = _json(server.investigation_store(
             inv_id, "inferred", "host alpha serves nginx 1.24 on port 443", "unit-test",
@@ -115,7 +122,7 @@ class VerifyFindingWrapperThreadingTest(unittest.TestCase):
         _json(server.investigation_store(
             inv_id, "observed", "Reflection loop replay run: loop fixed, model agreement 5/5.",
             "unit-test", confidence="high",
-            metadata={"evidence_provenance_tier": "tool_verified"},
+            metadata=_verified_metadata(inv_id),
         ))
         fid = _json(server.investigation_store(
             inv_id, "inferred", "The reflection loop is fixed by model agreement.",

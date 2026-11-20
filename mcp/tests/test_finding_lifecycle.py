@@ -23,6 +23,13 @@ if str(_MCP_DIR) not in sys.path:
     sys.path.insert(0, str(_MCP_DIR))
 
 import server  # noqa: E402
+
+
+def _verified_metadata(investigation_id):
+    """metadata for a tool_verified write. The store-time gate needs a receipt audit_log actually recorded."""
+    rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                      investigation_id=investigation_id))["receipt_id"]
+    return {"evidence_provenance_tier": "tool_verified", "receipt_ids": [rid]}
 import inv_store  # noqa: E402
 
 
@@ -318,8 +325,8 @@ class FindingLifecycleTest(unittest.TestCase):
         inv_id = self._start()
         # Explicitly tool_verified: an untagged (defaulted) finding is gated like
         # model_asserted and, with no linked evidence, never reaches the verifier.
-        fid1 = self._store(inv_id, "claim one", evidence_provenance_tier="tool_verified")
-        fid2 = self._store(inv_id, "claim two", evidence_provenance_tier="tool_verified")
+        fid1 = self._store(inv_id, "claim one", metadata=_verified_metadata(inv_id))
+        fid2 = self._store(inv_id, "claim two", metadata=_verified_metadata(inv_id))
 
         calls = []
 
@@ -395,7 +402,7 @@ class FindingLifecycleTest(unittest.TestCase):
         inv_id = self._start()
         self._store(
             inv_id, "Reflection loop replay run: loop fixed, model agreement 5/5.",
-            metadata={"evidence_provenance_tier": "tool_verified"},
+            metadata=_verified_metadata(inv_id),
         )
         fid = self._store(
             inv_id, "The reflection loop is fixed by model agreement.",

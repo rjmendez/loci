@@ -26,6 +26,10 @@ stays observe-only (the judge still gates nothing; ``quality_validators.evaluate
 * a pool whose only judge candidate is the answerer is skipped as ``same_model`` (``select_judge``), never self-graded.
 ``oracle_stats()`` reports every counter.
 
+With oracle mode AND ``[teacher] enabled`` (``mcp/teacher.py``) the judgment goes to the cloud role ``judge`` through
+``teacher_call`` and the unified teacher caps replace the $0.50 bucket (not charged, not consulted). A guard refusal is
+skipped as ``teacher_refused``; nothing raises into the caller. Teacher disabled: this path is unchanged.
+
 A judge is an opinion, not ground truth: measure it against a gold set before trusting its rate
 (``~/.loci/archive/judge_vs_gold.py``). The judge role is ``LOCI_MODEL_POOL_GRADE_ROLE`` (default ``verify``).
 """
@@ -111,6 +115,31 @@ def _measured_cost(res: dict):
     return cost if cost.is_finite() and cost >= 0 else None
 
 
+def teacher_judge_enabled() -> bool:
+    """True when oracle judging should go through the teacher core. Any config error means False (old path)."""
+    if not oracle_enabled():
+        return False
+    try:
+        import teacher
+        return bool(teacher.teacher_config()["enabled"])
+    except Exception as exc:
+        logger.debug("pool_grader: teacher config unreadable: %r", exc)
+        return False
+
+
+TEACHER_JUDGE_MAX_TOKENS = 24
+TEACHER_PURPOSE = "pool_grader_oracle"
+
+
+def _teacher_judge(task: str, prompt: str, answer: str) -> dict:
+    """One oracle judgment via ``teacher_call`` (role ``judge``), shaped like ``llm_local.generate``'s result."""
+    import teacher
+    res = teacher.teacher_call("judge", judge_prompt(task, prompt, answer), TEACHER_JUDGE_MAX_TOKENS, TEACHER_PURPOSE)
+    if not res.get("ok"):
+        return {"ok": False, "why": "teacher_refused", "reason": str(res.get("reason") or "")}
+    return {"ok": True, "text": res.get("text") or "", "cost_usd": res.get("usd"), "model": ""}
+
+
 def rate() -> float:
     try:
         return min(1.0, max(0.0, float(os.environ.get(GRADE_ENV, "0") or 0)))
@@ -126,6 +155,8 @@ def judge_prompt(task: str, prompt: str, answer: str) -> str:
 
 
 def _judge(task: str, prompt: str, answer: str, answerer: str) -> dict:
+    if teacher_judge_enabled():
+        return _teacher_judge(task, prompt, answer)
     roles = (os.environ.get(ROLE_ENV),) if os.environ.get(ROLE_ENV) else DEFAULT_ROLES
     cold_ok = (os.environ.get(COLD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
     if oracle_enabled():
@@ -149,7 +180,7 @@ def grade_one(item: dict, judge: Optional[Callable[[str, str, str, str], dict]] 
     """Judge one queued answer and record the verdict or the reason it was skipped. Never raises."""
     did, task, model = item["decision_id"], item["task"], item["model"]
     held = None
-    if oracle_enabled():
+    if oracle_enabled() and not teacher_judge_enabled():
         try:
             held = oracle_bucket().reserve()
         except qv.OracleStarved:
@@ -168,7 +199,7 @@ def grade_one(item: dict, judge: Optional[Callable[[str, str, str, str], dict]] 
     if not isinstance(res, dict) or not res.get("ok"):
         why = res.get("why") if isinstance(res, dict) else ""
         model_pool.record_grade_skip(
-            did, why if why in ("no_other_model", "no_resident_judge") or (why == "same_model" and held is not None)
+            did, why if why in ("no_other_model", "no_resident_judge", "teacher_refused") or (why == "same_model" and held is not None)
             else "judge_failed", model=model, task=task)
         return None
     if str(res.get("model") or "") == model:
