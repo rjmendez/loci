@@ -60,9 +60,16 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     error (HTTP status, malformed JSON, length mismatch) fails open to [] with no retry.
     """
     texts = [t if isinstance(t, str) else str(t) for t in texts]
-    base, model = _resolve()
     if not texts:
         return []
+    try:
+        import llm_gateway
+        if llm_gateway.enabled():
+            # Through the gateway, or nothing: a configured gateway is not quietly replaced by raw Ollama.
+            return llm_gateway.embed(texts, timeout=_EMBED_TIMEOUT_COLD)
+    except ImportError:
+        pass
+    base, model = _resolve()
     if not base:
         logger.warning("embed_texts: no embedding endpoint configured "
                        "(set OLLAMA_BASE_URL or EMBED_API_KEY) — returning no vectors")
