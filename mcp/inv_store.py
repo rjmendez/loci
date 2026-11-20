@@ -245,7 +245,7 @@ def _load_manifest(investigation_id: str) -> dict | None:
         p = Path(key)
         if not p.exists():
             return None
-        raw = p.read_text()
+        raw = p.read_text(encoding="utf-8")
         if len(_manifest_cache) >= _MANIFEST_CACHE_MAXSIZE:
             _manifest_cache.pop(next(iter(_manifest_cache)))
         _manifest_cache[key] = raw
@@ -264,7 +264,7 @@ def _load_manifest_fresh(investigation_id: str) -> dict | None:
     p = _root() / investigation_id / "manifest.json"
     if not p.exists():
         return None
-    raw = p.read_text()
+    raw = p.read_text(encoding="utf-8")
     manifest = _json_loads(raw)
     if "owner" not in manifest:
         manifest["owner"] = ""
@@ -282,7 +282,7 @@ def _atomic_write_text(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w") as f:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             f.write(data)
         os.replace(tmp_path, path)
     except Exception:
@@ -333,7 +333,7 @@ def _acquire_file_lock(fd: int, path: Path, *, exclusive: bool, timeout_s: float
 def _locked_file(path: Path, mode: str, *, exclusive: bool = True, timeout_s: float | None = None):
     """Open ``path`` and hold a bounded advisory lock for the caller's critical section."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, mode) as fh:
+    with open(path, mode, encoding=None if "b" in mode else "utf-8") as fh:
         _acquire_file_lock(fh.fileno(), path, exclusive=exclusive, timeout_s=timeout_s)
         try:
             yield fh
@@ -460,7 +460,7 @@ def _rewrite_jsonl_preserving(path: Path, update) -> int:
     skip_access = path.name == FINDINGS_LOG_NAME
     new_lines = []
     replaced = 0
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         rec = None
         if stripped:

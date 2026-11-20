@@ -158,7 +158,7 @@ def test_jsonl_append_fuzz_blocks_record_injection(tmp_path, monkeypatch, path_f
 
     inv_store._append_jsonl(path, entry)
 
-    raw = path.read_text()
+    raw = path.read_text(encoding="utf-8")
     assert raw.endswith("\n")
     assert len(raw.splitlines()) == 1
     assert inv_store._read_jsonl(path) == [entry]

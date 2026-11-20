@@ -48,6 +48,9 @@ loci_hermetic.install()
 # Autouse fixture failing any test that reached ~/.loci or ~/.hermes, plus the
 # report header and the session-level check. Opt-out: LOCI_TESTS_LIVE=1.
 globals().update(loci_hermetic.pytest_hooks())
+# The graph store probes a real database in a child process (2-3 s each on a busy host); the suite's stores skip it.
+# The hardening tests turn it on per store (test_ladybug_hardening.py).
+os.environ.setdefault("LOCI_LADYBUG_PROBE", "0")
 
 
 def _configure_pytest_temp_root() -> None:

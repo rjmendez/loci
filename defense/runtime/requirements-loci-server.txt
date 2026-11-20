@@ -1,0 +1,4 @@
+# Python: C:\Python314 (the Loci server runs from system Python via loci_launch.py, not a venv)
+# Installed 2026-10-30. Base package only: [embeddings] pulls onnxruntime, whose DLL is held by the rerank sidecar.
+mnemosyne-memory==4.0.0
+sqlite-vec==0.1.9

@@ -94,4 +94,74 @@ class TriageSuite:
         return CaseResult(case.id, score, "" if score >= 1.0 else trace)
 
 
-BUILTIN = {"triage": TriageSuite}
+class QueryExpandSuite:
+    """Grades ``query_expand.expand`` against the teacher gold set.
+
+    Gold rows (``<memory parent>/teacher/gold/query_expand.jsonl``, override ``LOCI_TEACHER_GOLD_DIR``):
+    ``{"id", "query", "expect": [terms]}``. Score = share of ``expect`` terms that appear (case-insensitive)
+    in the expanded queries or keywords. One surface, ``guidance``. No gold file -> ``unavailable()``."""
+    name = "query_expand"
+    surfaces = {
+        "guidance": Surface(
+            "guidance", "text", default="", max_len=800,
+            desc=("Extra instructions appended to the query-expansion prompt: how to phrase alternates and "
+                  "which domain terms to surface so relevant documents are reached. Plain text."),
+        ),
+    }
+
+    def __init__(self, gold_path: Optional[Path] = None, gen_fn: Optional[Callable[..., dict]] = None):
+        if gold_path is None:
+            base = os.environ.get("LOCI_TEACHER_GOLD_DIR")
+            gold_path = (Path(base) if base else suite_dir(self.name).parent.parent / "teacher" / "gold") / "query_expand.jsonl"
+        self._path = Path(gold_path)
+        self._gen = gen_fn
+
+    def _rows(self) -> list[dict]:
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        rows = []
+        for line in lines:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("id") and d.get("query") and isinstance(d.get("expect"), list) and d["expect"]:
+                rows.append(d)
+        return rows
+
+    def unavailable(self) -> Optional[str]:
+        return None if self._rows() else "no gold set yet"
+
+    def cases(self) -> list[Case]:
+        seen, out = set(), []
+        for d in self._rows():
+            if str(d["id"]) not in seen:
+                seen.add(str(d["id"]))
+                out.append(Case(str(d["id"]), d))
+        return out
+
+    def run(self, case: Case, overlay: dict) -> CaseResult:
+        from query_expand import expand, _lazy_generate
+
+        d = case.data
+        seen = {"ok": True}
+        real = self._gen or _lazy_generate
+
+        def gen(prompt, **kw):
+            r = real(prompt, **kw)
+            seen["ok"] = bool(isinstance(r, dict) and r.get("ok"))
+            return r
+
+        res = expand(d["query"], gen_fn=gen, guidance=str(overlay.get("guidance", "")))
+        if not seen["ok"]:
+            return CaseResult(case.id, 0.0, "model unavailable", infra_error=True)
+        blob = " ".join(list(res.get("queries", [])) + list(res.get("keywords", []))).lower()
+        expect = [str(t) for t in d["expect"]]
+        missing = [t for t in expect if t.lower() not in blob]
+        score = (len(expect) - len(missing)) / len(expect)
+        return CaseResult(case.id, score, "" if not missing else f"query {d['query']!r}: expansion lacks {missing}")
+
+
+BUILTIN = {"triage": TriageSuite, "query_expand": QueryExpandSuite}

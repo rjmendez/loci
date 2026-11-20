@@ -1,0 +1,22 @@
+# Owner spend envelope for the LiteLLM governor. Caps from F:/work/design/tripwire-governor-v2/decisions.md
+# (decision 1 + 2), anonymous_day raised to the 24h ceiling because prod callers send no client id (all
+# "anonymous"), so the GLOBAL day/hour caps must bind, not the per-anonymous-client sub-cap.
+# 2026-10-30: caps raised to $200/day (graduated ~4x), prompt_tokens_max 256k. Pinned by envelope.pin.
+[governor]
+enforce = true
+day_timezone = "local"
+
+[caps]
+day_soft = 120
+day_hard = 200
+rolling_24h = 240
+hour_downgrade = 40
+hour_reject = 100
+interactive_stop = 300
+anonymous_day = 240
+prompt_tokens_max = 256000
+
+[clients.hermes]
+secret_sha256 = "206519557ddc2ff1e0db7a5498d3be1e0ef17352969cbcaba0b8c1dd18820df7"
+interactive = true
+rw = false

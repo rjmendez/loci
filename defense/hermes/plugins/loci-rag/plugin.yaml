@@ -1,0 +1,6 @@
+name: loci-rag
+version: "1.0.0"
+description: "Automatically retrieve cited Loci context before every user turn, with project corpus routing and explicit outage notices."
+author: "Local workstation customization"
+provides_hooks:
+  - pre_llm_call

@@ -84,6 +84,12 @@ class _Isolated(unittest.TestCase):
     def _start(self, inv):
         server.investigation_start(investigation_id=inv, title="t")
 
+    def _cite(self, inv):
+        """A real receipt, as audit_log writes it: a tool_verified write must cite one (store-time gate)."""
+        rid = json.loads(server.audit_log(tool_name="probe-tool", inputs_json="{}", output="ok",
+                                          investigation_id=inv))["receipt_id"]
+        return {"receipt_ids": [rid]}
+
     def _rows(self, inv):
         return server._read_jsonl(server._inv_dir(inv) / "findings.jsonl")
 
@@ -128,7 +134,7 @@ class DefaultedTierIsNotIndependentTest(_Isolated):
         self._start(inv)
         server.investigation_store(
             investigation_id=inv, finding_type="observed", text=CLAIM, source="redis-cli",
-            confidence="high", evidence_provenance_tier="tool_verified")
+            confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv))
         out = _j(server.investigation_pre_answer_check(investigation_id=inv, claims=[CLAIM], record=False))
         self.assertEqual(out["support_count"], 1)
         self.assertTrue(out["claim_results"][0]["provenance_firewall"]["allowed"])
@@ -206,7 +212,9 @@ class MnemoRoundTripTest(_Isolated):
         raw = [{"content": "untagged claim", "metadata": meta, "score": 0.9}]
         with mock.patch.object(mnemo_ops, "_get_mnemo_funcs", return_value=(None, lambda **k: raw)):
             rows = mnemo_ops._mnemo_recall("untagged", investigation_id=inv)
-        self.assertEqual(rows[0]["evidence_provenance_tier"], "tool_verified")
+        # An untagged write is stored and recalled as model_asserted, not tool_verified: the old display let a
+        # model claim read as verified fact. It stays flagged as defaulted (nobody asserted the tier).
+        self.assertEqual(rows[0]["evidence_provenance_tier"], "model_asserted")
         self.assertTrue(rows[0]["provenance_defaulted"])
 
 
@@ -221,7 +229,7 @@ class FirewallRelevanceTest(_Isolated):
         self._start(inv)
         server.investigation_store(investigation_id=inv, finding_type="observed",
                                    text="Disk usage on host foo is 41 percent", source="df",
-                                   confidence="high", evidence_provenance_tier="tool_verified")
+                                   confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv))
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="inferred",
             text="Service X leaks memory (the model said so)", source="llm",
@@ -239,7 +247,7 @@ class FirewallRelevanceTest(_Isolated):
         server.investigation_store(investigation_id=inv, finding_type="observed",
                                    text="Service X memory grows 2GB per hour in heap profile",
                                    source="pprof", confidence="high",
-                                   evidence_provenance_tier="tool_verified")
+                                   evidence_provenance_tier="tool_verified", metadata=self._cite(inv))
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="inferred",
             text="Service X memory grows per hour: heap leak", source="llm",
@@ -256,7 +264,7 @@ class FirewallRelevanceTest(_Isolated):
         self._start(inv)
         parent = _j(server.investigation_store(
             investigation_id=inv, finding_type="observed", text="nmap: 10.0.0.5 tcp/22 open",
-            source="nmap", confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+            source="nmap", confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv)))["finding_id"]
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="inferred", text="The jump box accepts SSH",
             source="llm", confidence="high", evidence_provenance_tier="model_asserted",
@@ -271,7 +279,7 @@ class FirewallRelevanceTest(_Isolated):
                                          method_name="bar", expected_effect="flush cache")
         server.investigation_store(investigation_id=inv, finding_type="observed",
                                    text="Disk usage on host foo is 41 percent", source="df",
-                                   confidence="high", evidence_provenance_tier="tool_verified")
+                                   confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv))
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="inferred",
             text="Service X leaks memory (the model said so)", source="llm",
@@ -296,7 +304,7 @@ class PromotionGateTest(_Isolated):
         self._start(inv)
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="observed", text="Host foo runs nginx 1.24",
-            source="nmap", confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+            source="nmap", confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv)))["finding_id"]
         # Promotion is ok only once the point is indexed; stub a landed upsert.
         with mock.patch.object(verify, "_lazy_generate", _confirmed_gen([])),              mock.patch.object(server, "_qdrant_upsert", lambda *a, **k: True):
             out = _j(server.loci_validated_knowledge_promotion(investigation_id=inv, finding_id=fid))
@@ -451,7 +459,7 @@ class ReviewFollowUpTest(_Isolated):
         self._start(inv)
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="observed", text=CLAIM, source="redis-cli",
-            confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+            confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv)))["finding_id"]
         self._retract(inv, fid)
         out = _j(server.investigation_pre_answer_check(investigation_id=inv, claims=[CLAIM], record=False))
         self.assertEqual(out["support_count"], 0, out)
@@ -465,7 +473,7 @@ class ReviewFollowUpTest(_Isolated):
         bad = _j(server.investigation_store(
             investigation_id=inv, finding_type="observed",
             text="Service X memory grows 2GB per hour in heap profile", source="pprof",
-            confidence="high", evidence_provenance_tier="tool_verified"))["finding_id"]
+            confidence="high", evidence_provenance_tier="tool_verified", metadata=self._cite(inv)))["finding_id"]
         self._retract(inv, bad)
         fid = _j(server.investigation_store(
             investigation_id=inv, finding_type="inferred",
