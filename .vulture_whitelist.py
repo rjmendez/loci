@@ -137,6 +137,14 @@ _ = row_factory
 # by name convention (do_<METHOD>), never directly in our code.
 _ = do_GET
 _ = do_POST
+# scripts/ollama_lab_relay.py's Relay forwards every method (do_PUT, do_DELETE, do_HEAD,
+# do_PATCH, do_OPTIONS = _forward) and sets protocol_version, which the base class reads.
+_ = do_PUT
+_ = do_DELETE
+_ = do_HEAD
+_ = do_PATCH
+_ = do_OPTIONS
+_ = protocol_version
 
 # ── scripts/redteam/loci_adversarial_harness.py dataclass fields
 # AttackCase/CaseResult fields are populated positionally/by keyword and read
