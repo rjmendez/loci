@@ -106,12 +106,37 @@ if os.path.exists(_LOCI_ENV_FILE):
 # chain used by the MCP server. This keeps unattended/hook processes from
 # disagreeing with the live server when neither process environment nor .env
 # exports carry the endpoint.
+_profile_home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or ""
+_backend_config = os.environ.get(
+    "LOCI_CONFIG",
+    os.path.join(_profile_home, ".loci", "backends.toml") if _profile_home else "",
+)
 try:
-    _HOOK_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    if _HOOK_REPO_ROOT not in sys.path:
-        sys.path.insert(0, _HOOK_REPO_ROOT)
-    from mcp import backends as _loci_backends
-    _loci_backends.load_env(_HOOK_REPO_ROOT)
+    if os.environ.get("LOCI_CONFIG") or os.path.exists(_backend_config):
+        _HOOK_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        _HOOK_MCP_DIR = os.path.join(_HOOK_REPO_ROOT, "mcp")
+        if _HOOK_MCP_DIR not in sys.path:
+            sys.path.insert(0, _HOOK_MCP_DIR)
+        import backends as _loci_backends
+        _loci_backends.load_env(_HOOK_REPO_ROOT)
+    # Unattended Copilot hook processes do not inherit start_loci.ps1's
+    # LOCI_LOCAL_OLLAMA setting. Prefer the resident-proxy URL from
+    # ~/.loci/backends.toml over the probe's harmless 11434 placeholder.
+    _profile_home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or ""
+    _backend_config = os.environ.get(
+        "LOCI_CONFIG",
+        os.path.join(_profile_home, ".loci", "backends.toml") if _profile_home else "",
+    )
+    _configured_ollama = (
+        _loci_backends._cfg("ollama", "url", "")
+        if os.path.exists(_backend_config) else ""
+    )
+    if _configured_ollama:
+        _resolved_ollama = os.environ.get("OLLAMA_BASE_URL", "")
+        if not _resolved_ollama or _resolved_ollama.rstrip("/") in (
+            "http://localhost:11434", "http://127.0.0.1:11434",
+        ):
+            os.environ["OLLAMA_BASE_URL"] = _configured_ollama
 except Exception:
     pass
 
