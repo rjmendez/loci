@@ -162,6 +162,25 @@ def test_ollama_url_gets_v1_suffix():
     assert h.OLLAMA_URL == "http://o:11434/v1"
 
 
+def test_mnemosyne_embedding_api_url_wins_over_ollama_base():
+    h = load_hook({
+        "OLLAMA_BASE_URL": "http://wrong:11434",
+        "MNEMOSYNE_EMBEDDING_API_URL": "http://right:11440/v1",
+    })
+    assert h.OLLAMA_URL == "http://right:11440/v1"
+
+
+def test_prompt_only_copilot_payload_emits_claude_context(hook):
+    calls = fake_urlopen(hook, Resp({"data": [{"embedding": [0.1, 0.2, 0.3]}]}))
+    try:
+        code, out = run_main(hook, {"prompt": "Fix Loci grounding"})
+    finally:
+        calls.stop()
+    assert code is None
+    context = context_of(out)
+    assert "[GROUNDING DIRECTIVE" in context or "MEMORY MATCH" in context
+
+
 def test_sa_enabled_false_words():
     for word in ("false", "FALSE", "0", "no"):
         assert load_hook({"HOOK_SA_ENABLED": word}).SA_ENABLED is False

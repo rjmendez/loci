@@ -84,18 +84,49 @@ if os.path.exists(_ENV_FILE):
                 _k, _, _v = _line.partition("=")
                 os.environ.setdefault(_k.strip(), _v.strip())
 
+# Copilot CLI runs on Windows and is installed outside the Hermes profile.
+# Load the Loci-native env file when present, but preserve explicitly exported
+# process environment (including MNEMOSYNE profile values) over file values.
+_LOCI_ENV_FILE = os.environ.get(
+    "LOCI_ENV_FILE",
+    os.path.join(os.path.expanduser("~"), ".loci", ".env"),
+)
+if os.path.exists(_LOCI_ENV_FILE):
+    with open(_LOCI_ENV_FILE) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                _k = _k.strip()
+                _v = _v.strip().strip("\"'")
+                if _k:
+                    os.environ.setdefault(_k, _v)
+
+# Resolve Qdrant, Ollama and embed-model settings through the same backends
+# chain used by the MCP server. This keeps unattended/hook processes from
+# disagreeing with the live server when neither process environment nor .env
+# exports carry the endpoint.
+try:
+    _HOOK_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _HOOK_REPO_ROOT not in sys.path:
+        sys.path.insert(0, _HOOK_REPO_ROOT)
+    from mcp import backends as _loci_backends
+    _loci_backends.load_env(_HOOK_REPO_ROOT)
+except Exception:
+    pass
+
 # ── constants ─────────────────────────────────────────────────────────────────
 QDRANT_URL   = os.environ.get("QDRANT_URL")
 QDRANT_KEY   = os.environ.get("QDRANT_API_KEY", "")
 def _embed_base_url() -> Optional[str]:
     """OpenAI-compatible embeddings base. OLLAMA_BASE_URL is a bare host and needs
-    /v1; MNEMOSYNE_EMBEDDING_API_URL (what the Hermes profile actually sets) is
-    already a full /v1 endpoint."""
-    base = os.environ.get("OLLAMA_BASE_URL")
-    if base:
-        return f"{base.rstrip('/')}/v1"
+    /v1; MNEMOSYNE_EMBEDDING_API_URL is an existing full /v1 endpoint and wins
+    when both variables are present."""
     api = os.environ.get("MNEMOSYNE_EMBEDDING_API_URL")
-    return api.rstrip("/") if api else None
+    if api:
+        return api.rstrip("/")
+    base = os.environ.get("OLLAMA_BASE_URL")
+    return f"{base.rstrip('/')}/v1" if base else None
 
 
 OLLAMA_URL   = _embed_base_url()
@@ -566,13 +597,19 @@ def main() -> None:
     if not isinstance(payload, dict):
         sys.exit(0)
 
-    if payload.get("hook_event_name", "") not in (
+    event_name = payload.get("hook_event_name", "")
+    # Copilot CLI's hook payload can be prompt-only. It still uses Claude-style
+    # additionalContext output, unlike the legacy Hermes pre_llm_call shape.
+    if not event_name and payload.get("prompt"):
+        event_name = "UserPromptSubmit"
+
+    if event_name not in (
         "pre_llm_call", "PreLlmCall",       # legacy Hermes names
         "UserPromptSubmit", "SubagentStart", # Claude Code native names
     ):
         sys.exit(0)
     global _HOST_EVENT
-    _HOST_EVENT = payload.get("hook_event_name", "")
+    _HOST_EVENT = event_name
 
     extra = payload.get("extra") or {}
 
