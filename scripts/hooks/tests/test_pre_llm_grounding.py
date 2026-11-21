@@ -170,6 +170,16 @@ def test_mnemosyne_embedding_api_url_wins_over_ollama_base():
     assert h.OLLAMA_URL == "http://right:11440/v1"
 
 
+def test_localhost_placeholder_resolves_to_configured_proxy(monkeypatch, tmp_path):
+    config = tmp_path / "backends.toml"
+    config.write_text('[ollama]\nurl = "http://127.0.0.1:11435"\n')
+    h = load_hook({
+        "LOCI_CONFIG": str(config),
+        "OLLAMA_BASE_URL": "http://localhost:11434",
+    })
+    assert h.OLLAMA_URL == "http://127.0.0.1:11435/v1"
+
+
 def test_prompt_only_copilot_payload_emits_claude_context(hook):
     calls = fake_urlopen(hook, Resp({"data": [{"embedding": [0.1, 0.2, 0.3]}]}))
     try:
